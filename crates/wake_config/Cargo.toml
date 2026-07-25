@@ -1,0 +1,14 @@
+[package]
+name = "wake_config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "声明式项目配置加载（wake.config.toml）。对齐 crustify Config（CRUSTIFY-PARITY §M1）。"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true

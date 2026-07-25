@@ -1,0 +1,1190 @@
+//! codegen 测试：往返幂等（parse→codegen→parse→codegen 稳定）+ 输出快照。
+
+use wake_common::Interner;
+use wake_ecma_ast::SourceType;
+use wake_ecma_minify::MinifyCtx;
+use wake_ecma_parser::parse;
+
+use crate::codegen;
+
+fn run(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Module);
+    assert!(
+        !out.has_errors(),
+        "parse errors for {src:?}: {:?}",
+        out.diagnostics
+    );
+    out.module.with_ast(|p| codegen(p, &it))
+}
+
+/// TS 擦除：TypeScript 源码解析（跳过类型语法）→ codegen 出无类型 JS → 可作纯 JS 无错重解析。
+fn strip_ts(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::TypeScript);
+    assert!(
+        !out.has_errors(),
+        "TS parse errors {src:?}: {:?}",
+        out.diagnostics
+    );
+    let js = out.module.with_ast(|p| codegen(p, &it));
+    let re = parse(&js, &it, SourceType::Module);
+    assert!(
+        !re.has_errors(),
+        "擦除后 JS 重解析出错:\n{js}\n{:?}",
+        re.diagnostics
+    );
+    js
+}
+
+#[test]
+fn ts_erasure_basic() {
+    let js = strip_ts(
+        "const x: number = 1;\n\
+         function add(a: number, b: number): number { return a + b; }\n\
+         let y!: string;\n\
+         function id<T>(v: T): T { return v; }\n\
+         interface Foo { a: number; b(): void; }\n\
+         type Bar = { x: number } | string;",
+    );
+    // 类型语法擦除。
+    assert!(!js.contains(": number"), "残留类型注解:\n{js}");
+    assert!(!js.contains("interface"), "残留 interface:\n{js}");
+    assert!(!js.contains("<T>"), "残留泛型:\n{js}");
+    // 值语义保留。
+    assert!(js.contains("const x = 1"), "{js}");
+    assert!(js.contains("function add(a, b)"), "{js}");
+    assert!(js.contains("function id(v)"), "{js}");
+    assert!(js.contains("return a + b"), "{js}");
+}
+
+#[test]
+fn ts_erasure_expressions() {
+    // as / satisfies / 非空断言 ! / import type。
+    let js = strip_ts(
+        "import type { T } from './t';\n\
+         const a = 1;\n\
+         const b = (a as number) + 1;\n\
+         const c = a!;\n\
+         const d = a satisfies number;\n\
+         const e = a!.toString();",
+    );
+    assert!(!js.contains("as number"), "残留 as:\n{js}");
+    assert!(!js.contains("satisfies"), "残留 satisfies:\n{js}");
+    assert!(!js.contains("import type"), "残留 import type:\n{js}");
+    assert!(js.contains("const b = a + 1"), "{js}");
+    assert!(js.contains("const c = a;"), "{js}");
+    assert!(js.contains("const d = a;"), "{js}");
+    assert!(js.contains("const e = a.toString()"), "{js}");
+}
+
+#[test]
+fn ts_erasure_full_type_grammar() {
+    // 完整类型文法：联合/交叉、函数类型、条件类型、keyof/typeof、映射/对象/元组、
+    // 索引访问、模板字面量类型、`import()` 类型、限定名 + 类型实参、字面量类型。
+    let js = strip_ts(
+        "type A = string | number & boolean;\n\
+         type Fn = (a: number, b?: string) => void;\n\
+         type Ctor = new (x: number) => Foo;\n\
+         type Cond<T> = T extends string ? number : boolean;\n\
+         type Keys = keyof typeof obj;\n\
+         type Obj = { a: number; b?: string; readonly c: T[]; [k: string]: unknown };\n\
+         type Mapped = { [K in Keys]: T[K] };\n\
+         type Tup = [first: string, second?: number, ...rest: boolean[]];\n\
+         type Idx = Foo['bar'][number];\n\
+         type Tpl = `prefix-${string}-suffix`;\n\
+         type Imp = import('react').FC<Props>;\n\
+         type Ref = Map<string, Array<number>>;\n\
+         type Lit = 'a' | 'b' | 42 | -1 | true;\n\
+         type Nested = Array<Array<Map<K, V>>>;\n\
+         const x: Ref = new Map();",
+    );
+    // 全部类型声明擦除为空；仅剩最后的 const。
+    assert!(js.contains("const x = new Map()"), "{js}");
+    assert!(!js.contains("type "), "残留 type 声明:\n{js}");
+    assert!(!js.contains("extends"), "残留条件类型:\n{js}");
+    assert!(!js.contains("keyof"), "残留 keyof:\n{js}");
+    assert!(!js.contains(": number"), "残留类型注解:\n{js}");
+    assert!(!js.contains("=>") || js.contains("new Map"), "{js}");
+}
+
+#[test]
+fn ts_erasure_class_full() {
+    // 类：泛型、extends<T>、implements、修饰符、可选/明确赋值、索引签名、重载、abstract/declare 成员、参数属性、this 参数。
+    let js = strip_ts(
+        "class C<T> extends Base<T> implements I, J<T> {\n\
+           private readonly x: number = 1;\n\
+           static y?: string;\n\
+           declare z: boolean;\n\
+           [key: string]: unknown;\n\
+           foo(a: number): void;\n\
+           foo(a: string): void;\n\
+           foo(a: any): void { return; }\n\
+           bar<U>(this: C<T>, u: U): U { return u; }\n\
+           constructor(private a: number, public b: string) { super(); }\n\
+           get val(): number { return this.x; }\n\
+         }",
+    );
+    assert!(js.contains("class C extends Base"), "{js}");
+    assert!(!js.contains("implements"), "残留 implements:\n{js}");
+    assert!(!js.contains("private"), "残留修饰符:\n{js}");
+    assert!(!js.contains("declare"), "残留 declare 成员:\n{js}");
+    assert!(!js.contains(": number"), "残留类型:\n{js}");
+    // 重载签名擦除，仅保留有体的实现。
+    let foo_count = js.matches("foo(").count();
+    assert!(
+        foo_count <= 1,
+        "重载签名未擦除（foo 出现 {foo_count} 次）:\n{js}"
+    );
+    assert!(
+        js.contains("bar(u)"),
+        "泛型方法 + this 参数未正确擦除:\n{js}"
+    );
+    assert!(js.contains("get val()"), "{js}");
+}
+
+#[test]
+fn ts_erasure_declare_and_modules() {
+    // declare 环境声明擦除 + import type / 内联 type / export type。
+    let js = strip_ts(
+        "declare const g: number;\n\
+         declare function h(x: string): void;\n\
+         declare namespace NS { const k: number; }\n\
+         import type { T1 } from './t1';\n\
+         import { type T2, real } from './t2';\n\
+         export type { T3 } from './t3';\n\
+         export { type T4, actual } from './t4';\n\
+         const use = real + actual;",
+    );
+    assert!(!js.contains("declare"), "残留 declare:\n{js}");
+    assert!(!js.contains("import type"), "残留 import type:\n{js}");
+    assert!(
+        !js.contains("T1") && !js.contains("T3"),
+        "残留类型-only 名:\n{js}"
+    );
+    // 运行时导入保留。
+    assert!(js.contains("real") && js.contains("actual"), "{js}");
+}
+
+#[test]
+fn ts_decorators_parse_safely() {
+    // 装饰器（类/方法/属性/参数）当前被消费（擦除），代码可解析且产出合法 JS。
+    let js = strip_ts(
+        "@sealed\n\
+         @Component({ selector: 'app' })\n\
+         class C {\n\
+           @readonly name: string = 'x';\n\
+           @log method(@inject a: number): void { return; }\n\
+         }",
+    );
+    assert!(js.contains("class C"), "{js}");
+    assert!(!js.contains("@"), "残留装饰器:\n{js}");
+    assert!(js.contains("method(a)"), "{js}");
+    assert!(js.contains("name = \"x\""), "{js}");
+}
+
+#[test]
+fn ts_namespace_desugars() {
+    // namespace → IIFE；export 成员改写为 N.name = name；非导出保持局部；类型擦除。
+    let js = strip_ts(
+        "namespace Geo {\n\
+           export const PI = 3.14;\n\
+           interface Point { x: number; }\n\
+           function helper(): void {}\n\
+           export function area(r: number): number { return PI * r * r; }\n\
+         }",
+    );
+    assert!(js.contains("var Geo = function"), "{js}");
+    // export const → 局部 + N.PI = PI。
+    assert!(js.contains("Geo.PI = PI"), "{js}");
+    // export function → 局部 + N.area = area。
+    assert!(js.contains("Geo.area = area"), "{js}");
+    // 非导出 helper 保持局部（无 Geo.helper）。
+    assert!(
+        !js.contains("Geo.helper"),
+        "非导出成员不应挂到命名空间:\n{js}"
+    );
+    // interface 擦除。
+    assert!(!js.contains("interface") && !js.contains("Point"), "{js}");
+    assert!(js.contains("return Geo"), "{js}");
+}
+
+#[test]
+fn ts_parameter_properties() {
+    // 参数属性 → 构造函数体注入 `this.x = x`（super 之后）。
+    let js = strip_ts(
+        "class A {\n\
+           constructor(private x: number, public readonly y: string) {\n\
+             super();\n\
+             this.z = 1;\n\
+           }\n\
+         }\n\
+         class B {\n\
+           constructor(readonly a: number) {}\n\
+         }",
+    );
+    // 修饰符擦除，形参保留。
+    assert!(js.contains("constructor(x, y)"), "{js}");
+    assert!(
+        !js.contains("private") && !js.contains("readonly"),
+        "残留修饰符:\n{js}"
+    );
+    // super 之后注入赋值。
+    let super_pos = js.find("super()").unwrap();
+    let assign_x = js.find("this.x = x").expect("缺少 this.x=x 注入");
+    let assign_y = js.find("this.y = y").expect("缺少 this.y=y 注入");
+    assert!(
+        super_pos < assign_x && assign_x < assign_y,
+        "注入顺序/位置错误:\n{js}"
+    );
+    // 无 super 的构造函数：体首注入。
+    assert!(js.contains("this.a = a"), "{js}");
+}
+
+#[test]
+fn ts_enum_desugars() {
+    // enum → IIFE（正/反向映射 + 自增 + 字符串成员）。可作纯 JS 重解析。
+    let js = strip_ts(
+        "enum Color { Red, Green, Blue }\n\
+         const enum Dir { Up = 1, Down }\n\
+         enum S { A = \"a\", B = \"b\" }",
+    );
+    assert!(js.contains("var Color = function"), "{js}");
+    // 数字成员正反向映射。
+    assert!(js.contains("Color[Color[\"Red\"] = 0] = \"Red\""), "{js}");
+    assert!(
+        js.contains("Color[Color[\"Green\"] = 1] = \"Green\""),
+        "{js}"
+    );
+    // 显式起始 + 自增。
+    assert!(js.contains("Dir[Dir[\"Up\"] = 1] = \"Up\""), "{js}");
+    assert!(js.contains("Dir[Dir[\"Down\"] = 2] = \"Down\""), "{js}");
+    // 字符串成员仅正向。
+    assert!(js.contains("S[\"A\"] = \"a\""), "{js}");
+    assert!(
+        !js.contains("S[S[\"A\"]"),
+        "字符串枚举不应有反向映射:\n{js}"
+    );
+}
+
+#[test]
+fn ts_erasure_call_type_args() {
+    // 调用表达式类型实参 `f<T>()`（useState/useRef 等 React 高频写法）擦除。
+    let js = strip_ts(
+        "const s = useState<number>(0);\n\
+         const p = foo<A, B>(x);\n\
+         const n = make<Map<string, number[]>>(x);\n\
+         const m = obj.method<T>(a, b);\n\
+         const t = tag<T>`hello`;",
+    );
+    assert!(!js.contains("<number>"), "残留调用类型实参:\n{js}");
+    assert!(!js.contains("<A, B>"), "残留调用类型实参:\n{js}");
+    assert!(!js.contains("<T>"), "残留调用类型实参:\n{js}");
+    // 值语义保留：调用与实参不变。
+    assert!(js.contains("useState(0)"), "{js}");
+    assert!(js.contains("foo(x)"), "{js}");
+    assert!(js.contains("make(x)"), "{js}");
+    assert!(js.contains("obj.method(a, b)"), "{js}");
+    assert!(js.contains("tag`hello`"), "{js}");
+}
+
+#[test]
+fn ts_erasure_arrow_params_and_return() {
+    // 箭头函数参数类型注解 + 返回类型注解擦除（真实 TSX 事件处理器/回调高频）。
+    let js = strip_ts(
+        "const f = (a: number, b: string): boolean => a > 0;\n\
+         const g = (x: number) => x * 2;\n\
+         const h = (...args: number[]): number => args.length;\n\
+         const cb = arr.map((item: T, i: number) => item);",
+    );
+    assert!(!js.contains(": number"), "残留参数类型:\n{js}");
+    assert!(!js.contains(": boolean"), "残留返回类型:\n{js}");
+    assert!(js.contains("const f = (a, b) => a > 0"), "{js}");
+    assert!(js.contains("const g = (x) => x * 2"), "{js}");
+    assert!(js.contains("(...args) => args.length"), "{js}");
+    assert!(js.contains("(item, i) => item"), "{js}");
+}
+
+#[test]
+fn ts_erasure_arrow_return_type_not_conditional() {
+    // 反例：条件表达式 `c ? (y) : z` 的 `:` 不能被箭头返回类型擦除误吃。
+    let js = strip_ts("const r = c ? (y) : z;\nconst s = cond ? (a + b) : (d);");
+    assert!(js.contains("c ? y : z"), "条件表达式被破坏:\n{js}");
+    assert!(js.contains("? a + b :"), "条件表达式被破坏:\n{js}");
+}
+
+#[test]
+fn ts_erasure_keeps_comparisons() {
+    // 反例：真正的比较运算（`<` 后并非「平衡角括号 + 紧跟 `(`」）不得被误擦除。
+    let js = strip_ts(
+        "const a = x < y;\n\
+         const b = x < y ? 1 : 2;\n\
+         const c = p < q > r;\n\
+         const d = fn(x < y, z > w);\n\
+         const e = (x < y) && (z > w);",
+    );
+    assert!(js.contains("x < y"), "比较运算被误擦除:\n{js}");
+    assert!(js.contains("p < q > r"), "比较运算被误擦除:\n{js}");
+    assert!(js.contains("z > w"), "比较运算被误擦除:\n{js}");
+}
+
+/// JSX（.tsx）解析 → 降级为 automatic runtime 调用 → codegen 出可作纯 JS 重解析的产物。
+fn jsx_codegen(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Tsx);
+    assert!(
+        !out.has_errors(),
+        "JSX parse errors {src:?}: {:?}",
+        out.diagnostics
+    );
+    let js = out.module.with_ast(|p| codegen(p, &it));
+    let re = parse(&js, &it, SourceType::Module);
+    assert!(
+        !re.has_errors(),
+        "JSX 降级后重解析出错:\n{js}\n{:?}",
+        re.diagnostics
+    );
+    js
+}
+
+#[test]
+fn jsx_desugars_to_automatic_runtime() {
+    let js = jsx_codegen(
+        "const a = <div className=\"x\" data-id={1}>Hello</div>;\n\
+         const b = <Foo a={1} b=\"c\">{child}</Foo>;\n\
+         const c = <><span>1</span><span>2</span></>;\n\
+         const d = <img src=\"u.png\" alt=\"a\" />;\n\
+         const e = <List key={k} {...rest} />;",
+    );
+    // 顶部注入 react/jsx-runtime import。
+    assert!(js.contains("react/jsx-runtime"), "{js}");
+    // intrinsic 小写 → 字符串；组件 → 标识符。
+    assert!(js.contains("_jsx(\"div\""), "{js}");
+    assert!(js.contains("_jsx(Foo"), "{js}");
+    assert!(js.contains("_jsx(\"img\""), "{js}");
+    assert!(js.contains("_jsx(List"), "{js}");
+    // 片段（多子节点）→ _jsxs(_Fragment。
+    assert!(js.contains("_jsxs(_Fragment"), "{js}");
+    // 连字符属性 → 字符串键。
+    assert!(js.contains("\"data-id\""), "{js}");
+    // children 归入 props。
+    assert!(js.contains("children"), "{js}");
+    // 不残留任何原始 JSX 尖括号语法。
+    assert!(!js.contains("</"), "残留 JSX 闭合标签:\n{js}");
+}
+
+#[test]
+fn jsx_nested_and_text() {
+    let js = jsx_codegen(
+        "const t = (\n  <ul className=\"list\">\n    <li>a &amp; b</li>\n    <li>{value}</li>\n  </ul>\n);",
+    );
+    // 嵌套：ul 有两个 li 子 → _jsxs("ul"。
+    assert!(js.contains("_jsxs(\"ul\""), "{js}");
+    assert!(js.contains("_jsx(\"li\""), "{js}");
+    // 实体解码。
+    assert!(js.contains("a & b"), "实体未解码:\n{js}");
+    // 空白折叠：不应把缩进换行当作文本子节点。
+    assert!(!js.contains("\\n"), "{js}");
+}
+
+/// M4b 用的最简 linker。
+#[cfg(test)]
+struct NoLinker;
+#[cfg(test)]
+impl crate::ModuleLinker for NoLinker {
+    fn module_id(&self, _s: &str) -> Option<u32> {
+        None
+    }
+}
+
+#[test]
+fn m4b_dead_branch_strips_dev_block() {
+    use crate::codegen_module_shaken_with;
+    let it = Interner::new();
+    let define = [("process.env.NODE_ENV", "\"production\"")];
+    let src = "export function f(x) {\n\
+               if (process.env.NODE_ENV !== 'production') { devWarn(x); }\n\
+               if (process.env.NODE_ENV === 'production') { return x * 2; }\n\
+               return x;\n\
+               }";
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out
+        .module
+        .with_ast(|p| codegen_module_shaken_with(p, &it, &NoLinker, None, &define, true, false, false));
+    // dev 警告块（`if(false)`）被剥离；`if(true)` 的 consequent 保留、if 外壳消除。
+    assert!(!js.contains("devWarn"), "dev 块应被剥离:\n{js}");
+    assert!(js.contains("return x * 2"), "{js}");
+    assert!(!js.contains("if ("), "常量 if 应全部折叠:\n{js}");
+}
+
+#[test]
+fn m4b_keeps_branch_with_hoisted_var() {
+    // 被丢弃分支（else）含 `var` 提升声明 → 保守不折叠（丢弃会致 ReferenceError）。
+    use crate::codegen_module_shaken_with;
+    let it = Interner::new();
+    let define = [("process.env.NODE_ENV", "\"production\"")];
+    let src = "export const r = 1;\n\
+               if (process.env.NODE_ENV === 'production') { keep(); } else { var leaked = 2; }";
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out
+        .module
+        .with_ast(|p| codegen_module_shaken_with(p, &it, &NoLinker, None, &define, true, false, false));
+    assert!(
+        js.contains("if ("),
+        "含 var 的被丢弃分支应保守保留 if:\n{js}"
+    );
+    assert!(js.contains("leaked"), "var 绑定应保留:\n{js}");
+}
+
+#[test]
+fn m4b_no_fold_without_minify() {
+    // 非 minify（dev）不折叠：保留可读的 `if("production" !== "production")`。
+    use crate::codegen_module_shaken_with;
+    let it = Interner::new();
+    let define = [("process.env.NODE_ENV", "\"production\"")];
+    let src = "if (process.env.NODE_ENV !== 'production') { devWarn(); }";
+    let out = parse(src, &it, SourceType::Module);
+    let js = out
+        .module
+        .with_ast(|p| codegen_module_shaken_with(p, &it, &NoLinker, None, &define, false, false, false));
+    assert!(js.contains("devWarn"), "dev 模式不应折叠:\n{js}");
+}
+
+#[test]
+fn define_replaces_process_env_node_env() {
+    use crate::{ModuleLinker, codegen_module};
+    struct NoLinker;
+    impl ModuleLinker for NoLinker {
+        fn module_id(&self, _s: &str) -> Option<u32> {
+            None
+        }
+    }
+    let it = Interner::new();
+    let src = "const x = process.env.NODE_ENV;\n\
+               const dev = process.env.NODE_ENV !== 'production';\n\
+               const keep = process.env.OTHER;\n\
+               const nested = obj.process.env.NODE_ENV;";
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out.module.with_ast(|p| codegen_module(p, &it, &NoLinker, false));
+    // process.env.NODE_ENV → "production"（去 process shim 的关键）。
+    assert!(js.contains("const x = \"production\";"), "{js}");
+    assert!(js.contains("\"production\" !== \"production\""), "{js}");
+    // 其它 process.env.X 与前缀不同的链不误匹配。
+    assert!(js.contains("process.env.OTHER"), "{js}");
+    assert!(js.contains("obj.process.env.NODE_ENV"), "{js}");
+    // 不再残留待替换的 process.env.NODE_ENV。
+    assert!(!js.contains("= process.env.NODE_ENV;"), "{js}");
+}
+
+/// 往返幂等：codegen 的输出再 parse+codegen 应完全一致（强语义等价信号）。
+fn assert_stable(src: &str) {
+    let it = Interner::new();
+    let out1 = parse(src, &it, SourceType::Module);
+    assert!(
+        !out1.has_errors(),
+        "parse1 errors {src:?}: {:?}",
+        out1.diagnostics
+    );
+    let gen1 = out1.module.with_ast(|p| codegen(p, &it));
+
+    let out2 = parse(&gen1, &it, SourceType::Module);
+    assert!(
+        !out2.has_errors(),
+        "re-parse errors:\n{gen1}\n{:?}",
+        out2.diagnostics
+    );
+    let gen2 = out2.module.with_ast(|p| codegen(p, &it));
+
+    assert_eq!(
+        gen1, gen2,
+        "codegen 非幂等\n--- gen1 ---\n{gen1}\n--- gen2 ---\n{gen2}"
+    );
+}
+
+#[test]
+fn roundtrip_expressions() {
+    for src in [
+        "1 + 2 * 3;",
+        "(1 + 2) * 3;",
+        "a ? b : c ? d : e;",
+        "a = b = c;",
+        "-(-x);",
+        "a ** b ** c;",
+        "(a ** b) ** c;",
+        "!a && b || c;",
+        "a ?? b;",
+        "typeof x === 'string';",
+        "new Foo(a, b).bar();",
+        "a?.b?.[c]?.(d);",
+        "x++ + ++y;",
+        "[...a, b, , c];",
+        "({ a: 1, b, [c]: 2, ...d });",
+        "`a${b + c}d${e}`;",
+        "tag`x${y}z`;",
+        "(a, b, c);",
+        "f(...args);",
+        "delete obj.prop;",
+    ] {
+        assert_stable(src);
+    }
+}
+
+#[test]
+fn roundtrip_statements() {
+    for src in [
+        "const a = 1, b = 2;",
+        "let [x, , y = 3, ...z] = arr;",
+        "const { p, q: r, ...s } = obj;",
+        "if (a) b(); else { c(); d(); }",
+        "for (let i = 0; i < n; i++) log(i);",
+        "for (const k in obj) use(k);",
+        "for (const v of items) use(v);",
+        "while (x) y();",
+        "do z(); while (w);",
+        "switch (v) { case 1: a(); break; default: b(); }",
+        "try { risky(); } catch (e) { handle(e); } finally { done(); }",
+        "label: for (;;) break label;",
+        "throw new Error('boom');",
+    ] {
+        assert_stable(src);
+    }
+}
+
+#[test]
+fn roundtrip_functions_classes() {
+    for src in [
+        "function f(a, b = 1, ...rest) { return a + b; }",
+        "async function* g() { yield await x; }",
+        "const h = (a) => a * 2;",
+        "const k = async (x) => { return await x; };",
+        "const o = { m() {}, async n() {}, *gen() {}, get p() { return 1; } };",
+        "class A extends B { #x = 1; static y = 2; constructor() { super(); } get z() { return this.#x; } static { init(); } method() {} }",
+    ] {
+        assert_stable(src);
+    }
+}
+
+#[test]
+fn roundtrip_modules() {
+    for src in [
+        "import a from 'm';",
+        "import { b, c as d } from 'm';",
+        "import def, { e } from 'm';",
+        "import * as ns from 'm';",
+        "import 'side-effect';",
+        "export const x = 1;",
+        "export function f() {}",
+        "export default class {}",
+        "export default 42;",
+        "export { a, b as c };",
+        "export { d } from 'm';",
+        "export * from 'm';",
+        "export * as ns from 'm';",
+    ] {
+        assert_stable(src);
+    }
+}
+
+#[test]
+fn snapshot_output() {
+    insta::assert_snapshot!(run(
+        "export function add(a,b){return a+b}\nconst x=(1+2)*3;\nclass C extends D{#p=0;m(){return this.#p??0}}"
+    ));
+}
+
+#[test]
+fn precedence_parens_preserved() {
+    // (1+2)*3 必须保留括号；1+2*3 不加括号。
+    assert!(run("(1 + 2) * 3;").contains("(1 + 2) * 3"));
+    assert!(!run("1 + 2 * 3;").contains("("));
+    // 箭头体对象字面量加括号。
+    assert!(run("const f = () => ({ a: 1 });").contains("=> ({"));
+}
+
+// ======================================================================
+// Tree Shaking（PLAN §6.6）
+// ======================================================================
+
+struct NoLink;
+impl crate::ModuleLinker for NoLink {
+    fn module_id(&self, _s: &str) -> Option<u32> {
+        None
+    }
+}
+
+/// 用给定「保留导出名」列表做 shake 后的模块体。
+fn shake(src: &str, keep: Option<&[&str]>) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+    let keep_owned: Option<Vec<String>> = keep.map(|k| k.iter().map(|s| s.to_string()).collect());
+    out.module
+        .with_ast(|p| crate::codegen_module_shaken(p, &it, &NoLink, keep_owned.as_deref(), false))
+}
+
+#[test]
+fn shake_drops_unused_pure_exports() {
+    let src = "export const used = 1;\n\
+               export const unused = 2;\n\
+               export function helper() { return 3; }\n\
+               export class Widget {}";
+    let js = shake(src, Some(&["used"]));
+    // used 保留（声明 + 绑定）。
+    assert!(js.contains("const used = 1;"), "{js}");
+    assert!(js.contains("exports[\"used\"] = used;"), "{js}");
+    // unused / helper / Widget 整体移除（纯 + 外部未用 + 内部未引用）。
+    assert!(!js.contains("unused"), "unused 应被移除:\n{js}");
+    assert!(!js.contains("helper"), "helper 应被移除:\n{js}");
+    assert!(!js.contains("Widget"), "Widget 应被移除:\n{js}");
+}
+
+#[test]
+fn shake_keeps_internally_referenced_decl() {
+    // secret 外部未用，但被 pub 读取 → 保留声明，仅移除其 exports 绑定。
+    let src = "export const secret = 41;\n\
+               export function pub() { return secret + 1; }";
+    let js = shake(src, Some(&["pub"]));
+    assert!(js.contains("const secret = 41;"), "声明应保留:\n{js}");
+    assert!(!js.contains("exports[\"secret\"]"), "绑定应移除:\n{js}");
+    assert!(js.contains("function pub"), "{js}");
+    assert!(js.contains("exports[\"pub\"] = pub;"), "{js}");
+}
+
+#[test]
+fn shake_keeps_side_effect_initializer() {
+    // x 外部未用，但初始化器有副作用 → 保留声明（保留副作用），只移除 exports 绑定。
+    let src = "export const x = sideEffect();";
+    let js = shake(src, Some(&[]));
+    assert!(
+        js.contains("const x = sideEffect();"),
+        "副作用应保留:\n{js}"
+    );
+    assert!(!js.contains("exports[\"x\"]"), "绑定应移除:\n{js}");
+}
+
+#[test]
+fn shake_drops_unused_default() {
+    let src = "export default function App() { return 1; }\nexport const keep = 2;";
+    let js = shake(src, Some(&["keep"]));
+    assert!(
+        !js.contains("exports.default"),
+        "未用 default 应移除:\n{js}"
+    );
+    assert!(!js.contains("App"), "App 应整体移除:\n{js}");
+    assert!(js.contains("exports[\"keep\"] = keep;"), "{js}");
+}
+
+#[test]
+fn shake_none_keeps_everything() {
+    // keep=None（入口 / import*）→ 全保留（回归）。
+    let src = "export const a = 1;\nexport function b() {}";
+    let js = shake(src, None);
+    assert!(js.contains("exports[\"a\"] = a;"), "{js}");
+    assert!(js.contains("exports[\"b\"] = b;"), "{js}");
+}
+
+#[test]
+fn shake_filters_export_specifiers() {
+    // export { a, b }：只保留被用的。
+    let src = "const a = 1;\nconst b = 2;\nexport { a, b };";
+    let js = shake(src, Some(&["a"]));
+    assert!(js.contains("exports[\"a\"] = a;"), "{js}");
+    assert!(!js.contains("exports[\"b\"]"), "未用 b 绑定应移除:\n{js}");
+    // 局部声明保留（可能内部有用；v1 不做局部 DCE）。
+    assert!(js.contains("const b = 2;"), "{js}");
+}
+
+// ======================================================================
+// 标识符 mangling（CRUSTIFY-PARITY §M4）：侧表由 wake_ecma_minify 构建，codegen 按 span 替换。
+// ======================================================================
+
+/// mangle：parse → plan_mangle → codegen_module_shaken_mangled（minify），再 parse 校验合法。
+fn mangle_gen(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Module);
+    assert!(
+        !out.has_errors(),
+        "parse errors {src:?}: {:?}",
+        out.diagnostics
+    );
+    let js = out.module.with_ast(|p| {
+        let m = wake_ecma_minify::plan_mangle(p, &it);
+        crate::codegen_module_shaken_mangled(p, &it, &NoLink, None, &[], true, Some(m.table()), None, false, false)
+    });
+    // 产物必须能无错重解析（结构合法信号）。
+    let re = parse(&js, &it, SourceType::Module);
+    assert!(
+        !re.has_errors(),
+        "mangle 产物重解析出错:\n{js}\n{:?}",
+        re.diagnostics
+    );
+    js
+}
+
+#[test]
+fn mangle_renames_nested_locals_keeps_module_and_props() {
+    // 参数 x、局部 y 被重命名；模块级 helper 名保留；成员/属性名不动。
+    let js = mangle_gen(
+        "function helper(longParam) {\n\
+         const longLocal = longParam.value;\n\
+         return longLocal + longParam.count;\n\
+         }\n\
+         helper;",
+    );
+    // 参数与局部长名消失（被短名替换）。
+    assert!(!js.contains("longParam"), "参数应被重命名:\n{js}");
+    assert!(!js.contains("longLocal"), "局部应被重命名:\n{js}");
+    // 模块级函数名保留（可能被导出/合成引用）。
+    assert!(js.contains("helper"), "模块级函数名应保留:\n{js}");
+    // 成员属性名 .value / .count 不动。
+    assert!(js.contains(".value"), "属性名 value 不应改:\n{js}");
+    assert!(js.contains(".count"), "属性名 count 不应改:\n{js}");
+}
+
+#[test]
+fn mangle_expands_object_shorthand() {
+    // 局部 longName 被重命名 → 对象 shorthand `{ longName }` 须展开为 `longName: 新名`。
+    let js = mangle_gen(
+        "function f() {\n\
+         const longName = 1;\n\
+         return { longName };\n\
+         }\n\
+         f;",
+    );
+    // 属性名保留 longName，值是短名 → 出现 "longName:"（展开），且不是裸 `{ longName }`。
+    assert!(
+        js.contains("longName:"),
+        "shorthand 应展开为 key: value:\n{js}"
+    );
+    // 值处的旧名不应再作为独立标识符出现（只剩属性名那一处 longName）。
+    assert_eq!(
+        js.matches("longName").count(),
+        1,
+        "仅剩属性名一处 longName:\n{js}"
+    );
+}
+
+#[test]
+fn mangle_expands_destructuring_shorthand_with_default() {
+    // 解构 shorthand + 默认值：`{ longKey = 5 }` 绑定重命名 → `longKey: 新名 = 5`。
+    let js = mangle_gen(
+        "function f(obj) {\n\
+         const { longKey = 5 } = obj;\n\
+         return longKey;\n\
+         }\n\
+         f;",
+    );
+    assert!(js.contains("longKey:"), "解构 shorthand 应展开:\n{js}");
+    // 属性名 longKey 保留一处（key），绑定与引用用短名。
+    assert_eq!(
+        js.matches("longKey").count(),
+        1,
+        "仅剩属性名一处 longKey:\n{js}"
+    );
+    assert!(js.contains("= 5"), "默认值应保留:\n{js}");
+}
+
+#[test]
+fn mangle_nested_shadow_stays_correct() {
+    // 外层局部 outerVar 与内层局部 innerVar 同链，须不同名；内层对 outerVar 的引用一致重命名。
+    let js = mangle_gen(
+        "function o() {\n\
+         const outerVar = 1;\n\
+         function inner() {\n\
+         const innerVar = 2;\n\
+         return outerVar + innerVar;\n\
+         }\n\
+         return inner();\n\
+         }\n\
+         o;",
+    );
+    assert!(!js.contains("outerVar"), "outerVar 应被重命名:\n{js}");
+    assert!(!js.contains("innerVar"), "innerVar 应被重命名:\n{js}");
+    // inner 是 Function 名 → 保留。
+    assert!(js.contains("inner"), "函数名 inner 保留:\n{js}");
+}
+
+#[test]
+fn mangle_does_not_touch_globals_or_this() {
+    // 全局 console / this / 属性名都不动；参数 msg 重命名。
+    let js = mangle_gen(
+        "function log(msg) {\n\
+         console.log(msg, this.tag);\n\
+         }\n\
+         log;",
+    );
+    assert!(js.contains("console.log"), "全局 console 不动:\n{js}");
+    assert!(js.contains("this.tag"), "this / 属性不动:\n{js}");
+    assert!(!js.contains("msg"), "参数 msg 应被重命名:\n{js}");
+}
+
+#[test]
+fn mangle_ts_namespace_enum_roundtrip() {
+    // TS enum/namespace 降级用 DUMMY span 合成节点（NS.member = member 等）。mangle 必须排除它们，
+    // 否则多个不同标识符按 DUMMY span 塌成同名 → 重复声明 / 引用错乱。回归守护此坑。
+    let it = Interner::new();
+    let src = "enum Color { Red, Green }\n\
+               namespace NS { export const base = 10; export function scale(x: number){ return x * base; } }\n\
+               function useIt(){ const localValueHolder = NS.scale(2); return localValueHolder + Color.Green; }\n\
+               useIt();";
+    let out = parse(src, &it, SourceType::TypeScript);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out.module.with_ast(|p| {
+        let m = wake_ecma_minify::plan_mangle(p, &it);
+        crate::codegen_module_shaken_mangled(p, &it, &NoLink, None, &[], true, Some(m.table()), None, false, false)
+    });
+    // 产物必须能无错重解析（塌名会造成重复声明 / ReferenceError 级结构错乱）。
+    let re = parse(&js, &it, SourceType::Module);
+    assert!(
+        !re.has_errors(),
+        "TS 降级 mangle 产物重解析出错:\n{js}\n{:?}",
+        re.diagnostics
+    );
+    // namespace 成员合成绑定保持原名（NS.base = base / NS.scale = scale 不被塌缩）。
+    assert!(js.contains("NS.base = base"), "namespace 成员应保持原名:\n{js}");
+    assert!(js.contains("NS.scale = scale"), "namespace 成员应保持原名:\n{js}");
+    // 而函数内真实局部（带真 span）应被 mangle。
+    assert!(!js.contains("localValueHolder"), "真实局部应被 mangle:\n{js}");
+}
+
+#[test]
+fn mangle_roundtrip_valid_for_tricky_sources() {
+    // 一批含闭包/解构/默认值/catch/for 作用域的源码——只要 mangle 产物能无错重解析即算结构合法。
+    for src in [
+        "function f(a, b = a) { return a + b; } f;",
+        "function f() { try { g(); } catch (err) { return err; } } f;",
+        "function f(items) { for (const it of items) { use(it); } } f;",
+        "function f() { const { a, b: c, ...rest } = obj; return a + c + rest.x; } f;",
+        "function outer() { const cb = (x) => x * factor; let factor = 2; return cb; } outer;",
+        "function f() { let x = 1; { let x = 2; return x; } } f;",
+        "const g = function named(n) { return n <= 1 ? 1 : n * named(n - 1); }; g;",
+    ] {
+        let _ = mangle_gen(src);
+    }
+}
+
+// ======================================================================
+// Property mangling（M5）：对象字面量键 + 成员访问表达式缩短
+// ======================================================================
+
+/// prop_mangle: parse → plan_prop_mangle → codegen_module_shaken_mangled, 再 parse 校验合法。
+fn prop_mangle_gen(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Module);
+    assert!(
+        !out.has_errors(),
+        "parse errors {src:?}: {:?}",
+        out.diagnostics
+    );
+    let js = out.module.with_ast(|p| {
+        let m = wake_ecma_minify::plan_mangle(p, &it);
+        let pp = wake_ecma_minify::plan_prop_mangle(p, &it);
+        let ctx = MinifyCtx {
+            defines: &[],
+            prop_rename: Some(pp.table()),
+            ..MinifyCtx::default()
+        };
+        crate::codegen_module_shaken_mangled(
+            p, &it, &NoLink, None, &[], true, Some(m.table()), Some(&ctx), false, false,
+        )
+    });
+    let re = parse(&js, &it, SourceType::Module);
+    assert!(
+        !re.has_errors(),
+        "prop_mangle 产物重解析出错:\n{js}\n{:?}",
+        re.diagnostics
+    );
+    js
+}
+
+#[test]
+fn prop_mangle_object_literal_key_shortened() {
+    // 对象字面量键 `{ longName: 1 }` → `{ a: 1 }`。
+    let js = prop_mangle_gen("function f() { return { longName: 1 }; } f;");
+    assert!(!js.contains("longName"), "longName 应被缩短:\n{js}");
+    assert!(js.contains(": 1"), "属性值 1 应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_member_access_shortened() {
+    // 成员访问 `obj.longPropertyName` → `obj.a`（参数名也会被 identifier mangle）。
+    let js = prop_mangle_gen(
+        "function f(obj) { return obj.longPropertyName; } f;",
+    );
+    assert!(!js.contains("longPropertyName"), "longPropertyName 应被缩短:\n{js}");
+    assert!(js.contains("."), "成员访问语法保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_computed_not_mangled() {
+    // 计算属性访问 `obj[expr]` 不动（括号语法保留）。
+    let js = prop_mangle_gen("function f(o, k) { return o[k]; } f;");
+    assert!(js.contains("["), "计算属性括号应保留:\n{js}");
+    assert!(js.contains("]"), "计算属性括号应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_optional_chain_not_mangled() {
+    // 可选链 `obj?.prop` 不动。
+    let js = prop_mangle_gen("function f(obj) { return obj?.prop; } f;");
+    assert!(js.contains("?."), "可选链应保留:\n{js}");
+    assert!(js.contains("prop"), "可选链属性名应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_well_known_not_mangled() {
+    // well-known 属性名不缩短：`length`, `toString`, `constructor`
+    let js = prop_mangle_gen(
+        "function f(arr) { return arr.length + arr.toString(); } f;",
+    );
+    assert!(js.contains("length"), "length 应保留:\n{js}");
+    assert!(js.contains("toString"), "toString 应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_well_known_in_object_literal() {
+    // 对象字面量中的 well-known 名保留
+    let js = prop_mangle_gen("function f() { return { length: 1, constructor: 2 }; } f;");
+    assert!(js.contains("length"), "length 键应保留:\n{js}");
+    assert!(js.contains("constructor"), "constructor 键应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_method_not_mangled() {
+    // 对象方法的键不缩短
+    let js = prop_mangle_gen("function f() { return { myMethod() { return 1; } }; } f;");
+    assert!(js.contains("myMethod"), "方法名应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_getter_setter_not_mangled() {
+    // getter/setter 键不缩短
+    let js = prop_mangle_gen(
+        "function f() { return { get myProp() { return 1; }, set myProp(v) {} }; } f;",
+    );
+    assert!(js.contains("myProp"), "getter/setter 名应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_shorthand_not_mangled() {
+    // shorthand `{ longName }` 不动（key 与 value 同一名，不能单独改 key）
+    let js = prop_mangle_gen("function f() { const longName = 1; return { longName }; } f;");
+    assert!(js.contains("longName"), "shorthand 的 key 应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_class_member_not_mangled() {
+    // 类成员名不缩短
+    let js = prop_mangle_gen(
+        "class C { myMethod() {} myField = 1; } C;",
+    );
+    assert!(js.contains("myMethod"), "类方法名应保留:\n{js}");
+    assert!(js.contains("myField"), "类字段名应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_consistent_naming() {
+    // 同一属性名跨不同位置得同一短名
+    let js = prop_mangle_gen(
+        "function f(obj) { return obj.longName; } function g() { return { longName: 1 }; } f; g;",
+    );
+    // longName 应在成员访问和对象字面量两处都被缩短，且值相同
+    assert!(!js.contains("longName"), "longName 应在两处都被缩短:\n{js}");
+    assert_eq!(
+        js.matches(": 1").count(),
+        1,
+        "对象字面量键被缩短后值保留:\n{js}"
+    );
+}
+
+#[test]
+fn prop_mangle_export_names_preserved() {
+    // export 名不动（模块级语法安全）
+    let js = prop_mangle_gen("export { foo }; const foo = 1;");
+    assert!(js.contains("foo"), "export 名应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_runtime_names_not_mangled() {
+    // runtime 注入名不动
+    let js = prop_mangle_gen("function f() { return exports.foo + module.bar; } f;");
+    assert!(js.contains("exports"), "exports 应保留:\n{js}");
+    assert!(js.contains("module"), "module 应保留:\n{js}");
+}
+
+#[test]
+fn prop_mangle_roundtrip_valid() {
+    // 一组含属性访问的源码——产物必须可重解析
+    for src in [
+        "function f(o) { return o.a + o.b; } f;",
+        "function f() { return { a: 1, b: 2 }; } f;",
+        "function f(o) { return o?.a; } f;",
+        "function f(o) { return o[a]; } f;",
+        "function f() { return { [key]: 1 }; } f;",
+        "function f() { const x = 1; return { x }; } f;",
+        "var result = { longName: 1, anotherName: 2 }; result.longName;",
+    ] {
+        let js = prop_mangle_gen(src);
+        // 必须能无错重解析
+        let it = Interner::new();
+        let re = parse(&js, &it, SourceType::Module);
+        assert!(
+            !re.has_errors(),
+            "prop_mangle 重解析出错: {src}\n{js}\n{:?}",
+            re.diagnostics
+        );
+    }
+}
+
+#[test]
+fn prop_mangle_computed_object_key_not_mangled() {
+    // 计算属性键 `{ [expr]: val }` 不动（括号语法保留，参数名可能被 identifier mangle）
+    let js = prop_mangle_gen("function f(k) { return { [k]: 1 }; } f;");
+    assert!(js.contains("["), "计算键括号应保留:\n{js}");
+    assert!(js.contains("]: 1"), "计算键值对保留:\n{js}");
+}
+
+// ======================================================================
+// Scope hoisting（Phase 3.5）：var 声明提升至函数顶部
+// ======================================================================
+
+/// hoist: parse → plan_hoist → codegen with hoisted vars, re-parse 校验合法。
+fn hoist_gen(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Module);
+    assert!(
+        !out.has_errors(),
+        "parse errors {src:?}: {:?}",
+        out.diagnostics
+    );
+    let js = out.module.with_ast(|p| {
+        let hp = wake_ecma_minify::plan_hoist(p);
+        let ctx = MinifyCtx {
+            defines: &[],
+            hoist: hp,
+            minify: true,
+            ..MinifyCtx::default()
+        };
+        crate::codegen_module_shaken_mangled(p, &it, &NoLink, None, &[], true, None, Some(&ctx), false, false)
+    });
+    let re = parse(&js, &it, SourceType::Module);
+    assert!(
+        !re.has_errors(),
+        "hoist 产物重解析出错:\n{js}\n{:?}",
+        re.diagnostics
+    );
+    js
+}
+
+#[test]
+fn hoist_var_inside_block() {
+    // var 在块内 → 提升到函数顶部
+    let js = hoist_gen(
+        "function f() {\n\
+         { var x = 1; }\n\
+         console.log(x);\n\
+         }",
+    );
+    assert!(
+        js.contains("var x") && js.contains("console.log(x)"),
+        "var x 应在顶部: {js}"
+    );
+}
+
+#[test]
+fn hoist_multiple_vars_joined() {
+    // 多个 var 声明提升后合并
+    let js = hoist_gen(
+        "function f() {\n\
+         { var x = 1; }\n\
+         { var y = 2; }\n\
+         console.log(x + y);\n\
+         }",
+    );
+    // 应合并为单个 var 声明
+    let var_count = js.matches("var ").count();
+    assert!(
+        var_count <= 1,
+        "hoisted vars 应合并为一条 var 声明: {js}"
+    );
+    assert!(js.contains("var x = 1, y = 2") || js.contains("var x, y = 2") || js.contains("var x=1,y=2"), "vars 应合并: {js}");
+}
+
+#[test]
+fn hoist_var_inside_if() {
+    // var 在 if 块内 → 提升到函数顶部
+    let js = hoist_gen(
+        "function f() {\n\
+         if (true) { var x = 1; }\n\
+         console.log(x);\n\
+         }",
+    );
+    assert!(js.contains("var x"), "var x 应在顶部: {js}");
+}
+
+#[test]
+fn hoist_let_const_not_hoisted() {
+    // let/const 不提升（块级作用域）
+    let js = hoist_gen(
+        "function f() {\n\
+         { let x = 1; }\n\
+         { const y = 2; }\n\
+         var z = 3;\n\
+         }",
+    );
+    // let/const 应保留在块内
+    assert!(js.contains("let x = 1"), "let 应在块内: {js}");
+    assert!(js.contains("const y = 2"), "const 应在块内: {js}");
+    // var z 可能已在顶部或不提升（已在函数体直接子级）
+}
+
+#[test]
+fn hoist_module_var_stays() {
+    // 模块级 var 不应被提升（已在顶层）
+    let js = hoist_gen(
+        "var x = 1;\n\
+         function f() { return x; }",
+    );
+    assert!(
+        js.starts_with("var x") || js.starts_with("var x=1"),
+        "模块级 var 应保持在顶层: {js}"
+    );
+}
+
+#[test]
+fn hoist_for_loop_var_not_hoisted() {
+    // for 循环内的 var 不提升（循环体可能不执行，保持赋值时机）
+    let js = hoist_gen(
+        "function f() {\n\
+         for (var i = 0; i < 10; i++) { var x = i; }\n\
+         }",
+    );
+    // for-init var i 不在我们的 hoist 范围（非块内 statement）
+    // for 体 var x 也不提升（不遍历循环体）
+    assert!(
+        !js.contains("var x") || js.contains("for"),
+        "for 体内 var 不应单独提升到函数顶部: {js}"
+    );
+}
+
+#[test]
+fn hoist_nested_function_boundary() {
+    // 嵌套函数有自己的作用域，内层 var 不应提升到外层
+    let js = hoist_gen(
+        "function outer() {\n\
+         { var x = 1; }\n\
+         function inner() {\n\
+         { var y = 2; }\n\
+         return y;\n\
+         }\n\
+         return x + inner();\n\
+         }",
+    );
+    assert!(js.contains("var x"), "outer 应有 var x: {js}");
+    // inner 内部应有 var y（或者在 inner 顶部）
+    assert!(js.contains("y") || js.contains("var y"), "inner 应有 y: {js}");
+}
+

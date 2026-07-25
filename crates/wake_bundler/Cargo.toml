@@ -1,0 +1,31 @@
+[package]
+name = "wake_bundler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "编排器：Scan/Link/Emit 三阶段，函数包装打包。DESIGN §6"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_parser.workspace = true
+wake_ecma_codegen.workspace = true
+wake_ecma_minify.workspace = true
+wake_resolver.workspace = true
+wake_turbo.workspace = true
+wake_css.workspace = true
+wake_graph.workspace = true
+wake_cache.workspace = true
+xxhash-rust.workspace = true
+# P4+ 再接入：wake_ecma_transform（TS/JSX）。
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "bundle"
+harness = false

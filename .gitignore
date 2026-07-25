@@ -1,0 +1,30 @@
+/target
+**/*.rs.bk
+*.pdb
+node_modules
+.yarn
+# criterion / bench 输出
+/target/criterion
+
+# cargo-fuzz
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+
+# 本地缓存 / 产物
+/.wake
+*.log
+
+# fixture 打包产物（由 wake build / webpack 生成）
+fixtures/*/dist/
+fixtures/*/dist-*/
+/dist/
+
+# 合成模块 fixture 生成源文件（由 generate.mjs 生成，不入库）
+fixtures/*/input/src/
+
+# 编辑器
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store

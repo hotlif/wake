@@ -1,0 +1,19 @@
+[package]
+name = "wake_ecma_codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "代码生成（AST→字符串）+ SourceMap（含恒等旁路）。DESIGN §4.6"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_minify.workspace = true
+
+[dev-dependencies]
+wake_ecma_parser.workspace = true
+insta.workspace = true

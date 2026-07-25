@@ -1,0 +1,25 @@
+# cargo-fuzz 目标（PLAN §1.5）。**独立 workspace**（末尾空 [workspace]），不参与主工作区构建，
+# 避免把 nightly-only 的 libfuzzer 带进稳定构建。
+#
+# 运行：`cargo install cargo-fuzz` 后 `cargo +nightly fuzz run lex`（Gate-1a：跑 1h 不 panic/OOM）。
+[package]
+name = "wake-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wake_ecma_lexer = { path = "../crates/wake_ecma_lexer" }
+
+[[bin]]
+name = "lex"
+path = "fuzz_targets/lex.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

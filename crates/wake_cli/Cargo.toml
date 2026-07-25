@@ -1,0 +1,29 @@
+[package]
+name = "wake_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wake 命令行入口（bin: wake）。DESIGN §3.1"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wake"
+path = "src/main.rs"
+
+[dependencies]
+wake_common.workspace = true
+wake_config.workspace = true
+wake_scan.workspace = true
+wake_html.workspace = true
+wake_ecma_lexer.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_parser.workspace = true
+wake_bundler.workspace = true
+wake_dev_server.workspace = true
+clap.workspace = true
+notify.workspace = true
+# NOTE: cli → wake_bundler / wake_dev_server 的边在 P3 / P5 实际接入时再加，
+# 避免过早引入未使用依赖。依赖方向见 docs/ARCHITECTURE-DEPS.md。

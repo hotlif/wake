@@ -1,0 +1,14 @@
+---
+source: crates/wake_ecma_codegen/src/tests.rs
+expression: "run(\"export function add(a,b){return a+b}\\nconst x=(1+2)*3;\\nclass C extends D{#p=0;m(){return this.#p??0}}\")"
+---
+export function add(a, b) {
+  return a + b;
+}
+const x = (1 + 2) * 3;
+class C extends D {
+  #p = 0;
+  m() {
+    return this.#p ?? 0;
+  }
+}

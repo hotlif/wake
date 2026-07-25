@@ -1,0 +1,37 @@
+[package]
+name = "wake_turbo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "函数级增量计算引擎：红绿失效 + 工作窃取执行器。DESIGN §10"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_turbo_macros.workspace = true
+rustc-hash.workspace = true
+xxhash-rust.workspace = true
+
+# 工作窃取执行器（crossbeam-deque）：仅非 loom 构建需要。loom 验证独立 single-flight 模型，
+# 不碰执行器；排除 crossbeam 也避开其构建脚本触发 Windows Defender 误报（os error 225）。
+[target.'cfg(not(loom))'.dependencies]
+crossbeam-deque.workspace = true
+
+# loom 并发模型检查：仅在 `--cfg loom` 下编译，验证 single-flight 协议（tests/loom_single_flight.rs）。
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
+# criterion（默认 features 经 rayon 拉入 crossbeam）也排除于 loom 构建，避免重新引入 crossbeam。
+[target.'cfg(not(loom))'.dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[example]]
+name = "spike_red_green"
+path = "examples/spike_red_green.rs"

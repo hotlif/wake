@@ -1,0 +1,12 @@
+[package]
+name = "wake_html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "构建期 HTML 生成：模板 + chunk <script>/<link> 注入（静态外壳，替代 SSR；CRUSTIFY-PARITY §M2/决策②）。"
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+---
+source: crates/wake_ecma_lexer/tests/tokens_snapshot.rs
+expression: "dump(\"a\\nb\\nreturn\\n42\")"
+---
+identifier         "a"
+identifier         "b" ⏎
+return             "return" ⏎
+number             "42" ⏎

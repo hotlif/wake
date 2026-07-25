@@ -1,0 +1,1479 @@
+//! 语句 / 声明 / 函数 / 类 / 模式 / 模块（import·export）解析 + ASI + 依赖提取。DESIGN §4.4
+
+use wake_common::Span;
+use wake_ecma_ast::*;
+use wake_ecma_lexer::{Keyword, TokenKind};
+
+use crate::Parser;
+
+impl<'a, 'src> Parser<'a, 'src> {
+    // ==================================================================
+    // 语句分派
+    // ==================================================================
+
+    pub(crate) fn parse_statement(&mut self) -> Statement<'a> {
+        let lo = self.start();
+        let kind = self.cur.kind;
+        match kind {
+            TokenKind::LBrace => Statement::Block(self.parse_block()),
+            TokenKind::Semicolon => {
+                let s = self.cur.span;
+                self.bump();
+                Statement::Empty(s)
+            }
+            TokenKind::Keyword(Keyword::Var) => {
+                let d = self.parse_var_declaration(VarKind::Var, true);
+                Statement::VariableDeclaration(d)
+            }
+            TokenKind::Keyword(Keyword::Const) => {
+                // TS：`const enum E {..}` → 值转换（IIFE）。
+                if self.ts && self.peek().kind == TokenKind::Keyword(Keyword::Enum) {
+                    self.bump(); // const
+                    return self.parse_enum(lo);
+                }
+                let d = self.parse_var_declaration(VarKind::Const, true);
+                Statement::VariableDeclaration(d)
+            }
+            TokenKind::Keyword(Keyword::Let) if self.let_is_declaration() => {
+                let d = self.parse_var_declaration(VarKind::Let, true);
+                Statement::VariableDeclaration(d)
+            }
+            TokenKind::Keyword(Keyword::Function) => {
+                Statement::FunctionDeclaration(self.parse_function(lo, false))
+            }
+            TokenKind::Keyword(Keyword::Async)
+                if self.peek().kind == TokenKind::Keyword(Keyword::Function)
+                    && !self.peek().newline_before =>
+            {
+                self.bump(); // async
+                Statement::FunctionDeclaration(self.parse_function(lo, true))
+            }
+            TokenKind::Keyword(Keyword::Class) => Statement::ClassDeclaration(self.parse_class(lo)),
+            TokenKind::Keyword(Keyword::If) => self.parse_if(lo),
+            TokenKind::Keyword(Keyword::For) => self.parse_for(lo),
+            TokenKind::Keyword(Keyword::While) => self.parse_while(lo),
+            TokenKind::Keyword(Keyword::Do) => self.parse_do_while(lo),
+            TokenKind::Keyword(Keyword::Switch) => self.parse_switch(lo),
+            TokenKind::Keyword(Keyword::Return) => self.parse_return(lo),
+            TokenKind::Keyword(Keyword::Break) => self.parse_break_continue(lo, true),
+            TokenKind::Keyword(Keyword::Continue) => self.parse_break_continue(lo, false),
+            TokenKind::Keyword(Keyword::Throw) => self.parse_throw(lo),
+            TokenKind::Keyword(Keyword::Try) => self.parse_try(lo),
+            TokenKind::Keyword(Keyword::With) => self.parse_with(lo),
+            TokenKind::Keyword(Keyword::Debugger) => {
+                self.bump();
+                self.semicolon();
+                Statement::Debugger(self.span_to(lo))
+            }
+            TokenKind::Keyword(Keyword::Import) if !self.import_is_expression() => {
+                self.parse_import_declaration(lo)
+            }
+            TokenKind::Keyword(Keyword::Export) => self.parse_export(lo),
+            // TS：装饰器 `@dec class C {}` / `@dec export class ..`。装饰器被消费（当前不应用其
+            // 运行时语义，见 ts.rs `skip_decorators` 说明）；随后解析被装饰的声明。
+            TokenKind::At if self.ts => {
+                self.skip_decorators();
+                self.parse_statement()
+            }
+            // TS：`interface X { .. }` 整体擦除。
+            TokenKind::Keyword(Keyword::Interface) if self.ts => self.skip_interface(lo),
+            // TS：`enum E { .. }` → 值转换（IIFE）。
+            TokenKind::Keyword(Keyword::Enum) if self.ts => self.parse_enum(lo),
+            _ => {
+                if self.ts {
+                    // `type X = ..;` 类型别名擦除（`type` 后接绑定名，区别于 `type` 作变量）。
+                    if self.at_contextual("type") && self.peek_is_binding_name() {
+                        return self.skip_type_alias(lo);
+                    }
+                    // `declare ...` 环境声明 → 整体擦除。
+                    if self.at_contextual("declare") && self.ts_declare_is_declaration() {
+                        return self.parse_declare(lo);
+                    }
+                    // `abstract class ..` → 消费 abstract 后按 class 解析。
+                    if self.at_contextual("abstract")
+                        && self.peek().kind == TokenKind::Keyword(Keyword::Class)
+                    {
+                        self.bump(); // abstract
+                        return Statement::ClassDeclaration(self.parse_class(self.start()));
+                    }
+                    // `namespace N { .. }` / `module N { .. }` → 值转换（IIFE）。
+                    if (self.at_contextual("namespace") || self.at_contextual("module"))
+                        && self.ts_namespace_is_declaration()
+                    {
+                        return self.parse_namespace(lo);
+                    }
+                }
+                // 标签语句：ident `:`。
+                if self.at_ident_name() && self.peek().kind == TokenKind::Colon {
+                    let label = self.parse_ident_name();
+                    self.bump(); // :
+                    let body = self.parse_statement();
+                    return Statement::Labeled(self.alloc(LabeledStatement {
+                        span: self.span_to(lo),
+                        label,
+                        body,
+                    }));
+                }
+                self.parse_expression_statement(lo)
+            }
+        }
+    }
+
+    /// `let` 是否作为声明起始（后跟 `[`/`{`/标识符名）。
+    fn let_is_declaration(&mut self) -> bool {
+        matches!(
+            self.peek().kind,
+            TokenKind::LBracket | TokenKind::LBrace | TokenKind::Ident
+        ) || matches!(self.peek().kind, TokenKind::Keyword(kw) if !kw.is_reserved())
+    }
+
+    /// `import` 是否是表达式（`import(...)` / `import.meta`）而非声明。
+    fn import_is_expression(&mut self) -> bool {
+        matches!(self.peek().kind, TokenKind::LParen | TokenKind::Dot)
+    }
+
+    fn parse_expression_statement(&mut self, lo: u32) -> Statement<'a> {
+        let expression = self.parse_expression();
+        self.semicolon();
+        Statement::Expression(self.alloc(ExpressionStatement {
+            span: self.span_to(lo),
+            expression,
+        }))
+    }
+
+    /// `require("x")` 依赖提取——在每处 CallExpression 构建后调用（覆盖任意位置）。
+    pub(crate) fn maybe_record_require(&mut self, call: &CallExpression<'a>) {
+        if let Expression::Identifier(id) = &call.callee
+            && id.name == self.require_atom
+            && call.arguments.len() == 1
+            && let Expression::StringLiteral(s) = &call.arguments[0]
+        {
+            self.record_dependency(Dependency {
+                specifier: s.value,
+                kind: DependencyKind::Require,
+                span: call.span,
+            });
+        }
+    }
+
+    // ==================================================================
+    // 块 / 变量声明
+    // ==================================================================
+
+    pub(crate) fn parse_block(&mut self) -> &'a BlockStatement<'a> {
+        let lo = self.start();
+        self.expect(TokenKind::LBrace);
+        let mut body = self.new_vec::<Statement>();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let before = self.cur.span.lo;
+            body.push(self.parse_statement());
+            if self.cur.span.lo == before && !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof)
+            {
+                self.bump();
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        self.alloc(BlockStatement {
+            span: self.span_to(lo),
+            body,
+        })
+    }
+
+    fn parse_var_declaration(
+        &mut self,
+        kind: VarKind,
+        need_semi: bool,
+    ) -> &'a VariableDeclaration<'a> {
+        let lo = self.start();
+        self.bump(); // var/let/const
+        let mut declarations = self.new_vec::<VariableDeclarator>();
+        loop {
+            let dlo = self.start();
+            let id = self.parse_binding_pattern();
+            if self.ts {
+                self.eat(TokenKind::Bang); // 明确赋值断言 `let x!: T`
+                self.ts_type_annotation(); // `: T`
+            }
+            let init = if self.eat(TokenKind::Eq) {
+                Some(self.parse_assignment_expression())
+            } else {
+                None
+            };
+            declarations.push(VariableDeclarator {
+                span: self.span_to(dlo),
+                id,
+                init,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        if need_semi {
+            self.semicolon();
+        }
+        self.alloc(VariableDeclaration {
+            span: self.span_to(lo),
+            kind,
+            declarations,
+        })
+    }
+
+    // ==================================================================
+    // TypeScript 声明擦除（DESIGN §4.1）——仅 ts 模式。类型语法的结构化消费在 `ts.rs`。
+    // 本节：interface / type 别名 / declare 的整体擦除（值语义的 enum/namespace 见 `parse_enum`/`parse_namespace`）。
+    // ==================================================================
+
+    /// `interface X<..> extends A, B { .. }` → 整体擦除为空语句（语法结构化消费）。
+    fn skip_interface(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // interface
+        if self.at_ident_name() {
+            self.bump(); // 名字
+        }
+        self.ts_type_parameters(); // <T ..>
+        if self.eat_keyword(Keyword::Extends) {
+            loop {
+                self.ts_type();
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        if self.at(TokenKind::LBrace) {
+            self.ts_skip_balanced(); // 成员体（对象类型，自平衡）
+        }
+        Statement::Empty(self.span_to(lo))
+    }
+
+    /// `type X<..> = Type;` → 整体擦除为空语句（RHS 用完整类型文法消费）。
+    fn skip_type_alias(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // type
+        if self.at_ident_name() {
+            self.bump(); // 别名名
+        }
+        self.ts_type_parameters();
+        if self.eat(TokenKind::Eq) {
+            self.ts_type();
+        }
+        self.semicolon();
+        Statement::Empty(self.span_to(lo))
+    }
+
+    /// 当前是否为上下文关键字 `name`（Ident 且文本相符）。
+    pub(crate) fn at_contextual(&self, name: &str) -> bool {
+        self.cur.kind == TokenKind::Ident && self.slice(self.cur.span) == name
+    }
+
+    /// 前瞻是否为可作绑定名的标识符（Ident 或非保留关键字）。
+    fn peek_is_binding_name(&mut self) -> bool {
+        matches!(self.peek().kind, TokenKind::Ident)
+            || matches!(self.peek().kind, TokenKind::Keyword(kw) if !kw.is_reserved())
+    }
+
+    // ==================================================================
+    // 控制流
+    // ==================================================================
+
+    fn parse_if(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // if
+        self.expect(TokenKind::LParen);
+        let test = self.with_allow_in(true, |p| p.parse_expression());
+        self.expect(TokenKind::RParen);
+        let consequent = self.parse_statement();
+        let alternate = if self.eat_keyword(Keyword::Else) {
+            Some(self.parse_statement())
+        } else {
+            None
+        };
+        Statement::If(self.alloc(IfStatement {
+            span: self.span_to(lo),
+            test,
+            consequent,
+            alternate,
+        }))
+    }
+
+    fn parse_while(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // while
+        self.expect(TokenKind::LParen);
+        let test = self.with_allow_in(true, |p| p.parse_expression());
+        self.expect(TokenKind::RParen);
+        let body = self.parse_statement();
+        Statement::While(self.alloc(WhileStatement {
+            span: self.span_to(lo),
+            test,
+            body,
+        }))
+    }
+
+    fn parse_do_while(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // do
+        let body = self.parse_statement();
+        self.expect(TokenKind::Keyword(Keyword::While));
+        self.expect(TokenKind::LParen);
+        let test = self.with_allow_in(true, |p| p.parse_expression());
+        self.expect(TokenKind::RParen);
+        self.eat(TokenKind::Semicolon);
+        Statement::DoWhile(self.alloc(DoWhileStatement {
+            span: self.span_to(lo),
+            body,
+            test,
+        }))
+    }
+
+    fn parse_for(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // for
+        let is_await = self.eat_keyword(Keyword::Await);
+        self.expect(TokenKind::LParen);
+
+        // 初始化：可能是变量声明或表达式，或空。
+        let init: Option<ForInit<'a>> = if self.at(TokenKind::Semicolon) {
+            None
+        } else if let Some(kind) = self.var_kind_here() {
+            // for-init 内禁 `in` 运算符。
+            let decl = self.with_allow_in(false, |p| p.parse_var_declaration_no_semi(kind));
+            Some(ForInit::Variable(decl))
+        } else {
+            let expr = self.with_allow_in(false, |p| p.parse_expression());
+            Some(ForInit::Expression(expr))
+        };
+
+        // for-in / for-of。
+        if self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of) {
+            let is_of = self.at_keyword(Keyword::Of);
+            self.bump();
+            let left = match init {
+                Some(ForInit::Variable(d)) => ForLeft::Variable(d),
+                Some(ForInit::Expression(e)) => ForLeft::Target(e),
+                None => {
+                    self.error(self.cur.span, "for-in/of 缺少左侧");
+                    ForLeft::Target(Expression::NullLiteral(self.cur.span))
+                }
+            };
+            let right = if is_of {
+                self.with_allow_in(true, |p| p.parse_assignment_expression())
+            } else {
+                self.with_allow_in(true, |p| p.parse_expression())
+            };
+            self.expect(TokenKind::RParen);
+            let body = self.parse_statement();
+            return if is_of {
+                Statement::ForOf(self.alloc(ForOfStatement {
+                    span: self.span_to(lo),
+                    left,
+                    right,
+                    body,
+                    is_await,
+                }))
+            } else {
+                Statement::ForIn(self.alloc(ForInStatement {
+                    span: self.span_to(lo),
+                    left,
+                    right,
+                    body,
+                }))
+            };
+        }
+
+        // 传统 for(init; test; update)。
+        self.expect(TokenKind::Semicolon);
+        let test = if self.at(TokenKind::Semicolon) {
+            None
+        } else {
+            Some(self.with_allow_in(true, |p| p.parse_expression()))
+        };
+        self.expect(TokenKind::Semicolon);
+        let update = if self.at(TokenKind::RParen) {
+            None
+        } else {
+            Some(self.with_allow_in(true, |p| p.parse_expression()))
+        };
+        self.expect(TokenKind::RParen);
+        let body = self.parse_statement();
+        Statement::For(self.alloc(ForStatement {
+            span: self.span_to(lo),
+            init,
+            test,
+            update,
+            body,
+        }))
+    }
+
+    fn var_kind_here(&self) -> Option<VarKind> {
+        match self.cur.kind {
+            TokenKind::Keyword(Keyword::Var) => Some(VarKind::Var),
+            TokenKind::Keyword(Keyword::Const) => Some(VarKind::Const),
+            TokenKind::Keyword(Keyword::Let) => Some(VarKind::Let),
+            _ => None,
+        }
+    }
+
+    fn parse_var_declaration_no_semi(&mut self, kind: VarKind) -> &'a VariableDeclaration<'a> {
+        self.parse_var_declaration(kind, false)
+    }
+
+    fn parse_switch(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // switch
+        self.expect(TokenKind::LParen);
+        let discriminant = self.with_allow_in(true, |p| p.parse_expression());
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+        let mut cases = self.new_vec::<SwitchCase>();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let clo = self.start();
+            let test = if self.eat_keyword(Keyword::Case) {
+                let t = self.with_allow_in(true, |p| p.parse_expression());
+                Some(t)
+            } else {
+                self.expect(TokenKind::Keyword(Keyword::Default));
+                None
+            };
+            self.expect(TokenKind::Colon);
+            let mut consequent = self.new_vec::<Statement>();
+            while !self.at(TokenKind::RBrace)
+                && !self.at_keyword(Keyword::Case)
+                && !self.at_keyword(Keyword::Default)
+                && !self.at(TokenKind::Eof)
+            {
+                consequent.push(self.parse_statement());
+            }
+            cases.push(SwitchCase {
+                span: self.span_to(clo),
+                test,
+                consequent,
+            });
+        }
+        self.expect(TokenKind::RBrace);
+        Statement::Switch(self.alloc(SwitchStatement {
+            span: self.span_to(lo),
+            discriminant,
+            cases,
+        }))
+    }
+
+    fn parse_return(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // return
+        let argument = if self.newline_before() || self.at_statement_end() {
+            None
+        } else {
+            Some(self.with_allow_in(true, |p| p.parse_expression()))
+        };
+        self.semicolon();
+        Statement::Return(self.alloc(ReturnStatement {
+            span: self.span_to(lo),
+            argument,
+        }))
+    }
+
+    fn parse_break_continue(&mut self, lo: u32, is_break: bool) -> Statement<'a> {
+        self.bump(); // break/continue
+        let label = if !self.newline_before() && self.at_ident_name() {
+            Some(self.parse_ident_name())
+        } else {
+            None
+        };
+        self.semicolon();
+        let span = self.span_to(lo);
+        if is_break {
+            Statement::Break(self.alloc(BreakStatement { span, label }))
+        } else {
+            Statement::Continue(self.alloc(ContinueStatement { span, label }))
+        }
+    }
+
+    fn parse_throw(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // throw
+        if self.newline_before() {
+            self.error(self.cur.span, "`throw` 后不能换行");
+        }
+        let argument = self.with_allow_in(true, |p| p.parse_expression());
+        self.semicolon();
+        Statement::Throw(self.alloc(ThrowStatement {
+            span: self.span_to(lo),
+            argument,
+        }))
+    }
+
+    fn parse_try(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // try
+        let block = self.parse_block();
+        let handler = if self.eat_keyword(Keyword::Catch) {
+            let clo = self.span_to(lo).lo;
+            let param = if self.eat(TokenKind::LParen) {
+                let p = self.parse_binding_pattern();
+                self.expect(TokenKind::RParen);
+                Some(p)
+            } else {
+                None
+            };
+            let body = self.parse_block();
+            Some(self.alloc(CatchClause {
+                span: self.span_to(clo),
+                param,
+                body,
+            }))
+        } else {
+            None
+        };
+        let finalizer = if self.eat_keyword(Keyword::Finally) {
+            Some(self.parse_block())
+        } else {
+            None
+        };
+        if handler.is_none() && finalizer.is_none() {
+            self.error(self.span_to(lo), "`try` 需要 catch 或 finally");
+        }
+        Statement::Try(self.alloc(TryStatement {
+            span: self.span_to(lo),
+            block,
+            handler,
+            finalizer,
+        }))
+    }
+
+    fn parse_with(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // with
+        self.expect(TokenKind::LParen);
+        let object = self.with_allow_in(true, |p| p.parse_expression());
+        self.expect(TokenKind::RParen);
+        let body = self.parse_statement();
+        Statement::With(self.alloc(WithStatement {
+            span: self.span_to(lo),
+            object,
+            body,
+        }))
+    }
+
+    // ==================================================================
+    // 函数 / 类
+    // ==================================================================
+
+    pub(crate) fn parse_function_expression(&mut self, lo: u32, is_async: bool) -> Expression<'a> {
+        Expression::Function(self.parse_function(lo, is_async))
+    }
+
+    /// `function` 声明/表达式共用（`function` 关键字尚未消费；async 已由调用方消费）。
+    pub(crate) fn parse_function(&mut self, lo: u32, is_async: bool) -> &'a Function<'a> {
+        self.expect(TokenKind::Keyword(Keyword::Function));
+        let is_generator = self.eat(TokenKind::Star);
+        let id = if self.at_ident_name() {
+            Some(self.parse_binding_ident())
+        } else {
+            None
+        };
+        self.ts_type_parameters(); // `function foo<T>(...)`
+
+        let saved = (self.ctx.in_async, self.ctx.in_generator);
+        self.ctx.in_async = is_async;
+        self.ctx.in_generator = is_generator;
+        let params = self.parse_params();
+        self.ts_type_annotation(); // 返回类型 `): T {`（类型文法遇 `{` 自然停）
+        let body = self.parse_function_body();
+        self.ctx.in_async = saved.0;
+        self.ctx.in_generator = saved.1;
+
+        self.alloc(Function {
+            span: self.span_to(lo),
+            id,
+            params,
+            body: Some(body),
+            is_async,
+            is_generator,
+        })
+    }
+
+    pub(crate) fn parse_method_function(
+        &mut self,
+        lo: u32,
+        is_async: bool,
+        is_generator: bool,
+    ) -> &'a Function<'a> {
+        self.ts_type_parameters(); // 方法泛型 `m<T>()`
+        let saved = (self.ctx.in_async, self.ctx.in_generator);
+        self.ctx.in_async = is_async;
+        self.ctx.in_generator = is_generator;
+        let (params, param_props) = self.parse_params_collecting();
+        self.ts_type_annotation(); // 方法返回类型（含类型谓词）
+        // 无函数体 → 重载签名 / abstract / declare 方法：body 置 None，供 class 层擦除。
+        let body = if self.at(TokenKind::LBrace) {
+            let b = self.parse_function_body();
+            // TS 参数属性：在 `super(...)` 之后（或体首）注入 `this.x = x`（仅构造函数会有 props）。
+            if param_props.is_empty() {
+                Some(b)
+            } else {
+                Some(self.inject_param_props(b, &param_props))
+            }
+        } else {
+            self.semicolon();
+            None
+        };
+        self.ctx.in_async = saved.0;
+        self.ctx.in_generator = saved.1;
+        self.alloc(Function {
+            span: self.span_to(lo),
+            id: None,
+            params,
+            body,
+            is_async,
+            is_generator,
+        })
+    }
+
+    /// 在函数体的 `super(...)` 之后（无则体首）注入参数属性赋值 `this.name = name`。
+    fn inject_param_props(
+        &self,
+        body: &'a FunctionBody<'a>,
+        props: &[wake_common::Atom],
+    ) -> &'a FunctionBody<'a> {
+        // 找到 super 调用语句的位置（其后插入）。
+        let insert_at = body
+            .statements
+            .iter()
+            .position(|s| is_super_call_stmt(s))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut stmts = self.new_vec::<Statement>();
+        for (i, s) in body.statements.iter().enumerate() {
+            if i == insert_at {
+                for &name in props {
+                    stmts.push(self.this_assign_stmt(name));
+                }
+            }
+            stmts.push(*s);
+        }
+        // super 在末尾或空体：补在最后。
+        if insert_at >= body.statements.len() {
+            for &name in props {
+                stmts.push(self.this_assign_stmt(name));
+            }
+        }
+        self.alloc(FunctionBody {
+            span: body.span,
+            statements: stmts,
+            strict: body.strict,
+        })
+    }
+
+    /// 构造 `this.name = name;` 语句。
+    fn this_assign_stmt(&self, name: wake_common::Atom) -> Statement<'a> {
+        let member = Expression::Member(self.alloc(MemberExpression {
+            span: Span::DUMMY,
+            object: Expression::This(Span::DUMMY),
+            property: MemberProperty::Ident(Ident::new(Span::DUMMY, name)),
+            optional: false,
+        }));
+        let rhs = Expression::Identifier(self.alloc(Ident::new(Span::DUMMY, name)));
+        let assign = Expression::Assignment(self.alloc(AssignmentExpression {
+            span: Span::DUMMY,
+            operator: AssignmentOperator::Assign,
+            left: member,
+            right: rhs,
+        }));
+        Statement::Expression(self.alloc(ExpressionStatement {
+            span: Span::DUMMY,
+            expression: assign,
+        }))
+    }
+
+    fn parse_params(&mut self) -> AVec<'a, Pattern<'a>> {
+        let (params, _props) = self.parse_params_collecting();
+        params
+    }
+
+    /// 解析形参，并返回「参数属性」名字（带修饰符的简单标识符参数）——供构造函数注入 `this.x = x`。
+    fn parse_params_collecting(&mut self) -> (AVec<'a, Pattern<'a>>, Vec<wake_common::Atom>) {
+        self.expect(TokenKind::LParen);
+        let mut params = self.new_vec::<Pattern>();
+        let mut param_props: Vec<wake_common::Atom> = Vec::new();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            // 参数装饰器 `@dec` —— 消费（暂不应用到参数）。
+            if self.ts {
+                self.skip_decorators();
+            }
+            // TS：`this` 参数（`function f(this: T, ..)`）—— 纯类型，擦除。
+            if self.ts && self.at_keyword(Keyword::This) && self.peek().kind == TokenKind::Colon {
+                self.bump(); // this
+                self.ts_type_annotation(); // : T
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+                continue;
+            }
+            // TS：参数属性/修饰符（public/private/protected/readonly/override）。
+            let is_param_prop = self.ts && self.ts_skip_param_modifiers();
+            if self.at(TokenKind::DotDotDot) {
+                let rlo = self.start();
+                self.bump();
+                let argument = self.parse_binding_pattern();
+                if self.ts {
+                    self.ts_type_annotation(); // `...args: T[]`
+                }
+                params.push(Pattern::Rest(self.alloc(RestElement {
+                    span: self.span_to(rlo),
+                    argument,
+                })));
+                break;
+            }
+            let param = self.parse_binding_element();
+            if is_param_prop && let Some(name) = param_prop_name(&param) {
+                param_props.push(name);
+            }
+            params.push(param);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen);
+        (params, param_props)
+    }
+
+    /// `declare ...` 环境声明 → 整体擦除为空语句。
+    fn parse_declare(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // declare
+        self.ts_skip_ambient();
+        Statement::Empty(self.span_to(lo))
+    }
+
+    pub(crate) fn parse_function_body(&mut self) -> &'a FunctionBody<'a> {
+        let lo = self.start();
+        self.expect(TokenKind::LBrace);
+        let mut statements = self.new_vec::<Statement>();
+        let strict = self.parse_directive_prologue(&mut statements);
+        let saved_strict = self.ctx.strict;
+        if strict {
+            self.ctx.strict = true;
+        }
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let before = self.cur.span.lo;
+            statements.push(self.parse_statement());
+            if self.cur.span.lo == before && !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof)
+            {
+                self.bump();
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        self.ctx.strict = saved_strict;
+        self.alloc(FunctionBody {
+            span: self.span_to(lo),
+            statements,
+            strict,
+        })
+    }
+
+    pub(crate) fn parse_class(&mut self, lo: u32) -> &'a Class<'a> {
+        self.expect(TokenKind::Keyword(Keyword::Class));
+        let id = if self.at_ident_name() && !self.at_keyword(Keyword::Extends) {
+            Some(self.parse_binding_ident())
+        } else {
+            None
+        };
+        self.ts_type_parameters(); // class C<T>
+        let super_class = if self.eat_keyword(Keyword::Extends) {
+            let sc = self.parse_lhs_expression();
+            // TS：`extends Base<T>` 的超类类型实参擦除。
+            if self.ts && self.at(TokenKind::Lt) {
+                self.ts_type_arguments();
+            }
+            Some(sc)
+        } else {
+            None
+        };
+        // TS：`implements I, J<K>` 擦除。
+        if self.ts && self.at_keyword(Keyword::Implements) {
+            self.bump();
+            loop {
+                self.ts_type();
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::LBrace);
+        let saved_strict = self.ctx.strict;
+        self.ctx.strict = true; // 类体恒严格。
+        let mut body = self.new_vec::<ClassMember>();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            if self.eat(TokenKind::Semicolon) {
+                continue;
+            }
+            let before = self.cur.span.lo;
+            if let Some(member) = self.parse_class_member() {
+                body.push(member);
+            }
+            if self.cur.span.lo == before && !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof)
+            {
+                self.bump();
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        self.ctx.strict = saved_strict;
+        self.alloc(Class {
+            span: self.span_to(lo),
+            id,
+            super_class,
+            body,
+        })
+    }
+
+    fn parse_class_member(&mut self) -> Option<ClassMember<'a>> {
+        let lo = self.start();
+
+        // TS：成员装饰器 `@dec method() {}` / `@dec prop = 1` —— 消费（当前不应用运行时语义）。
+        if self.ts && self.at(TokenKind::At) {
+            self.skip_decorators();
+        }
+
+        // —— 成员修饰符（含 TS：public/private/protected/readonly/abstract/override/declare/accessor）——
+        // 某词仅在其后不是「成员终止符」时才算修饰符，否则它本身是成员名（如 `private() {}`）。
+        let mut is_static = false;
+        let mut erase_member = false; // abstract / declare 成员 → 擦除
+        loop {
+            if self.at_keyword(Keyword::Static) && !self.peek_is_member_terminator() {
+                self.bump();
+                is_static = true;
+                continue;
+            }
+            if matches!(
+                self.cur.kind,
+                TokenKind::Keyword(Keyword::Public)
+                    | TokenKind::Keyword(Keyword::Private)
+                    | TokenKind::Keyword(Keyword::Protected)
+            ) && !self.peek_is_member_terminator()
+            {
+                self.bump();
+                continue;
+            }
+            if self.ts
+                && (self.at_contextual("readonly")
+                    || self.at_contextual("override")
+                    || self.at_contextual("accessor"))
+                && !self.peek_is_member_terminator()
+            {
+                self.bump();
+                continue;
+            }
+            if self.ts
+                && (self.at_contextual("abstract") || self.at_contextual("declare"))
+                && !self.peek_is_member_terminator()
+            {
+                self.bump();
+                erase_member = true;
+                continue;
+            }
+            break;
+        }
+
+        // static 块。
+        if is_static && self.at(TokenKind::LBrace) {
+            self.bump(); // {
+            let mut body = self.new_vec::<Statement>();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                let before = self.cur.span.lo;
+                body.push(self.parse_statement());
+                if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
+                    self.bump();
+                }
+            }
+            self.expect(TokenKind::RBrace);
+            return Some(ClassMember::StaticBlock(self.alloc(StaticBlock {
+                span: self.span_to(lo),
+                body,
+            })));
+        }
+
+        // TS 索引签名 `[k: T]: U;` → 擦除。
+        if self.ts && self.at(TokenKind::LBracket) && self.is_index_signature() {
+            self.ts_skip_balanced(); // [ ... ]
+            self.ts_type_annotation(); // : U
+            self.semicolon();
+            return None;
+        }
+
+        let mut kind = MethodKind::Method;
+        let mut is_async = false;
+        let mut is_generator = false;
+
+        if self.at_keyword(Keyword::Get) && !self.peek_is_member_terminator() {
+            self.bump();
+            kind = MethodKind::Get;
+        } else if self.at_keyword(Keyword::Set) && !self.peek_is_member_terminator() {
+            self.bump();
+            kind = MethodKind::Set;
+        } else {
+            if self.at_keyword(Keyword::Async)
+                && !self.peek_is_member_terminator()
+                && !self.peek().newline_before
+            {
+                self.bump();
+                is_async = true;
+            }
+            if self.at(TokenKind::Star) {
+                self.bump();
+                is_generator = true;
+            }
+        }
+
+        let (key, computed) = self.parse_property_key();
+
+        // TS：成员名后的可选 `?` / 明确赋值 `!`。
+        if self.ts {
+            self.eat(TokenKind::Question);
+            self.eat(TokenKind::Bang);
+        }
+
+        // 方法（含泛型方法 `m<T>()`）。
+        if self.at(TokenKind::LParen)
+            || (self.ts && self.at(TokenKind::Lt))
+            || matches!(kind, MethodKind::Get | MethodKind::Set)
+            || is_async
+            || is_generator
+        {
+            let is_ctor = !is_static
+                && !computed
+                && matches!(kind, MethodKind::Method)
+                && self.key_is_named(&key, "constructor");
+            let mkind = if is_ctor {
+                MethodKind::Constructor
+            } else {
+                kind
+            };
+            let value = self.parse_method_function(lo, is_async, is_generator);
+            // 无函数体（重载签名 / abstract / declare 方法）→ 擦除。
+            value.body?;
+            return Some(ClassMember::Method(self.alloc(MethodDefinition {
+                span: self.span_to(lo),
+                key,
+                value,
+                kind: mkind,
+                is_static,
+                computed,
+            })));
+        }
+
+        // 字段（class property）：TS 类型注解已随 `?`/`!` 之后消费。
+        self.ts_type_annotation();
+        let value = if self.eat(TokenKind::Eq) {
+            Some(self.parse_assignment_expression())
+        } else {
+            None
+        };
+        self.semicolon();
+        // abstract / declare 字段 → 擦除（无运行时）。
+        if erase_member {
+            return None;
+        }
+        Some(ClassMember::Property(self.alloc(PropertyDefinition {
+            span: self.span_to(lo),
+            key,
+            value,
+            is_static,
+            computed,
+        })))
+    }
+
+    /// 试探判断 `[` 是否为 TS 索引签名 `[ident: type]`（而非计算成员名 `[expr]`）。
+    fn is_index_signature(&mut self) -> bool {
+        // `[` 后紧跟 标识符 + `:`。用 checkpoint 试探。
+        let cp = self.checkpoint();
+        self.bump(); // [
+        let yes = self.at_ident_name() && self.peek().kind == TokenKind::Colon;
+        self.rewind(cp);
+        yes
+    }
+
+    fn key_is_named(&self, key: &PropertyKey<'a>, name: &str) -> bool {
+        matches!(key, PropertyKey::Ident(id) if self.interner_eq(id.name, name))
+    }
+
+    /// 比较一个 Atom 是否等于给定字符串（冷路径：类/对象属性名判定）。热路径应预驻留 Atom 后比 u32。
+    fn interner_eq(&self, atom: wake_common::Atom, s: &str) -> bool {
+        self.interner.with_resolved(atom, |resolved| resolved == s)
+    }
+
+    fn peek_is_member_terminator(&mut self) -> bool {
+        matches!(
+            self.peek().kind,
+            TokenKind::LParen
+                | TokenKind::Eq
+                | TokenKind::Semicolon
+                | TokenKind::RBrace
+                | TokenKind::Colon
+        )
+    }
+
+    // ==================================================================
+    // 模式（绑定 / 解构）
+    // ==================================================================
+
+    pub(crate) fn parse_binding_ident(&mut self) -> Ident {
+        let span = self.cur.span;
+        if self.at_ident_name() {
+            let name = self.intern_ident(span);
+            self.bump();
+            Ident::new(span, name)
+        } else {
+            self.error(span, "期望绑定标识符");
+            Ident::new(span, self.interner.intern("__error__"))
+        }
+    }
+
+    /// 标识符名（成员/属性/标签用，接受任意关键字作名字）。
+    pub(crate) fn parse_ident_name(&mut self) -> Ident {
+        let span = self.cur.span;
+        match self.cur.kind {
+            TokenKind::Ident | TokenKind::Keyword(_) => {
+                let name = self.intern_ident(span);
+                self.bump();
+                Ident::new(span, name)
+            }
+            _ => {
+                self.error(span, "期望标识符名");
+                Ident::new(span, self.interner.intern("__error__"))
+            }
+        }
+    }
+
+    pub(crate) fn parse_binding_pattern(&mut self) -> Pattern<'a> {
+        match self.cur.kind {
+            TokenKind::LBracket => self.parse_array_pattern(),
+            TokenKind::LBrace => self.parse_object_pattern(),
+            _ => {
+                let id = self.parse_binding_ident();
+                Pattern::Ident(self.alloc(id))
+            }
+        }
+    }
+
+    fn parse_binding_element(&mut self) -> Pattern<'a> {
+        let lo = self.start();
+        let pat = self.parse_binding_pattern();
+        if self.ts {
+            self.eat(TokenKind::Question); // 可选参数 `x?`
+            self.ts_type_annotation(); // `: T`
+        }
+        if self.eat(TokenKind::Eq) {
+            let right = self.parse_assignment_expression();
+            Pattern::Assignment(self.alloc(AssignmentPattern {
+                span: self.span_to(lo),
+                left: pat,
+                right,
+            }))
+        } else {
+            pat
+        }
+    }
+
+    fn parse_array_pattern(&mut self) -> Pattern<'a> {
+        let lo = self.start();
+        self.bump(); // [
+        let mut elements = self.new_vec::<Option<Pattern>>();
+        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::Comma) {
+                self.bump();
+                elements.push(None);
+                continue;
+            }
+            if self.at(TokenKind::DotDotDot) {
+                let rlo = self.start();
+                self.bump();
+                let argument = self.parse_binding_pattern();
+                elements.push(Some(Pattern::Rest(self.alloc(RestElement {
+                    span: self.span_to(rlo),
+                    argument,
+                }))));
+                break;
+            }
+            elements.push(Some(self.parse_binding_element()));
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBracket);
+        Pattern::Array(self.alloc(ArrayPattern {
+            span: self.span_to(lo),
+            elements,
+        }))
+    }
+
+    fn parse_object_pattern(&mut self) -> Pattern<'a> {
+        let lo = self.start();
+        self.bump(); // {
+        let mut properties = self.new_vec::<ObjectPatternProperty>();
+        let mut rest = None;
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::DotDotDot) {
+                let rlo = self.start();
+                self.bump();
+                let argument = self.parse_binding_pattern();
+                rest = Some(self.alloc(RestElement {
+                    span: self.span_to(rlo),
+                    argument,
+                }));
+                break;
+            }
+            let plo = self.start();
+            let (key, computed) = self.parse_property_key();
+            let value = if self.eat(TokenKind::Colon) {
+                self.parse_binding_element()
+            } else {
+                // 简写 `{ x }` 或 `{ x = default }`。
+                let id = match key {
+                    PropertyKey::Ident(id) => id,
+                    _ => {
+                        self.error(self.span_to(plo), "解构简写需要标识符");
+                        Ident::new(self.span_to(plo), self.interner.intern("__error__"))
+                    }
+                };
+                if self.eat(TokenKind::Eq) {
+                    let right = self.parse_assignment_expression();
+                    Pattern::Assignment(self.alloc(AssignmentPattern {
+                        span: self.span_to(plo),
+                        left: Pattern::Ident(self.alloc(id)),
+                        right,
+                    }))
+                } else {
+                    Pattern::Ident(self.alloc(id))
+                }
+            };
+            properties.push(ObjectPatternProperty {
+                span: self.span_to(plo),
+                key,
+                value,
+                shorthand: !computed,
+                computed,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        Pattern::Object(self.alloc(ObjectPattern {
+            span: self.span_to(lo),
+            properties,
+            rest,
+        }))
+    }
+
+    // ==================================================================
+    // 模块：import / export（含依赖提取）
+    // ==================================================================
+
+    fn parse_import_declaration(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // import
+
+        // TS：`import type ...`（类型-only 导入）→ 整体擦除，不产生运行时依赖。
+        // 区分 `import type from '...'`（`type` 是默认绑定名，非类型导入）。
+        if self.ts && self.at_contextual("type") {
+            let p = self.peek();
+            let type_only = match p.kind {
+                TokenKind::LBrace | TokenKind::Star => true,
+                TokenKind::Ident => self.slice(p.span) != "from",
+                TokenKind::Keyword(kw) if !kw.is_reserved() => self.slice(p.span) != "from",
+                _ => false,
+            };
+            if type_only {
+                while !self.at(TokenKind::Str)
+                    && !self.at(TokenKind::Semicolon)
+                    && !self.at(TokenKind::Eof)
+                {
+                    self.bump();
+                }
+                self.eat(TokenKind::Str);
+                self.semicolon();
+                return Statement::Empty(self.span_to(lo));
+            }
+        }
+
+        let mut specifiers = self.new_vec::<ImportSpecifier>();
+
+        // import 'side-effect';
+        if self.at(TokenKind::Str) {
+            let source = self.string_atom(self.cur.span);
+            let sp = self.cur.span;
+            self.bump();
+            self.semicolon();
+            self.record_dependency(Dependency {
+                specifier: source,
+                kind: DependencyKind::Import,
+                span: sp,
+            });
+            return Statement::Import(self.alloc(ImportDeclaration {
+                span: self.span_to(lo),
+                specifiers,
+                source,
+            }));
+        }
+
+        // default 导入。
+        if self.at_ident_name() {
+            let slo = self.start();
+            let local = self.parse_binding_ident();
+            specifiers.push(ImportSpecifier::Default {
+                span: self.span_to(slo),
+                local,
+            });
+            self.eat(TokenKind::Comma);
+        }
+
+        // namespace 或 named。
+        if self.at(TokenKind::Star) {
+            let slo = self.start();
+            self.bump();
+            self.expect(TokenKind::Keyword(Keyword::As));
+            let local = self.parse_binding_ident();
+            specifiers.push(ImportSpecifier::Namespace {
+                span: self.span_to(slo),
+                local,
+            });
+        } else if self.at(TokenKind::LBrace) {
+            self.bump();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                let slo = self.start();
+                // TS：内联类型说明符 `import { type A, B }` → 跳过该说明符（`type` 后接名字且非 `as`）。
+                if self.ts && self.at_contextual("type") && self.ts_inline_type_specifier_ahead() {
+                    self.bump(); // type
+                    let _ = self.parse_module_export_name();
+                    if self.eat_keyword(Keyword::As) {
+                        self.parse_binding_ident();
+                    }
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                    continue;
+                }
+                let imported = self.parse_module_export_name();
+                let local = if self.eat_keyword(Keyword::As) {
+                    self.parse_binding_ident()
+                } else {
+                    match imported {
+                        ModuleExportName::Ident(id) => id,
+                        ModuleExportName::String(_) => {
+                            self.error(self.span_to(slo), "字符串导入名需 `as` 本地绑定");
+                            Ident::new(self.span_to(slo), self.interner.intern("__error__"))
+                        }
+                    }
+                };
+                specifiers.push(ImportSpecifier::Named {
+                    span: self.span_to(slo),
+                    imported,
+                    local,
+                });
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBrace);
+        }
+
+        // from 'source'
+        self.expect(TokenKind::Keyword(Keyword::From));
+        let source = self.expect_string_specifier();
+        self.semicolon();
+        self.record_dependency(Dependency {
+            specifier: source,
+            kind: DependencyKind::Import,
+            span: self.span_to(lo),
+        });
+        Statement::Import(self.alloc(ImportDeclaration {
+            span: self.span_to(lo),
+            specifiers,
+            source,
+        }))
+    }
+
+    fn parse_export(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // export
+
+        // TS：`export type { .. } (from '..')?` / `export type * from '..'` → 整体擦除（无运行时）。
+        if self.ts
+            && self.at_contextual("type")
+            && matches!(self.peek().kind, TokenKind::LBrace | TokenKind::Star)
+        {
+            self.bump(); // type
+            if self.at(TokenKind::LBrace) {
+                self.ts_skip_balanced();
+            } else if self.eat(TokenKind::Star) && self.eat_keyword(Keyword::As) {
+                let _ = self.parse_module_export_name();
+            }
+            if self.eat_keyword(Keyword::From) {
+                self.eat(TokenKind::Str); // 类型-only：不记录运行时依赖
+            }
+            self.semicolon();
+            return Statement::Empty(self.span_to(lo));
+        }
+
+        // export default ...
+        if self.eat_keyword(Keyword::Default) {
+            let declaration = if self.at_keyword(Keyword::Function) {
+                ExportDefaultKind::Function(self.parse_function(self.start(), false))
+            } else if self.at_keyword(Keyword::Async)
+                && self.peek().kind == TokenKind::Keyword(Keyword::Function)
+            {
+                self.bump();
+                ExportDefaultKind::Function(self.parse_function(self.start(), true))
+            } else if self.at_keyword(Keyword::Class) {
+                ExportDefaultKind::Class(self.parse_class(self.start()))
+            } else {
+                let e = self.with_allow_in(true, |p| p.parse_assignment_expression());
+                self.semicolon();
+                ExportDefaultKind::Expression(e)
+            };
+            return Statement::ExportDefault(self.alloc(ExportDefaultDeclaration {
+                span: self.span_to(lo),
+                declaration,
+            }));
+        }
+
+        // export * (as ns)? from '...'
+        if self.at(TokenKind::Star) {
+            self.bump();
+            let exported = if self.eat_keyword(Keyword::As) {
+                Some(self.parse_module_export_name())
+            } else {
+                None
+            };
+            self.expect(TokenKind::Keyword(Keyword::From));
+            let source = self.expect_string_specifier();
+            self.semicolon();
+            self.record_dependency(Dependency {
+                specifier: source,
+                kind: DependencyKind::ExportFrom,
+                span: self.span_to(lo),
+            });
+            return Statement::ExportAll(self.alloc(ExportAllDeclaration {
+                span: self.span_to(lo),
+                exported,
+                source,
+            }));
+        }
+
+        // export { a, b as c } (from '...')?
+        if self.at(TokenKind::LBrace) {
+            self.bump();
+            let mut specifiers = self.new_vec::<ExportSpecifier>();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                let slo = self.start();
+                // TS：内联类型说明符 `export { type A, B }` → 跳过该说明符。
+                if self.ts && self.at_contextual("type") && self.ts_inline_type_specifier_ahead() {
+                    self.bump(); // type
+                    let _ = self.parse_module_export_name();
+                    if self.eat_keyword(Keyword::As) {
+                        let _ = self.parse_module_export_name();
+                    }
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                    continue;
+                }
+                let local = self.parse_module_export_name();
+                let exported = if self.eat_keyword(Keyword::As) {
+                    self.parse_module_export_name()
+                } else {
+                    local
+                };
+                specifiers.push(ExportSpecifier {
+                    span: self.span_to(slo),
+                    local,
+                    exported,
+                });
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBrace);
+            let source = if self.eat_keyword(Keyword::From) {
+                let s = self.expect_string_specifier();
+                self.record_dependency(Dependency {
+                    specifier: s,
+                    kind: DependencyKind::ExportFrom,
+                    span: self.span_to(lo),
+                });
+                Some(s)
+            } else {
+                None
+            };
+            self.semicolon();
+            return Statement::ExportNamed(self.alloc(ExportNamedDeclaration {
+                span: self.span_to(lo),
+                declaration: None,
+                specifiers,
+                source,
+            }));
+        }
+
+        // export <declaration>
+        let declaration = self.parse_statement();
+        Statement::ExportNamed(self.alloc(ExportNamedDeclaration {
+            span: self.span_to(lo),
+            declaration: Some(declaration),
+            specifiers: self.new_vec(),
+            source: None,
+        }))
+    }
+
+    fn parse_module_export_name(&mut self) -> ModuleExportName {
+        if self.at(TokenKind::Str) {
+            let atom = self.string_atom(self.cur.span);
+            self.bump();
+            ModuleExportName::String(atom)
+        } else {
+            ModuleExportName::Ident(self.parse_ident_name())
+        }
+    }
+
+    /// 期望一个字符串说明符并返回其驻留 Atom（用于 from 子句）。
+    fn expect_string_specifier(&mut self) -> wake_common::Atom {
+        if self.at(TokenKind::Str) {
+            let atom = self.string_atom(self.cur.span);
+            self.bump();
+            atom
+        } else {
+            self.error_expected("模块说明符字符串");
+            self.interner.intern("")
+        }
+    }
+
+    fn string_atom(&self, span: Span) -> wake_common::Atom {
+        self.interner.intern(&self.lexer.string_value(span))
+    }
+
+    // ==================================================================
+    // ASI
+    // ==================================================================
+
+    /// 消费语句结尾分号（ASI：换行 / `}` / EOF 处可省略）。
+    fn semicolon(&mut self) {
+        if self.eat(TokenKind::Semicolon) {
+            return;
+        }
+        if self.newline_before() || self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+            return;
+        }
+        self.error_expected("`;`");
+    }
+
+    fn at_statement_end(&self) -> bool {
+        matches!(
+            self.cur.kind,
+            TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof
+        )
+    }
+}
+
+/// 参数属性名：简单标识符参数（含带默认值 `private x = 1`）的名字；解构参数不作参数属性。
+fn param_prop_name(pat: &Pattern) -> Option<wake_common::Atom> {
+    match pat {
+        Pattern::Ident(id) => Some(id.name),
+        Pattern::Assignment(a) => param_prop_name(&a.left),
+        _ => None,
+    }
+}
+
+/// 语句是否为 `super(...)` 调用（参数属性注入的锚点）。
+fn is_super_call_stmt(s: &Statement) -> bool {
+    if let Statement::Expression(es) = s
+        && let Expression::Call(c) = &es.expression
+    {
+        return matches!(c.callee, Expression::Super(_));
+    }
+    false
+}

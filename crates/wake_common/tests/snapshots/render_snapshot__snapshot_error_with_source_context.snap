@@ -1,0 +1,11 @@
+---
+source: crates/wake_common/tests/render_snapshot.rs
+expression: "render(&diag, &sf, RenderStyle::plain())"
+---
+error[WAKE0001]: unexpected token, expected `)`
+ --> a.js:3:5
+  |
+3 | foo(bar
+  |     ^^^ expected `)` before this
+  |
+  = note: 每条诊断都带源码上下文（对标 rustc）

@@ -1,0 +1,12 @@
+---
+source: crates/wake_common/tests/render_snapshot.rs
+expression: "render(&diag, &sf, RenderStyle::plain())"
+---
+warning[WAKE0100]: `z` 未定义
+ --> mod.js:2:15
+  |
+2 | const y = x + z;
+  |           - `x` 在此导入
+2 | const y = x + z;
+  |               ^ 此处使用了未声明的 `z`
+  |

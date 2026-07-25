@@ -1,0 +1,23 @@
+{
+  "name": "react-ts-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "真实的 TypeScript + React 项目，用于测试 wake 打包器",
+  "type": "module",
+  "packageManager": "yarn@4.16.0",
+  "scripts": {
+    "dev": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- dev . --port 5173",
+    "build": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- build src/index.tsx --outdir dist && node -e \"require('fs').copyFileSync('public/index.html','dist/index.html')\""
+  },
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/lodash": "^4.17.7",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.3"
+  }
+}

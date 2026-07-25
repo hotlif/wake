@@ -1,0 +1,18 @@
+[package]
+name = "wake_ecma_minify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "标识符 mangling 计划器（作用域安全重命名 → span→新名 侧表）。CRUSTIFY-PARITY §M4"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_parser.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

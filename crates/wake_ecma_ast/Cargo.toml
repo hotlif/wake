@@ -1,0 +1,18 @@
+[package]
+name = "wake_ecma_ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ECMAScript AST（arena 分配 + 生命周期参数）。DESIGN §4.2"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+bumpalo.workspace = true
+
+[[example]]
+name = "spike_arena_ast"
+path = "examples/spike_arena_ast.rs"

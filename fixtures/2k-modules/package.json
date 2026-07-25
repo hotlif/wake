@@ -1,0 +1,12 @@
+{
+  "scripts": {
+    "generate": "node generate.mjs",
+    "build:wake": "cargo run -r -p wake_cli -- build input/entry.js --outdir dist-wake",
+    "build:webpack": "webpack --config webpack.config.mjs",
+    "compare": "node compare.mjs",
+    "bench": "node run.mjs"
+  },
+  "devDependencies": {
+    "webpack-cli": "^7.2.1"
+  }
+}

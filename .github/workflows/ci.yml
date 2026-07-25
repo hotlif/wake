@@ -1,0 +1,91 @@
+name: CI
+
+# PLAN §1 工程基线：每 PR 跑 fmt + clippy(-D warnings) + test + miri；bench 先做编译冒烟，
+# 回归门禁（超 5% 红灯）待有基线历史后接入 critcmp。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  miri:
+    name: miri (手写 unsafe 内存模型)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Spike ① 的自引用持有者含唯一一处 unsafe，必须常驻 miri 防回归（DESIGN §10.4）。
+      - run: cargo miri test -p wake_ecma_ast
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+      # wake_turbo 引擎核心：engine.rs 的 thread-local 裸指针 unsafe + 红绿对拍，默认 Stacked Borrows。
+      # executor/concurrent 测试用 crossbeam（SB 下有已知假阳性、~11min），已 #[cfg_attr(miri, ignore)]
+      # 自动跳过——并发正确性归下方 loom job（PLAN §2.5.6）。
+      - run: cargo miri test -p wake_turbo
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+
+  loom:
+    name: loom (single-flight 并发协议)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      # 穷举线程交错验证 single-flight 协议（tests/loom_single_flight.rs）。
+      # --cfg loom 下执行器/crossbeam 被排除（见 Cargo.toml），只编译引擎核心 + loom。
+      - run: cargo test -p wake_turbo --test loom_single_flight
+        env:
+          RUSTFLAGS: --cfg loom
+
+  bench-smoke:
+    name: benches compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      # 只确认 bench 骨架可编译可跑（--no-run）。回归门禁待基线历史后用 critcmp 接入。
+      - run: cargo bench --workspace --no-run

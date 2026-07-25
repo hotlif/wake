@@ -1,0 +1,21 @@
+[package]
+name = "wake_common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wake 基础设施：Span、Atom interner、诊断、FileSystem 抽象。DESIGN §4.1"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "interner"
+harness = false
