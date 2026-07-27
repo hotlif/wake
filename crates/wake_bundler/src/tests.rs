@@ -1232,6 +1232,137 @@ fn code_splitting_lazy_loads_in_node() {
     );
 }
 
+#[test]
+fn public_path_injected_into_chunk_loader() {
+    // `set_public_path` 必须贯穿到 async chunk 的加载 URL：否则子路径部署下 import() 按当前
+    // 页面 URL 相对解析 → 404（CRUSTIFY-PARITY 切片 2）。
+    let mut b = IncrementalBundler::new(Arc::new(split_fixture()));
+    b.enable_code_splitting().set_public_path("/app/");
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    assert!(
+        out.bundle.contains("__wake__.publicPath = \"/app/\";"),
+        "entry chunk 应注入 publicPath:\n{}",
+        out.bundle
+    );
+    // 注入点与消费点对齐：运行时确实用 publicPath 拼 chunk 的 script.src。
+    assert!(
+        out.bundle.contains("s.src = W.publicPath + file;"),
+        "运行时应用 publicPath 拼 chunk URL:\n{}",
+        out.bundle
+    );
+    // async chunk 体内不含文件名/前缀（保持 hash 无环）——URL 只在 entry 的 f 映射里拼。
+    let async_chunk = out.chunks.iter().find(|c| !c.is_entry).unwrap();
+    assert!(!async_chunk.code.contains("/app/"), "{}", async_chunk.code);
+}
+
+#[test]
+fn public_path_defaults_and_escapes() {
+    // 默认 `/`（与 wake_html 注入 `<script src>` 的默认一致）。
+    let mut b = IncrementalBundler::new(Arc::new(split_fixture()));
+    b.enable_code_splitting();
+    let out = b.build(Path::new("src/index.js"));
+    assert!(
+        out.bundle.contains("__wake__.publicPath = \"/\";"),
+        "{}",
+        out.bundle
+    );
+
+    // 值作为 JS 字符串字面量发出 → 反斜杠/引号须转义，不能截断字面量。
+    let mut b = IncrementalBundler::new(Arc::new(split_fixture()));
+    b.enable_code_splitting().set_public_path("/a\"b\\c/");
+    let out = b.build(Path::new("src/index.js"));
+    assert!(
+        out.bundle
+            .contains("__wake__.publicPath = \"/a\\\"b\\\\c/\";"),
+        "{}",
+        out.bundle
+    );
+}
+
+/// 浏览器形态 e2e 的 runner：在 vm 沙箱里跑 entry chunk（无 `process`/`require` → 走 `<script>`
+/// 分支），用桩 `document` 捕获 chunk URL 并从盘上加载，最后校验 URL 前缀与懒加载结果。
+const PUBLIC_PATH_RUNNER_JS: &str = r#"const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const PUBLIC = "/app/";
+const entryFile = process.argv[2];
+const requested = [];
+
+function run(ctx, file) {
+  const code = fs.readFileSync(path.join(__dirname, file), "utf8");
+  vm.runInContext(code, ctx, { filename: file });
+}
+
+const document = {
+  createElement: function () { return {}; },
+  head: {
+    appendChild: function (s) {
+      requested.push(s.src);
+      if (s.src.slice(0, PUBLIC.length) !== PUBLIC) {
+        console.error("chunk URL 缺少 publicPath 前缀:", s.src);
+        return s.onerror();
+      }
+      try { run(ctx, s.src.slice(PUBLIC.length)); s.onload(); }
+      catch (e) { console.error(e); s.onerror(); }
+    },
+  },
+};
+// 沙箱里不放 process/require：运行时据此判定为浏览器，走 script 标签加载。
+const ctx = vm.createContext({ console: console, document: document });
+
+run(ctx, entryFile);
+const app = ctx.__wake_entry__;
+if (!app || app.eager !== 1) { console.error("entry exports=", app); process.exit(4); }
+app.load().then(function (v) {
+  if (v !== 42) { console.error("v=", v); process.exit(2); }
+  if (requested.length !== 1) { console.error("requested=", requested); process.exit(5); }
+  process.stdout.write("OK " + requested.join(","));
+}).catch(function (e) { console.error(e); process.exit(3); });
+"#;
+
+#[test]
+fn public_path_chunk_url_loads_in_browser_like_env() {
+    if !node_available() {
+        eprintln!("node 不可用，跳过 publicPath chunk URL e2e");
+        return;
+    }
+    let mut b = IncrementalBundler::new(Arc::new(split_fixture()));
+    b.enable_code_splitting().set_public_path("/app/");
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let dir = std::env::temp_dir().join("wake_split_public_path_e2e");
+    let _ = std::fs::remove_dir_all(&dir);
+    let entry = write_chunks(&out, &dir);
+    let entry_file = entry.file_name().unwrap().to_string_lossy().into_owned();
+    let runner = dir.join("run-public-path.js");
+    std::fs::write(&runner, PUBLIC_PATH_RUNNER_JS).unwrap();
+
+    let output = std::process::Command::new("node")
+        .arg(&runner)
+        .arg(&entry_file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "node 执行失败 status={:?} stdout={} stderr={}",
+        output.status.code(),
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let async_chunk = out.chunks.iter().find(|c| !c.is_entry).unwrap();
+    assert_eq!(
+        stdout,
+        format!("OK /app/{}", async_chunk.file_name),
+        "chunk 应经 `/app/` 前缀加载"
+    );
+}
+
 /// Fixture B：入口动态 import a、b；a、b 都静态依赖 shared。
 fn shared_fixture() -> MemoryFileSystem {
     MemoryFileSystem::from_files([

@@ -64,7 +64,7 @@
 **切片 2（⏭ 待做）——资源与 CSS：**
 - [ ] asset **4KB 阈值** + 超阈值独立产物（hash 命名 + 服务/拷贝）；`url()` 资源改写
 - [ ] prod **CSS 抽取为 `.css`** 独立产物（`rewrite_urls` 钩子已在）+ HTML `<link>` 注入（`emit_html` 的 `styles` 填充）
-- [ ] `publicPath` 贯穿 runtime chunk 加载
+- [x] `publicPath` 贯穿 runtime chunk 加载
 
 **切片 3（✅ 完成）——dev server 网络层：**
 - [x] **proxy**（context/target/pathRewrite(正则)/changeOrigin）：`ServeOptions`+`ProxyRule`；[wake_dev_server](../crates/wake_dev_server/src/lib.rs) 用 `awc` 转发，默认服务先试代理（任意方法）再回退 SPA；`CompiledProxy`（正则预编译）
@@ -78,6 +78,7 @@
 - [x] **asset 4KB 阈值**：[loader](../crates/wake_bundler/src/loader.rs) `LoadOptions`（extract_css/asset_inline_limit/public_path）；超阈值写 `<stem>.<hash>.<ext>` 独立产物 + 模块导出 `publicPath` URL，`≤` 阈值内联 base64。
 - [x] **prod CSS 抽取为 `.css`**：`css_extract`/`css_module_extract`（不注入 `<style>`，CSS 文本带出），driver 聚合（模块 id 升序）为 `styles.<hash>.css`；`emit_html` 注入 `<link>`。
 - [x] bundler `enable_css_extraction`/`set_asset_inline_limit`/`set_public_path`；CLI build/watch prod 开启。
+- [x] **`publicPath` 贯穿 runtime chunk 加载**：entry chunk 在 prelude 后注入 `__wake__.publicPath = "<配置值>"`（JS 字符串转义走 `push_js_string`），运行时 `loadFile` 据此拼 `script.src`；写在 prelude 之后而非其对象字面量里，因 registry 可能已由同 token 的先前加载建好。node 加载分支（`W.nreq` + `__dirname`）不受影响。单测 `public_path_injected_into_chunk_loader`/`public_path_defaults_and_escapes` + vm 沙箱浏览器形态 e2e `public_path_chunk_url_loads_in_browser_like_env`。
 - **切片 2 验收通过**：fixture（普通 CSS + CSS Module + 5KB/1KB 资源 + publicPath `/app/`）→ 8/8 校验：CSS 抽取（含作用域化 `.card_964e17`）、`<link>` 带 publicPath、bundle 不注入 `<style>`、大资源独立产物 URL、小资源内联、CSS Module 导出映射。`css_extraction_and_asset_threshold` 单测绿；真实 `react-ts-app` prod 全管线 19 模块无回归。
 - ⏭ 待做（非阻塞）：`url()` 资源改写、CSS 抽取的运行时 eval 序（当前 BFS 发现序）、polyfill 决策。
 
