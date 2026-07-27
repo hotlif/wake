@@ -119,7 +119,7 @@ jsxDEV 的 `fileName` 泄露 Windows `\\?\` 前缀。
 - [x] **CSS 聚合按依赖后序**（`incremental.rs::css_emission_order`）：层叠顺序须与 dev 的 `<style>` 注入顺序（= 模块求值序，依赖先行）一致。此前按模块 id（BFS 发现序）排，被 `@import` 的基础样式会排到消费方**之后**，覆盖关系整个反过来。
 - [x] manifest 增 `styles` / `assets` 字段（SSR / CDN 上传脚本需要 hash 后的真实文件名）
 - [x] watcher 扩展名纳入图片与字体（此前改一张图不触发重建 → 陈旧产物）
-- [ ] `publicPath` 贯穿 runtime chunk 加载（`incremental.rs` 的 `W.publicPath` 恒为空串，无赋值点；子路径部署下动态 `import()` 会 404）
+- [x] **`publicPath` 贯穿 runtime chunk 加载**：entry chunk 在 prelude 后注入 `__wake__.publicPath = "<配置值>"`（JS 字符串转义走 `push_js_string`），运行时 `loadFile` 据此拼 `script.src`；写在 prelude 之后而非其对象字面量里，因 registry 可能已由同 token 的先前加载建好。node 加载分支（`W.nreq` + `__dirname`）不受影响。单测 `public_path_injected_into_chunk_loader`/`public_path_defaults_and_escapes` + vm 沙箱浏览器形态 e2e `public_path_chunk_url_loads_in_browser_like_env`。
 
 **切片 3（✅ 完成）——dev server 网络层：**
 - [x] **proxy**（context/target/pathRewrite(正则)/changeOrigin）：`ServeOptions`+`ProxyRule`；[wake_dev_server](../crates/wake_dev_server/src/lib.rs) 用 `awc` 转发，默认服务先试代理（任意方法）再回退 SPA；`CompiledProxy`（正则预编译）
@@ -131,12 +131,11 @@ jsxDEV 的 `fileName` 泄露 Windows `\\?\` 前缀。
 > 📌 此处原有一份**重复的「切片 2」**（"bundler emit 手术"版）已删除：它与上面那份记述的是同一批工作，
 > 但内容已过时且与实现相反——写着「driver 聚合（**模块 id 升序**）」而实现早已改为依赖后序，
 > 「⏭ 待做：`url()` 资源改写」也已完成。旧快照留在文档里比没有更糟，会让后来者按错误前提动手。
-> 其独有信息（带外产物基建 `BuildOutput.assets`、`LoadOptions` 三字段）已并入上面的条目。
+> 其独有信息（带外产物基建 `BuildOutput.assets`、`LoadOptions` 三字段、`publicPath` 贯穿 chunk 加载）
+> 已并入上面的条目。
 
-### M3 小结（核心三切片完成，但 ⚠️ 有未完成项）
-- 切片 1 define/`.raw`/clean · 切片 2 asset 阈值/CSS 抽取/url() 改写 · 切片 3 dev proxy/host/open。
-- ⚠️ **不能记作「全部验证通过」**：切片 2 的 `publicPath` 贯穿 runtime chunk 加载仍未做（见上），
-  子路径部署下动态 `import()` 会 404。
+### M3 小结（核心三切片完成）
+- 切片 1 define/`.raw`/clean · 切片 2 asset 阈值/CSS 抽取/url() 改写/`publicPath` 贯穿 · 切片 3 dev proxy/host/open。
 - **遗留（非阻塞）**：dev server **https**（rustls+rcgen）、**ws 代理**；`buffer`/`string_decoder` polyfill。
 
 ### M4 — prod 压缩 + sourcemap · XL（分阶段，按安全性排序）

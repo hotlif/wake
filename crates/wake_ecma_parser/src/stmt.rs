@@ -157,9 +157,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         // （`await usingFoo()` / `await using(x)` 都不是声明，必须能正确回退。）
         //
         // 只在 async 上下文里识别——与 `await` 运算符的口径一致（expr.rs 亦要求 `in_async`）。
-        // 模块顶层的 `await using` 虽合乎规范，但 wake 目前不支持任何形式的顶层 await，且
-        // bundler 的模块包装器 `function(module, exports, __wake_require__)` 非 async：
-        // 若在此放行，产物会是加载即抛 SyntaxError 的包。宁可在解析期报错。
+        // 模块顶层即 async 上下文（ES2022 顶层 await），故顶层 `await using` 合法；但它**必须**
+        // 一并把模块标成 async 子图的种子——否则 bundler 会把它包进非 async 的
+        // `function(module, exports, __wake_require__)`，产物加载即抛 SyntaxError。
+        // `await` 运算符走 expr.rs 的分支置位，`await using` 声明不经那条路径，故在此补。
         if self.at_keyword(Keyword::Await) && self.ctx.in_async {
             let cp = self.checkpoint();
             self.bump(); // await
@@ -167,6 +168,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 && self.at_contextual("using")
                 && self.using_binding_follows();
             self.rewind(cp);
+            if ok && self.ctx.top_level {
+                self.has_top_level_await = true;
+            }
             return ok.then_some(VarKind::AwaitUsing);
         }
         None
@@ -377,6 +381,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_for(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // for
         let is_await = self.eat_keyword(Keyword::Await);
+        if is_await && self.ctx.top_level {
+            self.has_top_level_await = true;
+        }
         self.expect(TokenKind::LParen);
 
         // 初始化：可能是变量声明或表达式，或空。
@@ -632,14 +639,16 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         self.ts_type_parameters(); // `function foo<T>(...)`
 
-        let saved = (self.ctx.in_async, self.ctx.in_generator);
+        let saved = (self.ctx.in_async, self.ctx.in_generator, self.ctx.top_level);
         self.ctx.in_async = is_async;
         self.ctx.in_generator = is_generator;
+        self.ctx.top_level = false;
         let params = self.parse_params();
         self.ts_type_annotation(); // 返回类型 `): T {`（类型文法遇 `{` 自然停）
         let body = self.parse_function_body();
         self.ctx.in_async = saved.0;
         self.ctx.in_generator = saved.1;
+        self.ctx.top_level = saved.2;
 
         self.alloc(Function {
             span: self.span_to(lo),
@@ -658,9 +667,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         is_generator: bool,
     ) -> &'a Function<'a> {
         self.ts_type_parameters(); // 方法泛型 `m<T>()`
-        let saved = (self.ctx.in_async, self.ctx.in_generator);
+        let saved = (self.ctx.in_async, self.ctx.in_generator, self.ctx.top_level);
         self.ctx.in_async = is_async;
         self.ctx.in_generator = is_generator;
+        self.ctx.top_level = false;
         let (params, param_props) = self.parse_params_collecting();
         self.ts_type_annotation(); // 方法返回类型（含类型谓词）
         // 无函数体 → 重载签名 / abstract / declare 方法：body 置 None，供 class 层擦除。
@@ -678,6 +688,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         self.ctx.in_async = saved.0;
         self.ctx.in_generator = saved.1;
+        self.ctx.top_level = saved.2;
         self.alloc(Function {
             span: self.span_to(lo),
             id: None,
@@ -961,6 +972,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         // static 块。
         if is_static && self.at(TokenKind::LBrace) {
             self.bump(); // {
+            // static 块不是 async 上下文，也不再是模块顶层（规范禁止其中出现 `await`）。
+            let saved = (self.ctx.in_async, self.ctx.top_level);
+            self.ctx.in_async = false;
+            self.ctx.top_level = false;
             let mut body = self.new_vec::<Statement>();
             while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
                 let before = self.cur.span.lo;
@@ -969,6 +984,8 @@ impl<'a, 'src> Parser<'a, 'src> {
                     self.bump();
                 }
             }
+            self.ctx.in_async = saved.0;
+            self.ctx.top_level = saved.1;
             self.expect(TokenKind::RBrace);
             return Some(ClassMember::StaticBlock(self.alloc(StaticBlock {
                 span: self.span_to(lo),

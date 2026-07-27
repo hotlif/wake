@@ -348,22 +348,31 @@ fn using_declarations() {
 }
 
 #[test]
-fn top_level_await_using_is_rejected() {
-    // wake 不支持任何形式的顶层 await，且 bundler 的模块包装器非 async——若放行顶层
-    // `await using`，产物会是加载即抛 SyntaxError 的包。必须在解析期就报错。
+fn top_level_await_using_marks_module_async() {
+    // 顶层 `await using` 合乎规范（模块顶层即 async 上下文）。关键在于它**必须**置位
+    // `has_top_level_await`：否则 bundler 把它包进非 async 的模块包装器，产物加载即抛
+    // SyntaxError。`await` 运算符由 expr.rs 置位，`await using` 声明不走那条路径。
     let interner = Interner::new();
     let out = parse("await using a = mkAsync();", &interner, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(
-        out.has_errors(),
-        "顶层 await using 应报错而非静默产出坏代码"
+        out.has_top_level_await,
+        "顶层 await using 未标记 has_top_level_await → 产物会被包进同步包装器"
     );
-    // 非 async 函数内同理（本就是非法 JS）。
+    out.module.with_ast(|p| {
+        assert!(matches!(
+            p.body[0],
+            Statement::VariableDeclaration(d) if d.kind == VarKind::AwaitUsing
+        ));
+    });
+    // 非 async 函数内仍非法（不因模块顶层放行而泄漏进去）。
     let out = parse(
         "function f() { await using a = mkAsync(); }",
         &interner,
         SourceType::Module,
     );
     assert!(out.has_errors(), "非 async 函数内的 await using 应报错");
+    assert!(!out.has_top_level_await);
 }
 
 #[test]
@@ -403,6 +412,93 @@ fn using_as_plain_identifier() {
             .expect("应有 for-of");
         assert!(matches!(for_of.left, ForLeft::Target(_)));
     });
+}
+
+// ============================================================
+// 顶层 await（ES2022）
+// ============================================================
+
+#[test]
+fn top_level_await_parses_in_modules() {
+    let interner = Interner::new();
+    for st in [
+        SourceType::Module,
+        SourceType::TypeScript,
+        SourceType::Jsx,
+        SourceType::Tsx,
+    ] {
+        let out = parse("const a = await fetch('u');", &interner, st);
+        assert!(
+            !out.has_errors(),
+            "{st:?} 顶层 await 解析错误: {:?}",
+            out.diagnostics
+        );
+        assert!(out.has_top_level_await, "{st:?} 未标记 has_top_level_await");
+    }
+}
+
+#[test]
+fn top_level_await_forms() {
+    let interner = Interner::new();
+    for src in [
+        "await import('./m.js');",
+        "for await (const x of xs) { use(x); }",
+        "export const v = await load();",
+        "if (cond) { const r = await go(); }",
+        "const [a, b] = await Promise.all([p1, p2]);",
+    ] {
+        let out = parse(src, &interner, SourceType::Module);
+        assert!(
+            !out.has_errors(),
+            "顶层 await 解析错误 {src:?}: {:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.has_top_level_await,
+            "{src:?} 未标记 has_top_level_await"
+        );
+    }
+}
+
+#[test]
+fn await_inside_functions_is_not_top_level() {
+    // 函数/方法/箭头/static 块内的 await 不得把模块标成 async 模块。
+    let interner = Interner::new();
+    for src in [
+        "async function f() { await p; }",
+        "const f = async () => await p;",
+        "class C { async m() { await p; } }",
+        "async function* g() { for await (const x of xs) {} }",
+        "const o = { async m() { await p; } };",
+    ] {
+        let out = parse(src, &interner, SourceType::Module);
+        assert!(!out.has_errors(), "解析错误 {src:?}: {:?}", out.diagnostics);
+        assert!(!out.has_top_level_await, "{src:?} 被误标为顶层 await");
+    }
+}
+
+#[test]
+fn top_level_await_rejected_in_script_and_sync_fn() {
+    let interner = Interner::new();
+    // Script 不是模块：`await x` 不是 await 表达式（`await` 退化为标识符，两个标识符相邻 → 报错）。
+    let out = parse("const a = await fetch('u');", &interner, SourceType::Script);
+    assert!(out.has_errors(), "Script 顶层 await 不应被接受");
+    assert!(!out.has_top_level_await);
+    // 非 async 函数体内仍禁止（不因模块顶层放行而泄漏进去）。
+    let out = parse(
+        "function f() { const a = await g(); }",
+        &interner,
+        SourceType::Module,
+    );
+    assert!(out.has_errors(), "非 async 函数内 await 不应被接受");
+    assert!(!out.has_top_level_await);
+    // class static 块同理（规范禁止）。
+    let out = parse(
+        "class C { static { const a = await g(); } }",
+        &interner,
+        SourceType::Module,
+    );
+    assert!(out.has_errors(), "static 块内 await 不应被接受");
 }
 
 #[test]

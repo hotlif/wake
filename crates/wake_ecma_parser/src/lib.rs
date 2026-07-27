@@ -30,6 +30,9 @@ pub struct ParseOutput {
     pub dependencies: Vec<Dependency>,
     /// 诊断（错误恢复模式下可能多条）。
     pub diagnostics: Vec<Diagnostic>,
+    /// 模块**顶层**（不在任何函数/方法/箭头/`static {}` 内）出现过 `await` 或 `for await`。
+    /// 打包器据此把该模块包成 `async function` 并让其导入方 `await`（DESIGN §6.1.1）。
+    pub has_top_level_await: bool,
 }
 
 impl ParseOutput {
@@ -76,12 +79,14 @@ pub fn parse_with(
 ) -> ParseOutput {
     let deps = RefCell::new(Vec::new());
     let diags = RefCell::new(Vec::new());
+    let tla = Cell::new(false);
 
     let module = ModuleAst::from_builder(|arena| {
         let mut parser = Parser::new(source, interner, arena, source_type, options);
         let program = parser.parse_program();
         *deps.borrow_mut() = std::mem::take(&mut parser.dependencies);
         *diags.borrow_mut() = std::mem::take(&mut parser.diagnostics);
+        tla.set(parser.has_top_level_await);
         program
     });
 
@@ -89,16 +94,20 @@ pub fn parse_with(
         module,
         dependencies: deps.into_inner(),
         diagnostics: diags.into_inner(),
+        has_top_level_await: tla.get(),
     }
 }
 
 /// 上下文标志，随递归传递并在特定语法位保存/恢复（DESIGN §4.4）。
 #[derive(Clone, Copy)]
 struct Context {
-    /// 处于 async 函数体（`await` 是运算符）。
+    /// 处于 async 函数体（`await` 是运算符）。模块顶层同样为真——顶层 await（ES2022）。
     in_async: bool,
     /// 处于 generator 函数体（`yield` 是运算符）。
     in_generator: bool,
+    /// 仍在模块**顶层**（未进入任何函数/方法/箭头/`static {}` 体）。
+    /// 与 `in_async` 一起区分「顶层 await」与「async 函数内 await」。
+    top_level: bool,
     /// `in` 运算符是否允许（for-init 里禁止，避免与 for-in 歧义）。
     allow_in: bool,
     /// 严格模式。
@@ -110,6 +119,7 @@ impl Default for Context {
         Context {
             in_async: false,
             in_generator: false,
+            top_level: true,
             allow_in: true,
             strict: false,
         }
@@ -165,6 +175,8 @@ pub(crate) struct Parser<'a, 'src> {
     options: ParseOptions<'src>,
     /// 换行偏移表，惰性构建——仅 JSX dev runtime 需要把 span 换算成行列。
     line_starts: OnceCell<Vec<u32>>,
+    /// 本模块顶层是否出现过 `await` / `for await`（见 [`ParseOutput::has_top_level_await`]）。
+    has_top_level_await: bool,
     diagnostics: Vec<Diagnostic>,
     dependencies: Vec<Dependency>,
 
@@ -190,8 +202,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut lexer = Lexer::new(source);
         // 表达式起始位置：首 token 允许正则。
         let cur = lexer.next(true);
+        // 模块顶层即 async 上下文：`await` 是运算符（ES2022 顶层 await）。Script 保持旧语义。
         let ctx = Context {
             strict: source_type.is_module(),
+            in_async: source_type.is_module(),
             ..Context::default()
         };
         Parser {
@@ -209,6 +223,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             ts: source_type.is_typescript(),
             jsx: source_type.is_jsx(),
             used_jsx: false,
+            has_top_level_await: false,
             diagnostics: Vec::new(),
             dependencies: Vec::new(),
             ident_cache: RefCell::new(FxHashMap::default()),

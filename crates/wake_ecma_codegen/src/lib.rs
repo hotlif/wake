@@ -74,6 +74,14 @@ pub trait ModuleLinker {
     fn dynamic_chunk(&self, _specifier: &str) -> Option<u32> {
         None
     }
+    /// 目标模块是否为 **async 模块**（自身含顶层 await，或静态导入了这类模块）。
+    ///
+    /// 为真时它的包装器是 `async function`，`__wake_require__(id)` 返回 Promise，
+    /// 故**静态导入点**（`import` / `export ... from`）需写成 `(await __wake_require__(id))`。
+    /// 由打包器在全图算出 async 子图后经 linker 传入（DESIGN §6.1.1）。
+    fn is_async_module(&self, _id: u32) -> bool {
+        false
+    }
 }
 
 /// 生成 **已链接**（ESM→CJS）的模块体，供函数包装打包。
@@ -1510,6 +1518,23 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         }
     }
 
+    /// **静态导入位置**的 require 表达式：目标是 async 模块（顶层 await）时 `__wake_require__`
+    /// 返回 Promise，需 `await` 解包。此处的调用点只出现在模块体顶层，而导入了 async 模块的模块
+    /// 本身也被打包器标为 async（包装器是 `async function`），故 `await` 合法。
+    ///
+    /// 只用于 `import` / `export ... from` 的降级；`require("x")` 改写点与动态 `import()`
+    /// 不走这里（前者可能嵌在普通函数内，后者本就产出 Promise）。
+    fn require_expr_static(&self, specifier: &str) -> String {
+        let linker = self.linker.unwrap();
+        match linker.module_id(specifier) {
+            Some(id) if linker.is_async_module(id) => {
+                format!("(await {}({}))", linker.require_fn(), id)
+            }
+            Some(id) => format!("{}({})", linker.require_fn(), id),
+            None => format!("require({specifier:?})"),
+        }
+    }
+
     fn module_export_name_string(&self, n: &ModuleExportName) -> String {
         match n {
             ModuleExportName::Ident(id) => self.name(id.name),
@@ -1519,7 +1544,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_import_linked(&mut self, d: &ImportDeclaration) {
         let src = self.name(d.source);
-        let req = self.require_expr(&src);
+        let req = self.require_expr_static(&src);
         if d.specifiers.is_empty() {
             self.push(&req);
             self.push(";");
@@ -1590,7 +1615,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             Some(src) => {
                 // re-export：`require` 始终保留（模块副作用），仅按 shake 过滤绑定行。
                 let srcs = self.name(src);
-                let req = self.require_expr(&srcs);
+                let req = self.require_expr_static(&srcs);
                 let tmp = self.next_tmp();
                 self.push(&format!("const {tmp} = {req};"));
                 for spec in s.specifiers.iter() {
@@ -1756,7 +1781,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_export_all_linked(&mut self, s: &ExportAllDeclaration) {
         let srcs = self.name(s.source);
-        let req = self.require_expr(&srcs);
+        let req = self.require_expr_static(&srcs);
         let tmp = self.next_tmp();
         self.push(&format!("const {tmp} = {req};"));
         self.newline();

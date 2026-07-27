@@ -47,8 +47,10 @@ use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
-use crate::loader::{LoadOptions, Loaded, load_source};
-use crate::{BuildOutput, ChunkKind, Linker, OutputAsset, OutputChunk, POSTLUDE, PRELUDE};
+use crate::loader::{LoadOptions, Loaded, load_source, push_js_string};
+use crate::{
+    BuildOutput, ChunkKind, Linker, OutputAsset, OutputChunk, POSTLUDE, PRELUDE, PRELUDE_ASYNC,
+};
 
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
 type Content = Arc<str>;
@@ -56,11 +58,12 @@ type Content = Arc<str>;
 /// 「说明符 → 内部模块 id」映射（dep 顺序确定，指纹稳定）。
 type DepIds = Vec<(String, u32)>;
 
-/// scan 阶段单模块的解析结果：(依赖, 静态使用, 已 parse 的 AST 持有者, parse 任务句柄)。
+/// scan 阶段单模块的解析结果：(依赖, 静态使用, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
 /// 摘要命中时后两者为 `None`（不 parse）；未命中时携带新 parse 的 AST 与句柄。
 type ScanParsed = (
     Vec<ParsedDep>,
     Vec<(String, ImportUse)>,
+    bool,
     Option<Arc<ParsedModule>>,
     Option<Vc<ParsedModule>>,
 );
@@ -75,6 +78,9 @@ struct LinkerData {
     deps: DepIds,
     keep_exports: Option<Vec<String>>,
     dyn_chunks: Vec<(String, u32)>,
+    /// 本模块依赖里属于 **async 子图**（顶层 await 传染）的模块 id（升序去重）。
+    /// codegen 据此把静态导入点写成 `(await __wake_require__(id))`。进指纹 → async 归属变化精确重跑。
+    async_deps: Vec<u32>,
 }
 
 /// `parse` 任务的输出：AST 持有者 + 源文本 + 依赖（说明符已解为 `String`）+ 诊断。
@@ -85,6 +91,8 @@ pub struct ParsedModule {
     pub source: Arc<str>,
     pub deps: Vec<ParsedDep>,
     pub diagnostics: Vec<Diagnostic>,
+    /// 模块顶层含 `await` / `for await` → 该模块须包成 `async function`（见 [`async_module_ids`]）。
+    pub has_top_level_await: bool,
 }
 
 /// 一条依赖：说明符文本 + 种类 + 源码位置。
@@ -186,6 +194,8 @@ struct ModuleRec {
     liveness: Option<ModuleLiveness>,
     /// 单包 concat 块安全信息（`{}` vs IIFE；缓存摘要命中 → `None` → 保守走 IIFE + 不加 strict）。
     block_info: Option<ConcatBlockInfo>,
+    /// 模块顶层含 `await`（来自 parse 或缓存摘要）。async 子图的种子。
+    has_top_level_await: bool,
     /// parse 结果——缓存命中摘要时为 `None`（延迟到产物未命中才 parse）。
     parse_vc: Option<Vc<ParsedModule>>,
     parsed: Option<Arc<ParsedModule>>,
@@ -217,6 +227,7 @@ struct PendingModule {
     uses: Vec<(String, ImportUse)>,
     liveness: Option<ModuleLiveness>,
     block_info: Option<ConcatBlockInfo>,
+    has_top_level_await: bool,
     parse_vc_opt: Option<Vc<ParsedModule>>,
     parsed_opt: Option<Arc<ParsedModule>>,
 }
@@ -321,7 +332,8 @@ impl IncrementalBundler {
         self
     }
 
-    /// 资源 URL / chunk 加载的 `publicPath` 前缀（如 `/app/`）。
+    /// 资源 URL / chunk 加载的 `publicPath` 前缀（如 `/app/`）。前者由 loader 拼进模块导出的 URL，
+    /// 后者由 entry chunk 注入运行时 `__wake__.publicPath`（`loadFile` 拼 async chunk 的 `script.src`）。
     pub fn set_public_path(&mut self, public_path: impl Into<String>) -> &mut Self {
         self.public_path = public_path.into();
         self
@@ -697,10 +709,11 @@ impl IncrementalBundler {
                     content_key,
                     cached,
                 } = it;
-                let (deps, uses, parsed_opt, parse_vc_opt): ScanParsed = match cached {
+                let (deps, uses, has_tla, parsed_opt, parse_vc_opt): ScanParsed = match cached {
                     Some(sum) => (
                         sum.deps.iter().map(cached_dep_to_parsed).collect(),
                         sum.uses.iter().map(cached_use_to_import).collect(),
+                        sum.has_top_level_await,
                         None,
                         None,
                     ),
@@ -725,10 +738,12 @@ impl IncrementalBundler {
                                 ModuleSummary {
                                     deps: deps.iter().map(parsed_dep_to_cached).collect(),
                                     uses: uses.iter().map(import_use_to_cached).collect(),
+                                    has_top_level_await: parsed.has_top_level_await,
                                 },
                             );
                         }
-                        (deps, uses, Some(parsed), Some(parse_vc))
+                        let has_tla = parsed.has_top_level_await;
+                        (deps, uses, has_tla, Some(parsed), Some(parse_vc))
                     }
                 };
 
@@ -765,6 +780,7 @@ impl IncrementalBundler {
                     uses,
                     liveness,
                     block_info,
+                    has_top_level_await: has_tla,
                     parse_vc_opt,
                     parsed_opt,
                 });
@@ -805,6 +821,7 @@ impl IncrementalBundler {
                     uses,
                     liveness,
                     block_info,
+                    has_top_level_await,
                     parse_vc_opt,
                     parsed_opt,
                 } = pm;
@@ -850,6 +867,7 @@ impl IncrementalBundler {
                         dep_ids,
                         liveness,
                         block_info,
+                        has_top_level_await,
                         parse_vc: parse_vc_opt,
                         parsed: parsed_opt,
                     },
@@ -870,6 +888,9 @@ impl IncrementalBundler {
         } else {
             None
         };
+
+        // —— Link 阶段：顶层 await——算 async 子图（含 TLA 的模块 + 静态导入它们的模块）——
+        let async_ids = async_module_ids(&modules);
 
         // —— codegen 阶段：设 linker cell（驱动）+ 查产物缓存 + 并行 codegen 未命中者 ——
         let ordered: Vec<u32> = (0..next_id).filter(|id| modules.contains_key(id)).collect();
@@ -897,10 +918,19 @@ impl IncrementalBundler {
                     rec.content_key,
                 )
             };
+            // 本模块依赖中落在 async 子图内的（升序去重）——codegen 据此给静态导入点加 `await`。
+            let mut async_deps: Vec<u32> = dep_ids
+                .iter()
+                .map(|(_, tid)| *tid)
+                .filter(|tid| async_ids.contains(tid))
+                .collect();
+            async_deps.sort_unstable();
+            async_deps.dedup();
             let data = LinkerData {
                 deps: dep_ids,
                 keep_exports: keep.get(&id).cloned().flatten(),
                 dyn_chunks,
+                async_deps,
             };
             // body_key 与查缓存仅在启用缓存时做——`hash_linker`（SipHash 全依赖）无缓存时纯浪费。
             // define + minify 指纹混入低 64 位：dev↔prod / minify 开关变化 → 缓存精确失效。
@@ -1104,6 +1134,7 @@ impl IncrementalBundler {
                     self.minify,
                     self.minify,
                     &block_infos,
+                    &async_ids,
                     &self.exec,
                     want_map.then_some(&mut body_starts),
                 );
@@ -1131,8 +1162,15 @@ impl IncrementalBundler {
             }
             Some(g) => {
                 let token = build_token(&normalize(entry), live_ids.len());
-                let (chunks, entry_chunk) =
-                    emit_chunks(&bodies, g, entry_id, &token, self.content_hash);
+                let (chunks, entry_chunk) = emit_chunks(
+                    &bodies,
+                    g,
+                    entry_id,
+                    &token,
+                    &self.public_path,
+                    self.content_hash,
+                    &async_ids,
+                );
                 let bundle = chunks[entry_chunk].code.clone();
                 BuildOutput {
                     bundle,
@@ -1644,7 +1682,12 @@ fn codegen_request(
         let data = linker_vc.read();
         let map: FxHashMap<String, u32> = data.deps.iter().cloned().collect();
         let dyn_chunk: FxHashMap<String, u32> = data.dyn_chunks.iter().cloned().collect();
-        let linker = Linker { map, dyn_chunk };
+        let async_ids: FxHashSet<u32> = data.async_deps.iter().copied().collect();
+        let linker = Linker {
+            map,
+            dyn_chunk,
+            async_ids,
+        };
         let keep = data.keep_exports.as_deref();
         // define / minify / mangle 是每个 bundler 的常量（TaskId 未纳入——同一引擎内不变；
         // 跨引擎无共享内存缓存）。产物磁盘缓存键则由 body_key 混入 define/minify/mangle 指纹区分。
@@ -1875,6 +1918,7 @@ fn parse_module(
         source,
         deps,
         diagnostics: out.diagnostics,
+        has_top_level_await: out.has_top_level_await,
     }
 }
 
@@ -2348,6 +2392,10 @@ fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
 }
 
 /// 拼接各模块（已 codegen 的）函数体 + mini runtime。
+///
+/// `async_ids`：async 子图（顶层 await）。非空时包装器改 `async function`、runtime 换 Promise 感知版、
+/// 且**关闭模块合并**；**为空时逐字节等同于改造前的产物**（无顶层 await 的项目零影响）。
+///
 /// `body_starts`：非 `None` 时，回填「模块 id → 体首行在 bundle 中的 0 基行号」，供
 /// [`merge_bundle_map`] 平移模块内映射。**仅非 minify 分支回填**（minify 分支会重排/改写
 /// 模块体，行偏移法不成立）。
@@ -2357,6 +2405,7 @@ fn emit(
     minify: bool,
     no_esmodule: bool,
     block_infos: &FxHashMap<u32, ConcatBlockInfo>,
+    async_ids: &FxHashSet<u32>,
     exec: &Executor,
     body_starts: Option<&mut Vec<(u32, u32)>>,
 ) -> String {
@@ -2421,131 +2470,145 @@ fn emit(
         // 收集 inline __reg：所有 candidates 的 body 直接内联
         let inline_regs: Vec<String> = candidates.values().map(|b| (**b).clone()).collect();
 
-        // —— 模块合并：将所有非 hoist 模块体拼接到一个闭包，避免命名冲突 ——
-        let concat_id = entry_id + (filtered.len() as u32) + 1000;
-        // 被合并模块是否全为 ESM（恒 strict-safe）→ 给 concat 函数加 `"use strict"`，使**块级函数声明
-        // 变块作用域**，从而可用裸 `{}` 块替代 IIFE 包裹（省 `(function(){`+`})();` 开销）而不发生
-        // 顶层名跨模块碰撞。任一非 ESM（可能依赖 sloppy 语义）→ 全走 IIFE 且不加 strict（保守安全）。
-        let all_esm = filtered
-            .iter()
-            .filter(|(id, _)| *id != entry_id)
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        let all_esm = !all_esm.is_empty()
-            && all_esm
+        // 构建最终模块表。含顶层 await 时**不做模块合并**：合并闭包是单个函数，无法表达
+        // 「其中一部分模块是 async、且彼此有 await 依赖顺序」；退回逐模块注册表（仍是紧凑产物）。
+        let mut final_modules: Vec<(u32, String)> = Vec::new();
+        if async_ids.is_empty() {
+            // —— 模块合并：将所有非 hoist 模块体拼接到一个闭包，避免命名冲突 ——
+            let concat_id = entry_id + (filtered.len() as u32) + 1000;
+            // 被合并模块是否全为 ESM（恒 strict-safe）→ 给 concat 函数加 `"use strict"`，使**块级函数声明
+            // 变块作用域**，从而可用裸 `{}` 块替代 IIFE 包裹（省 `(function(){`+`})();` 开销）而不发生
+            // 顶层名跨模块碰撞。任一非 ESM（可能依赖 sloppy 语义）→ 全走 IIFE 且不加 strict（保守安全）。
+            let all_esm = filtered
                 .iter()
-                .all(|id| block_infos.get(id).is_some_and(|bi| bi.is_esm));
-        let mut concat_body = String::new();
-        if all_esm {
-            concat_body.push_str("\"use strict\";");
-        }
-        // 拓扑排序：确保依赖模块先于消费方执行，避免 _r(N) 返回空的 $
-        filtered = topo_sort_modules(&filtered);
+                .filter(|(id, _)| *id != entry_id)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            let all_esm = !all_esm.is_empty()
+                && all_esm
+                    .iter()
+                    .all(|id| block_infos.get(id).is_some_and(|bi| bi.is_esm));
+            let mut concat_body = String::new();
+            if all_esm {
+                concat_body.push_str("\"use strict\";");
+            }
+            // 拓扑排序：确保依赖模块先于消费方执行，避免 _r(N) 返回空的 $
+            filtered = topo_sort_modules(&filtered);
 
-        // 整体重新赋值 `module.exports` 的 CJS 模块必须留作**独立注册模块**：它们会把
-        // `module.exports` 换成新对象，与 concat 共享的 `$` 分裂成两个导出对象。
-        let mut standalone: FxHashSet<u32> = filtered
-            .iter()
-            .filter(|(id, body)| *id != entry_id && reassigns_module_exports(body))
-            .map(|(id, _)| *id)
-            .collect();
+            // 整体重新赋值 `module.exports` 的 CJS 模块必须留作**独立注册模块**：它们会把
+            // `module.exports` 换成新对象，与 concat 共享的 `$` 分裂成两个导出对象。
+            let mut standalone: FxHashSet<u32> = filtered
+                .iter()
+                .filter(|(id, body)| *id != entry_id && reassigns_module_exports(body))
+                .map(|(id, _)| *id)
+                .collect();
 
-        // **导出名冲突**同理必须降级：concat 让所有成员共享同一个 exports 对象 `$`，两个模块
-        // 写同一个名字就是后者覆盖前者、静默丢值。`default` 尤其必撞——`export default` 是
-        // 最常见的写法，而**每个资源模块恰好都是 `export default "<url>"`**，所以只要有两个
-        // 图片/字体被 import，它们的 URL 就会串（实测 `import a from './a.js'` +
-        // `import b from './b.js'` 各自 `export default` 曾产出 `"BB"` 而非 `"AB"`）。
-        //
-        // 按 id 序「先到先得」：首个占用某导出名的模块留在 concat，之后与之冲突的降级为独立
-        // 注册模块（有自己的 exports 对象）。保留尽可能多的 scope-hoist 收益。
-        {
-            let mut claimed: FxHashSet<String> = FxHashSet::default();
+            // **导出名冲突**同理必须降级：concat 让所有成员共享同一个 exports 对象 `$`，两个模块
+            // 写同一个名字就是后者覆盖前者、静默丢值。`default` 尤其必撞——`export default` 是
+            // 最常见的写法，而**每个资源模块恰好都是 `export default "<url>"`**，所以只要有两个
+            // 图片/字体被 import，它们的 URL 就会串（实测 `import a from './a.js'` +
+            // `import b from './b.js'` 各自 `export default` 曾产出 `"BB"` 而非 `"AB"`）。
+            //
+            // 按 id 序「先到先得」：首个占用某导出名的模块留在 concat，之后与之冲突的降级为独立
+            // 注册模块（有自己的 exports 对象）。保留尽可能多的 scope-hoist 收益。
+            {
+                let mut claimed: FxHashSet<String> = FxHashSet::default();
+                for (id, body) in &filtered {
+                    if *id == entry_id || standalone.contains(id) {
+                        continue;
+                    }
+                    let names = exported_names(body);
+                    if names.iter().any(|n| claimed.contains(n)) {
+                        standalone.insert(*id);
+                    } else {
+                        claimed.extend(names);
+                    }
+                }
+            }
+
+            // 真正并入 concat 的模块 id（供 `_r` 垫片判定）。
+            let concat_member_ids: Vec<u32> = filtered
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| *id != entry_id && !standalone.contains(id))
+                .collect();
+
+            // `_r` 垫片：并入 concat 的模块共享 `$`，其余 id **转发真实 require**
+            // （独立模块有自己的 module.exports，不能返回 `$`）。
+            {
+                let set = concat_member_ids
+                    .iter()
+                    .map(|i| format!("{i}:1"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                concat_body.push_str(&format!(
+                    "_r=function(_o){{var _m={{{set}}};return function(i){{return _m[i]?$:_o(i)}}}}(_r);"
+                ));
+            }
+
             for (id, body) in &filtered {
                 if *id == entry_id || standalone.contains(id) {
                     continue;
                 }
-                let names = exported_names(body);
-                if names.iter().any(|n| claimed.contains(n)) {
-                    standalone.insert(*id);
+                let b = strip_standalone_requires(&compact_body_names(body));
+                // 块安全（ESM 且无 `var`/`this`）+ 整组 strict → 用裸 `{}` 块（strict 下块级函数声明块作用域，
+                // let/const 本就块作用域 → 顶层名不跨块碰撞）。否则用 IIFE 建立真正函数作用域隔离
+                // （`var` 会 hoist 出块、sloppy 下块级函数亦 hoist；曾致 React Symbol 覆盖 scheduler 计数器）。
+                let block_safe = all_esm && block_infos.get(id).is_some_and(|bi| bi.block_safe);
+                if block_safe {
+                    concat_body.push('{');
+                    concat_body.push_str(&b);
+                    concat_body.push('}');
                 } else {
-                    claimed.extend(names);
+                    concat_body.push_str("(function(){");
+                    concat_body.push_str(&b);
+                    concat_body.push_str("})();");
+                }
+            }
+
+            // 收集所有被合并到 concat 模块的原始模块 ID（非入口 + 非 stub + 非独立 CJS）
+            let merged_ids: FxHashSet<u32> = filtered
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| *id != entry_id && !ref_ids.contains(id) && !standalone.contains(id))
+                .collect();
+
+            // 把对已合并模块的 `_r(M)` 重定向到 concat 模块（独立模块保持自己的 id）。
+            let redirect = |body: &str| -> String {
+                let mut nb = compact_body_names(body);
+                for &mid in &merged_ids {
+                    nb = nb.replace(&format!("_r({mid})"), &format!("_r({concat_id})"));
+                }
+                nb
+            };
+
+            // 构建最终模块表：入口 + stubs + 独立 CJS 模块 + 合并模块
+            for (id, body) in &filtered {
+                if *id == entry_id {
+                    final_modules.push((entry_id, redirect(body)));
+                    break;
+                }
+            }
+            for &sid in &ref_ids {
+                final_modules.push((sid, String::new()));
+            }
+            for (id, body) in &filtered {
+                if standalone.contains(id) {
+                    final_modules.push((*id, redirect(body)));
+                }
+            }
+            final_modules.push((concat_id, concat_body));
+        } else {
+            // async 子图存在 → 逐模块注册（`_r` 返回 Promise，由导入点 `await`）。
+            for (id, body) in &filtered {
+                final_modules.push((*id, compact_body_names(body)));
+            }
+            for &sid in &ref_ids {
+                if !final_modules.iter().any(|(i, _)| *i == sid) {
+                    final_modules.push((sid, String::new()));
                 }
             }
         }
-
-        // 真正并入 concat 的模块 id（供 `_r` 垫片判定）。
-        let concat_member_ids: Vec<u32> = filtered
-            .iter()
-            .map(|(id, _)| *id)
-            .filter(|id| *id != entry_id && !standalone.contains(id))
-            .collect();
-
-        // `_r` 垫片：并入 concat 的模块共享 `$`，其余 id **转发真实 require**
-        // （独立模块有自己的 module.exports，不能返回 `$`）。
-        {
-            let set = concat_member_ids
-                .iter()
-                .map(|i| format!("{i}:1"))
-                .collect::<Vec<_>>()
-                .join(",");
-            concat_body.push_str(&format!(
-                "_r=function(_o){{var _m={{{set}}};return function(i){{return _m[i]?$:_o(i)}}}}(_r);"
-            ));
-        }
-
-        for (id, body) in &filtered {
-            if *id == entry_id || standalone.contains(id) {
-                continue;
-            }
-            let b = strip_standalone_requires(&compact_body_names(body));
-            // 块安全（ESM 且无 `var`/`this`）+ 整组 strict → 用裸 `{}` 块（strict 下块级函数声明块作用域，
-            // let/const 本就块作用域 → 顶层名不跨块碰撞）。否则用 IIFE 建立真正函数作用域隔离
-            // （`var` 会 hoist 出块、sloppy 下块级函数亦 hoist；曾致 React Symbol 覆盖 scheduler 计数器）。
-            let block_safe = all_esm && block_infos.get(id).is_some_and(|bi| bi.block_safe);
-            if block_safe {
-                concat_body.push('{');
-                concat_body.push_str(&b);
-                concat_body.push('}');
-            } else {
-                concat_body.push_str("(function(){");
-                concat_body.push_str(&b);
-                concat_body.push_str("})();");
-            }
-        }
-
-        // 收集所有被合并到 concat 模块的原始模块 ID（非入口 + 非 stub + 非独立 CJS）
-        let merged_ids: FxHashSet<u32> = filtered
-            .iter()
-            .map(|(id, _)| *id)
-            .filter(|id| *id != entry_id && !ref_ids.contains(id) && !standalone.contains(id))
-            .collect();
-
-        // 把对已合并模块的 `_r(M)` 重定向到 concat 模块（独立模块保持自己的 id）。
-        let redirect = |body: &str| -> String {
-            let mut nb = compact_body_names(body);
-            for &mid in &merged_ids {
-                nb = nb.replace(&format!("_r({mid})"), &format!("_r({concat_id})"));
-            }
-            nb
-        };
-
-        // 构建最终模块表：入口 + stubs + 独立 CJS 模块 + 合并模块
-        let mut final_modules: Vec<(u32, String)> = Vec::new();
-        for (id, body) in &filtered {
-            if *id == entry_id {
-                final_modules.push((entry_id, redirect(body)));
-                break;
-            }
-        }
-        for &sid in &ref_ids {
-            final_modules.push((sid, String::new()));
-        }
-        for (id, body) in &filtered {
-            if standalone.contains(id) {
-                final_modules.push((*id, redirect(body)));
-            }
-        }
-        final_modules.push((concat_id, concat_body));
         final_modules.sort_by_key(|(id, _)| *id);
 
         let mut out = String::new();
@@ -2575,7 +2638,12 @@ fn emit(
         } else {
             "function __wake_interop_star(m){if(m&&m.__esModule)return m;var ns={};if(m!=null){for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}return ns}"
         };
-        out.push_str("(function(root){var __wake_cache__={};function __wake_require__(id){var cached=__wake_cache__[id];if(cached)return cached.exports;var module={exports:{}};__wake_cache__[id]=module;__wake_modules__[id].call(module.exports,module,module.exports,__wake_require__);return module.exports}");
+        // async 变体：async 模块的包装器返回 Promise → 缓存并返回它，导入方 `await` 得到最终 exports。
+        out.push_str(if async_ids.is_empty() {
+            "(function(root){var __wake_cache__={};function __wake_require__(id){var cached=__wake_cache__[id];if(cached)return cached.exports;var module={exports:{}};__wake_cache__[id]=module;__wake_modules__[id].call(module.exports,module,module.exports,__wake_require__);return module.exports}"
+        } else {
+            "(function(root){var __wake_cache__={};function __wake_require__(id){var cached=__wake_cache__[id];if(cached)return cached.p||cached.exports;var module={exports:{}};__wake_cache__[id]=module;var r=__wake_modules__[id].call(module.exports,module,module.exports,__wake_require__);if(r&&typeof r.then==='function')return module.p=r.then(function(){return module.exports});return module.exports}"
+        });
 
         if !inline_regs.is_empty() {
             out.push_str(";");
@@ -2595,7 +2663,12 @@ fn emit(
             if body.is_empty() {
                 out.push_str(&format!("{}:function(){{}},", id));
             } else {
-                out.push_str(&format!("{}:function(m,$,_r){{", id));
+                let kw = if async_ids.contains(id) {
+                    "async function"
+                } else {
+                    "function"
+                };
+                out.push_str(&format!("{}:{kw}(m,$,_r){{", id));
                 out.push_str(body);
                 out.push_str("},");
             }
@@ -2615,14 +2688,25 @@ fn emit(
             .collect();
 
         let mut out = String::new();
-        out.push_str(PRELUDE);
+        out.push_str(if async_ids.is_empty() {
+            PRELUDE
+        } else {
+            PRELUDE_ASYNC
+        });
         out.push_str("var __wake_modules__ = {\n");
         // SourceMap：逐模块记录其体在 bundle 中的起始行，供调用方平移模块内局部映射。
         // 本分支模块体**逐行原样**拼接（仅前缀 2 空格），故映射平移是 (行 +offset, 列 +2)。
         let mut starts: Vec<(u32, u32)> = Vec::with_capacity(filtered.len());
         let mut line = count_lines(&out);
         for (id, body) in &filtered {
-            let head = format!("{id}: function(module, exports, __wake_require__) {{\n");
+            // async 子图成员的包装器必须是 `async function`：其体内静态导入点被写成
+            // `(await __wake_require__(id))`。
+            let kw = if async_ids.contains(id) {
+                "async function"
+            } else {
+                "function"
+            };
+            let head = format!("{id}: {kw}(module, exports, __wake_require__) {{\n");
             out.push_str(&head);
             line += 1; // 包装头占 1 行
             starts.push((*id, line));
@@ -2748,6 +2832,52 @@ fn merge_bundle_map(
 // 代码分割 emit（多产物，DESIGN §6.3 / PLAN §6.5）
 // ======================================================================
 
+/// 顶层 await 的 **async 子图**：自身含顶层 await 的模块，加上（传递地）**静态 ESM 导入**了
+/// 这类模块的模块。
+///
+/// 静态导入点由 codegen 写成 `(await __wake_require__(id))`，故导入方本身也必须是 `async function`
+/// ——这就是传染的来源，与 esbuild/Rollup 的做法一致。两类边**不**传染：
+/// - 动态 `import()`：本就产出 Promise，`Promise.resolve(...)` 会把 async 模块的 Promise 展平；
+/// - CJS `require()`：调用点可能嵌在普通函数体内，插不进 `await`（同步 require 一个 async 模块
+///   在任何打包器里都无解，见 `docs/TS-SYNTAX-SUPPORT.md` §11）。
+fn async_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
+    // 反向边：被导入者 → 静态 ESM 导入它的模块。
+    let mut importers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&id, rec) in modules {
+        let spec2id: FxHashMap<&str, u32> =
+            rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
+        for dep in &rec.deps {
+            if !matches!(
+                dep.kind,
+                DependencyKind::Import | DependencyKind::ExportFrom
+            ) {
+                continue;
+            }
+            if let Some(&tid) = spec2id.get(dep.specifier.as_str()) {
+                importers.entry(tid).or_default().push(id);
+            }
+        }
+    }
+    let mut set: FxHashSet<u32> = FxHashSet::default();
+    let mut stack: Vec<u32> = Vec::new();
+    for (&id, rec) in modules {
+        if rec.has_top_level_await && set.insert(id) {
+            stack.push(id);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        let Some(list) = importers.get(&id) else {
+            continue;
+        };
+        for &imp in list {
+            if set.insert(imp) {
+                stack.push(imp);
+            }
+        }
+    }
+    set
+}
+
 /// 从模块记录提取 chunk 划分所需的依赖边。
 fn build_module_edges(modules: &FxHashMap<u32, ModuleRec>) -> FxHashMap<u32, ModuleEdges> {
     let mut edges = FxHashMap::default();
@@ -2809,12 +2939,22 @@ fn dyn_chunks_of(rec: &ModuleRec, chunk_graph: Option<&ChunkGraph>) -> Vec<(Stri
 }
 
 /// 渲染一组模块为 `<id>: function(module, exports, __wake_require__) { <body> },` 条目。
-fn render_module_entries(module_ids: &[u32], body_of: &FxHashMap<u32, &Arc<String>>) -> String {
+/// `async_ids` 中的模块（顶层 await 子图）改用 `async function`。
+fn render_module_entries(
+    module_ids: &[u32],
+    body_of: &FxHashMap<u32, &Arc<String>>,
+    async_ids: &FxHashSet<u32>,
+) -> String {
     let mut out = String::new();
     for &id in module_ids {
         if let Some(body) = body_of.get(&id) {
+            let kw = if async_ids.contains(&id) {
+                "async function"
+            } else {
+                "function"
+            };
             out.push_str(&format!(
-                "{id}: function(module, exports, __wake_require__) {{\n"
+                "{id}: {kw}(module, exports, __wake_require__) {{\n"
             ));
             for line in body.lines() {
                 out.push_str("  ");
@@ -2833,7 +2973,9 @@ fn emit_chunks(
     g: &ChunkGraph,
     entry_id: u32,
     token: &str,
+    public_path: &str,
     hashed: bool,
+    async_ids: &FxHashSet<u32>,
 ) -> (Vec<OutputChunk>, usize) {
     let body_of: FxHashMap<u32, &Arc<String>> = bodies.iter().map(|(id, b)| (*id, b)).collect();
 
@@ -2844,7 +2986,7 @@ fn emit_chunks(
         if plan.id == 0 {
             continue;
         }
-        let entries = render_module_entries(&plan.modules, &body_of);
+        let entries = render_module_entries(&plan.modules, &body_of, async_ids);
         let code = render_async_chunk(token, plan.id, &entries);
         let file = chunk_filename(&plan.name, &code, hashed);
         file_of.insert(plan.id, file.clone());
@@ -2872,10 +3014,10 @@ fn emit_chunks(
 
     // 2. 渲染 entry chunk（内嵌 f/d 映射，引用非 entry 的文件名）。
     let entry_plan = g.chunks.iter().find(|c| c.id == 0).expect("entry chunk");
-    let entries = render_module_entries(&entry_plan.modules, &body_of);
+    let entries = render_module_entries(&entry_plan.modules, &body_of, async_ids);
     let f_map = json_file_map(&file_of);
     let d_map = json_deps_map(&g.chunk_deps);
-    let code = render_entry_chunk(token, entry_id, &f_map, &d_map, &entries);
+    let code = render_entry_chunk(token, entry_id, public_path, &f_map, &d_map, &entries);
     let file = chunk_filename(&entry_plan.name, &code, hashed);
     let entry = OutputChunk {
         name: entry_plan.name.clone(),
@@ -2897,15 +3039,22 @@ fn emit_chunks(
     (chunks, entry_chunk)
 }
 
-/// entry chunk：全局 registry bootstrap + f/d 映射 + register 模块 + 运行入口 + 导出。
+/// entry chunk：全局 registry bootstrap + publicPath + f/d 映射 + register 模块 + 运行入口 + 导出。
 fn render_entry_chunk(
     token: &str,
     entry_id: u32,
+    public_path: &str,
     f_map: &str,
     d_map: &str,
     entries: &str,
 ) -> String {
     let mut out = RUNTIME_ENTRY_PRELUDE.replace("__WAKE_NS__", token);
+    // 配置的 `publicPath` 注入运行时（`loadFile` 用它拼 chunk URL）：子路径部署下动态 import()
+    // 才不会按当前页面 URL 相对解析而 404。写在 prelude 之后而非其对象字面量里——registry 可能
+    // 已由同 token 的先前加载建好（`g.__WAKE_NS__ || (...)`），字面量那次不会再跑。
+    out.push_str("__wake__.publicPath = ");
+    push_js_string(&mut out, public_path);
+    out.push_str(";\n");
     out.push_str(&format!("__wake__.f = {f_map};\n"));
     out.push_str(&format!("Object.assign(__wake__.d, {d_map});\n"));
     out.push_str("__wake__.markLoaded(0);\n");
@@ -3000,12 +3149,17 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
             publicPath: "", nreq: null, ndir: ".", npath: null };
   function require(id) {
     var hit = cache[id];
-    if (hit) return hit.exports;
+    if (hit) return hit.p || hit.exports;
     var module = { exports: {} };
     cache[id] = module;
     var fac = modules[id];
     if (!fac) throw new Error("wake: module " + id + " not registered");
-    fac.call(module.exports, module, module.exports, require);
+    var r = fac.call(module.exports, module, module.exports, require);
+    // 顶层 await：async 模块的工厂返回 Promise → 缓存并返回它，导入方 await 后得到最终 exports。
+    if (r && typeof r.then === "function") {
+      module.p = r.then(function () { return module.exports; });
+      return module.p;
+    }
     return module.exports;
   }
   function interopDefault(m) { return m && m.__esModule ? m.default : m; }
@@ -3045,9 +3199,11 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
     p.catch(function () { if (chunkPromises[cid] === p) delete chunkPromises[cid]; });
     return p;
   }
+  // async 模块的 require 返回 Promise，需先解包再取命名空间（同步模块保持原时序）。
+  function nsOf(m) { return m && typeof m.then === "function" ? m.then(interopStar) : interopStar(m); }
   function dynImport(cid, id) {
-    if (cid == null) return Promise.resolve(interopStar(require(id)));
-    return ensure(cid).then(function () { return interopStar(require(id)); });
+    if (cid == null) return Promise.resolve(nsOf(require(id)));
+    return ensure(cid).then(function () { return nsOf(require(id)); });
   }
   require.import = dynImport;
   W.require = require; W.register = register; W.markLoaded = markLoaded;
