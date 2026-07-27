@@ -396,13 +396,12 @@ impl IncrementalBundler {
                     Ok(Loaded {
                         source: src,
                         source_type: st,
-                        asset,
+                        assets: module_assets,
                         css,
                     }) => {
-                        // 带外产物：超阈值资源文件 + prod 抽取的 CSS 文本（按模块 id 记序）。
-                        if let Some(a) = asset {
-                            collected_assets.push(a);
-                        }
+                        // 带外产物：超阈值资源文件（JS import 的资源 + CSS `url()` 引出的
+                        // 字体/图片）+ prod 抽取的 CSS 文本（按模块 id 记序）。
+                        collected_assets.extend(module_assets);
                         if let Some(text) = css {
                             collected_css.push((id, text));
                         }
