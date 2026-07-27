@@ -4,9 +4,9 @@
 //! `node_modules` 逐级向上 + `package.json` 的 `main`/`module` 字段 + 结果缓存。
 //! `exports`/`imports` 字段、tsconfig paths、browser 字段、symlink 是 resolver v2（DESIGN §4.7 / P4）。
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use wake_common::{FileSystem, FxHashMap, fs::normalize};
 
@@ -69,7 +69,9 @@ pub struct Resolver {
     fs: Arc<dyn FileSystem>,
     options: ResolveOptions,
     /// `(from_dir, specifier)` → 解析结果（`None` = 未找到）。
-    cache: RefCell<FxHashMap<(PathBuf, String), Option<PathBuf>>>,
+    /// `Mutex` 而非 `RefCell`：使 `Resolver: Sync`，让打包器能经 `Arc<Resolver>` 在工作窃取
+    /// 执行器上**并行 resolve**（临界区仅包住 cache 的 get/insert，昂贵的 FS 探测在锁外，竞争极小）。
+    cache: Mutex<FxHashMap<(PathBuf, String), Option<PathBuf>>>,
     /// Yarn PnP 清单。`Some` 时裸说明符走 PnP 依赖图（不走 `node_modules` 上溯）。
     pnp: Option<Arc<PnpManifest>>,
 }
@@ -83,7 +85,7 @@ impl Resolver {
         Resolver {
             fs,
             options,
-            cache: RefCell::new(FxHashMap::default()),
+            cache: Mutex::new(FxHashMap::default()),
             pnp: None,
         }
     }
@@ -106,7 +108,7 @@ impl Resolver {
         Resolver {
             fs,
             options,
-            cache: RefCell::new(FxHashMap::default()),
+            cache: Mutex::new(FxHashMap::default()),
             pnp: Some(manifest),
         }
     }
@@ -114,11 +116,16 @@ impl Resolver {
     /// 从 `from_dir` 解析 `specifier` 到一个规范文件路径。
     pub fn resolve(&self, specifier: &str, from_dir: &Path) -> Result<PathBuf, ResolveError> {
         let key = (from_dir.to_path_buf(), specifier.to_string());
-        if let Some(cached) = self.cache.borrow().get(&key) {
-            return cached.clone().ok_or_else(|| self.err(specifier, from_dir));
+        // 先取 cache（锁瞬间释放：`.cloned()` 拷出 Option 后 guard 即析构）——**关键**是别把锁
+        // 持到 `resolve_uncached` 的 FS 探测期间，否则并行退化为串行。
+        let cached = self.cache.lock().unwrap().get(&key).cloned();
+        if let Some(resolved) = cached {
+            return resolved.ok_or_else(|| self.err(specifier, from_dir));
         }
+        // 未命中：昂贵的 FS 探测在锁外进行（并行的收益全在这里）。两个线程同 key 竞争时都会算一遍
+        // 再各自 insert——幂等无害，换取零锁争用。
         let resolved = self.resolve_uncached(specifier, from_dir);
-        self.cache.borrow_mut().insert(key, resolved.clone());
+        self.cache.lock().unwrap().insert(key, resolved.clone());
         resolved.ok_or_else(|| self.err(specifier, from_dir))
     }
 
