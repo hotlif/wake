@@ -104,7 +104,7 @@ struct AppState {
     /// HMR 事件广播（消息本身为 JSON 文本）。
     tx: broadcast::Sender<String>,
     /// 注入了 HMR client 脚本的 HTML 外壳。
-    html: String,
+    html: Arc<RwLock<String>>,
     /// 代理规则（已编译）；命中前缀的请求转发到后端 target。
     proxies: Arc<Vec<CompiledProxy>>,
     /// `public/` 静态资源目录（对齐 crustify / Vite：原样映射到 URL 根）。
@@ -174,7 +174,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
             )));
         }
     };
-    let html = load_html_template(&root);
+    let html = Arc::new(RwLock::new(load_html_template(&root)));
 
     let sty = Sty::detect();
     let bundle = Arc::new(RwLock::new(BundleState {
@@ -202,6 +202,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     {
         let bundle = bundle.clone();
         let tx = tx.clone();
+        let html = html.clone();
         let entry = entry.clone();
         let watch_root = root.clone();
         std::thread::Builder::new()
@@ -211,6 +212,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
                     watch_root,
                     entry,
                     bundle,
+                    html,
                     tx,
                     ready_tx,
                     sty,
@@ -367,6 +369,7 @@ fn watch_and_rebuild(
     root: PathBuf,
     entry: PathBuf,
     bundle: Arc<RwLock<BundleState>>,
+    html: Arc<RwLock<String>>,
     tx: broadcast::Sender<String>,
     ready_tx: mpsc::Sender<Option<BuildSummary>>,
     sty: Sty,
@@ -393,7 +396,7 @@ fn watch_and_rebuild(
     let summary = rebuild(&mut bundler, &entry, &bundle, &tx, true, sty);
     let _ = ready_tx.send(summary);
 
-    // notify：监听 src（存在则）否则根目录，避开 node_modules/dist 的海量文件。
+    // notify：源码与 public 分开监听，避免递归监听整个项目带来的 node_modules/dist 噪声。
     let watch_dir = {
         let src = root.join("src");
         if src.is_dir() { src } else { root.clone() }
@@ -417,6 +420,21 @@ fn watch_and_rebuild(
         eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), watch_dir.display());
         return;
     }
+    let public_dir = root.join("public");
+    if public_dir.is_dir()
+        && public_dir != watch_dir
+        && let Err(e) = watcher.watch(&public_dir, RecursiveMode::Recursive)
+    {
+        eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), public_dir.display());
+        return;
+    }
+    // 同时支持位于项目根的 `index.html`，仅监听根目录本身，不递归进入依赖与产物目录。
+    if root != watch_dir
+        && let Err(e) = watcher.watch(&root, RecursiveMode::NonRecursive)
+    {
+        eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), root.display());
+        return;
+    }
     loop {
         // 阻塞等第一个事件。
         if evt_rx.recv().is_err() {
@@ -426,6 +444,8 @@ fn watch_and_rebuild(
         // 再排空同批事件直到 20ms 静默（防抖）。
         std::thread::sleep(Duration::from_millis(30));
         while evt_rx.recv_timeout(Duration::from_millis(20)).is_ok() {}
+        // HTML 外壳不经过 bundler，必须在通知浏览器刷新前单独刷新共享模板。
+        *html.write().unwrap() = load_html_template(&root);
         let _ = rebuild(&mut bundler, &entry, &bundle, &tx, false, sty);
     }
 }
@@ -456,6 +476,7 @@ fn is_watched_ext(e: &str) -> bool {
             | "mts"
             | "cts"
             | "json"
+            | "html"
             | "css"
             | "raw"
             // 图片
@@ -599,10 +620,11 @@ async fn serve_client() -> HttpResponse {
 
 /// 服务 HTML（含 SPA fallback：任何未知 GET 路径都回退到应用外壳）。
 async fn serve_html(data: web::Data<AppState>) -> HttpResponse {
+    let html = data.html.read().unwrap().clone();
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .insert_header(("Cache-Control", "no-cache"))
-        .body(data.html.clone())
+        .body(html)
 }
 
 /// 默认服务，按序尝试：
@@ -944,6 +966,11 @@ mod tests {
         assert!(h.contains("/__wake/client.js"));
         assert!(h.contains("/bundle.js"));
         assert!(h.contains("id=\"root\""));
+    }
+
+    #[test]
+    fn html_changes_are_watched() {
+        assert!(is_watched_ext("html"));
     }
 
     #[test]
