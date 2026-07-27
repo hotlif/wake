@@ -78,8 +78,15 @@ fn human_dur(d: Duration) -> String {
 
 /// 当前产物状态（跨线程共享）。
 struct BundleState {
-    /// 最近一次成功构建的 JS 产物。
+    /// 最近一次成功构建的**入口** chunk（服务于 `/bundle.js`）。
     js: String,
+    /// 非入口 chunk：`文件名 → 源码`。代码分割后由运行时以
+    /// `<script src=publicPath+file>` 拉取，dev 必须能按文件名提供。
+    chunks: std::collections::HashMap<String, String>,
+    /// 带外资源产物：`文件名 → 字节`（超阈值的图片/字体等）。
+    assets: std::collections::HashMap<String, Vec<u8>>,
+    /// 最近一次构建的 Source Map V3 JSON（`None` = 未产出）。CRUSTIFY-PARITY §M4d。
+    map: Option<String>,
     /// 若最近一次构建失败，格式化后的诊断文本；否则 `None`。
     error: Option<String>,
 }
@@ -93,6 +100,8 @@ struct AppState {
     html: String,
     /// 代理规则（已编译）；命中前缀的请求转发到后端 target。
     proxies: Arc<Vec<CompiledProxy>>,
+    /// `public/` 静态资源目录（对齐 crustify / Vite：原样映射到 URL 根）。
+    public_dir: PathBuf,
 }
 
 /// Dev server 选项（由 CLI 读 `wake.config.toml` 装配）。CRUSTIFY-PARITY §M3。
@@ -163,6 +172,9 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     let sty = Sty::detect();
     let bundle = Arc::new(RwLock::new(BundleState {
         js: String::new(),
+        chunks: std::collections::HashMap::new(),
+        assets: std::collections::HashMap::new(),
+        map: None,
         error: None,
     }));
     let (tx, _rx) = broadcast::channel::<String>(64);
@@ -254,6 +266,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
         tx,
         html,
         proxies: Arc::new(proxies),
+        public_dir: root.join("public"),
     });
     actix_web::rt::System::new().block_on(async move {
         HttpServer::new(move || {
@@ -262,6 +275,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
                 // 放宽负载上限，便于代理转发较大的 POST 请求体。
                 .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
                 .route("/bundle.js", web::get().to(serve_bundle))
+                .route("/bundle.js.map", web::get().to(serve_bundle_map))
                 .route("/__wake/client.js", web::get().to(serve_client))
                 .route("/__wake_hmr", web::get().to(ws_handler))
                 // 默认服务：先试代理转发（任意方法），未命中且为 GET 则回退 SPA HTML。
@@ -346,6 +360,18 @@ fn watch_and_rebuild(
     // 别名（@/@@）+ define（dev 口径）须在首次 build 前设置，dev 与 build 一致。
     bundler.set_resolve_options(resolve_options);
     bundler.set_define(define);
+    // dev 走非 minify 单包路径 → 可产出精确 sourcemap（CRUSTIFY-PARITY §M4d）。
+    bundler.enable_sourcemap();
+    // 零运行时 CSS-in-JS（§M5）：dev 不抽取 `.css`，抽出的样式随模块体 `<style>` 注入，
+    // 与 `.css` 模块的 dev 行为一致。项目未用 Linaria 时零开销。
+    bundler.enable_css_in_js();
+    // 代码分割：与 prod 行为一致——动态 `import()` 切出 async chunk。此前 dev 不开分割，
+    // 懒加载模块被内联进单包（能跑但不懒加载），与生产产物结构不一致、掩盖分割相关问题。
+    bundler.enable_code_splitting();
+    // JSX **dev runtime**：`jsxDEV` 携带 `{fileName,lineNumber,columnNumber}`，
+    // React DevTools 借此显示组件栈、报错能定位到源文件行列（对齐 crustify 的 dev 口径）。
+    // 该口径已混入 `content_key`，与 prod 的模块摘要缓存互不干扰。
+    bundler.set_jsx_runtime(true, "react");
     // 首次构建。
     rebuild(&mut bundler, &entry, &bundle, &tx, true, sty);
     let _ = ready_tx.send(());
@@ -395,13 +421,44 @@ fn is_source_event(ev: &notify::Event) -> bool {
         ev.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     ) && ev.paths.iter().any(|p| {
-        p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-            matches!(
-                e,
-                "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "json" | "css"
-            )
-        })
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(is_watched_ext)
     })
+}
+
+/// 触发重建的扩展名。
+///
+/// 图片与字体必须在内：它们既可能被 JS `import`，也可能被 CSS 的 `url()` 引用，两条路径
+/// 都会把字节内容（dev 下是 base64 内联）打进产物——换一张图不重建，页面就还是旧的。
+fn is_watched_ext(e: &str) -> bool {
+    matches!(
+        e,
+        "ts" | "tsx"
+            | "js"
+            | "jsx"
+            | "mts"
+            | "cts"
+            | "json"
+            | "css"
+            | "raw"
+            // 图片
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "svg"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "bmp"
+            // 字体
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+    )
 }
 
 /// 执行一次（增量）构建并更新共享状态 + 广播 HMR 事件。
@@ -437,7 +494,30 @@ fn rebuild(
     } else {
         {
             let mut s = bundle.write().unwrap();
-            s.js = out.bundle;
+            // 追加 sourceMappingURL 让 DevTools 自动拉取（外链 .map，不膨胀 bundle 体积）。
+            let map = out.chunks[out.entry_chunk].source_map.clone();
+            s.js = if map.is_some() {
+                format!("{}\n//# sourceMappingURL=/bundle.js.map\n", out.bundle)
+            } else {
+                out.bundle.clone()
+            };
+            // 非入口 chunk 按**文件名**登记：运行时以 `<script src=publicPath+file>` 拉取，
+            // dev 必须能按同名提供。此前未登记 → 请求落到 SPA fallback 拿到 HTML，
+            // 浏览器把 HTML 当 JS 执行报语法错误。
+            s.chunks = out
+                .chunks
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != out.entry_chunk)
+                .map(|(_, c)| (c.file_name.clone(), c.code.clone()))
+                .collect();
+            // 带外资源产物（超阈值图片/字体等）同理按文件名提供。
+            s.assets = out
+                .assets
+                .iter()
+                .map(|a| (a.file_name.clone(), a.bytes.clone()))
+                .collect();
+            s.map = map;
             s.error = None;
         }
         let label = if first { "首次构建" } else { "热重建" };
@@ -475,6 +555,17 @@ async fn serve_bundle(data: web::Data<AppState>) -> HttpResponse {
         .body(js)
 }
 
+/// 提供 `/bundle.js.map`（DevTools 依 `sourceMappingURL` 自动拉取）。
+async fn serve_bundle_map(data: web::Data<AppState>) -> HttpResponse {
+    match data.bundle.read().unwrap().map.clone() {
+        Some(map) => HttpResponse::Ok()
+            .content_type("application/json; charset=utf-8")
+            .insert_header(("Cache-Control", "no-cache"))
+            .body(map),
+        None => HttpResponse::NotFound().body("no source map"),
+    }
+}
+
 async fn serve_client() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("application/javascript; charset=utf-8")
@@ -489,7 +580,16 @@ async fn serve_html(data: web::Data<AppState>) -> HttpResponse {
         .body(data.html.clone())
 }
 
-/// 默认服务：命中代理前缀 → 转发到后端（任意方法）；否则 GET 回退 SPA HTML、其它方法 404。
+/// 默认服务，按序尝试：
+/// ① 代理前缀（任意方法）→ 转发后端；
+/// ② 分割产生的 async/shared **chunk**（按文件名）；
+/// ③ 带外**资源产物**（超阈值图片/字体等）；
+/// ④ **`public/` 静态文件**（对齐 crustify / Vite，原样映射到 URL 根）；
+/// ⑤ SPA 回退 —— **仅当路径不像文件时**。
+///
+/// ⑤ 的限定是关键：此前任何未知 GET 都返回 HTML，于是 `/logo.png`、`/a.chunk.js` 一律拿到
+/// 200 + HTML —— 浏览器把 HTML 当 JS 执行报语法错误、当图片渲染则空白，且**看不出是 404**。
+/// 现在带扩展名的路径未命中即 404（对齐 webpack-dev-server 的 `disableDotRule: false`）。
 async fn serve_default(
     req: HttpRequest,
     body: web::Bytes,
@@ -498,10 +598,92 @@ async fn serve_default(
     if let Some(i) = data.proxies.iter().position(|p| p.matches(req.path())) {
         return forward(&req, body, &data.proxies[i]).await;
     }
-    if req.method() == actix_web::http::Method::GET {
-        serve_html(data).await
-    } else {
-        HttpResponse::NotFound().finish()
+    if req.method() != actix_web::http::Method::GET {
+        return HttpResponse::NotFound().finish();
+    }
+
+    let rel = req.path().trim_start_matches('/');
+
+    // ② chunk（内存）
+    if let Some(code) = data.bundle.read().unwrap().chunks.get(rel).cloned() {
+        return HttpResponse::Ok()
+            .content_type("application/javascript; charset=utf-8")
+            .insert_header(("Cache-Control", "no-cache"))
+            .body(code);
+    }
+    // ③ 资源产物（内存）
+    if let Some(bytes) = data.bundle.read().unwrap().assets.get(rel).cloned() {
+        return HttpResponse::Ok()
+            .content_type(mime_for(rel))
+            .insert_header(("Cache-Control", "no-cache"))
+            .body(bytes);
+    }
+    // ④ public/ 静态文件
+    if let Some((bytes, ct)) = read_public_file(&data.public_dir, rel) {
+        return HttpResponse::Ok()
+            .content_type(ct)
+            .insert_header(("Cache-Control", "no-cache"))
+            .body(bytes);
+    }
+    // ⑤ SPA 回退：仅无扩展名的路径（前端路由），形似文件者 404。
+    if looks_like_file(rel) {
+        return HttpResponse::NotFound()
+            .content_type("text/plain; charset=utf-8")
+            .body(format!("wake dev: 未找到 `/{rel}`"));
+    }
+    serve_html(data).await
+}
+
+/// 路径末段是否含扩展名（`assets/a.png` → true；`users/1` → false）。
+fn looks_like_file(rel: &str) -> bool {
+    rel.rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains('.'))
+}
+
+/// 从 `public/` 读取静态文件；返回 `(字节, content-type)`。
+///
+/// **防目录穿越**：规范化后必须仍在 `public_dir` 之内，否则拒绝——`/../../etc/passwd`
+/// 这类请求不得逃出该目录。
+fn read_public_file(public_dir: &Path, rel: &str) -> Option<(Vec<u8>, &'static str)> {
+    if rel.is_empty() {
+        return None;
+    }
+    let candidate = public_dir.join(rel);
+    let real = candidate.canonicalize().ok()?;
+    let base = public_dir.canonicalize().ok()?;
+    if !real.starts_with(&base) || !real.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&real).ok()?;
+    Some((bytes, mime_for(rel)))
+}
+
+/// 按扩展名给 content-type（仅覆盖 dev 常见类型，未知走 octet-stream）。
+fn mime_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "js" | "mjs" | "cjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "txt" => "text/plain; charset=utf-8",
+        "wasm" => "application/wasm",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
     }
 }
 
@@ -770,5 +952,66 @@ mod tests {
         assert!(!p.matches("/assets/x"));
         // 无 rewrite → 原样。
         assert_eq!(p.rewrite("/api/x"), "/api/x");
+    }
+}
+
+#[cfg(test)]
+mod static_serving_tests {
+    use super::*;
+
+    #[test]
+    fn spa_fallback_only_for_extensionless_paths() {
+        // 带扩展名 → 视为文件请求，未命中应 404（而非返回 HTML）
+        assert!(looks_like_file("a.page.1234.js"));
+        assert!(looks_like_file("assets/logo.png"));
+        assert!(looks_like_file("styles.css"));
+        // 前端路由 → 回退 SPA
+        assert!(!looks_like_file("users/1"));
+        assert!(!looks_like_file("about"));
+        assert!(!looks_like_file(""));
+        // 目录形式的路径也按路由处理
+        assert!(!looks_like_file("docs/getting-started"));
+    }
+
+    #[test]
+    fn mime_covers_dev_common_types() {
+        assert!(mime_for("a.js").contains("javascript"));
+        assert!(mime_for("a.mjs").contains("javascript"));
+        assert_eq!(mime_for("a.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for("a.png"), "image/png");
+        assert_eq!(mime_for("a.svg"), "image/svg+xml");
+        assert_eq!(mime_for("a.woff2"), "font/woff2");
+        assert!(mime_for("a.json").contains("json"));
+        // 未知扩展名不猜测
+        assert_eq!(mime_for("a.xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn public_file_is_served_and_traversal_is_blocked() {
+        let dir = std::env::temp_dir().join("wake_dev_public_test");
+        let pubdir = dir.join("public");
+        std::fs::create_dir_all(pubdir.join("sub")).unwrap();
+        std::fs::write(pubdir.join("note.txt"), b"HELLO").unwrap();
+        std::fs::write(pubdir.join("sub").join("a.css"), b".x{}").unwrap();
+        // 目录外的敏感文件
+        std::fs::write(dir.join("secret.txt"), b"SECRET").unwrap();
+
+        let (bytes, ct) = read_public_file(&pubdir, "note.txt").expect("应能读到 public 文件");
+        assert_eq!(bytes, b"HELLO");
+        assert!(ct.contains("text/plain"));
+
+        let (_, ct2) = read_public_file(&pubdir, "sub/a.css").expect("子目录也应可读");
+        assert!(ct2.contains("text/css"));
+
+        // 目录穿越必须被拒（否则 dev server 可读到项目任意文件）
+        assert!(
+            read_public_file(&pubdir, "../secret.txt").is_none(),
+            "目录穿越应被拒绝"
+        );
+        assert!(read_public_file(&pubdir, "nope.txt").is_none());
+        // 目录本身不是文件
+        assert!(read_public_file(&pubdir, "sub").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
