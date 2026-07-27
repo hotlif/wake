@@ -1773,3 +1773,315 @@ fn pnp_bundle_runs_in_node() {
         out.bundle
     );
 }
+
+// ============================================================
+// 顶层 await（DESIGN §6.1.1）
+// ============================================================
+
+/// index → cfg（顶层 await）→ raw。async 子图 = {index, cfg}，raw 保持同步。
+fn tla_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import { port } from './cfg.js';\n\
+             export const url = 'http://host:' + port;",
+        ),
+        (
+            "src/cfg.js",
+            "import { raw } from './raw.js';\n\
+             const loaded = await Promise.resolve(raw);\n\
+             export const port = loaded + 1;",
+        ),
+        ("src/raw.js", "export const raw = 8079;"),
+    ])
+}
+
+/// 消费 async 入口：`module.exports` 是 Promise，await 后断言导出值。
+fn tla_entry_script(bundle_path: &Path) -> String {
+    format!(
+        "Promise.resolve(require({:?})).then(m => {{ \
+           if (m.url !== 'http://host:8080') {{ console.error('url=', m.url); process.exit(2); }} \
+           process.stdout.write('OK'); \
+         }}).catch(e => {{ console.error(e); process.exit(3); }});",
+        bundle_path.to_string_lossy()
+    )
+}
+
+#[test]
+fn top_level_await_marks_async_subgraph() {
+    let out = IncrementalBundler::new(Arc::new(tla_fixture())).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.module_count, 3);
+    // cfg（含 TLA）与 index（静态导入 cfg）是 async；raw 不受影响。
+    assert!(
+        out.bundle
+            .contains("0: async function(module, exports, __wake_require__)"),
+        "index 应为 async 包装:\n{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle
+            .contains("1: async function(module, exports, __wake_require__)"),
+        "cfg 应为 async 包装:\n{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle
+            .contains("2: function(module, exports, __wake_require__)"),
+        "raw 应保持同步包装:\n{}",
+        out.bundle
+    );
+    // 静态导入点插入 await；同步依赖不插。
+    assert!(
+        out.bundle
+            .contains("const _wm0 = (await __wake_require__(1));"),
+        "index 对 cfg 的导入应 await:\n{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("const _wm0 = __wake_require__(2);"),
+        "cfg 对 raw 的导入不应 await:\n{}",
+        out.bundle
+    );
+    // runtime 换成 Promise 感知版。
+    assert!(out.bundle.contains("return cached.p || cached.exports;"));
+}
+
+#[test]
+fn no_top_level_await_keeps_sync_runtime() {
+    // 无顶层 await 的项目：产物不得出现 async 包装 / Promise 感知 runtime（旧路径逐字节不变）。
+    let out = IncrementalBundler::new(Arc::new(fixture())).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        !out.bundle.contains("async function(module"),
+        "{}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("cached.p"), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("(await __wake_require__"),
+        "{}",
+        out.bundle
+    );
+}
+
+#[test]
+fn top_level_await_bundle_runs_in_node() {
+    if !node_available() {
+        eprintln!("node 不可用，跳过顶层 await e2e");
+        return;
+    }
+    let out = IncrementalBundler::new(Arc::new(tla_fixture())).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let dir = std::env::temp_dir().join("wake_bundle_tla_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(tla_entry_script(&bundle_path))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn top_level_await_minified_bundle_runs_in_node() {
+    if !node_available() {
+        eprintln!("node 不可用，跳过顶层 await minify e2e");
+        return;
+    }
+    let mut b = IncrementalBundler::new(Arc::new(tla_fixture()));
+    b.enable_minify();
+    b.enable_mangle();
+    b.enable_tree_shaking();
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    // 含顶层 await → 退出模块合并，回到逐模块注册表 + async 包装。
+    assert!(
+        out.bundle.contains("async function(m,$,_r)"),
+        "minify 路径应有 async 包装:\n{}",
+        out.bundle
+    );
+
+    let dir = std::env::temp_dir().join("wake_bundle_tla_min_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(tla_entry_script(&bundle_path))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn dynamic_import_of_tla_module_keeps_importer_sync() {
+    if !node_available() {
+        eprintln!("node 不可用，跳过动态 import TLA e2e");
+        return;
+    }
+    // 动态 import 不传染 async：入口保持同步，`import()` 的 Promise 自动展平到目标求值完成。
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "export function load() { return import('./slow.js').then(m => m.value); }",
+        ),
+        (
+            "src/slow.js",
+            "const v = await Promise.resolve(41);\nexport const value = v + 1;",
+        ),
+    ]);
+    let out = IncrementalBundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle
+            .contains("0: function(module, exports, __wake_require__)"),
+        "入口不应因动态 import 变 async:\n{}",
+        out.bundle
+    );
+
+    let dir = std::env::temp_dir().join("wake_bundle_tla_dyn_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+
+    let script = format!(
+        "require({:?}).load().then(v => {{ \
+           if (v !== 42) {{ console.error('value=', v); process.exit(2); }} \
+           process.stdout.write('OK'); \
+         }}).catch(e => {{ console.error(e); process.exit(3); }});",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn top_level_await_across_code_split_chunks_runs_in_node() {
+    if !node_available() {
+        eprintln!("node 不可用，跳过顶层 await 代码分割 e2e");
+        return;
+    }
+    // async chunk 里的模块含顶层 await：`__wake_require__.import` 需等它求值完成再取命名空间。
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "export const eager = 1;\n\
+             export function load() { return import('./lazy.js').then(m => m.value); }",
+        ),
+        (
+            "src/lazy.js",
+            "const base = await Promise.resolve(40);\nexport const value = base + 2;",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_code_splitting();
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let async_chunk = out.chunks.iter().find(|c| !c.is_entry).unwrap();
+    assert!(
+        async_chunk
+            .code
+            .contains("async function(module, exports, __wake_require__)"),
+        "async chunk 内的 TLA 模块应 async 包装:\n{}",
+        async_chunk.code
+    );
+
+    let dir = std::env::temp_dir().join("wake_split_tla_e2e");
+    let _ = std::fs::remove_dir_all(&dir);
+    let entry = write_chunks(&out, &dir);
+
+    let script = format!(
+        "const app = require({:?});\n\
+         app.load().then(v => {{ \
+           if (v !== 42) {{ console.error('value=', v); process.exit(2); }} \
+           process.stdout.write('OK'); \
+         }}).catch(e => {{ console.error(e); process.exit(3); }});",
+        entry.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn top_level_await_survives_persistent_cache() {
+    // 关键路径：摘要命中 → 跳过 parse，`has_top_level_await` 只能来自缓存摘要。
+    // 若摘要不带该标志，热缓存产物会退回同步包装 → 加载即 SyntaxError。
+    let cache_path = std::env::temp_dir().join("wake_pcache_tla.bin");
+    let _ = std::fs::remove_file(&cache_path);
+
+    let ref_out = IncrementalBundler::new(Arc::new(tla_fixture())).build(Path::new("src/index.js"));
+    assert!(!ref_out.has_errors(), "{:?}", ref_out.diagnostics);
+
+    let mut b1 = IncrementalBundler::new(Arc::new(tla_fixture()));
+    b1.enable_persistent_cache(cache_path.clone());
+    let out1 = b1.build(Path::new("src/index.js"));
+    assert!(!out1.has_errors(), "{:?}", out1.diagnostics);
+    assert_eq!(out1.bundle, ref_out.bundle, "开缓存首遍须与无缓存产物一致");
+
+    // 全新 bundler（内存 memo 空），从磁盘载入热缓存。
+    let mut b2 = IncrementalBundler::new(Arc::new(tla_fixture()));
+    b2.enable_persistent_cache(cache_path.clone());
+    let out2 = b2.build(Path::new("src/index.js"));
+    assert!(!out2.has_errors(), "{:?}", out2.diagnostics);
+    assert_eq!(out2.bundle, ref_out.bundle, "热缓存新进程产物须逐字节一致");
+    assert_eq!(b2.task_exec_count(), 0, "热缓存：parse + codegen 全部跳过");
+
+    let _ = std::fs::remove_file(&cache_path);
+}
+
+#[test]
+fn top_level_await_in_non_incremental_bundler() {
+    // 非增量 `Bundler`（MVP 直接执行路径）同样要产出 async 包装，否则是加载即报错的坏包。
+    let out = Bundler::new(Arc::new(tla_fixture())).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.module_count, 3);
+    assert!(
+        out.bundle
+            .contains("async function(module, exports, __wake_require__)"),
+        "应有 async 包装:\n{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("(await __wake_require__("),
+        "静态导入点应 await:\n{}",
+        out.bundle
+    );
+    assert!(out.bundle.contains("return cached.p || cached.exports;"));
+}

@@ -199,6 +199,93 @@ fn ts_as_const_assertion() {
     assert!(!out.has_errors(), "<const> 解析错误: {:?}", out.diagnostics);
 }
 
+// ============================================================
+// 顶层 await（ES2022）
+// ============================================================
+
+#[test]
+fn top_level_await_parses_in_modules() {
+    let interner = Interner::new();
+    for st in [
+        SourceType::Module,
+        SourceType::TypeScript,
+        SourceType::Jsx,
+        SourceType::Tsx,
+    ] {
+        let out = parse("const a = await fetch('u');", &interner, st);
+        assert!(
+            !out.has_errors(),
+            "{st:?} 顶层 await 解析错误: {:?}",
+            out.diagnostics
+        );
+        assert!(out.has_top_level_await, "{st:?} 未标记 has_top_level_await");
+    }
+}
+
+#[test]
+fn top_level_await_forms() {
+    let interner = Interner::new();
+    for src in [
+        "await import('./m.js');",
+        "for await (const x of xs) { use(x); }",
+        "export const v = await load();",
+        "if (cond) { const r = await go(); }",
+        "const [a, b] = await Promise.all([p1, p2]);",
+    ] {
+        let out = parse(src, &interner, SourceType::Module);
+        assert!(
+            !out.has_errors(),
+            "顶层 await 解析错误 {src:?}: {:?}",
+            out.diagnostics
+        );
+        assert!(out.has_top_level_await, "{src:?} 未标记 has_top_level_await");
+    }
+}
+
+#[test]
+fn await_inside_functions_is_not_top_level() {
+    // 函数/方法/箭头/static 块内的 await 不得把模块标成 async 模块。
+    let interner = Interner::new();
+    for src in [
+        "async function f() { await p; }",
+        "const f = async () => await p;",
+        "class C { async m() { await p; } }",
+        "async function* g() { for await (const x of xs) {} }",
+        "const o = { async m() { await p; } };",
+    ] {
+        let out = parse(src, &interner, SourceType::Module);
+        assert!(
+            !out.has_errors(),
+            "解析错误 {src:?}: {:?}",
+            out.diagnostics
+        );
+        assert!(
+            !out.has_top_level_await,
+            "{src:?} 被误标为顶层 await"
+        );
+    }
+}
+
+#[test]
+fn top_level_await_rejected_in_script_and_sync_fn() {
+    let interner = Interner::new();
+    // Script 不是模块：`await x` 不是 await 表达式（`await` 退化为标识符，两个标识符相邻 → 报错）。
+    let out = parse("const a = await fetch('u');", &interner, SourceType::Script);
+    assert!(out.has_errors(), "Script 顶层 await 不应被接受");
+    assert!(!out.has_top_level_await);
+    // 非 async 函数体内仍禁止（不因模块顶层放行而泄漏进去）。
+    let out = parse(
+        "function f() { const a = await g(); }",
+        &interner,
+        SourceType::Module,
+    );
+    assert!(out.has_errors(), "非 async 函数内 await 不应被接受");
+    assert!(!out.has_top_level_await);
+    // class static 块同理（规范禁止）。
+    let out = parse("class C { static { const a = await g(); } }", &interner, SourceType::Module);
+    assert!(out.has_errors(), "static 块内 await 不应被接受");
+}
+
 #[test]
 fn no_panic_on_garbage() {
     // 错误恢复：乱码不应 panic，且总能到达 EOF。
