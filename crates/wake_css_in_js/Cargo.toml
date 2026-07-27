@@ -1,0 +1,17 @@
+[package]
+name = "wake_css_in_js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "零运行时 CSS-in-JS（Linaria / wyw-in-js 子集）：构建期抽取 css`` 为静态 CSS。CRUSTIFY-PARITY §M5"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+
+[dev-dependencies]
+wake_ecma_parser.workspace = true

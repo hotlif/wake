@@ -2210,6 +2210,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wake_css_in_js"
+version = "0.1.0"
+dependencies = [
+ "wake_common",
+ "wake_ecma_ast",
+ "wake_ecma_parser",
+]
+
+[[package]]
 name = "wake_dev_server"
 version = "0.1.0"
 dependencies = [
