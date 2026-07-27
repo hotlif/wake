@@ -33,7 +33,7 @@ use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
-use crate::loader::{LoadOptions, Loaded, load_source};
+use crate::loader::{LoadOptions, Loaded, load_source, push_js_string};
 use crate::{BuildOutput, ChunkKind, Linker, OutputAsset, OutputChunk, POSTLUDE, PRELUDE};
 
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
@@ -267,7 +267,8 @@ impl IncrementalBundler {
         self
     }
 
-    /// 资源 URL / chunk 加载的 `publicPath` 前缀（如 `/app/`）。
+    /// 资源 URL / chunk 加载的 `publicPath` 前缀（如 `/app/`）。前者由 loader 拼进模块导出的 URL，
+    /// 后者由 entry chunk 注入运行时 `__wake__.publicPath`（`loadFile` 拼 async chunk 的 `script.src`）。
     pub fn set_public_path(&mut self, public_path: impl Into<String>) -> &mut Self {
         self.public_path = public_path.into();
         self
@@ -720,8 +721,14 @@ impl IncrementalBundler {
             }
             Some(g) => {
                 let token = build_token(&normalize(entry), live_ids.len());
-                let (chunks, entry_chunk) =
-                    emit_chunks(&bodies, g, entry_id, &token, self.content_hash);
+                let (chunks, entry_chunk) = emit_chunks(
+                    &bodies,
+                    g,
+                    entry_id,
+                    &token,
+                    &self.public_path,
+                    self.content_hash,
+                );
                 let bundle = chunks[entry_chunk].code.clone();
                 BuildOutput {
                     bundle,
@@ -1780,6 +1787,7 @@ fn emit_chunks(
     g: &ChunkGraph,
     entry_id: u32,
     token: &str,
+    public_path: &str,
     hashed: bool,
 ) -> (Vec<OutputChunk>, usize) {
     let body_of: FxHashMap<u32, &Arc<String>> = bodies.iter().map(|(id, b)| (*id, b)).collect();
@@ -1821,7 +1829,7 @@ fn emit_chunks(
     let entries = render_module_entries(&entry_plan.modules, &body_of);
     let f_map = json_file_map(&file_of);
     let d_map = json_deps_map(&g.chunk_deps);
-    let code = render_entry_chunk(token, entry_id, &f_map, &d_map, &entries);
+    let code = render_entry_chunk(token, entry_id, public_path, &f_map, &d_map, &entries);
     let file = chunk_filename(&entry_plan.name, &code, hashed);
     let entry = OutputChunk {
         name: entry_plan.name.clone(),
@@ -1842,15 +1850,22 @@ fn emit_chunks(
     (chunks, entry_chunk)
 }
 
-/// entry chunk：全局 registry bootstrap + f/d 映射 + register 模块 + 运行入口 + 导出。
+/// entry chunk：全局 registry bootstrap + publicPath + f/d 映射 + register 模块 + 运行入口 + 导出。
 fn render_entry_chunk(
     token: &str,
     entry_id: u32,
+    public_path: &str,
     f_map: &str,
     d_map: &str,
     entries: &str,
 ) -> String {
     let mut out = RUNTIME_ENTRY_PRELUDE.replace("__WAKE_NS__", token);
+    // 配置的 `publicPath` 注入运行时（`loadFile` 用它拼 chunk URL）：子路径部署下动态 import()
+    // 才不会按当前页面 URL 相对解析而 404。写在 prelude 之后而非其对象字面量里——registry 可能
+    // 已由同 token 的先前加载建好（`g.__WAKE_NS__ || (...)`），字面量那次不会再跑。
+    out.push_str("__wake__.publicPath = ");
+    push_js_string(&mut out, public_path);
+    out.push_str(";\n");
     out.push_str(&format!("__wake__.f = {f_map};\n"));
     out.push_str(&format!("Object.assign(__wake__.d, {d_map});\n"));
     out.push_str("__wake__.markLoaded(0);\n");
