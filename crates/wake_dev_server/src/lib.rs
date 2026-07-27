@@ -45,10 +45,10 @@ impl Sty {
         }
     }
     fn brand(&self, s: &str) -> String {
-        self.p("\x1b[1;35m", s)
+        self.p("\x1b[1;38;5;213m", s)
     }
     fn ok(&self, s: &str) -> String {
-        self.p("\x1b[32m", s)
+        self.p("\x1b[1;38;5;114m", s)
     }
     fn err(&self, s: &str) -> String {
         self.p("\x1b[31m", s)
@@ -57,7 +57,7 @@ impl Sty {
         self.p("\x1b[2m", s)
     }
     fn accent(&self, s: &str) -> String {
-        self.p("\x1b[36m", s)
+        self.p("\x1b[38;5;81m", s)
     }
     fn bold(&self, s: &str) -> String {
         self.p("\x1b[1m", s)
@@ -70,10 +70,17 @@ impl Sty {
 fn human_dur(d: Duration) -> String {
     let ms = d.as_secs_f64() * 1000.0;
     if ms < 1000.0 {
-        format!("{:.0}ms", ms.max(1.0))
+        format!("{:.0} ms", ms.max(1.0))
     } else {
-        format!("{:.2}s", ms / 1000.0)
+        format!("{:.2} s", ms / 1000.0)
     }
+}
+
+struct BuildSummary {
+    modules: usize,
+    chunks: usize,
+    assets: usize,
+    duration: String,
 }
 
 /// 当前产物状态（跨线程共享）。
@@ -179,18 +186,19 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     }));
     let (tx, _rx) = broadcast::channel::<String>(64);
 
-    // 品牌行（在首次构建前打印）。
+    // 品牌行保持克制；运行状态与构建数据在首次构建结束后统一展示。
     println!();
     println!(
-        "  {} {} {}",
+        "  {}  {} {} {}  {}",
         sty.warn("⚡"),
-        sty.brand("wake dev"),
+        sty.brand("wake"),
+        sty.dim("/"),
+        sty.bold("dev"),
         sty.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
     );
-    println!();
 
     // —— 监听线程：独占 bundler，负责首次构建 + 增量重建 + 广播 ——
-    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Option<BuildSummary>>();
     {
         let bundle = bundle.clone();
         let tx = tx.clone();
@@ -213,7 +221,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
             .expect("spawn watcher thread");
     }
     // 等首次构建完成再开始服务（保证第一屏有产物）。
-    let _ = ready_rx.recv();
+    let summary = ready_rx.recv().ok().flatten();
 
     // 浏览器展示地址：0.0.0.0 时用 localhost。
     let display_host = if host == "0.0.0.0" {
@@ -222,38 +230,47 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
         host.as_str()
     };
     let url = format!("http://{display_host}:{port}/");
-    let entry_rel = entry
-        .strip_prefix(&root)
-        .unwrap_or(&entry)
-        .display()
-        .to_string();
+
+    if let Some(summary) = &summary {
+        println!();
+        println!(
+            "  {}  {}",
+            sty.ok("●"),
+            sty.bold(&format!("Ready in {}", summary.duration))
+        );
+    }
+
     println!();
-    println!(
-        "  {}  {}   {}",
-        sty.accent("➜"),
-        sty.bold("本地:"),
-        sty.accent(&url)
-    );
-    println!(
-        "  {}  {}   {}",
-        sty.accent("➜"),
-        sty.bold("入口:"),
-        sty.dim(&entry_rel)
-    );
+    println!("     {}  {}", sty.dim("Local"), sty.accent(&url));
+
+    if let Some(summary) = summary {
+        println!();
+        println!(
+            "     {}   {}   {}",
+            sty.accent(&format!("{} modules", summary.modules)),
+            sty.dim(&format!("{} chunks", summary.chunks)),
+            sty.dim(&format!("{} assets", summary.assets))
+        );
+        println!(
+            "     {}",
+            sty.dim("HMR on  ·  source maps on  ·  watching for changes")
+        );
+    }
+
     if !proxies.is_empty() {
+        println!();
         for p in &proxies {
             println!(
-                "  {}  {}   {} {} {}",
-                sty.accent("➜"),
-                sty.bold("代理:"),
+                "     {}  {} {} {}",
+                sty.dim("Proxy"),
                 sty.dim(&p.context.join(",")),
-                sty.dim("→"),
-                sty.dim(&p.target)
+                sty.accent("→"),
+                sty.accent(&p.target)
             );
         }
     }
     println!();
-    println!("  {}", sty.dim("监听中… 保存源码即热重载"));
+    println!("     {}", sty.dim("Press Ctrl+C to stop"));
     println!();
 
     // 自动打开浏览器（启动后）。
@@ -351,7 +368,7 @@ fn watch_and_rebuild(
     entry: PathBuf,
     bundle: Arc<RwLock<BundleState>>,
     tx: broadcast::Sender<String>,
-    ready_tx: mpsc::Sender<()>,
+    ready_tx: mpsc::Sender<Option<BuildSummary>>,
     sty: Sty,
     resolve_options: ResolveOptions,
     define: Vec<(String, String)>,
@@ -373,8 +390,8 @@ fn watch_and_rebuild(
     // 该口径已混入 `content_key`，与 prod 的模块摘要缓存互不干扰。
     bundler.set_jsx_runtime(true, "react");
     // 首次构建。
-    rebuild(&mut bundler, &entry, &bundle, &tx, true, sty);
-    let _ = ready_tx.send(());
+    let summary = rebuild(&mut bundler, &entry, &bundle, &tx, true, sty);
+    let _ = ready_tx.send(summary);
 
     // notify：监听 src（存在则）否则根目录，避开 node_modules/dist 的海量文件。
     let watch_dir = {
@@ -400,7 +417,6 @@ fn watch_and_rebuild(
         eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), watch_dir.display());
         return;
     }
-
     loop {
         // 阻塞等第一个事件。
         if evt_rx.recv().is_err() {
@@ -410,7 +426,7 @@ fn watch_and_rebuild(
         // 再排空同批事件直到 20ms 静默（防抖）。
         std::thread::sleep(Duration::from_millis(30));
         while evt_rx.recv_timeout(Duration::from_millis(20)).is_ok() {}
-        rebuild(&mut bundler, &entry, &bundle, &tx, false, sty);
+        let _ = rebuild(&mut bundler, &entry, &bundle, &tx, false, sty);
     }
 }
 
@@ -469,7 +485,7 @@ fn rebuild(
     tx: &broadcast::Sender<String>,
     first: bool,
     sty: Sty,
-) {
+) -> Option<BuildSummary> {
     let t = Instant::now();
     let out = bundler.build(entry);
     let dur = human_dur(t.elapsed());
@@ -491,7 +507,14 @@ fn rebuild(
             eprintln!("    {}", sty.dim(line));
         }
         let _ = tx.send(msg_error(&err));
+        None
     } else {
+        let summary = BuildSummary {
+            modules: out.module_count,
+            chunks: out.chunks.len(),
+            assets: out.assets.len(),
+            duration: dur.clone(),
+        };
         {
             let mut s = bundle.write().unwrap();
             // 追加 sourceMappingURL 让 DevTools 自动拉取（外链 .map，不膨胀 bundle 体积）。
@@ -520,17 +543,19 @@ fn rebuild(
             s.map = map;
             s.error = None;
         }
-        let label = if first { "首次构建" } else { "热重建" };
-        eprintln!(
-            "  {}  {}  {sep}  {}  {sep}  {}",
-            sty.ok("✓"),
-            sty.bold(label),
-            sty.accent(&format!("{} 模块", out.module_count)),
-            sty.accent(&dur),
-        );
+        if !first {
+            eprintln!(
+                "  {}  {}  {sep}  {}  {sep}  {}",
+                sty.ok("✓"),
+                sty.bold("已更新"),
+                sty.accent(&format!("{} 模块", out.module_count)),
+                sty.dim(&format!("耗时 {dur}")),
+            );
+        }
         if !first {
             let _ = tx.send(r#"{"type":"reload"}"#.to_string());
         }
+        Some(summary)
     }
 }
 
