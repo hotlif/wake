@@ -1,6 +1,7 @@
 import { StrictMode, useMemo, useState } from 'react';
-import type { CSSProperties, ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { css, cx } from '@linaria/core';
 
 // ============================================================
 // 枚举（值语义 → IIFE 降级）
@@ -230,12 +231,211 @@ const initialTodos: TodoItem[] = [
   { id: 3, title: 'Write a short summary', done: false, priority: 'low', status: TaskStatus.Active },
 ];
 
-const cardStyle: CSSProperties = {
-  background: '#fff',
-  border: '1px solid #e2e8f0',
-  borderRadius: 16,
-  padding: 20,
+// ============================================================
+// 样式：@linaria/core 零运行时 CSS-in-JS
+// css`` 在构建期被抽取为静态 CSS，表达式本身替换为类名字符串
+// ============================================================
+
+// design token：顶层纯数据常量，css`` 里的 `${theme.x}` 在构建期静态求值
+const theme = {
+  ink: '#0f172a',
+  soft: '#cbd5e1',
+  muted: '#64748b',
+  line: '#e2e8f0',
+  accent: '#2563eb',
+  danger: '#b91c1c',
+  dangerSoft: '#fee2e2',
+  surface: '#fff',
+  radius: '16px',
+  radiusSm: '12px',
+  pill: '999px',
+  shadow: '0 10px 30px rgba(15,23,42,0.15)',
+  shadowSoft: '0 6px 20px rgba(15,23,42,0.08)',
 };
+
+const page = css`
+  font-family: sans-serif;
+  max-width: 760px;
+  margin: 40px auto;
+  padding: 24px;
+`;
+
+// 嵌套选择器：`h1` / `p` 展开为 `.hero h1` / `.hero p`
+const hero = css`
+  background: ${theme.ink};
+  color: #fff;
+  border-radius: ${theme.radius};
+  padding: 24px;
+  margin-bottom: 24px;
+  box-shadow: ${theme.shadow};
+
+  h1 {
+    margin-top: 0;
+  }
+
+  p {
+    margin-bottom: 0;
+    color: ${theme.soft};
+  }
+`;
+
+const statsGrid = css`
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+`;
+
+const statCard = css`
+  background: ${theme.surface};
+  border: 1px solid ${theme.line};
+  border-radius: ${theme.radius};
+  padding: 16px;
+  box-shadow: ${theme.shadowSoft};
+`;
+
+const statLabel = css`
+  color: ${theme.muted};
+  font-size: 14px;
+`;
+
+const statValue = css`
+  font-size: 28px;
+  font-weight: 700;
+  margin-top: 6px;
+`;
+
+const card = css`
+  background: ${theme.surface};
+  border: 1px solid ${theme.line};
+  border-radius: ${theme.radius};
+  padding: 20px;
+`;
+
+// 与 card 组合使用（cx）：卡片之间的间距
+const cardGap = css`
+  margin-bottom: 24px;
+`;
+
+const sectionTitle = css`
+  margin-top: 0;
+`;
+
+const formRow = css`
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+`;
+
+const titleInput = css`
+  flex: 1;
+  min-width: 220px;
+  padding: 10px 12px;
+`;
+
+const prioritySelect = css`
+  padding: 10px 12px;
+`;
+
+const addButton = css`
+  padding: 10px 16px;
+  cursor: pointer;
+`;
+
+const listHeader = css`
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+
+  h2 {
+    margin: 0;
+  }
+`;
+
+const filterGroup = css`
+  display: flex;
+  gap: 8px;
+  align-items: center;
+`;
+
+const filterButton = css`
+  border: none;
+  padding: 8px 12px;
+  border-radius: ${theme.pill};
+  background: ${theme.line};
+  color: ${theme.ink};
+  cursor: pointer;
+`;
+
+// 必须定义在 filterButton 之后：抽取出的 CSS 保持声明序，同优先级时后者胜出
+const filterButtonActive = css`
+  background: ${theme.accent};
+  color: #fff;
+`;
+
+const sortButton = css`
+  border: 1px solid ${theme.soft};
+  padding: 8px 12px;
+  border-radius: ${theme.pill};
+  cursor: pointer;
+`;
+
+const list = css`
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+`;
+
+const emptyState = css`
+  padding: 16px;
+  color: ${theme.muted};
+  text-align: center;
+`;
+
+const todoRow = css`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid ${theme.line};
+  border-radius: ${theme.radiusSm};
+  padding: 12px 14px;
+`;
+
+const todoMain = css`
+  display: flex;
+  align-items: center;
+  gap: 12px;
+`;
+
+const todoTitle = css`
+  font-weight: 600;
+`;
+
+const todoTitleDone = css`
+  text-decoration: line-through;
+`;
+
+const badge = css`
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: ${theme.danger};
+  background: ${theme.dangerSoft};
+  border-radius: 6px;
+  padding: 2px 6px;
+`;
+
+const todoMeta = css`
+  color: ${theme.muted};
+`;
+
+const removeButton = css`
+  padding: 8px 12px;
+  cursor: pointer;
+`;
 
 function App() {
   const [todos, setTodos] = useState<TodoItem[]>(initialTodos);
@@ -301,144 +501,86 @@ function App() {
     setSortDir((dir) => (dir === SortDirection.Asc ? SortDirection.Desc : SortDirection.Asc));
 
   return (
-    <div style={{ fontFamily: 'sans-serif', maxWidth: 760, margin: '40px auto', padding: 24 }}>
-      <div
-        style={{
-          background: '#0f172a',
-          color: '#fff',
-          borderRadius: 16,
-          padding: 24,
-          marginBottom: 24,
-          boxShadow: '0 10px 30px rgba(15,23,42,0.15)',
-        }}
-      >
-        <h1 style={{ marginTop: 0 }}>Task Dashboard</h1>
-        <p style={{ marginBottom: 0, color: '#cbd5e1' }}>
+    <div className={page}>
+      <div className={hero}>
+        <h1>Task Dashboard</h1>
+        <p>
           A small React demo with state, filtering, and live summaries — {collection.describe()}.
         </p>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, marginBottom: 24 }}>
+      <div className={statsGrid}>
         <StatCard label="Completed" value={summary.completed} />
         <StatCard label="Pending" value={summary.pending} />
         <StatCard label="High Priority" value={summary.highPriority} />
       </div>
 
-      <section
-        style={{
-          background: '#fff',
-          border: '1px solid #e2e8f0',
-          borderRadius: 16,
-          padding: 20,
-          marginBottom: 24,
-        }}
-      >
-        <h2 style={{ marginTop: 0 }}>Add a task</h2>
-        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+      <section className={cx(card, cardGap)}>
+        <h2 className={sectionTitle}>Add a task</h2>
+        <div className={formRow}>
           <input
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             placeholder="Enter a task title"
-            style={{ flex: 1, minWidth: 220, padding: '10px 12px' }}
+            className={titleInput}
           />
           <select
             value={priority}
             onChange={(event) => setPriority(event.target.value as Priority)}
-            style={{ padding: '10px 12px' }}
+            className={prioritySelect}
           >
             <option value="low">Low</option>
             <option value="medium">Medium</option>
             <option value="high">High</option>
           </select>
-          <button onClick={addTodo} style={{ padding: '10px 16px', cursor: 'pointer' }}>
+          <button onClick={addTodo} className={addButton}>
             Add
           </button>
         </div>
       </section>
 
-      <section style={cardStyle}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <h2 style={{ margin: 0 }}>Task List</h2>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <section className={card}>
+        <div className={listHeader}>
+          <h2>Task List</h2>
+          <div className={filterGroup}>
             {FILTERS.map((item) => (
               <button
                 key={item}
                 onClick={() => setFilter(item)}
-                style={{
-                  border: 'none',
-                  padding: '8px 12px',
-                  borderRadius: 999,
-                  background: filter === item ? '#2563eb' : '#e2e8f0',
-                  color: filter === item ? '#fff' : '#0f172a',
-                  cursor: 'pointer',
-                }}
+                className={cx(filterButton, filter === item && filterButtonActive)}
               >
                 {item}
               </button>
             ))}
-            <button
-              onClick={toggleSort}
-              style={{ border: '1px solid #cbd5e1', padding: '8px 12px', borderRadius: 999, cursor: 'pointer' }}
-            >
+            <button onClick={toggleSort} className={sortButton}>
               Sort: {sortDir === SortDirection.Asc ? 'A→Z' : 'Z→A'}
             </button>
           </div>
         </div>
 
-        <div style={{ marginTop: 16, display: 'grid', gap: 12 }}>
+        <div className={list}>
           <List
             items={filteredTodos}
             getKey={(todo) => todo.id}
-            empty={
-              <div style={{ padding: 16, color: '#64748b', textAlign: 'center' }}>
-                No tasks match the current filter.
-              </div>
-            }
+            empty={<div className={emptyState}>No tasks match the current filter.</div>}
           >
             {(todo) => (
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                  border: '1px solid #e2e8f0',
-                  borderRadius: 12,
-                  padding: '12px 14px',
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div className={todoRow}>
+                <div className={todoMain}>
                   <input type="checkbox" checked={todo.done} onChange={() => toggleTodo(todo.id)} />
                   <div>
-                    <div style={{ textDecoration: todo.done ? 'line-through' : 'none', fontWeight: 600 }}>
+                    <div className={cx(todoTitle, todo.done && todoTitleDone)}>
                       {todo.title}
-                      {isHigh(todo) && (
-                        <span
-                          style={{
-                            marginLeft: 8,
-                            fontSize: 11,
-                            fontWeight: 700,
-                            color: '#b91c1c',
-                            background: '#fee2e2',
-                            borderRadius: 6,
-                            padding: '2px 6px',
-                          }}
-                        >
-                          HIGH
-                        </span>
-                      )}
+                      {isHigh(todo) && <span className={badge}>HIGH</span>}
                     </div>
-                    <small style={{ color: '#64748b' }}>
+                    <small className={todoMeta}>
                       Priority: {todo.priority} · Status: {TaskUtils.statusLabel(todo.status)} · Weight:{' '}
                       {TaskUtils.weightOf(todo)}
                     </small>
                   </div>
                 </div>
 
-                <button
-                  onClick={() => removeTodo(todo.id)}
-                  style={{ padding: '8px 12px', cursor: 'pointer' }}
-                >
+                <button onClick={() => removeTodo(todo.id)} className={removeButton}>
                   Remove
                 </button>
               </div>
@@ -453,17 +595,9 @@ function App() {
 function StatCard({ label, value }: { label: string; value: number }) {
   const format: CountFormatter = (n) => `${n}`;
   return (
-    <div
-      style={{
-        background: '#fff',
-        border: '1px solid #e2e8f0',
-        borderRadius: 16,
-        padding: 16,
-        boxShadow: '0 6px 20px rgba(15,23,42,0.08)',
-      }}
-    >
-      <div style={{ color: '#64748b', fontSize: 14 }}>{label}</div>
-      <div style={{ fontSize: 28, fontWeight: 700, marginTop: 6 }}>{format(value)}</div>
+    <div className={statCard}>
+      <div className={statLabel}>{label}</div>
+      <div className={statValue}>{format(value)}</div>
     </div>
   );
 }

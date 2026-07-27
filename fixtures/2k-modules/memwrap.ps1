@@ -14,7 +14,7 @@ while (!$p.HasExited) {
     $p.Refresh()
     $ws = $p.WorkingSet64
     if ($ws -gt $peak) { $peak = $ws }
-    Start-Sleep -Milliseconds 100
+    Start-Sleep -Milliseconds 20
 }
 $p.WaitForExit()
 
