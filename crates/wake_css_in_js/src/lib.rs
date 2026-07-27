@@ -104,6 +104,10 @@ pub struct TransformResult {
     /// `span → 替换源码`（标签模板 span → JS 字符串字面量）。喂给 codegen 的
     /// `MinifyCtx::expression_replacements`。
     pub replacements: FxHashMap<Span, String>,
+    /// 替换文本直接复用了原源码的表达式范围；mangler 必须保留其中引用的绑定名。
+    pub verbatim_replacement_spans: Vec<Span>,
+    /// 已被完整静态消解、可从 codegen 删除的 CSS-in-JS import 语句。
+    pub removable_import_spans: Vec<Span>,
     /// 本模块抽取出的 CSS（已按声明序拼接）。
     pub css: String,
     /// 求值失败等诊断（警告级，不中断构建）。
@@ -137,14 +141,16 @@ pub fn is_css_in_js_source(specifier: &str) -> bool {
 pub fn transform(
     program: &Program,
     interner: &Interner,
+    source: &str,
     seed: &str,
     imported: &value::Scope,
 ) -> TransformResult {
     let mut out = TransformResult::default();
 
-    // 1) 找出本模块把 `css` 绑定成了哪个本地名（支持 `import { css as c }`）。
+    // 1) 找出本模块把 `css` / `cx` 绑定成了哪些本地名（支持别名）。
     let tags = collect_css_tags(program, interner);
-    if tags.is_empty() {
+    let cx_bindings = collect_named_bindings(program, interner, "cx");
+    if tags.is_empty() && cx_bindings.is_empty() {
         return out;
     }
 
@@ -166,21 +172,65 @@ pub fn transform(
     };
 
     // 3) 遍历 AST，处理每个 `css` 标签模板。
-    let mut collector = Collector {
+    if !tags.is_empty() {
+        let mut collector = Collector {
+            interner,
+            tags: &tags,
+            ctx: &ctx,
+            seed,
+            out: &mut out,
+            name_hint: None,
+            counter: 0,
+        };
+        collector.visit_program(program);
+    }
+
+    // 4) `cx` 的 atomic-class 冲突语义不能盲目降级成 join。只有能证明每个可能出现的
+    // class 都是单个非 atomic token 时才替换；未知调用保留原包依赖。
+    let mut usage = CssInJsUsage {
         interner,
+        source,
         tags: &tags,
+        cx_bindings: &cx_bindings,
         ctx: &ctx,
-        seed,
         out: &mut out,
-        name_hint: None,
-        counter: 0,
+        css_safe: true,
+        cx_safe: true,
     };
-    collector.visit_program(program);
+    usage.visit_program(program);
+
+    // import 的全部 specifier 都已消解时删整条语句，codegen 不再发出 require，
+    // 随后的 dead-module elimination 就能把 @linaria/core 从模块图中移除。
+    for stmt in program.body.iter() {
+        let Statement::Import(imp) = stmt else {
+            continue;
+        };
+        if !is_css_in_js_source(&interner.resolve(imp.source)) || imp.specifiers.is_empty() {
+            continue;
+        }
+        let removable = imp.specifiers.iter().all(|spec| match spec {
+            ImportSpecifier::Named { imported, .. } => {
+                let name = match imported {
+                    ModuleExportName::Ident(id) => interner.resolve(id.name),
+                    ModuleExportName::String(a) => interner.resolve(*a),
+                };
+                (name == "css" && usage.css_safe) || (name == "cx" && usage.cx_safe)
+            }
+            _ => false,
+        });
+        if removable {
+            usage.out.removable_import_spans.push(imp.span);
+        }
+    }
     out
 }
 
 /// 收集 `import { css } from '@linaria/core'` 绑定的本地名。
 fn collect_css_tags(program: &Program, interner: &Interner) -> Vec<String> {
+    collect_named_bindings(program, interner, "css")
+}
+
+fn collect_named_bindings(program: &Program, interner: &Interner, wanted: &str) -> Vec<String> {
     let mut tags = Vec::new();
     for stmt in program.body.iter() {
         let Statement::Import(imp) = stmt else {
@@ -199,13 +249,117 @@ fn collect_css_tags(program: &Program, interner: &Interner) -> Vec<String> {
                     ModuleExportName::Ident(id) => interner.resolve(id.name),
                     ModuleExportName::String(a) => interner.resolve(*a),
                 };
-                if imported_name == "css" {
+                if imported_name == wanted {
                     tags.push(interner.resolve(local.name));
                 }
             }
         }
     }
     tags
+}
+
+struct CssInJsUsage<'a, 'b> {
+    interner: &'a Interner,
+    source: &'a str,
+    tags: &'a [String],
+    cx_bindings: &'a [String],
+    ctx: &'a value::EvalCtx<'a>,
+    out: &'b mut TransformResult,
+    css_safe: bool,
+    cx_safe: bool,
+}
+
+impl CssWalk for CssInJsUsage<'_, '_> {
+    fn interner(&self) -> &Interner {
+        self.interner
+    }
+    fn tags(&self) -> &[String] {
+        self.tags
+    }
+    fn swap_hint(&mut self, _hint: Option<String>) -> Option<String> {
+        None
+    }
+    fn on_css(&mut self, _tt: &TaggedTemplateExpression) {}
+
+    fn visit_expression(&mut self, expr: &Expression) {
+        if let Expression::TaggedTemplate(tt) = expr
+            && is_css_tag(self.interner, self.tags, &tt.tag)
+        {
+            for expression in tt.quasi.expressions.iter() {
+                self.visit_expression(expression);
+            }
+            return;
+        }
+        if let Expression::Call(call) = expr
+            && is_named_binding(self.interner, self.cx_bindings, &call.callee)
+        {
+            if call.optional
+                || !call
+                    .arguments
+                    .iter()
+                    .all(|arg| known_non_atomic_class(arg, self.ctx))
+            {
+                self.cx_safe = false;
+            } else if let Some(replacement) = cx_replacement(call, self.source) {
+                self.out.replacements.insert(call.span, replacement);
+                self.out.verbatim_replacement_spans.push(call.span);
+            } else {
+                self.cx_safe = false;
+            }
+            for argument in call.arguments.iter() {
+                self.visit_expression(argument);
+            }
+            return;
+        }
+        if let Expression::Identifier(id) = expr {
+            let name = self.interner.resolve(id.name);
+            if self.tags.contains(&name) {
+                self.css_safe = false;
+            }
+            if self.cx_bindings.contains(&name) {
+                self.cx_safe = false;
+            }
+        }
+        walk_expression_children(self, expr);
+    }
+}
+
+fn is_named_binding(interner: &Interner, bindings: &[String], expr: &Expression) -> bool {
+    matches!(expr, Expression::Identifier(id) if bindings.contains(&interner.resolve(id.name)))
+}
+
+fn known_non_atomic_class(expr: &Expression, ctx: &value::EvalCtx) -> bool {
+    match value::eval(expr, ctx) {
+        Some(StaticValue::Str(value)) => {
+            value.is_empty()
+                || (!value.chars().any(char::is_whitespace) && !value.starts_with("atm_"))
+        }
+        Some(StaticValue::Null | StaticValue::Undefined | StaticValue::Bool(false)) => true,
+        _ => match expr {
+            // `condition && knownClass`: truthy 时一定得到右侧 class，falsy 时会被 filter 删除。
+            Expression::Logical(logical) if logical.operator == LogicalOperator::And => {
+                known_non_atomic_class(&logical.right, ctx)
+            }
+            Expression::Conditional(conditional) => {
+                known_non_atomic_class(&conditional.consequent, ctx)
+                    && known_non_atomic_class(&conditional.alternate, ctx)
+            }
+            _ => false,
+        },
+    }
+}
+
+fn cx_replacement(call: &CallExpression, source: &str) -> Option<String> {
+    let mut out = String::from("[");
+    for (index, argument) in call.arguments.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        let span = argument.span();
+        out.push_str(source.get(span.lo as usize..span.hi as usize)?);
+    }
+    out.push_str("].filter(Boolean).join(\" \")");
+    Some(out)
 }
 
 /// 类名生成：`变量名_hash8`，hash 只由「模块路径 + 模块内序号」决定。

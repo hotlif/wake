@@ -16,7 +16,7 @@ fn run_with(src: &str, imported: &Scope) -> TransformResult {
     let out = parse(src, &it, SourceType::Tsx);
     assert!(!out.has_errors(), "parse 失败: {:?}", out.diagnostics);
     out.module
-        .with_ast(|p| transform(p, &it, "src/a.tsx", imported))
+        .with_ast(|p| transform(p, &it, src, "src/a.tsx", imported))
 }
 
 const IMPORT: &str = "import { css } from '@linaria/core';\n";
@@ -52,6 +52,36 @@ fn supports_import_alias() {
     let r = run("import { css as c } from '@linaria/core';\nconst box = c`color: red;`;");
     assert_eq!(r.replacements.len(), 1, "应支持 import 别名");
     assert!(r.css.contains("color: red"));
+}
+
+#[test]
+fn lowers_safe_cx_calls_and_removes_fully_consumed_import() {
+    let src = "import { css, cx as merge } from '@linaria/core';\n\
+               const base = css`color:red;`;\n\
+               const active = css`font-weight:bold;`;\n\
+               const value = merge(base, enabled && active);";
+    let r = run(src);
+    assert_eq!(r.replacements.len(), 3);
+    assert_eq!(r.removable_import_spans.len(), 1);
+    assert!(
+        r.replacements
+            .values()
+            .any(|text| text.contains(".filter(Boolean).join(\" \")")),
+        "{:?}",
+        r.replacements
+    );
+}
+
+#[test]
+fn keeps_cx_runtime_when_atomic_or_unknown_classes_are_possible() {
+    for src in [
+        "import { cx } from '@linaria/core'; const value = cx('atm_color_a', 'atm_color_b');",
+        "import { cx } from '@linaria/core'; const value = cx(props.className);",
+    ] {
+        let r = run(src);
+        assert!(r.replacements.is_empty(), "{:?}", r.replacements);
+        assert!(r.removable_import_spans.is_empty());
+    }
 }
 
 #[test]
@@ -159,10 +189,10 @@ fn class_name_differs_across_modules() {
     let out = parse(&src, &it, SourceType::Tsx);
     let a = out
         .module
-        .with_ast(|p| transform(p, &it, "src/a.tsx", &Scope::default()));
+        .with_ast(|p| transform(p, &it, &src, "src/a.tsx", &Scope::default()));
     let b = out
         .module
-        .with_ast(|p| transform(p, &it, "src/b.tsx", &Scope::default()));
+        .with_ast(|p| transform(p, &it, &src, "src/b.tsx", &Scope::default()));
     assert_ne!(
         a.replacements.values().next(),
         b.replacements.values().next(),

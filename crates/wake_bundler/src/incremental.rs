@@ -34,10 +34,10 @@ use wake_ecma_codegen::{
     codegen_module_shaken_with_map, concat_block_info,
 };
 use wake_ecma_minify::{
-    MinifyCtx, SimplifyAction, analyze_dce, analyze_vars, collect_init_map, is_undefined_shadowed,
-    plan_simplifications,
+    MinifyCtx, SimplifyAction, analyze_dce, analyze_vars_with_model, collect_init_map, has_hazard,
+    is_undefined_shadowed, plan_mangle_with_model_and_protected, plan_simplifications,
 };
-use wake_ecma_parser::parse_with;
+use wake_ecma_parser::{analyze, parse_with};
 use wake_graph::{
     ImportUse, LiveResult, ModuleLiveness, collect_module_liveness, collect_static_uses,
     compute_live_keep,
@@ -58,11 +58,10 @@ type Content = Arc<str>;
 /// 「说明符 → 内部模块 id」映射（dep 顺序确定，指纹稳定）。
 type DepIds = Vec<(String, u32)>;
 
-/// scan 阶段单模块的解析结果：(依赖, 静态使用, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
+/// scan 阶段单模块的解析结果：(依赖, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
 /// 摘要命中时后两者为 `None`（不 parse）；未命中时携带新 parse 的 AST 与句柄。
 type ScanParsed = (
     Vec<ParsedDep>,
-    Vec<(String, ImportUse)>,
     bool,
     Option<Arc<ParsedModule>>,
     Option<Vc<ParsedModule>>,
@@ -187,8 +186,6 @@ struct ModuleRec {
     content_vc: Vc<Content>,
     /// 依赖（来自 parse 或缓存摘要）。
     deps: Vec<ParsedDep>,
-    /// 静态使用（Tree Shaking 用；来自 parse 或缓存摘要；仅在需要时填充）。
-    uses: Vec<(String, ImportUse)>,
     dep_ids: DepIds,
     /// 绑定级活跃性（Tree Shaking 用；仅 prod + 新 parse 的模块有；缓存摘要命中 → `None` → 保守全保留）。
     liveness: Option<ModuleLiveness>,
@@ -212,19 +209,17 @@ struct LayerItem {
     cached: Option<ModuleSummary>,
 }
 
-/// 驱动层两遍处理的中转态：Pass 1（串行）算好 deps/uses/liveness/block_info 并收集 resolve 请求，
+/// 驱动层两遍处理的中转态：Pass 1（串行）算好 deps/liveness/block_info 并收集 resolve 请求，
 /// Pass P（并行）resolve 全部请求，Pass 2（串行）按序消费结果填 `dep_ids` + assign_id + 建 `ModuleRec`。
 /// 拆两遍是为把昂贵的 resolve（FS 探测）从串行的 id 分配/建图记账中剥出来并行——而 id 分配顺序
 /// （= 模块序 × 依赖序）在 Pass 2 严格复刻原单层循环，故产物逐字节不变。
 struct PendingModule {
     id: u32,
     path: PathBuf,
-    from_dir: PathBuf,
     content_key: u64,
     source_type: SourceType,
     content_vc: Vc<Content>,
     deps: Vec<ParsedDep>,
-    uses: Vec<(String, ImportUse)>,
     liveness: Option<ModuleLiveness>,
     block_info: Option<ConcatBlockInfo>,
     has_top_level_await: bool,
@@ -571,8 +566,8 @@ impl IncrementalBundler {
         let entry_id = assign_id(&mut path_to_id, &mut next_id, entry_norm.clone());
         let mut frontier: Vec<(u32, PathBuf)> = vec![(entry_id, entry_norm)];
 
-        // Tree Shaking 或缓存启用时才需算 uses（否则 keep 全 None，白算）。
-        let need_uses = self.tree_shaking || self.cache.is_some();
+        // uses 只进缓存摘要（Tree Shaking 的 keep 集走绑定级 liveness，不读 uses），无缓存则白算。
+        let need_uses = self.cache.is_some();
 
         // 加载选项（CSS 抽取 / 资源阈值 / publicPath）+ 带外产物收集（CRUSTIFY-PARITY §M3）。
         // Arc 包裹：每层并行读取时克隆句柄进 worker 闭包（`'static` 约束）。
@@ -593,7 +588,7 @@ impl IncrementalBundler {
             // 结果按输入顺序返回（`Executor::parallel` 保序）→ 后续串行建 cell/查缓存的顺序、
             // assign_id 与产物收集序完全不变 → 产物逐字节一致。读完再做 `&mut self` 的 cell/缓存
             // 记账（这些依赖共享可变状态，本就该串行；它们很便宜）。
-            let frontier_items: Vec<(u32, PathBuf)> = frontier.drain(..).collect();
+            let frontier_items: Vec<(u32, PathBuf)> = std::mem::take(&mut frontier);
             let tr = timing.then(std::time::Instant::now);
             let loaded_results: Vec<(u32, PathBuf, std::io::Result<Loaded>)> = {
                 let jobs: Vec<_> = frontier_items
@@ -663,11 +658,12 @@ impl IncrementalBundler {
                 break;
             }
 
-            // 2. 并行 parse 仅「未命中缓存摘要」的模块（工作窃取执行器扇出）。
+            // 2. 并行 parse 缓存未命中的模块。Tree Shaking / concat minify 还需要缓存摘要
+            // 尚未持久化的 AST 分析结果，因此即使摘要命中也必须重建分析，保证冷热产物一致。
             let to_parse: Vec<usize> = layer
                 .iter()
                 .enumerate()
-                .filter(|(_, it)| it.cached.is_none())
+                .filter(|(_, it)| it.cached.is_none() || self.tree_shaking || self.minify)
                 .map(|(i, _)| i)
                 .collect();
             let requests: Vec<_> = to_parse
@@ -691,13 +687,13 @@ impl IncrementalBundler {
                 parsed_by_idx.insert(i, res);
             }
 
-            // 3. 驱动层：取 deps/uses（parse 或缓存）+ resolve 依赖 + 下一层（BFS 去重处理循环）。
+            // 3. 驱动层：取 deps（parse 或缓存）+ resolve 依赖 + 下一层（BFS 去重处理循环）。
             //
-            // 拆三步：Pass 1 串行取 deps/uses/liveness/block_info（依赖 parsed AST 与 `&mut self` 缓存）
+            // 拆三步：Pass 1 串行取 deps/liveness/block_info（依赖 parsed AST 与 `&mut self` 缓存）
             // 并收集扁平 resolve 请求；Pass P 并行 resolve（FS 探测密集）；Pass 2 串行按「模块序×依赖序」
             // 消费结果做 assign_id/建图——**顺序严格复刻原单层循环**，产物逐字节不变。
 
-            // —— Pass 1：串行取 deps/uses/liveness/block_info + 收集 resolve 请求 ——
+            // —— Pass 1：串行取 deps/liveness/block_info + 收集 resolve 请求 ——
             let mut pending: Vec<PendingModule> = Vec::with_capacity(layer.len());
             let mut resolve_reqs: Vec<(String, PathBuf)> = Vec::new();
             for (i, it) in layer.into_iter().enumerate() {
@@ -709,14 +705,19 @@ impl IncrementalBundler {
                     content_key,
                     cached,
                 } = it;
-                let (deps, uses, has_tla, parsed_opt, parse_vc_opt): ScanParsed = match cached {
-                    Some(sum) => (
-                        sum.deps.iter().map(cached_dep_to_parsed).collect(),
-                        sum.uses.iter().map(cached_use_to_import).collect(),
-                        sum.has_top_level_await,
-                        None,
-                        None,
-                    ),
+                let (deps, has_tla, parsed_opt, parse_vc_opt): ScanParsed = match cached {
+                    Some(sum) => {
+                        let parsed = parsed_by_idx.remove(&i);
+                        if let Some((_, parsed)) = &parsed {
+                            diagnostics.extend(parsed.diagnostics.iter().cloned());
+                        }
+                        (
+                            sum.deps.iter().map(cached_dep_to_parsed).collect(),
+                            sum.has_top_level_await,
+                            parsed.as_ref().map(|(_, parsed)| Arc::clone(parsed)),
+                            parsed.map(|(parse_vc, _)| parse_vc),
+                        )
+                    }
                     None => {
                         let (parse_vc, parsed) =
                             parsed_by_idx.remove(&i).expect("miss 模块应已 parse");
@@ -743,7 +744,7 @@ impl IncrementalBundler {
                             );
                         }
                         let has_tla = parsed.has_top_level_await;
-                        (deps, uses, has_tla, Some(parsed), Some(parse_vc))
+                        (deps, has_tla, Some(parsed), Some(parse_vc))
                     }
                 };
 
@@ -772,12 +773,10 @@ impl IncrementalBundler {
                 pending.push(PendingModule {
                     id,
                     path,
-                    from_dir,
                     content_key,
                     source_type,
                     content_vc,
                     deps,
-                    uses,
                     liveness,
                     block_info,
                     has_top_level_await: has_tla,
@@ -813,12 +812,10 @@ impl IncrementalBundler {
                 let PendingModule {
                     id,
                     path,
-                    from_dir: _,
                     content_key,
                     source_type,
                     content_vc,
                     deps,
-                    uses,
                     liveness,
                     block_info,
                     has_top_level_await,
@@ -863,7 +860,6 @@ impl IncrementalBundler {
                         source_type,
                         content_vc,
                         deps,
-                        uses,
                         dep_ids,
                         liveness,
                         block_info,
@@ -1533,19 +1529,6 @@ fn import_use_to_cached(u: &(String, ImportUse)) -> CachedUse {
         },
     }
 }
-fn cached_use_to_import(c: &CachedUse) -> (String, ImportUse) {
-    let u = if c.all {
-        if c.reexport {
-            ImportUse::ReexportAll
-        } else {
-            ImportUse::All
-        }
-    } else {
-        ImportUse::Names(c.names.clone())
-    };
-    (c.specifier.clone(), u)
-}
-
 /// parse 请求（在 worker 线程的 `enter` 上下文内执行）：登记 parse 任务、返回句柄 + 结果。
 fn parse_request(
     cell: Vc<Content>,
@@ -1564,8 +1547,6 @@ fn parse_request(
     let arc = vc.read();
     (vc, arc)
 }
-
-/// codegen 请求（在 worker 线程的 `enter` 上下文内执行）：登记 codegen 任务、返回模块体。
 
 /// 收集模块中所有 (export_name, variable_name, declarator_span) 三元组。
 /// declarator_span 用于 span 级别精确匹配，避免同名字段在不同作用域被误判。
@@ -1698,15 +1679,26 @@ fn codegen_request(
         parsed.ast.with_ast(|program| {
             // —— CSS-in-JS（Linaria 子集）：与 mangle/minify 无关，先跑 ——
             // 产出「标签模板 span → 类名字面量」替换 + 本模块抽取的 CSS。
-            let cij = css_in_js
-                .as_ref()
-                .map(|imported| wake_css_in_js::transform(program, &interner, &cij_seed, imported));
+            let cij = css_in_js.as_ref().map(|imported| {
+                wake_css_in_js::transform(program, &interner, &parsed.source, &cij_seed, imported)
+            });
 
             // emit 把每个模块包成 `function(m,$,_r){…}`（`m`=module、`$`=exports、`_r`=require 的
             // 压缩名）。声明为保留名，mangler 不会把局部压成它们而与包装器参数撞车（曾致 React
             // 产物 `class m{}` 与参数 `m` 重复声明 → SyntaxError）。
-            let plan = mangle
-                .then(|| wake_ecma_minify::plan_mangle(program, &interner, &["m", "$", "_r"]));
+            let semantic = (minify || mangle).then(|| analyze(program));
+            let semantic_safe = !has_hazard(program, &interner);
+            let plan = (mangle && semantic_safe).then(|| {
+                plan_mangle_with_model_and_protected(
+                    program,
+                    &interner,
+                    &["m", "$", "_r"],
+                    semantic.as_ref().expect("semantic model was requested"),
+                    cij.as_ref()
+                        .map(|c| c.verbatim_replacement_spans.as_slice())
+                        .unwrap_or_default(),
+                )
+            });
             // 属性名混淆默认关闭：逐模块、基于名字频率的属性重命名从根本上不健全——
             // 它无法看到跨模块 / 宿主（React style、DOM）对属性的读取，也无法处理计算成员
             // `obj[expr]` 与运行时字符串键，会破坏 enum 成员访问、内联 style、查表等。
@@ -1753,10 +1745,40 @@ fn codegen_request(
 
                     // 2) DCE
                     let dce = analyze_dce(program, &interner, drop_debugger, drop_console);
-                    minify_ctx.remove_spans = dce.remove_spans;
 
-                    // 3) 变量使用分析（未引用变量消除 + 变量内联）
-                    let va = analyze_vars(program, &interner);
+                    // 3) 变量使用分析（未引用变量消除 + 变量内联）。被 tree shaking 删除的
+                    // export 不再人为保活其本地声明；同一本地仍由另一个活跃导出引用时除外。
+                    let removable_export_locals = if let Some(keep_names) = keep {
+                        let keep_set: FxHashSet<&str> =
+                            keep_names.iter().map(String::as_str).collect();
+                        let pairs = collect_export_var_pairs(program, &interner);
+                        let live_locals: FxHashSet<&str> = pairs
+                            .iter()
+                            .filter(|(export, _, _)| keep_set.contains(export.as_str()))
+                            .map(|(_, local, _)| local.as_str())
+                            .collect();
+                        pairs
+                            .iter()
+                            .filter(|(export, local, _)| {
+                                !keep_set.contains(export.as_str())
+                                    && !live_locals.contains(local.as_str())
+                            })
+                            .map(|(_, local, _)| interner.intern(local))
+                            .collect()
+                    } else {
+                        FxHashSet::default()
+                    };
+                    let va = if semantic_safe {
+                        analyze_vars_with_model(
+                            program,
+                            semantic.as_ref().expect("semantic model was requested"),
+                            &dce.remove_spans,
+                            &removable_export_locals,
+                        )
+                    } else {
+                        Default::default()
+                    };
+                    minify_ctx.remove_spans = dce.remove_spans;
                     minify_ctx.unused_vars = va.unused_vars;
                     minify_ctx.unused_var_spans = va.unused_var_spans;
 
@@ -1806,6 +1828,11 @@ fn codegen_request(
                     minify_ctx.no_undefined_shadow = !is_undefined_shadowed(program, &interner);
 
                     minify_ctx.minify = true;
+                }
+                if let Some(c) = &cij {
+                    minify_ctx
+                        .remove_spans
+                        .extend(c.removable_import_spans.iter().copied());
                 }
 
                 let rename = plan.as_ref().map(|p| p.table());
@@ -2026,10 +2053,12 @@ fn for_each_require<F: FnMut(usize, u32, usize)>(body: &str, mut f: F) {
         while end < bytes.len() && bytes[end].is_ascii_digit() {
             end += 1;
         }
-        if end > after && end < bytes.len() && bytes[end] == b')' {
-            if let Ok(id) = body[after..end].parse::<u32>() {
-                f(abs, id, end + 1); // end 指向 ')'，call_end = 其后一位
-            }
+        if end > after
+            && end < bytes.len()
+            && bytes[end] == b')'
+            && let Ok(id) = body[after..end].parse::<u32>()
+        {
+            f(abs, id, end + 1); // end 指向 ')'，call_end = 其后一位
         }
         search = after;
     }
@@ -2131,6 +2160,28 @@ fn compact_reg_body(body: &str) -> String {
     s = s.replace(";globalThis.__reg.", ",globalThis.__reg.");
     s = s.replace(" = ", "=");
     s
+}
+
+/// If `body` is exactly the generated registry bootstrap followed by one numeric property
+/// assignment, return the `property=number` tail. Callers may only cache the registry object across
+/// exact bodies in the same uninterrupted run.
+fn exact_reg_assignment(body: &str) -> Option<&str> {
+    const PREFIX: &str = "globalThis.__reg||(globalThis.__reg={}),";
+    let assignment = body.trim_end_matches(';').strip_prefix(PREFIX)?;
+    let value = assignment.strip_prefix("globalThis.__reg.")?;
+    let (property, number) = value.split_once('=')?;
+    if property.is_empty()
+        || !property
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+        || number.is_empty()
+        || !number
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-' | b'e' | b'E'))
+    {
+        return None;
+    }
+    Some(value)
 }
 
 /// 紧凑模块 body 中的运行时引用：`__wake_require__`→`_r`，自由变量 `exports`→`$`。
@@ -2341,10 +2392,11 @@ fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
         while let Some(pos) = rest.find("_r(") {
             let after = &rest[pos + 3..];
             if let Some(end) = after.find(')') {
-                if let Ok(n) = after[..end].parse::<u32>() {
-                    if id_set.contains(&n) && n != *id {
-                        module_deps.push(n);
-                    }
+                if let Ok(n) = after[..end].parse::<u32>()
+                    && id_set.contains(&n)
+                    && n != *id
+                {
+                    module_deps.push(n);
                 }
                 rest = &after[end..];
             } else {
@@ -2468,7 +2520,14 @@ fn emit(
         let mut filtered: Vec<(u32, String)> = stripped_bodies;
 
         // 收集 inline __reg：所有 candidates 的 body 直接内联
-        let inline_regs: Vec<String> = candidates.values().map(|b| (**b).clone()).collect();
+        // FxHashMap 的迭代顺序既不稳定，也会把路径/模块编号相近的注册语句随机打散，
+        // 显著破坏 Gzip/Brotli 的局部重复匹配。按稳定 module id 输出。
+        let mut inline_reg_entries: Vec<_> = candidates.iter().collect();
+        inline_reg_entries.sort_unstable_by_key(|(id, _)| **id);
+        let inline_regs: Vec<String> = inline_reg_entries
+            .into_iter()
+            .map(|(_, body)| (**body).clone())
+            .collect();
 
         // 构建最终模块表。含顶层 await 时**不做模块合并**：合并闭包是单个函数，无法表达
         // 「其中一部分模块是 async、且彼此有 await 依赖顺序」；退回逐模块注册表（仍是紧凑产物）。
@@ -2554,8 +2613,14 @@ fn emit(
                 // 块安全（ESM 且无 `var`/`this`）+ 整组 strict → 用裸 `{}` 块（strict 下块级函数声明块作用域，
                 // let/const 本就块作用域 → 顶层名不跨块碰撞）。否则用 IIFE 建立真正函数作用域隔离
                 // （`var` 会 hoist 出块、sloppy 下块级函数亦 hoist；曾致 React Symbol 覆盖 scheduler 计数器）。
+                let has_scope_binding = ["const ", "let ", "var ", "class ", "function "]
+                    .iter()
+                    .any(|token| b.contains(token));
                 let block_safe = all_esm && block_infos.get(id).is_some_and(|bi| bi.block_safe);
-                if block_safe {
+                if !has_scope_binding {
+                    // 经过 tree shaking 后只剩表达式的模块不再需要隔离作用域。
+                    concat_body.push_str(&b);
+                } else if block_safe {
                     concat_body.push('{');
                     concat_body.push_str(&b);
                     concat_body.push('}');
@@ -2609,6 +2674,9 @@ fn emit(
                 }
             }
         }
+        // 空 stub 的 require 语义只是“创建并缓存独立的空 exports”。运行时对缺省表项执行
+        // no-op 即可保持该语义，无需为每个 id 输出重复的 `function(){}`。
+        final_modules.retain(|(_, body)| !body.is_empty());
         final_modules.sort_by_key(|(id, _)| *id);
 
         let mut out = String::new();
@@ -2620,7 +2688,6 @@ fn emit(
         let needs_interop_star = final_bodies
             .iter()
             .any(|b| b.contains("__wake_interop_star"));
-
         // minify 下省略 `__esModule` 标记，故不能用它区分「转译 ESM」与「纯 CJS」，改按
         // **是否存在 `default` 键**判定：转译 ESM 必定写了 `exports.default`，而
         // `module.exports = {…}` 的纯 CJS 通常没有。
@@ -2640,16 +2707,37 @@ fn emit(
         };
         // async 变体：async 模块的包装器返回 Promise → 缓存并返回它，导入方 `await` 得到最终 exports。
         out.push_str(if async_ids.is_empty() {
-            "(function(root){var __wake_cache__={};function __wake_require__(id){var cached=__wake_cache__[id];if(cached)return cached.exports;var module={exports:{}};__wake_cache__[id]=module;__wake_modules__[id].call(module.exports,module,module.exports,__wake_require__);return module.exports}"
+            "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
         } else {
-            "(function(root){var __wake_cache__={};function __wake_require__(id){var cached=__wake_cache__[id];if(cached)return cached.p||cached.exports;var module={exports:{}};__wake_cache__[id]=module;var r=__wake_modules__[id].call(module.exports,module,module.exports,__wake_require__);if(r&&typeof r.then==='function')return module.p=r.then(function(){return module.exports});return module.exports}"
+            "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
         });
 
         if !inline_regs.is_empty() {
-            out.push_str(";");
-            for reg in &inline_regs {
-                out.push_str(&compact_reg_body(reg));
+            out.push(';');
+            let mut registry_ready = false;
+            for (index, reg) in inline_regs.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                let compact = compact_reg_body(reg);
+                let compact = compact.trim_end_matches(';');
+                if let Some(assignment) = exact_reg_assignment(compact) {
+                    if registry_ready {
+                        out.push_str("q.");
+                        out.push_str(assignment);
+                    } else {
+                        out.push_str("q=globalThis.__reg||(globalThis.__reg={}),q.");
+                        out.push_str(assignment);
+                        registry_ready = true;
+                    }
+                } else {
+                    out.push_str(compact);
+                    if !compact.is_empty() {
+                        registry_ready = false;
+                    }
+                }
             }
+            out.push(';');
         }
 
         if needs_interop_default {
@@ -2658,7 +2746,7 @@ fn emit(
         if needs_interop_star {
             out.push_str(interop_star);
         }
-        out.push_str("var __wake_modules__={");
+        out.push_str("var t={");
         for (id, body) in &final_modules {
             if body.is_empty() {
                 out.push_str(&format!("{}:function(){{}},", id));
@@ -2674,11 +2762,8 @@ fn emit(
             }
         }
         out.push_str("};");
-        out.push_str(&format!(
-            "var __wake_entry__=__wake_require__({});",
-            entry_id
-        ));
-        out.push_str("if(typeof module!=='undefined'&&module.exports)module.exports=__wake_entry__;else root.__wake_entry__=__wake_entry__;return __wake_entry__;})(typeof globalThis!=='undefined'?globalThis:this);");
+        out.push_str(&format!("var e=r({});", entry_id));
+        out.push_str("if(typeof module!=='undefined'&&module.exports)module.exports=e;else g.__wake_entry__=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);");
         out
     } else {
         // 非 minify 模式：不 do scope hoisting（无 tree-shaking，所有模块都有 exports/requires）。

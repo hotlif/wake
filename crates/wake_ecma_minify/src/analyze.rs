@@ -2,7 +2,7 @@ use wake_common::{Atom, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::visit::{Visit, walk_expression};
 use wake_ecma_ast::*;
 use wake_ecma_parser::analyze;
-use wake_ecma_parser::semantic::{DeclKind, ScopeId, SymbolId};
+use wake_ecma_parser::semantic::{DeclKind, ScopeId, SemanticModel, SymbolId};
 
 use crate::const_eval::expr_is_pure;
 use crate::mangle::has_hazard;
@@ -26,20 +26,78 @@ pub struct VarAnalysis {
 }
 
 pub fn analyze_vars(program: &Program, interner: &Interner) -> VarAnalysis {
+    analyze_vars_ignoring_spans(program, interner, &FxHashSet::default())
+}
+
+/// Analyze variables while excluding references contained in statements that DCE will remove.
+///
+/// This makes the two side-table passes converge without mutating the arena AST: for example,
+/// after `imported;` is planned for removal, that no-op read must no longer keep `imported` alive.
+pub fn analyze_vars_ignoring_spans(
+    program: &Program,
+    interner: &Interner,
+    ignored_statement_spans: &FxHashSet<Span>,
+) -> VarAnalysis {
+    analyze_vars_with_plan(
+        program,
+        interner,
+        ignored_statement_spans,
+        &FxHashSet::default(),
+    )
+}
+
+/// Bundle-aware variable analysis. `removable_export_locals` contains module-scope local names
+/// whose public export bindings were removed by tree shaking, so those declarations can become
+/// ordinary unused candidates.
+pub fn analyze_vars_with_plan(
+    program: &Program,
+    interner: &Interner,
+    ignored_statement_spans: &FxHashSet<Span>,
+    removable_export_locals: &FxHashSet<Atom>,
+) -> VarAnalysis {
     if has_hazard(program, interner) {
         return VarAnalysis::default();
     }
 
     let model = analyze(program);
+    analyze_vars_with_model(
+        program,
+        &model,
+        ignored_statement_spans,
+        removable_export_locals,
+    )
+}
 
+/// Variable analysis using a semantic model already produced by another pass.
+///
+/// The caller is responsible for rejecting direct-eval / with hazards.
+pub fn analyze_vars_with_model(
+    program: &Program,
+    model: &SemanticModel,
+    ignored_statement_spans: &FxHashSet<Span>,
+    removable_export_locals: &FxHashSet<Atom>,
+) -> VarAnalysis {
     if model.symbols.is_empty() || model.scopes.is_empty() {
         return VarAnalysis::default();
     }
 
     let mut ref_counts: FxHashMap<SymbolId, usize> = FxHashMap::default();
+    let mut sole_ref_spans: FxHashMap<SymbolId, Span> = FxHashMap::default();
     for r in &model.references {
+        if ignored_statement_spans
+            .iter()
+            .any(|span| span.lo <= r.span.lo && r.span.hi <= span.hi)
+        {
+            continue;
+        }
         if let Some(sid) = r.resolved {
-            *ref_counts.entry(sid).or_default() += 1;
+            let count = ref_counts.entry(sid).or_default();
+            *count += 1;
+            if *count == 1 {
+                sole_ref_spans.insert(sid, r.span);
+            } else {
+                sole_ref_spans.remove(&sid);
+            }
         }
     }
 
@@ -56,40 +114,46 @@ pub fn analyze_vars(program: &Program, interner: &Interner) -> VarAnalysis {
     for (sid, sym) in model.symbols.iter().enumerate() {
         let sid = sid as SymbolId;
 
-        // import 绑定由链接层处理；`using` 绑定带 dispose 副作用——两者都不参与「无引用即删」
-        // 与「单次引用内联」。`using _ = acquire()` 这种**零引用**形态恰是 using 最典型的用法，
+        // `using` 绑定带 dispose 副作用，不参与「无引用即删」与「单次引用内联」。
+        // `using _ = acquire()` 这种**零引用**形态恰是 using 最典型的用法，
         // 若判为 unused，codegen 会把它降级成裸 `acquire();`，dispose 静默丢失。
-        if matches!(sym.decl_kind, DeclKind::Import | DeclKind::Using) {
-            continue;
-        }
-
-        if sym.scope == MODULE_SCOPE && exported.contains(&sym.name) {
+        if sym.decl_kind == DeclKind::Using {
             continue;
         }
 
         let ref_count = ref_counts.get(&sid).copied().unwrap_or(0);
+        if sym.scope == MODULE_SCOPE
+            && exported.contains(&sym.name)
+            && !removable_export_locals.contains(&sym.name)
+        {
+            continue;
+        }
 
         if ref_count == 0 {
             unused_vars.insert(sym.name);
             unused_var_spans.insert(sym.span);
+            // Import bindings have no initializer in the source AST and are emitted specially by
+            // the linker. They may be omitted, but must never enter the normal inline path.
+            if sym.decl_kind == DeclKind::Import {
+                continue;
+            }
         } else if ref_count == 1 {
-            let ref_span = model
-                .references
-                .iter()
-                .find(|r| r.resolved == Some(sid))
-                .map(|r| r.span)
-                .expect("single-use var must have a reference");
+            if sym.decl_kind == DeclKind::Import {
+                continue;
+            }
+            let ref_span = sole_ref_spans[&sid];
             single_use_vars.insert(sym.name, ref_span);
 
             if write_spans.contains(&ref_span) {
                 continue;
             }
 
-            if let Some(init) = init_map.get(&sym.span) {
-                if expr_is_pure(init) && init_is_safe_to_inline(init) {
-                    inline_candidates.insert(sym.name, sym.span);
-                    inline_ref_spans.insert(sym.name, ref_span);
-                }
+            if let Some(init) = init_map.get(&sym.span)
+                && expr_is_pure(init)
+                && init_is_safe_to_inline(init)
+            {
+                inline_candidates.insert(sym.name, sym.span);
+                inline_ref_spans.insert(sym.name, ref_span);
             }
         }
     }
@@ -287,12 +351,12 @@ fn walk_stmt_for_inits<'a>(stmt: &'a Statement<'a>, map: &mut FxHashMap<Span, &'
             }
         }
         Statement::For(s) => {
-            if let Some(init) = &s.init {
-                if let ForInit::Variable(d) = init {
-                    for decl in d.declarations.iter() {
-                        if let Some(init) = &decl.init {
-                            simple_binding_inits(&decl.id, init, map);
-                        }
+            if let Some(init) = &s.init
+                && let ForInit::Variable(d) = init
+            {
+                for decl in d.declarations.iter() {
+                    if let Some(init) = &decl.init {
+                        simple_binding_inits(&decl.id, init, map);
                     }
                 }
             }
@@ -328,10 +392,10 @@ fn walk_stmt_for_inits<'a>(stmt: &'a Statement<'a>, map: &mut FxHashMap<Span, &'
             }
         }
         Statement::ExportDefault(e) => {
-            if let ExportDefaultKind::Function(f) = &e.declaration {
-                if let Some(body) = f.body {
-                    stmt_init_map(&body.statements, map);
-                }
+            if let ExportDefaultKind::Function(f) = &e.declaration
+                && let Some(body) = f.body
+            {
+                stmt_init_map(&body.statements, map);
             }
         }
         _ => {}
@@ -346,6 +410,48 @@ fn simple_binding_inits<'a>(
     if let Pattern::Ident(id) = pat {
         map.insert(id.span, init);
     }
+}
+
+pub fn is_undefined_shadowed(program: &Program, interner: &Interner) -> bool {
+    struct UndefChecker<'a> {
+        interner: &'a Interner,
+        found: bool,
+    }
+    impl<'a, 'ast> Visit<'ast> for UndefChecker<'a> {
+        fn visit_pattern(&mut self, pat: &Pattern<'ast>) {
+            if let Pattern::Ident(id) = pat
+                && self.interner.resolve(id.name) == "undefined"
+            {
+                self.found = true;
+                return;
+            }
+            walk_pattern(self, pat);
+        }
+        fn visit_function(&mut self, node: &Function<'ast>) {
+            if let Some(id) = node.id
+                && self.interner.resolve(id.name) == "undefined"
+            {
+                self.found = true;
+                return;
+            }
+            walk_function(self, node);
+        }
+        fn visit_class(&mut self, node: &Class<'ast>) {
+            if let Some(id) = node.id
+                && self.interner.resolve(id.name) == "undefined"
+            {
+                self.found = true;
+                return;
+            }
+            walk_class(self, node);
+        }
+    }
+    let mut c = UndefChecker {
+        interner,
+        found: false,
+    };
+    c.visit_program(program);
+    c.found
 }
 
 // ── Tests ──
@@ -396,9 +502,10 @@ mod tests {
     }
 
     #[test]
-    fn import_not_marked_unused() {
+    fn unused_import_binding_is_reported_for_linker_codegen() {
         let (a, it) = analyze("import { readFile } from 'fs';");
-        assert!(!contains_in_set(&a.unused_vars, &it, "readFile"));
+        assert!(contains_in_set(&a.unused_vars, &it, "readFile"));
+        assert!(a.inline_candidates.is_empty());
     }
 
     #[test]
@@ -537,46 +644,4 @@ mod tests {
         let (a, it) = analyze("function f(){ var x = 1; [a, ...x] = [1, 2, 3]; }");
         assert!(!contains_in_map(&a.inline_candidates, &it, "x"));
     }
-}
-
-pub fn is_undefined_shadowed(program: &Program, interner: &Interner) -> bool {
-    struct UndefChecker<'a> {
-        interner: &'a Interner,
-        found: bool,
-    }
-    impl<'a, 'ast> Visit<'ast> for UndefChecker<'a> {
-        fn visit_pattern(&mut self, pat: &Pattern<'ast>) {
-            if let Pattern::Ident(id) = pat {
-                if self.interner.resolve(id.name) == "undefined" {
-                    self.found = true;
-                    return;
-                }
-            }
-            walk_pattern(self, pat);
-        }
-        fn visit_function(&mut self, node: &Function<'ast>) {
-            if let Some(id) = node.id {
-                if self.interner.resolve(id.name) == "undefined" {
-                    self.found = true;
-                    return;
-                }
-            }
-            walk_function(self, node);
-        }
-        fn visit_class(&mut self, node: &Class<'ast>) {
-            if let Some(id) = node.id {
-                if self.interner.resolve(id.name) == "undefined" {
-                    self.found = true;
-                    return;
-                }
-            }
-            walk_class(self, node);
-        }
-    }
-    let mut c = UndefChecker {
-        interner,
-        found: false,
-    };
-    c.visit_program(program);
-    c.found
 }

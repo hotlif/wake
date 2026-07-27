@@ -7,26 +7,24 @@
 //! Phase 3 MVP：**直接执行**（无增量），全管线接入引擎（`#[wake::task]`）是 Phase 2.5 之后的事
 //! （DESIGN §13 降级预案：引擎缺席时纯执行也能产出正确产物）。
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use wake_common::{Atom, Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, fs::normalize};
-use wake_ecma_ast::{DependencyKind, ModuleAst, SourceType};
-use wake_ecma_codegen::{ModuleLinker, codegen_module};
-use wake_ecma_parser::parse;
-use wake_resolver::Resolver;
+use wake_common::{Diagnostic, FileSystem, FxHashMap, FxHashSet};
+use wake_ecma_codegen::ModuleLinker;
 
 mod chunk;
 pub mod incremental;
 mod loader;
+mod session;
 pub use incremental::IncrementalBundler;
+pub use session::{BuildOptions, BuildRequest, BuildSession};
 // 供 CLI 组装别名而无需直接依赖 wake_resolver。
 pub use wake_resolver::ResolveOptions;
 
 /// 打包器。持有文件系统与全局 interner（跨模块共享 Atom，DESIGN §4.1）。
 pub struct Bundler {
-    fs: Arc<dyn FileSystem>,
-    interner: Interner,
+    session: Mutex<BuildSession>,
 }
 
 /// 打包产物。
@@ -137,198 +135,20 @@ pub(crate) fn single_chunk(
 }
 
 /// 已扫描的模块。
-struct Module {
-    id: u32,
-    ast: ModuleAst,
-    /// 原始说明符 → 内部模块 id（供 linker）。
-    deps: Vec<(Atom, u32)>,
-    /// 静态 ESM 导入（`import` / `export ... from`）的目标 id——顶层 await 沿这些边传染。
-    static_deps: Vec<u32>,
-    /// 模块顶层含 `await` / `for await`。
-    has_top_level_await: bool,
-}
-
 impl Bundler {
     pub fn new(fs: Arc<dyn FileSystem>) -> Bundler {
         Bundler {
-            fs,
-            interner: Interner::new(),
+            session: Mutex::new(BuildSession::new(fs, BuildOptions::default())),
         }
     }
 
-    /// 从 `entry` 打包，产出单 chunk bundle。
+    /// 从 `entry` 打包。兼容旧 API，内部统一通过 [`BuildSession`] 执行。
     pub fn build(&self, entry: &Path) -> BuildOutput {
-        let resolver = Resolver::new(self.fs.clone());
-        let mut diagnostics = Vec::new();
-
-        // —— Scan：BFS 建模块图 ——
-        let mut path_to_id: FxHashMap<PathBuf, u32> = FxHashMap::default();
-        let mut worklist: Vec<(u32, PathBuf)> = Vec::new();
-        let mut modules: Vec<Module> = Vec::new();
-        let mut next_id: u32 = 0;
-
-        let entry_norm = normalize(entry);
-        let entry_id = intern_id(&mut path_to_id, &mut worklist, &mut next_id, entry_norm);
-
-        while let Some((id, path)) = worklist.pop() {
-            let source = match self.fs.read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    diagnostics.push(
-                        Diagnostic::error(format!("无法读取模块 `{}`：{e}", path.display()))
-                            .with_code("WAKE0300"),
-                    );
-                    continue;
-                }
-            };
-            let out = parse(&source, &self.interner, SourceType::Module);
-            diagnostics.extend(out.diagnostics);
-
-            let from_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-            let mut deps: Vec<(Atom, u32)> = Vec::new();
-            let mut static_deps: Vec<u32> = Vec::new();
-            for dep in &out.dependencies {
-                let spec = self.interner.resolve(dep.specifier);
-                match resolver.resolve(&spec, &from_dir) {
-                    Ok(resolved) => {
-                        let dep_id =
-                            intern_id(&mut path_to_id, &mut worklist, &mut next_id, resolved);
-                        deps.push((dep.specifier, dep_id));
-                        if matches!(
-                            dep.kind,
-                            DependencyKind::Import | DependencyKind::ExportFrom
-                        ) {
-                            static_deps.push(dep_id);
-                        }
-                    }
-                    Err(_) => {
-                        diagnostics.push(
-                            Diagnostic::error(format!(
-                                "无法从 `{}` 解析依赖 `{spec}`",
-                                path.display()
-                            ))
-                            .with_code("WAKE0301")
-                            .with_primary(dep.span, "此依赖"),
-                        );
-                    }
-                }
-            }
-            modules.push(Module {
-                id,
-                ast: out.module,
-                deps,
-                static_deps,
-                has_top_level_await: out.has_top_level_await,
-            });
-        }
-
-        // —— Link + Emit ——
-        let bundle = self.emit(&modules, entry_id);
-        let module_ids: Vec<u32> = modules.iter().map(|m| m.id).collect();
-        single_chunk(bundle, modules.len(), diagnostics, module_ids)
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .build_entry(entry)
     }
-
-    /// 每模块 ESM→CJS 链接 + 函数包装 + 运行时拼接。
-    fn emit(&self, modules: &[Module], entry_id: u32) -> String {
-        // 顶层 await：含 TLA 的模块 + 沿静态 ESM 边传递导入它们的模块 → `async function` 包装。
-        let async_ids = simple_async_module_ids(modules);
-
-        let mut out = String::new();
-        out.push_str(if async_ids.is_empty() {
-            PRELUDE
-        } else {
-            PRELUDE_ASYNC
-        });
-        out.push_str("var __wake_modules__ = {\n");
-
-        for m in modules {
-            let mut map: FxHashMap<String, u32> = FxHashMap::default();
-            for (atom, id) in &m.deps {
-                map.insert(self.interner.resolve(*atom), *id);
-            }
-            let linker = Linker {
-                map,
-                dyn_chunk: FxHashMap::default(),
-                async_ids: m
-                    .deps
-                    .iter()
-                    .map(|(_, id)| *id)
-                    .filter(|id| async_ids.contains(id))
-                    .collect(),
-            };
-            let body = m
-                .ast
-                .with_ast(|program| codegen_module(program, &self.interner, &linker, false));
-
-            let kw = if async_ids.contains(&m.id) {
-                "async function"
-            } else {
-                "function"
-            };
-            out.push_str(&format!(
-                "{}: {kw}(module, exports, __wake_require__) {{\n",
-                m.id
-            ));
-            for line in body.lines() {
-                out.push_str("  ");
-                out.push_str(line);
-                out.push('\n');
-            }
-            out.push_str("},\n");
-        }
-
-        out.push_str("};\n");
-        out.push_str(&format!(
-            "var __wake_entry__ = __wake_require__({entry_id});\n"
-        ));
-        out.push_str(POSTLUDE);
-        out
-    }
-}
-
-/// 非增量路径的 async 子图（语义同 incremental 的 `async_module_ids`，只是数据源不同）。
-fn simple_async_module_ids(modules: &[Module]) -> FxHashSet<u32> {
-    let mut importers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for m in modules {
-        for &tid in &m.static_deps {
-            importers.entry(tid).or_default().push(m.id);
-        }
-    }
-    let mut set: FxHashSet<u32> = FxHashSet::default();
-    let mut stack: Vec<u32> = Vec::new();
-    for m in modules {
-        if m.has_top_level_await && set.insert(m.id) {
-            stack.push(m.id);
-        }
-    }
-    while let Some(id) = stack.pop() {
-        let Some(list) = importers.get(&id) else {
-            continue;
-        };
-        for &imp in list {
-            if set.insert(imp) {
-                stack.push(imp);
-            }
-        }
-    }
-    set
-}
-
-/// 分配/复用模块 id；新路径入队。
-fn intern_id(
-    path_to_id: &mut FxHashMap<PathBuf, u32>,
-    worklist: &mut Vec<(u32, PathBuf)>,
-    next_id: &mut u32,
-    path: PathBuf,
-) -> u32 {
-    if let Some(&id) = path_to_id.get(&path) {
-        return id;
-    }
-    let id = *next_id;
-    *next_id += 1;
-    path_to_id.insert(path.clone(), id);
-    worklist.push((id, path));
-    id
 }
 
 pub(crate) struct Linker {

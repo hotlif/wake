@@ -12,7 +12,7 @@ use wake_ecma_ast::{
     walk_statement,
 };
 use wake_ecma_parser::analyze;
-use wake_ecma_parser::semantic::{DeclKind, ScopeId, Symbol, SymbolId};
+use wake_ecma_parser::semantic::{DeclKind, ScopeId, SemanticModel, Symbol, SymbolId};
 
 /// Mangling plan: every identifier occurrence (decl + ref) that gets renamed, mapped to its new name.
 #[derive(Debug, Default)]
@@ -122,10 +122,8 @@ fn pattern_binding_names(pat: &Pattern, names: &mut FxHashSet<Atom>) {
             names.insert(id.name);
         }
         Pattern::Array(arr) => {
-            for elem in &arr.elements {
-                if let Some(p) = elem {
-                    pattern_binding_names(p, names);
-                }
+            for p in (&arr.elements).into_iter().flatten() {
+                pattern_binding_names(p, names);
             }
         }
         Pattern::Object(obj) => {
@@ -157,6 +155,32 @@ pub fn plan_mangle(program: &Program, interner: &Interner, reserved: &[&str]) ->
         return Mangling::empty();
     }
     let model = analyze(program);
+    plan_mangle_with_model(program, interner, reserved, &model)
+}
+
+/// [`plan_mangle`] variant for callers that already built the semantic model.
+///
+/// The caller must perform the `eval` / `with` hazard check before using this
+/// function. Bundling runs several semantic minification passes, so sharing one
+/// model avoids repeatedly walking large vendor modules.
+pub fn plan_mangle_with_model(
+    program: &Program,
+    interner: &Interner,
+    reserved: &[&str],
+    model: &SemanticModel,
+) -> Mangling {
+    plan_mangle_with_model_and_protected(program, interner, reserved, model, &[])
+}
+
+/// Shared-model mangle planner with source ranges whose referenced bindings
+/// must keep their original names (used by verbatim expression replacements).
+pub fn plan_mangle_with_model_and_protected(
+    program: &Program,
+    interner: &Interner,
+    reserved: &[&str],
+    model: &SemanticModel,
+    protected_ranges: &[Span],
+) -> Mangling {
     if model.symbols.is_empty() || model.scopes.is_empty() {
         return Mangling::empty();
     }
@@ -190,6 +214,20 @@ pub fn plan_mangle(program: &Program, interner: &Interner, reserved: &[&str]) ->
         forbidden.insert(interner.intern(name));
     }
 
+    // Every scope starts assigning from the same short-name sequence. Generate
+    // and intern that sequence once instead of allocating `a`, `b`, ... again
+    // for every function scope (large vendor bundles have thousands of them).
+    let candidate_count = model.symbols.len() + forbidden.len();
+    let mut candidates = Vec::with_capacity(candidate_count);
+    let mut candidate_index = 0usize;
+    while candidates.len() < candidate_count {
+        let candidate = nth_name(candidate_index);
+        candidate_index += 1;
+        if !is_reserved(&candidate) {
+            candidates.push(interner.intern(&candidate));
+        }
+    }
+
     let mut synthetic: FxHashSet<SymbolId> = FxHashSet::default();
     for (sid, sym) in model.symbols.iter().enumerate() {
         if sym.span.is_dummy() {
@@ -202,21 +240,31 @@ pub fn plan_mangle(program: &Program, interner: &Interner, reserved: &[&str]) ->
         {
             synthetic.insert(sid);
         }
+        if protected_ranges
+            .iter()
+            .any(|range| range.lo <= r.span.lo && r.span.hi <= range.hi)
+            && let Some(sid) = r.resolved
+        {
+            synthetic.insert(sid);
+        }
     }
 
     let mut new_name: Vec<Option<Atom>> = vec![None; model.symbols.len()];
     let mut ctx = AssignCtx {
         model: &model,
-        interner,
         scope_symbols: &scope_symbols,
         children: &children,
+        candidates: &candidates,
         synthetic: &synthetic,
         new_name: &mut new_name,
         exported_names: &exported_names,
     };
     ctx.assign(MODULE_SCOPE, &mut forbidden);
 
-    let mut renames: FxHashMap<Span, Atom> = FxHashMap::default();
+    let mut renames: FxHashMap<Span, Atom> = FxHashMap::with_capacity_and_hasher(
+        model.symbols.len() + model.references.len(),
+        Default::default(),
+    );
     let mut renamed_symbols = 0usize;
     for (sid, sym) in model.symbols.iter().enumerate() {
         if let Some(nn) = new_name[sid]
@@ -250,9 +298,9 @@ fn is_renameable(sym: &Symbol, _exported_names: &FxHashSet<Atom>) -> bool {
 
 struct AssignCtx<'a> {
     model: &'a wake_ecma_parser::SemanticModel,
-    interner: &'a Interner,
     scope_symbols: &'a [Vec<SymbolId>],
     children: &'a [Vec<ScopeId>],
+    candidates: &'a [Atom],
     synthetic: &'a FxHashSet<SymbolId>,
     new_name: &'a mut [Option<Atom>],
     exported_names: &'a FxHashSet<Atom>,
@@ -266,12 +314,8 @@ impl AssignCtx<'_> {
             let sym = &self.model.symbols[sid as usize];
             if is_renameable(sym, self.exported_names) && !self.synthetic.contains(&sid) {
                 let atom = loop {
-                    let cand = nth_name(counter);
+                    let atom = self.candidates[counter];
                     counter += 1;
-                    if is_reserved(&cand) {
-                        continue;
-                    }
-                    let atom = self.interner.intern(&cand);
                     if !path.contains(&atom) {
                         break atom;
                     }
@@ -296,7 +340,7 @@ impl AssignCtx<'_> {
 
 // ── Hazard detection: eval / with ──
 
-pub(crate) fn has_hazard(program: &Program, interner: &Interner) -> bool {
+pub fn has_hazard(program: &Program, interner: &Interner) -> bool {
     let mut h = Hazard {
         eval_atom: interner.intern("eval"),
         found: false,

@@ -429,11 +429,11 @@ mod tests {
         let out = parse("foo?.bar();", &it, SourceType::Script);
         out.module.with_ast(|p| {
             let stmt = p.body.first().unwrap();
-            if let Statement::Expression(es) = stmt {
-                if let Expression::Call(c) = &es.expression {
-                    let a: Vec<_> = c.arguments.iter().cloned().collect();
-                    assert!(!call_is_pure(&c.callee, &a, Some(&it)));
-                }
+            if let Statement::Expression(es) = stmt
+                && let Expression::Call(c) = &es.expression
+            {
+                let a: Vec<_> = c.arguments.iter().cloned().collect();
+                assert!(!call_is_pure(&c.callee, &a, Some(&it)));
             }
         });
     }

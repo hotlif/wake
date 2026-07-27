@@ -700,8 +700,7 @@ fn shake_keeps_internally_referenced_decl() {
     let js = shake(src, Some(&["pub"]));
     assert!(js.contains("const secret = 41;"), "声明应保留:\n{js}");
     assert!(!js.contains("exports[\"secret\"]"), "绑定应移除:\n{js}");
-    assert!(js.contains("function pub"), "{js}");
-    assert!(js.contains("exports[\"pub\"] = pub;"), "{js}");
+    assert!(js.contains("exports[\"pub\"] = function ()"), "{js}");
 }
 
 #[test]
@@ -734,7 +733,17 @@ fn shake_none_keeps_everything() {
     let src = "export const a = 1;\nexport function b() {}";
     let js = shake(src, None);
     assert!(js.contains("exports[\"a\"] = a;"), "{js}");
-    assert!(js.contains("exports[\"b\"] = b;"), "{js}");
+    assert!(js.contains("exports[\"b\"] = function ()"), "{js}");
+}
+
+#[test]
+fn shake_none_keeps_recursive_export_name() {
+    let js = shake(
+        "export function factorial(n){return n?factorial(n-1)*n:1}",
+        None,
+    );
+    assert!(js.contains("function factorial"), "{js}");
+    assert!(js.contains("exports[\"factorial\"] = factorial"), "{js}");
 }
 
 #[test]
@@ -744,8 +753,64 @@ fn shake_filters_export_specifiers() {
     let js = shake(src, Some(&["a"]));
     assert!(js.contains("exports[\"a\"] = a;"), "{js}");
     assert!(!js.contains("exports[\"b\"]"), "未用 b 绑定应移除:\n{js}");
-    // 局部声明保留（可能内部有用；v1 不做局部 DCE）。
-    assert!(js.contains("const b = 2;"), "{js}");
+    // 无其它读取的纯局部声明随未用导出一起移除。
+    assert!(!js.contains("const b = 2;"), "{js}");
+}
+
+#[test]
+fn shake_prunes_locals_only_read_by_dropped_exports() {
+    let src = "const state={value:1};const listeners=new Set();\
+               export function read(){return state.value}\
+               export function subscribe(fn){listeners.add(fn)}";
+    let js = shake(src, Some(&[]));
+    assert!(!js.contains("state"), "{js}");
+    assert!(js.contains("new Set()"), "构造求值必须保留:\n{js}");
+    assert!(!js.contains("listeners"), "{js}");
+}
+
+#[test]
+fn shake_keeps_local_used_by_live_aliased_export() {
+    let src = "const local={value:1};export {local as publicName};";
+    let js = shake(src, Some(&["publicName"]));
+    assert!(js.contains("const local"), "{js}");
+    assert!(js.contains("exports[\"publicName\"] = local"), "{js}");
+}
+
+#[test]
+fn shake_keeps_local_with_non_export_reader() {
+    let src = "const state={value:1};export function dropped(){return state.value}\
+               console.log(state);";
+    let js = shake(src, Some(&[]));
+    assert!(js.contains("const state"), "{js}");
+    assert!(js.contains("console.log(state)"), "{js}");
+}
+
+#[test]
+fn shake_prunes_self_recursive_and_helper_functions_in_dead_chain() {
+    let src = "export function flatten(xs){return xs.map(flatten)}\
+               function process(){return 1}\
+               export function enqueue(){return process()}";
+    let js = shake(src, Some(&[]));
+    assert!(!js.contains("function flatten"), "{js}");
+    assert!(!js.contains("function process"), "{js}");
+    assert!(!js.contains("function enqueue"), "{js}");
+}
+
+#[test]
+fn shake_emits_live_unreferenced_function_directly_to_export() {
+    let js = shake("export function answer(){return 42}", Some(&["answer"]));
+    assert!(js.contains("exports[\"answer\"] = function ()"), "{js}");
+    assert!(!js.contains("function answer"), "{js}");
+}
+
+#[test]
+fn shake_keeps_named_recursive_live_export() {
+    let js = shake(
+        "export function factorial(n){return n?factorial(n-1)*n:1}",
+        Some(&["factorial"]),
+    );
+    assert!(js.contains("function factorial"), "{js}");
+    assert!(js.contains("exports[\"factorial\"] = factorial"), "{js}");
 }
 
 // ======================================================================

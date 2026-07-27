@@ -1,12 +1,12 @@
-//! wake_ecma_transform — 转换管线（TS 擦除/JSX/define）。DESIGN §4.5
+//! wake_ecma_transform — 转换管线的稳定边界。
 //!
-//! Phase 0 占位骨架；实现随对应 Phase 填充（见 docs/PLAN.md）。
-//! 本文件当前仅保证 crate 可编译、依赖方向正确、`cargo test` 有可运行单元。
+//! 当前 TS/JSX lowering 仍由 parser/codegen 承担，本 crate 暂不暴露虚假的转换 API。
+//! 是否迁移为独立 pass pipeline，按 `docs/ROADMAP.md` 的阶段边界另行决策。
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn crate_compiles() {
-        // 占位：确认骨架可编译可测。
+        // 保证保留的架构边界可独立编译。
     }
 }

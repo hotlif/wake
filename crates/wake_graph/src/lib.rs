@@ -480,7 +480,7 @@ fn splat_closure<'b>(
     m: u32,
     memo: &'b mut FxHashMap<u32, FxHashSet<u32>>,
 ) -> &'b FxHashSet<u32> {
-    if !memo.contains_key(&m) {
+    memo.entry(m).or_insert_with(|| {
         let mut set = FxHashSet::default();
         let mut stack = vec![m];
         while let Some(x) = stack.pop() {
@@ -492,8 +492,8 @@ fn splat_closure<'b>(
                 }
             }
         }
-        memo.insert(m, set);
-    }
+        set
+    });
     memo.get(&m).unwrap()
 }
 
@@ -608,21 +608,20 @@ pub fn compute_live_keep(
                     if let Some(t) = resolve(m, spec) {
                         wl.push(Ev::Export(t, imported));
                     }
-                } else if let Some(spec) = mi.namespace.get(&r).copied() {
-                    if let Some(t) = resolve(m, spec) {
-                        wl.push(Ev::All(t));
-                    }
+                } else if let Some(spec) = mi.namespace.get(&r).copied()
+                    && let Some(t) = resolve(m, spec)
+                {
+                    wl.push(Ev::All(t));
                 }
                 // 否则：全局 / 不纯本地绑定 → 忽略（后者本就恒保留）。
             }
             Ev::Live(m, local) => {
-                if live.entry(m).or_default().insert(local) {
-                    if let Some(mi) = idx.get(&m)
-                        && let Some(refs) = mi.decl_refs.get(&local)
-                    {
-                        for r in refs.iter() {
-                            wl.push(Ev::Ref(m, *r));
-                        }
+                if live.entry(m).or_default().insert(local)
+                    && let Some(mi) = idx.get(&m)
+                    && let Some(refs) = mi.decl_refs.get(&local)
+                {
+                    for r in refs.iter() {
+                        wl.push(Ev::Ref(m, *r));
                     }
                 }
             }
@@ -661,31 +660,31 @@ pub fn compute_live_keep(
                 }
             }
             Ev::All(m) => {
-                if all_used.insert(m) {
-                    if let Some(mi) = idx.get(&m) {
-                        for (spec, imported) in mi.named.values() {
-                            if let Some(t) = resolve(m, spec) {
-                                wl.push(Ev::Export(t, *imported));
-                            }
+                if all_used.insert(m)
+                    && let Some(mi) = idx.get(&m)
+                {
+                    for (spec, imported) in mi.named.values() {
+                        if let Some(t) = resolve(m, spec) {
+                            wl.push(Ev::Export(t, *imported));
                         }
-                        for spec in mi.namespace.values() {
-                            if let Some(t) = resolve(m, spec) {
-                                wl.push(Ev::All(t));
-                            }
-                        }
-                        for (spec, imp) in mi.reexport_named.values() {
-                            if let Some(t) = resolve(m, spec) {
-                                wl.push(Ev::Export(t, *imp));
-                            }
-                        }
-                        for spec in mi.ns_reexports.values() {
-                            if let Some(t) = resolve(m, spec) {
-                                wl.push(Ev::All(t));
-                            }
-                        }
-                        for &t in &mi.splat_targets {
+                    }
+                    for spec in mi.namespace.values() {
+                        if let Some(t) = resolve(m, spec) {
                             wl.push(Ev::All(t));
                         }
+                    }
+                    for (spec, imp) in mi.reexport_named.values() {
+                        if let Some(t) = resolve(m, spec) {
+                            wl.push(Ev::Export(t, *imp));
+                        }
+                    }
+                    for spec in mi.ns_reexports.values() {
+                        if let Some(t) = resolve(m, spec) {
+                            wl.push(Ev::All(t));
+                        }
+                    }
+                    for &t in &mi.splat_targets {
+                        wl.push(Ev::All(t));
                     }
                 }
             }
@@ -844,15 +843,11 @@ mod tests {
         };
         let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
 
-        match &keep[&2] {
-            LiveResult::Names(s) => assert!(s.contains(&use_state), "useState 应活(entry 用了)"),
-            _ => {} // All 也可接受
+        if let LiveResult::Names(s) = &keep[&2] {
+            assert!(s.contains(&use_state), "useState 应活(entry 用了)");
         }
-        match &keep[&1] {
-            LiveResult::Names(s) => {
-                assert!(s.contains(&create), "createElement 应活(useState 传递引用)")
-            }
-            _ => {}
+        if let LiveResult::Names(s) = &keep[&1] {
+            assert!(s.contains(&create), "createElement 应活(useState 传递引用)")
         }
     }
 

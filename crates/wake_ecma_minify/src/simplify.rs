@@ -100,14 +100,14 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
             // ── Pattern 1 & 2: Double negation / Not-constant
             Expression::Unary(u) if u.operator == UnaryOperator::LogicalNot => {
                 // !!x → x  when inner argument is pure
-                if let Expression::Unary(inner) = &u.argument {
-                    if inner.operator == UnaryOperator::LogicalNot && expr_is_pure(&inner.argument)
-                    {
-                        self.actions.insert(u.span, SimplifyAction::RemoveDoubleNot);
-                        // Recurse into the inner argument for nested simplifications
-                        self.visit_expression(&inner.argument);
-                        return;
-                    }
+                if let Expression::Unary(inner) = &u.argument
+                    && inner.operator == UnaryOperator::LogicalNot
+                    && expr_is_pure(&inner.argument)
+                {
+                    self.actions.insert(u.span, SimplifyAction::RemoveDoubleNot);
+                    // Recurse into the inner argument for nested simplifications
+                    self.visit_expression(&inner.argument);
+                    return;
                 }
                 // !constant → !ConstVal result
                 if let Some(val) = const_eval::const_eval(node, &ctx) {
@@ -177,15 +177,15 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
 
             // ── Pattern 6: Bracket to dot  a['b'] → a.b
             Expression::Member(m) if !m.optional => {
-                if let MemberProperty::Computed(e) = &m.property {
-                    if let Expression::StringLiteral(s) = e {
-                        let name = self.interner.resolve(s.value);
-                        if is_valid_ident(&name) {
-                            self.actions.insert(m.span, SimplifyAction::BracketToDot);
-                            self.bracket_names.insert(m.span, name);
-                            self.visit_expression(&m.object);
-                            return;
-                        }
+                if let MemberProperty::Computed(e) = &m.property
+                    && let Expression::StringLiteral(s) = e
+                {
+                    let name = self.interner.resolve(s.value);
+                    if is_valid_ident(&name) {
+                        self.actions.insert(m.span, SimplifyAction::BracketToDot);
+                        self.bracket_names.insert(m.span, name);
+                        self.visit_expression(&m.object);
+                        return;
                     }
                 }
             }

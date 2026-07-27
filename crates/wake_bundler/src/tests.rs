@@ -33,7 +33,7 @@ fn bundles_multi_module_esm() {
         out.bundle
             .contains("function(module, exports, __wake_require__)")
     );
-    assert!(out.bundle.contains("exports[\"add\"] = add;"));
+    assert!(out.bundle.contains("exports[\"add\"] = function (a, b)"));
     assert!(out.bundle.contains("exports.default = \"hello\";"));
     assert!(out.bundle.contains("exports[\"result\"] = result;"));
 }
@@ -50,9 +50,43 @@ fn incremental_bundles_correctly() {
     assert_eq!(out.module_count, 3);
     // 与直接打包同样的 runtime + 函数包装 + ESM→CJS 改写。
     assert!(out.bundle.contains("__wake_require__"));
-    assert!(out.bundle.contains("exports[\"add\"] = add;"));
+    assert!(out.bundle.contains("exports[\"add\"] = function (a, b)"));
     assert!(out.bundle.contains("exports.default = \"hello\";"));
     assert!(out.bundle.contains("exports[\"result\"] = result;"));
+}
+
+#[test]
+fn direct_and_incremental_default_paths_are_equivalent() {
+    let direct = Bundler::new(Arc::new(fixture())).build(Path::new("src/index.js"));
+    let mut incremental = IncrementalBundler::new(Arc::new(fixture()));
+    let incremental = incremental.build(Path::new("src/index.js"));
+
+    assert!(!direct.has_errors(), "{:?}", direct.diagnostics);
+    assert!(!incremental.has_errors(), "{:?}", incremental.diagnostics);
+    assert_eq!(direct.module_count, incremental.module_count);
+    assert_eq!(
+        direct.bundle, incremental.bundle,
+        "默认构建的两条编排路径必须产生相同字节"
+    );
+}
+
+#[test]
+fn minify_uses_dot_access_for_identifier_export_names() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const value = 1; export { value as answer };",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(output.bundle.contains("$.answer="), "{}", output.bundle);
+    assert!(
+        !output.bundle.contains("$[\"answer\"]"),
+        "{}",
+        output.bundle
+    );
 }
 
 #[test]
@@ -1554,6 +1588,40 @@ fn persistent_cache_invalidates_on_content_change() {
     let _ = std::fs::remove_file(&cache_path);
 }
 
+#[test]
+fn persistent_cache_preserves_tree_shaking_output() {
+    let unique = format!(
+        "wake_pcache_tree_shaking_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 Unix epoch")
+            .as_nanos()
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+
+    let mut cold = IncrementalBundler::new(Arc::new(shake_fixture()));
+    cold.enable_tree_shaking()
+        .enable_persistent_cache(cache_path.clone());
+    let cold_out = cold.build(Path::new("src/index.js"));
+    assert!(!cold_out.has_errors(), "{:?}", cold_out.diagnostics);
+
+    let mut warm = IncrementalBundler::new(Arc::new(shake_fixture()));
+    warm.enable_tree_shaking()
+        .enable_persistent_cache(cache_path.clone());
+    let warm_out = warm.build(Path::new("src/index.js"));
+    assert!(!warm_out.has_errors(), "{:?}", warm_out.diagnostics);
+
+    assert_eq!(
+        warm_out.bundle, cold_out.bundle,
+        "持久化缓存冷热状态不得改变 tree-shaking 产物"
+    );
+    assert_eq!(warm_out.chunks.len(), cold_out.chunks.len());
+    assert_eq!(warm_out.assets.len(), cold_out.assets.len());
+
+    let _ = std::fs::remove_file(cache_path);
+}
+
 // ============================================================
 // Yarn PnP（Plug'n'Play）解析（hermetic：内存 FS 模拟 PnP 项目，不依赖真实 Yarn 缓存）
 // ============================================================
@@ -2024,6 +2092,38 @@ fn css_in_js_extracts_styles_and_replaces_with_class() {
         out.bundle.contains(&format!("\"{cls}\"")),
         "bundle 应引用同一类名 {cls}"
     );
+}
+
+#[test]
+fn css_in_js_lowers_safe_cx_and_eliminates_linaria_runtime_module() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
+        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        (
+            "src/index.tsx",
+            "import { css, cx as merge } from '@linaria/core';\n\
+             const base = css`color:red;`;\n\
+             const active = css`font-weight:bold;`;\n\
+             const enabled = false;\n\
+             export const className = merge(base, enabled && active);",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    b.enable_dead_module_elimination();
+    b.enable_minify();
+    b.enable_mangle();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        !out.bundle.contains("css should be compiled away"),
+        "已完全消解的 @linaria/core 不应进入产物: {}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("@linaria/core"), "{}", out.bundle);
+    assert!(out.bundle.contains("filter(Boolean).join(\" \")"));
+    assert_eq!(out.module_count, 1, "Linaria 模块应被 DME 删除");
 }
 
 #[test]
@@ -3405,4 +3505,33 @@ fn top_level_await_in_non_incremental_bundler() {
         out.bundle
     );
     assert!(out.bundle.contains("return cached.p || cached.exports;"));
+}
+
+#[test]
+fn synthetic_cjs_export_uses_mangled_binding_name() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "index.js",
+            "const pkg=require('./pkg.js');console.log(pkg.css());",
+        ),
+        (
+            "pkg.js",
+            r#"
+var __defProp=Object.defineProperty;
+var __export=(target,all)=>{for(var name in all)__defProp(target,name,{get:all[name],enumerable:true})};
+var src_exports={};
+__export(src_exports,{css:()=>css_default});
+module.exports=src_exports;
+var css=()=>42;
+var css_default=css;
+"#,
+        ),
+    ]);
+    let out = IncrementalBundler::new(Arc::new(fs)).build(Path::new("index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        !out.bundle.contains("=css_default"),
+        "合成 CJS 导出不得引用已被 mangle 的旧名:\n{}",
+        out.bundle
+    );
 }

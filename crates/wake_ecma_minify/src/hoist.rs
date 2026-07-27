@@ -90,10 +90,10 @@ fn collect_from_program(stmts: &[Statement], out: &mut FxHashMap<Span, Vec<Span>
                 }
             }
             Statement::ExportDefault(e) => {
-                if let ExportDefaultKind::Function(f) = &e.declaration {
-                    if let Some(body) = &f.body {
-                        collect_hoisted_impl(&body.statements, body.span, out);
-                    }
+                if let ExportDefaultKind::Function(f) = &e.declaration
+                    && let Some(body) = &f.body
+                {
+                    collect_hoisted_impl(&body.statements, body.span, out);
                 }
             }
             _ => {}

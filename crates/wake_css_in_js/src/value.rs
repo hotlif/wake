@@ -482,7 +482,7 @@ pub fn collect_static_exports_with(
                     let ctx = EvalCtx {
                         interner,
                         scope: &scope,
-                        imported: &empty,
+                        imported: empty,
                     };
                     if let Some(v) = eval(e, &ctx) {
                         out.insert("default".to_string(), v);

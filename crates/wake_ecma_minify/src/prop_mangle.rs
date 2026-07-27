@@ -330,7 +330,7 @@ pub fn plan_prop_mangle(program: &Program, interner: &Interner) -> PropManglePla
     }
 
     let mut freq: Vec<(Atom, usize)> = collector.freq.into_iter().collect();
-    freq.sort_by(|a, b| b.1.cmp(&a.1));
+    freq.sort_by_key(|item| std::cmp::Reverse(item.1));
 
     let mut name_to_short: FxHashMap<Atom, Atom> = FxHashMap::default();
     let mut used_shorts: FxHashSet<Atom> = FxHashSet::default();
@@ -420,13 +420,13 @@ impl<'a> Visit<'a> for PropCollector<'a> {
     fn visit_expression(&mut self, node: &Expression<'a>) {
         match node {
             Expression::Member(m) => {
-                if !m.optional {
-                    if let MemberProperty::Ident(id) = &m.property {
-                        let on_global = self.is_member_of_global(&m.object);
-                        if !self.should_skip(id.name, on_global) {
-                            *self.freq.entry(id.name).or_insert(0) += 1;
-                            self.member_spans.push((id.span, id.name));
-                        }
+                if !m.optional
+                    && let MemberProperty::Ident(id) = &m.property
+                {
+                    let on_global = self.is_member_of_global(&m.object);
+                    if !self.should_skip(id.name, on_global) {
+                        *self.freq.entry(id.name).or_insert(0) += 1;
+                        self.member_spans.push((id.span, id.name));
                     }
                 }
                 self.visit_expression(&m.object);
@@ -439,13 +439,11 @@ impl<'a> Visit<'a> for PropCollector<'a> {
                                 && !p.method
                                 && !p.shorthand
                                 && p.kind == PropertyKind::Init
+                                && let PropertyKey::Ident(id) = &p.key
+                                && !self.should_skip(id.name, false)
                             {
-                                if let PropertyKey::Ident(id) = &p.key {
-                                    if !self.should_skip(id.name, false) {
-                                        *self.freq.entry(id.name).or_insert(0) += 1;
-                                        self.key_spans.push((id.span, id.name));
-                                    }
-                                }
+                                *self.freq.entry(id.name).or_insert(0) += 1;
+                                self.key_spans.push((id.span, id.name));
                             }
                             self.visit_expression(&p.value);
                         }

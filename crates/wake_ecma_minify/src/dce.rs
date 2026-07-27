@@ -13,6 +13,7 @@
 
 use wake_common::{FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
+use wake_ecma_parser::analyze;
 
 use crate::const_eval::has_hoisted_decl;
 use crate::purity::call_is_pure;
@@ -33,11 +34,19 @@ pub fn analyze_dce(
     drop_debugger: bool,
     drop_console: bool,
 ) -> DcePlan {
+    let semantic = analyze(program);
+    let resolved_reference_spans: FxHashSet<Span> = semantic
+        .references
+        .iter()
+        .filter(|reference| reference.resolved.is_some())
+        .map(|reference| reference.span)
+        .collect();
     let mut analyzer = DceAnalyzer {
         remove_spans: FxHashSet::default(),
         drop_debugger,
         drop_console,
         interner: Some(interner),
+        resolved_reference_spans,
     };
     analyzer.analyze_seq(&program.body);
     DcePlan {
@@ -52,6 +61,7 @@ struct DceAnalyzer<'a> {
     drop_debugger: bool,
     drop_console: bool,
     interner: Option<&'a Interner>,
+    resolved_reference_spans: FxHashSet<Span>,
 }
 
 impl DceAnalyzer<'_> {
@@ -78,10 +88,8 @@ impl DceAnalyzer<'_> {
                 Statement::Debugger(span) if self.drop_debugger => {
                     self.remove_spans.insert(*span);
                 }
-                Statement::Expression(es) => {
-                    if self.is_removable_expr_stmt(&es.expression) {
-                        self.remove_spans.insert(es.span);
-                    }
+                Statement::Expression(es) if self.is_removable_expr_stmt(&es.expression) => {
+                    self.remove_spans.insert(es.span);
                 }
                 Statement::Return(_)
                 | Statement::Throw(_)
@@ -175,6 +183,18 @@ impl DceAnalyzer<'_> {
     /// Check whether an expression statement's expression can be removed.
     fn is_removable_expr_stmt(&self, expr: &Expression) -> bool {
         match expr {
+            // Reading a lexical binding has no observable effect. Keep member reads because
+            // getters/proxies may run user code, and keep calls/new expressions unless the
+            // dedicated purity analysis proves them safe.
+            Expression::Identifier(id) => self.resolved_reference_spans.contains(&id.span),
+            Expression::NumberLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::Function(_)
+            | Expression::Arrow(_) => true,
             Expression::Call(c) => {
                 // console.* call removal.
                 if self.drop_console && self.is_console_call(&c.callee) {
@@ -355,6 +375,16 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn resolved_identifier_read_is_removable() {
+        assert_eq!(spans_text("const value=1;value;", false, false), ["value;"]);
+    }
+
+    #[test]
+    fn unresolved_identifier_read_is_preserved_for_reference_error() {
+        assert!(spans_text("missingGlobal;", false, false).is_empty());
     }
 
     // ── 1. Unreachable after return ──

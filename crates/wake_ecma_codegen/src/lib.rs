@@ -44,8 +44,10 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
         define: &[],
         define_leaves: Vec::new(),
         shake: None,
+        program_reads: collect_reads(program),
         minify: false,
         rename: None,
+        module_renames: FxHashMap::default(),
         prop_rename: None,
         minify_ctx: None,
         no_esmodule: false,
@@ -234,13 +236,18 @@ fn codegen_impl(
     minify_names: bool,
     want_map: bool,
 ) -> (String, Option<ModuleMappings>) {
-    let shake = keep_exports.map(|keep| ShakeCtx {
-        // 外部已用导出名预驻留为 Atom（与导出名 Atom 同 interner，u32 相等 ⟺ 字符串相等）。
-        used: keep.iter().map(|s| interner.intern(s)).collect(),
-        internal_reads: collect_reads(program),
-        default_atom: interner.intern("default"),
+    let shake = keep_exports.map(|keep| {
+        let used: FxHashSet<Atom> = keep.iter().map(|s| interner.intern(s)).collect();
+        ShakeCtx {
+            used_locals: collect_used_export_locals(program, &used),
+            // 外部已用导出名预驻留为 Atom（与导出名 Atom 同 interner，u32 相等 ⟺ 字符串相等）。
+            used,
+            internal_reads: collect_reads(program),
+            default_atom: interner.intern("default"),
+        }
     });
     let prop_rename = minify_ctx.and_then(|ctx| ctx.prop_rename);
+    let module_renames = collect_module_renames(program, rename);
     let mut cg = Codegen {
         out: String::new(),
         interner,
@@ -250,8 +257,10 @@ fn codegen_impl(
         define,
         define_leaves: define_leaf_atoms(define, interner),
         shake,
+        program_reads: collect_reads(program),
         minify,
         rename,
+        module_renames,
         prop_rename,
         minify_ctx,
         no_esmodule,
@@ -283,6 +292,8 @@ fn codegen_impl(
 struct ShakeCtx {
     /// 外部（其它模块）真正 import 的导出名 Atom（含 `"default"`，见 [`ShakeCtx::default_atom`]）。
     used: FxHashSet<Atom>,
+    /// Local bindings behind a live `export { local as public }` specifier.
+    used_locals: FxHashSet<Atom>,
     /// 本模块内作为**读取**出现的标识符名 Atom（判断某导出声明是否还被内部引用）。
     internal_reads: FxHashSet<Atom>,
     /// 预驻留的 `"default"` Atom（默认导出的 used 判定用）。
@@ -301,6 +312,10 @@ impl ShakeCtx {
     /// 从 internal_reads 中移除指定 atom。
     fn remove_read(&mut self, name: Atom) {
         self.internal_reads.remove(&name);
+    }
+
+    fn is_local_live(&self, name: Atom) -> bool {
+        self.is_used(name) || self.used_locals.contains(&name) || self.is_read(name)
     }
 }
 
@@ -392,6 +407,9 @@ struct Codegen<'i, 'l, 'd, 'm, 'mc> {
     define_leaves: Vec<Atom>,
     /// Tree Shaking 上下文（`None` = 不 shake）。见 [`codegen_module_shaken`]。
     shake: Option<ShakeCtx>,
+    /// All identifier reads in the module. This remains available when tree shaking is disabled,
+    /// allowing codegen-only rewrites that must preserve locally referenced declaration names.
+    program_reads: FxHashSet<Atom>,
     /// 紧凑（minify）输出：换行/缩进省略（语句均发显式 `;`/`}`，ASI 安全）。CRUSTIFY-PARITY §M4a。
     minify: bool,
     /// 跳过 `__esModule` 定义（用于单包模式，bundler 静态处理 interop）。
@@ -400,6 +418,8 @@ struct Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// 构建、经调用方传入（codegen 属编译核心，不能反向依赖 parser 的语义分析）。CRUSTIFY-PARITY §M4。
     /// 只在**变量引用/绑定**发射点（[`Codegen::push_ident`]）按 span 查表；属性名/成员名/导出名不查。
     rename: Option<&'m FxHashMap<Span, Atom>>,
+    /// Module-scope binding rename fallback for synthetic export references whose span is DUMMY.
+    module_renames: FxHashMap<Atom, Atom>,
     /// Property mangling side-table (span → new name).
     /// Built by `plan_prop_mangle`, consumed to shorten property names in
     /// member access expressions and object literal keys.
@@ -593,6 +613,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.push_name(nn);
             return;
         }
+        if let Some(&nn) = self.module_renames.get(&ident.name) {
+            self.push_name(nn);
+            return;
+        }
         self.push_name(ident.name);
     }
 
@@ -602,6 +626,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             && let Some(map) = self.rename
             && let Some(&nn) = map.get(&ident.span)
         {
+            return self.name(nn);
+        }
+        if let Some(&nn) = self.module_renames.get(&ident.name) {
             return self.name(nn);
         }
         self.name(ident.name)
@@ -682,8 +709,88 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             if i > 0 {
                 self.newline();
             }
+            if let Statement::VariableDeclaration(decl) = &stmts[i]
+                && self.emit_shaken_top_level_var(decl)
+            {
+                i += 1;
+                continue;
+            }
+            if let Statement::FunctionDeclaration(function) = &stmts[i]
+                && let Some(id) = function.id
+                && self
+                    .shake
+                    .as_ref()
+                    .is_some_and(|shake| !shake.is_local_live(id.name))
+            {
+                i += 1;
+                continue;
+            }
             i = self.emit_merged_statement(stmts, i);
         }
+    }
+
+    /// Emit a module-scope declaration after zombie-export pruning.
+    ///
+    /// Returns `true` when this method handled the declaration. Only simple identifiers are
+    /// candidates; destructuring is left to the normal emitter because binding itself may invoke
+    /// iterators/getters.
+    fn emit_shaken_top_level_var(&mut self, decl: &VariableDeclaration) -> bool {
+        let Some(shake) = &self.shake else {
+            return false;
+        };
+        if decl.kind.is_using() {
+            return false;
+        }
+        let removable: Vec<bool> = decl
+            .declarations
+            .iter()
+            .map(|item| match &item.id {
+                Pattern::Ident(id) => !shake.is_local_live(id.name),
+                _ => false,
+            })
+            .collect();
+        if !removable.iter().any(|remove| *remove) {
+            return false;
+        }
+
+        let mut emitted = false;
+        let mut in_declaration = false;
+        for (item, remove) in decl.declarations.iter().zip(removable) {
+            if remove {
+                if let Some(init) = &item.init
+                    && !expr_is_definitely_effect_free(init)
+                {
+                    if emitted {
+                        self.push(";");
+                    }
+                    self.emit_expr(init, P_SEQUENCE);
+                    emitted = true;
+                    in_declaration = false;
+                }
+                continue;
+            }
+
+            if in_declaration {
+                self.punct(", ");
+            } else {
+                if emitted {
+                    self.push(";");
+                }
+                self.push(decl.kind.as_str());
+                self.sp();
+                in_declaration = true;
+            }
+            self.emit_pattern(&item.id);
+            if let Some(init) = &item.init {
+                self.punct(" = ");
+                self.emit_expr(init, P_ASSIGN);
+            }
+            emitted = true;
+        }
+        if emitted {
+            self.push(";");
+        }
+        true
     }
 
     /// Iteratively identify export declarations that can be dropped and remove their
@@ -700,26 +807,31 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         let mut exports: Vec<ExpInfo> = Vec::new();
         // Map: atom → set of export indices that READ this atom.
         let mut readers_of: FxHashMap<Atom, Vec<usize>> = FxHashMap::default();
+        let mut fixed_reads = FxHashSet::default();
 
         for stmt in stmts {
-            if let Statement::ExportNamed(s) = stmt {
-                if let Some(decl) = &s.declaration {
-                    let names = self.decl_names(decl);
-                    let all_unused = names
-                        .iter()
-                        .all(|n| !self.shake.as_ref().unwrap().is_used(*n));
-                    let pure = decl_is_pure(decl);
+            if let Statement::ExportNamed(s) = stmt
+                && let Some(decl) = &s.declaration
+            {
+                let names = self.decl_names(decl);
+                let all_unused = names
+                    .iter()
+                    .all(|n| !self.shake.as_ref().unwrap().is_used(*n));
+                let pure = decl_is_pure(decl);
 
-                    let mut reads = FxHashSet::default();
-                    if all_unused && pure {
-                        collect_reads_in_statement(decl, &mut reads);
-                        for atom in &reads {
-                            readers_of.entry(*atom).or_default().push(exports.len());
-                        }
+                let mut reads = FxHashSet::default();
+                if all_unused && pure {
+                    collect_reads_in_statement(decl, &mut reads);
+                    for atom in &reads {
+                        readers_of.entry(*atom).or_default().push(exports.len());
                     }
-
-                    exports.push(ExpInfo { names, pure, reads });
+                } else {
+                    collect_reads_in_statement(decl, &mut fixed_reads);
                 }
+
+                exports.push(ExpInfo { names, pure, reads });
+            } else {
+                collect_reads_in_statement(stmt, &mut fixed_reads);
             }
         }
 
@@ -745,9 +857,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     continue;
                 }
                 let all_readers_dropped = exp.names.iter().all(|n| {
-                    readers_of
-                        .get(n)
-                        .map_or(true, |readers| readers.iter().all(|r| dropped.contains(r)))
+                    readers_of.get(n).is_none_or(|readers| {
+                        readers.iter().all(|r| *r == i || dropped.contains(r))
+                    })
                 });
                 if all_readers_dropped {
                     dropped.insert(i);
@@ -763,9 +875,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 continue;
             }
             for atom in &exp.reads {
-                let has_live_reader = readers_of.get(atom).map_or(false, |readers| {
-                    readers.iter().any(|r| *r != i && !dropped.contains(r))
-                });
+                let has_live_reader = readers_of
+                    .get(atom)
+                    .is_some_and(|readers| readers.iter().any(|r| *r != i && !dropped.contains(r)))
+                    || fixed_reads.contains(atom);
                 if !has_live_reader {
                     shake.remove_read(*atom);
                 }
@@ -1078,22 +1191,22 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             };
 
             if is_unused {
-                if let Some(init) = &decl.init {
-                    if !expr_is_pure(init) {
-                        if emitted {
-                            self.push(";");
-                        }
-                        let needs_paren = starts_with_problematic(init);
-                        if needs_paren {
-                            self.push("(");
-                        }
-                        self.emit_expr(init, P_SEQUENCE);
-                        if needs_paren {
-                            self.push(")");
-                        }
-                        emitted = true;
-                        in_var = false;
+                if let Some(init) = &decl.init
+                    && !expr_is_pure(init)
+                {
+                    if emitted {
+                        self.push(";");
                     }
+                    let needs_paren = starts_with_problematic(init);
+                    if needs_paren {
+                        self.push("(");
+                    }
+                    self.emit_expr(init, P_SEQUENCE);
+                    if needs_paren {
+                        self.push(")");
+                    }
+                    emitted = true;
+                    in_var = false;
                 }
                 continue;
             }
@@ -1140,12 +1253,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         }
 
         // Skip hoisted var declarations (already emitted at function top)
-        if let Some(ctx) = self.minify_ctx {
-            if let Statement::VariableDeclaration(d) = stmt {
-                if ctx.hoist.var_hoist_flat.contains(&d.span) {
-                    return i + 1;
-                }
-            }
+        if let Some(ctx) = self.minify_ctx
+            && let Statement::VariableDeclaration(d) = stmt
+            && ctx.hoist.var_hoist_flat.contains(&d.span)
+        {
+            return i + 1;
         }
 
         if let Some(ctx) = self.minify_ctx {
@@ -1228,22 +1340,22 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 };
 
                 if is_unused {
-                    if let Some(init) = &decl.init {
-                        if !expr_is_pure(init) {
-                            if emitted {
-                                self.push(";");
-                            }
-                            let needs_paren = starts_with_problematic(init);
-                            if needs_paren {
-                                self.push("(");
-                            }
-                            self.emit_expr(init, P_SEQUENCE);
-                            if needs_paren {
-                                self.push(")");
-                            }
-                            emitted = true;
-                            in_var = false;
+                    if let Some(init) = &decl.init
+                        && !expr_is_pure(init)
+                    {
+                        if emitted {
+                            self.push(";");
                         }
+                        let needs_paren = starts_with_problematic(init);
+                        if needs_paren {
+                            self.push("(");
+                        }
+                        self.emit_expr(init, P_SEQUENCE);
+                        if needs_paren {
+                            self.push(")");
+                        }
+                        emitted = true;
+                        in_var = false;
                     }
                     continue;
                 }
@@ -1545,7 +1657,20 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     fn emit_import_linked(&mut self, d: &ImportDeclaration) {
         let src = self.name(d.source);
         let req = self.require_expr_static(&src);
-        if d.specifiers.is_empty() {
+        let unused_spans = self
+            .minify_ctx
+            .map(|ctx| ctx.unused_var_spans.clone())
+            .unwrap_or_default();
+        let is_unused = |spec: &ImportSpecifier| {
+            let span = match spec {
+                ImportSpecifier::Default { local, .. }
+                | ImportSpecifier::Namespace { local, .. }
+                | ImportSpecifier::Named { local, .. } => local.span,
+            };
+            unused_spans.contains(&span)
+        };
+        let has_live_specifier = d.specifiers.iter().any(|spec| !is_unused(spec));
+        if !has_live_specifier {
             self.push(&req);
             self.push(";");
             return;
@@ -1553,6 +1678,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         let tmp = self.next_tmp();
         self.push(&format!("const {tmp} = {req};"));
         for spec in d.specifiers.iter() {
+            if is_unused(spec) {
+                continue;
+            }
             self.newline();
             match spec {
                 ImportSpecifier::Default { local, .. } => {
@@ -1571,7 +1699,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 } => {
                     let imp = self.module_export_name_string(imported);
                     let n = self.name(local.name);
-                    self.push(&format!("const {n} = {tmp}[{imp:?}];"));
+                    self.push(&format!("const {n} = "));
+                    self.emit_property_access(&tmp, &imp);
+                    self.push(";");
                 }
             }
         }
@@ -1594,6 +1724,21 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 if drop_all {
                     return;
                 }
+                if used_flags.as_slice() == [true]
+                    && let Statement::FunctionDeclaration(function) = decl
+                    && let Some(id) = function.id
+                    && self
+                        .shake
+                        .as_ref()
+                        .is_some_and(|shake| !shake.is_read(id.name))
+                {
+                    let key = self.name(name_spans[0].0);
+                    self.emit_property_access("exports", &key);
+                    self.punct(" = ");
+                    self.emit_function_with_name(function, false);
+                    self.push(";");
+                    return;
+                }
                 // 否则保留声明，但仅为**已用**导出发绑定行（移除未用绑定永远安全）。
                 self.emit_statement(decl);
                 for ((n, sp), &used) in name_spans.iter().zip(&used_flags) {
@@ -1602,6 +1747,18 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                         self.emit_export_binding(*n, Some(*sp));
                     }
                 }
+                return;
+            }
+            if name_spans.len() == 1
+                && let Statement::FunctionDeclaration(function) = decl
+                && let Some(id) = function.id
+                && !self.program_reads.contains(&id.name)
+            {
+                let key = self.name(name_spans[0].0);
+                self.emit_property_access("exports", &key);
+                self.punct(" = ");
+                self.emit_function_with_name(function, false);
+                self.push(";");
                 return;
             }
             self.emit_statement(decl);
@@ -1628,7 +1785,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     // 用字面量 `exports`（与 emit_export_binding / 本地 re-export 一致）——单包模式
                     // 由 compact_body_names 统一转 `$`。曾误用 `self.ex()`（minify_names 下 = "e"）→
                     // 单包 wrapper 无 `e` 绑定 → 运行期 `e is not defined`。
-                    self.push(&format!("exports[{exported:?}] = {tmp}[{local:?}];"));
+                    self.emit_property_access("exports", &exported);
+                    self.punct(" = ");
+                    self.emit_property_access(&tmp, &local);
+                    self.push(";");
                 }
             }
             None => {
@@ -1648,8 +1808,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                         ModuleExportName::Ident(id) => self.renamed_or(local_atom, id.span),
                         ModuleExportName::String(_) => local_atom,
                     };
-                    let local = self.name(local_val);
-                    self.push(&format!("exports[{exported:?}] = {local};"));
+                    self.emit_property_access("exports", &exported);
+                    self.punct(" = ");
+                    self.push_name(local_val);
+                    self.push(";");
                 }
             }
         }
@@ -1663,14 +1825,19 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// 绑定 `name`（声明于 `span`）经 mangle 后的实际名——命中 rename 侧表则取新名，否则原名。
     /// 用于**导出赋值的值**：`exports["原名"] = 新名`（字符串键保留公开契约，值随 mangle）。
     fn renamed_or(&self, name: Atom, span: Span) -> Atom {
-        if !span.is_dummy()
-            && let Some(map) = self.rename
-            && let Some(&nn) = map.get(&span)
-        {
-            nn
-        } else {
-            name
+        if !span.is_dummy() {
+            if let Some(map) = self.rename
+                && let Some(&nn) = map.get(&span)
+            {
+                return nn;
+            }
+        } else if let Some(&nn) = self.module_renames.get(&name) {
+            return nn;
         }
+        if let Some(&nn) = self.module_renames.get(&name) {
+            return nn;
+        }
+        name
     }
 
     /// 发射一行 `exports["name"] = value;`：键用导出名（原名，公开契约），值随 mangle（按绑定 span 查表）。
@@ -1678,9 +1845,24 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         let value = decl_span.map_or(name, |sp| self.renamed_or(name, sp));
         let key = self.interner.resolve(name);
         let val = self.interner.resolve(value);
-        let before = self.out.len();
-        let _ = write!(self.out, "exports[{key:?}] = {val};");
-        self.sync_from(before);
+        self.emit_property_access("exports", &key);
+        self.punct(" = ");
+        self.push(&val);
+        self.push(";");
+    }
+
+    /// Emit a static property access. In compact output, identifier-like keys are shorter and
+    /// equally precise in dot form (`exports.name`); arbitrary string export names retain brackets.
+    fn emit_property_access(&mut self, base: &str, key: &str) {
+        self.push(base);
+        if self.minify && is_ascii_property_name(key) {
+            self.push(".");
+            self.push(key);
+        } else {
+            let before = self.out.len();
+            let _ = write!(self.out, "[{key:?}]");
+            self.sync_from(before);
+        }
     }
 
     /// 同步 sourcemap 游标：把 `self.out[from..]`（绕过 [`Codegen::push`] 直写的部分）计入行列。
@@ -1788,7 +1970,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         match &s.exported {
             Some(ns) => {
                 let name = self.module_export_name_string(ns);
-                self.push(&format!("exports[{name:?}] = {tmp};"));
+                self.emit_property_access("exports", &name);
+                self.punct(" = ");
+                self.push(&tmp);
+                self.push(";");
             }
             None => {
                 self.push(&format!(
@@ -1820,15 +2005,6 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             _ => {}
         }
         names
-    }
-
-    /// 声明语句导出的名字 Span（用于 rename lookup）。
-    fn decl_span(&self, stmt: &Statement) -> Option<Span> {
-        match stmt {
-            Statement::FunctionDeclaration(f) => f.id.as_ref().map(|id| id.span),
-            Statement::ClassDeclaration(c) => c.id.as_ref().map(|id| id.span),
-            _ => None,
-        }
     }
 
     /// 声明的 (绑定名, 绑定标识符 span) 列表——供导出赋值行按各自 span 查 rename 表发正确的值。
@@ -1876,6 +2052,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     // ==================================================================
 
     fn emit_function(&mut self, f: &Function) {
+        self.emit_function_with_name(f, true);
+    }
+
+    fn emit_function_with_name(&mut self, f: &Function, emit_name: bool) {
         if f.is_async {
             self.push("async ");
         }
@@ -1883,8 +2063,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         if f.is_generator {
             self.push("*");
         }
-        self.sp();
-        if let Some(id) = f.id {
+        if emit_name || !self.minify {
+            self.sp();
+        }
+        if emit_name && let Some(id) = f.id {
             self.push_ident(&id);
         }
         self.emit_params(&f.params);
@@ -2166,7 +2348,8 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             // mangler 重命名类绑定后会变成压缩名，装饰器读到的名字就错了。
             let src_name = c.id.map(|id| self.name(id.name)).unwrap_or_default();
             self.push(&format!(
-                "__esDecorate(null,_classDescriptor={{value:_classThis}},_classDecorators,{{kind:\"class\",name:{n:?}}},null,_classExtraInitializers);{class_name}=_classThis=_classDescriptor.value;",
+                "__esDecorate(null,_classDescriptor={{value:_classThis}},_classDecorators,{{kind:\"{k}\",name:{n:?}}},null,_classExtraInitializers);{class_name}=_classThis=_classDescriptor.value;",
+                k = DecoratedKind::Class.as_str(),
                 n = src_name
             ));
         }
@@ -2479,25 +2662,25 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         // pure variable, emit its initializer expression directly.
         // Skip inlining when in write-target position (Update argument / Assignment left)
         // to avoid producing invalid syntax like `(1 << bf) = 1`.
-        if !self.skip_inline {
-            if let Expression::Identifier(id) = expr {
-                // 按标识符**引用 span**（非名字）命中内联,只替换那唯一一次使用,
-                // 不波及其它作用域的同名变量。合成节点(DUMMY)不参与。
-                if let Some(ctx) = self.minify_ctx
-                    && !id.span.is_dummy()
-                    && let Some(inline_expr) = ctx.inline_vars.get(&id.span)
-                {
-                    let prec = expr_precedence(inline_expr);
-                    let parens = prec < min_prec;
-                    if parens {
-                        self.push("(");
-                    }
-                    self.emit_expr_inner(inline_expr);
-                    if parens {
-                        self.push(")");
-                    }
-                    return;
+        if !self.skip_inline
+            && let Expression::Identifier(id) = expr
+        {
+            // 按标识符**引用 span**（非名字）命中内联,只替换那唯一一次使用,
+            // 不波及其它作用域的同名变量。合成节点(DUMMY)不参与。
+            if let Some(ctx) = self.minify_ctx
+                && !id.span.is_dummy()
+                && let Some(inline_expr) = ctx.inline_vars.get(&id.span)
+            {
+                let prec = expr_precedence(inline_expr);
+                let parens = prec < min_prec;
+                if parens {
+                    self.push("(");
                 }
+                self.emit_expr_inner(inline_expr);
+                if parens {
+                    self.push(")");
+                }
+                return;
             }
         }
         let prec = expr_precedence(expr);
@@ -2596,11 +2779,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 if let Some(ctx) = self.minify_ctx
                     && !u.span.is_dummy()
                     && ctx.double_not_spans.contains(&u.span)
+                    && let Expression::Unary(inner) = &u.argument
                 {
-                    if let Expression::Unary(inner) = &u.argument {
-                        self.emit_expr(&inner.argument, P_UNARY);
-                        return;
-                    }
+                    self.emit_expr(&inner.argument, P_UNARY);
+                    return;
                 }
                 let op = u.operator.as_str();
                 self.push(op);
@@ -3074,6 +3256,15 @@ fn same_name(a: &ModuleExportName, b: &ModuleExportName) -> bool {
     }
 }
 
+fn is_ascii_property_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, b'_' | b'$'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+}
+
 // ======================================================================
 // Tree Shaking 辅助（PLAN §6.6）
 // ======================================================================
@@ -3103,6 +3294,97 @@ fn collect_reads(program: &Program) -> FxHashSet<Atom> {
     };
     c.visit_program(program);
     c.reads
+}
+
+fn collect_module_renames(
+    program: &Program,
+    rename: Option<&FxHashMap<Span, Atom>>,
+) -> FxHashMap<Atom, Atom> {
+    let Some(rename) = rename else {
+        return FxHashMap::default();
+    };
+    let mut out = FxHashMap::default();
+    let mut collect = |stmt: &Statement| match stmt {
+        Statement::VariableDeclaration(decl) => {
+            for item in decl.declarations.iter() {
+                if let Pattern::Ident(id) = &item.id
+                    && let Some(&new_name) = rename.get(&id.span)
+                {
+                    out.insert(id.name, new_name);
+                }
+            }
+        }
+        Statement::FunctionDeclaration(function) => {
+            if let Some(id) = function.id
+                && let Some(&new_name) = rename.get(&id.span)
+            {
+                out.insert(id.name, new_name);
+            }
+        }
+        Statement::ClassDeclaration(class) => {
+            if let Some(id) = class.id
+                && let Some(&new_name) = rename.get(&id.span)
+            {
+                out.insert(id.name, new_name);
+            }
+        }
+        _ => {}
+    };
+    for stmt in program.body.iter() {
+        if let Statement::ExportNamed(export) = stmt
+            && let Some(decl) = &export.declaration
+        {
+            collect(decl);
+        } else {
+            collect(stmt);
+        }
+    }
+    out
+}
+
+fn collect_used_export_locals(program: &Program, used: &FxHashSet<Atom>) -> FxHashSet<Atom> {
+    let mut locals = FxHashSet::default();
+    for stmt in program.body.iter() {
+        if let Statement::ExportNamed(export) = stmt
+            && export.declaration.is_none()
+            && export.source.is_none()
+        {
+            for specifier in export.specifiers.iter() {
+                if used.contains(&module_export_name_atom(&specifier.exported)) {
+                    locals.insert(module_export_name_atom(&specifier.local));
+                }
+            }
+        }
+    }
+    locals
+}
+
+/// Conservative proof that evaluating an expression cannot call user code, throw through an
+/// unresolved lookup, mutate state, or invoke a getter/iterator.
+fn expr_is_definitely_effect_free(expr: &Expression) -> bool {
+    match expr {
+        Expression::NumberLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::Function(_)
+        | Expression::Arrow(_) => true,
+        Expression::Array(array) => array.elements.iter().flatten().all(|element| {
+            !matches!(element, Expression::Spread(_)) && expr_is_definitely_effect_free(element)
+        }),
+        Expression::Object(object) => object.properties.iter().all(|member| match member {
+            ObjectMember::Property(property) => {
+                !matches!(property.key, PropertyKey::Computed(_))
+                    && expr_is_definitely_effect_free(&property.value)
+            }
+            ObjectMember::Spread(_) => false,
+        }),
+        // Class evaluation may execute computed keys, static fields/blocks, or `extends`.
+        // Identifiers can throw in TDZ/unresolved cases; member reads can invoke getters/proxies.
+        _ => false,
+    }
 }
 
 /// Collect all identifier reads within a single statement (for per-declaration read tracking).

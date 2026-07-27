@@ -28,37 +28,33 @@ fn analyze_seq_if_return(stmts: &[Statement], candidates: &mut Vec<IfReturnCandi
     // ── Pattern 1: if (cond) return a; (no else) + return b; ──
     for i in 0..stmts.len().saturating_sub(1) {
         let (first, second) = (&stmts[i], &stmts[i + 1]);
-        if let Statement::If(if_stmt) = first {
-            if if_stmt.alternate.is_none() {
-                if let Some(cons_ret) = extract_single_return(&if_stmt.consequent) {
-                    if let Statement::Return(next_ret) = second {
-                        candidates.push(IfReturnCandidate {
-                            cond_span: if_stmt.test.span(),
-                            if_span: if_stmt.span,
-                            return_span: cons_ret.span,
-                            subsequent_return_span: next_ret.span,
-                        });
-                    }
-                }
-            }
+        if let Statement::If(if_stmt) = first
+            && if_stmt.alternate.is_none()
+            && let Some(cons_ret) = extract_single_return(&if_stmt.consequent)
+            && let Statement::Return(next_ret) = second
+        {
+            candidates.push(IfReturnCandidate {
+                cond_span: if_stmt.test.span(),
+                if_span: if_stmt.span,
+                return_span: cons_ret.span,
+                subsequent_return_span: next_ret.span,
+            });
         }
     }
 
     // ── Pattern 2: if (cond) return a; else return b; ──
     for stmt in stmts {
-        if let Statement::If(if_stmt) = stmt {
-            if let Some(cons_ret) = extract_single_return(&if_stmt.consequent) {
-                if let Some(alt) = &if_stmt.alternate {
-                    if let Some(alt_ret) = extract_single_return(alt) {
-                        candidates.push(IfReturnCandidate {
-                            cond_span: if_stmt.test.span(),
-                            if_span: if_stmt.span,
-                            return_span: cons_ret.span,
-                            subsequent_return_span: alt_ret.span,
-                        });
-                    }
-                }
-            }
+        if let Statement::If(if_stmt) = stmt
+            && let Some(cons_ret) = extract_single_return(&if_stmt.consequent)
+            && let Some(alt) = &if_stmt.alternate
+            && let Some(alt_ret) = extract_single_return(alt)
+        {
+            candidates.push(IfReturnCandidate {
+                cond_span: if_stmt.test.span(),
+                if_span: if_stmt.span,
+                return_span: cons_ret.span,
+                subsequent_return_span: alt_ret.span,
+            });
         }
     }
 
@@ -460,11 +456,8 @@ pub fn analyze_sequences(program: &Program) -> Vec<(Span, Span)> {
 
 fn analyze_seq_sequences(stmts: &[Statement], pairs: &mut Vec<(Span, Span)>) {
     for i in 0..stmts.len().saturating_sub(1) {
-        match (&stmts[i], &stmts[i + 1]) {
-            (Statement::Expression(a), Statement::Expression(b)) => {
-                pairs.push((a.span, b.span));
-            }
-            _ => {}
+        if let (Statement::Expression(a), Statement::Expression(b)) = (&stmts[i], &stmts[i + 1]) {
+            pairs.push((a.span, b.span));
         }
     }
 
@@ -651,21 +644,21 @@ mod tests {
         let it = Interner::new();
         let out = parse(src, &it, SourceType::Script);
         assert!(!out.has_errors(), "parse error: {:?}", out.diagnostics);
-        out.module.with_ast(|p| analyze_if_return(p))
+        out.module.with_ast(analyze_if_return)
     }
 
     fn run_join_vars(src: &str) -> Vec<(Span, Span)> {
         let it = Interner::new();
         let out = parse(src, &it, SourceType::Script);
         assert!(!out.has_errors(), "parse error: {:?}", out.diagnostics);
-        out.module.with_ast(|p| analyze_join_vars(p))
+        out.module.with_ast(analyze_join_vars)
     }
 
     fn run_sequences(src: &str) -> Vec<(Span, Span)> {
         let it = Interner::new();
         let out = parse(src, &it, SourceType::Script);
         assert!(!out.has_errors(), "parse error: {:?}", out.diagnostics);
-        out.module.with_ast(|p| analyze_sequences(p))
+        out.module.with_ast(analyze_sequences)
     }
 
     fn candidate_texts(src: &str, candidates: &[IfReturnCandidate]) -> Vec<String> {

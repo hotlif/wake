@@ -68,10 +68,10 @@ fn write_number_impl(n: f64, minified: bool) -> String {
     } else {
         let s = format!("{}", n);
         if minified {
-            if s.starts_with("0.") {
-                format!(".{}", &s[2..])
-            } else if s.starts_with("-0.") {
-                format!("-.{}", &s[3..])
+            if let Some(stripped) = s.strip_prefix("0.") {
+                format!(".{stripped}")
+            } else if let Some(stripped) = s.strip_prefix("-0.") {
+                format!("-.{stripped}")
             } else {
                 s
             }
@@ -314,10 +314,10 @@ fn const_eval_binary<'a>(bin: &BinaryExpression<'a>, ctx: &ConstCtx) -> Option<C
                 (Some(a), _) => Some(ConstVal::Str(format!("{}{}", a, string_val(&r)))),
                 (_, Some(b)) => Some(ConstVal::Str(format!("{}{}", string_val(&l), b))),
                 _ if matches!((&l, &r), (ConstVal::Num(_), ConstVal::Num(_))) => {
-                    if let ConstVal::Num(a) = l {
-                        if let ConstVal::Num(b) = r {
-                            return Some(ConstVal::Num(a + b));
-                        }
+                    if let ConstVal::Num(a) = l
+                        && let ConstVal::Num(b) = r
+                    {
+                        return Some(ConstVal::Num(a + b));
                     }
                     unreachable!()
                 }
@@ -350,7 +350,7 @@ fn const_eval_binary<'a>(bin: &BinaryExpression<'a>, ctx: &ConstCtx) -> Option<C
         }
         Shl | Shr | Ushr => {
             let l = const_eval(&bin.left, ctx).map(|v| to_int32(&v))?;
-            let r = const_eval(&bin.right, ctx).map(|v| (to_uint32(&v) & 0x1F) as u32)?;
+            let r = const_eval(&bin.right, ctx).map(|v| to_uint32(&v) & 0x1F)?;
             let result = match bin.operator {
                 Shl => (l as u32).wrapping_shl(r) as i32,
                 Shr => l.wrapping_shr(r),
@@ -589,17 +589,17 @@ mod tests {
 
     fn assert_eval(src: &str, expected: ConstVal) {
         let val = eval(src);
-        if let Some(ConstVal::Num(a)) = &val {
-            if let ConstVal::Num(b) = &expected {
-                assert!(
-                    a.is_nan() && b.is_nan() || (a == b),
-                    "eval `{}`: got {:?}, expected {:?}",
-                    src,
-                    val,
-                    expected
-                );
-                return;
-            }
+        if let Some(ConstVal::Num(a)) = &val
+            && let ConstVal::Num(b) = &expected
+        {
+            assert!(
+                a.is_nan() && b.is_nan() || (a == b),
+                "eval `{}`: got {:?}, expected {:?}",
+                src,
+                val,
+                expected
+            );
+            return;
         }
         assert_eq!(val, Some(expected), "eval `{}`", src);
     }
@@ -620,7 +620,7 @@ mod tests {
     }
     #[test]
     fn eval_neg_number() {
-        assert_eval("-3.14;", ConstVal::Num(-3.14));
+        assert_eval("-3.125;", ConstVal::Num(-3.125));
     }
     #[test]
     fn eval_string_double() {
