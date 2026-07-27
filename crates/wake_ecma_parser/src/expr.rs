@@ -270,8 +270,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             }));
         }
 
-        // await（async 内）。
+        // await（async 内，或模块顶层）。
         if self.at_keyword(Keyword::Await) && self.ctx.in_async {
+            if self.ctx.top_level {
+                self.has_top_level_await = true;
+            }
             self.bump();
             let argument = self.parse_unary_expression();
             return Expression::Await(self.alloc(AwaitExpression {
@@ -998,8 +1001,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     ) -> Expression<'a> {
         let saved_async = self.ctx.in_async;
         let saved_gen = self.ctx.in_generator;
+        let saved_top = self.ctx.top_level;
         self.ctx.in_async = is_async;
         self.ctx.in_generator = false;
+        self.ctx.top_level = false;
 
         let body = if self.at(TokenKind::LBrace) {
             ArrowBody::Block(self.parse_function_body())
@@ -1009,6 +1014,7 @@ impl<'a, 'src> Parser<'a, 'src> {
 
         self.ctx.in_async = saved_async;
         self.ctx.in_generator = saved_gen;
+        self.ctx.top_level = saved_top;
 
         Expression::Arrow(self.alloc(ArrowFunction {
             span: self.span_to(lo),

@@ -302,6 +302,18 @@ CJS 模块不做 shaking（整体保留），与业界一致。第一版可以�
 
 **第二步（优化期，scope hoisting）**：对「纯 ESM、单实例、无循环复杂性」的模块子图做 Rollup 式的作用域提升——把多个模块拼进同一函数作用域，冲突标识符用符号表统一重命名（Atom 使这一步很便宜）。产物更小、运行更快。dev 永远用函数包装（利于 HMR），prod 用 scope hoisting。
 
+### 6.1.1 顶层 await（async 模块）
+
+顶层 await（ES2022）与「同步返回 `module.exports` 的 `__wake_require__`」天然冲突。wake 的做法与 esbuild/Rollup 同构：把受影响的模块升级成 **async 模块**。
+
+- **async 子图**：解析器给每个模块打 `has_top_level_await` 标记（`ParseOutput::has_top_level_await`，仅统计不在任何函数/方法/箭头/`static {}` 内的 `await`/`for await`）；打包器由这些模块出发，沿**静态 ESM 边**（`import` / `export ... from`）反向传递闭包 —— 导入了 async 模块的模块自身也是 async 模块。
+- **包装器**：async 子图内的模块包成 `async function(module, exports, __wake_require__)`。
+- **调用点**：codegen 只在**静态导入降级点**把目标是 async 模块的 require 写成 `(await __wake_require__(id))`；模块体顶层之外的 `require("x")` 改写点不加 `await`。
+- **runtime**：`__wake_require__` 检测工厂返回值是否 thenable，是则缓存该 Promise（`module.p`）并返回它。同步模块返回 `undefined`（非 thenable），走原路径。循环依赖下拿到的是**部分填充**的 exports，与同步路径语义一致，不会死锁。
+- **不传染的边**：动态 `import()`（本就产出 Promise，`Promise.resolve` 自动展平）与 CJS `require()`（调用点可能嵌在普通函数内，插不进 `await`）。
+- **入口效应**：入口落在 async 子图内时 `module.exports` 是 Promise，消费方需 `await require("./bundle.js")`。
+- **产物影响**：无顶层 await 的项目走完全相同的旧路径，产物**逐字节不变**；含顶层 await 时 prod 的模块合并（scope hoisting）关闭 —— 单个合并闭包无法表达「其中一部分模块 async 且彼此有 await 顺序」。
+
 ### 6.2 CJS/ESM 互操作
 
 - ESM import CJS：生成 `interop` 辅助（`default` 指向 `module.exports`，具名属性尽力而为——与 esbuild 语义对齐并写成兼容性测试集）；

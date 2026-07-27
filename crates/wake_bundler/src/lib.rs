@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use wake_common::{Atom, Diagnostic, FileSystem, FxHashMap, Interner, fs::normalize};
-use wake_ecma_ast::{ModuleAst, SourceType};
+use wake_common::{Atom, Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, fs::normalize};
+use wake_ecma_ast::{DependencyKind, ModuleAst, SourceType};
 use wake_ecma_codegen::{ModuleLinker, codegen_module};
 use wake_ecma_parser::parse;
 use wake_resolver::Resolver;
@@ -138,6 +138,10 @@ struct Module {
     ast: ModuleAst,
     /// 原始说明符 → 内部模块 id（供 linker）。
     deps: Vec<(Atom, u32)>,
+    /// 静态 ESM 导入（`import` / `export ... from`）的目标 id——顶层 await 沿这些边传染。
+    static_deps: Vec<u32>,
+    /// 模块顶层含 `await` / `for await`。
+    has_top_level_await: bool,
 }
 
 impl Bundler {
@@ -178,6 +182,7 @@ impl Bundler {
 
             let from_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             let mut deps: Vec<(Atom, u32)> = Vec::new();
+            let mut static_deps: Vec<u32> = Vec::new();
             for dep in &out.dependencies {
                 let spec = self.interner.resolve(dep.specifier);
                 match resolver.resolve(&spec, &from_dir) {
@@ -185,6 +190,12 @@ impl Bundler {
                         let dep_id =
                             intern_id(&mut path_to_id, &mut worklist, &mut next_id, resolved);
                         deps.push((dep.specifier, dep_id));
+                        if matches!(
+                            dep.kind,
+                            DependencyKind::Import | DependencyKind::ExportFrom
+                        ) {
+                            static_deps.push(dep_id);
+                        }
                     }
                     Err(_) => {
                         diagnostics.push(
@@ -202,6 +213,8 @@ impl Bundler {
                 id,
                 ast: out.module,
                 deps,
+                static_deps,
+                has_top_level_await: out.has_top_level_await,
             });
         }
 
@@ -213,8 +226,15 @@ impl Bundler {
 
     /// 每模块 ESM→CJS 链接 + 函数包装 + 运行时拼接。
     fn emit(&self, modules: &[Module], entry_id: u32) -> String {
+        // 顶层 await：含 TLA 的模块 + 沿静态 ESM 边传递导入它们的模块 → `async function` 包装。
+        let async_ids = simple_async_module_ids(modules);
+
         let mut out = String::new();
-        out.push_str(PRELUDE);
+        out.push_str(if async_ids.is_empty() {
+            PRELUDE
+        } else {
+            PRELUDE_ASYNC
+        });
         out.push_str("var __wake_modules__ = {\n");
 
         for m in modules {
@@ -225,13 +245,24 @@ impl Bundler {
             let linker = Linker {
                 map,
                 dyn_chunk: FxHashMap::default(),
+                async_ids: m
+                    .deps
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .filter(|id| async_ids.contains(id))
+                    .collect(),
             };
             let body = m
                 .ast
                 .with_ast(|program| codegen_module(program, &self.interner, &linker, false));
 
+            let kw = if async_ids.contains(&m.id) {
+                "async function"
+            } else {
+                "function"
+            };
             out.push_str(&format!(
-                "{}: function(module, exports, __wake_require__) {{\n",
+                "{}: {kw}(module, exports, __wake_require__) {{\n",
                 m.id
             ));
             for line in body.lines() {
@@ -249,6 +280,34 @@ impl Bundler {
         out.push_str(POSTLUDE);
         out
     }
+}
+
+/// 非增量路径的 async 子图（语义同 incremental 的 `async_module_ids`，只是数据源不同）。
+fn simple_async_module_ids(modules: &[Module]) -> FxHashSet<u32> {
+    let mut importers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for m in modules {
+        for &tid in &m.static_deps {
+            importers.entry(tid).or_default().push(m.id);
+        }
+    }
+    let mut set: FxHashSet<u32> = FxHashSet::default();
+    let mut stack: Vec<u32> = Vec::new();
+    for m in modules {
+        if m.has_top_level_await && set.insert(m.id) {
+            stack.push(m.id);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        let Some(list) = importers.get(&id) else {
+            continue;
+        };
+        for &imp in list {
+            if set.insert(imp) {
+                stack.push(imp);
+            }
+        }
+    }
+    set
 }
 
 /// 分配/复用模块 id；新路径入队。
@@ -272,6 +331,8 @@ pub(crate) struct Linker {
     pub(crate) map: FxHashMap<String, u32>,
     /// 动态 import 说明符 → async/shared chunk id（代码分割，6.5）。空 = 不分割。
     pub(crate) dyn_chunk: FxHashMap<String, u32>,
+    /// 本模块依赖里属于 async 子图（顶层 await 传染）的模块 id。空 = 无顶层 await。
+    pub(crate) async_ids: FxHashSet<u32>,
 }
 
 impl ModuleLinker for Linker {
@@ -280,6 +341,9 @@ impl ModuleLinker for Linker {
     }
     fn dynamic_chunk(&self, specifier: &str) -> Option<u32> {
         self.dyn_chunk.get(specifier).copied()
+    }
+    fn is_async_module(&self, id: u32) -> bool {
+        self.async_ids.contains(&id)
     }
 }
 
@@ -294,6 +358,36 @@ function __wake_require__(id) {
   var module = { exports: {} };
   __wake_cache__[id] = module;
   __wake_modules__[id].call(module.exports, module, module.exports, __wake_require__);
+  return module.exports;
+}
+function __wake_interop_default(m) { return m && m.__esModule ? m.default : m; }
+function __wake_interop_star(m) {
+  if (m && m.__esModule) return m;
+  var ns = {};
+  if (m != null) { for (var k in m) if (Object.prototype.hasOwnProperty.call(m, k) && k !== "default") ns[k] = m[k]; }
+  ns.default = m;
+  return ns;
+}
+"#;
+
+/// mini runtime 前半的 **async 变体**：产物含顶层 await 时启用（DESIGN §6.1.1）。
+///
+/// 与 [`PRELUDE`] 的唯一差别是 `__wake_require__`：async 模块的包装器是 `async function`，
+/// `.call(...)` 返回 Promise → 缓存该 Promise（`module.p`）并返回它，使导入方 `await` 得到
+/// 求值完毕的 `module.exports`。同步模块的返回值是 `undefined`（非 thenable），走原路径不受影响。
+/// 循环依赖下先拿到的是**部分填充**的 exports，与同步路径语义一致（不会死锁）。
+pub(crate) const PRELUDE_ASYNC: &str = r#"(function(root) {
+var __wake_cache__ = {};
+function __wake_require__(id) {
+  var cached = __wake_cache__[id];
+  if (cached) return cached.p || cached.exports;
+  var module = { exports: {} };
+  __wake_cache__[id] = module;
+  var r = __wake_modules__[id].call(module.exports, module, module.exports, __wake_require__);
+  if (r && typeof r.then === "function") {
+    module.p = r.then(function () { return module.exports; });
+    return module.p;
+  }
   return module.exports;
 }
 function __wake_interop_default(m) { return m && m.__esModule ? m.default : m; }

@@ -2,7 +2,7 @@
 //!
 //! 目标：让一个**全新进程**的冷构建跳过未变模块的 parse + codegen——把两类纯函数输出落盘：
 //!
-//! - **模块摘要**（`ModuleSummary`）：`content_key → (deps, uses)`。`content_key = hash(源类型 ‖ 源文本)`。
+//! - **模块摘要**（`ModuleSummary`）：`content_key → (deps, uses, 顶层 await 标志)`。`content_key = hash(源类型 ‖ 源文本)`。
 //!   有它就能不 parse 直接建依赖图、算 Tree Shaking 保留集。
 //! - **codegen 产物**（`body`）：`(content_key, linker_key) → String`。`linker_key = hash(依赖 id 映射 ‖ keep ‖ dyn_chunks)`。
 //!   两键都命中 → 该模块 parse 与 codegen 全跳过，直接取缓存体拼接。
@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// 缓存文件魔数。
 const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 /// 一条依赖（说明符 + 种类判别值 + 源码位置）。`kind` 用 `u8`（由调用方与 `DependencyKind` 互转），
 /// 使本 crate 不依赖 AST 类型。
@@ -43,11 +43,13 @@ pub struct CachedUse {
     pub names: Vec<String>,
 }
 
-/// 一个模块的摘要：依赖 + 静态使用。足以建图 + 算 keep，无需 parse。
+/// 一个模块的摘要：依赖 + 静态使用 + 是否含顶层 await。足以建图 + 算 keep + 算 async 子图，无需 parse。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleSummary {
     pub deps: Vec<CachedDep>,
     pub uses: Vec<CachedUse>,
+    /// 模块顶层出现过 `await` / `for await` → 打包器把它包成 `async function`。
+    pub has_top_level_await: bool,
 }
 
 /// 持久化构建缓存：摘要表 + 产物表。
@@ -157,6 +159,7 @@ impl BuildCache {
                     put_str(&mut b, n);
                 }
             }
+            b.push(s.has_top_level_await as u8);
         }
         // bodies
         put_u32(&mut b, self.bodies.len() as u32);
@@ -211,7 +214,15 @@ impl BuildCache {
                     names,
                 });
             }
-            cache.summaries.insert(key, ModuleSummary { deps, uses });
+            let has_top_level_await = c.u8()? != 0;
+            cache.summaries.insert(
+                key,
+                ModuleSummary {
+                    deps,
+                    uses,
+                    has_top_level_await,
+                },
+            );
         }
         let n_bodies = c.u32()?;
         for _ in 0..n_bodies {
@@ -289,6 +300,7 @@ mod tests {
                     reexport: false,
                     names: vec!["useState".into(), "default".into()],
                 }],
+                has_top_level_await: true,
             },
         );
         c.put_body(
@@ -308,6 +320,7 @@ mod tests {
             "./a.js"
         );
         assert_eq!(back.summary(0xDEAD_BEEF).unwrap().uses[0].names.len(), 2);
+        assert!(back.summary(0xDEAD_BEEF).unwrap().has_top_level_await);
         assert_eq!(
             back.body(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
                 .as_deref()

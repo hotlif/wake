@@ -1,6 +1,6 @@
 # TypeScript 语法支持清单
 
-> 最后更新：2025-07-24 · 基于 TypeScript 7（`erasableSyntaxOnly` 模式可用）
+> 最后更新：2026-07-27 · 基于 TypeScript 7（`erasableSyntaxOnly` 模式可用）
 >
 > wake 采用 **解析器级类型擦除**（DESIGN §4.1）：解析时直接跳过类型语法，不构造类型 AST。
 > `enum`/`namespace` 等值语义构造降级为 IIFE；`import type`/`export type` 等类型-only 语法擦除为空。
@@ -130,8 +130,9 @@
 | `export { } from '...'` | ✅ | `stmt.rs:1350-1401` |
 | `import()` 动态导入 | ✅ | `import_is_expression()` |
 | `import.meta` | ✅ | 表达式解析 |
-| **`import x = require('...')`** | ❌ 🟡 | 无任何处理分支 |
-| **`import x = await import('...')`** | ❌ 🟡 | 同上 |
+| 顶层 `await`（含 `await import(...)` / `for await`） | ✅ | 见 §11。`SourceType::is_module()` 的顶层即 async 上下文 |
+| **`import x = require('...')`** | ❌ 🟡 | `parse_import` 无 `=` 分支（读完 `import x` 就要 `from`） |
+| **`import x = await import('...')`** | ❌ 🟡 | 同上——卡在 `=`，与顶层 await 无关（右侧的 `await import(...)` 本身已支持） |
 | **`export = expr`** | ❌ 🟡 | `parse_export` 无 `=` 分支 |
 | **`export as namespace`** | ❌ 🟢 | 无处理 |
 | **Import attributes `with { type: "json" }`** | ❌ 🔴 | 消费完 `from "src"` 后直接 `semicolon()` |
@@ -166,6 +167,9 @@
 | **`for (await using x of xs)`** | ❌ 🔴 | 同上 |
 | **`yield using x = expr`** | ❌ 🔴 | `parse_yield()` 无 `using` 分支 |
 
+> 全部卡在同一处：词法/`VarKind` 尚无 `using`。**模块顶层的 `await using` 不再有额外阻塞**——
+> 顶层 await 已支持（§11），实现 `using` 时顶层 `await using` 会随之可用，无需再为「产出坏包」设限。
+
 ---
 
 ## 8. 标准 JavaScript 特性
@@ -183,6 +187,7 @@
 | `async`/`await` | ✅ |
 | `yield*` 委托 | ✅ |
 | `import()` 动态导入 | ✅ |
+| 顶层 `await` / 顶层 `for await`（ES2022） | ✅ 见 §11 |
 | `export default` | ✅ |
 | 逗号序列表达式 | ✅ |
 | `Object`/`Array`/`class` 字面量 | ✅ |
@@ -198,6 +203,7 @@
 | `namespace` → IIFE | ✅ | ❌¹ | ✅ |
 | 参数属性 `this.x = x` | ✅ | ✅ | ✅ |
 | `import type` / `export type` | ✅ | ✅ | ✅ |
+| 顶层 await（CJS/IIFE 形态产物） | ✅⁴ | ❌⁵ | — |
 | `using` / `await using` | ❌ | ✅ | ✅ |
 | Import attributes `with` | ❌ | ✅ | ✅ |
 | 装饰器下游 emit | ❌² | ✅ | ✅ |
@@ -206,7 +212,9 @@
 
 > ¹ esbuild 不支持 `namespace` 降级。[^1]  
 > ² wake 消费装饰器语法但不构建 AST，无法做 `__decorate` 或 stage 3 运行时 emit。  
-> ³ esbuild/SWC 推荐使用 ESM 等价写法。
+> ³ esbuild/SWC 推荐使用 ESM 等价写法。  
+> ⁴ wake 用 async 模块 + Promise 感知 runtime 支持（§11），代价是入口导出变 Promise。  
+> ⁵ esbuild 对 `--format=cjs` / `iife` 直接报错「Top-level await is currently not supported with the … output format」，只有 `--format=esm` 可用；Rollup 同理（`cjs`/`iife` 报 "Module format cjs does not support top-level await"）。
 
 [^1]: https://esbuild.github.io/content-types/#typescript-namespaces
 
@@ -225,3 +233,53 @@
 | 类型标志 | `crates/wake_ecma_ast/src/lib.rs` | `SourceType::TypeScript` `SourceType::Tsx` |
 | 擦除验证测试 | `crates/wake_ecma_codegen/src/tests.rs` | 11 个 `strip_ts` 测试函数 |
 | Bundler 集成测试 | `crates/wake_bundler/src/tests.rs` | TS 项目擦除 + Node 执行验证 |
+| 顶层 await 标记 | `crates/wake_ecma_parser/src/lib.rs` | `Context::top_level` + `ParseOutput::has_top_level_await` |
+| async 子图 | `crates/wake_bundler/src/incremental.rs` | `async_module_ids()` + `LinkerData::async_deps` |
+| async 包装 / runtime | `crates/wake_bundler/src/{lib,incremental}.rs` | `PRELUDE_ASYNC` + `emit()` 的 `async_ids` 分支 |
+
+---
+
+## 11. 顶层 await（top-level await，ES2022）
+
+### 11.1 解析
+
+`SourceType::is_module()` 为真的源（`Module` / `TypeScript` / `Jsx` / `Tsx`）顶层即 async 上下文，`await` 是运算符。`Script` 保持旧语义（`await` 退化为标识符）。解析器用 `Context::top_level` 区分「模块顶层」与「函数体内」：
+
+| 位置 | `await` | 说明 |
+|------|---------|------|
+| 模块顶层 | ✅ | 记入 `ParseOutput::has_top_level_await` |
+| 模块顶层 `for await (… of …)` | ✅ | 同上 |
+| `async` 函数 / 方法 / 箭头体 | ✅ | 不计入顶层标记 |
+| 非 `async` 函数体 | ❌ | 报错（不因顶层放行而泄漏） |
+| `class C { static { … } }` | ❌ | 规范禁止，解析器显式关闭 async 上下文 |
+| 非 async 函数的参数默认值 | ❌ | 参数在 `in_async = false` 下解析 |
+
+### 11.2 打包（async 模块）
+
+含顶层 await 的模块升级为 **async 模块**，并沿**静态 ESM 边**（`import` / `export … from`）反向传染给所有导入方：
+
+```js
+// 产物形态（非压缩路径）
+0: async function(module, exports, __wake_require__) {   // 导入了 async 模块 → 自身也 async
+  const _wm0 = (await __wake_require__(1));              // 静态导入点插 await
+  …
+},
+1: async function(module, exports, __wake_require__) {   // 含顶层 await
+  const _wm0 = __wake_require__(2);                      // 目标同步 → 不插 await
+  const loaded = await Promise.resolve(raw);
+  …
+},
+2: function(module, exports, __wake_require__) { … },    // 未受影响
+```
+
+runtime 的 `__wake_require__` 检测工厂返回值是否 thenable，是则缓存并返回该 Promise。设计细节见 `docs/DESIGN.md` §6.1.1。
+
+### 11.3 已知限制
+
+| 限制 | 说明 |
+|------|------|
+| 入口导出变 Promise | 入口落在 async 子图内时 `module.exports` 是 Promise，消费方须 `await require("./bundle.js")`。这是 CJS/IIFE 形态下的固有代价（esbuild/Rollup 干脆报错拒绝） |
+| prod 模块合并关闭 | 产物含 async 模块时 scope hoisting（模块体合并进单个闭包）关闭——单个闭包无法表达「部分模块 async 且彼此有 await 顺序」。产物略大，仍是紧凑形态 |
+| CJS `require()` 拿到 Promise | 用 `require('./tla-module')` 同步引入 async 模块会拿到 Promise 而非 exports。调用点可能嵌在普通函数体内，插不进 `await`；此场景在任何打包器里都无解，应改用 ESM `import` 或动态 `import()` |
+| 动态 `import()` 不传染 | 有意为之：`import()` 本就产出 Promise，runtime 会把 async 模块的 Promise 展平，导入方无需变 async |
+| 循环依赖 | 环内先拿到**部分填充**的 exports，与同步路径语义一致（不死锁，也不额外报错） |
