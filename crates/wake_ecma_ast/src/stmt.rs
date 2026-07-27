@@ -42,7 +42,7 @@ pub enum Statement<'a> {
     Import(&'a ImportDeclaration<'a>),
     ExportNamed(&'a ExportNamedDeclaration<'a>),
     ExportDefault(&'a ExportDefaultDeclaration<'a>),
-    ExportAll(&'a ExportAllDeclaration),
+    ExportAll(&'a ExportAllDeclaration<'a>),
 }
 
 const _: () = assert!(
@@ -87,6 +87,10 @@ pub enum VarKind {
     Var,
     Let,
     Const,
+    /// `using x = expr`（TC39 显式资源管理）：块作用域，离开作用域时调用 `x[Symbol.dispose]()`。
+    Using,
+    /// `await using x = expr`：同上，但调用 `x[Symbol.asyncDispose]()` 并 await。
+    AwaitUsing,
 }
 
 impl VarKind {
@@ -95,7 +99,17 @@ impl VarKind {
             VarKind::Var => "var",
             VarKind::Let => "let",
             VarKind::Const => "const",
+            VarKind::Using => "using",
+            VarKind::AwaitUsing => "await using",
         }
+    }
+
+    /// 是否为 `using` / `await using`。
+    ///
+    /// 这类声明**带副作用**（作用域结束时的 dispose 调用），故：绑定即使无引用也不可删除、
+    /// 初始化式不可内联、声明不可与其它 kind 合并。所有「未用即删」的优化都必须先问这个。
+    pub fn is_using(self) -> bool {
+        matches!(self, VarKind::Using | VarKind::AwaitUsing)
     }
 }
 

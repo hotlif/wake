@@ -38,6 +38,9 @@ pub enum DeclKind {
     Param,
     Import,
     CatchParam,
+    /// `using` / `await using` 绑定。作用域规则同 `Const`，但**带副作用**（离开作用域时
+    /// 调用 dispose），故 minify 的「无引用即删」「单次引用内联」都必须放过它。
+    Using,
 }
 
 #[derive(Debug)]
@@ -254,6 +257,21 @@ impl Resolver {
                 }
             }
             Statement::Labeled(s) => self.hoist_stmt(&s.body, func_scope),
+            // `export function/var …`：把被包裹声明按同规则提升到 enclosing scope（否则 export 函数名
+            // 只落在 own scope，兄弟 export 函数 mangle 时同名碰撞）。const/let 不提升（visit 时声明）。
+            Statement::ExportNamed(s) => {
+                if let Some(d) = &s.declaration {
+                    self.hoist_stmt(d, func_scope);
+                }
+            }
+            // `export default function foo`：foo 是模块作用域的提升声明（供内部/导出引用一致解析）。
+            Statement::ExportDefault(s) => {
+                if let ExportDefaultKind::Function(f) = &s.declaration
+                    && let Some(id) = f.id
+                {
+                    self.declare(func_scope, id.name, DeclKind::Function, id.span);
+                }
+            }
             _ => {}
         }
     }
@@ -342,6 +360,7 @@ impl Resolver {
                         VarKind::Var => DeclKind::Var,
                         VarKind::Let => DeclKind::Let,
                         VarKind::Const => DeclKind::Const,
+                        VarKind::Using | VarKind::AwaitUsing => DeclKind::Using,
                     };
                     self.declare_pattern(scope, &decl.id, kind);
                     // 默认值/computed key 里的引用。
@@ -351,7 +370,8 @@ impl Resolver {
                     }
                 }
             }
-            Statement::FunctionDeclaration(f) => self.visit_function(f),
+            // 函数声明：名字已由外层 hoist 声明在 enclosing scope → 传 true 跳过 own-scope 重复声明。
+            Statement::FunctionDeclaration(f) => self.visit_function(f, true),
             Statement::ClassDeclaration(c) => {
                 if let Some(id) = c.id {
                     self.declare(self.cur_scope(), id.name, DeclKind::Class, id.span);
@@ -457,7 +477,8 @@ impl Resolver {
                 }
             }
             Statement::ExportDefault(s) => match s.declaration {
-                ExportDefaultKind::Function(f) => self.visit_function(f),
+                // 默认导出的命名函数：名字已由 hoist 提升到模块作用域 → true 跳过 own-scope 重复声明。
+                ExportDefaultKind::Function(f) => self.visit_function(f, true),
                 ExportDefaultKind::Class(c) => self.visit_class(c),
                 ExportDefaultKind::Expression(e) => self.visit_expression(&e),
             },
@@ -490,12 +511,16 @@ impl Resolver {
         self.exit();
     }
 
-    fn visit_function(&mut self, f: &Function) {
-        // 函数名（表达式的具名）绑在函数自身作用域，声明的名字已由外层 hoist/declare 处理。
+    /// `name_hoisted`：函数**声明**的名字已由外层 `hoist` 声明在 enclosing scope（true）——此时**不得**
+    /// 在函数自身作用域再声明一次，否则各函数自作用域名字计数各自从 0 → mangle 时兄弟函数同名碰撞
+    /// （`function a`/`function a`）。具名函数**表达式**/默认导出/方法（false）则名字仅在函数作用域可见。
+    fn visit_function(&mut self, f: &Function, name_hoisted: bool) {
         self.enter(ScopeKind::Function);
         let fscope = self.cur_scope();
-        if let Some(id) = f.id {
-            // 具名函数表达式：名字在函数作用域内可见。
+        if let Some(id) = f.id
+            && !name_hoisted
+        {
+            // 具名函数表达式：名字在函数作用域内可见（供自引用）。声明名走 enclosing hoist，此处跳过。
             self.declare(fscope, id.name, DeclKind::Function, id.span);
         }
         for p in f.params.iter() {
@@ -514,18 +539,30 @@ impl Resolver {
     }
 
     fn visit_class(&mut self, c: &Class) {
+        // 装饰器表达式是真实运行时引用，必须计入作用域分析——否则 mangler 重命名被引用的
+        // 装饰器函数后，装饰器处仍写旧名（ReferenceError），tree-shaking 也会误删它们。
+        for d in c.decorators.iter() {
+            self.visit_expression(d);
+        }
         if let Some(sc) = &c.super_class {
             self.visit_expression(sc);
         }
         for member in c.body.iter() {
             match member {
                 ClassMember::Method(m) => {
+                    for d in m.decorators.iter() {
+                        self.visit_expression(d);
+                    }
                     if let PropertyKey::Computed(e) = &m.key {
                         self.visit_expression(e);
                     }
-                    self.visit_function(m.value);
+                    // 方法：其函数无独立声明名进入 enclosing，own-scope 处理即可。
+                    self.visit_function(m.value, false);
                 }
                 ClassMember::Property(p) => {
+                    for d in p.decorators.iter() {
+                        self.visit_expression(d);
+                    }
                     if let PropertyKey::Computed(e) = &p.key {
                         self.visit_expression(e);
                     }
@@ -579,7 +616,8 @@ impl Resolver {
                     }
                 }
             }
-            Expression::Function(f) => self.visit_function(f),
+            // 具名函数表达式：名字仅在函数自身作用域可见（供自引用）→ false，own-scope 声明。
+            Expression::Function(f) => self.visit_function(f, false),
             Expression::Arrow(a) => {
                 self.enter(ScopeKind::Function);
                 let fscope = self.cur_scope();

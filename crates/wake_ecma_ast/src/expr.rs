@@ -478,6 +478,8 @@ pub struct Class<'a> {
     pub id: Option<Ident>,
     pub super_class: Option<Expression<'a>>,
     pub body: AVec<'a, ClassMember<'a>>,
+    /// 类装饰器 `@dec class C {}`（TC39 Stage-3）。求值序 = 源码序；应用序相反。
+    pub decorators: AVec<'a, Expression<'a>>,
 }
 
 #[derive(Debug)]
@@ -495,6 +497,8 @@ pub struct MethodDefinition<'a> {
     pub kind: MethodKind,
     pub is_static: bool,
     pub computed: bool,
+    /// 方法/取值器/设值器装饰器（TC39 Stage-3）。
+    pub decorators: AVec<'a, Expression<'a>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,6 +516,10 @@ pub struct PropertyDefinition<'a> {
     pub value: Option<Expression<'a>>,
     pub is_static: bool,
     pub computed: bool,
+    /// 字段装饰器（TC39 Stage-3）。
+    pub decorators: AVec<'a, Expression<'a>>,
+    /// `accessor x = 1`（auto-accessor）：降级为私有存储 + getter/setter 对。
+    pub accessor: bool,
 }
 
 #[derive(Debug)]

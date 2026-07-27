@@ -28,7 +28,9 @@ pub use literal::*;
 pub use module::*;
 pub use pattern::*;
 pub use stmt::*;
-pub use visit::{Visit, walk_expression, walk_program, walk_statement, walk_pattern, walk_function, walk_class};
+pub use visit::{
+    Visit, walk_class, walk_expression, walk_function, walk_pattern, walk_program, walk_statement,
+};
 
 /// arena 分配的 `Vec` 别名。
 pub type AVec<'a, T> = bumpalo::collections::Vec<'a, T>;

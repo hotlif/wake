@@ -299,16 +299,27 @@ pub fn walk_function<'a, V: Visit<'a>>(v: &mut V, node: &Function<'a>) {
 }
 
 pub fn walk_class<'a, V: Visit<'a>>(v: &mut V, node: &Class<'a>) {
+    // 装饰器表达式**必须**参与遍历：它们是真实的运行时引用。漏掉会让 mangler 看不到这些
+    // 引用（重命名后装饰器名对不上）、也会让 tree-shaking 误判装饰器函数未被使用而删除。
+    for d in node.decorators.iter() {
+        v.visit_expression(d);
+    }
     if let Some(sc) = &node.super_class {
         v.visit_expression(sc);
     }
     for member in node.body.iter() {
         match member {
             ClassMember::Method(m) => {
+                for d in m.decorators.iter() {
+                    v.visit_expression(d);
+                }
                 walk_property_key(v, &m.key);
                 v.visit_function(m.value);
             }
             ClassMember::Property(p) => {
+                for d in p.decorators.iter() {
+                    v.visit_expression(d);
+                }
                 walk_property_key(v, &p.key);
                 if let Some(val) = &p.value {
                     v.visit_expression(val);

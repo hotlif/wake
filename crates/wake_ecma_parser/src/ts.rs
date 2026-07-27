@@ -8,6 +8,7 @@
 //! `<...>`（类型参数/实参）用 [`Parser::consume_type_gt`] 精确处理 `>`/`>>`/`>>>` 收尾；
 //! 「扁平」文法（联合/交叉/条件/引用/前缀算子）按产生式递归消费。
 
+use wake_ecma_ast::Expression;
 use wake_ecma_lexer::{Keyword, TokenKind};
 
 use crate::Parser;
@@ -403,7 +404,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// 前瞻 token 是否是上下文关键字 `name`（Ident 且文本相符）。
-    fn peek_contextual(&mut self, name: &str) -> bool {
+    pub(crate) fn peek_contextual(&mut self, name: &str) -> bool {
         let p = self.peek();
         p.kind == TokenKind::Ident && self.slice(p.span) == name
     }
@@ -493,10 +494,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// **注意**：当前仅擦除装饰器，不生成其运行时语义（legacy `__decorate`/`__param` 转换属大型
     /// 独立切片，React TSX 基本不用装饰器）。装饰器表达式本身按 LHS 消费（`@a.b(c)` 等）。
     pub(crate) fn skip_decorators(&mut self) {
+        let _ = self.parse_decorators();
+    }
+
+    /// 解析装饰器序列 `@a @b.c(d)`，返回其表达式（按源码序）。
+    ///
+    /// TC39 Stage-3 语义：装饰器表达式按**源码序求值**，但按**相反序应用**——
+    /// 后者由 `__esDecorate` 内部倒序遍历实现（见 codegen 发射的运行时辅助）。
+    pub(crate) fn parse_decorators(&mut self) -> wake_ecma_ast::AVec<'a, Expression<'a>> {
+        let mut out = self.new_vec::<Expression>();
         while self.at(TokenKind::At) {
             self.bump(); // @
-            let _ = self.parse_lhs_expression();
+            out.push(self.parse_lhs_expression());
         }
+        out
     }
 
     /// 消费参数属性/参数修饰符（public/private/protected/readonly/override）。

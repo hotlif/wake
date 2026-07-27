@@ -8,10 +8,19 @@
 //! 词法配合：`>`/`}` 之后的子节点文本由 [`wake_ecma_lexer::Lexer::next_jsx_child_token`] 扫描；
 //! 标签内部（名字/属性/`/`/`>`）用普通词法 + 少量原始字节判断（避开 `/` 的 regex 歧义、支持连字符名）。
 //!
-//! 覆盖：元素/片段、intrinsic（小写→字符串）与组件（大写/成员 `A.B`）、属性（字符串/`{表达式}`/
-//! 布尔简写/`{...spread}`）、连字符属性名（`data-*`/`aria-*`）、`key`（提到第 3 参）、子节点
-//! （文本/`{表达式}`/嵌套元素）、自闭合、HTML 实体解码。
-//! 未覆盖（后续切片）：命名空间名 `a:b`、多行属性字符串中的 JS 转义、dev runtime（`jsxDEV`）。
+//! 覆盖：元素/片段、intrinsic（小写→字符串）与组件（大写/成员 `A.B`）、**命名空间名 `a:b`**
+//! （整体作字符串类型，同 tsc）、属性（字符串/`{表达式}`/布尔简写/`{...spread}`）、连字符属性名
+//! （`data-*`/`aria-*`）、`key`（提到第 3 参）、子节点（文本/`{表达式}`/嵌套元素）、自闭合、
+//! HTML 实体解码。
+//!
+//! **runtime 口径**由 [`crate::ParseOptions`] 决定：
+//! - `jsx_import_source`（默认 `"react"`）→ 导入 `<source>/jsx-runtime`；
+//! - `jsx_dev` → 改用 **dev runtime**：`_jsxDEV(type, props, key, isStaticChildren,
+//!   {fileName,lineNumber,columnNumber}, this)`（对齐 tsc `--jsx react-jsxdev`），
+//!   供 React DevTools 显示组件栈。
+//!
+//! 未覆盖：classic runtime / `@jsx` pragma——**不在 crustify 对齐范围**（crustify 显式配置
+//! `@babel/preset-react` 的 `runtime: "automatic"`）；多行属性字符串中的 JS 转义。
 
 use wake_common::{Atom, Span};
 use wake_ecma_ast::{
@@ -59,6 +68,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             jsx: self.interner.intern("_jsx"),
             jsxs: self.interner.intern("_jsxs"),
             fragment: self.interner.intern("_Fragment"),
+            jsx_dev: self.interner.intern("_jsxDEV"),
+            file_name: self.interner.intern("fileName"),
+            line_number: self.interner.intern("lineNumber"),
+            column_number: self.interner.intern("columnNumber"),
         };
         self.jsx_atoms.set(Some(a));
         a
@@ -139,6 +152,19 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }));
             }
             return expr;
+        }
+
+        // 命名空间名 `a:b`（SVG/XML 场景，如 `<xlink:href>`）：整体作为**字符串类型**，
+        // 与 tsc 一致（`<a:b/>` → `_jsx("a:b", …)`）——冒号不是合法标识符字符，不可能是组件。
+        if self.at(TokenKind::Colon) {
+            let after_colon = self.cur.span.hi;
+            self.jsx_relex(after_colon);
+            let second = self.jsx_read_name_raw();
+            let full = Span::new(first.lo, second.hi);
+            return Expression::StringLiteral(self.alloc(StringLiteral {
+                span: full,
+                value: self.intern_slice(full),
+            }));
         }
 
         let raw = self.slice(first);
@@ -415,13 +441,35 @@ impl<'a, 'src> Parser<'a, 'src> {
         }));
 
         let atoms = self.jsx_atoms();
-        let callee = self.ident_expr_atom(span, if use_jsxs { atoms.jsxs } else { atoms.jsx });
         let mut args = self.new_vec::<Expression>();
         args.push(type_expr);
         args.push(props);
-        if let Some(k) = key {
-            args.push(k);
+
+        if !self.options.jsx_dev {
+            let callee = self.ident_expr_atom(span, if use_jsxs { atoms.jsxs } else { atoms.jsx });
+            if let Some(k) = key {
+                args.push(k);
+            }
+            return Expression::Call(self.alloc(CallExpression {
+                span,
+                callee,
+                arguments: args,
+                optional: false,
+            }));
         }
+
+        // dev runtime：`_jsxDEV(type, props, key, isStaticChildren, source, self)`
+        // ——固定 6 参（对齐 tsc/Babel），额外携带源位置供 React DevTools 显示组件栈。
+        let callee = self.ident_expr_atom(span, atoms.jsx_dev);
+        args.push(key.unwrap_or_else(|| self.undefined_expr()));
+        args.push(Expression::BooleanLiteral(self.alloc(
+            wake_ecma_ast::BooleanLiteral {
+                span,
+                value: use_jsxs,
+            },
+        )));
+        args.push(self.jsx_dev_source(span, lo));
+        args.push(Expression::This(span));
         Expression::Call(self.alloc(CallExpression {
             span,
             callee,
@@ -430,15 +478,71 @@ impl<'a, 'src> Parser<'a, 'src> {
         }))
     }
 
+    /// dev runtime 的第 5 参：`{ fileName, lineNumber, columnNumber }`（行列均 1 基，
+    /// 列指向元素起始的 `<`——与 tsc 一致）。
+    fn jsx_dev_source(&self, span: Span, lo: u32) -> Expression<'a> {
+        let atoms = self.jsx_atoms();
+        let (line, column) = self.line_col_1based(lo);
+        let mut props = self.new_vec::<ObjectMember>();
+        let mut push = |key: Atom, value: Expression<'a>| {
+            props.push(ObjectMember::Property(self.alloc(ObjectProperty {
+                span,
+                key: PropertyKey::Ident(Ident::new(span, key)),
+                value,
+                kind: PropertyKind::Init,
+                method: false,
+                shorthand: false,
+                computed: false,
+            })));
+        };
+        push(
+            atoms.file_name,
+            Expression::StringLiteral(self.alloc(StringLiteral {
+                span,
+                value: self.intern_str(self.options.file_name),
+            })),
+        );
+        push(atoms.line_number, self.num_lit(line as f64));
+        push(atoms.column_number, self.num_lit(column as f64));
+        Expression::Object(self.alloc(ObjectExpression {
+            span,
+            properties: props,
+        }))
+    }
+
+    /// 字节偏移 → (行, 列)，均 **1 基**；列按 UTF-8 字符计。惰性构建换行表并缓存。
+    fn line_col_1based(&self, offset: u32) -> (u32, u32) {
+        let starts = self.line_starts.get_or_init(|| {
+            let mut v = Vec::with_capacity(self.source.len() / 32 + 1);
+            v.push(0u32);
+            for (i, b) in self.source.bytes().enumerate() {
+                if b == b'\n' {
+                    v.push(i as u32 + 1);
+                }
+            }
+            v
+        });
+        let idx = starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        let line_start = starts[idx] as usize;
+        let col = self.source[line_start..offset as usize].chars().count() + 1;
+        (idx as u32 + 1, col as u32)
+    }
+
     /// 构造并返回按需注入的 `react/jsx-runtime` import（供 `parse_program` 在用到 JSX 时插入 body[0]）。
     pub(crate) fn build_jsx_runtime_import(&self) -> Statement<'a> {
-        let source = self.intern_str("react/jsx-runtime");
+        let source = self.intern_str(&self.jsx_runtime_specifier());
         let mut specs = self.new_vec::<ImportSpecifier>();
-        for (imported, local) in [
-            ("jsx", "_jsx"),
-            ("jsxs", "_jsxs"),
-            ("Fragment", "_Fragment"),
-        ] {
+        // dev runtime 只导出 `jsxDEV`（无 jsx/jsxs 之分——是否静态子节点由第 4 参表达）。
+        let imports: &[(&str, &str)] = if self.options.jsx_dev {
+            &[("jsxDEV", "_jsxDEV"), ("Fragment", "_Fragment")]
+        } else {
+            &[
+                ("jsx", "_jsx"),
+                ("jsxs", "_jsxs"),
+                ("Fragment", "_Fragment"),
+            ]
+        };
+        for &(imported, local) in imports {
             specs.push(ImportSpecifier::Named {
                 span: Span::DUMMY,
                 imported: ModuleExportName::Ident(Ident::new(
@@ -452,12 +556,23 @@ impl<'a, 'src> Parser<'a, 'src> {
             span: Span::DUMMY,
             specifiers: specs,
             source,
+            attributes: None,
         }))
     }
 
-    /// 记录对 `react/jsx-runtime` 的依赖（供 bundler 扇出 + 建立 linker 映射）。
+    /// JSX 运行时说明符：`<jsxImportSource>/jsx-runtime`（dev 下 `/jsx-dev-runtime`）。
+    pub(crate) fn jsx_runtime_specifier(&self) -> String {
+        let suffix = if self.options.jsx_dev {
+            "/jsx-dev-runtime"
+        } else {
+            "/jsx-runtime"
+        };
+        format!("{}{}", self.options.jsx_import_source, suffix)
+    }
+
+    /// 记录对 JSX 运行时的依赖（供 bundler 扇出 + 建立 linker 映射）。
     pub(crate) fn record_jsx_runtime_dependency(&mut self) {
-        let specifier = self.intern_str("react/jsx-runtime");
+        let specifier = self.intern_str(&self.jsx_runtime_specifier());
         self.dependencies.push(Dependency {
             specifier,
             kind: DependencyKind::Import,

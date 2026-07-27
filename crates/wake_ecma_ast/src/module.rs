@@ -14,6 +14,44 @@ pub enum ModuleExportName {
     String(Atom),
 }
 
+// —— import attributes（`with { type: "json" }`）——
+
+/// 引入属性子句的引导关键字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttributesKeyword {
+    /// 标准 import attributes：`with { type: "json" }`。
+    With,
+    /// 已废弃的 import assertions：`assert { type: "json" }`（保留以兼容存量代码）。
+    Assert,
+}
+
+impl AttributesKeyword {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttributesKeyword::With => "with",
+            AttributesKeyword::Assert => "assert",
+        }
+    }
+}
+
+/// 一条引入属性：`type: "json"` / `"content-type": "text/css"`。值恒为字符串字面量。
+#[derive(Clone, Copy, Debug)]
+pub struct ImportAttribute {
+    pub span: Span,
+    pub key: ModuleExportName,
+    /// 属性值（已驻留的字符串字面量内容）。
+    pub value: Atom,
+}
+
+/// `with { .. }` / `assert { .. }` 子句。用 `&'a [_]` 而非 `AVec` 承载条目，
+/// 使 [`ExportAllDeclaration`] 等 `Copy` 节点保持 `Copy`。
+#[derive(Clone, Copy, Debug)]
+pub struct ImportAttributes<'a> {
+    pub span: Span,
+    pub keyword: AttributesKeyword,
+    pub items: &'a [ImportAttribute],
+}
+
 // —— import ——
 
 #[derive(Debug)]
@@ -22,6 +60,8 @@ pub struct ImportDeclaration<'a> {
     pub specifiers: AVec<'a, ImportSpecifier>,
     /// 模块说明符字符串（已驻留）。
     pub source: Atom,
+    /// `with { type: "json" }` 子句（无则 `None`）。
+    pub attributes: Option<&'a ImportAttributes<'a>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +89,8 @@ pub struct ExportNamedDeclaration<'a> {
     pub specifiers: AVec<'a, ExportSpecifier>,
     /// `export { a } from '...'` 的来源（已驻留）。
     pub source: Option<Atom>,
+    /// `export { a } from '...' with { .. }` 子句（无 `from` 时恒 `None`）。
+    pub attributes: Option<&'a ImportAttributes<'a>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,11 +114,13 @@ pub enum ExportDefaultKind<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ExportAllDeclaration {
+pub struct ExportAllDeclaration<'a> {
     pub span: Span,
     /// `export * as ns from '...'` 的命名空间名。
     pub exported: Option<ModuleExportName>,
     pub source: Atom,
+    /// `export * from '...' with { .. }` 子句。
+    pub attributes: Option<&'a ImportAttributes<'a>>,
 }
 
 // ======================================================================

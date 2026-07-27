@@ -15,7 +15,7 @@ mod ts_value;
 pub use semantic::{SemanticModel, analyze};
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 
 use bumpalo::Bump;
 use wake_common::{Atom, Diagnostic, FxHashMap, Interner, Span};
@@ -39,13 +39,46 @@ impl ParseOutput {
     }
 }
 
+/// 解析选项（JSX 运行时口径等）。默认对应 production automatic runtime。
+#[derive(Clone, Copy, Debug)]
+pub struct ParseOptions<'o> {
+    /// JSX 运行时来源包，实际 import `<source>/jsx-runtime`（dev 下 `/jsx-dev-runtime`）。
+    /// 对齐 Babel/TS 的 `jsxImportSource`；默认 `"react"`。
+    pub jsx_import_source: &'o str,
+    /// 使用 **dev runtime**：`jsxDEV(type, props, key, isStaticChildren, source, self)`，
+    /// 额外携带 `{fileName,lineNumber,columnNumber}`，供 React DevTools 显示组件栈。
+    pub jsx_dev: bool,
+    /// dev runtime 的 `fileName`（源文件路径）。
+    pub file_name: &'o str,
+}
+
+impl Default for ParseOptions<'_> {
+    fn default() -> Self {
+        ParseOptions {
+            jsx_import_source: "react",
+            jsx_dev: false,
+            file_name: "",
+        }
+    }
+}
+
 /// 解析源码为 AST + 依赖 + 诊断。`source` / `interner` 需在返回值使用期内存活。
 pub fn parse(source: &str, interner: &Interner, source_type: SourceType) -> ParseOutput {
+    parse_with(source, interner, source_type, ParseOptions::default())
+}
+
+/// 同 [`parse`]，但可指定 [`ParseOptions`]（JSX dev runtime / `jsxImportSource`）。
+pub fn parse_with(
+    source: &str,
+    interner: &Interner,
+    source_type: SourceType,
+    options: ParseOptions<'_>,
+) -> ParseOutput {
     let deps = RefCell::new(Vec::new());
     let diags = RefCell::new(Vec::new());
 
     let module = ModuleAst::from_builder(|arena| {
-        let mut parser = Parser::new(source, interner, arena, source_type);
+        let mut parser = Parser::new(source, interner, arena, source_type, options);
         let program = parser.parse_program();
         *deps.borrow_mut() = std::mem::take(&mut parser.dependencies);
         *diags.borrow_mut() = std::mem::take(&mut parser.diagnostics);
@@ -100,6 +133,11 @@ pub(crate) struct JsxAtoms {
     pub jsx: Atom,
     pub jsxs: Atom,
     pub fragment: Atom,
+    /// dev runtime 的调用名 `_jsxDEV`（仅 `jsx_dev` 下使用）。
+    pub jsx_dev: Atom,
+    pub file_name: Atom,
+    pub line_number: Atom,
+    pub column_number: Atom,
 }
 
 pub(crate) struct Parser<'a, 'src> {
@@ -123,6 +161,10 @@ pub(crate) struct Parser<'a, 'src> {
     jsx: bool,
     /// 本模块是否用到 JSX（用于按需注入 `react/jsx-runtime` 的 import）。
     used_jsx: bool,
+    /// 解析选项（JSX 运行时口径）。
+    options: ParseOptions<'src>,
+    /// 换行偏移表，惰性构建——仅 JSX dev runtime 需要把 span 换算成行列。
+    line_starts: OnceCell<Vec<u32>>,
     diagnostics: Vec<Diagnostic>,
     dependencies: Vec<Dependency>,
 
@@ -143,6 +185,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         interner: &'src Interner,
         arena: &'a Bump,
         source_type: SourceType,
+        options: ParseOptions<'src>,
     ) -> Parser<'a, 'src> {
         let mut lexer = Lexer::new(source);
         // 表达式起始位置：首 token 允许正则。
@@ -153,6 +196,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         Parser {
             source,
+            options,
+            line_starts: OnceCell::new(),
             lexer,
             interner,
             arena,

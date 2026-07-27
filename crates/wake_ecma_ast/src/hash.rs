@@ -6,6 +6,7 @@ use std::mem::Discriminant;
 use wake_common::Hash64;
 
 use crate::expr::Expression;
+use crate::module::{ImportAttributes, ModuleExportName};
 use crate::stmt::Statement;
 use crate::visit::{Visit, walk_expression, walk_statement};
 use crate::{Ident, Program};
@@ -64,9 +65,37 @@ impl Hasher for HashFold {
     }
 }
 
+impl HashFold {
+    /// 折叠 `with { .. }` / `assert { .. }` 子句。
+    ///
+    /// [`walk_statement`] 刻意不下钻引入属性（其中的 `Ident` 是属性名、不是引用，下钻会让
+    /// mangler 把它误当自由变量）。故指纹须在此显式混入——否则只改 `with { type: "json" }`
+    /// 的编辑会得到逐位相同的指纹，引擎早期截断误判「输出未变」→ 产出陈旧包。
+    fn mix_attributes(&mut self, attrs: Option<&ImportAttributes>) {
+        let Some(a) = attrs else { return };
+        self.mix_disc(std::mem::discriminant(&a.keyword));
+        for item in a.items {
+            match item.key {
+                ModuleExportName::Ident(id) => self.mix_u64(id.name.as_u32() as u64),
+                ModuleExportName::String(s) => self.mix_u64(s.as_u32() as u64),
+            }
+            self.mix_u64(item.value.as_u32() as u64);
+        }
+    }
+}
+
 impl<'a> Visit<'a> for HashFold {
     fn visit_statement(&mut self, node: &Statement<'a>) {
         self.mix_disc(std::mem::discriminant(node));
+        // 语句判别式之外、codegen 会直接发射的**非子节点**信息，必须一并进指纹（同
+        // `visit_expression` 中字面量值的理由）：`var`↔`using` 只差 kind，引入属性只挂在语句上。
+        match node {
+            Statement::VariableDeclaration(d) => self.mix_disc(std::mem::discriminant(&d.kind)),
+            Statement::Import(d) => self.mix_attributes(d.attributes),
+            Statement::ExportNamed(d) => self.mix_attributes(d.attributes),
+            Statement::ExportAll(d) => self.mix_attributes(d.attributes),
+            _ => {}
+        }
         walk_statement(self, node);
     }
 

@@ -71,15 +71,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             TokenKind::Keyword(Keyword::Export) => self.parse_export(lo),
             // TS：装饰器 `@dec class C {}` / `@dec export class ..`。装饰器被消费（当前不应用其
             // 运行时语义，见 ts.rs `skip_decorators` 说明）；随后解析被装饰的声明。
+            // 装饰器 `@dec class C {}`（TC39 Stage-3）：解析后转交给被装饰的类。
             TokenKind::At if self.ts => {
-                self.skip_decorators();
-                self.parse_statement()
+                let decs = self.parse_decorators();
+                if self.at_keyword(Keyword::Class) {
+                    let clo = self.start();
+                    Statement::ClassDeclaration(self.parse_class_with_decorators(clo, decs))
+                } else {
+                    // `@dec export class ..` 等：装饰器已消费，继续解析后续声明。
+                    self.parse_statement()
+                }
             }
             // TS：`interface X { .. }` 整体擦除。
             TokenKind::Keyword(Keyword::Interface) if self.ts => self.skip_interface(lo),
             // TS：`enum E { .. }` → 值转换（IIFE）。
             TokenKind::Keyword(Keyword::Enum) if self.ts => self.parse_enum(lo),
             _ => {
+                // TC39 显式资源管理：`using x = e;` / `await using x = e;`。非 TS-only，纯 JS 同样合法。
+                if let Some(kind) = self.using_decl_here() {
+                    let d = self.parse_var_declaration(kind, true);
+                    return Statement::VariableDeclaration(d);
+                }
                 if self.ts {
                     // `type X = ..;` 类型别名擦除（`type` 后接绑定名，区别于 `type` 作变量）。
                     if self.at_contextual("type") && self.peek_is_binding_name() {
@@ -130,6 +142,45 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `import` 是否是表达式（`import(...)` / `import.meta`）而非声明。
     fn import_is_expression(&mut self) -> bool {
         matches!(self.peek().kind, TokenKind::LParen | TokenKind::Dot)
+    }
+
+    /// 当前位置是否起始一个 `using` / `await using` 声明（TC39 显式资源管理）。
+    ///
+    /// `using` 是**上下文关键字**：只有同一行紧跟一个可作绑定名的标识符时才是声明。这样
+    /// `using = 1` / `using.foo()` / `using(x)` / `using` + 换行（ASI）里的 `using` 仍是普通
+    /// 标识符。规范也不允许解构模式（`using {a} = o` 非法），故只认标识符。
+    pub(crate) fn using_decl_here(&mut self) -> Option<VarKind> {
+        if self.at_contextual("using") {
+            return self.using_binding_follows().then_some(VarKind::Using);
+        }
+        // `await using`：需要 2 个 token 的前瞻，用 checkpoint 试探后回退。
+        // （`await usingFoo()` / `await using(x)` 都不是声明，必须能正确回退。）
+        //
+        // 只在 async 上下文里识别——与 `await` 运算符的口径一致（expr.rs 亦要求 `in_async`）。
+        // 模块顶层的 `await using` 虽合乎规范，但 wake 目前不支持任何形式的顶层 await，且
+        // bundler 的模块包装器 `function(module, exports, __wake_require__)` 非 async：
+        // 若在此放行，产物会是加载即抛 SyntaxError 的包。宁可在解析期报错。
+        if self.at_keyword(Keyword::Await) && self.ctx.in_async {
+            let cp = self.checkpoint();
+            self.bump(); // await
+            let ok = !self.newline_before()
+                && self.at_contextual("using")
+                && self.using_binding_follows();
+            self.rewind(cp);
+            return ok.then_some(VarKind::AwaitUsing);
+        }
+        None
+    }
+
+    /// `using` 之后是否**同行**紧跟一个可作绑定名的标识符。
+    fn using_binding_follows(&mut self) -> bool {
+        let p = self.peek();
+        // `using` 与绑定名之间不允许换行（否则 ASI 将 `using` 断成表达式语句）。
+        if p.newline_before {
+            return false;
+        }
+        matches!(p.kind, TokenKind::Ident)
+            || matches!(p.kind, TokenKind::Keyword(kw) if !kw.is_reserved())
     }
 
     fn parse_expression_statement(&mut self, lo: u32) -> Statement<'a> {
@@ -185,7 +236,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         need_semi: bool,
     ) -> &'a VariableDeclaration<'a> {
         let lo = self.start();
-        self.bump(); // var/let/const
+        self.bump(); // var / let / const / using / await
+        if kind == VarKind::AwaitUsing {
+            self.bump(); // using（`await` 已在上一行消费）
+        }
         let mut declarations = self.new_vec::<VariableDeclarator>();
         loop {
             let dlo = self.start();
@@ -328,7 +382,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // 初始化：可能是变量声明或表达式，或空。
         let init: Option<ForInit<'a>> = if self.at(TokenKind::Semicolon) {
             None
-        } else if let Some(kind) = self.var_kind_here() {
+        } else if let Some(kind) = self.for_head_var_kind() {
             // for-init 内禁 `in` 运算符。
             let decl = self.with_allow_in(false, |p| p.parse_var_declaration_no_semi(kind));
             Some(ForInit::Variable(decl))
@@ -405,6 +459,22 @@ impl<'a, 'src> Parser<'a, 'src> {
             TokenKind::Keyword(Keyword::Let) => Some(VarKind::Let),
             _ => None,
         }
+    }
+
+    /// for-head 的声明种类：var/let/const，外加 `using` / `await using`（`for (using x of xs)`）。
+    ///
+    /// 例外：`for (using of xs)` 中的 `using` 是**循环变量名**而非声明——规范为消除这处歧义
+    /// 显式禁止了 `for (using of ...)` 形态的 using 声明。
+    fn for_head_var_kind(&mut self) -> Option<VarKind> {
+        if let Some(k) = self.var_kind_here() {
+            return Some(k);
+        }
+        let kind = self.using_decl_here()?;
+        // `of` 词法上是 `Keyword::Of`（非 `Ident`），故不能用 `peek_contextual`。
+        if kind == VarKind::Using && self.peek().kind == TokenKind::Keyword(Keyword::Of) {
+            return None;
+        }
+        Some(kind)
     }
 
     fn parse_var_declaration_no_semi(&mut self, kind: VarKind) -> &'a VariableDeclaration<'a> {
@@ -622,7 +692,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn inject_param_props(
         &self,
         body: &'a FunctionBody<'a>,
-        props: &[wake_common::Atom],
+        props: &[(wake_common::Atom, Span)],
     ) -> &'a FunctionBody<'a> {
         // 找到 super 调用语句的位置（其后插入）。
         let insert_at = body
@@ -634,16 +704,16 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut stmts = self.new_vec::<Statement>();
         for (i, s) in body.statements.iter().enumerate() {
             if i == insert_at {
-                for &name in props {
-                    stmts.push(self.this_assign_stmt(name));
+                for &(name, span) in props {
+                    stmts.push(self.this_assign_stmt(name, span));
                 }
             }
             stmts.push(*s);
         }
         // super 在末尾或空体：补在最后。
         if insert_at >= body.statements.len() {
-            for &name in props {
-                stmts.push(self.this_assign_stmt(name));
+            for &(name, span) in props {
+                stmts.push(self.this_assign_stmt(name, span));
             }
         }
         self.alloc(FunctionBody {
@@ -654,14 +724,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// 构造 `this.name = name;` 语句。
-    fn this_assign_stmt(&self, name: wake_common::Atom) -> Statement<'a> {
+    ///
+    /// 属性名与右值标识符复用参数在源码中的真实 span（`name_span`），使它们与源码里对同名
+    /// 属性 / 同一参数的其它访问在 prop-mangle / identifier-mangle 侧表中被一致处理；否则若
+    /// 用 `Span::DUMMY`，多个参数属性会在按 span 索引的侧表上互相碰撞（last-write-wins），
+    /// 且与源码访问的重命名不一致。外层 Member/Assign/Statement 仍用 DUMMY（codegen 对
+    /// DUMMY 语句/表达式一律原样发射，不参与语句级合并与常量折叠）。
+    fn this_assign_stmt(&self, name: wake_common::Atom, name_span: Span) -> Statement<'a> {
         let member = Expression::Member(self.alloc(MemberExpression {
             span: Span::DUMMY,
             object: Expression::This(Span::DUMMY),
-            property: MemberProperty::Ident(Ident::new(Span::DUMMY, name)),
+            property: MemberProperty::Ident(Ident::new(name_span, name)),
             optional: false,
         }));
-        let rhs = Expression::Identifier(self.alloc(Ident::new(Span::DUMMY, name)));
+        let rhs = Expression::Identifier(self.alloc(Ident::new(name_span, name)));
         let assign = Expression::Assignment(self.alloc(AssignmentExpression {
             span: Span::DUMMY,
             operator: AssignmentOperator::Assign,
@@ -680,10 +756,12 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// 解析形参，并返回「参数属性」名字（带修饰符的简单标识符参数）——供构造函数注入 `this.x = x`。
-    fn parse_params_collecting(&mut self) -> (AVec<'a, Pattern<'a>>, Vec<wake_common::Atom>) {
+    fn parse_params_collecting(
+        &mut self,
+    ) -> (AVec<'a, Pattern<'a>>, Vec<(wake_common::Atom, Span)>) {
         self.expect(TokenKind::LParen);
         let mut params = self.new_vec::<Pattern>();
-        let mut param_props: Vec<wake_common::Atom> = Vec::new();
+        let mut param_props: Vec<(wake_common::Atom, Span)> = Vec::new();
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
             // 参数装饰器 `@dec` —— 消费（暂不应用到参数）。
             if self.ts {
@@ -714,8 +792,8 @@ impl<'a, 'src> Parser<'a, 'src> {
                 break;
             }
             let param = self.parse_binding_element();
-            if is_param_prop && let Some(name) = param_prop_name(&param) {
-                param_props.push(name);
+            if is_param_prop && let Some(name_span) = param_prop_name(&param) {
+                param_props.push(name_span);
             }
             params.push(param);
             if !self.eat(TokenKind::Comma) {
@@ -760,6 +838,16 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     pub(crate) fn parse_class(&mut self, lo: u32) -> &'a Class<'a> {
+        let decorators = self.new_vec::<Expression>();
+        self.parse_class_with_decorators(lo, decorators)
+    }
+
+    /// 同上，但带已解析的**类装饰器**（`@dec class C {}`）。
+    pub(crate) fn parse_class_with_decorators(
+        &mut self,
+        lo: u32,
+        class_decorators: wake_ecma_ast::AVec<'a, Expression<'a>>,
+    ) -> &'a Class<'a> {
         self.expect(TokenKind::Keyword(Keyword::Class));
         let id = if self.at_ident_name() && !self.at_keyword(Keyword::Extends) {
             Some(self.parse_binding_ident())
@@ -807,6 +895,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect(TokenKind::RBrace);
         self.ctx.strict = saved_strict;
         self.alloc(Class {
+            decorators: class_decorators,
             span: self.span_to(lo),
             id,
             super_class,
@@ -817,15 +906,18 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_class_member(&mut self) -> Option<ClassMember<'a>> {
         let lo = self.start();
 
-        // TS：成员装饰器 `@dec method() {}` / `@dec prop = 1` —— 消费（当前不应用运行时语义）。
-        if self.ts && self.at(TokenKind::At) {
-            self.skip_decorators();
+        // 成员装饰器 `@dec method() {}` / `@dec prop = 1`（TC39 Stage-3）。
+        let mut member_decorators = self.new_vec::<Expression>();
+        if self.at(TokenKind::At) {
+            member_decorators = self.parse_decorators();
         }
 
         // —— 成员修饰符（含 TS：public/private/protected/readonly/abstract/override/declare/accessor）——
         // 某词仅在其后不是「成员终止符」时才算修饰符，否则它本身是成员名（如 `private() {}`）。
         let mut is_static = false;
         let mut erase_member = false; // abstract / declare 成员 → 擦除
+        // `accessor x = 1`（auto-accessor，TC39）：需单独记录以便降级为私有存储 + get/set 对。
+        let mut is_accessor = false;
         loop {
             if self.at_keyword(Keyword::Static) && !self.peek_is_member_terminator() {
                 self.bump();
@@ -842,10 +934,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.bump();
                 continue;
             }
+            // `accessor` 不是 TS-only：TC39 auto-accessor 在纯 JS 中同样合法。
+            if self.at_contextual("accessor") && !self.peek_is_member_terminator() {
+                self.bump();
+                is_accessor = true;
+                continue;
+            }
             if self.ts
-                && (self.at_contextual("readonly")
-                    || self.at_contextual("override")
-                    || self.at_contextual("accessor"))
+                && (self.at_contextual("readonly") || self.at_contextual("override"))
                 && !self.peek_is_member_terminator()
             {
                 self.bump();
@@ -946,6 +1042,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 kind: mkind,
                 is_static,
                 computed,
+                decorators: member_decorators,
             })));
         }
 
@@ -967,6 +1064,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             value,
             is_static,
             computed,
+            decorators: member_decorators,
+            accessor: is_accessor,
         })))
     }
 
@@ -1171,6 +1270,20 @@ impl<'a, 'src> Parser<'a, 'src> {
                 _ => false,
             };
             if type_only {
+                self.bump(); // type
+                // `import type A = require('m')` / `import type A = N.B`：右侧按表达式消费
+                // （其中的 `require('m')` 会被 `maybe_record_require` 记为依赖，故解析后
+                // 截断依赖列表——类型-only 导入不产生任何运行时依赖）。
+                if self.at_ident_name() && self.peek().kind == TokenKind::Eq {
+                    self.bump(); // A
+                    self.bump(); // =
+                    let dep_mark = self.dependencies.len();
+                    let _ = self.with_allow_in(true, |p| p.parse_assignment_expression());
+                    self.dependencies.truncate(dep_mark);
+                    self.semicolon();
+                    return Statement::Empty(self.span_to(lo));
+                }
+                // `import type X from 'm'` / `import type { A } from 'm'` / `import type * as N from 'm'`
                 while !self.at(TokenKind::Str)
                     && !self.at(TokenKind::Semicolon)
                     && !self.at(TokenKind::Eof)
@@ -1178,9 +1291,16 @@ impl<'a, 'src> Parser<'a, 'src> {
                     self.bump();
                 }
                 self.eat(TokenKind::Str);
+                let _ = self.parse_import_attributes();
                 self.semicolon();
                 return Statement::Empty(self.span_to(lo));
             }
+        }
+
+        // TS：`import x = require('m')` / `import A = N.B.C`（import-equals）。
+        // 放在 default 导入分支之前——两者都以标识符起始，靠其后的 `=` 区分。
+        if self.ts && self.at_ident_name() && self.peek().kind == TokenKind::Eq {
+            return self.parse_import_equals(lo);
         }
 
         let mut specifiers = self.new_vec::<ImportSpecifier>();
@@ -1190,6 +1310,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             let source = self.string_atom(self.cur.span);
             let sp = self.cur.span;
             self.bump();
+            let attributes = self.parse_import_attributes();
             self.semicolon();
             self.record_dependency(Dependency {
                 specifier: source,
@@ -1200,6 +1321,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 span: self.span_to(lo),
                 specifiers,
                 source,
+                attributes,
             }));
         }
 
@@ -1267,6 +1389,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // from 'source'
         self.expect(TokenKind::Keyword(Keyword::From));
         let source = self.expect_string_specifier();
+        let attributes = self.parse_import_attributes();
         self.semicolon();
         self.record_dependency(Dependency {
             specifier: source,
@@ -1277,11 +1400,120 @@ impl<'a, 'src> Parser<'a, 'src> {
             span: self.span_to(lo),
             specifiers,
             source,
+            attributes,
+        }))
+    }
+
+    /// TS `import x = require('m');` / `import A = N.B.C;` → `const x = require('m');` /
+    /// `var A = N.B.C;`（对齐 tsc 的 CommonJS emit）。
+    ///
+    /// 右侧**直接按表达式解析**：`require('m')` 天然构成 CallExpression，依赖由
+    /// [`Parser::maybe_record_require`] 在构建时自动记为 [`DependencyKind::Require`]，
+    /// codegen 的 `emit_require_call` 再把它改写成 `__wake_require__(id)`——整条链路复用既有
+    /// CJS 机制，bundler 无需改动。实体名 `N.B.C` 则天然构成成员链。
+    ///
+    /// kind 的选择对齐 tsc：`require` 形态用 `const`（不可变导入绑定，且避免 `var` 让模块失去
+    /// `{}` 块隔离资格）；实体名别名用 `var`，因为命名空间声明合并允许在别名之后才补齐段，
+    /// `var` 的提升语义可避免 TDZ。
+    fn parse_import_equals(&mut self, lo: u32) -> Statement<'a> {
+        let name = self.parse_binding_ident();
+        self.expect(TokenKind::Eq);
+        let init = self.with_allow_in(true, |p| p.parse_assignment_expression());
+        self.semicolon();
+        let span = self.span_to(lo);
+        let kind = if matches!(init, Expression::Call(_)) {
+            VarKind::Const
+        } else {
+            VarKind::Var
+        };
+        let mut declarations = self.new_vec::<VariableDeclarator>();
+        declarations.push(VariableDeclarator {
+            span,
+            id: Pattern::Ident(self.alloc(name)),
+            init: Some(init),
+        });
+        Statement::VariableDeclaration(self.alloc(VariableDeclaration {
+            span,
+            kind,
+            declarations,
+        }))
+    }
+
+    /// 模块说明符之后的引入属性子句 `with { type: "json" }`（或已废弃的 `assert { .. }`）。
+    ///
+    /// 关键字前**不允许换行**（规范的 `[no LineTerminator here]`）——否则
+    /// `import x from 'm'` 换行后的 `with (o) {}` 会被误吞成属性子句而非 with 语句。
+    fn parse_import_attributes(&mut self) -> Option<&'a ImportAttributes<'a>> {
+        if self.newline_before() {
+            return None;
+        }
+        let keyword = if self.at_keyword(Keyword::With) {
+            AttributesKeyword::With
+        } else if self.at_contextual("assert") {
+            AttributesKeyword::Assert
+        } else {
+            return None;
+        };
+        let lo = self.start();
+        self.bump(); // with / assert
+        self.expect(TokenKind::LBrace);
+        let mut items = self.new_vec::<ImportAttribute>();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let ilo = self.start();
+            let key = self.parse_module_export_name();
+            self.expect(TokenKind::Colon);
+            // 属性值只能是字符串字面量（规范限定）。
+            let value = if self.at(TokenKind::Str) {
+                let a = self.string_atom(self.cur.span);
+                self.bump();
+                a
+            } else {
+                self.error_expected("引入属性值（字符串字面量）");
+                self.interner.intern("")
+            };
+            items.push(ImportAttribute {
+                span: self.span_to(ilo),
+                key,
+                value,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        Some(self.alloc(ImportAttributes {
+            span: self.span_to(lo),
+            keyword,
+            items: items.into_bump_slice(),
         }))
     }
 
     fn parse_export(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // export
+
+        // TS：`export = expr;`（CommonJS 整体导出）→ `module.exports = expr;`，对齐 tsc 的
+        // commonjs emit。wake 的模块包装器签名就是 `function(module, exports, __wake_require__)`，
+        // 且 bundler 已识别「整体重新赋值 module.exports」的模块（incremental.rs
+        // `reassigns_module_exports`）并保留其为独立注册模块，故无需额外运行时支持。
+        // 降级结果不含任何 ESM 语句 → `program_is_esm` 为假 → 不打 `__esModule` 标记，
+        // 默认导入 interop 因而拿到整个 exports 对象，与 TS 的 `export =` 语义一致。
+        if self.ts && self.at(TokenKind::Eq) {
+            self.bump(); // =
+            let value = self.with_allow_in(true, |p| p.parse_assignment_expression());
+            self.semicolon();
+            return self.module_exports_assign(self.span_to(lo), value);
+        }
+
+        // TS：`export as namespace X;`（UMD 全局声明）→ 纯类型，擦除。
+        if self.ts && self.at_keyword(Keyword::As) && self.peek_contextual("namespace") {
+            self.bump(); // as
+            self.bump(); // namespace
+            if self.at_ident_name() {
+                self.bump(); // X
+            }
+            self.semicolon();
+            return Statement::Empty(self.span_to(lo));
+        }
 
         // TS：`export type { .. } (from '..')?` / `export type * from '..'` → 整体擦除（无运行时）。
         if self.ts
@@ -1333,6 +1565,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             };
             self.expect(TokenKind::Keyword(Keyword::From));
             let source = self.expect_string_specifier();
+            let attributes = self.parse_import_attributes();
             self.semicolon();
             self.record_dependency(Dependency {
                 specifier: source,
@@ -1343,6 +1576,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 span: self.span_to(lo),
                 exported,
                 source,
+                attributes,
             }));
         }
 
@@ -1380,8 +1614,10 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }
             }
             self.expect(TokenKind::RBrace);
+            let mut attributes = None;
             let source = if self.eat_keyword(Keyword::From) {
                 let s = self.expect_string_specifier();
+                attributes = self.parse_import_attributes();
                 self.record_dependency(Dependency {
                     specifier: s,
                     kind: DependencyKind::ExportFrom,
@@ -1397,6 +1633,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 declaration: None,
                 specifiers,
                 source,
+                attributes,
             }));
         }
 
@@ -1407,6 +1644,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             declaration: Some(declaration),
             specifiers: self.new_vec(),
             source: None,
+            attributes: None,
         }))
     }
 
@@ -1460,9 +1698,10 @@ impl<'a, 'src> Parser<'a, 'src> {
 }
 
 /// 参数属性名：简单标识符参数（含带默认值 `private x = 1`）的名字；解构参数不作参数属性。
-fn param_prop_name(pat: &Pattern) -> Option<wake_common::Atom> {
+/// 参数属性的名字 + 其在源码中的真实 span（用于注入 `this.x = x` 时保持 mangle 一致性）。
+fn param_prop_name(pat: &Pattern) -> Option<(wake_common::Atom, Span)> {
     match pat {
-        Pattern::Ident(id) => Some(id.name),
+        Pattern::Ident(id) => Some((id.name, id.span)),
         Pattern::Assignment(a) => param_prop_name(&a.left),
         _ => None,
     }

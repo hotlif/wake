@@ -199,6 +199,212 @@ fn ts_as_const_assertion() {
     assert!(!out.has_errors(), "<const> 解析错误: {:?}", out.diagnostics);
 }
 
+/// 无诊断地解析（指定 source type），返回 [`crate::ParseOutput`]。
+fn parse_ok(src: &str, st: SourceType) -> crate::ParseOutput {
+    let interner = Interner::new();
+    let out = parse(src, &interner, st);
+    assert!(
+        !out.has_errors(),
+        "parse errors for {src:?}: {:?}",
+        out.diagnostics
+    );
+    out
+}
+
+#[test]
+fn ts_import_equals_and_export_assign() {
+    let interner = Interner::new();
+    let src = "import fs = require('fs');
+        import A = N.B.C;
+        export import Pub = require('pub');
+        export = { fs, A };";
+    let out = parse(src, &interner, SourceType::TypeScript);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    // `= require('x')` 形态记为 Require 依赖（复用既有 CJS 链路）。
+    let requires: Vec<String> = out
+        .dependencies
+        .iter()
+        .filter(|d| d.kind == DependencyKind::Require)
+        .map(|d| interner.resolve(d.specifier))
+        .collect();
+    assert_eq!(requires, vec!["fs".to_string(), "pub".to_string()]);
+
+    out.module.with_ast(|p| {
+        // import-equals 降级为变量声明：require 形态用 const，实体名别名用 var。
+        assert!(matches!(
+            p.body[0],
+            Statement::VariableDeclaration(d) if d.kind == VarKind::Const
+        ));
+        assert!(matches!(
+            p.body[1],
+            Statement::VariableDeclaration(d) if d.kind == VarKind::Var
+        ));
+        // `export import` 仍是具名导出，内层是降级后的声明。
+        assert!(matches!(p.body[2], Statement::ExportNamed(_)));
+        // `export =` 降级为普通赋值语句 → 该模块不含 ESM 语句，按 CJS 语义处理。
+        assert!(matches!(p.body[3], Statement::Expression(_)));
+    });
+}
+
+#[test]
+fn ts_type_only_import_equals_erased() {
+    // 类型-only 的 import-equals 整条擦除，且**不得**留下 require 依赖。
+    let interner = Interner::new();
+    let src = "import type T = require('./types');
+        import type { X } from './x';
+        export as namespace Lib;
+        export const v = 1;";
+    let out = parse(src, &interner, SourceType::TypeScript);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.dependencies.is_empty(),
+        "类型-only 声明不应产生运行时依赖：{:?}",
+        out.dependencies
+            .iter()
+            .map(|d| interner.resolve(d.specifier))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn import_attributes_parsed() {
+    let out = parse_ok(
+        "import d from './d.json' with { type: 'json' };
+         import './s.css' with { type: 'css' };
+         export { a } from './m.js' with { type: 'json' };
+         export * from './n.js' with { type: 'json' };
+         import o from './o.json' assert { type: 'json' };",
+        SourceType::Module,
+    );
+    // 依赖照常抽取（属性不影响模块图）。
+    assert_eq!(out.dependencies.len(), 5);
+    fn attrs<'a>(s: &Statement<'a>) -> Option<&'a ImportAttributes<'a>> {
+        match s {
+            Statement::Import(d) => d.attributes,
+            Statement::ExportNamed(d) => d.attributes,
+            Statement::ExportAll(d) => d.attributes,
+            _ => None,
+        }
+    }
+    out.module.with_ast(|p| {
+        for (i, stmt) in p.body.iter().enumerate() {
+            let a = attrs(stmt).unwrap_or_else(|| panic!("第 {i} 条语句缺少引入属性"));
+            assert_eq!(a.items.len(), 1);
+        }
+        assert_eq!(attrs(&p.body[0]).unwrap().keyword, AttributesKeyword::With);
+        // 已废弃的 import assertions 保留原关键字，不静默改写为 `with`。
+        assert_eq!(
+            attrs(&p.body[4]).unwrap().keyword,
+            AttributesKeyword::Assert
+        );
+    });
+}
+
+#[test]
+fn import_attributes_do_not_swallow_with_statement() {
+    // 反例：`with` 前有换行时是 with 语句，不是引入属性（规范的 [no LineTerminator here]）。
+    let out = parse_ok("import x from 'm'\nwith (o) { y }", SourceType::Script);
+    out.module.with_ast(|p| {
+        assert!(matches!(p.body[0], Statement::Import(d) if d.attributes.is_none()));
+        assert!(matches!(p.body[1], Statement::With(_)));
+    });
+}
+
+#[test]
+fn using_declarations() {
+    let out = parse_ok(
+        "{ using a = mk(); }
+         async function f() {
+             using c = mk();
+             await using b = mkAsync();
+             for (using r of rs) {}
+             for (await using k of ks) {}
+         }
+         class C { static { using s = mk(); } }",
+        SourceType::Module,
+    );
+    out.module.with_ast(|p| {
+        let Statement::Block(b) = &p.body[0] else {
+            panic!("期望块语句")
+        };
+        assert!(matches!(
+            b.body[0],
+            Statement::VariableDeclaration(d) if d.kind == VarKind::Using
+        ));
+        let Statement::FunctionDeclaration(f) = &p.body[1] else {
+            panic!("期望函数声明")
+        };
+        let body = f.body.expect("函数应有体");
+        assert!(matches!(
+            body.statements[0],
+            Statement::VariableDeclaration(d) if d.kind == VarKind::Using
+        ));
+        assert!(matches!(
+            body.statements[1],
+            Statement::VariableDeclaration(d) if d.kind == VarKind::AwaitUsing
+        ));
+    });
+}
+
+#[test]
+fn top_level_await_using_is_rejected() {
+    // wake 不支持任何形式的顶层 await，且 bundler 的模块包装器非 async——若放行顶层
+    // `await using`，产物会是加载即抛 SyntaxError 的包。必须在解析期就报错。
+    let interner = Interner::new();
+    let out = parse("await using a = mkAsync();", &interner, SourceType::Module);
+    assert!(
+        out.has_errors(),
+        "顶层 await using 应报错而非静默产出坏代码"
+    );
+    // 非 async 函数内同理（本就是非法 JS）。
+    let out = parse(
+        "function f() { await using a = mkAsync(); }",
+        &interner,
+        SourceType::Module,
+    );
+    assert!(out.has_errors(), "非 async 函数内的 await using 应报错");
+}
+
+#[test]
+fn using_as_plain_identifier() {
+    // 反例：`using` 是上下文关键字——下列每一处都必须仍按普通标识符解析。
+    let out = parse_ok(
+        "let using = 1;
+         using = 2;
+         using;
+         using
+         x = 3;
+         foo(using);
+         using.prop;
+         for (using of xs) {}
+         async function g() { await using(1); await usingThing(); }",
+        SourceType::Module,
+    );
+    out.module.with_ast(|p| {
+        // 无一条语句被解析成 using 声明。
+        for s in p.body.iter() {
+            assert!(
+                !matches!(s, Statement::VariableDeclaration(d) if d.kind.is_using()),
+                "`using` 被误判为声明：{s:?}"
+            );
+        }
+        // `using\nx = 3` 经 ASI 断成两条表达式语句。
+        assert!(matches!(p.body[2], Statement::Expression(_)));
+        assert!(matches!(p.body[3], Statement::Expression(_)));
+        // `for (using of xs)` 是 for-of，左侧是赋值目标而非声明。
+        let for_of = p
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Statement::ForOf(f) => Some(f),
+                _ => None,
+            })
+            .expect("应有 for-of");
+        assert!(matches!(for_of.left, ForLeft::Target(_)));
+    });
+}
+
 #[test]
 fn no_panic_on_garbage() {
     // 错误恢复：乱码不应 panic，且总能到达 EOF。
