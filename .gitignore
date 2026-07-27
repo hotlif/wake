@@ -2,6 +2,7 @@
 **/*.rs.bk
 *.pdb
 node_modules
+.wake
 .yarn
 # criterion / bench 输出
 /target/criterion

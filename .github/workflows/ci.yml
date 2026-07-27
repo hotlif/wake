@@ -1,6 +1,6 @@
 name: CI
 
-# PLAN §1 工程基线：每 PR 跑 fmt + clippy(-D warnings) + test + miri；bench 先做编译冒烟，
+# 工程基线：每 PR 跑 fmt + clippy(-D warnings) + test + miri；bench 先做编译冒烟，
 # 回归门禁（超 5% 红灯）待有基线历史后接入 critcmp。
 
 on:
@@ -56,13 +56,13 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      # Spike ① 的自引用持有者含唯一一处 unsafe，必须常驻 miri 防回归（DESIGN §10.4）。
+      # 自引用 AST 持有者含手写 unsafe，必须常驻 miri 防回归。
       - run: cargo miri test -p wake_ecma_ast
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
       # wake_turbo 引擎核心：engine.rs 的 thread-local 裸指针 unsafe + 红绿对拍，默认 Stacked Borrows。
       # executor/concurrent 测试用 crossbeam（SB 下有已知假阳性、~11min），已 #[cfg_attr(miri, ignore)]
-      # 自动跳过——并发正确性归下方 loom job（PLAN §2.5.6）。
+      # 自动跳过——并发正确性归下方 loom job。
       - run: cargo miri test -p wake_turbo
         env:
           MIRIFLAGS: -Zmiri-disable-isolation

@@ -1,74 +1,97 @@
-# 测试与基准约定
+# 测试与质量门禁
 
-> 对应：DESIGN §11、PLAN §1 / §0.4。各 Phase 只往这套骨架里填用例。
+## 1. 提交前命令
 
-## 门禁（每 PR，CI 强制）
-
-| 门 | 命令 | 说明 |
-|----|------|------|
-| 格式 | `cargo fmt --all --check` | rustfmt 统一风格 |
-| lint | `cargo clippy --workspace --all-targets -- -D warnings` | 警告即失败 |
-| 测试 | `cargo test --workspace` | 单测 + 集成 + 快照 + doctest |
-| miri | `cargo miri test -p wake_ecma_ast` + `cargo miri test -p wake_turbo` | 手写 `unsafe` 无 UB（自引用 AST §10.4 + 引擎 thread-local 裸指针 §10.3） |
-| loom | `RUSTFLAGS=--cfg loom cargo test -p wake_turbo --test loom_single_flight` | single-flight 协议在所有线程交错下正确（§10.3 / §2.5.6） |
-| bench 冒烟 | `cargo bench --workspace --no-run` | bench 骨架可编译 |
-
-**编译器代码无 snapshot 覆盖不合入；引擎代码无对拍/loom 测试不合入**（PLAN §1）。
-
-## 1. 快照测试（insta）
-
-用于 lexer/parser/transform/codegen/诊断的输出验收。示例见
-[`crates/wake_common/tests/render_snapshot.rs`](../crates/wake_common/tests/render_snapshot.rs)。
-
-- 快照文件：`<crate>/tests/snapshots/*.snap`，随代码提交。
-- 新增/变更后审查：`cargo insta review`（或一次性 `INSTA_UPDATE=always cargo test -p <crate>`）。
-- 快照应用 **plain**（无 ANSI）形态，保证可读、可 diff。
-
-## 2. 基准（criterion）
-
-- 微基准：`<crate>/benches/*.rs`，`harness = false` + `criterion_main!`。示例见
-  [`crates/wake_common/benches/interner.rs`](../crates/wake_common/benches/interner.rs)。
-- 运行：`cargo bench -p <crate>`；快速冒烟：`-- --measurement-time 1 --sample-size 10`。
-- 宏基准（三档合成项目 100/1k/10k + 一个真实开源项目）在 P1+ 随管线建立。
-- **双值展示**：底线值与目标值并列（PLAN §1），防止用底线自我满足。
-- **回归门禁**：超 5% 红灯（PLAN §1）。需基线历史，用 critcmp/bencher 在有数据后接入 CI。
-
-## 3. Fixture 约定（e2e 打包）
-
-见 [`fixtures/README.md`](../fixtures/README.md)。端到端打包 fixture 从 P3 起填充：
-输入项目目录 → 期望产物结构 + **产物在 node/浏览器实际执行** 的断言。
-
-## 4. 正确性防线
-
-- **对拍**（引擎）：随机变更 + 随机请求与全量重算比对。Spike ② 已建雏形
-  （[`crates/wake_turbo/src/spike.rs`](../crates/wake_turbo/src/spike.rs)），P2.5 固化为
-  `WAKE_VERIFY=1` 常驻模式（每次增量构建后偷偷全量重算比对，进 CI nightly）。
-- **对拍**（parser）：test262-parser-tests 全量 + 随机 npm 包源码与 acorn 语义对比（P2）。
-- **fuzz**：cargo-fuzz 打 lexer/parser，长期跑不 panic/OOM（P1 起）。
-- **loom**：引擎并发正确性模型检查（P2.5）。
-
-## 5. miri
-
-所有 **手写 unsafe** 必须常驻 miri 防回归（默认 Stacked Borrows）：
-- `wake_ecma_ast`：自引用 AST 持有者（DESIGN §10.4）；
-- `wake_turbo` 引擎核心：`engine.rs` 的 thread-local 「当前引擎」裸指针（DESIGN §10.3）。
-
-```bash
-rustup toolchain install nightly --component miri
-MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test -p wake_ecma_ast
-MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test -p wake_turbo
+```powershell
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
 ```
 
-**用 crossbeam 的测试（`executor` 单测 + `concurrent` 集成测试）标了 `#[cfg_attr(miri, ignore)]`，miri 自动跳过**：
-它们无自有 `unsafe`，仅依赖 crossbeam-deque/epoch 无锁结构——这类结构在 Stacked Borrows 下有已知 retag 假阳性，
-须 `-Zmiri-tree-borrows`；而 Tree Borrows 下又会把 crossbeam-epoch 的延迟回收报为 `memory leaked`
-（需再加 `-Zmiri-ignore-leaks`），且单跑约 11 分钟。其并发正确性由 **loom**（§10.3 single-flight 协议）
-与并发对拍压测覆盖，更对口。本地取证命令（非 CI）：
+当前状态：全量测试通过；Clippy 门禁尚未通过，具体见 [AUDIT.md](AUDIT.md)。
 
-```bash
-MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks" \
-  cargo +nightly miri test -p wake_turbo --lib executor
+## 2. 测试层次
 
-# loom（穷举线程交错验证 single-flight 协议）
-RUSTFLAGS="--cfg loom" cargo test -p wake_turbo --test loom_single_flight
-```
+### 单元测试
+
+适合 lexer、parser 规则、路径规范化、hash/key 生成、活跃性转移、chunk 划分和缓存编码。
+
+### 属性与模糊测试
+
+重点不变量：
+
+- lexer/parser 对任意字节不发生越界或永久循环；
+- codegen 后再次 parse 不崩溃；
+- 模块/chunk 输出不依赖 hash map 遍历顺序；
+- cache decode 对截断、随机和旧版本输入安全失败。
+
+### 并发测试
+
+`wake_turbo` 需要覆盖：
+
+- 同 key 并发请求只执行一次；
+- 依赖变化期间没有丢失唤醒；
+- 任务 panic、错误或取消后等待者全部结束；
+- cycle 检测不会留下永久 running cell；
+- 并发度 1 与 N 的结果完全一致。
+
+状态机级测试使用 Loom；吞吐和真实阻塞行为使用普通线程测试。
+
+### 端到端测试
+
+每个重要能力至少验证两件事：
+
+1. 产物结构符合预期；
+2. 产物在 Node 或浏览器样环境中执行正确。
+
+现有测试已经覆盖 ESM/CJS、TypeScript、JSX、CSS、动态 import、TLA、tree shaking、PnP 和缓存，应继续保留。
+
+## 3. 必补回归矩阵
+
+| 场景 | 冷内存 | 热内存 | 冷持久化 | 热持久化 |
+|---|---:|---:|---:|---:|
+| 基础 ESM | ✓ | ✓ | ✓ | ✓ |
+| Tree shaking | ✓ | ✓ | ✓ | ✓ |
+| Code splitting | ✓ | ✓ | ✓ | ✓ |
+| TLA | ✓ | ✓ | ✓ | ✓ |
+| CSS/assets | ✓ | ✓ | ✓ | ✓ |
+| Source map | ✓ | ✓ | ✓ | ✓ |
+
+四种模式的 JS、CSS、asset、manifest 和 source map 应逐字节一致。允许不同的只有统计信息和耗时。
+
+## 4. 缓存失效矩阵
+
+逐项改变以下输入，并断言相关任务 miss、无关任务仍可 hit：
+
+- 源文本和文件类型；
+- define、target、dev/prod、minify、tree shaking；
+- alias、解析扩展名、package exports 条件；
+- PnP manifest；
+- CSS inline 阈值与 public path；
+- cache schema 和算法 revision。
+
+## 5. 确定性测试
+
+同一 fixture：
+
+- 重复构建至少 20 次；
+- 使用不同线程数；
+- 打乱文件系统枚举顺序；
+- 使用不同进程；
+- 分别从空缓存和热缓存启动。
+
+比较所有输出文件名和字节。若失败，应打印首个不同阶段的稳定摘要，而不是只比较最终 bundle。
+
+## 6. 性能基准
+
+基准必须固定机器信息、Rust 版本、profile、线程数和 fixture revision。至少报告中位数、p95 和峰值内存：
+
+- 冷构建；
+- 无修改 rebuild；
+- 单叶模块修改；
+- 公共依赖修改；
+- 1k/10k 模块宽图；
+- source map 和 minify 独立开关。
+
+性能优化不得通过减少正确性检查或让热缓存产物退化来换取。
