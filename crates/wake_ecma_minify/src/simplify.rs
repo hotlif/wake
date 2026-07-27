@@ -17,9 +17,9 @@
 //! | `2+3` | `5` | constant fold via const_eval |
 //! | `` `hello ${1+2}` `` | `"hello 3"` | all-const template literal |
 
+use crate::const_eval::{self, ConstCtx, ConstVal, expr_is_pure};
 use wake_common::{FxHashMap, Interner, Span};
 use wake_ecma_ast::*;
-use crate::const_eval::{self, ConstCtx, ConstVal, expr_is_pure};
 
 /// A planned simplification at a specific span location.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,7 +80,11 @@ impl<'a> SimplifyPlanner<'a> {
     }
 
     fn const_ctx(&self) -> ConstCtx<'a> {
-        ConstCtx { defines: &[], known_vars: &[], interner: Some(self.interner) }
+        ConstCtx {
+            defines: &[],
+            known_vars: &[],
+            interner: Some(self.interner),
+        }
     }
 }
 
@@ -97,8 +101,7 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
             Expression::Unary(u) if u.operator == UnaryOperator::LogicalNot => {
                 // !!x → x  when inner argument is pure
                 if let Expression::Unary(inner) = &u.argument {
-                    if inner.operator == UnaryOperator::LogicalNot
-                        && expr_is_pure(&inner.argument)
+                    if inner.operator == UnaryOperator::LogicalNot && expr_is_pure(&inner.argument)
                     {
                         self.actions.insert(u.span, SimplifyAction::RemoveDoubleNot);
                         // Recurse into the inner argument for nested simplifications
@@ -108,7 +111,8 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
                 }
                 // !constant → !ConstVal result
                 if let Some(val) = const_eval::const_eval(node, &ctx) {
-                    self.actions.insert(node.span(), SimplifyAction::ReplaceWith(val.to_source()));
+                    self.actions
+                        .insert(node.span(), SimplifyAction::ReplaceWith(val.to_source()));
                     return;
                 }
             }
@@ -118,9 +122,14 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
             // ── Pattern 4: Ternary on constant
             Expression::Conditional(c) => {
                 if let Some(val) = const_eval::const_eval(&c.test, &ctx) {
-                    let branch = if val.truthy() { &c.consequent } else { &c.alternate };
+                    let branch = if val.truthy() {
+                        &c.consequent
+                    } else {
+                        &c.alternate
+                    };
                     let text = self.span_text(branch.span());
-                    self.actions.insert(c.span, SimplifyAction::ReplaceWith(text));
+                    self.actions
+                        .insert(c.span, SimplifyAction::ReplaceWith(text));
                     // Recurse into the selected branch for nested simplifications
                     self.visit_expression(branch);
                     return;
@@ -135,21 +144,25 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
                             if val.truthy() {
                                 // true && x → x
                                 let text = self.span_text(l.right.span());
-                                self.actions.insert(l.span, SimplifyAction::ReplaceWith(text));
+                                self.actions
+                                    .insert(l.span, SimplifyAction::ReplaceWith(text));
                                 self.visit_expression(&l.right);
                             } else {
                                 // false && x → false
-                                self.actions.insert(l.span, SimplifyAction::ReplaceWith("false".into()));
+                                self.actions
+                                    .insert(l.span, SimplifyAction::ReplaceWith("false".into()));
                             }
                         }
                         LogicalOperator::Or => {
                             if val.truthy() {
                                 // true || x → true
-                                self.actions.insert(l.span, SimplifyAction::ReplaceWith("true".into()));
+                                self.actions
+                                    .insert(l.span, SimplifyAction::ReplaceWith("true".into()));
                             } else {
                                 // false || x → x
                                 let text = self.span_text(l.right.span());
-                                self.actions.insert(l.span, SimplifyAction::ReplaceWith(text));
+                                self.actions
+                                    .insert(l.span, SimplifyAction::ReplaceWith(text));
                                 self.visit_expression(&l.right);
                             }
                         }
@@ -180,7 +193,8 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
             // ── Pattern 7 & 8: Binary folding (concat + arithmetic)
             Expression::Binary(_) => {
                 if let Some(val) = const_eval::const_eval(node, &ctx) {
-                    self.actions.insert(node.span(), SimplifyAction::ReplaceWith(val.to_source()));
+                    self.actions
+                        .insert(node.span(), SimplifyAction::ReplaceWith(val.to_source()));
                     return;
                 }
             }
@@ -188,7 +202,8 @@ impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
             // ── Pattern 9: Template literal with all-constant parts
             Expression::TemplateLiteral(_) => {
                 if let Some(val) = const_eval::const_eval(node, &ctx) {
-                    self.actions.insert(node.span(), SimplifyAction::ReplaceWith(val.to_source()));
+                    self.actions
+                        .insert(node.span(), SimplifyAction::ReplaceWith(val.to_source()));
                     return;
                 }
             }
@@ -244,7 +259,13 @@ mod tests {
 
     fn assert_no_action(src: &str, expr_src: &str) {
         let got = action_on(src, expr_src);
-        assert!(got.is_none(), "unexpected action {:?} on `{}` at `{}`", got, src, expr_src);
+        assert!(
+            got.is_none(),
+            "unexpected action {:?} on `{}` at `{}`",
+            got,
+            src,
+            expr_src
+        );
     }
 
     fn assert_action_count(src: &str, count: usize) {
@@ -285,12 +306,20 @@ mod tests {
 
     #[test]
     fn not_true() {
-        assert_action("!true;", "!true", SimplifyAction::ReplaceWith("false".into()));
+        assert_action(
+            "!true;",
+            "!true",
+            SimplifyAction::ReplaceWith("false".into()),
+        );
     }
 
     #[test]
     fn not_false() {
-        assert_action("!false;", "!false", SimplifyAction::ReplaceWith("true".into()));
+        assert_action(
+            "!false;",
+            "!false",
+            SimplifyAction::ReplaceWith("true".into()),
+        );
     }
 
     #[test]
@@ -305,34 +334,58 @@ mod tests {
 
     #[test]
     fn not_undefined() {
-        assert_action("!undefined;", "!undefined", SimplifyAction::ReplaceWith("true".into()));
+        assert_action(
+            "!undefined;",
+            "!undefined",
+            SimplifyAction::ReplaceWith("true".into()),
+        );
     }
 
     #[test]
     fn not_null() {
-        assert_action("!null;", "!null", SimplifyAction::ReplaceWith("true".into()));
+        assert_action(
+            "!null;",
+            "!null",
+            SimplifyAction::ReplaceWith("true".into()),
+        );
     }
 
     #[test]
     fn not_empty_string() {
-        assert_action("!\"\";", "!\"\"", SimplifyAction::ReplaceWith("true".into()));
+        assert_action(
+            "!\"\";",
+            "!\"\"",
+            SimplifyAction::ReplaceWith("true".into()),
+        );
     }
 
     // ── Ternary on constant ──
 
     #[test]
     fn ternary_true() {
-        assert_action("true ? x : y;", "true ? x : y", SimplifyAction::ReplaceWith("x".into()));
+        assert_action(
+            "true ? x : y;",
+            "true ? x : y",
+            SimplifyAction::ReplaceWith("x".into()),
+        );
     }
 
     #[test]
     fn ternary_false() {
-        assert_action("false ? x : y;", "false ? x : y", SimplifyAction::ReplaceWith("y".into()));
+        assert_action(
+            "false ? x : y;",
+            "false ? x : y",
+            SimplifyAction::ReplaceWith("y".into()),
+        );
     }
 
     #[test]
     fn ternary_true_side_effect_free() {
-        assert_action("true ? a + b : c * d;", "true ? a + b : c * d", SimplifyAction::ReplaceWith("a + b".into()));
+        assert_action(
+            "true ? a + b : c * d;",
+            "true ? a + b : c * d",
+            SimplifyAction::ReplaceWith("a + b".into()),
+        );
     }
 
     #[test]
@@ -344,28 +397,48 @@ mod tests {
 
     #[test]
     fn logical_and_true() {
-        assert_action("true && x;", "true && x", SimplifyAction::ReplaceWith("x".into()));
+        assert_action(
+            "true && x;",
+            "true && x",
+            SimplifyAction::ReplaceWith("x".into()),
+        );
     }
 
     #[test]
     fn logical_and_false() {
-        assert_action("false && x;", "false && x", SimplifyAction::ReplaceWith("false".into()));
+        assert_action(
+            "false && x;",
+            "false && x",
+            SimplifyAction::ReplaceWith("false".into()),
+        );
     }
 
     #[test]
     fn logical_or_true() {
-        assert_action("true || x;", "true || x", SimplifyAction::ReplaceWith("true".into()));
+        assert_action(
+            "true || x;",
+            "true || x",
+            SimplifyAction::ReplaceWith("true".into()),
+        );
     }
 
     #[test]
     fn logical_or_false() {
-        assert_action("false || x;", "false || x", SimplifyAction::ReplaceWith("x".into()));
+        assert_action(
+            "false || x;",
+            "false || x",
+            SimplifyAction::ReplaceWith("x".into()),
+        );
     }
 
     #[test]
     fn logical_and_true_complex_right() {
         // The right operand span excludes parentheses — they are syntactic grouping
-        assert_action("true && (a + b);", "true && (a + b)", SimplifyAction::ReplaceWith("a + b".into()));
+        assert_action(
+            "true && (a + b);",
+            "true && (a + b)",
+            SimplifyAction::ReplaceWith("a + b".into()),
+        );
     }
 
     // ── Bracket to dot ──
@@ -377,7 +450,11 @@ mod tests {
 
     #[test]
     fn bracket_to_dot_multi_char() {
-        assert_action("obj['propName'];", "obj['propName']", SimplifyAction::BracketToDot);
+        assert_action(
+            "obj['propName'];",
+            "obj['propName']",
+            SimplifyAction::BracketToDot,
+        );
     }
 
     #[test]
@@ -412,17 +489,29 @@ mod tests {
 
     #[test]
     fn str_concat() {
-        assert_action("\"a\" + \"b\";", "\"a\" + \"b\"", SimplifyAction::ReplaceWith("\"ab\"".into()));
+        assert_action(
+            "\"a\" + \"b\";",
+            "\"a\" + \"b\"",
+            SimplifyAction::ReplaceWith("\"ab\"".into()),
+        );
     }
 
     #[test]
     fn str_concat_multi() {
-        assert_action("\"a\" + \"b\" + \"c\";", "\"a\" + \"b\" + \"c\"", SimplifyAction::ReplaceWith("\"abc\"".into()));
+        assert_action(
+            "\"a\" + \"b\" + \"c\";",
+            "\"a\" + \"b\" + \"c\"",
+            SimplifyAction::ReplaceWith("\"abc\"".into()),
+        );
     }
 
     #[test]
     fn str_concat_with_number() {
-        assert_action("\"a\" + 1;", "\"a\" + 1", SimplifyAction::ReplaceWith("\"a1\"".into()));
+        assert_action(
+            "\"a\" + 1;",
+            "\"a\" + 1",
+            SimplifyAction::ReplaceWith("\"a1\"".into()),
+        );
     }
 
     // ── Arithmetic folding ──
@@ -449,19 +538,31 @@ mod tests {
 
     #[test]
     fn arithmetic_complex() {
-        assert_action("2 + 3 * 4;", "2 + 3 * 4", SimplifyAction::ReplaceWith("14".into()));
+        assert_action(
+            "2 + 3 * 4;",
+            "2 + 3 * 4",
+            SimplifyAction::ReplaceWith("14".into()),
+        );
     }
 
     // ── Template literal ──
 
     #[test]
     fn template_no_expr() {
-        assert_action("`hello`;", "`hello`", SimplifyAction::ReplaceWith("\"hello\"".into()));
+        assert_action(
+            "`hello`;",
+            "`hello`",
+            SimplifyAction::ReplaceWith("\"hello\"".into()),
+        );
     }
 
     #[test]
     fn template_all_const_exprs() {
-        assert_action("`hello ${1 + 2}`;", "`hello ${1 + 2}`", SimplifyAction::ReplaceWith("\"hello 3\"".into()));
+        assert_action(
+            "`hello ${1 + 2}`;",
+            "`hello ${1 + 2}`",
+            SimplifyAction::ReplaceWith("\"hello 3\"".into()),
+        );
     }
 
     #[test]
@@ -471,7 +572,11 @@ mod tests {
 
     #[test]
     fn template_all_const_multiple() {
-        assert_action("`${1} + ${2} = ${3}`;", "`${1} + ${2} = ${3}`", SimplifyAction::ReplaceWith("\"1 + 2 = 3\"".into()));
+        assert_action(
+            "`${1} + ${2} = ${3}`;",
+            "`${1} + ${2} = ${3}`",
+            SimplifyAction::ReplaceWith("\"1 + 2 = 3\"".into()),
+        );
     }
 
     // ── void 0 stays as is ──
@@ -514,8 +619,14 @@ mod tests {
     fn nested_double_not() {
         // !!(!true) -> !!0..9, inner !true at 3..8
         let sp = plan("!!(!true);");
-        assert_eq!(sp.actions.get(&Span::new(0, 9)), Some(&SimplifyAction::RemoveDoubleNot));
-        assert_eq!(sp.actions.get(&Span::new(3, 8)), Some(&SimplifyAction::ReplaceWith("false".into())));
+        assert_eq!(
+            sp.actions.get(&Span::new(0, 9)),
+            Some(&SimplifyAction::RemoveDoubleNot)
+        );
+        assert_eq!(
+            sp.actions.get(&Span::new(3, 8)),
+            Some(&SimplifyAction::ReplaceWith("false".into()))
+        );
     }
 
     #[test]

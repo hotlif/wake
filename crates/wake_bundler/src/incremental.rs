@@ -1202,7 +1202,7 @@ fn codegen_request(
         parsed.ast.with_ast(|program| {
             if mangle {
                 // 每模块规划作用域安全的短名重命名，得 span→新名 侧表传入 codegen。
-                let plan = wake_ecma_minify::plan_mangle(program, &interner);
+                let plan = wake_ecma_minify::plan_mangle(program, &interner, &["m", "$", "_r"]);
                 // 每模块规划属性名缩短，得 span→新名 侧表传入 codegen。
                 let prop_plan = wake_ecma_minify::plan_prop_mangle(program, &interner);
 
@@ -1253,12 +1253,16 @@ fn codegen_request(
                         }
                     }
 
-                    // 4) 变量内联（Phase 2.4）：将单次使用纯变量的初始化表达式注入 inline_vars
+                    // 4) 变量内联（Phase 2.4）：将单次使用纯变量的初始化表达式注入 inline_vars。
+                    // 按该变量**唯一一次使用**的引用 span 索引（非名字）——否则会把其它作用域里
+                    // 同名变量的引用也一并替换（曾致 react-dom 局部 root/lane 被换成模块级同名变量）。
                     if !va.inline_candidates.is_empty() {
                         let init_map = collect_init_map(program);
-                        for (&name, &decl_span) in &va.inline_candidates {
-                            if let Some(init) = init_map.get(&decl_span) {
-                                minify_ctx.inline_vars.insert(name, *init);
+                        for (name, &decl_span) in &va.inline_candidates {
+                            if let (Some(&ref_span), Some(init)) =
+                                (va.inline_ref_spans.get(name), init_map.get(&decl_span))
+                            {
+                                minify_ctx.inline_vars.insert(ref_span, *init);
                             }
                         }
                     }

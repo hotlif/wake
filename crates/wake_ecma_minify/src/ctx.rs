@@ -4,9 +4,9 @@
 //! `wake_ecma_codegen` during emission. This is how the minifier communicates
 //! its decisions to the code generator without modifying the AST.
 
-use wake_common::{Atom, FxHashMap, FxHashSet, Span};
-use crate::const_eval::ConstVal;
 use crate::HoistPlan;
+use crate::const_eval::ConstVal;
+use wake_common::{Atom, FxHashMap, FxHashSet, Span};
 use wake_ecma_ast::Expression;
 
 /// Aggregated minification context: all analysis results available to codegen.
@@ -36,9 +36,14 @@ pub struct MinifyCtx<'a> {
 
     // ── Variable elimination (Phase 2.3 / 2.4) ──
     /// Variables that are unused (decl can be removed or reduced to side effects only).
+    /// NOTE: Atom（名字）集合——**不可**用于按声明删除变量/参数，因为同名的不同作用域
+    /// 绑定会碰撞。删除决策一律走 [`Self::unused_var_spans`]（按声明 span）。
     pub unused_vars: FxHashSet<Atom>,
-    /// Single-use pure variables: variable name → initializer expression to inline.
-    pub inline_vars: FxHashMap<Atom, &'a Expression<'a>>,
+    /// 未使用绑定的声明 span 集合（按符号）。codegen 删除未用变量声明 / 末尾参数的依据。
+    pub unused_var_spans: FxHashSet<Span>,
+    /// Single-use pure variables to inline: **单次使用的引用 span** → 要注入的初始化表达式。
+    /// 按引用 span（非名字）索引,确保只替换那**唯一一次使用**,不波及其它作用域同名变量。
+    pub inline_vars: FxHashMap<Span, &'a Expression<'a>>,
 
     // ── Statement merging (Phase 3) ──
     /// Consecutive var declarations that can be merged.
@@ -96,9 +101,13 @@ impl<'a> MinifyCtx<'a> {
     {
         self.remove_spans = plan.remove_spans.clone();
         self.unused_vars = var.unused_vars.clone();
-        for (&name, &decl_span) in &var.inline_candidates {
-            if let Some(&init) = init_map.get(&decl_span) {
-                self.inline_vars.insert(name, init);
+        self.unused_var_spans = var.unused_var_spans.clone();
+        for (name, &decl_span) in &var.inline_candidates {
+            // 按该变量**唯一一次使用**的引用 span 索引内联（非名字）。
+            if let (Some(&ref_span), Some(&init)) =
+                (var.inline_ref_spans.get(name), init_map.get(&decl_span))
+            {
+                self.inline_vars.insert(ref_span, init);
             }
         }
     }

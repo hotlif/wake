@@ -22,7 +22,13 @@ impl ConstVal {
 
     pub fn to_source(&self) -> String {
         match self {
-            ConstVal::Bool(b) => if *b { "true".into() } else { "false".into() },
+            ConstVal::Bool(b) => {
+                if *b {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            }
             ConstVal::Str(s) => format!("{:?}", s),
             ConstVal::Num(n) => write_number_minified(*n),
             ConstVal::Null => "null".into(),
@@ -36,10 +42,18 @@ pub fn write_number_minified(n: f64) -> String {
 }
 
 fn write_number_impl(n: f64, minified: bool) -> String {
-    if n == 0.0 && n.is_sign_negative() { return "-0".into(); }
-    if n.is_infinite() && n > 0.0 { return "Infinity".into(); }
-    if n.is_infinite() { return "-Infinity".into(); }
-    if n.is_nan() { return "NaN".into(); }
+    if n == 0.0 && n.is_sign_negative() {
+        return "-0".into();
+    }
+    if n.is_infinite() && n > 0.0 {
+        return "Infinity".into();
+    }
+    if n.is_infinite() {
+        return "-Infinity".into();
+    }
+    if n.is_nan() {
+        return "NaN".into();
+    }
 
     if n.fract() == 0.0 && n.is_finite() && n.abs() <= 2_f64.powi(53) {
         let int_val = n as i64;
@@ -100,10 +114,9 @@ pub struct ConstCtx<'a> {
 pub fn expr_is_pure(e: &Expression) -> bool {
     use Expression::*;
     match e {
-        NumberLiteral(_) | StringLiteral(_) | BooleanLiteral(_)
-        | NullLiteral(_) | BigIntLiteral(_) | RegExpLiteral(_)
-        | Identifier(_) | This(_) | Super(_) | MetaProperty(_)
-        | Function(_) | Arrow(_) => true,
+        NumberLiteral(_) | StringLiteral(_) | BooleanLiteral(_) | NullLiteral(_)
+        | BigIntLiteral(_) | RegExpLiteral(_) | Identifier(_) | This(_) | Super(_)
+        | MetaProperty(_) | Function(_) | Arrow(_) => true,
         Class(c) => class_is_pure(c),
         TemplateLiteral(t) => t.expressions.iter().all(expr_is_pure),
         Array(a) => a.elements.iter().flatten().all(expr_is_pure),
@@ -116,7 +129,9 @@ pub fn expr_is_pure(e: &Expression) -> bool {
         Binary(b) => expr_is_pure(&b.left) && expr_is_pure(&b.right),
         Logical(l) => expr_is_pure(&l.left) && expr_is_pure(&l.right),
         Assignment(_) => false,
-        Conditional(c) => expr_is_pure(&c.test) && expr_is_pure(&c.consequent) && expr_is_pure(&c.alternate),
+        Conditional(c) => {
+            expr_is_pure(&c.test) && expr_is_pure(&c.consequent) && expr_is_pure(&c.alternate)
+        }
         Sequence(s) => s.expressions.iter().all(expr_is_pure),
         Call(c) => expr_is_pure(&c.callee) && c.arguments.iter().all(expr_is_pure),
         New(n) => expr_is_pure(&n.callee) && n.arguments.iter().all(expr_is_pure),
@@ -217,8 +232,8 @@ fn const_eval_typeof<'a>(e: &Expression<'a>, ctx: &ConstCtx) -> Option<ConstVal>
             };
             Some(ConstVal::Str(typ.into()))
         }
-        _ => {
-            Some(ConstVal::Str(match e {
+        _ => Some(ConstVal::Str(
+            match e {
                 Expression::StringLiteral(_) => "string",
                 Expression::NumberLiteral(_) => "number",
                 Expression::BooleanLiteral(_) => "boolean",
@@ -228,8 +243,9 @@ fn const_eval_typeof<'a>(e: &Expression<'a>, ctx: &ConstCtx) -> Option<ConstVal>
                 Expression::Array(_) | Expression::Object(_) | Expression::Class(_) => "object",
                 Expression::RegExpLiteral(_) => "object",
                 _ => return None,
-            }.into()))
-        }
+            }
+            .into(),
+        )),
     }
 }
 
@@ -262,14 +278,20 @@ fn const_eval_binary<'a>(bin: &BinaryExpression<'a>, ctx: &ConstCtx) -> Option<C
             match (&lv, &rv) {
                 (ConstVal::Num(a), ConstVal::Num(bb)) => {
                     let result = match bin.operator {
-                        Lt => a < bb, Gt => a > bb, LtEq => a <= bb, GtEq => a >= bb,
+                        Lt => a < bb,
+                        Gt => a > bb,
+                        LtEq => a <= bb,
+                        GtEq => a >= bb,
                         _ => unreachable!(),
                     };
                     Some(ConstVal::Bool(result))
                 }
                 (ConstVal::Str(a), ConstVal::Str(bb)) => {
                     let result = match bin.operator {
-                        Lt => a < bb, Gt => a > bb, LtEq => a <= bb, GtEq => a >= bb,
+                        Lt => a < bb,
+                        Gt => a > bb,
+                        LtEq => a <= bb,
+                        GtEq => a >= bb,
                         _ => unreachable!(),
                     };
                     Some(ConstVal::Bool(result))
@@ -292,7 +314,11 @@ fn const_eval_binary<'a>(bin: &BinaryExpression<'a>, ctx: &ConstCtx) -> Option<C
                 (Some(a), _) => Some(ConstVal::Str(format!("{}{}", a, string_val(&r)))),
                 (_, Some(b)) => Some(ConstVal::Str(format!("{}{}", string_val(&l), b))),
                 _ if matches!((&l, &r), (ConstVal::Num(_), ConstVal::Num(_))) => {
-                    if let ConstVal::Num(a) = l { if let ConstVal::Num(b) = r { return Some(ConstVal::Num(a + b)); } }
+                    if let ConstVal::Num(a) = l {
+                        if let ConstVal::Num(b) = r {
+                            return Some(ConstVal::Num(a + b));
+                        }
+                    }
                     unreachable!()
                 }
                 _ => None,
@@ -302,7 +328,11 @@ fn const_eval_binary<'a>(bin: &BinaryExpression<'a>, ctx: &ConstCtx) -> Option<C
             let lv = const_eval(&bin.left, ctx).map(|v| to_number(&v))?;
             let rv = const_eval(&bin.right, ctx).map(|v| to_number(&v))?;
             let result = match bin.operator {
-                Sub => lv - rv, Mul => lv * rv, Div => lv / rv, Rem => lv % rv, Exp => lv.powf(rv),
+                Sub => lv - rv,
+                Mul => lv * rv,
+                Div => lv / rv,
+                Rem => lv % rv,
+                Exp => lv.powf(rv),
                 _ => unreachable!(),
             };
             Some(ConstVal::Num(result))
@@ -311,7 +341,9 @@ fn const_eval_binary<'a>(bin: &BinaryExpression<'a>, ctx: &ConstCtx) -> Option<C
             let l = const_eval(&bin.left, ctx).map(|v| to_int32(&v))?;
             let r = const_eval(&bin.right, ctx).map(|v| to_int32(&v))?;
             let result = match bin.operator {
-                BitAnd => l & r, BitOr => l | r, BitXor => l ^ r,
+                BitAnd => l & r,
+                BitOr => l | r,
+                BitXor => l ^ r,
                 _ => unreachable!(),
             };
             Some(ConstVal::Num(result as f64))
@@ -336,10 +368,18 @@ fn const_eval_logical<'a>(l: &LogicalExpression<'a>, ctx: &ConstCtx) -> Option<C
     let left = const_eval(&l.left, ctx)?;
     match l.operator {
         And => {
-            if left.truthy() { const_eval(&l.right, ctx) } else { Some(left) }
+            if left.truthy() {
+                const_eval(&l.right, ctx)
+            } else {
+                Some(left)
+            }
         }
         Or => {
-            if left.truthy() { Some(left) } else { const_eval(&l.right, ctx) }
+            if left.truthy() {
+                Some(left)
+            } else {
+                const_eval(&l.right, ctx)
+            }
         }
         Coalesce => {
             if matches!(left, ConstVal::Null | ConstVal::Undefined) {
@@ -353,7 +393,11 @@ fn const_eval_logical<'a>(l: &LogicalExpression<'a>, ctx: &ConstCtx) -> Option<C
 
 fn const_eval_conditional<'a>(c: &ConditionalExpression<'a>, ctx: &ConstCtx) -> Option<ConstVal> {
     let test = const_eval(&c.test, ctx)?;
-    if test.truthy() { const_eval(&c.consequent, ctx) } else { const_eval(&c.alternate, ctx) }
+    if test.truthy() {
+        const_eval(&c.consequent, ctx)
+    } else {
+        const_eval(&c.alternate, ctx)
+    }
 }
 
 fn const_eval_template<'a>(t: &TemplateLiteral<'a>, ctx: &ConstCtx) -> Option<ConstVal> {
@@ -426,9 +470,7 @@ fn parse_define_literal(lit: &str) -> Option<ConstVal> {
     let t = lit.trim();
     if t.len() >= 2 {
         let b = t.as_bytes();
-        if (b[0] == b'"' && b[t.len() - 1] == b'"')
-            || (b[0] == b'\'' && b[t.len() - 1] == b'\'')
-        {
+        if (b[0] == b'"' && b[t.len() - 1] == b'"') || (b[0] == b'\'' && b[t.len() - 1] == b'\'') {
             return Some(ConstVal::Str(t[1..t.len() - 1].to_string()));
         }
     }
@@ -461,7 +503,13 @@ fn same_type(l: &ConstVal, r: &ConstVal) -> bool {
 fn to_number(v: &ConstVal) -> f64 {
     match v {
         ConstVal::Num(n) => *n,
-        ConstVal::Bool(b) => if *b { 1.0 } else { 0.0 },
+        ConstVal::Bool(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
         ConstVal::Null => 0.0,
         ConstVal::Undefined => f64::NAN,
         ConstVal::Str(s) => s.parse::<f64>().unwrap_or(f64::NAN),
@@ -470,11 +518,16 @@ fn to_number(v: &ConstVal) -> f64 {
 
 fn to_int32(v: &ConstVal) -> i32 {
     let n = to_number(v);
-    if n.is_nan() || n.is_infinite() { 0 }
-    else { (n as i64).wrapping_rem(0x1_0000_0000) as i32 }
+    if n.is_nan() || n.is_infinite() {
+        0
+    } else {
+        (n as i64).wrapping_rem(0x1_0000_0000) as i32
+    }
 }
 
-fn to_uint32(v: &ConstVal) -> u32 { to_int32(v) as u32 }
+fn to_uint32(v: &ConstVal) -> u32 {
+    to_int32(v) as u32
+}
 
 /// Get the string value of a ConstVal (without quotes for strings).
 fn string_val(v: &ConstVal) -> String {
@@ -490,13 +543,16 @@ pub fn has_hoisted_decl(stmt: &Statement) -> bool {
         Statement::FunctionDeclaration(_) => true,
         Statement::Block(b) => b.body.iter().any(has_hoisted_decl),
         Statement::If(s) => {
-            has_hoisted_decl(&s.consequent)
-                || s.alternate.as_ref().is_some_and(has_hoisted_decl)
+            has_hoisted_decl(&s.consequent) || s.alternate.as_ref().is_some_and(has_hoisted_decl)
         }
-        Statement::Expression(_) | Statement::Empty(_)
-        | Statement::Return(_) | Statement::Break(_)
-        | Statement::Continue(_) | Statement::Throw(_)
-        | Statement::Debugger(_) | Statement::ClassDeclaration(_) => false,
+        Statement::Expression(_)
+        | Statement::Empty(_)
+        | Statement::Return(_)
+        | Statement::Break(_)
+        | Statement::Continue(_)
+        | Statement::Throw(_)
+        | Statement::Debugger(_)
+        | Statement::ClassDeclaration(_) => false,
         _ => true,
     }
 }
@@ -518,7 +574,11 @@ mod tests {
                 Statement::Expression(es) => &es.expression,
                 _ => panic!("expected ExpressionStatement"),
             };
-            let ctx = ConstCtx { defines, known_vars: &[], interner: Some(&it) };
+            let ctx = ConstCtx {
+                defines,
+                known_vars: &[],
+                interner: Some(&it),
+            };
             const_eval(expr, &ctx)
         })
     }
@@ -531,7 +591,13 @@ mod tests {
         let val = eval(src);
         if let Some(ConstVal::Num(a)) = &val {
             if let ConstVal::Num(b) = &expected {
-                assert!(a.is_nan() && b.is_nan() || (a == b), "eval `{}`: got {:?}, expected {:?}", src, val, expected);
+                assert!(
+                    a.is_nan() && b.is_nan() || (a == b),
+                    "eval `{}`: got {:?}, expected {:?}",
+                    src,
+                    val,
+                    expected
+                );
                 return;
             }
         }
@@ -540,78 +606,250 @@ mod tests {
 
     fn assert_not_eval(src: &str) {
         let val = eval(src);
-        assert!(val.is_none(), "expected not evaluable: `{}` = {:?}", src, val);
+        assert!(
+            val.is_none(),
+            "expected not evaluable: `{}` = {:?}",
+            src,
+            val
+        );
     }
 
-    #[test] fn eval_number() { assert_eval("42;", ConstVal::Num(42.0)); }
-    #[test] fn eval_neg_number() { assert_eval("-3.14;", ConstVal::Num(-3.14)); }
-    #[test] fn eval_string_double() { assert_eval("\"hello\";", ConstVal::Str("hello".into())); }
-    #[test] fn eval_string_single() { assert_eval("'world';", ConstVal::Str("world".into())); }
-    #[test] fn eval_true() { assert_eval("true;", ConstVal::Bool(true)); }
-    #[test] fn eval_false() { assert_eval("false;", ConstVal::Bool(false)); }
-    #[test] fn eval_null() { assert_eval("null;", ConstVal::Null); }
-    #[test] fn eval_undefined() { assert_eval("undefined;", ConstVal::Undefined); }
-    #[test] fn eval_nan() { assert_eval("NaN;", ConstVal::Num(f64::NAN)); }
-    #[test] fn eval_infinity() { assert_eval("Infinity;", ConstVal::Num(f64::INFINITY)); }
+    #[test]
+    fn eval_number() {
+        assert_eval("42;", ConstVal::Num(42.0));
+    }
+    #[test]
+    fn eval_neg_number() {
+        assert_eval("-3.14;", ConstVal::Num(-3.14));
+    }
+    #[test]
+    fn eval_string_double() {
+        assert_eval("\"hello\";", ConstVal::Str("hello".into()));
+    }
+    #[test]
+    fn eval_string_single() {
+        assert_eval("'world';", ConstVal::Str("world".into()));
+    }
+    #[test]
+    fn eval_true() {
+        assert_eval("true;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_false() {
+        assert_eval("false;", ConstVal::Bool(false));
+    }
+    #[test]
+    fn eval_null() {
+        assert_eval("null;", ConstVal::Null);
+    }
+    #[test]
+    fn eval_undefined() {
+        assert_eval("undefined;", ConstVal::Undefined);
+    }
+    #[test]
+    fn eval_nan() {
+        assert_eval("NaN;", ConstVal::Num(f64::NAN));
+    }
+    #[test]
+    fn eval_infinity() {
+        assert_eval("Infinity;", ConstVal::Num(f64::INFINITY));
+    }
 
-    #[test] fn eval_not_true() { assert_eval("!true;", ConstVal::Bool(false)); }
-    #[test] fn eval_not_false() { assert_eval("!false;", ConstVal::Bool(true)); }
-    #[test] fn eval_not_zero() { assert_eval("!0;", ConstVal::Bool(true)); }
-    #[test] fn eval_not_one() { assert_eval("!1;", ConstVal::Bool(false)); }
-    #[test] fn eval_not_empty_str() { assert_eval("!\"\";", ConstVal::Bool(true)); }
-    #[test] fn eval_not_null() { assert_eval("!null;", ConstVal::Bool(true)); }
-    #[test] fn eval_not_undefined() { assert_eval("!undefined;", ConstVal::Bool(true)); }
-    #[test] fn eval_double_not() { assert_eval("!!42;", ConstVal::Bool(true)); }
-    #[test] fn eval_double_not_false() { assert_eval("!!0;", ConstVal::Bool(false)); }
-    #[test] fn eval_unary_plus() { assert_eval("+42;", ConstVal::Num(42.0)); }
-    #[test] fn eval_unary_plus_true() { assert_eval("+true;", ConstVal::Num(1.0)); }
-    #[test] fn eval_unary_minus() { assert_eval("-42;", ConstVal::Num(-42.0)); }
-    #[test] fn eval_unary_minus_neg() { assert_eval("-(-5);", ConstVal::Num(5.0)); }
-    #[test] fn eval_void() { assert_eval("void 0;", ConstVal::Undefined); }
-    #[test] fn eval_typeof_num() { assert_eval("typeof 42;", ConstVal::Str("number".into())); }
-    #[test] fn eval_typeof_str() { assert_eval("typeof \"x\";", ConstVal::Str("string".into())); }
-    #[test] fn eval_typeof_bool() { assert_eval("typeof true;", ConstVal::Str("boolean".into())); }
-    #[test] fn eval_typeof_null() { assert_eval("typeof null;", ConstVal::Str("object".into())); }
-    #[test] fn eval_typeof_func() { assert_eval("typeof function(){};", ConstVal::Str("function".into())); }
+    #[test]
+    fn eval_not_true() {
+        assert_eval("!true;", ConstVal::Bool(false));
+    }
+    #[test]
+    fn eval_not_false() {
+        assert_eval("!false;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_not_zero() {
+        assert_eval("!0;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_not_one() {
+        assert_eval("!1;", ConstVal::Bool(false));
+    }
+    #[test]
+    fn eval_not_empty_str() {
+        assert_eval("!\"\";", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_not_null() {
+        assert_eval("!null;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_not_undefined() {
+        assert_eval("!undefined;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_double_not() {
+        assert_eval("!!42;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_double_not_false() {
+        assert_eval("!!0;", ConstVal::Bool(false));
+    }
+    #[test]
+    fn eval_unary_plus() {
+        assert_eval("+42;", ConstVal::Num(42.0));
+    }
+    #[test]
+    fn eval_unary_plus_true() {
+        assert_eval("+true;", ConstVal::Num(1.0));
+    }
+    #[test]
+    fn eval_unary_minus() {
+        assert_eval("-42;", ConstVal::Num(-42.0));
+    }
+    #[test]
+    fn eval_unary_minus_neg() {
+        assert_eval("-(-5);", ConstVal::Num(5.0));
+    }
+    #[test]
+    fn eval_void() {
+        assert_eval("void 0;", ConstVal::Undefined);
+    }
+    #[test]
+    fn eval_typeof_num() {
+        assert_eval("typeof 42;", ConstVal::Str("number".into()));
+    }
+    #[test]
+    fn eval_typeof_str() {
+        assert_eval("typeof \"x\";", ConstVal::Str("string".into()));
+    }
+    #[test]
+    fn eval_typeof_bool() {
+        assert_eval("typeof true;", ConstVal::Str("boolean".into()));
+    }
+    #[test]
+    fn eval_typeof_null() {
+        assert_eval("typeof null;", ConstVal::Str("object".into()));
+    }
+    #[test]
+    fn eval_typeof_func() {
+        assert_eval("typeof function(){};", ConstVal::Str("function".into()));
+    }
 
-    #[test] fn eval_add() { assert_eval("2 + 3;", ConstVal::Num(5.0)); }
-    #[test] fn eval_str_concat() { assert_eval("\"a\" + \"b\";", ConstVal::Str("ab".into())); }
-    #[test] fn eval_sub() { assert_eval("10 - 3;", ConstVal::Num(7.0)); }
-    #[test] fn eval_mul() { assert_eval("7 * 8;", ConstVal::Num(56.0)); }
-    #[test] fn eval_div() { assert_eval("10 / 2;", ConstVal::Num(5.0)); }
+    #[test]
+    fn eval_add() {
+        assert_eval("2 + 3;", ConstVal::Num(5.0));
+    }
+    #[test]
+    fn eval_str_concat() {
+        assert_eval("\"a\" + \"b\";", ConstVal::Str("ab".into()));
+    }
+    #[test]
+    fn eval_sub() {
+        assert_eval("10 - 3;", ConstVal::Num(7.0));
+    }
+    #[test]
+    fn eval_mul() {
+        assert_eval("7 * 8;", ConstVal::Num(56.0));
+    }
+    #[test]
+    fn eval_div() {
+        assert_eval("10 / 2;", ConstVal::Num(5.0));
+    }
 
-    #[test] fn eval_strict_eq() { assert_eval("1 === 1;", ConstVal::Bool(true)); }
-    #[test] fn eval_strict_neq() { assert_eval("1 !== 2;", ConstVal::Bool(true)); }
-    #[test] fn eval_strict_cross_type() { assert_eval("\"1\" === 1;", ConstVal::Bool(false)); }
-    #[test] fn eval_lt() { assert_eval("1 < 2;", ConstVal::Bool(true)); }
-    #[test] fn eval_gt() { assert_eval("2 > 1;", ConstVal::Bool(true)); }
-    #[test] fn eval_lte() { assert_eval("1 <= 1;", ConstVal::Bool(true)); }
-    #[test] fn eval_str_lt() { assert_eval("\"a\" < \"b\";", ConstVal::Bool(true)); }
+    #[test]
+    fn eval_strict_eq() {
+        assert_eval("1 === 1;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_strict_neq() {
+        assert_eval("1 !== 2;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_strict_cross_type() {
+        assert_eval("\"1\" === 1;", ConstVal::Bool(false));
+    }
+    #[test]
+    fn eval_lt() {
+        assert_eval("1 < 2;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_gt() {
+        assert_eval("2 > 1;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_lte() {
+        assert_eval("1 <= 1;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_str_lt() {
+        assert_eval("\"a\" < \"b\";", ConstVal::Bool(true));
+    }
 
-    #[test] fn eval_and() { assert_eval("true && true;", ConstVal::Bool(true)); }
-    #[test] fn eval_or() { assert_eval("false || true;", ConstVal::Bool(true)); }
-    #[test] fn eval_coalesce() { assert_eval("null ?? 42;", ConstVal::Num(42.0)); }
+    #[test]
+    fn eval_and() {
+        assert_eval("true && true;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_or() {
+        assert_eval("false || true;", ConstVal::Bool(true));
+    }
+    #[test]
+    fn eval_coalesce() {
+        assert_eval("null ?? 42;", ConstVal::Num(42.0));
+    }
 
-    #[test] fn eval_ternary() { assert_eval("true ? 1 : 2;", ConstVal::Num(1.0)); }
-    #[test] fn eval_ternary_false() { assert_eval("false ? 1 : 2;", ConstVal::Num(2.0)); }
+    #[test]
+    fn eval_ternary() {
+        assert_eval("true ? 1 : 2;", ConstVal::Num(1.0));
+    }
+    #[test]
+    fn eval_ternary_false() {
+        assert_eval("false ? 1 : 2;", ConstVal::Num(2.0));
+    }
 
-    #[test] fn eval_template() { assert_eval("`hello`;", ConstVal::Str("hello".into())); }
-    #[test] fn eval_template_expr() { assert_eval("`${42}`;", ConstVal::Str("42".into())); }
+    #[test]
+    fn eval_template() {
+        assert_eval("`hello`;", ConstVal::Str("hello".into()));
+    }
+    #[test]
+    fn eval_template_expr() {
+        assert_eval("`${42}`;", ConstVal::Str("42".into()));
+    }
 
-    #[test] fn eval_bitwise_and() { assert_eval("5 & 3;", ConstVal::Num(1.0)); }
-    #[test] fn eval_bitwise_or() { assert_eval("5 | 3;", ConstVal::Num(7.0)); }
-    #[test] fn eval_bitwise_not() { assert_eval("~5;", ConstVal::Num(-6.0)); }
+    #[test]
+    fn eval_bitwise_and() {
+        assert_eval("5 & 3;", ConstVal::Num(1.0));
+    }
+    #[test]
+    fn eval_bitwise_or() {
+        assert_eval("5 | 3;", ConstVal::Num(7.0));
+    }
+    #[test]
+    fn eval_bitwise_not() {
+        assert_eval("~5;", ConstVal::Num(-6.0));
+    }
 
-    #[test] fn not_eval_var() { assert_not_eval("x;"); }
-    #[test] fn not_eval_call() { assert_not_eval("foo();"); }
-    #[test] fn not_eval_assign() { assert_not_eval("x = 42;"); }
+    #[test]
+    fn not_eval_var() {
+        assert_not_eval("x;");
+    }
+    #[test]
+    fn not_eval_call() {
+        assert_not_eval("foo();");
+    }
+    #[test]
+    fn not_eval_assign() {
+        assert_not_eval("x = 42;");
+    }
 
-    #[test] fn eval_define() {
-        let val = eval_helper("process.env.NODE_ENV;", &[("process.env.NODE_ENV", "\"production\"")]);
+    #[test]
+    fn eval_define() {
+        let val = eval_helper(
+            "process.env.NODE_ENV;",
+            &[("process.env.NODE_ENV", "\"production\"")],
+        );
         assert_eq!(val, Some(ConstVal::Str("production".into())));
     }
 
-    #[test] fn source_format() {
+    #[test]
+    fn source_format() {
         assert_eq!(ConstVal::Bool(true).to_source(), "true");
         assert_eq!(ConstVal::Null.to_source(), "null");
         assert_eq!(ConstVal::Undefined.to_source(), "undefined");
@@ -619,19 +857,25 @@ mod tests {
         assert_eq!(ConstVal::Str("hello".to_string()).to_source(), "\"hello\"");
     }
 
-    #[test] fn hoisted_var_detected() {
+    #[test]
+    fn hoisted_var_detected() {
         let it = Interner::new();
         let out = parse("var x = 1;", &it, SourceType::Script);
-        out.module.with_ast(|p| assert!(has_hoisted_decl(&p.body[0])));
+        out.module
+            .with_ast(|p| assert!(has_hoisted_decl(&p.body[0])));
     }
-    #[test] fn hoisted_func_detected() {
+    #[test]
+    fn hoisted_func_detected() {
         let it = Interner::new();
         let out = parse("function f(){}", &it, SourceType::Script);
-        out.module.with_ast(|p| assert!(has_hoisted_decl(&p.body[0])));
+        out.module
+            .with_ast(|p| assert!(has_hoisted_decl(&p.body[0])));
     }
-    #[test] fn non_hoisted() {
+    #[test]
+    fn non_hoisted() {
         let it = Interner::new();
         let out = parse("let x = 1;", &it, SourceType::Script);
-        out.module.with_ast(|p| assert!(!has_hoisted_decl(&p.body[0])));
+        out.module
+            .with_ast(|p| assert!(!has_hoisted_decl(&p.body[0])));
     }
 }

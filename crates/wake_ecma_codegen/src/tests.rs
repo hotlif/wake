@@ -167,8 +167,9 @@ fn ts_erasure_declare_and_modules() {
 }
 
 #[test]
-fn ts_decorators_parse_safely() {
-    // 装饰器（类/方法/属性/参数）当前被消费（擦除），代码可解析且产出合法 JS。
+fn ts_decorators_lower_to_stage3() {
+    // 装饰器降级为 TC39 Stage-3 形态（`__esDecorate` + `__runInitializers`，对齐 tsc）。
+    // 参数装饰器 `@inject a` 在 Stage-3 中不存在，仍作擦除。
     let js = strip_ts(
         "@sealed\n\
          @Component({ selector: 'app' })\n\
@@ -177,10 +178,39 @@ fn ts_decorators_parse_safely() {
            @log method(@inject a: number): void { return; }\n\
          }",
     );
-    assert!(js.contains("class C"), "{js}");
-    assert!(!js.contains("@"), "残留装饰器:\n{js}");
+    assert!(!js.contains('@'), "残留装饰器语法:\n{js}");
+    // 运行时辅助注入 + 类被包进 IIFE 并绑定
+    assert!(js.contains("__esDecorate"), "应注入运行时辅助:\n{js}");
+    assert!(js.contains("__runInitializers"), "{js}");
+    assert!(js.contains("let C ="), "类声明应绑定到 IIFE 结果:\n{js}");
+    // 各元素以正确 kind 登记
+    assert!(js.contains("kind:\"class\""), "{js}");
+    assert!(js.contains("kind:\"method\""), "{js}");
+    assert!(js.contains("kind:\"field\""), "{js}");
+    // 装饰器表达式保留（含带参调用）
+    assert!(js.contains("sealed"), "{js}");
+    assert!(js.contains("Component("), "{js}");
+    // 方法体与字段初值仍在
     assert!(js.contains("method(a)"), "{js}");
-    assert!(js.contains("name = \"x\""), "{js}");
+    assert!(js.contains("\"x\""), "{js}");
+}
+
+#[test]
+fn undecorated_class_is_unchanged() {
+    // 无装饰器的类不得走降级路径（产物与既有一致）
+    let js = strip_ts("class C { m() { return 1; } }");
+    assert!(js.contains("class C"), "{js}");
+    assert!(!js.contains("__esDecorate"), "不应注入辅助:\n{js}");
+    assert!(!js.contains("=>{"), "不应包 IIFE:\n{js}");
+}
+
+#[test]
+fn accessor_with_decorator_is_not_lowered() {
+    // auto-accessor 的降级（私有存储 + get/set 对）未实现 → 整类放弃转换，
+    // 宁可原样发射（运行时可见报错），也不产出看似成功却语义错误的代码。
+    let js = strip_ts("class C { @dec accessor x = 1; }");
+    assert!(!js.contains("__esDecorate"), "含 accessor 不应降级:\n{js}");
+    assert!(js.contains("class C"), "{js}");
 }
 
 #[test]
@@ -409,13 +439,13 @@ fn m4b_dead_branch_strips_dev_block() {
                }";
     let out = parse(src, &it, SourceType::Module);
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
-    let js = out
-        .module
-        .with_ast(|p| codegen_module_shaken_with(p, &it, &NoLinker, None, &define, true, false, false));
+    let js = out.module.with_ast(|p| {
+        codegen_module_shaken_with(p, &it, &NoLinker, None, &define, true, false, false)
+    });
     // dev 警告块（`if(false)`）被剥离；`if(true)` 的 consequent 保留、if 外壳消除。
     assert!(!js.contains("devWarn"), "dev 块应被剥离:\n{js}");
-    assert!(js.contains("return x * 2"), "{js}");
-    assert!(!js.contains("if ("), "常量 if 应全部折叠:\n{js}");
+    assert!(js.contains("return x*2"), "{js}");
+    assert!(!js.contains("if("), "常量 if 应全部折叠:\n{js}");
 }
 
 #[test]
@@ -428,28 +458,47 @@ fn m4b_keeps_branch_with_hoisted_var() {
                if (process.env.NODE_ENV === 'production') { keep(); } else { var leaked = 2; }";
     let out = parse(src, &it, SourceType::Module);
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
-    let js = out
-        .module
-        .with_ast(|p| codegen_module_shaken_with(p, &it, &NoLinker, None, &define, true, false, false));
+    let js = out.module.with_ast(|p| {
+        codegen_module_shaken_with(p, &it, &NoLinker, None, &define, true, false, false)
+    });
     assert!(
-        js.contains("if ("),
+        js.contains("if("),
         "含 var 的被丢弃分支应保守保留 if:\n{js}"
     );
     assert!(js.contains("leaked"), "var 绑定应保留:\n{js}");
 }
 
 #[test]
-fn m4b_no_fold_without_minify() {
-    // 非 minify（dev）不折叠：保留可读的 `if("production" !== "production")`。
+fn dead_branch_folding_is_independent_of_minify() {
+    // 死分支折叠**不再与 minify 耦合**：只要条件可在构建期定为常量就折叠，
+    // 语义中性且 dev 产物同样受益（`process.env.NODE_ENV` 的死分支在 dev 也应消失）。
     use crate::codegen_module_shaken_with;
     let it = Interner::new();
     let define = [("process.env.NODE_ENV", "\"production\"")];
-    let src = "if (process.env.NODE_ENV !== 'production') { devWarn(); }";
+    let src = "if (process.env.NODE_ENV !== 'production') { devWarn(); }\n\
+               if (process.env.NODE_ENV === 'production') { prodPath(); }";
     let out = parse(src, &it, SourceType::Module);
-    let js = out
-        .module
-        .with_ast(|p| codegen_module_shaken_with(p, &it, &NoLinker, None, &define, false, false, false));
-    assert!(js.contains("devWarn"), "dev 模式不应折叠:\n{js}");
+    // minify = false（dev 口径）
+    let js = out.module.with_ast(|p| {
+        codegen_module_shaken_with(p, &it, &NoLinker, None, &define, false, false, false)
+    });
+    assert!(!js.contains("devWarn"), "dev 死分支应被剥离:\n{js}");
+    assert!(js.contains("prodPath"), "存活分支应保留:\n{js}");
+    assert!(!js.contains("if ("), "常量条件的 if 外壳应消除:\n{js}");
+}
+
+#[test]
+fn dead_branch_folding_without_define_keeps_code() {
+    // 无法定为常量的条件一律保持原样——折叠只在「可确定」时发生。
+    use crate::codegen_module_shaken_with;
+    let it = Interner::new();
+    let src = "if (someRuntimeFlag) { a(); } else { b(); }";
+    let out = parse(src, &it, SourceType::Module);
+    let js = out.module.with_ast(|p| {
+        codegen_module_shaken_with(p, &it, &NoLinker, None, &[], false, false, false)
+    });
+    assert!(js.contains("a()") && js.contains("b()"), "{js}");
+    assert!(js.contains("if ("), "运行时条件不应折叠:\n{js}");
 }
 
 #[test]
@@ -468,7 +517,9 @@ fn define_replaces_process_env_node_env() {
                const nested = obj.process.env.NODE_ENV;";
     let out = parse(src, &it, SourceType::Module);
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
-    let js = out.module.with_ast(|p| codegen_module(p, &it, &NoLinker, false));
+    let js = out
+        .module
+        .with_ast(|p| codegen_module(p, &it, &NoLinker, false));
     // process.env.NODE_ENV → "production"（去 process shim 的关键）。
     assert!(js.contains("const x = \"production\";"), "{js}");
     assert!(js.contains("\"production\" !== \"production\""), "{js}");
@@ -711,8 +762,19 @@ fn mangle_gen(src: &str) -> String {
         out.diagnostics
     );
     let js = out.module.with_ast(|p| {
-        let m = wake_ecma_minify::plan_mangle(p, &it);
-        crate::codegen_module_shaken_mangled(p, &it, &NoLink, None, &[], true, Some(m.table()), None, false, false)
+        let m = wake_ecma_minify::plan_mangle(p, &it, &[]);
+        crate::codegen_module_shaken_mangled(
+            p,
+            &it,
+            &NoLink,
+            None,
+            &[],
+            true,
+            Some(m.table()),
+            None,
+            false,
+            false,
+        )
     });
     // 产物必须能无错重解析（结构合法信号）。
     let re = parse(&js, &it, SourceType::Module);
@@ -737,8 +799,9 @@ fn mangle_renames_nested_locals_keeps_module_and_props() {
     // 参数与局部长名消失（被短名替换）。
     assert!(!js.contains("longParam"), "参数应被重命名:\n{js}");
     assert!(!js.contains("longLocal"), "局部应被重命名:\n{js}");
-    // 模块级函数名保留（可能被导出/合成引用）。
-    assert!(js.contains("helper"), "模块级函数名应保留:\n{js}");
+    // 模块级函数名现在也重命名（单包 concat 下顶层块/闭包作用域，导出走字符串键）。
+    // `!contains` 同时证明重命名一致：声明与 `helper;` 引用都改了，无残留悬空引用。
+    assert!(!js.contains("helper"), "模块级函数名现在应被重命名:\n{js}");
     // 成员属性名 .value / .count 不动。
     assert!(js.contains(".value"), "属性名 value 不应改:\n{js}");
     assert!(js.contains(".count"), "属性名 count 不应改:\n{js}");
@@ -784,7 +847,7 @@ fn mangle_expands_destructuring_shorthand_with_default() {
         1,
         "仅剩属性名一处 longKey:\n{js}"
     );
-    assert!(js.contains("= 5"), "默认值应保留:\n{js}");
+    assert!(js.contains("=5"), "默认值应保留:\n{js}");
 }
 
 #[test]
@@ -803,8 +866,11 @@ fn mangle_nested_shadow_stays_correct() {
     );
     assert!(!js.contains("outerVar"), "outerVar 应被重命名:\n{js}");
     assert!(!js.contains("innerVar"), "innerVar 应被重命名:\n{js}");
-    // inner 是 Function 名 → 保留。
-    assert!(js.contains("inner"), "函数名 inner 保留:\n{js}");
+    // 函数名（含嵌套 inner）现在也重命名；`!contains` 证明声明与 `inner()` 调用一致重命名。
+    assert!(
+        !js.contains("inner"),
+        "函数名 inner 现在也应被重命名:\n{js}"
+    );
 }
 
 #[test]
@@ -833,8 +899,19 @@ fn mangle_ts_namespace_enum_roundtrip() {
     let out = parse(src, &it, SourceType::TypeScript);
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     let js = out.module.with_ast(|p| {
-        let m = wake_ecma_minify::plan_mangle(p, &it);
-        crate::codegen_module_shaken_mangled(p, &it, &NoLink, None, &[], true, Some(m.table()), None, false, false)
+        let m = wake_ecma_minify::plan_mangle(p, &it, &[]);
+        crate::codegen_module_shaken_mangled(
+            p,
+            &it,
+            &NoLink,
+            None,
+            &[],
+            true,
+            Some(m.table()),
+            None,
+            false,
+            false,
+        )
     });
     // 产物必须能无错重解析（塌名会造成重复声明 / ReferenceError 级结构错乱）。
     let re = parse(&js, &it, SourceType::Module);
@@ -844,10 +921,19 @@ fn mangle_ts_namespace_enum_roundtrip() {
         re.diagnostics
     );
     // namespace 成员合成绑定保持原名（NS.base = base / NS.scale = scale 不被塌缩）。
-    assert!(js.contains("NS.base = base"), "namespace 成员应保持原名:\n{js}");
-    assert!(js.contains("NS.scale = scale"), "namespace 成员应保持原名:\n{js}");
+    assert!(
+        js.contains("NS.base=base"),
+        "namespace 成员应保持原名:\n{js}"
+    );
+    assert!(
+        js.contains("NS.scale=scale"),
+        "namespace 成员应保持原名:\n{js}"
+    );
     // 而函数内真实局部（带真 span）应被 mangle。
-    assert!(!js.contains("localValueHolder"), "真实局部应被 mangle:\n{js}");
+    assert!(
+        !js.contains("localValueHolder"),
+        "真实局部应被 mangle:\n{js}"
+    );
 }
 
 #[test]
@@ -880,7 +966,7 @@ fn prop_mangle_gen(src: &str) -> String {
         out.diagnostics
     );
     let js = out.module.with_ast(|p| {
-        let m = wake_ecma_minify::plan_mangle(p, &it);
+        let m = wake_ecma_minify::plan_mangle(p, &it, &[]);
         let pp = wake_ecma_minify::plan_prop_mangle(p, &it);
         let ctx = MinifyCtx {
             defines: &[],
@@ -888,7 +974,16 @@ fn prop_mangle_gen(src: &str) -> String {
             ..MinifyCtx::default()
         };
         crate::codegen_module_shaken_mangled(
-            p, &it, &NoLink, None, &[], true, Some(m.table()), Some(&ctx), false, false,
+            p,
+            &it,
+            &NoLink,
+            None,
+            &[],
+            true,
+            Some(m.table()),
+            Some(&ctx),
+            false,
+            false,
         )
     });
     let re = parse(&js, &it, SourceType::Module);
@@ -905,16 +1000,17 @@ fn prop_mangle_object_literal_key_shortened() {
     // 对象字面量键 `{ longName: 1 }` → `{ a: 1 }`。
     let js = prop_mangle_gen("function f() { return { longName: 1 }; } f;");
     assert!(!js.contains("longName"), "longName 应被缩短:\n{js}");
-    assert!(js.contains(": 1"), "属性值 1 应保留:\n{js}");
+    assert!(js.contains(":1"), "属性值 1 应保留:\n{js}");
 }
 
 #[test]
 fn prop_mangle_member_access_shortened() {
     // 成员访问 `obj.longPropertyName` → `obj.a`（参数名也会被 identifier mangle）。
-    let js = prop_mangle_gen(
-        "function f(obj) { return obj.longPropertyName; } f;",
+    let js = prop_mangle_gen("function f(obj) { return obj.longPropertyName; } f;");
+    assert!(
+        !js.contains("longPropertyName"),
+        "longPropertyName 应被缩短:\n{js}"
     );
-    assert!(!js.contains("longPropertyName"), "longPropertyName 应被缩短:\n{js}");
     assert!(js.contains("."), "成员访问语法保留:\n{js}");
 }
 
@@ -937,9 +1033,7 @@ fn prop_mangle_optional_chain_not_mangled() {
 #[test]
 fn prop_mangle_well_known_not_mangled() {
     // well-known 属性名不缩短：`length`, `toString`, `constructor`
-    let js = prop_mangle_gen(
-        "function f(arr) { return arr.length + arr.toString(); } f;",
-    );
+    let js = prop_mangle_gen("function f(arr) { return arr.length + arr.toString(); } f;");
     assert!(js.contains("length"), "length 应保留:\n{js}");
     assert!(js.contains("toString"), "toString 应保留:\n{js}");
 }
@@ -978,9 +1072,7 @@ fn prop_mangle_shorthand_not_mangled() {
 #[test]
 fn prop_mangle_class_member_not_mangled() {
     // 类成员名不缩短
-    let js = prop_mangle_gen(
-        "class C { myMethod() {} myField = 1; } C;",
-    );
+    let js = prop_mangle_gen("class C { myMethod() {} myField = 1; } C;");
     assert!(js.contains("myMethod"), "类方法名应保留:\n{js}");
     assert!(js.contains("myField"), "类字段名应保留:\n{js}");
 }
@@ -994,7 +1086,7 @@ fn prop_mangle_consistent_naming() {
     // longName 应在成员访问和对象字面量两处都被缩短，且值相同
     assert!(!js.contains("longName"), "longName 应在两处都被缩短:\n{js}");
     assert_eq!(
-        js.matches(": 1").count(),
+        js.matches(":1").count(),
         1,
         "对象字面量键被缩短后值保留:\n{js}"
     );
@@ -1044,7 +1136,7 @@ fn prop_mangle_computed_object_key_not_mangled() {
     // 计算属性键 `{ [expr]: val }` 不动（括号语法保留，参数名可能被 identifier mangle）
     let js = prop_mangle_gen("function f(k) { return { [k]: 1 }; } f;");
     assert!(js.contains("["), "计算键括号应保留:\n{js}");
-    assert!(js.contains("]: 1"), "计算键值对保留:\n{js}");
+    assert!(js.contains("]:1"), "计算键值对保留:\n{js}");
 }
 
 // ======================================================================
@@ -1068,7 +1160,18 @@ fn hoist_gen(src: &str) -> String {
             minify: true,
             ..MinifyCtx::default()
         };
-        crate::codegen_module_shaken_mangled(p, &it, &NoLink, None, &[], true, None, Some(&ctx), false, false)
+        crate::codegen_module_shaken_mangled(
+            p,
+            &it,
+            &NoLink,
+            None,
+            &[],
+            true,
+            None,
+            Some(&ctx),
+            false,
+            false,
+        )
     });
     let re = parse(&js, &it, SourceType::Module);
     assert!(
@@ -1106,11 +1209,13 @@ fn hoist_multiple_vars_joined() {
     );
     // 应合并为单个 var 声明
     let var_count = js.matches("var ").count();
+    assert!(var_count <= 1, "hoisted vars 应合并为一条 var 声明: {js}");
     assert!(
-        var_count <= 1,
-        "hoisted vars 应合并为一条 var 声明: {js}"
+        js.contains("var x = 1, y = 2")
+            || js.contains("var x, y = 2")
+            || js.contains("var x=1,y=2"),
+        "vars 应合并: {js}"
     );
-    assert!(js.contains("var x = 1, y = 2") || js.contains("var x, y = 2") || js.contains("var x=1,y=2"), "vars 应合并: {js}");
 }
 
 #[test]
@@ -1136,8 +1241,8 @@ fn hoist_let_const_not_hoisted() {
          }",
     );
     // let/const 应保留在块内
-    assert!(js.contains("let x = 1"), "let 应在块内: {js}");
-    assert!(js.contains("const y = 2"), "const 应在块内: {js}");
+    assert!(js.contains("let x=1"), "let 应在块内: {js}");
+    assert!(js.contains("const y=2"), "const 应在块内: {js}");
     // var z 可能已在顶部或不提升（已在函数体直接子级）
 }
 
@@ -1185,6 +1290,434 @@ fn hoist_nested_function_boundary() {
     );
     assert!(js.contains("var x"), "outer 应有 var x: {js}");
     // inner 内部应有 var y（或者在 inner 顶部）
-    assert!(js.contains("y") || js.contains("var y"), "inner 应有 y: {js}");
+    assert!(
+        js.contains("y") || js.contains("var y"),
+        "inner 应有 y: {js}"
+    );
 }
 
+// ======================================================================
+// M4d — SourceMap 映射正确性
+// ======================================================================
+
+/// 用映射把产物位置反查源码，验证「产物 token ↔ 源码 token」真正对应。
+#[test]
+fn sourcemap_maps_identifiers_back_to_source() {
+    use crate::codegen_module_shaken_with_map;
+    use wake_common::SourceFile;
+
+    let it = Interner::new();
+    let src = "const alpha = 1;\nfunction beta(gamma) {\n  return gamma + alpha;\n}\n";
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let (js, map) = out.module.with_ast(|p| {
+        codegen_module_shaken_with_map(p, &it, &NoLinker, None, &[], false, None, None, true, false)
+    });
+    assert!(!map.is_empty(), "应产出映射");
+
+    let sf = SourceFile::new("a.js", src);
+    let gen_lines: Vec<&str> = js.lines().collect();
+
+    // 逐条映射：产物位置处的标识符，应与源码该字节偏移处的标识符同名。
+    let mut checked = 0;
+    for m in &map.mappings {
+        let gl = gen_lines
+            .get(m.gen_line as usize)
+            .unwrap_or_else(|| panic!("产物行 {} 越界:\n{js}", m.gen_line));
+        // 产物列是 UTF-16 列；本用例全 ASCII，可直接当字节列用。
+        let gen_tail = &gl[(m.gen_col as usize).min(gl.len())..];
+        let src_tail = &src[m.src_offset as usize..];
+
+        let ident_of = |s: &str| -> String {
+            s.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect()
+        };
+        let (g, s) = (ident_of(gen_tail), ident_of(src_tail));
+        // 只在两侧都取到标识符时比对（语句映射可能落在 `const`/`return` 等关键字上，同样应相等）。
+        if !g.is_empty() && !s.is_empty() {
+            assert_eq!(
+                g, s,
+                "映射错位：产物 ({},{}) 处是 `{}`，源码偏移 {} 处是 `{}`\n产物:\n{}",
+                m.gen_line, m.gen_col, g, m.src_offset, s, js
+            );
+            checked += 1;
+        }
+        // 源侧行列换算不得越界
+        let (line, _col) = sf.location0_utf16(m.src_offset);
+        assert!(line < sf.line_count(), "源行越界");
+    }
+    assert!(
+        checked >= 4,
+        "有效比对太少（{checked}），映射可能未覆盖标识符"
+    );
+}
+
+/// 产物游标必须与真实产物文本一致：mark 记录的行列处确实是对应内容。
+#[test]
+fn sourcemap_cursor_tracks_generated_position() {
+    use crate::codegen_module_shaken_with_map;
+
+    let it = Interner::new();
+    // 含非 ASCII 字符串字面量与多行结构，考验列（UTF-16）与行的累计。
+    let src = "const 名字 = \"中文值\";\nconst n = 42;\nexport { n };\n";
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let (js, map) = out.module.with_ast(|p| {
+        codegen_module_shaken_with_map(p, &it, &NoLinker, None, &[], false, None, None, true, false)
+    });
+
+    let gen_lines: Vec<&str> = js.lines().collect();
+    for m in &map.mappings {
+        let gl = gen_lines
+            .get(m.gen_line as usize)
+            .unwrap_or_else(|| panic!("产物行 {} 越界:\n{js}", m.gen_line));
+        // 把 UTF-16 列换算回字节位置，确认不越界（越界即游标漂移）。
+        let mut units = 0u32;
+        let mut byte = gl.len();
+        for (bi, ch) in gl.char_indices() {
+            if units == m.gen_col {
+                byte = bi;
+                break;
+            }
+            units += ch.len_utf16() as u32;
+        }
+        assert!(
+            byte <= gl.len(),
+            "产物列 {} 超出行长（游标漂移）: {gl:?}",
+            m.gen_col
+        );
+    }
+    assert!(!map.is_empty());
+}
+
+/// 不请求 map 时零开销，且产物与带 map 版本**逐字节相同**（map 采集不得影响输出）。
+#[test]
+fn sourcemap_does_not_alter_output() {
+    use crate::{codegen_module_shaken_mangled, codegen_module_shaken_with_map};
+
+    let it = Interner::new();
+    let src = "export function f(a, b) {\n  const s = `x${a}y`;\n  return s + b;\n}\n";
+    let out = parse(src, &it, SourceType::Module);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let plain = out.module.with_ast(|p| {
+        codegen_module_shaken_mangled(p, &it, &NoLinker, None, &[], false, None, None, true, false)
+    });
+    let (with_map, map) = out.module.with_ast(|p| {
+        codegen_module_shaken_with_map(p, &it, &NoLinker, None, &[], false, None, None, true, false)
+    });
+    assert_eq!(plain, with_map, "启用 sourcemap 不得改变产物");
+    assert!(!map.is_empty());
+}
+
+#[test]
+fn constant_ternary_is_folded() {
+    use crate::codegen_module_shaken_with;
+    let it = Interner::new();
+    let define = [("process.env.NODE_ENV", "\"production\"")];
+    let src = "const v = process.env.NODE_ENV === 'production' ? fast() : slow();";
+    let out = parse(src, &it, SourceType::Module);
+    let js = out.module.with_ast(|p| {
+        codegen_module_shaken_with(p, &it, &NoLinker, None, &define, false, false, false)
+    });
+    assert!(js.contains("fast()"), "{js}");
+    assert!(!js.contains("slow()"), "死分支应剥离:\n{js}");
+    assert!(!js.contains('?'), "三元外壳应消除:\n{js}");
+}
+
+#[test]
+fn unreachable_after_return_is_dropped() {
+    let js = run("function f() { return 1; console.log('never'); doMore(); }");
+    assert!(js.contains("return 1"), "{js}");
+    assert!(!js.contains("never"), "return 后不可达代码应丢弃:\n{js}");
+    assert!(!js.contains("doMore"), "{js}");
+}
+
+#[test]
+fn unreachable_after_throw_is_dropped() {
+    let js = run("function f() { throw new Error('x'); cleanup(); }");
+    assert!(js.contains("throw"), "{js}");
+    assert!(!js.contains("cleanup"), "{js}");
+}
+
+#[test]
+fn unreachable_tail_with_hoisted_decl_is_kept() {
+    // `var`/函数声明会被提升，丢弃会致 ReferenceError → 保守全保留
+    let js = run("function f() { return 1; var leaked = 2; }");
+    assert!(js.contains("leaked"), "含 var 的不可达尾部应保留:\n{js}");
+
+    let js2 = run("function f() { return 1; function g() {} }");
+    assert!(js2.contains("function g"), "函数声明应保留:\n{js2}");
+}
+
+#[test]
+fn reachable_code_before_terminator_is_untouched() {
+    let js = run("function f() { setup(); if (x) return 1; after(); }");
+    assert!(js.contains("setup()"), "{js}");
+    assert!(
+        js.contains("after()"),
+        "终止语句在嵌套 if 内，其后仍可达:\n{js}"
+    );
+}
+
+#[test]
+fn jsx_namespaced_name_becomes_string_type() {
+    // `<a:b/>` → `_jsx("a:b", …)`（与 tsc 一致：冒号名不可能是组件，整体作字符串类型）
+    let it = Interner::new();
+    let out = parse("const c = <xlink:href x=\"1\"/>;", &it, SourceType::Tsx);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out.module.with_ast(|p| codegen(p, &it));
+    assert!(js.contains("\"xlink:href\""), "命名空间名应为字符串: {js}");
+    assert!(!js.contains("xlink.href"), "不应被当成员访问: {js}");
+}
+
+#[test]
+fn jsx_dev_runtime_shape_matches_tsc() {
+    // 对齐 tsc `--jsx react-jsxdev`：
+    //   import { Fragment as _Fragment, jsxDEV as _jsxDEV } from "react/jsx-dev-runtime";
+    //   _jsxDEV("div", { className:"x", children:"hi" }, void 0, false,
+    //           { fileName, lineNumber: 1, columnNumber: 11 }, this)
+    use wake_ecma_parser::{ParseOptions, parse_with};
+    let it = Interner::new();
+    let opts = ParseOptions {
+        jsx_import_source: "react",
+        jsx_dev: true,
+        file_name: "src/a.tsx",
+    };
+    let src = "const a = <div className=\"x\">hi</div>;";
+    let out = parse_with(src, &it, SourceType::Tsx, opts);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out.module.with_ast(|p| codegen(p, &it));
+
+    assert!(
+        js.contains("react/jsx-dev-runtime"),
+        "应导入 dev runtime: {js}"
+    );
+    assert!(js.contains("jsxDEV"), "{js}");
+    assert!(js.contains("\"src/a.tsx\""), "应带 fileName: {js}");
+    // `<` 在第 1 行第 11 列（`const a = ` 占 10 字符）
+    assert!(js.contains("lineNumber: 1"), "{js}");
+    assert!(js.contains("columnNumber: 11"), "列应指向 `<`: {js}");
+    assert!(js.contains("this"), "第 6 参 self: {js}");
+    // 单子节点 → isStaticChildren=false
+    assert!(js.contains("false"), "{js}");
+}
+
+#[test]
+fn jsx_dev_runtime_static_children_flag() {
+    use wake_ecma_parser::{ParseOptions, parse_with};
+    let it = Interner::new();
+    let opts = ParseOptions {
+        jsx_dev: true,
+        file_name: "f.tsx",
+        ..ParseOptions::default()
+    };
+    // 多子节点 → isStaticChildren = true（对应 prod 的 jsxs）
+    let out = parse_with("const b = <p><i/><b/></p>;", &it, SourceType::Tsx, opts);
+    let js = out.module.with_ast(|p| codegen(p, &it));
+    assert!(
+        js.contains("true"),
+        "多子节点应 isStaticChildren=true: {js}"
+    );
+}
+
+#[test]
+fn jsx_import_source_is_configurable() {
+    use wake_ecma_parser::{ParseOptions, parse_with};
+    let it = Interner::new();
+    let opts = ParseOptions {
+        jsx_import_source: "preact",
+        ..ParseOptions::default()
+    };
+    let out = parse_with("const a = <div/>;", &it, SourceType::Tsx, opts);
+    let js = out.module.with_ast(|p| codegen(p, &it));
+    assert!(js.contains("preact/jsx-runtime"), "应用可配来源: {js}");
+    // 注意 "preact/jsx-runtime" 本身含子串 "react/jsx-runtime"，须按带引号的完整说明符比对
+    assert!(!js.contains("\"react/jsx-runtime\""), "{js}");
+}
+
+#[test]
+fn jsx_default_stays_production_runtime() {
+    // 默认（不配置）保持 production automatic runtime，产物与既有一致
+    let it = Interner::new();
+    let out = parse("const a = <div/>;", &it, SourceType::Tsx);
+    let js = out.module.with_ast(|p| codegen(p, &it));
+    assert!(js.contains("react/jsx-runtime"), "{js}");
+    assert!(!js.contains("jsxDEV"), "默认不应用 dev runtime: {js}");
+}
+
+// ======================================================================
+// import= / export= / import attributes / using（DESIGN §4.1 的四处语法缺口）
+// ======================================================================
+
+#[test]
+fn ts_import_equals_lowers_to_require() {
+    let js = strip_ts(
+        "import fs = require('fs');\n\
+         import path = require('path');\n\
+         import Alias = NS.Inner.Leaf;\n\
+         export function f() { return fs.readFileSync(path.join(Alias.p)); }",
+    );
+    // require 形态 → `const x = require("m")`（codegen 的 emit_require_call 会在链接期
+    // 把它改写为 `__wake_require__(id)`，故必须逐字保持这个形态）。
+    assert!(js.contains("const fs = require(\"fs\");"), "{js}");
+    assert!(js.contains("const path = require(\"path\");"), "{js}");
+    // 实体名别名 → `var`（命名空间声明合并允许后补段，var 的提升避免 TDZ）。
+    assert!(js.contains("var Alias = NS.Inner.Leaf;"), "{js}");
+    assert!(!js.contains("import "), "不应残留 import 语句:\n{js}");
+}
+
+#[test]
+fn ts_export_assign_lowers_to_module_exports() {
+    let js = strip_ts("const api = { a: 1 };\nexport = api;");
+    // 必须逐字是 `module.exports`：bundler 的 compact_body_names 以文本匹配这一串改写成
+    // 包装器形参 `m.exports`，换写法会静默丢导出。
+    assert!(js.contains("module.exports = api;"), "{js}");
+    assert!(!js.contains("export ="), "不应残留 `export =`:\n{js}");
+    // 降级后模块内无任何 ESM 语句 → `program_is_esm` 为假 → 不打 `__esModule` 标记，
+    // 默认导入 interop 因而拿到整个 exports 对象，与 TS 的 `export =` 语义一致。
+    assert!(!js.contains("export {"), "不应残留具名导出:\n{js}");
+}
+
+#[test]
+fn ts_export_as_namespace_erased() {
+    let js = strip_ts("export as namespace MyLib;\nexport const v = 1;");
+    assert!(!js.contains("namespace"), "UMD 全局声明应擦除:\n{js}");
+    assert!(js.contains("export const v = 1;"), "{js}");
+}
+
+#[test]
+fn import_attributes_emitted() {
+    let js = run("import d from './d.json' with { type: 'json' };\n\
+         import './s.css' with { type: 'css' };\n\
+         export { a } from './m.js' with { type: 'json' };\n\
+         export * from './n.js' with { type: 'json' };\n\
+         import o from './o.json' assert { type: 'json' };");
+    assert!(
+        js.contains("import d from \"./d.json\" with { type: \"json\" };"),
+        "{js}"
+    );
+    assert!(
+        js.contains("import \"./s.css\" with { type: \"css\" };"),
+        "{js}"
+    );
+    assert!(
+        js.contains("export { a } from \"./m.js\" with { type: \"json\" };"),
+        "{js}"
+    );
+    assert!(
+        js.contains("export * from \"./n.js\" with { type: \"json\" };"),
+        "{js}"
+    );
+    // 已废弃的 import assertions 保留原关键字（改写成 with 会在旧运行时上改变语义）。
+    assert!(
+        js.contains("import o from \"./o.json\" assert { type: \"json\" };"),
+        "{js}"
+    );
+    assert_stable(
+        "import d from './d.json' with { type: 'json' };\nexport * from './n.js' with { type: 'json' };",
+    );
+}
+
+#[test]
+fn import_attributes_do_not_swallow_with_statement() {
+    // 反例：换行后的 `with (o) {}` 是 with 语句，不能被吞成引入属性子句。
+    let js = run("import x from 'm'\nwith (o) { y }");
+    assert!(js.contains("import x from \"m\";"), "{js}");
+    assert!(js.contains("with (o)"), "{js}");
+}
+
+#[test]
+fn using_declarations_emit() {
+    // `await using` 只在 async 上下文内识别（顶层 await 未支持，见 parser 的
+    // `top_level_await_using_is_rejected`）。
+    let js = run("{ using a = mk(); use(a); }\n\
+         async function f() {\n\
+           await using b = mkAsync();\n\
+           for (using r of rs) { r.q(); }\n\
+           for await (using k of ks) { k.q(); }\n\
+         }\n\
+         class C { static { using s = mk(); s.q(); } }");
+    assert!(js.contains("using a = mk();"), "{js}");
+    assert!(js.contains("await using b = mkAsync();"), "{js}");
+    assert!(js.contains("for (using r of rs)"), "{js}");
+    assert!(js.contains("for await (using k of ks)"), "{js}");
+    assert!(js.contains("using s = mk();"), "{js}");
+    assert_stable("{ using a = mk(); }\nasync function f() { await using b = mkAsync(); }");
+}
+
+#[test]
+fn using_identifier_is_not_declaration() {
+    // 反例：`using` 是上下文关键字，下列每处都应原样保持为标识符。
+    let js = run("let using = 1;\n\
+         using = 2;\n\
+         using\n\
+         x = 3;\n\
+         foo(using);\n\
+         using.prop;\n\
+         for (using of xs) { g(using); }");
+    assert!(js.contains("let using = 1;"), "{js}");
+    assert!(js.contains("using = 2;"), "{js}");
+    assert!(js.contains("foo(using);"), "{js}");
+    assert!(js.contains("for (using of xs)"), "{js}");
+    // ASI：`using` 与下一行的 `x = 3` 是两条语句，绝不能粘成 `using x = 3`。
+    assert!(!js.contains("using x"), "ASI 被破坏:\n{js}");
+}
+
+/// 走「未用变量消除」的 minify 路径（`analyze_vars` → codegen）。
+fn elim_gen(src: &str) -> String {
+    let it = Interner::new();
+    let out = parse(src, &it, SourceType::Module);
+    assert!(
+        !out.has_errors(),
+        "parse errors {src:?}: {:?}",
+        out.diagnostics
+    );
+    out.module.with_ast(|p| {
+        let va = wake_ecma_minify::analyze_vars(p, &it);
+        let ctx = MinifyCtx {
+            unused_vars: va.unused_vars.clone(),
+            unused_var_spans: va.unused_var_spans.clone(),
+            ..MinifyCtx::default()
+        };
+        crate::codegen_module_shaken_mangled(
+            p,
+            &it,
+            &NoLink,
+            None,
+            &[],
+            true,
+            None,
+            Some(&ctx),
+            false,
+            false,
+        )
+    })
+}
+
+#[test]
+fn unused_using_declaration_is_never_eliminated() {
+    // `using _ = acquire()` 的**零引用**形态恰是 using 最典型的用法：绑定虽无人读，
+    // 但离开作用域时的 dispose 调用是可观测副作用，声明必须原样保留。
+    let js = elim_gen(
+        "async function f() {\n\
+           const deadConst = pure();\n\
+           using lock = acquire();\n\
+           await using conn = connect();\n\
+           return 1;\n\
+         }",
+    );
+    assert!(js.contains("using lock=acquire()"), "using 被消除:\n{js}");
+    assert!(
+        js.contains("await using conn=connect()"),
+        "await using 被消除:\n{js}"
+    );
+    // 对照组：同样零引用的普通 const 仍应被消除，证明本用例确实走到了消除路径。
+    assert!(
+        !js.contains("deadConst"),
+        "对照组未被消除，本用例没走到消除路径:\n{js}"
+    );
+}

@@ -8,8 +8,8 @@
 
 use wake_common::{Atom, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::{
-    Expression, Pattern, Program, Statement, Visit, walk_expression, walk_statement,
-    ModuleExportName,
+    Expression, ModuleExportName, Pattern, Program, Statement, Visit, walk_expression,
+    walk_statement,
 };
 use wake_ecma_parser::analyze;
 use wake_ecma_parser::semantic::{DeclKind, ScopeId, Symbol, SymbolId};
@@ -23,18 +23,31 @@ pub struct Mangling {
 
 impl Mangling {
     fn empty() -> Self {
-        Mangling { renames: FxHashMap::default(), renamed_symbols: 0 }
+        Mangling {
+            renames: FxHashMap::default(),
+            renamed_symbols: 0,
+        }
     }
-    pub fn is_empty(&self) -> bool { self.renames.is_empty() }
-    pub fn get(&self, span: Span) -> Option<Atom> { self.renames.get(&span).copied() }
-    pub fn table(&self) -> &FxHashMap<Span, Atom> { &self.renames }
+    pub fn is_empty(&self) -> bool {
+        self.renames.is_empty()
+    }
+    pub fn get(&self, span: Span) -> Option<Atom> {
+        self.renames.get(&span).copied()
+    }
+    pub fn table(&self) -> &FxHashMap<Span, Atom> {
+        &self.renames
+    }
 }
 
 const MODULE_SCOPE: ScopeId = 0;
 
 const RUNTIME_NAMES: &[&str] = &[
-    "exports", "module", "require",
-    "__wake_require__", "__wake_interop_default", "__wake_interop_star",
+    "exports",
+    "module",
+    "require",
+    "__wake_require__",
+    "__wake_interop_default",
+    "__wake_interop_star",
     "globalThis",
 ];
 
@@ -49,8 +62,12 @@ fn collect_exported_names(program: &Program) -> FxHashSet<Atom> {
                 }
                 for spec in &decl.specifiers {
                     match &spec.local {
-                        ModuleExportName::Ident(id) => { exported.insert(id.name); }
-                        ModuleExportName::String(s) => { exported.insert(*s); }
+                        ModuleExportName::Ident(id) => {
+                            exported.insert(id.name);
+                        }
+                        ModuleExportName::String(s) => {
+                            exported.insert(*s);
+                        }
                     }
                 }
             }
@@ -63,8 +80,12 @@ fn collect_exported_names(program: &Program) -> FxHashSet<Atom> {
                 // export * as ns from '...' — ns is an import-like binding, add to guard set
                 if let Some(exported_name) = &decl.exported {
                     match exported_name {
-                        ModuleExportName::Ident(id) => { exported.insert(id.name); }
-                        ModuleExportName::String(s) => { exported.insert(*s); }
+                        ModuleExportName::Ident(id) => {
+                            exported.insert(id.name);
+                        }
+                        ModuleExportName::String(s) => {
+                            exported.insert(*s);
+                        }
                     }
                 }
             }
@@ -97,7 +118,9 @@ fn exported_names_from_decl(stmt: &Statement, exported: &mut FxHashSet<Atom>) {
 
 fn pattern_binding_names(pat: &Pattern, names: &mut FxHashSet<Atom>) {
     match pat {
-        Pattern::Ident(id) => { names.insert(id.name); }
+        Pattern::Ident(id) => {
+            names.insert(id.name);
+        }
         Pattern::Array(arr) => {
             for elem in &arr.elements {
                 if let Some(p) = elem {
@@ -122,7 +145,14 @@ fn pattern_binding_names(pat: &Pattern, names: &mut FxHashSet<Atom>) {
     }
 }
 
-pub fn plan_mangle(program: &Program, interner: &Interner) -> Mangling {
+/// 生成标识符压缩计划。
+///
+/// `reserved`：调用方（bundler）声明的、mangler **绝不可生成**的名字。emit 把每个模块包成
+/// `function(m,$,_r){…}` 并在 mangle **之后**把 `exports`→`$`、`__wake_require__`→`_r`、
+/// `module.exports`→`m.$` 压缩，故这些压缩名(`m`/`$`/`_r`)不在 [`RUNTIME_NAMES`]（那是压缩前的名）。
+/// 若某模块可压缩绑定 ≥13 个，`nth_name` 会排到 `m`，与包装器参数 `m` 撞成 `class m` 之类的重复声明。
+/// 由 bundler 经此参数声明，mangler 保持通用、不硬编码 bundler 约定。
+pub fn plan_mangle(program: &Program, interner: &Interner, reserved: &[&str]) -> Mangling {
     if has_hazard(program, interner) {
         return Mangling::empty();
     }
@@ -154,21 +184,34 @@ pub fn plan_mangle(program: &Program, interner: &Interner) -> Mangling {
     for name in RUNTIME_NAMES {
         forbidden.insert(interner.intern(name));
     }
+    // 调用方声明的保留名（如 emit 包装器参数 `m`/`$`/`_r`）——并入 forbidden 即 `assign` 的 `path`
+    // 种子，`nth_name` 候选命中即跳过，从根本上不会生成它们。
+    for name in reserved {
+        forbidden.insert(interner.intern(name));
+    }
 
     let mut synthetic: FxHashSet<SymbolId> = FxHashSet::default();
     for (sid, sym) in model.symbols.iter().enumerate() {
-        if sym.span.is_dummy() { synthetic.insert(sid as SymbolId); }
+        if sym.span.is_dummy() {
+            synthetic.insert(sid as SymbolId);
+        }
     }
     for r in &model.references {
-        if r.span.is_dummy() && let Some(sid) = r.resolved {
+        if r.span.is_dummy()
+            && let Some(sid) = r.resolved
+        {
             synthetic.insert(sid);
         }
     }
 
     let mut new_name: Vec<Option<Atom>> = vec![None; model.symbols.len()];
     let mut ctx = AssignCtx {
-        model: &model, interner, scope_symbols: &scope_symbols,
-        children: &children, synthetic: &synthetic, new_name: &mut new_name,
+        model: &model,
+        interner,
+        scope_symbols: &scope_symbols,
+        children: &children,
+        synthetic: &synthetic,
+        new_name: &mut new_name,
         exported_names: &exported_names,
     };
     ctx.assign(MODULE_SCOPE, &mut forbidden);
@@ -176,26 +219,33 @@ pub fn plan_mangle(program: &Program, interner: &Interner) -> Mangling {
     let mut renames: FxHashMap<Span, Atom> = FxHashMap::default();
     let mut renamed_symbols = 0usize;
     for (sid, sym) in model.symbols.iter().enumerate() {
-        if let Some(nn) = new_name[sid] && !sym.span.is_dummy() {
-            renames.insert(sym.span, nn); renamed_symbols += 1;
+        if let Some(nn) = new_name[sid]
+            && !sym.span.is_dummy()
+        {
+            renames.insert(sym.span, nn);
+            renamed_symbols += 1;
         }
     }
     for r in &model.references {
-        if !r.span.is_dummy() && let Some(sid) = r.resolved && let Some(nn) = new_name[sid as usize] {
+        if !r.span.is_dummy()
+            && let Some(sid) = r.resolved
+            && let Some(nn) = new_name[sid as usize]
+        {
             renames.insert(r.span, nn);
         }
     }
-    Mangling { renames, renamed_symbols }
+    Mangling {
+        renames,
+        renamed_symbols,
+    }
 }
 
-fn is_renameable(sym: &Symbol, exported_names: &FxHashSet<Atom>) -> bool {
-    if matches!(sym.decl_kind, DeclKind::Import | DeclKind::Function) {
-        return false;
-    }
-    if sym.scope == MODULE_SCOPE {
-        return !exported_names.contains(&sym.name);
-    }
-    true
+fn is_renameable(sym: &Symbol, _exported_names: &FxHashSet<Atom>) -> bool {
+    // 仅 `Import` 绑定不重命名（其局部名与源模块导出名相关；保守，收益小）。
+    // **函数声明**与**模块顶层已导出名**现在也重命名：单包 concat 下顶层为块/闭包作用域，
+    // 导出经 `$["原名"]` 字符串键透传，重命名标识符对外透明——codegen 的导出赋值/默认导出的**值**
+    // 已改为按绑定 span 查 rename 表发新名（见 `renamed_or`/`emit_export_binding`）。
+    !matches!(sym.decl_kind, DeclKind::Import)
 }
 
 struct AssignCtx<'a> {
@@ -216,46 +266,72 @@ impl AssignCtx<'_> {
             let sym = &self.model.symbols[sid as usize];
             if is_renameable(sym, self.exported_names) && !self.synthetic.contains(&sid) {
                 let atom = loop {
-                    let cand = nth_name(counter); counter += 1;
-                    if is_reserved(&cand) { continue; }
+                    let cand = nth_name(counter);
+                    counter += 1;
+                    if is_reserved(&cand) {
+                        continue;
+                    }
                     let atom = self.interner.intern(&cand);
-                    if !path.contains(&atom) { break atom; }
+                    if !path.contains(&atom) {
+                        break atom;
+                    }
                 };
                 self.new_name[sid as usize] = Some(atom);
-                path.insert(atom); added.push(atom);
+                path.insert(atom);
+                added.push(atom);
             } else {
-                if path.insert(sym.name) { added.push(sym.name); }
+                if path.insert(sym.name) {
+                    added.push(sym.name);
+                }
             }
         }
         for &child in &self.children[scope as usize] {
             self.assign(child, path);
         }
-        for a in added { path.remove(&a); }
+        for a in added {
+            path.remove(&a);
+        }
     }
 }
 
 // ── Hazard detection: eval / with ──
 
 pub(crate) fn has_hazard(program: &Program, interner: &Interner) -> bool {
-    let mut h = Hazard { eval_atom: interner.intern("eval"), found: false };
+    let mut h = Hazard {
+        eval_atom: interner.intern("eval"),
+        found: false,
+    };
     h.visit_program(program);
     h.found
 }
 
-struct Hazard { eval_atom: Atom, found: bool }
+struct Hazard {
+    eval_atom: Atom,
+    found: bool,
+}
 
 impl<'a> Visit<'a> for Hazard {
     fn visit_statement(&mut self, node: &Statement<'a>) {
-        if self.found { return; }
-        if matches!(node, Statement::With(_)) { self.found = true; return; }
+        if self.found {
+            return;
+        }
+        if matches!(node, Statement::With(_)) {
+            self.found = true;
+            return;
+        }
         walk_statement(self, node);
     }
     fn visit_expression(&mut self, node: &Expression<'a>) {
-        if self.found { return; }
+        if self.found {
+            return;
+        }
         if let Expression::Call(c) = node
             && let Expression::Identifier(id) = &c.callee
             && id.name == self.eval_atom
-        { self.found = true; return; }
+        {
+            self.found = true;
+            return;
+        }
         walk_expression(self, node);
     }
 }
@@ -269,19 +345,69 @@ pub(crate) fn nth_name(mut n: usize) -> String {
     let mut s = String::new();
     s.push(FIRST[n % FIRST.len()] as char);
     n /= FIRST.len();
-    while n > 0 { n -= 1; s.push(REST[n % REST.len()] as char); n /= REST.len(); }
+    while n > 0 {
+        n -= 1;
+        s.push(REST[n % REST.len()] as char);
+        n /= REST.len();
+    }
     s
 }
 
 pub(crate) fn is_reserved(name: &str) -> bool {
-    matches!(name,
-        "await" | "break" | "case" | "catch" | "class" | "const" | "continue"
-        | "debugger" | "default" | "delete" | "do" | "else" | "enum" | "export"
-        | "extends" | "false" | "finally" | "for" | "function" | "if" | "import"
-        | "in" | "instanceof" | "new" | "null" | "return" | "super" | "switch"
-        | "this" | "throw" | "true" | "try" | "typeof" | "var" | "void" | "while"
-        | "with" | "yield" | "let" | "static"
-        | "implements" | "interface" | "package" | "private" | "protected" | "public"
-        | "arguments" | "eval" | "undefined" | "NaN" | "Infinity"
+    matches!(
+        name,
+        "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+            | "let"
+            | "static"
+            // `using`：语句起始处的 `using x` 被解析为 using 声明，故生成的名字不能叫 `using`。
+            | "using"
+            | "implements"
+            | "interface"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "arguments"
+            | "eval"
+            | "undefined"
+            | "NaN"
+            | "Infinity"
     )
 }

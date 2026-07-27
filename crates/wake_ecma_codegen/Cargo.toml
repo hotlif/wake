@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "代码生成（AST→字符串）+ SourceMap（含恒等旁路）。DESIGN §4.6"
+description = "代码生成（AST→字符串）+ SourceMap V3（VLQ，非压缩路径）。DESIGN §4.6"
 
 [lints]
 workspace = true

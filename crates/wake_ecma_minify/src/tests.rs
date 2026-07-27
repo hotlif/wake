@@ -1,8 +1,6 @@
 //! wake_ecma_minify integration tests.
 
-use crate::mangle::{
-    Mangling, plan_mangle, nth_name, is_reserved
-};
+use crate::mangle::{Mangling, is_reserved, nth_name, plan_mangle};
 use wake_common::Interner;
 use wake_ecma_ast::SourceType;
 use wake_ecma_parser::parse;
@@ -11,7 +9,7 @@ fn plan(src: &str) -> (Mangling, Interner) {
     let it = Interner::new();
     let out = parse(src, &it, SourceType::Module);
     assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
-    let m = out.module.with_ast(|p| plan_mangle(p, &it));
+    let m = out.module.with_ast(|p| plan_mangle(p, &it, &[]));
     (m, it)
 }
 
@@ -39,7 +37,18 @@ fn nth_name_distinct_and_valid() {
 
 #[test]
 fn reserved_words_flagged() {
-    for w in ["if", "in", "do", "for", "var", "new", "let", "class", "arguments", "eval"] {
+    for w in [
+        "if",
+        "in",
+        "do",
+        "for",
+        "var",
+        "new",
+        "let",
+        "class",
+        "arguments",
+        "eval",
+    ] {
         assert!(is_reserved(w), "{w} 应保留");
     }
     assert!(!is_reserved("a"));
@@ -49,10 +58,13 @@ fn reserved_words_flagged() {
 
 #[test]
 fn module_level_non_exported_renamed() {
+    // 现在函数声明名也重命名（x + foo）；单包 concat 下顶层块/闭包作用域，安全。
     let (m, it) = plan("const x = 1; function foo(){ return x; } foo;");
-    assert_eq!(m.renamed_symbols, 1);
-    assert_eq!(m.table().len(), 2);
-    assert_eq!(new_names(&m, &it), ["a".to_string()].into_iter().collect());
+    assert_eq!(m.renamed_symbols, 2);
+    assert_eq!(
+        new_names(&m, &it),
+        ["a", "b"].into_iter().map(str::to_string).collect()
+    );
 }
 
 #[test]
@@ -63,10 +75,13 @@ fn imports_not_renamed() {
 
 #[test]
 fn function_params_and_locals_renamed() {
+    // 函数名 f 现在也重命名（f + 参数 x）。
     let (m, it) = plan("function f(x){ return x + 1; } f;");
-    assert_eq!(m.renamed_symbols, 1);
-    assert_eq!(m.table().len(), 2);
-    assert_eq!(new_names(&m, &it), ["a".to_string()].into_iter().collect());
+    assert_eq!(m.renamed_symbols, 2);
+    assert_eq!(
+        new_names(&m, &it),
+        ["a", "b"].into_iter().map(str::to_string).collect()
+    );
 }
 
 #[test]
@@ -78,35 +93,40 @@ fn eval_bails_whole_module() {
 #[test]
 fn new_name_avoids_global_reference() {
     let (m2, it2) = plan("function f(){ var p = GLOBAL_X; return p; } f;");
-    assert_eq!(m2.renamed_symbols, 1);
+    assert_eq!(m2.renamed_symbols, 2); // f + p（GLOBAL_X 为未解析引用，被 forbidden 避开）
     assert!(new_names(&m2, &it2).contains("a"));
 }
 
 // ── Module-level rename safety ──
 
 #[test]
-fn exported_const_not_renamed() {
+fn exported_const_now_renamed() {
+    // 单包 concat 下导出经 `$["x"]` 字符串键透传，导出的本地绑定也可安全重命名（codegen 导出值随 rename）。
     let (m, _) = plan("export const x = 1;");
-    assert_eq!(m.renamed_symbols, 0);
+    assert_eq!(m.renamed_symbols, 1);
 }
 
 #[test]
-fn exported_via_specifier_not_renamed() {
+fn exported_via_specifier_now_renamed() {
     let (m, _) = plan("const x = 1; export { x };");
-    assert_eq!(m.renamed_symbols, 0);
+    assert_eq!(m.renamed_symbols, 1); // 本地 x 重命名，导出行 `exports["x"]=新名`
 }
 
 #[test]
-fn export_function_not_renamed() {
+fn export_function_now_renamed() {
     let (m, _) = plan("export function foo(){}");
-    assert_eq!(m.renamed_symbols, 0);
+    assert_eq!(m.renamed_symbols, 1); // foo 重命名，`exports["foo"]=新名`
 }
 
 #[test]
 fn mixed_exported_and_non_exported() {
+    // x 与 y（含已导出的 y）现在都重命名。
     let (m, it) = plan("const x = 1; export const y = 2; console.log(x, y);");
-    assert_eq!(m.renamed_symbols, 1);
-    assert_eq!(new_names(&m, &it), ["a".to_string()].into_iter().collect());
+    assert_eq!(m.renamed_symbols, 2);
+    assert_eq!(
+        new_names(&m, &it),
+        ["a", "b"].into_iter().map(str::to_string).collect()
+    );
 }
 
 #[test]
@@ -120,5 +140,8 @@ fn module_level_multi_non_exported_renamed() {
     let (m, it) = plan("const x = 1; const y = 2; console.log(x + y);");
     // Both x and y are non-exported module-level → both renamed
     assert_eq!(m.renamed_symbols, 2);
-    assert_eq!(new_names(&m, &it), ["a", "b"].into_iter().map(str::to_string).collect());
+    assert_eq!(
+        new_names(&m, &it),
+        ["a", "b"].into_iter().map(str::to_string).collect()
+    );
 }

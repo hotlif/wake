@@ -18,27 +18,27 @@
 //! | [`simplify`] | 🏗️ 2.1 | Expression simplification planner |
 //! | [`ctx`] | 🏗️ 4.1 | Aggregated minification context |
 
-pub mod mangle;
-pub mod const_eval;
-pub mod purity;
 pub mod analyze;
-pub mod simplify;
+pub mod const_eval;
 pub mod ctx;
 pub mod dce;
-pub mod statements;
-pub mod prop_mangle;
 pub mod hoist;
+pub mod mangle;
+pub mod prop_mangle;
+pub mod purity;
+pub mod simplify;
+pub mod statements;
 
-pub use mangle::*;
-pub use const_eval::*;
-pub use purity::*;
 pub use analyze::*;
-pub use simplify::*;
+pub use const_eval::*;
 pub use ctx::*;
 pub use dce::*;
-pub use statements::*;
-pub use prop_mangle::*;
 pub use hoist::*;
+pub use mangle::*;
+pub use prop_mangle::*;
+pub use purity::*;
+pub use simplify::*;
+pub use statements::*;
 
 #[cfg(test)]
 mod tests;

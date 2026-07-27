@@ -147,9 +147,12 @@ fn recurse_if_return(stmt: &Statement, candidates: &mut Vec<IfReturnCandidate>) 
             ExportDefaultKind::Expression(e) => walk_expr_for_if_return(&e, candidates),
         },
 
-        Statement::Empty(_) | Statement::Debugger(_)
-        | Statement::Break(_) | Statement::Continue(_)
-        | Statement::Import(_) | Statement::ExportAll(_) => {}
+        Statement::Empty(_)
+        | Statement::Debugger(_)
+        | Statement::Break(_)
+        | Statement::Continue(_)
+        | Statement::Import(_)
+        | Statement::ExportAll(_) => {}
     }
 }
 
@@ -266,8 +269,10 @@ pub fn analyze_join_vars(program: &Program) -> Vec<(Span, Span)> {
 fn analyze_seq_join_vars(stmts: &[Statement], pairs: &mut Vec<(Span, Span)>) {
     for i in 0..stmts.len().saturating_sub(1) {
         match (&stmts[i], &stmts[i + 1]) {
+            // `using` / `await using` 不参与合并：收益微乎其微，而合并路径
+            // （codegen `emit_joined_vars`）内嵌了未用绑定消除，会丢掉 dispose 副作用。
             (Statement::VariableDeclaration(a), Statement::VariableDeclaration(b))
-                if a.kind == b.kind =>
+                if a.kind == b.kind && !a.kind.is_using() =>
             {
                 pairs.push((a.span, b.span));
             }
@@ -669,7 +674,8 @@ mod tests {
             .map(|c| {
                 let cond = &src[c.cond_span.lo as usize..c.cond_span.hi as usize];
                 let ret = &src[c.return_span.lo as usize..c.return_span.hi as usize];
-                let sub = &src[c.subsequent_return_span.lo as usize..c.subsequent_return_span.hi as usize];
+                let sub = &src
+                    [c.subsequent_return_span.lo as usize..c.subsequent_return_span.hi as usize];
                 format!("cond:{cond} ret:{ret} sub:{sub}")
             })
             .collect()
@@ -694,14 +700,20 @@ mod tests {
         let candidates = run_if_return(src);
         assert_eq!(candidates.len(), 1, "should detect if-return pattern");
         let texts = candidate_texts(src, &candidates);
-        assert!(texts.iter().any(|t| t.contains("cond:x") && t.contains("ret:return a") && t.contains("sub:return b")));
+        assert!(texts.iter().any(|t| t.contains("cond:x")
+            && t.contains("ret:return a")
+            && t.contains("sub:return b")));
     }
 
     #[test]
     fn if_return_block_body() {
         let src = "function f() { if (x) { return a; } return b; }";
         let candidates = run_if_return(src);
-        assert_eq!(candidates.len(), 1, "should detect if-return with block body");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "should detect if-return with block body"
+        );
     }
 
     #[test]
@@ -710,21 +722,31 @@ mod tests {
         let candidates = run_if_return(src);
         assert_eq!(candidates.len(), 1, "should detect if-else-return pattern");
         let texts = candidate_texts(src, &candidates);
-        assert!(texts.iter().any(|t| t.contains("cond:x") && t.contains("ret:return a") && t.contains("sub:return b")));
+        assert!(texts.iter().any(|t| t.contains("cond:x")
+            && t.contains("ret:return a")
+            && t.contains("sub:return b")));
     }
 
     #[test]
     fn if_return_block_else_block() {
         let src = "function f() { if (x) { return a; } else { return b; } }";
         let candidates = run_if_return(src);
-        assert_eq!(candidates.len(), 1, "blocks wrapping returns should still be detected");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "blocks wrapping returns should still be detected"
+        );
     }
 
     #[test]
     fn if_return_non_return_in_consequent() {
         let src = "function f() { if (x) { console.log(x); return a; } return b; }";
         let candidates = run_if_return(src);
-        assert_eq!(candidates.len(), 0, "consequent with non-return stmt should NOT be detected");
+        assert_eq!(
+            candidates.len(),
+            0,
+            "consequent with non-return stmt should NOT be detected"
+        );
     }
 
     #[test]
@@ -738,14 +760,22 @@ mod tests {
     fn if_return_no_return_after() {
         let src = "function f() { if (x) return a; console.log(b); }";
         let candidates = run_if_return(src);
-        assert_eq!(candidates.len(), 0, "no return after if should not be detected");
+        assert_eq!(
+            candidates.len(),
+            0,
+            "no return after if should not be detected"
+        );
     }
 
     #[test]
     fn if_return_nested_function() {
         let src = "function f() { function g() { if (x) return a; return b; } }";
         let candidates = run_if_return(src);
-        assert_eq!(candidates.len(), 1, "pattern inside nested function should be detected");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "pattern inside nested function should be detected"
+        );
     }
 
     #[test]
@@ -775,7 +805,11 @@ mod tests {
     fn join_vars_same_kind_const() {
         let src = "const a = 1; const b = 2;";
         let pairs = run_join_vars(src);
-        assert_eq!(pairs.len(), 1, "const a = 1; const b = 2; should be joinable");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "const a = 1; const b = 2; should be joinable"
+        );
     }
 
     #[test]
@@ -789,7 +823,11 @@ mod tests {
     fn join_vars_not_consecutive() {
         let src = "var a = 1; console.log(a); var b = 2;";
         let pairs = run_join_vars(src);
-        assert_eq!(pairs.len(), 0, "non-consecutive var decls should NOT be joinable");
+        assert_eq!(
+            pairs.len(),
+            0,
+            "non-consecutive var decls should NOT be joinable"
+        );
     }
 
     #[test]
@@ -803,7 +841,11 @@ mod tests {
     fn join_vars_three_consecutive() {
         let src = "var a = 1; var b = 2; var c = 3;";
         let pairs = run_join_vars(src);
-        assert_eq!(pairs.len(), 2, "three consecutive vars should produce 2 pairs");
+        assert_eq!(
+            pairs.len(),
+            2,
+            "three consecutive vars should produce 2 pairs"
+        );
     }
 
     #[test]
@@ -842,7 +884,11 @@ mod tests {
     fn sequences_not_consecutive() {
         let src = "a(); if(x) {} b();";
         let pairs = run_sequences(src);
-        assert_eq!(pairs.len(), 0, "non-consecutive expression stmts should NOT be detected");
+        assert_eq!(
+            pairs.len(),
+            0,
+            "non-consecutive expression stmts should NOT be detected"
+        );
     }
 
     #[test]
@@ -856,35 +902,55 @@ mod tests {
     fn sequences_single_stmt() {
         let src = "a();";
         let pairs = run_sequences(src);
-        assert_eq!(pairs.len(), 0, "single expression stmt should not produce a pair");
+        assert_eq!(
+            pairs.len(),
+            0,
+            "single expression stmt should not produce a pair"
+        );
     }
 
     #[test]
     fn sequences_no_false_positive_var_decl() {
         let src = "var a = 1; b();";
         let pairs = run_sequences(src);
-        assert_eq!(pairs.len(), 0, "var decl followed by expr stmt should not be detected");
+        assert_eq!(
+            pairs.len(),
+            0,
+            "var decl followed by expr stmt should not be detected"
+        );
     }
 
     #[test]
     fn sequences_in_block() {
         let src = "{ a(); b(); }";
         let pairs = run_sequences(src);
-        assert_eq!(pairs.len(), 1, "expression stmts inside a block should be detected");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "expression stmts inside a block should be detected"
+        );
     }
 
     #[test]
     fn sequences_in_function() {
         let src = "function f() { a(); b(); }";
         let pairs = run_sequences(src);
-        assert_eq!(pairs.len(), 1, "expression stmts inside a function should be detected");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "expression stmts inside a function should be detected"
+        );
     }
 
     #[test]
     fn sequences_three_consecutive() {
         let src = "a(); b(); c();";
         let pairs = run_sequences(src);
-        assert_eq!(pairs.len(), 2, "three consecutive expr stmts should produce 2 pairs");
+        assert_eq!(
+            pairs.len(),
+            2,
+            "three consecutive expr stmts should produce 2 pairs"
+        );
     }
 
     #[test]

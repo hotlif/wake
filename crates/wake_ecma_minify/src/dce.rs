@@ -363,7 +363,11 @@ mod tests {
     fn code_after_return_marked_unreachable() {
         let src = "function f() { return 1; let x = 2; }";
         assert_eq!(remove_count(src, false, false), 1);
-        assert!(spans_text(src, false, false).iter().any(|t| t.contains("let x = 2")));
+        assert!(
+            spans_text(src, false, false)
+                .iter()
+                .any(|t| t.contains("let x = 2"))
+        );
     }
 
     #[test]
@@ -391,7 +395,10 @@ mod tests {
     fn function_decl_after_return_preserved() {
         let src = "function f() { return 1; function g() {} }";
         let spans = remove_spans(src, false, false);
-        assert!(spans.is_empty(), "should preserve function decl after return");
+        assert!(
+            spans.is_empty(),
+            "should preserve function decl after return"
+        );
     }
 
     #[test]
@@ -418,7 +425,11 @@ mod tests {
     fn non_hoisted_after_return_removed() {
         let src = "function f() { return; const x = 1; }";
         assert_eq!(remove_count(src, false, false), 1);
-        assert!(spans_text(src, false, false).iter().any(|t| t.contains("const x = 1")));
+        assert!(
+            spans_text(src, false, false)
+                .iter()
+                .any(|t| t.contains("const x = 1"))
+        );
     }
 
     // ── 2. Unreachable after throw ──
@@ -440,7 +451,10 @@ mod tests {
     fn function_decl_after_throw_preserved() {
         let src = "function f() { throw new Error(); function g() {} }";
         let spans = remove_spans(src, false, false);
-        assert!(spans.is_empty(), "function decl after throw should be preserved");
+        assert!(
+            spans.is_empty(),
+            "function decl after throw should be preserved"
+        );
     }
 
     // ── 3. Unreachable after break ──
@@ -513,7 +527,11 @@ mod tests {
     fn debugger_removed_when_drop_debugger() {
         let src = "function f() { debugger; }";
         assert_eq!(remove_count(src, true, false), 1);
-        assert!(spans_text(src, true, false).iter().any(|t| t.contains("debugger")));
+        assert!(
+            spans_text(src, true, false)
+                .iter()
+                .any(|t| t.contains("debugger"))
+        );
     }
 
     #[test]
@@ -528,7 +546,11 @@ mod tests {
     fn pure_call_expr_stmt_removed() {
         let src = "Math.abs(-5);";
         assert_eq!(remove_count(src, false, false), 1);
-        assert!(spans_text(src, false, false).iter().any(|t| t.contains("Math.abs")));
+        assert!(
+            spans_text(src, false, false)
+                .iter()
+                .any(|t| t.contains("Math.abs"))
+        );
     }
 
     #[test]
@@ -556,14 +578,22 @@ mod tests {
     fn console_log_removed_when_drop_console() {
         let src = "console.log('hello');";
         assert_eq!(remove_count(src, false, true), 1);
-        assert!(spans_text(src, false, true).iter().any(|t| t.contains("console.log")));
+        assert!(
+            spans_text(src, false, true)
+                .iter()
+                .any(|t| t.contains("console.log"))
+        );
     }
 
     #[test]
     fn console_error_removed_when_drop_console() {
         let src = "console.error('oops');";
         assert_eq!(remove_count(src, false, true), 1);
-        assert!(spans_text(src, false, true).iter().any(|t| t.contains("console.error")));
+        assert!(
+            spans_text(src, false, true)
+                .iter()
+                .any(|t| t.contains("console.error"))
+        );
     }
 
     #[test]

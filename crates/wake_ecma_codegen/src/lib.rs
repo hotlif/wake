@@ -1,15 +1,23 @@
 //! # wake_ecma_codegen — 代码生成（AST → JS 字符串）
 //!
-//! DESIGN §4.6：直接从 AST 写字符串，维护运算符优先级/结合性表自动补括号。Phase 3 先做无 sourcemap
-//! 的可读输出；恒等旁路、VLQ sourcemap、prod 紧凑模式是 Phase 4 的增量。
+//! DESIGN §4.6：直接从 AST 写字符串，维护运算符优先级/结合性表自动补括号。
+//!
+//! SourceMap（[`sourcemap`] 模块）：[`codegen_module_shaken_with_map`] 在发射时采集
+//! 「产物行列 ↔ 源字节偏移」映射；不请求时零开销，且产物逐字节不变。当前覆盖**非压缩**
+//! 路径（压缩路径由 bundler 做 scope hoisting 并改写模块体文本，映射需另行平移，见 M4d）。
 //!
 //! 入口：[`codegen`]（默认 dev 可读风格）。往返 `parse → codegen → parse` 语义等价（见测试）。
 
 use std::fmt::Write as _;
 
+mod decorators;
+
 use wake_common::{Atom, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
 use wake_ecma_minify::{IfReturnCandidate, MinifyCtx, write_number_minified};
+
+pub mod sourcemap;
+pub use sourcemap::{Mapping, ModuleMappings, SourceMap};
 
 /// 编译期常量替换（DESIGN §4.4 的最小切片）：静态成员访问链 → 字面量源码。
 /// [`codegen_module`] 默认应用，使 React 等库的 `process.env.NODE_ENV` 在浏览器无需
@@ -42,6 +50,9 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
         minify_ctx: None,
         no_esmodule: false,
         minify_names: false,
+        skip_inline: false,
+        smap: None,
+        needs_decorator_helpers: std::cell::Cell::new(false),
     };
     cg.emit_program(program);
     cg.out
@@ -66,7 +77,12 @@ pub trait ModuleLinker {
 }
 
 /// 生成 **已链接**（ESM→CJS）的模块体，供函数包装打包。
-pub fn codegen_module(program: &Program, interner: &Interner, linker: &dyn ModuleLinker, minify_names: bool) -> String {
+pub fn codegen_module(
+    program: &Program,
+    interner: &Interner,
+    linker: &dyn ModuleLinker,
+    minify_names: bool,
+) -> String {
     codegen_module_shaken(program, interner, linker, None, minify_names)
 }
 
@@ -143,6 +159,73 @@ pub fn codegen_module_shaken_mangled(
     no_esmodule: bool,
     minify_names: bool,
 ) -> String {
+    codegen_impl(
+        program,
+        interner,
+        linker,
+        keep_exports,
+        define,
+        minify,
+        rename,
+        minify_ctx,
+        no_esmodule,
+        minify_names,
+        false,
+    )
+    .0
+}
+
+/// 同 [`codegen_module_shaken_mangled`]，但**同时产出模块级 SourceMap 映射**（CRUSTIFY-PARITY §M4d）。
+///
+/// 返回 `(模块体源码, 映射)`。映射的产物坐标是**模块体内的局部坐标**（0 基行、0 基 UTF-16 列），
+/// `src_index` 恒为 0——bundler 把模块体拼进 bundle 时按行偏移平移、并重写为真实源文件下标。
+/// 源侧只记字节偏移（`Span::lo`），行列换算推迟到序列化（DESIGN §4.1：热路径不算行列）。
+///
+/// 与不带 map 的版本相比，仅多出游标累计与映射 push；`smap` 为 `None` 时零开销，故现有调用点不受影响。
+#[allow(clippy::too_many_arguments)]
+pub fn codegen_module_shaken_with_map(
+    program: &Program,
+    interner: &Interner,
+    linker: &dyn ModuleLinker,
+    keep_exports: Option<&[String]>,
+    define: &[(&str, &str)],
+    minify: bool,
+    rename: Option<&FxHashMap<Span, Atom>>,
+    minify_ctx: Option<&MinifyCtx>,
+    no_esmodule: bool,
+    minify_names: bool,
+) -> (String, ModuleMappings) {
+    let (code, map) = codegen_impl(
+        program,
+        interner,
+        linker,
+        keep_exports,
+        define,
+        minify,
+        rename,
+        minify_ctx,
+        no_esmodule,
+        minify_names,
+        true,
+    );
+    (code, map.unwrap_or_default())
+}
+
+/// [`codegen_module_shaken_mangled`] 与 [`codegen_module_shaken_with_map`] 的共同实现。
+#[allow(clippy::too_many_arguments)]
+fn codegen_impl(
+    program: &Program,
+    interner: &Interner,
+    linker: &dyn ModuleLinker,
+    keep_exports: Option<&[String]>,
+    define: &[(&str, &str)],
+    minify: bool,
+    rename: Option<&FxHashMap<Span, Atom>>,
+    minify_ctx: Option<&MinifyCtx>,
+    no_esmodule: bool,
+    minify_names: bool,
+    want_map: bool,
+) -> (String, Option<ModuleMappings>) {
     let shake = keep_exports.map(|keep| ShakeCtx {
         // 外部已用导出名预驻留为 Atom（与导出名 Atom 同 interner，u32 相等 ⟺ 字符串相等）。
         used: keep.iter().map(|s| interner.intern(s)).collect(),
@@ -165,6 +248,14 @@ pub fn codegen_module_shaken_mangled(
         minify_ctx,
         no_esmodule,
         minify_names,
+        skip_inline: false,
+        smap: want_map.then(|| SmapState {
+            line: 0,
+            col: 0,
+            mappings: Vec::new(),
+            last_src: None,
+        }),
+        needs_decorator_helpers: std::cell::Cell::new(false),
     };
     // ESM 模块（含 import/export 语法）标记 `__esModule`，供默认导入 interop 区分「转译 ESM」
     // 与「纯 CJS」。纯 CJS 模块（只有 `module.exports`/`require`）不标记，保持整体 exports 语义。
@@ -174,7 +265,10 @@ pub fn codegen_module_shaken_mangled(
         cg.newline();
     }
     cg.emit_program(program);
-    cg.out
+    let map = cg.smap.map(|sm| ModuleMappings {
+        mappings: sm.mappings,
+    });
+    (cg.out, map)
 }
 
 /// Tree Shaking 上下文：外部已用导出名 + 模块内被读取的标识符名（全部用 `Atom`，u32 比较，无分配）。
@@ -202,6 +296,52 @@ impl ShakeCtx {
     }
 }
 
+/// 单包 concat 的块安全信息：模块能否用裸 `{}` 块（而非 IIFE）包裹。
+#[derive(Clone, Copy, Debug)]
+pub struct ConcatBlockInfo {
+    /// 模块含 ESM 语法（import/export）——ESM 恒 strict-safe，是加 `"use strict"` 的前提。
+    pub is_esm: bool,
+    /// 块安全：ESM 且**无任何 `var`、无任何 `this`**。满足则可用 `{}` 块隔离（strict 下块级函数声明
+    /// 亦为块作用域，避免跨模块顶层名碰撞）。过近似（函数体内的 var/this 也一并否决）→ 只多退回 IIFE，
+    /// 绝不误用 `{}`：① `var` 会 hoist 出块致碰撞；② 顶层 `this` 在 `{}`（=module.exports）与 IIFE
+    /// （strict 下 =undefined，符合 ESM）语义不同。
+    pub block_safe: bool,
+}
+
+/// 扫描模块：是否 ESM、块是否安全（无 `var`、无 `this`）。
+pub fn concat_block_info(program: &Program) -> ConcatBlockInfo {
+    struct Scan {
+        has_var: bool,
+        has_this: bool,
+    }
+    impl<'a> Visit<'a> for Scan {
+        fn visit_statement(&mut self, s: &Statement<'a>) {
+            if let Statement::VariableDeclaration(d) = s
+                && d.kind == VarKind::Var
+            {
+                self.has_var = true;
+            }
+            walk_statement(self, s);
+        }
+        fn visit_expression(&mut self, e: &Expression<'a>) {
+            if matches!(e, Expression::This(_)) {
+                self.has_this = true;
+            }
+            walk_expression(self, e);
+        }
+    }
+    let is_esm = program_is_esm(program);
+    let mut sc = Scan {
+        has_var: false,
+        has_this: false,
+    };
+    sc.visit_program(program);
+    ConcatBlockInfo {
+        is_esm,
+        block_safe: is_esm && !sc.has_var && !sc.has_this,
+    }
+}
+
 /// 模块是否含 ESM 语法（据此决定是否标记 `__esModule`）。
 fn program_is_esm(program: &Program) -> bool {
     program.body.iter().any(|s| {
@@ -213,6 +353,20 @@ fn program_is_esm(program: &Program) -> bool {
                 | Statement::ExportAll(_)
         )
     })
+}
+
+/// minify 去空格后，相邻两 token 是否会错误粘连 → 需补一个空格。
+/// 覆盖：标识符/关键字/数字相邻（`return`+`x`、`in`+`y`）；`++`/`--` 误合并；`//`、`/*` 误起注释。
+#[inline]
+fn need_sep(a: u8, b: u8) -> bool {
+    #[inline]
+    fn word(c: u8) -> bool {
+        c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+    }
+    (word(a) && word(b))
+        || (a == b'+' && b == b'+')
+        || (a == b'-' && b == b'-')
+        || (a == b'/' && (b == b'/' || b == b'*'))
 }
 
 struct Codegen<'i, 'l, 'd, 'm, 'mc> {
@@ -246,6 +400,40 @@ struct Codegen<'i, 'l, 'd, 'm, 'mc> {
     minify_ctx: Option<&'mc MinifyCtx<'mc>>,
     /// Use short names for codegen output (e for exports, etc.) when true.
     minify_names: bool,
+    /// 临时标记：当前 emit_expr 处于写位置（Update 参数 / Assignment 左侧），禁止变量内联。
+    skip_inline: bool,
+    /// 本模块是否发射了装饰器降级 → 需在模块顶部注入 `__esDecorate`/`__runInitializers`。
+    needs_decorator_helpers: std::cell::Cell<bool>,
+    /// SourceMap 采集（`None` = 不产 map，零开销）。CRUSTIFY-PARITY §M4d。
+    smap: Option<SmapState>,
+}
+
+/// codegen 期的产物位置游标 + 映射累积（仅在启用 sourcemap 时存在）。
+struct SmapState {
+    /// 当前产物行（0 基）。
+    line: u32,
+    /// 当前产物列（0 基，UTF-16 码元）。
+    col: u32,
+    /// 已记录的映射（按发射顺序，天然按产物位置递增）。
+    mappings: Vec<Mapping>,
+    /// 上一条映射的源字节偏移——相同源位置连续发射时去重，避免 mappings 膨胀。
+    last_src: Option<u32>,
+}
+
+impl SmapState {
+    /// 把一段已写入产物的文本计入行列游标（列按 UTF-16 码元）。
+    fn advance(&mut self, s: &str) {
+        // 按行拆分：最后一个换行之后的部分决定新列。
+        match s.rfind('\n') {
+            Some(nl) => {
+                self.line += s.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32;
+                self.col = s[nl + 1..].chars().map(char::len_utf16).sum::<usize>() as u32;
+            }
+            None => {
+                self.col += s.chars().map(char::len_utf16).sum::<usize>() as u32;
+            }
+        }
+    }
 }
 
 // 表达式优先级（越大绑定越紧）。用于自动补括号。
@@ -275,22 +463,123 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     }
 
     fn push(&mut self, s: &str) {
+        // minify 下相邻 token 去空格可能错误粘连（`in`+ident、`a`+`+`→`++`、`/`+`/`→注释）——
+        // 在真正拼接前按前后字符补一个必要空格。pretty 模式不触发（末尾多为空格/换行）。
+        if self.minify
+            && let (Some(&a), Some(&b)) = (self.out.as_bytes().last(), s.as_bytes().first())
+            && need_sep(a, b)
+        {
+            self.out.push(' ');
+            if let Some(sm) = &mut self.smap {
+                sm.col += 1;
+            }
+        }
         self.out.push_str(s);
+        if let Some(sm) = &mut self.smap {
+            sm.advance(s);
+        }
     }
 
     fn push_name(&mut self, atom: Atom) {
         // 零分配：借用驻留切片直接拷进输出缓冲，省去 resolve 的临时 String。
         // 闭包只写 out、不回调 interner，无重入死锁风险。
+        let minify = self.minify;
         let interner = self.interner;
         let out = &mut self.out;
-        interner.with_resolved(atom, |s| out.push_str(s));
+        let smap = self.smap.as_mut();
+        interner.with_resolved(atom, |s| {
+            // 与 push 相同的 token 边界守卫：关键字/标识符紧邻标识符时补空格（`return`+`x`）。
+            let mut pad = false;
+            if minify
+                && let (Some(&a), Some(&b)) = (out.as_bytes().last(), s.as_bytes().first())
+                && need_sep(a, b)
+            {
+                out.push(' ');
+                pad = true;
+            }
+            out.push_str(s);
+            // 名字不含换行，直接按 UTF-16 码元累加列。
+            if let Some(sm) = smap {
+                sm.col += pad as u32 + s.chars().map(char::len_utf16).sum::<usize>() as u32;
+            }
+        });
+    }
+
+    /// 在当前产物位置记录一条指向 `span.lo` 的映射（源侧行列推迟到序列化换算）。
+    ///
+    /// 合成节点（`Span::DUMMY`）不记录——它不对应任何源码位置，映射过去会把调试器
+    /// 指到文件开头。相同源偏移连续出现时去重，避免每个 token 都产生冗余段。
+    #[inline]
+    fn mark(&mut self, span: Span) {
+        if span.is_dummy() {
+            return;
+        }
+        let Some(sm) = &mut self.smap else { return };
+        if sm.last_src == Some(span.lo) {
+            return;
+        }
+        sm.last_src = Some(span.lo);
+        // 同一产物位置只保留**最后**一条映射：被完全擦除的语句（如链接后消失的 `import`）会先在
+        // 当前位置留下一条映射，而真正占据该位置的是其后的语句——后者必须覆盖前者，否则调试器
+        // 会把该位置指回已消失的源语句。
+        if let Some(last) = sm.mappings.last_mut()
+            && last.gen_line == sm.line
+            && last.gen_col == sm.col
+        {
+            last.src_offset = span.lo;
+            return;
+        }
+        sm.mappings.push(Mapping {
+            gen_line: sm.line,
+            gen_col: sm.col,
+            src_index: 0, // 模块内恒 0；bundler 合并时重写为真实源下标
+            src_offset: span.lo,
+        });
+    }
+
+    /// 可省的标点分隔符：pretty 原样发；minify 去掉**两端**空格（内部空格保留）。
+    /// 仅用于纯标点分隔（`, ` `; ` ` = ` `{ ` ` }` `: ` ` ? ` ` : ` `) ` ` {` ` => ` 等）。
+    /// 去空格后若与相邻 token 粘连，由 [`Codegen::push`] 的 [`need_sep`] 守卫兜底补回。
+    fn punct(&mut self, pretty: &'static str) {
+        if self.minify {
+            self.push(pretty.trim_matches(' '));
+        } else {
+            self.push(pretty);
+        }
+    }
+
+    /// 二元/逻辑/赋值运算符：pretty 两侧留空格；minify 下**词运算符**（`in`/`instanceof`）
+    /// 仍两侧留空格，**标点运算符**裸发（`+ +`/`- -`/`/ /` 的 token 粘连由 push 守卫兜底）。
+    fn binop(&mut self, op: &str) {
+        if self.minify && !op.as_bytes()[0].is_ascii_alphabetic() {
+            self.push(op);
+        } else {
+            self.push(" ");
+            self.push(op);
+            self.push(" ");
+        }
+    }
+
+    /// 可省的单个空格：pretty 发一个空格，minify 省略。用于体块前 `) {` 之间等。
+    fn sp(&mut self) {
+        if !self.minify {
+            self.out.push(' ');
+            if let Some(sm) = &mut self.smap {
+                sm.col += 1;
+            }
+        }
     }
 
     /// 发射一个**变量引用/绑定**标识符：若 mangling 侧表命中该 span，写新名，否则写原名。
     /// 只用于会被 mangle 的位置（标识符表达式、绑定模式、函数/类名）；属性名/成员名/导出名
     /// 走 [`Codegen::push_name`]，永不查表。
     fn push_ident(&mut self, ident: &Ident) {
-        if let Some(map) = self.rename
+        // SourceMap：标识符是列级定位的锚点（悬停求值、"跳转到定义"都依赖它）。
+        self.mark(ident.span);
+        // 合成节点（Span::DUMMY）永不参与 span 索引的侧表——DUMMY 是共享哨兵，
+        // 用作身份键会跨节点碰撞（见 emit_expr_inner 常量表守卫）。
+        if !ident.span.is_dummy()
+            && let Some(map) = self.rename
             && let Some(&nn) = map.get(&ident.span)
         {
             self.push_name(nn);
@@ -299,13 +588,25 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         self.push_name(ident.name);
     }
 
+    /// 标识符最终发射出的名字（若被 mangle 则为新名）。
+    fn ident_text(&self, ident: &Ident) -> String {
+        if !ident.span.is_dummy()
+            && let Some(map) = self.rename
+            && let Some(&nn) = map.get(&ident.span)
+        {
+            return self.name(nn);
+        }
+        self.name(ident.name)
+    }
+
     /// 该 span 处标识符是否被 mangle 重命名。
     fn is_renamed(&self, span: Span) -> bool {
-        self.rename.is_some_and(|m| m.contains_key(&span))
+        !span.is_dummy() && self.rename.is_some_and(|m| m.contains_key(&span))
     }
 
     /// 对象字面量 shorthand `{ x }` 的 value 标识符是否被重命名——若是，须展开为 `x: 新名`，
     /// 否则会把属性名也一起改掉。
+    #[allow(dead_code)] // 预留：非单包模式下用短名 `e` 指代 exports（当前单包路径统一走 `exports`→`$`）。
     fn ex(&self) -> &str {
         if self.minify_names { "e" } else { "exports" }
     }
@@ -337,6 +638,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         for _ in 0..self.indent {
             self.out.push_str("  ");
         }
+        if let Some(sm) = &mut self.smap {
+            sm.line += 1;
+            sm.col = self.indent as u32 * 2;
+            // 换行后允许同一源位置再记一条映射（新行需要自己的段）。
+            sm.last_src = None;
+        }
     }
 
     // ==================================================================
@@ -345,6 +652,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_program(&mut self, program: &Program) {
         let stmts = &program.body[..];
+
+        // 装饰器运行时辅助：先探测本模块是否含需降级的类，若有则在模块顶部注入
+        // `__esDecorate` / `__runInitializers`（对齐 tsc 的 per-file helper）。
+        if program_has_decorated_class(stmts) {
+            self.push(crate::decorators::RUN_INITIALIZERS);
+            self.push(crate::decorators::ES_DECORATE);
+            self.newline();
+        }
 
         // Pre-pass: prune zombie internal_reads from declarations that will be dropped.
         // A "zombie read" is a read of variable A from inside declaration B, where B itself
@@ -382,7 +697,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             if let Statement::ExportNamed(s) = stmt {
                 if let Some(decl) = &s.declaration {
                     let names = self.decl_names(decl);
-                    let all_unused = names.iter().all(|n| !self.shake.as_ref().unwrap().is_used(*n));
+                    let all_unused = names
+                        .iter()
+                        .all(|n| !self.shake.as_ref().unwrap().is_used(*n));
                     let pure = decl_is_pure(decl);
 
                     let mut reads = FxHashSet::default();
@@ -412,14 +729,17 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 if !exp.pure || dropped.contains(&i) {
                     continue;
                 }
-                let all_unused = exp.names.iter().all(|n| !self.shake.as_ref().unwrap().is_used(*n));
+                let all_unused = exp
+                    .names
+                    .iter()
+                    .all(|n| !self.shake.as_ref().unwrap().is_used(*n));
                 if !all_unused {
                     continue;
                 }
                 let all_readers_dropped = exp.names.iter().all(|n| {
-                    readers_of.get(n).map_or(true, |readers| {
-                        readers.iter().all(|r| dropped.contains(r))
-                    })
+                    readers_of
+                        .get(n)
+                        .map_or(true, |readers| readers.iter().all(|r| dropped.contains(r)))
                 });
                 if all_readers_dropped {
                     dropped.insert(i);
@@ -447,11 +767,16 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_statement(&mut self, stmt: &Statement) {
         // DCE: skip statements marked for removal by the DCE analysis.
+        // 合成语句（Span::DUMMY）从不参与 span 索引侧表，避免 DUMMY 键碰撞误删
+        // （如参数属性注入的 `this.x = x`）。
         if let Some(ctx) = self.minify_ctx
+            && !stmt.span().is_dummy()
             && ctx.remove_spans.contains(&stmt.span())
         {
             return;
         }
+        // SourceMap：每条语句在其产物起点记一条映射——这是调试器断点/栈帧定位的主要粒度。
+        self.mark(stmt.span());
         match stmt {
             Statement::VariableDeclaration(d) => {
                 if let Some(ctx) = self.minify_ctx {
@@ -462,7 +787,21 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
             }
             Statement::FunctionDeclaration(f) => self.emit_function(f),
-            Statement::ClassDeclaration(c) => self.emit_class(c),
+            Statement::ClassDeclaration(c) => {
+                // 装饰器降级把类变成 IIFE **表达式**，声明形态须自行补出绑定与 `;`。
+                if Self::class_needs_decorator_lowering(c) {
+                    self.push("let ");
+                    match c.id {
+                        Some(id) => self.push_ident(&id),
+                        None => self.push("_default"),
+                    }
+                    self.punct(" = ");
+                    self.emit_decorated_class(c);
+                    self.push(";");
+                } else {
+                    self.emit_class(c);
+                }
+            }
             Statement::Block(b) => self.emit_block(&b.body),
             Statement::Empty(_) => self.push(";"),
             Statement::Expression(e) => {
@@ -478,11 +817,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.push(";");
             }
             Statement::If(s) => {
-                // M4b: minify 下按常量 test 折叠死分支（decide-then-skip，不改 AST，Span 保持）。
+                // 按常量 test 折叠死分支（decide-then-skip，不改 AST，Span 保持）。
+                // **不再与 minify 耦合**：折叠只依赖「条件可在构建期定为常量」，语义中性且
+                // dev 同样受益（`process.env.NODE_ENV` 的死分支在 dev 产物里也应消失）。
                 // 被丢弃分支含提升声明（var/函数）则不折叠——丢弃提升绑定会致 ReferenceError。
-                if self.minify
-                    && let Some(cond) = self.const_eval_bool(&s.test)
-                {
+                if let Some(cond) = self.const_eval_bool(&s.test) {
                     let (kept, dropped): (Option<&Statement>, Option<&Statement>) = if cond {
                         (Some(&s.consequent), s.alternate.as_ref())
                     } else {
@@ -497,9 +836,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     }
                     // 被丢弃分支含提升声明 → 落到常规发射（保守不折叠）。
                 }
-                self.push("if (");
+                self.push(if self.minify { "if(" } else { "if (" });
                 self.emit_expr(&s.test, P_SEQUENCE);
-                self.push(") ");
+                self.punct(") ");
                 self.emit_statement(&s.consequent);
                 if let Some(alt) = &s.alternate {
                     self.push(" else ");
@@ -507,57 +846,62 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
             }
             Statement::For(s) => {
-                self.push("for (");
+                self.push(if self.minify { "for(" } else { "for (" });
                 if let Some(init) = &s.init {
                     match init {
                         ForInit::Variable(d) => self.emit_var_decl(d),
                         ForInit::Expression(e) => self.emit_expr(e, P_SEQUENCE),
                     }
                 }
-                self.push("; ");
+                self.punct("; ");
                 if let Some(t) = &s.test {
                     self.emit_expr(t, P_SEQUENCE);
                 }
-                self.push("; ");
+                self.punct("; ");
                 if let Some(u) = &s.update {
                     self.emit_expr(u, P_SEQUENCE);
                 }
-                self.push(") ");
+                self.punct(") ");
                 self.emit_statement(&s.body);
             }
             Statement::ForIn(s) => {
-                self.push("for (");
+                self.push(if self.minify { "for(" } else { "for (" });
                 self.emit_for_left(&s.left);
                 self.push(" in ");
                 self.emit_expr(&s.right, P_SEQUENCE);
-                self.push(") ");
+                self.punct(") ");
                 self.emit_statement(&s.body);
             }
             Statement::ForOf(s) => {
-                self.push(if s.is_await { "for await (" } else { "for (" });
+                self.push(match (s.is_await, self.minify) {
+                    (true, true) => "for await(",
+                    (true, false) => "for await (",
+                    (false, true) => "for(",
+                    (false, false) => "for (",
+                });
                 self.emit_for_left(&s.left);
                 self.push(" of ");
                 self.emit_expr(&s.right, P_ASSIGN);
-                self.push(") ");
+                self.punct(") ");
                 self.emit_statement(&s.body);
             }
             Statement::While(s) => {
-                self.push("while (");
+                self.push(if self.minify { "while(" } else { "while (" });
                 self.emit_expr(&s.test, P_SEQUENCE);
-                self.push(") ");
+                self.punct(") ");
                 self.emit_statement(&s.body);
             }
             Statement::DoWhile(s) => {
                 self.push("do ");
                 self.emit_statement(&s.body);
-                self.push(" while (");
+                self.push(if self.minify { "while(" } else { " while (" });
                 self.emit_expr(&s.test, P_SEQUENCE);
                 self.push(");");
             }
             Statement::Switch(s) => {
-                self.push("switch (");
+                self.push(if self.minify { "switch(" } else { "switch (" });
                 self.emit_expr(&s.discriminant, P_SEQUENCE);
-                self.push(") {");
+                self.push(if self.minify { "){" } else { ") {" });
                 self.indent += 1;
                 for case in s.cases.iter() {
                     self.newline();
@@ -617,7 +961,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     if let Some(p) = &h.param {
                         self.push("(");
                         self.emit_pattern(p);
-                        self.push(") ");
+                        self.punct(") ");
                     }
                     self.emit_block(&h.body.body);
                 }
@@ -628,13 +972,13 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             }
             Statement::Labeled(s) => {
                 self.push_name(s.label.name);
-                self.push(": ");
+                self.punct(": ");
                 self.emit_statement(&s.body);
             }
             Statement::With(s) => {
-                self.push("with (");
+                self.push(if self.minify { "with(" } else { "with (" });
                 self.emit_expr(&s.object, P_SEQUENCE);
-                self.push(") ");
+                self.punct(") ");
                 self.emit_statement(&s.body);
             }
             Statement::Debugger(_) => self.push("debugger;"),
@@ -676,7 +1020,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             return;
         }
         self.indent += 1;
-        let stmts = &body[..];
+        // 不可达代码消除：`return`/`throw`/`break`/`continue` 之后的语句永不执行。
+        // 但**提升声明仍生效**（`var`/函数声明会被提升），故其后若含提升声明则整体保留，
+        // 与 if 折叠用同一条守卫（`has_hoisted_decl`）。
+        let stmts = truncate_after_terminator(&body[..]);
         let mut i = 0;
         while i < stmts.len() {
             self.newline();
@@ -689,14 +1036,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_var_decl(&mut self, d: &VariableDeclaration) {
         self.push(d.kind.as_str());
-        self.push(" ");
+        self.sp();
         for (i, decl) in d.declarations.iter().enumerate() {
             if i > 0 {
-                self.push(", ");
+                self.punct(", ");
             }
             self.emit_pattern(&decl.id);
             if let Some(init) = &decl.init {
-                self.push(" = ");
+                self.punct(" = ");
                 self.emit_expr(init, P_ASSIGN);
             }
         }
@@ -705,14 +1052,20 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// Emit a variable declaration with variable elimination: skip unused
     /// pure-bindings, emit only the initializer for unused impure bindings.
     fn emit_var_decl_elim(&mut self, d: &VariableDeclaration, ctx: &MinifyCtx) {
+        // `using` / `await using`：绑定即使无引用也**不可删**——作用域结束时的 dispose 调用是
+        // 可观测副作用。降级成裸初始化式（本函数对「不纯 init」的处理）会静默丢掉 dispose。
+        if d.kind.is_using() {
+            self.emit_var_decl(d);
+            self.push(";");
+            return;
+        }
         let mut emitted = false;
         let mut in_var = false;
 
         for decl in d.declarations.iter() {
             let is_unused = match &decl.id {
-                Pattern::Ident(id) => {
-                    ctx.unused_vars.contains(&id.name)
-                }
+                // 按声明 span 判断（非名字）：避免删掉同名但在别处仍被使用的绑定。
+                Pattern::Ident(id) => ctx.unused_var_spans.contains(&id.span),
                 _ => false,
             };
 
@@ -722,7 +1075,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                         if emitted {
                             self.push(";");
                         }
+                        let needs_paren = starts_with_problematic(init);
+                        if needs_paren {
+                            self.push("(");
+                        }
                         self.emit_expr(init, P_SEQUENCE);
+                        if needs_paren {
+                            self.push(")");
+                        }
                         emitted = true;
                         in_var = false;
                     }
@@ -731,19 +1091,19 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             }
 
             if in_var {
-                self.push(", ");
+                self.punct(", ");
             } else {
                 if emitted {
                     self.push(";");
                 }
                 self.push(d.kind.as_str());
-                self.push(" ");
+                self.sp();
                 in_var = true;
             }
 
             self.emit_pattern(&decl.id);
             if let Some(init) = &decl.init {
-                self.push(" = ");
+                self.punct(" = ");
                 self.emit_expr(init, P_ASSIGN);
             }
             emitted = true;
@@ -762,6 +1122,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// Returns the index of the next statement to process.
     fn emit_merged_statement(&mut self, stmts: &[Statement], i: usize) -> usize {
         let stmt = &stmts[i];
+
+        // 合成语句（Span::DUMMY，如 enum IIFE 内的成员赋值、参数属性注入）不参与任何
+        // span 索引的语句级合并：DUMMY 是共享哨兵，会与其它 DUMMY 语句在 sequence/join
+        // 侧表里互相碰撞（例如把 `E["A"]=0` 误判为已合并的后继而整条跳过）。逐条原样发射。
+        if stmt.span().is_dummy() {
+            self.emit_statement(stmt);
+            return i + 1;
+        }
 
         // Skip hoisted var declarations (already emitted at function top)
         if let Some(ctx) = self.minify_ctx {
@@ -810,15 +1178,26 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// Merge consecutive same-kind VariableDeclarations: `var a=1; var b=2;` → `var a=1, b=2;`
     fn emit_joined_vars(&mut self, stmts: &[Statement], i: usize) -> usize {
         let ctx = self.minify_ctx.unwrap();
-        let Statement::VariableDeclaration(first) = &stmts[i] else { return i + 1 };
+        let Statement::VariableDeclaration(first) = &stmts[i] else {
+            return i + 1;
+        };
         let kind = first.kind;
+        // `using` / `await using` 不参与合并，也不参与未用绑定消除（见 emit_var_decl_elim）。
+        // 上游 statements.rs 已不产生此类 join 计划，这里再兜一层。
+        if kind.is_using() {
+            self.emit_var_decl(first);
+            self.push(";");
+            return i + 1;
+        }
 
         let mut emitted = false;
         let mut in_var = false;
         let mut j = i;
 
         while j < stmts.len() {
-            let Statement::VariableDeclaration(next) = &stmts[j] else { break };
+            let Statement::VariableDeclaration(next) = &stmts[j] else {
+                break;
+            };
             if next.kind != kind {
                 break;
             }
@@ -835,7 +1214,8 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
             for decl in next.declarations.iter() {
                 let is_unused = match &decl.id {
-                    Pattern::Ident(id) => ctx.unused_vars.contains(&id.name),
+                    // 按声明 span 判断（非名字）——见 emit_var_decl_elim 同款注释。
+                    Pattern::Ident(id) => ctx.unused_var_spans.contains(&id.span),
                     _ => false,
                 };
 
@@ -845,7 +1225,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                             if emitted {
                                 self.push(";");
                             }
+                            let needs_paren = starts_with_problematic(init);
+                            if needs_paren {
+                                self.push("(");
+                            }
                             self.emit_expr(init, P_SEQUENCE);
+                            if needs_paren {
+                                self.push(")");
+                            }
                             emitted = true;
                             in_var = false;
                         }
@@ -854,19 +1241,19 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
 
                 if in_var {
-                    self.push(", ");
+                    self.punct(", ");
                 } else {
                     if emitted {
                         self.push(";");
                     }
                     self.push(kind.as_str());
-                    self.push(" ");
+                    self.sp();
                     in_var = true;
                 }
 
                 self.emit_pattern(&decl.id);
                 if let Some(init) = &decl.init {
-                    self.push(" = ");
+                    self.punct(" = ");
                     self.emit_expr(init, P_ASSIGN);
                 }
                 emitted = true;
@@ -898,7 +1285,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         let mut first = true;
         let mut j = i;
         while j < stmts.len() {
-            let Statement::Expression(next) = &stmts[j] else { break };
+            let Statement::Expression(next) = &stmts[j] else {
+                break;
+            };
             if j > i {
                 let prev_span = stmts[j - 1].span();
                 if !ctx
@@ -910,7 +1299,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
             }
             if !first {
-                self.push(", ");
+                self.punct(", ");
             }
             first = false;
             self.emit_expr(&next.expression, P_ASSIGN);
@@ -929,24 +1318,28 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         &mut self,
         s: &IfStatement,
         _cand: &IfReturnCandidate,
-        _stmts: &[Statement],
+        stmts: &[Statement],
         i: usize,
     ) -> usize {
         let cons_ret_expr = extract_return_expression(&s.consequent);
-        let alt_ret_expr = s
-            .alternate
-            .as_ref()
-            .and_then(|alt| extract_return_expression(alt));
+        // Pattern 2（`if (c) return a; else return b;`）从 else 分支取 alternate；
+        // Pattern 1（`if (c) return a; return b;`，无 else）从紧邻的后继 return 语句取。
+        // 此前 Pattern 1 只看 `s.alternate`（恒为 None）→ 误发 `void 0` 并把真正的
+        // `return b` 整条跳过，丢失表达式（如 `av > bv ? sign : -sign` 变成 `void 0`）。
+        let alt_ret_expr = match &s.alternate {
+            Some(alt) => extract_return_expression(alt),
+            None => stmts.get(i + 1).and_then(extract_return_expression),
+        };
 
         self.push("return ");
         self.emit_expr(&s.test, P_CONDITIONAL);
-        self.push(" ? ");
+        self.punct(" ? ");
         if let Some(arg) = cons_ret_expr {
             self.emit_expr(arg, P_ASSIGN);
         } else {
             self.push("void 0");
         }
-        self.push(" : ");
+        self.punct(" : ");
         if let Some(arg) = alt_ret_expr {
             self.emit_expr(arg, P_ASSIGN);
         } else {
@@ -955,11 +1348,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         self.push(";");
 
         // Pattern 1 (no else): also skip the subsequent return statement
-        if s.alternate.is_none() {
-            i + 2
-        } else {
-            i + 1
-        }
+        if s.alternate.is_none() { i + 2 } else { i + 1 }
     }
 
     fn emit_for_left(&mut self, left: &ForLeft) {
@@ -981,14 +1370,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             match spec {
                 ImportSpecifier::Default { local, .. } => {
                     if wrote_leading {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     self.push_name(local.name);
                     wrote_leading = true;
                 }
                 ImportSpecifier::Namespace { local, .. } => {
                     if wrote_leading {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     self.push("* as ");
                     self.push_name(local.name);
@@ -1001,12 +1390,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         }
         if !named.is_empty() {
             if wrote_leading {
-                self.push(", ");
+                self.punct(", ");
             }
-            self.push("{ ");
+            self.punct("{ ");
             for (i, (imported, local)) in named.iter().enumerate() {
                 if i > 0 {
-                    self.push(", ");
+                    self.punct(", ");
                 }
                 self.emit_module_export_name(imported);
                 if !same_name(imported, &ModuleExportName::Ident(*local)) {
@@ -1014,14 +1403,35 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     self.push_name(local.name);
                 }
             }
-            self.push(" }");
+            self.punct(" }");
             wrote_leading = true;
         }
         if wrote_leading {
             self.push(" from ");
         }
         self.emit_string_atom(d.source);
+        self.emit_import_attributes(d.attributes);
         self.push(";");
+    }
+
+    /// 引入属性子句 `with { type: "json" }`（跟在模块说明符之后）。
+    ///
+    /// 仅**非链接**路径发射：链接路径下目标模块已被内联进包，属性对运行时不再有意义
+    /// （`.json` 的加载在 loader 层按扩展名完成，见 `wake_bundler::loader::json_to_js_module`）。
+    fn emit_import_attributes(&mut self, attrs: Option<&ImportAttributes>) {
+        let Some(a) = attrs else { return };
+        self.sp();
+        self.push(a.keyword.as_str());
+        self.punct(" { ");
+        for (i, item) in a.items.iter().enumerate() {
+            if i > 0 {
+                self.punct(", ");
+            }
+            self.emit_module_export_name(&item.key);
+            self.punct(": ");
+            self.emit_string_atom(item.value);
+        }
+        self.punct(" }");
     }
 
     fn emit_export_named(&mut self, s: &ExportNamedDeclaration) {
@@ -1030,10 +1440,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.emit_statement(decl);
             return;
         }
-        self.push("{ ");
+        self.punct("{ ");
         for (i, spec) in s.specifiers.iter().enumerate() {
             if i > 0 {
-                self.push(", ");
+                self.punct(", ");
             }
             self.emit_module_export_name(&spec.local);
             if !same_name(&spec.local, &spec.exported) {
@@ -1041,10 +1451,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.emit_module_export_name(&spec.exported);
             }
         }
-        self.push(" }");
+        self.punct(" }");
         if let Some(src) = s.source {
             self.push(" from ");
             self.emit_string_atom(src);
+            self.emit_import_attributes(s.attributes);
         }
         self.push(";");
     }
@@ -1069,6 +1480,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         }
         self.push(" from ");
         self.emit_string_atom(s.source);
+        self.emit_import_attributes(s.attributes);
         self.push(";");
     }
 
@@ -1142,15 +1554,15 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_export_named_linked(&mut self, s: &ExportNamedDeclaration) {
         if let Some(decl) = &s.declaration {
-            let names = self.decl_names(decl);
-            let decl_span = self.decl_span(decl);
+            // 每个绑定带自己的 span——导出赋值的**值**按 span 查 rename 表（mangle 后取新名，字符串键保留）。
+            let name_spans = self.decl_name_spans(decl);
             if self.shake.is_some() {
                 // 先在不可变借用下算好决策，再释放借用做可变发射（避免 borrowck 冲突）。
                 let (drop_all, used_flags): (bool, Vec<bool>) = {
                     let shake = self.shake.as_ref().unwrap();
-                    let all_unused = names.iter().all(|n| !shake.is_used(*n));
-                    let none_read = names.iter().all(|n| !shake.is_read(*n));
-                    let used_flags = names.iter().map(|n| shake.is_used(*n)).collect();
+                    let all_unused = name_spans.iter().all(|(n, _)| !shake.is_used(*n));
+                    let none_read = name_spans.iter().all(|(n, _)| !shake.is_read(*n));
+                    let used_flags = name_spans.iter().map(|(n, _)| shake.is_used(*n)).collect();
                     // 整条声明既无外部使用、模块内也未引用、且无副作用 → 安全移除（Tree Shaking）。
                     (all_unused && none_read && decl_is_pure(decl), used_flags)
                 };
@@ -1159,18 +1571,18 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
                 // 否则保留声明，但仅为**已用**导出发绑定行（移除未用绑定永远安全）。
                 self.emit_statement(decl);
-                for (n, &used) in names.iter().zip(&used_flags) {
+                for ((n, sp), &used) in name_spans.iter().zip(&used_flags) {
                     if used {
                         self.newline();
-                        self.emit_export_binding(*n, decl_span);
+                        self.emit_export_binding(*n, Some(*sp));
                     }
                 }
                 return;
             }
             self.emit_statement(decl);
-            for n in names {
+            for (n, sp) in name_spans {
                 self.newline();
-                self.emit_export_binding(n, decl_span);
+                self.emit_export_binding(n, Some(sp));
             }
             return;
         }
@@ -1188,7 +1600,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     self.newline();
                     let exported = self.module_export_name_string(&spec.exported);
                     let local = self.module_export_name_string(&spec.local);
-                    self.push(&format!("{ex}[{exported:?}] = {tmp}[{local:?}];", ex = self.ex()));
+                    // 用字面量 `exports`（与 emit_export_binding / 本地 re-export 一致）——单包模式
+                    // 由 compact_body_names 统一转 `$`。曾误用 `self.ex()`（minify_names 下 = "e"）→
+                    // 单包 wrapper 无 `e` 绑定 → 运行期 `e is not defined`。
+                    self.push(&format!("exports[{exported:?}] = {tmp}[{local:?}];"));
                 }
             }
             None => {
@@ -1202,7 +1617,13 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     }
                     first = false;
                     let exported = self.module_export_name_string(&spec.exported);
-                    let local = self.module_export_name_string(&spec.local);
+                    // 值随 mangle：本地 re-export 的 local 可能被重命名（按其 span 查表）。
+                    let local_atom = module_export_name_atom(&spec.local);
+                    let local_val = match &spec.local {
+                        ModuleExportName::Ident(id) => self.renamed_or(local_atom, id.span),
+                        ModuleExportName::String(_) => local_atom,
+                    };
+                    let local = self.name(local_val);
                     self.push(&format!("exports[{exported:?}] = {local};"));
                 }
             }
@@ -1214,14 +1635,60 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         self.shake.as_ref().is_some_and(|sh| !sh.is_used(exported))
     }
 
-    /// 发射一行 `exports["name"] = name;`：借用驻留切片直接写出，零分配。
-    /// `{s:?}` 对 `&str` 与原 `String` 的 Debug 输出一致，字节不变。
-    fn emit_export_binding(&mut self, name: Atom, _decl_span: Option<Span>) {
-        let interner = self.interner;
-        let out = &mut self.out;
-        interner.with_resolved(name, |s| {
-            let _ = write!(out, "exports[{s:?}] = {s};");
-        });
+    /// 绑定 `name`（声明于 `span`）经 mangle 后的实际名——命中 rename 侧表则取新名，否则原名。
+    /// 用于**导出赋值的值**：`exports["原名"] = 新名`（字符串键保留公开契约，值随 mangle）。
+    fn renamed_or(&self, name: Atom, span: Span) -> Atom {
+        if !span.is_dummy()
+            && let Some(map) = self.rename
+            && let Some(&nn) = map.get(&span)
+        {
+            nn
+        } else {
+            name
+        }
+    }
+
+    /// 发射一行 `exports["name"] = value;`：键用导出名（原名，公开契约），值随 mangle（按绑定 span 查表）。
+    fn emit_export_binding(&mut self, name: Atom, decl_span: Option<Span>) {
+        let value = decl_span.map_or(name, |sp| self.renamed_or(name, sp));
+        let key = self.interner.resolve(name);
+        let val = self.interner.resolve(value);
+        let before = self.out.len();
+        let _ = write!(self.out, "exports[{key:?}] = {val};");
+        self.sync_from(before);
+    }
+
+    /// 同步 sourcemap 游标：把 `self.out[from..]`（绕过 [`Codegen::push`] 直写的部分）计入行列。
+    /// 直写点（`write!`/`write_number`/字符串转义）用它兜底，保证游标不漂移。
+    #[inline]
+    fn sync_from(&mut self, from: usize) {
+        if self.smap.is_none() {
+            return;
+        }
+        // 借用分离：先取出待计文本的副本长度信息，再改游标。
+        let tail = &self.out[from..];
+        let (nl, last_line_units, total_units) = {
+            let mut nl = 0u32;
+            let mut units = 0usize;
+            let mut since_nl = 0usize;
+            for ch in tail.chars() {
+                if ch == '\n' {
+                    nl += 1;
+                    since_nl = 0;
+                } else {
+                    since_nl += ch.len_utf16();
+                }
+                units += ch.len_utf16();
+            }
+            (nl, since_nl, units)
+        };
+        let sm = self.smap.as_mut().expect("checked above");
+        if nl > 0 {
+            sm.line += nl;
+            sm.col = last_line_units as u32;
+        } else {
+            sm.col += total_units as u32;
+        }
     }
 
     fn emit_export_default_linked(&mut self, s: &ExportDefaultDeclaration) {
@@ -1232,7 +1699,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         match s.declaration {
             ExportDefaultKind::Function(f) => match f.id {
                 Some(id) => {
-                    let n = self.name(id.name);
+                    let n = self.name(self.renamed_or(id.name, id.span));
                     let read = self.shake.as_ref().is_some_and(|sh| sh.is_read(id.name));
                     // 命名默认函数：未用且内部未引用 → 整体移除；否则保留声明，按需发绑定。
                     if !default_used && !read {
@@ -1255,7 +1722,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             },
             ExportDefaultKind::Class(c) => match c.id {
                 Some(id) => {
-                    let n = self.name(id.name);
+                    let n = self.name(self.renamed_or(id.name, id.span));
                     let read = self.shake.as_ref().is_some_and(|sh| sh.is_read(id.name));
                     if !default_used && !read && class_is_pure(c) {
                         return;
@@ -1339,6 +1806,31 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         }
     }
 
+    /// 声明的 (绑定名, 绑定标识符 span) 列表——供导出赋值行按各自 span 查 rename 表发正确的值。
+    /// 变量声明按声明符逐个（含解构里每个绑定），函数/类取其 id。
+    fn decl_name_spans(&self, stmt: &Statement) -> Vec<(Atom, Span)> {
+        let mut out = Vec::new();
+        match stmt {
+            Statement::FunctionDeclaration(f) => {
+                if let Some(id) = f.id {
+                    out.push((id.name, id.span));
+                }
+            }
+            Statement::ClassDeclaration(c) => {
+                if let Some(id) = c.id {
+                    out.push((id.name, id.span));
+                }
+            }
+            Statement::VariableDeclaration(d) => {
+                for decl in d.declarations.iter() {
+                    collect_pattern_name_spans(&decl.id, &mut out);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
     /// linker 存在且是 `require("literal")` 调用时改写为 `__wake_require__(id)`；返回是否已发射。
     fn emit_require_call(&mut self, c: &CallExpression) -> bool {
         if let Expression::Identifier(id) = &c.callee
@@ -1366,12 +1858,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         if f.is_generator {
             self.push("*");
         }
-        self.push(" ");
+        self.sp();
         if let Some(id) = f.id {
             self.push_ident(&id);
         }
         self.emit_params(&f.params);
-        self.push(" ");
+        self.sp();
         match f.body {
             Some(body) => {
                 if let Some(ctx) = self.minify_ctx
@@ -1425,12 +1917,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         for d in decls {
             for decl in d.declarations.iter() {
                 if !first {
-                    self.push(", ");
+                    self.punct(", ");
                 }
                 first = false;
                 self.emit_pattern(&decl.id);
                 if let Some(init) = &decl.init {
-                    self.push(" = ");
+                    self.punct(" = ");
                     self.emit_expr(init, P_ASSIGN);
                 }
             }
@@ -1445,7 +1937,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             let mut last_used = params.len();
             for (i, p) in params.iter().enumerate().rev() {
                 if let Pattern::Ident(id) = p {
-                    if ctx.unused_vars.contains(&id.name) {
+                    // 按参数声明 span 判断（非名字）：否则某处同名参数未使用时，会把
+                    // 本函数在用的末尾参数一并删掉（曾致 react-dom `jf is not defined`）。
+                    if ctx.unused_var_spans.contains(&id.span) {
                         last_used = i;
                         continue;
                     }
@@ -1460,24 +1954,36 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         self.push("(");
         for i in 0..end {
             if i > 0 {
-                self.push(", ");
+                self.punct(", ");
             }
             self.emit_pattern(&params[i]);
         }
         self.push(")");
     }
 
+    /// 该类是否需要装饰器降级（类自身或任一成员带装饰器）。
+    ///
+    /// `accessor` auto-accessor 字段的降级（私有存储 + get/set 对）未实现，含之则整体放弃转换
+    /// ——宁可原样发射（运行时报错可见），也不产出**看似成功但语义错误**的代码。
+    fn class_needs_decorator_lowering(c: &Class) -> bool {
+        class_needs_decorator_lowering(c)
+    }
+
     fn emit_class(&mut self, c: &Class) {
+        if Self::class_needs_decorator_lowering(c) {
+            self.emit_decorated_class(c);
+            return;
+        }
         self.push("class");
         if let Some(id) = c.id {
-            self.push(" ");
+            self.sp();
             self.push_ident(&id);
         }
         if let Some(sc) = &c.super_class {
             self.push(" extends ");
             self.emit_expr(sc, P_CALL_MEMBER);
         }
-        self.push(" {");
+        self.punct(" {");
         self.indent += 1;
         for member in c.body.iter() {
             self.newline();
@@ -1488,6 +1994,321 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.newline();
         }
         self.push("}");
+    }
+
+    /// 发射装饰器降级后的类（TC39 Stage-3，对齐 tsc emit）。见 [`crate::decorators`]。
+    fn emit_decorated_class(&mut self, c: &Class) {
+        use crate::decorators::{DecoratedKind, sanitize};
+        self.needs_decorator_helpers.set(true);
+
+        // 收集被装饰成员：(内部变量前缀, 属性名, kind, 是否静态)
+        struct Decorated<'x, 'a> {
+            var: String,
+            name: String,
+            kind: DecoratedKind,
+            is_static: bool,
+            decorators: &'x AVec<'a, Expression<'a>>,
+        }
+        let mut items: Vec<Decorated> = Vec::new();
+        for m in c.body.iter() {
+            match m {
+                ClassMember::Method(md) if !md.decorators.is_empty() => {
+                    let Some(name) = self.static_key_name(&md.key) else {
+                        continue;
+                    };
+                    let kind = match md.kind {
+                        MethodKind::Get => DecoratedKind::Getter,
+                        MethodKind::Set => DecoratedKind::Setter,
+                        _ => DecoratedKind::Method,
+                    };
+                    items.push(Decorated {
+                        var: format!(
+                            "_{}{}",
+                            if md.is_static { "static_" } else { "" },
+                            sanitize(&name)
+                        ),
+                        name,
+                        kind,
+                        is_static: md.is_static,
+                        decorators: &md.decorators,
+                    });
+                }
+                ClassMember::Property(p) if !p.decorators.is_empty() => {
+                    let Some(name) = self.static_key_name(&p.key) else {
+                        continue;
+                    };
+                    items.push(Decorated {
+                        var: format!(
+                            "_{}{}",
+                            if p.is_static { "static_" } else { "" },
+                            sanitize(&name)
+                        ),
+                        name,
+                        kind: DecoratedKind::Field,
+                        is_static: p.is_static,
+                        decorators: &p.decorators,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let has_class_dec = !c.decorators.is_empty();
+        // 非字段成员才产生 `_instance/_staticExtraInitializers`（字段走各自的 `_X_extraInitializers`）。
+        let has_instance_nonfield = items
+            .iter()
+            .any(|i| !i.is_static && i.kind != DecoratedKind::Field);
+        let has_static_nonfield = items
+            .iter()
+            .any(|i| i.is_static && i.kind != DecoratedKind::Field);
+        let has_instance_any = items.iter().any(|i| !i.is_static);
+        let has_static_any = items.iter().any(|i| i.is_static);
+        let class_name =
+            c.id.map(|id| self.ident_text(&id))
+                .unwrap_or_else(|| "_default".to_string());
+        // 静态侧的 `this`：类被装饰时须用 `_classThis`（装饰可能替换类本身）。
+        let static_target = if has_class_dec { "_classThis" } else { "this" };
+
+        // —— IIFE 头：声明全部内部变量 ——
+        self.push("(()=>{");
+        if has_instance_nonfield {
+            self.push("let _instanceExtraInitializers=[];");
+        }
+        if has_static_nonfield {
+            self.push("let _staticExtraInitializers=[];");
+        }
+        for it in &items {
+            self.push(&format!("let {}_decorators;", it.var));
+            if it.kind == DecoratedKind::Field {
+                self.push(&format!(
+                    "let {v}_initializers=[];let {v}_extraInitializers=[];",
+                    v = it.var
+                ));
+            }
+        }
+        if has_class_dec {
+            self.push("let _classDecorators;let _classDescriptor;let _classExtraInitializers=[];let _classThis;");
+        }
+
+        // —— 类本体 ——
+        self.push(&format!("var {class_name}=class"));
+        if let Some(sc) = &c.super_class {
+            self.push(" extends ");
+            self.emit_expr(sc, P_CALL_MEMBER);
+        }
+        self.push("{");
+        if has_class_dec {
+            self.push("static{_classThis=this;}");
+        }
+
+        // static 块 #1：填装饰器数组 → 逐元素 __esDecorate → 类装饰。
+        self.push("static{");
+        for it in &items {
+            self.push(&format!("{}_decorators=[", it.var));
+            for (i, d) in it.decorators.iter().enumerate() {
+                if i > 0 {
+                    self.push(",");
+                }
+                self.emit_expr(d, P_ASSIGN);
+            }
+            self.push("];");
+        }
+        if has_class_dec {
+            self.push("_classDecorators=[");
+            for (i, d) in c.decorators.iter().enumerate() {
+                if i > 0 {
+                    self.push(",");
+                }
+                self.emit_expr(d, P_ASSIGN);
+            }
+            self.push("];");
+        }
+        // 顺序对齐 tsc：非字段（静态→实例）→ 字段（静态→实例）。
+        let ordered = |field: bool, stat: bool| {
+            items
+                .iter()
+                .filter(move |i| (i.kind == DecoratedKind::Field) == field && i.is_static == stat)
+        };
+        for it in ordered(false, true)
+            .chain(ordered(false, false))
+            .chain(ordered(true, true))
+            .chain(ordered(true, false))
+        {
+            self.emit_es_decorate_call(it.var.as_str(), &it.name, it.kind, it.is_static);
+        }
+        if has_class_dec {
+            // `context.name` 用**源码原名**字面量，而非 tsc 的 `_classThis.name`——后者在
+            // mangler 重命名类绑定后会变成压缩名，装饰器读到的名字就错了。
+            let src_name = c.id.map(|id| self.name(id.name)).unwrap_or_default();
+            self.push(&format!(
+                "__esDecorate(null,_classDescriptor={{value:_classThis}},_classDecorators,{{kind:\"class\",name:{n:?}}},null,_classExtraInitializers);{class_name}=_classThis=_classDescriptor.value;",
+                n = src_name
+            ));
+        }
+        self.push("}");
+
+        // —— 成员：被装饰字段的初值需串联 extraInitializers ——
+        // 首个被装饰字段跑 `_{instance,static}ExtraInitializers`（若存在），其后每个跑**前一个**
+        // 字段的 `_extraInitializers`；最后一个的 `_extraInitializers` 即该侧「尾部」。
+        let mut inst_prev: Option<String> =
+            has_instance_nonfield.then(|| "_instanceExtraInitializers".to_string());
+        let mut stat_prev: Option<String> =
+            has_static_nonfield.then(|| "_staticExtraInitializers".to_string());
+        let mut ctor_emitted = false;
+
+        for m in c.body.iter() {
+            self.newline();
+            match m {
+                ClassMember::Property(p) if !p.decorators.is_empty() => {
+                    let name = self.static_key_name(&p.key).unwrap_or_default();
+                    let var = format!(
+                        "_{}{}",
+                        if p.is_static { "static_" } else { "" },
+                        sanitize(&name)
+                    );
+                    let (target, prev) = if p.is_static {
+                        (static_target, &mut stat_prev)
+                    } else {
+                        ("this", &mut inst_prev)
+                    };
+                    let pre = prev.clone();
+                    if p.is_static {
+                        self.push("static ");
+                    }
+                    self.emit_property_key(&p.key, p.computed);
+                    self.push("=");
+                    match &pre {
+                        Some(pv) => self.push(&format!(
+                            "(__runInitializers({target},{pv}),__runInitializers({target},{var}_initializers,"
+                        )),
+                        None => {
+                            self.push(&format!("__runInitializers({target},{var}_initializers,"))
+                        }
+                    }
+                    match &p.value {
+                        Some(v) => self.emit_expr(v, P_ASSIGN),
+                        None => self.push("void 0"),
+                    }
+                    self.push(if pre.is_some() { "));" } else { ");" });
+                    *prev = Some(format!("{var}_extraInitializers"));
+                }
+                ClassMember::Method(md)
+                    if md.kind == MethodKind::Constructor && has_instance_any =>
+                {
+                    // 显式构造函数：在体首插入实例侧 extraInitializers（对齐 tsc）。
+                    ctor_emitted = true;
+                    let tail = inst_prev
+                        .clone()
+                        .unwrap_or_else(|| "_instanceExtraInitializers".to_string());
+                    // `emit_params` 自带括号，此处不可再补。
+                    self.push("constructor");
+                    self.emit_params(&md.value.params);
+                    self.push("{");
+                    self.push(&format!("__runInitializers(this,{tail});"));
+                    if let Some(body) = &md.value.body {
+                        for st in body.statements.iter() {
+                            self.emit_statement(st);
+                        }
+                    }
+                    self.push("}");
+                }
+                other => self.emit_class_member(other),
+            }
+        }
+
+        // 无显式构造函数时合成一个，跑实例侧尾部。
+        if has_instance_any && !ctor_emitted {
+            let tail = inst_prev
+                .clone()
+                .unwrap_or_else(|| "_instanceExtraInitializers".to_string());
+            self.newline();
+            if c.super_class.is_some() {
+                self.push(&format!(
+                    "constructor(...args){{super(...args);__runInitializers(this,{tail});}}"
+                ));
+            } else {
+                self.push(&format!("constructor(){{__runInitializers(this,{tail});}}"));
+            }
+        }
+
+        // 尾部 static 块：静态侧尾部 + 类 extraInitializers（须在全部静态字段初始化之后）。
+        if has_static_any || has_class_dec {
+            self.newline();
+            self.push("static{");
+            if has_static_any {
+                let tail = stat_prev
+                    .clone()
+                    .unwrap_or_else(|| "_staticExtraInitializers".to_string());
+                self.push(&format!("__runInitializers({static_target},{tail});"));
+            }
+            if has_class_dec {
+                self.push("__runInitializers(_classThis,_classExtraInitializers);");
+            }
+            self.push("}");
+        }
+
+        self.push("};");
+        if has_class_dec {
+            self.push(&format!("return {class_name}=_classThis;"));
+        } else {
+            self.push(&format!("return {class_name};"));
+        }
+        self.push("})()");
+    }
+
+    /// 发射一次 `__esDecorate(...)` 调用。
+    fn emit_es_decorate_call(
+        &mut self,
+        var: &str,
+        name: &str,
+        kind: crate::decorators::DecoratedKind,
+        is_static: bool,
+    ) {
+        use crate::decorators::DecoratedKind;
+        // 名字作为 JS 字符串字面量嵌入（属性名可能含引号/反斜杠）。
+        let key = format!("{name:?}");
+        // field 的 target 为 null（值经 initializers 注入），其余挂到 ctor/prototype 上。
+        let ctor = if kind == DecoratedKind::Field {
+            "null"
+        } else {
+            "this"
+        };
+        let access = match kind {
+            DecoratedKind::Field => {
+                format!("{{has:o=>{key} in o,get:o=>o[{key}],set:(o,v)=>{{o[{key}]=v;}}}}")
+            }
+            DecoratedKind::Setter => format!("{{has:o=>{key} in o,set:(o,v)=>{{o[{key}]=v;}}}}"),
+            _ => format!("{{has:o=>{key} in o,get:o=>o[{key}]}}"),
+        };
+        let (inits, extra) = if kind == DecoratedKind::Field {
+            (
+                format!("{var}_initializers"),
+                format!("{var}_extraInitializers"),
+            )
+        } else {
+            (
+                "null".to_string(),
+                if is_static {
+                    "_staticExtraInitializers".to_string()
+                } else {
+                    "_instanceExtraInitializers".to_string()
+                },
+            )
+        };
+        self.push(&format!(
+            "__esDecorate({ctor},null,{var}_decorators,{{kind:\"{k}\",name:{key},static:{is_static},private:false,access:{access}}},{inits},{extra});",
+            k = kind.as_str()
+        ));
+    }
+
+    /// 取静态可知的成员名（标识符/字符串/数字键）；计算键返回 `None`（不降级）。
+    fn static_key_name(&self, key: &PropertyKey) -> Option<String> {
+        match key {
+            PropertyKey::Ident(id) => Some(self.name(id.name)),
+            PropertyKey::String(s) => Some(self.name(s.value)),
+            PropertyKey::Number(n) => Some(format!("{}", n.value)),
+            _ => None,
+        }
     }
 
     fn emit_class_member(&mut self, member: &ClassMember) {
@@ -1509,7 +2330,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
                 self.emit_property_key(&m.key, m.computed);
                 self.emit_params(&m.value.params);
-                self.push(" ");
+                self.sp();
                 match m.value.body {
                     Some(b) => self.emit_block(&b.statements),
                     None => self.push("{}"),
@@ -1519,9 +2340,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 if p.is_static {
                     self.push("static ");
                 }
+                // auto-accessor（`accessor x = 1`）：语义是私有存储 + 自动 get/set 对，
+                // 与普通字段不同，修饰符必须原样发出。
+                if p.accessor {
+                    self.push("accessor ");
+                }
                 self.emit_property_key(&p.key, p.computed);
                 if let Some(v) = &p.value {
-                    self.push(" = ");
+                    self.punct(" = ");
                     self.emit_expr(v, P_ASSIGN);
                 }
                 self.push(";");
@@ -1545,7 +2371,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         match key {
             PropertyKey::Ident(id) => self.push_name(id.name),
             PropertyKey::String(s) => self.emit_string_atom(s.value),
-            PropertyKey::Number(n) => write_number(&mut self.out, n.value),
+            PropertyKey::Number(n) => {
+                let before = self.out.len();
+                write_number(&mut self.out, n.value);
+                self.sync_from(before);
+            }
             PropertyKey::Private(id) => {
                 self.push("#");
                 self.push_name(id.name);
@@ -1569,7 +2399,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.push("[");
                 for (i, el) in a.elements.iter().enumerate() {
                     if i > 0 {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     if let Some(p) = el {
                         self.emit_pattern(p);
@@ -1578,11 +2408,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.push("]");
             }
             Pattern::Object(o) => {
-                self.push("{ ");
+                self.punct("{ ");
                 let mut first = true;
                 for p in o.properties.iter() {
                     if !first {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     first = false;
                     // mangle 后绑定名改变时展开 shorthand，避免连带改掉属性名。
@@ -1590,22 +2420,22 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                         self.emit_pattern(&p.value);
                     } else {
                         self.emit_property_key(&p.key, p.computed);
-                        self.push(": ");
+                        self.punct(": ");
                         self.emit_pattern(&p.value);
                     }
                 }
                 if let Some(rest) = &o.rest {
                     if !first {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     self.push("...");
                     self.emit_pattern(&rest.argument);
                 }
-                self.push(" }");
+                self.punct(" }");
             }
             Pattern::Assignment(a) => {
                 self.emit_pattern(&a.left);
-                self.push(" = ");
+                self.punct(" = ");
                 self.emit_expr(&a.right, P_ASSIGN);
             }
             Pattern::Rest(r) => {
@@ -1622,20 +2452,27 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     fn emit_expr(&mut self, expr: &Expression, min_prec: u8) {
         // Variable inlining (Phase 2.4): if the identifier resolves to a single-use
         // pure variable, emit its initializer expression directly.
-        if let Expression::Identifier(id) = expr {
-            if let Some(ctx) = self.minify_ctx
-                && let Some(inline_expr) = ctx.inline_vars.get(&id.name)
-            {
-                let prec = expr_precedence(inline_expr);
-                let parens = prec < min_prec;
-                if parens {
-                    self.push("(");
+        // Skip inlining when in write-target position (Update argument / Assignment left)
+        // to avoid producing invalid syntax like `(1 << bf) = 1`.
+        if !self.skip_inline {
+            if let Expression::Identifier(id) = expr {
+                // 按标识符**引用 span**（非名字）命中内联,只替换那唯一一次使用,
+                // 不波及其它作用域的同名变量。合成节点(DUMMY)不参与。
+                if let Some(ctx) = self.minify_ctx
+                    && !id.span.is_dummy()
+                    && let Some(inline_expr) = ctx.inline_vars.get(&id.span)
+                {
+                    let prec = expr_precedence(inline_expr);
+                    let parens = prec < min_prec;
+                    if parens {
+                        self.push("(");
+                    }
+                    self.emit_expr_inner(inline_expr);
+                    if parens {
+                        self.push(")");
+                    }
+                    return;
                 }
-                self.emit_expr_inner(inline_expr);
-                if parens {
-                    self.push(")");
-                }
-                return;
             }
         }
         let prec = expr_precedence(expr);
@@ -1651,7 +2488,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_expr_inner(&mut self, expr: &Expression) {
         // 若 minify 引擎已确定该表达式的常量值，直接发射折叠结果。
-        if let Some(ctx) = self.minify_ctx {
+        // 合成表达式（Span::DUMMY）跳过：DUMMY 是共享哨兵，多个合成字面量会在
+        // constants 表上碰撞（last-write-wins），曾导致整个 enum IIFE 被替换成最后一个
+        // 成员名字符串（如 `var a = "Archived"`）。
+        if let Some(ctx) = self.minify_ctx
+            && !expr.span().is_dummy()
+        {
             if let Some(val) = ctx.constants.get(&expr.span()) {
                 self.push(&val.to_source());
                 return;
@@ -1666,7 +2508,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 if self.minify {
                     self.push(&write_number_minified(n.value));
                 } else {
+                    let before = self.out.len();
                     write_number(&mut self.out, n.value);
+                    self.sync_from(before);
                 }
             }
             Expression::StringLiteral(s) => self.emit_string_atom(s.value),
@@ -1711,7 +2555,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.push("[");
                 for (i, el) in a.elements.iter().enumerate() {
                     if i > 0 {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     if let Some(e) = el {
                         self.emit_expr(e, P_ASSIGN);
@@ -1725,6 +2569,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             Expression::Class(c) => self.emit_class(c),
             Expression::Unary(u) => {
                 if let Some(ctx) = self.minify_ctx
+                    && !u.span.is_dummy()
                     && ctx.double_not_spans.contains(&u.span)
                 {
                     if let Expression::Unary(inner) = &u.argument {
@@ -1742,9 +2587,13 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             Expression::Update(u) => {
                 if u.prefix {
                     self.push(u.operator.as_str());
+                    self.skip_inline = true;
                     self.emit_expr(&u.argument, P_UNARY);
+                    self.skip_inline = false;
                 } else {
+                    self.skip_inline = true;
                     self.emit_expr(&u.argument, P_POSTFIX);
+                    self.skip_inline = false;
                     self.push(u.operator.as_str());
                 }
             }
@@ -1757,31 +2606,34 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     (prec, prec + 1)
                 };
                 self.emit_expr(&b.left, left_min);
-                self.push(" ");
-                self.push(b.operator.as_str());
-                self.push(" ");
+                self.binop(b.operator.as_str());
                 self.emit_expr(&b.right, right_min);
             }
             Expression::Logical(l) => {
                 let prec = logical_prec(l.operator);
                 self.emit_expr(&l.left, prec);
-                self.push(" ");
-                self.push(l.operator.as_str());
-                self.push(" ");
+                self.binop(l.operator.as_str());
                 self.emit_expr(&l.right, prec + 1);
             }
             Expression::Assignment(a) => {
+                self.skip_inline = true;
                 self.emit_expr(&a.left, P_CALL_MEMBER);
-                self.push(" ");
-                self.push(a.operator.as_str());
-                self.push(" ");
+                self.skip_inline = false;
+                self.binop(a.operator.as_str());
                 self.emit_expr(&a.right, P_ASSIGN);
             }
             Expression::Conditional(c) => {
+                // 常量条件的三元同样折叠——与 if 折叠同源（`const_eval_bool` 只对纯节点求值，
+                // 有副作用的 test 会被拒绝，故直接取存活分支是安全的）。
+                if let Some(cond) = self.const_eval_bool(&c.test) {
+                    let kept = if cond { &c.consequent } else { &c.alternate };
+                    self.emit_expr(kept, P_ASSIGN);
+                    return;
+                }
                 self.emit_expr(&c.test, P_CONDITIONAL + 1);
-                self.push(" ? ");
+                self.punct(" ? ");
                 self.emit_expr(&c.consequent, P_ASSIGN);
-                self.push(" : ");
+                self.punct(" : ");
                 self.emit_expr(&c.alternate, P_ASSIGN);
             }
             Expression::Call(c) => {
@@ -1808,7 +2660,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             Expression::Sequence(s) => {
                 for (i, e) in s.expressions.iter().enumerate() {
                     if i > 0 {
-                        self.push(", ");
+                        self.punct(", ");
                     }
                     self.emit_expr(e, P_ASSIGN);
                 }
@@ -1859,7 +2711,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     self.push("import(");
                     self.emit_expr(&i.source, P_ASSIGN);
                     if let Some(o) = &i.options {
-                        self.push(", ");
+                        self.punct(", ");
                         self.emit_expr(o, P_ASSIGN);
                     }
                     self.push(")");
@@ -1929,6 +2781,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_member(&mut self, m: &MemberExpression) {
         if !m.optional
+            && !m.span.is_dummy()
             && let Some(ctx) = self.minify_ctx
             && let Some(dot_name) = ctx.bracket_to_dot.get(&m.span)
         {
@@ -1942,6 +2795,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             MemberProperty::Ident(id) => {
                 self.push(if m.optional { "?." } else { "." });
                 if !m.optional
+                    && !id.span.is_dummy()
                     && let Some(map) = self.prop_rename
                     && let Some(&nn) = map.get(&id.span)
                 {
@@ -1969,7 +2823,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         self.push("(");
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                self.push(", ");
+                self.punct(", ");
             }
             self.emit_expr(arg, P_ASSIGN);
         }
@@ -1981,10 +2835,10 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.push("{}");
             return;
         }
-        self.push("{ ");
+        self.punct("{ ");
         for (i, m) in o.properties.iter().enumerate() {
             if i > 0 {
-                self.push(", ");
+                self.punct(", ");
             }
             match m {
                 ObjectMember::Spread(s) => {
@@ -1994,7 +2848,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 ObjectMember::Property(p) => self.emit_object_property(p),
             }
         }
-        self.push(" }");
+        self.punct(" }");
     }
 
     fn emit_object_property(&mut self, p: &ObjectProperty) {
@@ -2014,7 +2868,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             }
             self.emit_property_key(&p.key, p.computed);
             self.emit_params(&f.params);
-            self.push(" ");
+            self.sp();
             match f.body {
                 Some(b) => self.emit_block(&b.statements),
                 None => self.push("{}"),
@@ -2029,15 +2883,16 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             && p.kind == PropertyKind::Init
             && !p.shorthand
             && let PropertyKey::Ident(id) = &p.key
+            && !id.span.is_dummy()
             && let Some(map) = self.prop_rename
             && let Some(&nn) = map.get(&id.span)
         {
             self.push_name(nn);
-            self.push(": ");
+            self.punct(": ");
             self.emit_expr(&p.value, P_ASSIGN);
         } else {
             self.emit_property_key(&p.key, p.computed);
-            self.push(": ");
+            self.punct(": ");
             self.emit_expr(&p.value, P_ASSIGN);
         }
     }
@@ -2047,7 +2902,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.push("async ");
         }
         self.emit_params(&a.params);
-        self.push(" => ");
+        self.punct(" => ");
         match a.body {
             ArrowBody::Block(b) => self.emit_block(&b.statements),
             ArrowBody::Expression(e) => {
@@ -2078,6 +2933,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_string_atom(&mut self, atom: Atom) {
         // 零分配：借用驻留切片，转义直接写进 out（闭包不回调 interner，无重入）。
+        let before = self.out.len();
         let interner = self.interner;
         let out = &mut self.out;
         out.push('"');
@@ -2099,6 +2955,8 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             }
         });
         out.push('"');
+        // 转义后的字面量已直写 out（可能含 `\n` 两字符转义、非 ASCII 原样字符）→ 统一回算游标。
+        self.sync_from(before);
     }
 }
 
@@ -2150,6 +3008,28 @@ fn collect_pattern_names(pat: &Pattern, out: &mut Vec<Atom>) {
         }
         Pattern::Assignment(a) => collect_pattern_names(&a.left, out),
         Pattern::Rest(r) => collect_pattern_names(&r.argument, out),
+    }
+}
+
+/// 同 [`collect_pattern_names`]，但带每个绑定标识符的 span（供导出赋值行查 rename 表）。
+fn collect_pattern_name_spans(pat: &Pattern, out: &mut Vec<(Atom, Span)>) {
+    match pat {
+        Pattern::Ident(id) => out.push((id.name, id.span)),
+        Pattern::Array(a) => {
+            for el in a.elements.iter().flatten() {
+                collect_pattern_name_spans(el, out);
+            }
+        }
+        Pattern::Object(o) => {
+            for p in o.properties.iter() {
+                collect_pattern_name_spans(&p.value, out);
+            }
+            if let Some(r) = &o.rest {
+                collect_pattern_name_spans(&r.argument, out);
+            }
+        }
+        Pattern::Assignment(a) => collect_pattern_name_spans(&a.left, out),
+        Pattern::Rest(r) => collect_pattern_name_spans(&r.argument, out),
     }
 }
 
@@ -2272,11 +3152,81 @@ fn key_is_pure(key: &PropertyKey) -> bool {
     }
 }
 
-
-
 /// 语句（含嵌套块 / if）是否含**提升**声明（`var` / 函数声明）。M4b 折叠时用于守卫**被丢弃**分支：
 /// 含提升声明则不折叠（保守但安全——丢弃提升绑定会致 ReferenceError）。
 /// 不下钻函数/箭头表达式体（其内 `var` 不外提）；未精确处理的控制流（For/Switch/Try…）保守判 `true`。
+/// 截断语句序列中「终止语句之后」的不可达部分。
+///
+/// `return`/`throw`/`break`/`continue` 之后的语句永不执行，可整体丢弃。**但**其中若含
+/// 提升声明（`var` / 函数声明），这些绑定在进入作用域时就已生效、丢弃会致 ReferenceError，
+/// 故此时保守保留全部（与 if 折叠同一条守卫）。
+fn truncate_after_terminator<'s, 'a>(stmts: &'s [Statement<'a>]) -> &'s [Statement<'a>] {
+    let Some(pos) = stmts.iter().position(is_terminator) else {
+        return stmts;
+    };
+    let tail = &stmts[pos + 1..];
+    if tail.is_empty() || tail.iter().any(has_hoisted_decl) {
+        return stmts;
+    }
+    &stmts[..=pos]
+}
+
+/// 该语句是否使控制流离开当前语句序列。
+fn is_terminator(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Return(_) | Statement::Throw(_) | Statement::Break(_) | Statement::Continue(_)
+    )
+}
+
+/// 该类是否需要装饰器降级。
+///
+/// `accessor` auto-accessor 字段的降级（私有存储 + get/set 对）未实现，含之则整体放弃转换
+/// ——宁可原样发射（运行时报错可见），也不产出**看似成功但语义错误**的代码。
+fn class_needs_decorator_lowering(c: &Class) -> bool {
+    if c.body.iter().any(|m| match m {
+        ClassMember::Property(p) => p.accessor && !p.decorators.is_empty(),
+        _ => false,
+    }) {
+        return false;
+    }
+    !c.decorators.is_empty()
+        || c.body.iter().any(|m| match m {
+            ClassMember::Method(m) => !m.decorators.is_empty(),
+            ClassMember::Property(p) => !p.decorators.is_empty(),
+            ClassMember::StaticBlock(_) => false,
+        })
+}
+
+/// 模块顶层是否存在需要装饰器降级的类（决定是否注入运行时辅助）。
+///
+/// 只扫顶层的类声明 / `export [default] class` / 顶层 `const X = class`——覆盖装饰器的
+/// 合法出现位置（装饰器只能修饰类声明与类表达式的绑定形式）。
+fn program_has_decorated_class(stmts: &[Statement]) -> bool {
+    // 与实际降级判定同源：含未支持的 `accessor` 装饰时不降级，也就不该注入辅助。
+    let class_decorated = class_needs_decorator_lowering;
+    stmts.iter().any(|s| match s {
+        Statement::ClassDeclaration(c) => class_decorated(c),
+        Statement::ExportDefault(d) => match &d.declaration {
+            ExportDefaultKind::Class(c) => class_decorated(c),
+            _ => false,
+        },
+        Statement::ExportNamed(e) => match &e.declaration {
+            Some(Statement::ClassDeclaration(c)) => class_decorated(c),
+            Some(Statement::VariableDeclaration(d)) => d
+                .declarations
+                .iter()
+                .any(|x| matches!(&x.init, Some(Expression::Class(c)) if class_decorated(c))),
+            _ => false,
+        },
+        Statement::VariableDeclaration(d) => d
+            .declarations
+            .iter()
+            .any(|x| matches!(&x.init, Some(Expression::Class(c)) if class_decorated(c))),
+        _ => false,
+    })
+}
+
 fn has_hoisted_decl(stmt: &Statement) -> bool {
     match stmt {
         Statement::VariableDeclaration(d) => d.kind == VarKind::Var,
@@ -2351,8 +3301,11 @@ fn walk_collect_hoisted<'a>(
                 }
             }
             // Loop bodies — consistent with plan_hoist (no vars collected from loops)
-            Statement::For(_) | Statement::ForIn(_) | Statement::ForOf(_)
-            | Statement::While(_) | Statement::DoWhile(_) => {}
+            Statement::For(_)
+            | Statement::ForIn(_)
+            | Statement::ForOf(_)
+            | Statement::While(_)
+            | Statement::DoWhile(_) => {}
             // Stop at scope boundaries
             Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => {}
             _ => {}

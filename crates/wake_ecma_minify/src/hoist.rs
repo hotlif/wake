@@ -148,8 +148,11 @@ fn collect_recursive(stmts: &[Statement], out: &mut Vec<Span>) {
                 }
             }
             // Loop bodies — do NOT hoist from loops (preserves assignment timing)
-            Statement::For(_) | Statement::ForIn(_) | Statement::ForOf(_)
-            | Statement::While(_) | Statement::DoWhile(_) => {}
+            Statement::For(_)
+            | Statement::ForIn(_)
+            | Statement::ForOf(_)
+            | Statement::While(_)
+            | Statement::DoWhile(_) => {}
             // Stop at scope boundaries
             Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => {}
             _ => {}
