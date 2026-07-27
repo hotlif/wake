@@ -18,6 +18,7 @@ wake_ecma_minify.workspace = true
 wake_resolver.workspace = true
 wake_turbo.workspace = true
 wake_css.workspace = true
+wake_css_in_js.workspace = true
 wake_graph.workspace = true
 wake_cache.workspace = true
 xxhash-rust.workspace = true

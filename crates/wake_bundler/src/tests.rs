@@ -455,6 +455,60 @@ fn incremental_bundle_runs_in_node() {
     );
 }
 
+/// mangle 正确性 e2e：开 minify+mangle 后，被重命名的**函数声明**（导出的 `compute`、本地 `helper`）
+/// 在 node 真实运行须结果正确——覆盖「活函数体内跨函数引用一致重命名」（fixture 里函数多为死代码
+/// 不被调用，无法覆盖此路径）。曾因语义模型把函数声明名重复声明进 own scope 致兄弟函数同名碰撞。
+#[test]
+fn mangled_functions_run_correctly_in_node() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用，跳过 mangle e2e");
+        return;
+    }
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import { compute } from './lib.js';\n\
+             export const result = compute(4);",
+        ),
+        (
+            "src/lib.js",
+            // helper（本地）与 compute（导出）都是顶层函数声明 → 都被 mangle；compute 调用 helper。
+            "function helper(n) { return n * 2; }\n\
+             export function compute(n) { return helper(n) + helper(n + 1); }",
+        ),
+    ]);
+    // compute(4) = helper(4) + helper(5) = 8 + 10 = 18
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let dir = std::env::temp_dir().join("wake_bundle_mangle_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r = require({:?}); if (r.result !== 18) {{ console.error('result=', r.result); process.exit(2); }} process.stdout.write('OK');",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "mangle 后 node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle,
+    );
+}
+
 /// TypeScript 项目：类型注解 / interface / type / 泛型 全擦除后打包。
 fn ts_fixture() -> MemoryFileSystem {
     MemoryFileSystem::from_files([
@@ -1640,5 +1694,1272 @@ fn pnp_bundle_runs_in_node() {
         output.status.code(),
         String::from_utf8_lossy(&output.stderr),
         out.bundle
+    );
+}
+
+// ======================================================================
+// M4d — bundle 级 SourceMap
+// ======================================================================
+
+/// 解码 Base64 VLQ 段序列 → `(gen_line, gen_col, src_index, src_line, src_col)` 列表。
+/// 测试自带解码器：不引第三方依赖也能独立验证编码正确性（避免"自己编自己解"的同义反复，
+/// 解码逻辑按 Source Map V3 规范独立实现）。
+fn decode_mappings(s: &str) -> Vec<(u32, u32, u32, u32, u32)> {
+    fn b64(c: u8) -> i64 {
+        match c {
+            b'A'..=b'Z' => (c - b'A') as i64,
+            b'a'..=b'z' => (c - b'a') as i64 + 26,
+            b'0'..=b'9' => (c - b'0') as i64 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("非法 base64 字符: {}", c as char),
+        }
+    }
+    let mut out = Vec::new();
+    let (mut gl, mut si, mut sl, mut sc) = (0i64, 0i64, 0i64, 0i64);
+    for line in s.split(';') {
+        // 产物列每行归零（规范：仅此字段跨行重置，其余三者全局连续差分）
+        let mut gc = 0i64;
+        if line.is_empty() {
+            gl += 1;
+            continue;
+        }
+        for seg in line.split(',') {
+            if seg.is_empty() {
+                continue;
+            }
+            let bytes = seg.as_bytes();
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                let (mut result, mut shift) = (0i64, 0);
+                loop {
+                    let d = b64(bytes[i]);
+                    i += 1;
+                    result |= (d & 0x1f) << shift;
+                    shift += 5;
+                    if d & 0x20 == 0 {
+                        break;
+                    }
+                }
+                // 最低位是符号位
+                let neg = result & 1 == 1;
+                let v = result >> 1;
+                vals.push(if neg { -v } else { v });
+            }
+            assert_eq!(vals.len(), 4, "本实现只发 4 字段段: {seg}");
+            gc += vals[0];
+            si += vals[1];
+            sl += vals[2];
+            sc += vals[3];
+            out.push((gl as u32, gc as u32, si as u32, sl as u32, sc as u32));
+        }
+        gl += 1;
+    }
+    out
+}
+
+/// 从 map JSON 里取一个字符串数组字段（简易提取，仅用于测试断言）。
+fn json_field<'a>(json: &'a str, key: &str) -> &'a str {
+    let pat = format!("\"{key}\":");
+    let start = json
+        .find(&pat)
+        .unwrap_or_else(|| panic!("缺字段 {key}: {json}"))
+        + pat.len();
+    &json[start..]
+}
+
+/// 端到端：bundle 级映射必须把产物位置正确指回**各自源文件**的对应 token。
+#[test]
+fn sourcemap_bundle_maps_back_to_original_sources() {
+    let mut bundler = IncrementalBundler::new(Arc::new(fixture()));
+    bundler.enable_sourcemap();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let chunk = out.entry();
+    let map = chunk
+        .source_map
+        .as_ref()
+        .expect("启用 sourcemap 后入口 chunk 应带 map");
+
+    assert!(map.contains("\"version\":3"), "须为 V3: {map}");
+    // 三个源文件都应登记，且路径用正斜杠
+    for f in ["src/index.js", "src/math.js", "src/msg.js"] {
+        assert!(map.contains(f), "map 应含源文件 {f}: {map}");
+    }
+
+    // 取出 mappings 串并解码
+    let m = json_field(map, "mappings");
+    let mappings_str = m
+        .trim_start_matches('"')
+        .split('"')
+        .next()
+        .expect("mappings 值");
+    let decoded = decode_mappings(mappings_str);
+    assert!(!decoded.is_empty(), "应有映射: {map}");
+
+    // 源文件内容（与 fixture 一致），按 map 中 sources 的顺序对齐
+    let contents: std::collections::HashMap<&str, &str> = [
+        (
+            "src/index.js",
+            "import { add } from './math.js';\n\
+             import msg from './msg.js';\n\
+             export const result = add(2, 3) + msg.length;",
+        ),
+        ("src/math.js", "export function add(a, b) { return a + b; }"),
+        ("src/msg.js", "export default 'hello';"),
+    ]
+    .into_iter()
+    .collect();
+
+    // sources 数组顺序：按 map JSON 中出现次序解析
+    let src_list = json_field(map, "sources");
+    let src_names: Vec<&str> = src_list
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap()
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .collect();
+
+    let bundle_lines: Vec<&str> = chunk.code.lines().collect();
+    let ident_of = |s: &str| -> String {
+        s.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+            .collect()
+    };
+
+    let mut checked = 0;
+    for (gl, gc, si, sl, sc) in &decoded {
+        let name = src_names
+            .get(*si as usize)
+            .unwrap_or_else(|| panic!("源下标 {si} 越界: {src_names:?}"));
+        let content = contents
+            .get(name)
+            .unwrap_or_else(|| panic!("未知源文件 {name}"));
+
+        // 产物侧 token
+        let gline = bundle_lines
+            .get(*gl as usize)
+            .unwrap_or_else(|| panic!("产物行 {gl} 越界"));
+        let gtok = ident_of(&gline[(*gc as usize).min(gline.len())..]);
+
+        // 源侧 token（按行列定位）
+        let sline = content.lines().nth(*sl as usize).unwrap_or("");
+        let stok = ident_of(&sline[(*sc as usize).min(sline.len())..]);
+
+        // 关键字两侧可**合法地不同**：ESM→CJS 链接把 `import ... from 'x'` 改写成
+        // `const _wm0 = __wake_require__(1)`，此时产物 `const` 映射到源 `import` 是正确的。
+        // 故只对**非关键字标识符**做等值比对——这些 token 经转换后应原样保留。
+        const KEYWORDS: &[&str] = &[
+            "import",
+            "export",
+            "const",
+            "let",
+            "var",
+            "function",
+            "return",
+            "default",
+            "class",
+            "new",
+            "this",
+            "typeof",
+            "void",
+            "in",
+            "of",
+            "from",
+            "await",
+            "async",
+            "true",
+            "false",
+            "null",
+            "undefined",
+        ];
+        let is_kw = |t: &str| KEYWORDS.contains(&t);
+        if !gtok.is_empty() && !stok.is_empty() && !is_kw(&gtok) && !is_kw(&stok) {
+            assert_eq!(
+                gtok, stok,
+                "bundle 映射错位：产物 ({gl},{gc}) 是 `{gtok}`，\
+                 但映射指向 {name} ({sl},{sc}) 处的 `{stok}`"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "有效比对过少（{checked}），映射可能未生效");
+}
+
+/// minify 路径不得产出（错位的）map——宁缺毋错。
+#[test]
+fn sourcemap_absent_under_minify() {
+    let mut bundler = IncrementalBundler::new(Arc::new(fixture()));
+    bundler.enable_sourcemap();
+    bundler.enable_minify();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.entry().source_map.is_none(),
+        "minify 路径会改写模块体文本，不应产出错位的 map"
+    );
+}
+
+/// 不启用时不产 map，且产物与启用前**逐字节相同**（sourcemap 不得影响产物）。
+#[test]
+fn sourcemap_opt_in_does_not_change_bundle() {
+    let plain = IncrementalBundler::new(Arc::new(fixture())).build(Path::new("src/index.js"));
+    assert!(plain.entry().source_map.is_none());
+
+    let mut b2 = IncrementalBundler::new(Arc::new(fixture()));
+    b2.enable_sourcemap();
+    let mapped = b2.build(Path::new("src/index.js"));
+
+    assert_eq!(plain.bundle, mapped.bundle, "启用 sourcemap 不得改变产物");
+    assert!(mapped.entry().source_map.is_some());
+}
+
+/// `sources` 路径规整：去 Windows `\\?\` 扩展长度前缀、相对化、统一正斜杠。
+#[test]
+fn sourcemap_source_names_are_normalized() {
+    use crate::incremental::map_source_name;
+
+    // 扩展长度前缀必须去掉（否则泄漏成 `//?/C:/…`，DevTools 无法定位源文件）
+    let p = Path::new(r"\\?\C:\proj\src\a.js");
+    let cwd = Path::new(r"\\?\C:\proj");
+    assert_eq!(map_source_name(p, Some(cwd)), "src/a.js");
+
+    // cwd 未加前缀、路径加了前缀（dev server 的真实情形）也应相对化
+    assert_eq!(map_source_name(p, Some(Path::new(r"C:\proj"))), "src/a.js");
+
+    // 不在 cwd 之下 → 保留绝对路径，但仍去前缀并转正斜杠
+    let outside = map_source_name(p, Some(Path::new(r"C:\other")));
+    assert!(
+        !outside.contains(r"\\?\") && !outside.starts_with("//?/"),
+        "不应残留 verbatim 前缀: {outside}"
+    );
+    assert!(!outside.contains('\\'), "应统一正斜杠: {outside}");
+    assert!(outside.ends_with("src/a.js"), "{outside}");
+
+    // 无 cwd 时不 panic，且同样去前缀
+    let no_cwd = map_source_name(p, None);
+    assert!(!no_cwd.starts_with("//?/"), "{no_cwd}");
+}
+
+// ======================================================================
+// M5 — 零运行时 CSS-in-JS（Linaria 子集）
+// ======================================================================
+
+/// `@linaria/core` 桩包：真实项目里这是已安装的依赖。`css` 会被构建期完全消解，
+/// 但同包的 `cx`（类名拼接）仍是运行时函数，故不能整体外部化——保留正常解析。
+const LINARIA_PKG_JSON: &str = r#"{"name":"@linaria/core","version":"6.0.0","main":"index.js"}"#;
+const LINARIA_INDEX: &str = "export const css = () => { throw new Error('css should be compiled away'); };\n\
+     export const cx = (...a) => a.filter(Boolean).join(' ');\n";
+
+/// crab-dev 的真实形态：token 模块导出嵌套对象，组件模块用 `${token.a.b}` 插值。
+fn linaria_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
+        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        (
+            "src/index.tsx",
+            "import { css } from '@linaria/core';\n\
+             import token from './token.js';\n\
+             const box = css`\n\
+             \x20 display: flex;\n\
+             \x20 padding: ${token.container.padding};\n\
+             \x20 &:hover { color: red; }\n\
+             `;\n\
+             export default box;",
+        ),
+        (
+            "src/token.js",
+            "const vars = { 'container.padding': '--c-pad' };\n\
+             const token = { container: { padding: `var(${vars['container.padding']}, 24px)` } };\n\
+             export default token;",
+        ),
+    ])
+}
+
+#[test]
+fn css_in_js_extracts_styles_and_replaces_with_class() {
+    let mut b = IncrementalBundler::new(Arc::new(linaria_fixture()));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    // 1) 产出了 CSS 资源
+    let css_asset = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .expect("应产出抽取的 CSS");
+    let css = String::from_utf8(css_asset.bytes.clone()).unwrap();
+
+    // 2) 跨模块 token 求值成功（`var(--c-pad, 24px)`）
+    assert!(
+        css.contains("padding: var(--c-pad, 24px)"),
+        "跨模块 design token 应被求值: {css}"
+    );
+    assert!(css.contains("display: flex"), "{css}");
+
+    // 3) 嵌套被展开为独立规则
+    assert!(css.contains(":hover{color: red;}"), "嵌套未展开: {css}");
+
+    // 4) bundle 里标签模板已被类名字符串替换，不再有 css`` 调用
+    assert!(
+        !out.bundle.contains("css`"),
+        "标签模板应已在构建期消解: {}",
+        &out.bundle[..out.bundle.len().min(600)]
+    );
+    // 类名以变量名 box 为前缀，且 CSS 与 JS 用的是同一个类名
+    let cls = css
+        .split('{')
+        .next()
+        .unwrap()
+        .trim_start_matches('.')
+        .to_string();
+    assert!(cls.starts_with("box_"), "类名应含变量名前缀: {cls}");
+    assert!(
+        out.bundle.contains(&format!("\"{cls}\"")),
+        "bundle 应引用同一类名 {cls}"
+    );
+}
+
+#[test]
+fn css_in_js_dev_injects_style_tag() {
+    // dev（不开抽取）：CSS 随模块体以 <style> 注入，不产 .css 资源
+    let mut b = IncrementalBundler::new(Arc::new(linaria_fixture()));
+    b.enable_css_in_js();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    assert!(
+        out.assets.iter().all(|a| !a.is_css),
+        "dev 不应产出 .css 资源"
+    );
+    assert!(
+        out.bundle.contains("createElement(\"style\")"),
+        "dev 应注入 <style>"
+    );
+    assert!(
+        out.bundle.contains("var(--c-pad, 24px)"),
+        "注入的样式应含求值结果"
+    );
+}
+
+#[test]
+fn css_in_js_disabled_leaves_source_untouched() {
+    let out =
+        IncrementalBundler::new(Arc::new(linaria_fixture())).build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.assets.iter().all(|a| !a.is_css));
+    // 未启用时不应有类名替换发生
+    assert!(
+        !out.bundle.contains("box_"),
+        "未启用 CSS-in-JS 时不应生成类名"
+    );
+}
+
+#[test]
+fn css_in_js_warns_on_unevaluatable_interpolation() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
+        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        (
+            "src/index.tsx",
+            "import { css } from '@linaria/core';\n\
+             const box = css`color: red; width: ${compute()}; height: 1px;`;\n\
+             export default box;",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    let out = b.build(Path::new("src/index.tsx"));
+
+    // 警告但不失败
+    assert!(!out.has_errors(), "求值失败应是警告而非错误");
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.message.contains("无法在构建期求值")),
+        "应报出求值失败警告: {:?}",
+        out.diagnostics
+    );
+    let css = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
+        .unwrap_or_default();
+    // 其余声明保留，产物是合法 CSS
+    assert!(css.contains("color: red"), "{css}");
+    assert!(css.contains("height: 1px"), "{css}");
+    assert!(!css.contains("compute"), "不得残留原表达式: {css}");
+}
+
+#[test]
+fn css_in_js_runs_in_node_with_correct_class_name() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用，跳过 CSS-in-JS e2e");
+        return;
+    }
+    let mut b = IncrementalBundler::new(Arc::new(linaria_fixture()));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let dir = std::env::temp_dir().join("wake_cij_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bundle.cjs");
+    std::fs::write(&p, &out.bundle).unwrap();
+
+    // 默认导出应是类名字符串（运行时零样式计算）
+    let script = format!(
+        "const r = require({:?}); const v = r.default ?? r; \
+         if (typeof v !== 'string' || !v.startsWith('box_')) {{ console.error('got', v); process.exit(2); }} \
+         process.stdout.write('OK');",
+        p.to_string_lossy()
+    );
+    let o = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success() && o.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}",
+        o.status.code(),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+#[test]
+fn css_in_js_cross_module_class_reference() {
+    // 跨模块 css 互相引用：base 模块导出一个 css 类，wrap 模块用 `.${base}` 当选择器
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
+        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        (
+            "src/base.tsx",
+            "import { css } from '@linaria/core';\n\
+             export const base = css`color: red;`;",
+        ),
+        (
+            "src/index.tsx",
+            "import { css } from '@linaria/core';\n\
+             import { base } from './base.js';\n\
+             const wrap = css`.${base} { margin: 4px; }`;\n\
+             export default { base, wrap };",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics.is_empty(),
+        "跨模块引用不应报警: {:?}",
+        out.diagnostics
+    );
+
+    let css = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
+        .expect("应产出 CSS");
+
+    // 取 base 的类名（来自 base 模块的规则）
+    let base_cls = css
+        .split('{')
+        .find(|s| s.contains("base_"))
+        .map(|s| {
+            s.rsplit('.')
+                .next()
+                .unwrap()
+                .trim()
+                .trim_start_matches('.')
+                .to_string()
+        })
+        .expect("应有 base 类名");
+    assert!(base_cls.starts_with("base_"), "{base_cls} / {css}");
+
+    // wrap 的规则应把 base 的类名当作后代选择器
+    assert!(
+        css.contains(&format!(".{base_cls}{{margin: 4px;}}")),
+        "跨模块类名引用未生效\nbase={base_cls}\ncss={css}"
+    );
+}
+
+/// 回归：`module.exports = X` 形态的 CJS 模块在 minify 路径下必须真正导出。
+///
+/// 曾因 `compact_body_names` 把 `module.exports` 改写成 `m.$`（`$` 是 exports 的**值**，
+/// `m` 才是 module）导致赋值落到无关属性上，模块导出恒为空对象——任何
+/// `module.exports = X` 的 CJS 包（如 `@linaria/core` 的 `cx`）整包失效。
+#[test]
+fn cjs_module_exports_assignment_survives_minify() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/lib.js",
+            "var out = {};\nout.hello = function () { return 42; };\nmodule.exports = out;",
+        ),
+        (
+            "src/index.js",
+            "const lib = require('./lib.js');\nexport default lib.hello();",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_minify();
+    b.enable_mangle();
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    assert!(
+        !out.bundle.contains("m.$="),
+        "`module.exports` 不得改写为 `m.$`（会写到无关属性上）:\n{}",
+        &out.bundle[..out.bundle.len().min(800)]
+    );
+    assert!(
+        out.bundle.contains("m.exports="),
+        "`module.exports` 应改写为 `m.exports`:\n{}",
+        &out.bundle[..out.bundle.len().min(800)]
+    );
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_cjs_exports_regression");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bundle.cjs");
+    std::fs::write(&p, &out.bundle).unwrap();
+    let script = format!(
+        "const r = require({:?}); const v = r.default ?? r; \
+         if (v !== 42) {{ console.error('got', v); process.exit(2); }} process.stdout.write('OK');",
+        p.to_string_lossy()
+    );
+    let o = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success() && o.stdout == b"OK",
+        "CJS 导出未生效 stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// 回归：整体重新赋值 `module.exports` 的 CJS 模块不得并入 scope-hoist 的 concat。
+///
+/// concat 让被合并模块共享同一个 exports 对象 `$`；而 `module.exports = X` 会把导出**换成
+/// 另一个对象**，此后该模块的导出与其它模块写入的 `$` 分属两处，必丢其一。曾致
+/// `@linaria/core` 与同组 ESM 模块的导出互相覆盖（`cx` 或 ESM 导出二者只能活一个）。
+#[test]
+fn cjs_module_exports_module_not_merged_into_concat() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "node_modules/pkg/package.json",
+            r#"{"name":"pkg","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/pkg/index.js",
+            "var api = {};\napi.join = function () { \
+             return Array.prototype.slice.call(arguments).filter(Boolean).join(' '); };\n\
+             module.exports = api;",
+        ),
+        ("src/base.js", "export const icon = 'icon_' + String(1);"),
+        (
+            "src/index.js",
+            "import pkg from 'pkg';\n\
+             import { icon } from './base.js';\n\
+             export default pkg.join('a', icon);",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_minify();
+    b.enable_mangle();
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_cjs_concat_regression");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bundle.cjs");
+    std::fs::write(&p, &out.bundle).unwrap();
+    // CJS 的函数导出与 ESM 的常量导出必须**同时**可用
+    let script = format!(
+        "const r = require({:?}); const v = r.default ?? r; \
+         if (v !== 'a icon_1') {{ console.error('got', JSON.stringify(v)); process.exit(2); }} \
+         process.stdout.write('OK');",
+        p.to_string_lossy()
+    );
+    let o = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success() && o.stdout == b"OK",
+        "CJS 与 ESM 导出未能共存 stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// 跨模块**多层**常量传播：`base → mid → leaf` 三层链，css 插值须能取到最深处的值。
+#[test]
+fn css_in_js_multi_level_constant_propagation() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
+        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        // 第 3 层：最底层的原始常量
+        (
+            "src/base.js",
+            "export const UNIT = 4;\nexport const HUE = 'oklch(0.7 0.1 250)';",
+        ),
+        // 第 2 层：引用第 3 层，组合出新常量
+        (
+            "src/mid.js",
+            "import { UNIT, HUE } from './base.js';\n\
+             export const space = { sm: `${UNIT}px`, lg: `${UNIT * 3}px` };\n\
+             export const theme = { color: HUE, pad: space.sm };",
+        ),
+        // 第 1 层：css 插值引用第 2 层（其值又来自第 3 层）
+        (
+            "src/index.tsx",
+            "import { css } from '@linaria/core';\n\
+             import { theme } from './mid.js';\n\
+             const box = css`color: ${theme.color}; padding: ${theme.pad};`;\n\
+             export default box;",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics.is_empty(),
+        "多层传播不应报警: {:?}",
+        out.diagnostics
+    );
+
+    let css = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
+        .expect("应产出 CSS");
+    // color 穿过 2 层（index ← mid ← base）
+    assert!(
+        css.contains("color: oklch(0.7 0.1 250)"),
+        "第 3 层常量未传播: {css}"
+    );
+    // pad 穿过 2 层且经过模块内二次引用（space.sm ← UNIT）
+    assert!(css.contains("padding: 4px"), "模板内算式未传播: {css}");
+}
+
+/// `@keyframes` 作用域化 + `:global()` 逃逸的端到端。
+#[test]
+fn css_in_js_keyframes_scoped_and_global_escapes() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
+        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        (
+            "src/index.tsx",
+            "import { css } from '@linaria/core';\n\
+             const spinner = css`\n\
+             \x20 animation: spin 1s linear infinite;\n\
+             \x20 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }\n\
+             \x20 :global() { html, body { margin: 0; } }\n\
+             `;\n\
+             export default spinner;",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_css_in_js();
+    b.enable_css_extraction();
+    let out = b.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let css = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
+        .expect("应产出 CSS");
+
+    // 类名后缀 = 类名去掉 `.`
+    let cls = css
+        .split('{')
+        .next()
+        .unwrap()
+        .trim_start_matches('.')
+        .to_string();
+    assert!(cls.starts_with("spinner_"), "{cls} / {css}");
+
+    // 关键帧被作用域化，且 animation 引用同步改写
+    assert!(
+        css.contains(&format!("@keyframes spin-{cls}")),
+        "关键帧未作用域化: {css}"
+    );
+    assert!(
+        css.contains(&format!("animation: spin-{cls} 1s linear infinite")),
+        "animation 引用未改写: {css}"
+    );
+    // :global() 内容逃逸出类作用域
+    assert!(css.contains("html,body{margin: 0;}"), "{css}");
+    assert!(
+        !css.contains(&format!(".{cls} html")),
+        ":global() 内容不应带类前缀: {css}"
+    );
+}
+
+/// TS `namespace` 的点分名 / 声明合并 / 嵌套，以及 `enum` 合并——须在 **prod 压缩路径**下正确。
+///
+/// 回归点：各嵌套层曾共用同一 span，而压缩器侧表以 span 为键 → 对某层的「未用绑定消除」
+/// 判定连带命中其它层，把整个嵌套削平（第二个 `namespace A.B.C` 块整体消失、合并失效）。
+#[test]
+fn ts_namespace_dotted_merged_and_nested_survive_minify() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.ts",
+        "namespace A.B.C { export const x = 1; export function f() { return x + 1; } }\n\
+         namespace A.B.C { export const y = 2; }\n\
+         enum E { P = 1 }\n\
+         enum E { Q = 2 }\n\
+         namespace Outer { export namespace Inner { export const z = 3; } \
+         const priv = 4; export const pub = priv; }\n\
+         export default JSON.stringify({ x: A.B.C.x, y: A.B.C.y, f: A.B.C.f(), \
+         eP: E.P, eQ: E.Q, rev: E[1], inner: Outer.Inner.z, pub: Outer.pub });",
+    )]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_minify();
+    b.enable_mangle();
+    b.enable_tree_shaking();
+    let out = b.build(Path::new("src/index.ts"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let dir = std::env::temp_dir().join("wake_ns_regression");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bundle.cjs");
+    std::fs::write(&p, &out.bundle).unwrap();
+    let script = format!(
+        "const r = require({:?}); const v = JSON.parse(r.default ?? r); \
+         const want = {{x:1,y:2,f:2,eP:1,eQ:2,rev:'P',inner:3,pub:4}}; \
+         for (const k of Object.keys(want)) if (v[k] !== want[k]) {{ \
+           console.error(k, '=', v[k], 'want', want[k]); process.exit(2); }} \
+         process.stdout.write('OK');",
+        p.to_string_lossy()
+    );
+    let o = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success() && o.stdout == b"OK",
+        "namespace/enum 降级在压缩后语义不符 stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// JSX dev runtime 经 bundler 接线：dev 口径产 `jsxDEV` + 源位置，prod 口径不受影响。
+#[test]
+fn jsx_dev_runtime_wired_through_bundler() {
+    let files = [
+        (
+            "node_modules/react/package.json",
+            r#"{"name":"react","main":"index.js"}"#,
+        ),
+        ("node_modules/react/index.js", "exports.x = 1;"),
+        (
+            "node_modules/react/jsx-runtime.js",
+            "exports.jsx=()=>0;exports.jsxs=()=>0;exports.Fragment=0;",
+        ),
+        (
+            "node_modules/react/jsx-dev-runtime.js",
+            "exports.jsxDEV=()=>0;exports.Fragment=0;",
+        ),
+        (
+            "src/index.tsx",
+            "export default <div className=\"x\">hi</div>;",
+        ),
+    ];
+
+    // dev 口径
+    let mut dev = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files(files)));
+    dev.set_jsx_runtime(true, "react");
+    let out = dev.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("jsxDEV"), "dev 应用 jsxDEV");
+    assert!(
+        out.bundle.contains("src/index.tsx"),
+        "dev 应带 fileName（正斜杠）"
+    );
+    assert!(out.bundle.contains("lineNumber"), "dev 应带源位置");
+
+    // prod 口径（默认）——不应出现 dev runtime
+    let out2 = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files(files)))
+        .build(Path::new("src/index.tsx"));
+    assert!(!out2.has_errors(), "{:?}", out2.diagnostics);
+    assert!(!out2.bundle.contains("jsxDEV"), "prod 不应用 dev runtime");
+    assert!(!out2.bundle.contains("lineNumber"), "prod 不应带源位置");
+}
+
+/// TC39 **Stage-3 装饰器**端到端：编译产物在 node 中的**可观察行为**须与 tsc 一致。
+///
+/// 覆盖：类/方法/静态方法/取值器/设值器/字段/静态字段装饰器、多装饰器倒序应用、
+/// 装饰器返回值替换、`addInitializer`、继承、显式构造函数、字段 extraInitializers 串联。
+/// 期望值取自 `tsc --target es2022` 对同一源码产物的实际运行结果。
+#[test]
+fn stage3_decorators_match_tsc_behavior() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "kinds_and_order",
+            "const log=[];\
+             function mdec(v,c){log.push('dec:'+c.kind+':'+c.name);return v;}\
+             @mdec class C{ @mdec m(){return 'm';} @mdec static sm(){return 'sm';} \
+             @mdec f='f'; @mdec get g(){return 'g';} }\
+             const c=new C();\
+             export default JSON.stringify({log,m:c.m(),sm:C.sm(),f:c.f,g:c.g});",
+            r#"{"log":["dec:method:sm","dec:method:m","dec:getter:g","dec:field:f","dec:class:C"],"m":"m","sm":"sm","f":"f","g":"g"}"#,
+        ),
+        (
+            "replace_init_inherit",
+            "const log=[];\
+             function twice(v,c){return function(...a){return v.apply(this,a)+v.apply(this,a);};}\
+             function init(v,c){c.addInitializer(function(){log.push('init:'+c.name);});return v;}\
+             function plus(v,c){return (x)=>x+'!';}\
+             function tag(n){return (v,c)=>{log.push('apply:'+n);return v;};}\
+             class Base{ base(){return 'B';} }\
+             @tag('c1') @tag('c2') class D extends Base{\
+               @twice m(){return 'x';} @init n(){return 'n';} @plus f='f';\
+               @tag('m1') @tag('m2') k(){return 'k';} }\
+             const d=new D();\
+             export default JSON.stringify({log,m:d.m(),f:d.f,base:d.base(),k:d.k()});",
+            r#"{"log":["apply:m2","apply:m1","apply:c2","apply:c1","init:n"],"m":"xx","f":"f!","base":"B","k":"k"}"#,
+        ),
+        (
+            "static_field_and_explicit_ctor",
+            "const log=[];\
+             function d(v,c){log.push(c.kind+':'+c.name+':'+c.static);return v;}\
+             function sfd(v,c){return (x)=>'S'+x;}\
+             class E{ @d static sf='sf'; @d static get sg(){return 'sg';} \
+               @d set s(v){log.push('set:'+v);} @sfd g1='a'; @sfd g2='b';\
+               constructor(){log.push('ctor');} }\
+             const e=new E(); e.s='v';\
+             export default JSON.stringify({log,sf:E.sf,sg:E.sg,g1:e.g1,g2:e.g2});",
+            r#"{"log":["getter:sg:true","setter:s:false","field:sf:true","ctor","set:v"],"sf":"sf","sg":"sg","g1":"Sa","g2":"Sb"}"#,
+        ),
+    ];
+
+    for (name, src, expected) in cases {
+        let fs = MemoryFileSystem::from_files([("src/index.ts", *src)]);
+        let mut b = IncrementalBundler::new(Arc::new(fs));
+        b.enable_minify();
+        b.enable_mangle();
+        let out = b.build(Path::new("src/index.ts"));
+        assert!(!out.has_errors(), "[{name}] {:?}", out.diagnostics);
+
+        let dir = std::env::temp_dir().join(format!("wake_stage3_{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bundle.cjs");
+        std::fs::write(&p, &out.bundle).unwrap();
+        let script = format!(
+            "const r=require({:?});process.stdout.write(String(r.default??r));",
+            p.to_string_lossy()
+        );
+        let o = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "[{name}] node 执行失败: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let got = String::from_utf8_lossy(&o.stdout);
+        assert_eq!(got, *expected, "[{name}] 行为与 tsc 不一致");
+    }
+}
+
+/// `.scss`/`.sass`/`.less` 须**明确报错**，而不是当普通 CSS 透传。
+///
+/// 回归点：曾把这些扩展名并入 `is_css_path`，嵌套/变量/mixin 会原样落进产物，
+/// 形成非法 CSS 或静默错误样式——「看似构建成功」比构建失败更危险。
+#[test]
+fn sass_and_less_are_rejected_with_clear_error() {
+    for (file, ext) in [("src/a.scss", "scss"), ("src/b.less", "less")] {
+        let fs = MemoryFileSystem::from_files([
+            (file, "$c: red;\n.a { color: $c; .b { margin: 0 } }"),
+            (
+                "src/index.ts",
+                &format!(
+                    "import \"./{}\";\nexport default 1;",
+                    std::path::Path::new(file)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                ),
+            ),
+        ]);
+        let out = IncrementalBundler::new(Arc::new(fs)).build(Path::new("src/index.ts"));
+        assert!(out.has_errors(), "`.{ext}` 应报错而非静默透传");
+        let d = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code.as_deref() == Some("WAKE0302"))
+            .unwrap_or_else(|| panic!("应有 WAKE0302 诊断: {:?}", out.diagnostics));
+        // 提示必须可操作：说明不内置预处理器 + 给出替代做法
+        let note = d.notes.join(" ");
+        assert!(note.contains("预处理器"), "{note}");
+        assert!(note.contains(".css"), "应指出改用 .css: {note}");
+        // 产物里不得残留未编译的预处理器语法
+        assert!(!out.bundle.contains("$c"), "不得把 SCSS 变量透传进产物");
+    }
+}
+
+/// 普通 `.css` 不受上一条影响。
+#[test]
+fn plain_css_still_loads() {
+    let fs = MemoryFileSystem::from_files([
+        ("src/a.css", ".p { color: blue }"),
+        ("src/index.ts", "import \"./a.css\";\nexport default 1;"),
+    ]);
+    let out = IncrementalBundler::new(Arc::new(fs)).build(Path::new("src/index.ts"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("color: blue"));
+}
+
+// ======================================================================
+// import= / export= / import attributes / using 的端到端验证
+// ======================================================================
+
+/// `import x = require(..)` + `export = ..` + `.json` 引入属性的混合项目。
+fn ts_cjs_interop_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        (
+            "index.ts",
+            // `import = require` 拿到的是目标模块的整个 exports（即 `export =` 赋出的那个对象），
+            // 与 TS/Node 的 CJS 语义一致。
+            //
+            // JSON 走普通默认导入 + 引入属性：wake 的 loader 把 `.json` 转成
+            // `export default <json>`（loader.rs `json_to_js_module`），故 `require('./x.json')`
+            // 得到的是 `{ default: … }` 而非裸对象——JSON 应当用 ESM 导入，属性子句仅作标注。
+            "import api = require('./api.ts');\n\
+             import cfg from './cfg.json' with { type: 'json' };\n\
+             export const sum: number = api.add(2, 3) + cfg.bonus;",
+        ),
+        (
+            "api.ts",
+            "const api = { add(a: number, b: number): number { return a + b; } };\n\
+             export = api;",
+        ),
+        ("cfg.json", "{ \"bonus\": 4 }"),
+    ])
+}
+
+#[test]
+fn ts_import_equals_and_export_assign_bundle_in_node() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用，跳过 import=/export= e2e");
+        return;
+    }
+    let out =
+        IncrementalBundler::new(Arc::new(ts_cjs_interop_fixture())).build(Path::new("index.ts"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    // `import = require('./api.ts')` 走既有 Require 依赖链路 → 目标进模块图并被改写。
+    assert_eq!(out.module_count, 3, "api.ts / cfg.json 都应进模块图");
+    assert!(
+        !out.bundle.contains("require(\"./api.ts\")"),
+        "内部 require 未被改写为 __wake_require__:\n{}",
+        out.bundle
+    );
+
+    let dir = std::env::temp_dir().join("wake_bundle_import_equals_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+
+    // sum = add(2,3) + 4 = 9。
+    let script = format!(
+        "const r = require({:?}); if (r.sum !== 9) {{ console.error('sum=', r.sum); process.exit(2); }} process.stdout.write('OK');",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+/// `using` / `await using`：资源在离开作用域时必须被 dispose——包括**零引用**的绑定。
+fn using_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([(
+        "index.ts",
+        "const log: string[] = [];\n\
+         function res(name: string) { return { [Symbol.dispose]() { log.push(name); } }; }\n\
+         function ares(name: string) { return { async [Symbol.asyncDispose]() { log.push(name); } }; }\n\
+         export async function run(): Promise<string> {\n\
+         {\n\
+           using a = res('a');\n\
+           using _unused = res('unused');\n\
+           await using b = ares('b');\n\
+           log.push('body');\n\
+           void a;\n\
+         }\n\
+         return log.join(',');\n\
+         }",
+    )])
+}
+
+#[test]
+fn using_declarations_dispose_in_node() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用，跳过 using e2e");
+        return;
+    }
+    // 关闭/开启 minify+mangle 各跑一遍：未用绑定消除、变量重命名都不得破坏 dispose 语义。
+    for (label, minify) in [("plain", false), ("minified", true)] {
+        let mut b = IncrementalBundler::new(Arc::new(using_fixture()));
+        if minify {
+            b.enable_minify().enable_mangle();
+        }
+        let out = b.build(Path::new("index.ts"));
+        assert!(!out.has_errors(), "[{label}] {:?}", out.diagnostics);
+
+        let dir = std::env::temp_dir().join(format!("wake_bundle_using_e2e_{label}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_path = dir.join("bundle.cjs");
+        std::fs::write(&bundle_path, &out.bundle).unwrap();
+
+        // dispose 逆声明序执行：body → b → unused → a。
+        let script = format!(
+            "require({:?}).run().then(s => {{ if (s !== 'body,b,unused,a') {{ console.error('got=', s); process.exit(2); }} process.stdout.write('OK'); }}).catch(e => {{ console.error(e); process.exit(3); }});",
+            bundle_path.to_string_lossy()
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stdout == b"OK",
+            "[{label}] node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            out.bundle
+        );
+    }
+}
+
+// ======================================================================
+// 字体/图片资源 loader（CSS `url()`）+ CSS prod 抽取顺序 + concat 导出名冲突
+// ======================================================================
+
+#[test]
+fn concat_does_not_clobber_duplicate_export_names() {
+    // 回归：scope-hoist 的 concat 让所有成员共享同一个 exports 对象 `$`，两个模块写同一个
+    // 导出名会互相覆盖。`export default` 必撞——曾使 `a + b` 产出 "BB" 而非 "AB"，
+    // 且**每个资源模块恰好都是 `export default "<url>"`**，两张图片的 URL 就此串掉。
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import a from './a.js';\nimport b from './b.js';\nimport { v } from './c.js';\n\
+             export const info = a + b + v;",
+        ),
+        ("src/a.js", "export default 'A';"),
+        ("src/b.js", "export default 'B';"),
+        ("src/c.js", "export const v = 'C';"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用，跳过 concat 导出名 e2e");
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_bundle_concat_dup_export");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r = require({:?}); if (r.info !== 'ABC') {{ console.error('info=', r.info); process.exit(2); }} process.stdout.write('OK');",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn extracted_css_follows_dependency_order() {
+    // CSS 层叠靠顺序定胜负。prod 抽取必须与 dev 的 `<style>` 注入顺序一致——都是模块求值序
+    // （依赖先行）。此前按模块 id（BFS 发现序）排，`base.css` 被排到 `styles.css` 之后，
+    // 覆盖关系整个反过来。dev 侧的顺序断言见 `css_bundle_runs_in_node`。
+    let mut bundler = IncrementalBundler::new(Arc::new(css_fixture()));
+    bundler.enable_css_extraction();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let css = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .expect("应有抽取的 CSS 产物");
+    let text = String::from_utf8_lossy(&css.bytes);
+    let base = text.find(".base").expect("缺 .base");
+    let title = text.find(".title").expect("缺 .title");
+    assert!(
+        base < title,
+        "被 @import 的 base.css 必须排在 styles.css 之前:\n{text}"
+    );
+}
+
+/// CSS 通过 `url()` 引用字体与图片——这是字体/图片**主要**的引用方式，不是 JS import。
+fn css_url_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import './theme.css';\nexport const ok = 1;",
+        ),
+        (
+            "src/theme.css",
+            "@font-face{font-family:\"F\";src:url(\"./fonts/big.woff2\") format(\"woff2\"),\
+             url(./fonts/small.woff) format(\"woff\")}\
+             .hero{background-image:url(../img/dot.png)}\
+             .ext{background:url(https://cdn.example/x.png)}\
+             .frag{filter:url(#blur)}",
+        ),
+        ("src/fonts/big.woff2", &"F".repeat(5000)),
+        ("src/fonts/small.woff", "SMALLFONT"),
+        ("img/dot.png", "PNGBYTES"),
+    ])
+}
+
+#[test]
+fn css_url_assets_are_emitted_and_rewritten() {
+    let mut bundler = IncrementalBundler::new(Arc::new(css_url_fixture()));
+    bundler
+        .enable_css_extraction()
+        .set_asset_inline_limit(4096)
+        .set_public_path("/");
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    let css = out
+        .assets
+        .iter()
+        .find(|a| a.is_css)
+        .expect("应有抽取的 CSS 产物");
+    let text = String::from_utf8_lossy(&css.bytes);
+
+    // 超阈值字体 → 独立产物 + publicPath URL；产物字节与源一致。
+    let font = out
+        .assets
+        .iter()
+        .find(|a| a.file_name.starts_with("big.") && a.file_name.ends_with(".woff2"))
+        .expect("超阈值字体应产出独立文件");
+    assert_eq!(font.bytes.len(), 5000);
+    assert!(
+        text.contains(&format!("/{}", font.file_name)),
+        "CSS 里的字体 url 应改写为产物 URL:\n{text}"
+    );
+    // 阈值内的字体与图片 → data URI（MIME 按扩展名）。
+    assert!(text.contains("data:font/woff;base64,"), "{text}");
+    assert!(text.contains("data:image/png;base64,"), "{text}");
+    // 原相对路径全部消失，否则产物里是死链。
+    assert!(!text.contains("./fonts/big.woff2"), "{text}");
+    assert!(!text.contains("./fonts/small.woff"), "{text}");
+    assert!(!text.contains("../img/dot.png"), "{text}");
+    // 反例：外部 URL 与 SVG 片段引用不得被改写。
+    assert!(text.contains("https://cdn.example/x.png"), "{text}");
+    assert!(text.contains("url(#blur)"), "{text}");
+}
+
+#[test]
+fn css_url_assets_work_in_dev_injection_path() {
+    // dev（不抽取、全内联）下同样要改写——`<style>` 注入后相对路径的基准变成 HTML 文档，
+    // 不改写必然 404。
+    let mut bundler = IncrementalBundler::new(Arc::new(css_url_fixture()));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains("data:font/woff2;base64,"),
+        "{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("data:image/png;base64,"),
+        "{}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("./fonts/big.woff2"), "{}", out.bundle);
+    // dev 默认全内联 → 无独立资源产物。
+    assert!(
+        out.assets.iter().all(|a| a.is_css),
+        "dev 不应产出独立资源文件"
     );
 }

@@ -74,6 +74,9 @@ pub struct OutputChunk {
     pub module_ids: Vec<u32>,
     /// 依赖的其它 chunk 文件名（须先加载；供 manifest）。
     pub imports: Vec<String>,
+    /// Source Map V3 JSON（`None` = 未启用或该路径不支持）。CRUSTIFY-PARITY §M4d。
+    /// 由 CLI 写为 `<file_name>.map` 或经 dev server 提供；`code` 末尾对应追加 `sourceMappingURL`。
+    pub source_map: Option<String>,
 }
 
 /// chunk 类型：初始（entry）/ 异步（动态 import 目标）/ 共享（多 async 共享）。
@@ -121,6 +124,7 @@ pub(crate) fn single_chunk(
         chunk_id: 0,
         module_ids,
         imports: Vec::new(),
+        source_map: None, // 由调用方（IncrementalBundler）在启用 sourcemap 时回填
     };
     BuildOutput {
         bundle,
