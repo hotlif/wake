@@ -12,6 +12,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
+import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:zlib';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const psWrap = join(__dirname, 'memwrap.ps1');
@@ -24,6 +25,23 @@ function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+}
+
+function artifactStats(path) {
+  const bytes = readFileSync(path);
+  const source = bytes.toString('utf8');
+  const count = (text) => source.split(text).length - 1;
+  return {
+    raw: bytes.length,
+    gzip: gzipSync(bytes, { level: 9 }).length,
+    brotli: brotliCompressSync(bytes, {
+      params: {
+        [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
+      },
+    }).length,
+    wrappers: [...source.matchAll(/(?:^|[,;{])\d+:function\(/g)].length,
+    requires: count('__wake_require__'),
+  };
 }
 
 // 纯构建墙钟（不套内存包装器）。
@@ -108,11 +126,13 @@ const webpackBundle = join(webpackOut, 'bundle.js');
 console.log('[2/4] Building with wake...');
 const wakeStats = measure('wake', wakeBin, ['build', entry, '--outdir', wakeOut], wakeBundle);
 let wakeBundleSize = 0; try { wakeBundleSize = statSync(wakeBundle).size; } catch {}
+const wakeArtifact = artifactStats(wakeBundle);
 
 // ---- 4. webpack ----
 console.log('[3/4] Building with webpack...');
 const wpStats = measure('webpack', nodeExe, [wpEntry, '--config', webpackCfg], webpackBundle);
 let wpBundleSize = 0; try { wpBundleSize = statSync(webpackBundle).size; } catch {}
+const wpArtifact = artifactStats(webpackBundle);
 
 // ---- 5. results ----
 const speedup = wpStats.avg / wakeStats.avg;
@@ -136,4 +156,7 @@ console.log(`    wake     ${`${wakeStats.avgMem}MB`.padStart(7)}  ${bar(wakeStat
 console.log(`    webpack  ${`${wpStats.avgMem}MB`.padStart(7)}  ${bar(wpStats.avgMem, wpStats.avgMem)}  基准`);
 console.log(`  💾 内存: wake 节约 ${formatBytes(memSaved * 1024 * 1024)} (${memPct}%)`);
 console.log(`\n  产物大小  wake ${formatBytes(wakeBundleSize)}  vs  webpack ${formatBytes(wpBundleSize)}`);
+console.log(`  Gzip -9   wake ${formatBytes(wakeArtifact.gzip)}  vs  webpack ${formatBytes(wpArtifact.gzip)}`);
+console.log(`  Brotli 11 wake ${formatBytes(wakeArtifact.brotli)}  vs  webpack ${formatBytes(wpArtifact.brotli)}`);
+console.log(`  结构统计  wake wrappers=${wakeArtifact.wrappers} require-token=${wakeArtifact.requires}`);
 console.log(`${'─'.repeat(56)}\n`);
