@@ -78,6 +78,23 @@ impl SourceFile {
         }
     }
 
+    /// 字节偏移 → **0 基行 + 0 基 UTF-16 列**（Source Map V3 的坐标口径）。
+    ///
+    /// 与 [`SourceFile::location`] 的区别：后者是给人看的诊断坐标（1 基、按 Unicode 字符计），
+    /// 而 sourcemap 规范要求 0 基且列按 **UTF-16 码元**计——BMP 外字符（emoji、部分 CJK 扩展）
+    /// 占 2 个码元，若按字符计会与浏览器的解码结果差位。
+    pub fn location0_utf16(&self, offset: u32) -> (u32, u32) {
+        let offset = offset.min(self.len());
+        let line_idx = self.line_index(offset);
+        let line_start = self.line_starts[line_idx];
+        // 行首到 offset 的 UTF-16 码元数（`len_utf16` 对 BMP 外字符返回 2）。
+        let column: usize = self.src[line_start as usize..offset as usize]
+            .chars()
+            .map(char::len_utf16)
+            .sum();
+        (line_idx as u32, column as u32)
+    }
+
     /// 取某一行（0 基）的文本，不含行尾换行符。
     pub fn line_text(&self, line_index: usize) -> &str {
         let start = self.line_starts[line_index] as usize;
@@ -152,6 +169,30 @@ mod tests {
         let sf = SourceFile::new("a.js", "x\r\ny");
         assert_eq!(sf.line_text(0), "x");
         assert_eq!(sf.line_text(1), "y");
+    }
+
+    #[test]
+    fn location0_utf16_is_zero_based() {
+        let sf = SourceFile::new("a.js", "aa\nbbb");
+        // location 是 1 基，location0_utf16 是 0 基
+        assert_eq!(sf.location(0), LineCol { line: 1, column: 1 });
+        assert_eq!(sf.location0_utf16(0), (0, 0));
+        // 'b' 起始于偏移 3 → 第 2 行（0 基 1）第 1 列（0 基 0）
+        assert_eq!(sf.location0_utf16(3), (1, 0));
+        assert_eq!(sf.location0_utf16(5), (1, 2));
+    }
+
+    #[test]
+    fn location0_utf16_counts_code_units_not_chars() {
+        // "é" 是 1 个字符 / 1 个 UTF-16 码元 / 2 字节
+        let sf = SourceFile::new("a.js", "héllo");
+        assert_eq!(sf.location0_utf16(3), (0, 2)); // 'l' 前有 h,é = 2 码元
+
+        // "𝒳"（U+1D4B3）是 1 个字符 / **2 个 UTF-16 码元** / 4 字节。
+        // location 按字符计得 1，location0_utf16 须得 2——这正是浏览器的口径。
+        let sf2 = SourceFile::new("a.js", "𝒳x");
+        assert_eq!(sf2.location(4).column, 2); // 1 基字符列
+        assert_eq!(sf2.location0_utf16(4), (0, 2)); // 0 基 UTF-16 列
     }
 
     #[test]
