@@ -278,3 +278,54 @@ mod tests {
         assert_eq!(aliases[1], ("@@".to_string(), PathBuf::from("/x")));
     }
 }
+
+#[cfg(test)]
+mod root_dir_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_root_defaults_to_config_dir() {
+        let c = Config::default();
+        assert_eq!(c.resolved_root(Path::new("/proj")), PathBuf::from("/proj"));
+    }
+
+    #[test]
+    fn resolved_root_is_relative_to_config_dir() {
+        let c: Config = toml::from_str("root_dir = \"app\"").unwrap();
+        assert_eq!(
+            c.resolved_root(Path::new("/proj")),
+            PathBuf::from("/proj/app")
+        );
+    }
+
+    #[test]
+    fn absolute_root_dir_wins() {
+        let c: Config = toml::from_str("root_dir = \"/elsewhere\"").unwrap();
+        assert_eq!(
+            c.resolved_root(Path::new("/proj")),
+            PathBuf::from("/elsewhere")
+        );
+    }
+
+    /// `root_dir` 必须真正改变别名基准——这是它此前作为「死字段」的核心症状。
+    #[test]
+    fn root_dir_shifts_alias_base() {
+        let c: Config = toml::from_str("root_dir = \"app\"").unwrap();
+        let root = c.resolved_root(Path::new("/proj"));
+        let aliases = c.resolver_aliases(&root);
+        let at = aliases
+            .iter()
+            .find(|(k, _)| k == "@")
+            .expect("应有默认 @ 别名");
+        assert_eq!(
+            at.1,
+            PathBuf::from("/proj/app/src"),
+            "@ 应指向 root_dir/src"
+        );
+        let at2 = aliases
+            .iter()
+            .find(|(k, _)| k == "@@")
+            .expect("应有默认 @@ 别名");
+        assert_eq!(at2.1, PathBuf::from("/proj/app"), "@@ 应指向 root_dir");
+    }
+}
