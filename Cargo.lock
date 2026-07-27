@@ -2150,6 +2150,7 @@ dependencies = [
  "wake_cache",
  "wake_common",
  "wake_css",
+ "wake_css_in_js",
  "wake_ecma_ast",
  "wake_ecma_codegen",
  "wake_ecma_minify",
