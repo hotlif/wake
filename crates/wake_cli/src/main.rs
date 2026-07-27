@@ -40,6 +40,12 @@ enum Command {
         /// 监听源码变更，进程常驻热重建（引擎保持温热，增量重建远快于每次冷起）。
         #[arg(long)]
         watch: bool,
+        /// 产出 Source Map（`<chunk>.js.map` + `sourceMappingURL`）。
+        ///
+        /// 注意：当前仅**非压缩**产物支持精确映射，故本选项会关闭 minify/mangle
+        /// （压缩路径会重排改写模块体，映射会错位）。用于调试生产构建的模块组合问题。
+        #[arg(long)]
+        sourcemap: bool,
     },
     /// 启动 Dev Server + HMR（Phase 5，actix-web）。
     Dev {
@@ -75,11 +81,18 @@ fn main() -> ExitCode {
             outdir,
             cache,
             watch,
+            sourcemap,
         } => {
             if watch {
-                cmd_build_watch(entry.as_deref(), &outdir, Ui::new(style.color))
+                cmd_build_watch(entry.as_deref(), &outdir, sourcemap, Ui::new(style.color))
             } else {
-                cmd_build(entry.as_deref(), &outdir, cache, Ui::new(style.color))
+                cmd_build(
+                    entry.as_deref(),
+                    &outdir,
+                    cache,
+                    sourcemap,
+                    Ui::new(style.color),
+                )
             }
         }
         Command::Dev { root, port } => cmd_dev(&root, port),
@@ -98,11 +111,55 @@ fn main() -> ExitCode {
 /// 配置缺失时回退默认（零配置可跑）；解析失败打印告警并用默认。返回 (配置, 项目根, 别名表)。
 /// CRUSTIFY-PARITY §M1+§M2：别名解析 + 组件自动扫描（`@@@/{ns}` 懒加载模块）。
 fn prepare_project(start_dir: &Path) -> (wake_config::Config, PathBuf, Vec<(String, PathBuf)>) {
-    let root = wake_config::find_root(start_dir);
-    let config = wake_config::load(&root).unwrap_or_else(|e| {
+    // `config_dir` = 配置文件所在目录（向上探测得到）；项目根可由 `root_dir` 覆盖。
+    let config_dir = wake_config::find_root(start_dir);
+    let config = wake_config::load(&config_dir).unwrap_or_else(|e| {
         eprintln!("warning: {e}（改用默认配置）");
         wake_config::Config::default()
     });
+    // `root_dir` 相对配置文件目录解析（绝对路径则原样取用），此后**一切基准都用它**：
+    // 别名 `@`→root/src、`@@`→root、组件扫描的 cwd、`.wake/` 目录、虚拟入口、HTML 模板。
+    // 对齐 crustify 的 `getCwdDir(conf.rootDir)`。
+    let root = normalize_root(config.resolved_root(&config_dir));
+    if root != config_dir && !root.is_dir() {
+        // `find_root` 对相对入口可能返回空路径（一路向上走到 `""`），直接 display 会是空串。
+        let shown = |p: &Path| {
+            if p.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                p.display().to_string()
+            }
+        };
+        eprintln!(
+            "warning: 配置的 root_dir 指向不存在的目录 `{}`（回退到 `{}`）",
+            shown(&root),
+            shown(&config_dir)
+        );
+        return prepare_with_root(config, config_dir);
+    }
+    prepare_with_root(config, root)
+}
+
+/// 去掉 `join(".")` 之类留下的 `.` 分量，使日志/别名里的路径可读。
+fn normalize_root(p: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn prepare_with_root(
+    config: wake_config::Config,
+    root: PathBuf,
+) -> (wake_config::Config, PathBuf, Vec<(String, PathBuf)>) {
     let mut aliases = config.resolver_aliases(&root);
 
     // 组件自动扫描：每条规则生成 `@@@/{ns}` 懒加载模块，写入 `.wake/scan/{ns}.ts` 并登记别名。
@@ -247,7 +304,13 @@ fn resolve_style(no_color_flag: bool) -> RenderStyle {
     }
 }
 
-fn cmd_build(entry: Option<&Path>, outdir: &Path, cache: bool, ui: Ui) -> Result<(), ExitCode> {
+fn cmd_build(
+    entry: Option<&Path>,
+    outdir: &Path,
+    cache: bool,
+    sourcemap: bool,
+    ui: Ui,
+) -> Result<(), ExitCode> {
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -283,17 +346,32 @@ fn cmd_build(entry: Option<&Path>, outdir: &Path, cache: bool, ui: Ui) -> Result
     bundler.set_define(build_define(&config, false));
     // prod 产物完善：CSS 抽取为独立 `.css`、资源 4KB 阈值（超阈值独立产物）、publicPath 前缀（§M3）。
     bundler.enable_css_extraction();
+    // 零运行时 CSS-in-JS（Linaria 子集，§M5）：默认开启——项目没 import `@linaria/core`
+    // 时打包器整体跳过，零开销。
+    bundler.enable_css_in_js();
     bundler.set_asset_inline_limit(4096);
     bundler.set_public_path(config.public_path());
-    bundler.enable_minify();
-    if std::env::var_os("WAKE_NO_MANGLE").is_none() {
-        bundler.enable_mangle();
+    // `--sourcemap`：映射仅在非压缩路径精确（压缩会重排改写模块体），故与 minify/mangle 互斥。
+    if sourcemap {
+        bundler.enable_sourcemap();
+        eprintln!(
+            "  {} --sourcemap 已启用：本次构建不压缩（压缩路径的映射会错位）",
+            ui.warn("!")
+        );
+    } else {
+        bundler.enable_minify();
+        if std::env::var_os("WAKE_NO_MANGLE").is_none() {
+            bundler.enable_mangle();
+        }
     }
     bundler.enable_dead_module_elimination();
     // prod build 开启 Tree Shaking（移除未用导出，PLAN §6.6）+ 代码分割（动态 import 切 chunk，
     // PLAN §6.5）；dev（wake dev）保持关闭利于 HMR。
     bundler.enable_tree_shaking();
-    bundler.enable_code_splitting();
+    // 代码分割路径暂不产 map（M4d 首期只覆盖单包）——开 sourcemap 时关闭分割以保证映射完整。
+    if !sourcemap {
+        bundler.enable_code_splitting();
+    }
     // `--cache`：持久化构建缓存（PLAN §7.1）。跨进程跳过未变模块的 parse+codegen。
     if cache {
         let cache_dir = root.join(".wake");
@@ -428,9 +506,24 @@ fn write_build_output(out: &wake_bundler::BuildOutput, outdir: &Path) -> Result<
     let mut total = 0usize;
     for c in &out.chunks {
         let p = outdir.join(&c.file_name);
-        write_atomic(&p, c.code.as_bytes())
-            .map_err(|e| format!("无法写入 `{}`：{e}", p.display()))?;
-        total += c.code.len();
+        match &c.source_map {
+            // 有 map：产物末尾追加 sourceMappingURL（外链），并另写 `<chunk>.js.map`。
+            Some(map) => {
+                let code = format!("{}\n//# sourceMappingURL={}.map\n", c.code, c.file_name);
+                write_atomic(&p, code.as_bytes())
+                    .map_err(|e| format!("无法写入 `{}`：{e}", p.display()))?;
+                total += code.len();
+                let mp = outdir.join(format!("{}.map", c.file_name));
+                write_atomic(&mp, map.as_bytes())
+                    .map_err(|e| format!("无法写入 `{}`：{e}", mp.display()))?;
+                total += map.len();
+            }
+            None => {
+                write_atomic(&p, c.code.as_bytes())
+                    .map_err(|e| format!("无法写入 `{}`：{e}", p.display()))?;
+                total += c.code.len();
+            }
+        }
     }
     // 带外产物：超阈值资源文件 + 抽取的 `.css`。
     for a in &out.assets {
@@ -447,7 +540,12 @@ fn write_build_output(out: &wake_bundler::BuildOutput, outdir: &Path) -> Result<
 
 /// `wake build --watch`：进程常驻，引擎保持温热。首次冷构建后监听源码，改动即**增量**热重建
 /// 并写盘。省掉每次冷起的进程启动 + 构造（线程池）+ 缓存载入——热重建远快于一次性 `wake build`。
-fn cmd_build_watch(entry: Option<&Path>, outdir: &Path, ui: Ui) -> Result<(), ExitCode> {
+fn cmd_build_watch(
+    entry: Option<&Path>,
+    outdir: &Path,
+    sourcemap: bool,
+    ui: Ui,
+) -> Result<(), ExitCode> {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -479,15 +577,29 @@ fn cmd_build_watch(entry: Option<&Path>, outdir: &Path, ui: Ui) -> Result<(), Ex
     // `build --watch` 走 prod 口径（同 `build`）；dev 口径在 `wake dev`。
     bundler.set_define(build_define(&config, false));
     bundler.enable_css_extraction();
+    // 零运行时 CSS-in-JS（Linaria 子集，§M5）：默认开启——项目没 import `@linaria/core`
+    // 时打包器整体跳过，零开销。
+    bundler.enable_css_in_js();
     bundler.set_asset_inline_limit(4096);
     bundler.set_public_path(config.public_path());
-    bundler.enable_minify();
-    if std::env::var_os("WAKE_NO_MANGLE").is_none() {
-        bundler.enable_mangle();
+    // 同 `cmd_build`：`--sourcemap` 与压缩/分割互斥（压缩路径映射会错位，分割路径暂不产 map）。
+    if sourcemap {
+        bundler.enable_sourcemap();
+        eprintln!(
+            "  {} --sourcemap 已启用：本次构建不压缩（压缩路径的映射会错位）",
+            ui.warn("!")
+        );
+    } else {
+        bundler.enable_minify();
+        if std::env::var_os("WAKE_NO_MANGLE").is_none() {
+            bundler.enable_mangle();
+        }
     }
     bundler.enable_dead_module_elimination();
     bundler.enable_tree_shaking();
-    bundler.enable_code_splitting();
+    if !sourcemap {
+        bundler.enable_code_splitting();
+    }
 
     // 一次构建 + 写盘 + HTML + 打印一行状态（label 区分首次/热重建）。
     let run_once = |bundler: &mut wake_bundler::IncrementalBundler, label: &str| {
@@ -580,13 +692,44 @@ fn is_source_event(ev: &notify::Event) -> bool {
         ev.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     ) && ev.paths.iter().any(|p| {
-        p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-            matches!(
-                e,
-                "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "json" | "css"
-            )
-        })
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(is_watched_ext)
     })
+}
+
+/// 触发重建的扩展名。
+///
+/// 除源码外必须包含**图片与字体**：它们既可能被 JS `import`，也可能被 CSS 的 `url()` 引用，
+/// 两条路径都会把字节内容（base64 或内容 hash 文件名）打进产物——换一张图不重建就是陈旧产物。
+fn is_watched_ext(e: &str) -> bool {
+    matches!(
+        e,
+        "ts" | "tsx"
+            | "js"
+            | "jsx"
+            | "mts"
+            | "cts"
+            | "json"
+            | "css"
+            | "raw"
+            // 图片
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "svg"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "bmp"
+            // 字体
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+    )
 }
 
 /// 构建期 manifest.json：入口文件名 + 各 chunk（文件/类型/模块数/依赖）。供 HTML 注入 / SSR。
@@ -609,6 +752,22 @@ fn build_manifest(out: &wake_bundler::BuildOutput) -> String {
         ));
     }
     s.push_str("\n  },\n");
+    // 带外产物：抽取的 `.css` 与独立资源文件。名字都带内容 hash，SSR / CDN 上传脚本 /
+    // 后端模板只能从这里拿到真实文件名——此前 manifest 完全不含这两类，外部消费方拿不到。
+    let styles: Vec<String> = out
+        .assets
+        .iter()
+        .filter(|a| a.is_css)
+        .map(|a| format!("{:?}", a.file_name))
+        .collect();
+    let files: Vec<String> = out
+        .assets
+        .iter()
+        .filter(|a| !a.is_css)
+        .map(|a| format!("{:?}", a.file_name))
+        .collect();
+    s.push_str(&format!("  \"styles\": [{}],\n", styles.join(", ")));
+    s.push_str(&format!("  \"assets\": [{}],\n", files.join(", ")));
     s.push_str(&format!("  \"modules\": {}\n}}\n", out.module_count));
     s
 }
@@ -636,6 +795,11 @@ fn print_diagnostics(ui: &Ui, diags: &[wake_common::Diagnostic]) {
             (ui.warn("warn"), d)
         };
         eprintln!("  {}{}  {}", tag, ui.dim(&format!("[{code}]")), sev.message);
+        // 尾注承载「怎么办」（如不支持的文件类型该改用什么、插值支持哪些表达式）——
+        // 此前从未打印，等于用户看不到最有用的那半条信息。
+        for note in &d.notes {
+            eprintln!("      {} {}", ui.dim("note:"), note);
+        }
     }
 }
 
