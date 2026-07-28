@@ -1,0 +1,4 @@
+[html]
+entry = "src/index.tsx"
+template = "public/index.html"
+
