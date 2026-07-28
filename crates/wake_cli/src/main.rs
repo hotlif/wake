@@ -52,6 +52,9 @@ enum Command {
         /// 项目根目录。
         #[arg(default_value = ".")]
         root: PathBuf,
+        /// 入口文件。优先于 `wake.config.toml` 的 `html.entry`。
+        #[arg(long)]
+        entry: Option<PathBuf>,
         /// 监听端口。
         #[arg(long, default_value_t = 5173)]
         port: u16,
@@ -95,7 +98,7 @@ fn main() -> ExitCode {
                 )
             }
         }
-        Command::Dev { root, port } => cmd_dev(&root, port),
+        Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port),
         Command::Parse { file, ast } => cmd_parse(&file, ast, style),
         Command::Tokenize { file } => cmd_tokenize(&file, style),
     };
@@ -804,10 +807,20 @@ fn print_diagnostics(ui: &Ui, diags: &[wake_common::Diagnostic]) {
 }
 
 /// `wake dev`：启动 Dev Server + HMR（Phase 5，actix-web）。阻塞直到进程退出。
-fn cmd_dev(root: &Path, port: u16) -> Result<(), ExitCode> {
+fn cmd_dev(root: &Path, entry: Option<&Path>, port: u16) -> Result<(), ExitCode> {
     // 读配置 + 组件扫描 + 别名，交给 dev server 的内部打包器（与 build 一致，@/@@/@@@ 在 dev 也可解析）。
-    let (config, _root, aliases) = prepare_project(root);
+    let (config, project_root, aliases) = prepare_project(root);
     let ds = &config.dev_server;
+    // 入口由 CLI 统一决定并传给 dev server：命令行 > 配置 > 零配置默认。
+    let entry = entry
+        .map(Path::to_path_buf)
+        .or_else(|| config.html.entry.as_deref().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("src/index.tsx"));
+    let entry = if entry.is_absolute() {
+        entry
+    } else {
+        project_root.join(entry)
+    };
 
     // https 暂未实现（需 TLS 依赖）——配置了则告警并按 http 起。
     if ds.server.as_deref() == Some("https") {
@@ -840,13 +853,14 @@ fn cmd_dev(root: &Path, port: u16) -> Result<(), ExitCode> {
         .collect();
 
     let options = wake_dev_server::ServeOptions {
+        entry,
         resolve_options: resolve_options(aliases),
         define: build_define(&config, true), // dev 口径：NODE_ENV=development
         host: ds.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
         open: ds.open,
         proxy,
     };
-    match wake_dev_server::serve(root, effective_port, options) {
+    match wake_dev_server::serve(&project_root, effective_port, options) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("error: dev server 启动失败：{e}");

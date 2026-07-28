@@ -113,6 +113,8 @@ struct AppState {
 
 /// Dev server 选项（由 CLI 读 `wake.config.toml` 装配）。CRUSTIFY-PARITY §M3。
 pub struct ServeOptions {
+    /// 已由调用方解析完成的入口文件。
+    pub entry: PathBuf,
     /// 解析选项（含别名 `@`/`@@`/`@@@`）。
     pub resolve_options: ResolveOptions,
     /// 编译期 define（dev 口径：`process.env.NODE_ENV → "development"` + 用户 `[define]`）。
@@ -128,6 +130,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
+            entry: PathBuf::from("src/index.tsx"),
             resolve_options: ResolveOptions::default(),
             define: Vec::new(),
             host: "127.0.0.1".to_string(),
@@ -153,6 +156,7 @@ pub struct ProxyRule {
 /// 启动 dev server（阻塞直到进程退出）。`root` 为项目根，`port` 为监听端口，`options` 见 [`ServeOptions`]。
 pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<()> {
     let ServeOptions {
+        entry,
         resolve_options,
         define,
         host,
@@ -165,15 +169,17 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
         .filter_map(CompiledProxy::compile)
         .collect();
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let entry = match find_entry(&root) {
-        Some(e) => e,
-        None => {
-            return Err(std::io::Error::other(format!(
-                "未找到入口文件（在 {} 下找 src/index.{{tsx,ts,jsx,js}} 或 index.*）",
-                root.display()
-            )));
-        }
+    let entry = if entry.is_absolute() {
+        entry
+    } else {
+        root.join(entry)
     };
+    if !entry.is_file() {
+        return Err(std::io::Error::other(format!(
+            "入口文件不存在：{}",
+            entry.display()
+        )));
+    }
     let html = Arc::new(RwLock::new(load_html_template(&root)));
 
     let sty = Sty::detect();
@@ -833,23 +839,6 @@ async fn ws_handler(
 // ======================================================================
 // 入口 / HTML / 消息
 // ======================================================================
-
-/// 查找入口：`src/index.{tsx,ts,jsx,js}` / `src/main.*` 优先，其次根目录同名文件。
-fn find_entry(root: &Path) -> Option<PathBuf> {
-    const NAMES: &[&str] = &[
-        "src/index.tsx",
-        "src/index.ts",
-        "src/index.jsx",
-        "src/index.js",
-        "src/main.tsx",
-        "src/main.ts",
-        "index.tsx",
-        "index.ts",
-        "index.jsx",
-        "index.js",
-    ];
-    NAMES.iter().map(|n| root.join(n)).find(|p| p.is_file())
-}
 
 /// 加载 HTML 外壳：优先项目 `public/index.html` / `index.html`，注入 HMR client 脚本；
 /// 无则生成默认外壳。
