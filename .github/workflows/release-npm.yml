@@ -261,7 +261,16 @@ jobs:
           mkdir smoke
           cd smoke
           npm init -y
-          npm install --ignore-scripts @crab-dev/wake@0.1.2
+          for attempt in {1..12}; do
+            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.2; then
+              break
+            fi
+            if [[ "$attempt" -eq 12 ]]; then
+              exit 1
+            fi
+            echo "npm package is not visible yet; retrying in 30 seconds"
+            sleep 30
+          done
           npx wake --version
           node -e "console.log(require('@crab-dev/wake').version())"
 
@@ -284,7 +293,16 @@ jobs:
           mkdir smoke
           cd smoke
           npm init -y
-          npm install --ignore-scripts @crab-dev/wake@0.1.2
+          for attempt in {1..12}; do
+            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.2; then
+              break
+            fi
+            if [[ "$attempt" -eq 12 ]]; then
+              exit 1
+            fi
+            echo "npm package is not visible yet; retrying in 30 seconds"
+            sleep 30
+          done
           node -e "let p=require('./package.json');p.scripts={'wake-smoke':'wake build'};require('node:fs').writeFileSync('package.json',JSON.stringify(p));require('node:fs').mkdirSync('src');require('node:fs').writeFileSync('wake.config.toml','[html]\nentry = \"src/index.js\"\n');require('node:fs').writeFileSync('src/index.js','export const value = 42\n')"
           npx @crab-dev/wake --version
           npx wake --version
