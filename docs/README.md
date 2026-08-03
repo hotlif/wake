@@ -1,28 +1,69 @@
-# Wake 文档
+# Wake 中文文档
 
-本文档集描述仓库在 2026-07-28 的实际状态，而不是远期愿景。结论来自源码、Cargo 清单和本地验证。
+`docs/` 只保存由 `wake docs` 构建的中文使用文档及其运行资源。Wake 内部架构、性能和测试资料统一放在 [`engineering/`](../engineering/README.md)，不会进入文档路由或搜索索引。
 
-## 阅读顺序
+## 新手从哪里开始
 
-1. [ARCHITECTURE.md](ARCHITECTURE.md)：当前系统边界、依赖方向和构建数据流。
-2. [AUDIT.md](AUDIT.md)：已确认的问题、风险等级和证据。
-3. [ROADMAP.md](ROADMAP.md)：按风险排序的架构演进方案。
-4. [TESTING.md](TESTING.md)：本地与 CI 应执行的质量门禁。
-5. [PERFORMANCE.md](PERFORMANCE.md)：可复现的构建性能和产物体积基线。
+建议严格按照下面的顺序阅读。每一阶段都包含可以直接复制运行的代码、检查方法和练习。
 
-## 当前结论
+1. [学习路线](getting-started/learning-path.mdx)：先认识 Wake、Wake Docs 和完整学习目标。
+2. [快速开始](getting-started/quick-start.mdx)：从零创建第一个 React 19 应用。
+3. [第一个文档站](getting-started/first-docs-site.mdx)：完成组件、Demo、API 表格和主题配置。
+4. [开发模式](guide/development.mdx)：掌握热更新、代理、别名和文件监听。
+5. [配置参考](guide/configuration.mdx)：理解 `wake.config.toml` 的全部常用字段。
+6. [MDX 写作](docs-system/mdx.mdx)：掌握 Frontmatter、代码高亮、JSX 和静态资源。
+7. [Demo 与 API](docs-system/demo-api.mdx)：编写隔离预览和 Props 文档。
+8. [Button 完整教程](docs-system/button-tutorial.mdx)：独立完成一个组件的整套文档。
+9. [生产构建](guide/production.mdx)：配置部署路径、缓存、静态路由和 CI。
+10. [排错手册](reference/troubleshooting.mdx)：按构建阶段定位常见问题。
 
-Wake 已经不是纯设计原型。它具备从解析、转换、链接到输出、缓存和开发服务器的完整垂直切片，工作区测试全部通过。当前最需要解决的不是继续增加 crate，而是收敛执行模型：
+需要查命令时阅读 [CLI 参考](reference/cli.mdx)，不理解术语时阅读 [术语表](reference/glossary.mdx)。Crab UI 的安装、导入、样式与版本升级见 [Crab UI 组件指南](guide/crab-components.mdx)。
 
-- `Bundler` 与 `IncrementalBundler` 是两套编排路径，能力和正确性容易漂移。
-- `IncrementalBundler` 已使用 `wake_turbo`，但不是所有阶段都被统一建模为任务。
-- 持久化缓存保存摘要与产物，命中时会缺少活跃性及 concat 分析，导致优化结果依赖缓存冷热状态。
-- `wake_bundler` 同时承担扫描、解析调度、图构建、优化、chunk、runtime 生成和缓存协调，边界过宽。
-- 测试通过，但仓库声明的 `cargo clippy --workspace --all-targets -- -D warnings` 当前失败。
+## 本地运行文档站
 
-## 文档原则
+环境要求：
 
-- 以源码为事实来源；文档不承诺尚未实现的能力。
-- 架构决策必须说明不变量、失败模式和验证方法。
-- 性能目标必须配套可复现基准，不使用无测量依据的数字。
-- 新设计先消除双路径和正确性分叉，再考虑微优化。
+- Rust 1.95 或更高版本；
+- Node.js 与 npm；
+- 文档项目使用 React 19。
+
+在仓库根目录执行：
+
+```powershell
+npm install
+npm run docs:dev
+```
+
+浏览器打开终端显示的地址。开发模式会监听 MDX、Demo、组件 Props 和主题文件的变化。
+
+构建生产站点：
+
+```powershell
+npm run docs:build
+```
+
+默认产物位于 `docs-dist/`。提交前建议执行：
+
+```powershell
+cargo test -p wake_docs
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+npm run docs:build
+```
+
+## 文档目录
+
+```text
+docs/
+├─ index.mdx                 # 文档站首页
+├─ getting-started/          # 入门路线和零基础教程
+├─ guide/                    # 开发、配置、生产和组件使用
+├─ docs-system/              # MDX、Demo、API 和完整实战
+├─ reference/                # CLI、排错和术语表
+├─ examples/                 # Demo 与 Props 提取使用的真实源码
+└─ site/                     # 文档站 React 组件、Preview 与主题样式
+```
+
+新增页面时必须提供 Frontmatter，并确保 `slug` 唯一。代码示例应能够运行；涉及组件 Props 时优先使用 JSDoc 说明、`@default` 和 `@deprecated`，以便 `<API>` 自动生成准确内容。
+
+只把面向 Wake 使用者、会参与文档站构建的内容放进本目录。编译器设计、基准数据、测试策略和阶段性结论应写入 `engineering/`，避免站点源码再次混入内部记录。

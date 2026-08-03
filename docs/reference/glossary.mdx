@@ -1,0 +1,202 @@
++++
+title = "术语表"
+description = "用新手能理解的方式解释 Wake、React 和组件文档中的常见术语"
+group = "参考"
+group_order = 30
+order = 30
+slug = "/reference/glossary"
+status = "stable"
++++
+
+# 术语表
+
+第一次接触构建工具时，很多困难来自术语。这里按实际使用场景解释，不要求先理解编译器理论。
+
+## 项目和模块
+
+### 项目根 Root
+
+Wake 解析配置、入口、别名和相对路径的基准目录。命令中的 `.` 通常表示当前目录。`root_dir` 可以把配置目录映射到另一个实际根。
+
+### 入口 Entry
+
+应用执行的第一份模块。Wake 从入口继续查找 import，形成模块图。默认是 `src/entry.tsx`，也可以通过配置或 CLI 指定。
+
+### 模块 Module
+
+一份可以 import/export 的 JS、TS、TSX、CSS 或资源文件。模块不等于 npm 包；一个包通常包含很多模块。
+
+### 依赖 Dependency
+
+某个模块通过 import、require、CSS url 等引用的其他内容。Wake 从发起模块的位置解析依赖。
+
+### 模块图 Module Graph
+
+从入口出发，把模块与依赖关系连接起来的图。增量构建通过它判断源码变化会影响哪些下游模块。
+
+## 开发流程
+
+### Dev Server
+
+为浏览器提供开发页面、模块和 HMR 连接的本地 HTTP 服务。它不是生产服务器。
+
+### HMR
+
+Hot Module Replacement，热模块替换。源码变化后尽量只更新相关模块，避免整个页面重新启动。
+
+### Watch Root
+
+开发服务器监听文件变化的目录。普通源码、Docs source、Demo、Preview、主题和组件扫描目录都可能成为监听根。
+
+### BuildSession
+
+一次开发生命周期中复用的构建会话。它保存模块图和增量状态，避免每次修改都冷启动全部工作。
+
+### 增量构建
+
+只重新处理发生变化以及受其影响的内容。它追求结果与冷构建一致，只是减少重复计算。
+
+### 冷构建和热构建
+
+冷构建没有可复用的进程状态；热构建复用已解析模块、图和缓存。比较性能时要说明是哪一种。
+
+## 生产构建
+
+### Bundle
+
+把多个模块连接成浏览器可加载产物的过程或结果。
+
+### Chunk
+
+最终输出的一份 JavaScript 文件。入口、共享依赖和动态页面可能分别成为不同 chunk。
+
+### Code Splitting
+
+代码分割。通过动态 import 把非首屏代码拆成异步 chunk，需要时再加载。
+
+### Tree Shaking
+
+根据 import/export 使用情况移除未使用代码。它依赖模块语义，不能简单理解为删除所有没有出现的文本。
+
+### Dead Module Elimination
+
+从入口重新计算可达模块，并移除完全不可达的模块。
+
+### Minify
+
+在保持行为的前提下缩短代码，例如删除空白、简化表达式。
+
+### Mangle
+
+缩短局部标识符名称。它是压缩的一部分，调试第三方兼容问题时可以临时关闭。
+
+### Source Map
+
+把生成代码位置映射回源码。Wake 当前精确 Source Map 使用非压缩单包路径，适合调试而非最终发布。
+
+### 内容 Hash
+
+由文件内容计算的短标识，通常出现在文件名中。内容不变时可复用缓存，内容变化时 URL 变化。
+
+### Public Path / Base Path
+
+部署资源的 URL 前缀。普通应用使用 `public_path`，文档使用 `[docs].base_path`。部署到子目录时必须匹配真实地址。
+
+### Manifest
+
+记录逻辑 chunk、资源与实际 hash 文件名的 JSON。部署系统或其他工具可以读取它。
+
+## Wake Docs
+
+### MDX
+
+Markdown 与 JSX 的组合格式。适合在说明文字中嵌入 React 组件和表达式。
+
+### Frontmatter
+
+MDX 顶部的结构化元数据。Wake 使用 `+++` 包围 TOML，用来声明 title、slug、group、order 等。
+
+### Slug
+
+页面 URL 路径，例如 `/components/button`。每条生产路由必须唯一。
+
+### Demo
+
+以 `.demo.tsx` 结尾的可运行示例。文档页面可以预览、查看和复制它的源码。
+
+### Preview
+
+包装所有 Demo 的 React 组件。用于注入 Provider、全局 CSS、主题和国际化。
+
+### Props API
+
+从导出 TypeScript 类型和 JSDoc 生成的属性文档，包括类型、必填、默认值、废弃和继承来源。
+
+### JSDoc
+
+写在类型或属性上方的结构化注释。`@default`、`@deprecated`、`@since` 会进入 API 数据。
+
+### 编译期组件
+
+`Demo`、`Demos`、`API`。Wake 在生成页面时读取它们的静态属性，因此路径和 symbol 不能来自运行时变量。
+
+### 草稿 Draft
+
+Frontmatter 中 `draft = true` 的页面。开发模式可见，生产构建排除。
+
+### 搜索索引
+
+构建期生成的标题、描述、标题节点和 Props 名称集合。运行时搜索不需要远程服务。
+
+### iframe 隔离
+
+Demo 在独立文档环境运行，减少样式和错误对主文档页面的影响。主题和高度通过 postMessage 同步。
+
+## 类型和解析
+
+### ESM
+
+使用 import/export 的 ECMAScript 模块格式。现代 npm 包通常通过 exports 的 import 条件提供 ESM。
+
+### CommonJS
+
+使用 require/module.exports 的模块格式。Wake resolver 会根据入口和包条件解析相应文件。
+
+### Package Exports
+
+`package.json#exports` 定义消费者允许使用的包入口和条件。应从公开入口导入，不要绕到包内部构建文件。
+
+### Peer Dependency
+
+组件包要求由宿主项目提供的依赖，例如 React。这样可以避免组件库私自安装第二份 React。
+
+### Alias
+
+把简短前缀映射到目录或生成模块，例如 `@` 指向 `src`。
+
+### Resolver
+
+根据 import 字符串、发起文件、扩展名、alias 和 node_modules 找到真实文件的组件。
+
+## 缓存和生成目录
+
+### `.wake`
+
+Wake 的本地生成与缓存目录。可以删除重建，不应提交源码管理。
+
+### `dist` / `docs-dist`
+
+生产输出目录。构建前会被清理，不应手工维护。
+
+### 持久化缓存
+
+跨进程保存可复用构建结果的 `.wake/cache.bin`。它只负责加速，删除后结果应保持一致。
+
+## 继续学习
+
+遇到不熟悉的词时，回到当前词条后再阅读原章节：
+
+- 开发相关术语：查看“开发与 HMR”；
+- 输出相关术语：查看“生产构建”；
+- MDX、Demo、API：查看“组件文档”分组；
+- 具体参数：查看“CLI 参考”和“配置参考”。

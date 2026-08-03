@@ -89,3 +89,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # 只确认 bench 骨架可编译可跑（--no-run）。回归门禁待基线历史后用 critcmp 接入。
       - run: cargo bench --workspace --no-run
+  node:
+    name: node ${{ matrix.node }} / win32-x64
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22.14.0, 24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-${{ matrix.node }}
+      - run: npm ci --ignore-scripts
+      - run: npm run versions:check
+      - run: npm run native:build
+      - name: Select local native binding
+        shell: pwsh
+        run: |
+          "WAKE_NATIVE_PATH=$((Resolve-Path npm/wake/wake.win32-x64-msvc.node).Path)" >> $env:GITHUB_ENV
+          Copy-Item npm/wake/wake.win32-x64-msvc.node npm/wake-win32-x64-msvc/wake.win32-x64-msvc.node
+      - run: npm run npm:test
+      - run: npm run npm:typecheck
+      - run: node scripts/check-startup.mjs
+      - run: npm run npm:pack:check
+        env:
+          WAKE_PACK_TARGETS: npm/wake,npm/wake-win32-x64-msvc

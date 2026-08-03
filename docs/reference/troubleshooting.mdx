@@ -1,0 +1,380 @@
++++
+title = "故障排查"
+description = "按症状定位安装、配置、模块解析、MDX、Demo、API、样式和部署问题"
+group = "参考"
+group_order = 30
+order = 20
+slug = "/reference/troubleshooting"
+status = "stable"
++++
+
+import { Callout } from "../site/components.tsx"
+
+# 故障排查
+
+排错的关键不是一次尝试很多修改，而是先判断失败发生在哪个阶段。
+
+## 五阶段定位法
+
+| 阶段 | 典型错误 |
+| --- | --- |
+| CLI 启动 | 找不到 wake、参数不认识、端口占用 |
+| 配置与项目根 | TOML warning、入口或目录错误 |
+| 模块构建 | 无法解析依赖、语法错误、CSS/资源问题 |
+| Docs 生成 | Frontmatter、Demo 静态路径、API symbol |
+| 浏览器与部署 | 页面空白、chunk 404、base path、主题样式 |
+
+先找到最早失败阶段。浏览器里的连锁错误不能代替终端中的第一条构建诊断。
+
+## 快速症状表
+
+| 症状 | 最可能原因 | 第一项检查 |
+| --- | --- | --- |
+| `wake` 不是命令 | PATH 未包含二进制 | `wake --version` |
+| React 19 检查失败 | 当前根未声明依赖 | 项目根 `package.json` |
+| 无法解析 npm 包 | 未安装或包依赖缺失 | `node_modules` 和错误包名 |
+| 配置似乎无效 | TOML 解析回退默认 | 启动 warning |
+| 页面空白 | 入口运行错误 | 浏览器控制台 |
+| MDX 生成失败 | Frontmatter 或静态属性 | 报错行列 |
+| Demo 不显示 | 路径、默认导出或 Provider | Demo 错误层 |
+| API 找不到 | source/symbol/re-export | 类型导出 |
+| 生产子路由 404 | 部署不完整或 base 错 | 路由 HTML 与 404 |
+| 暗色卡片仍是白色 | UI 语义变量未映射 | theme.css |
+
+## 找不到 wake 命令
+
+检查二进制是否存在：
+
+```powershell
+Test-Path C:\path\to\wake\target\release\wake.exe
+```
+
+直接运行验证：
+
+```powershell
+C:\path\to\wake\target\release\wake.exe --version
+```
+
+如果可运行，把所在目录加入 PATH 后重新打开终端。还要确认 PATH 中没有更旧的 Wake：
+
+```powershell
+Get-Command wake -All
+```
+
+## 找不到 React 或 react-dom
+
+当前项目根的 `package.json` 必须声明：
+
+```json
+{
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
+```
+
+然后用项目包管理器安装。仅在父级或另一个 workspace 包声明 React，不满足 Wake Docs 对当前根的检查。
+
+确认实际版本：
+
+```bash
+npm ls react react-dom
+```
+
+如果出现多份不兼容 React，检查 workspace 链接和组件包 peer dependencies。
+
+## React 18 被拒绝
+
+这是预期行为。升级四组包：
+
+```bash
+npm install react@^19 react-dom@^19
+npm install -D @types/react@^19 @types/react-dom@^19
+```
+
+再运行项目自己的类型检查，处理 React 19 类型变化，然后重启 Wake Docs。
+
+## 无法解析 npm 依赖
+
+错误通常包含“从哪个文件解析哪个包”。按顺序检查：
+
+1. 包是否在当前根 `package.json`；
+2. 是否执行过安装；
+3. 锁文件与包管理器是否匹配；
+4. import 是否使用公开 exports；
+5. 发布包是否遗漏运行时依赖；
+6. ESM/CJS 条件是否存在。
+
+Crab UI 0.0.2 如果提示 `@linaria/core`：
+
+```bash
+npm install @linaria/core@8.1.1
+```
+
+这是发布依赖声明问题，不应通过本机绝对源码导入绕过。
+
+## 配置没有生效
+
+启动时如果出现“配置解析失败，改用默认配置”，先修复 TOML。常见错误：
+
+- 字符串缺少引号；
+- Windows 反斜杠没有转义；
+- 数组漏逗号；
+- `[[proxy]]` 层级写错；
+- 把 MDX 的 `+++` 写进 TOML；
+- 编辑了另一个目录的配置。
+
+显式传项目根并重启：
+
+```bash
+wake docs dev C:\projects\my-ui
+```
+
+如果设置了 `root_dir`，后续路径会以它为基准。
+
+## 入口找不到
+
+优先级是 CLI 入口、`[html].entry`、`src/entry.tsx`。检查真实文件：
+
+```powershell
+Test-Path .\src\entry.tsx
+```
+
+Windows 不区分大小写不代表 Linux CI 也不区分。import 文件名大小写应与磁盘完全一致。
+
+## 端口被占用
+
+临时换端口：
+
+```bash
+wake docs dev . --port 5174
+```
+
+如果应用和文档同时开发，给它们分配不同端口。修改配置端口后需要重启进程。
+
+## 页面空白但构建成功
+
+检查顺序：
+
+1. 浏览器控制台第一条错误；
+2. Network 中入口 JS 是否 200；
+3. HTML 是否包含 `#root`；
+4. 入口是否执行 `createRoot`；
+5. 依赖是否在运行时抛错；
+6. `public_path` 是否让 chunk 请求到错误目录。
+
+先用默认 HTML 外壳排除模板问题，再恢复自定义 `public/index.html`。
+
+## Frontmatter 解析失败
+
+Frontmatter 必须在文件顶部，用 `+++` 包围合法 TOML：
+
+```mdx
++++
+title = "Button"
+order = 10
+draft = false
++++
+```
+
+不要使用 YAML 的 `---`，不要把数字写成带引号的字符串后又期望按整数排序。
+
+## 重复路由
+
+两个页面使用相同 slug 会失败。搜索全部声明：
+
+```powershell
+Get-ChildItem docs -Recurse -Filter *.mdx |
+  Select-String 'slug ='
+```
+
+省略 slug 时也可能由路径推导出冲突，例如同一文件名经过重命名或复制后未清理旧文件。
+
+## MDX 编译期属性报错
+
+`Demo.src`、`Demos.glob`、`Demos.columns`、`API.source`、`API.symbol` 和 `API.component` 必须是静态字面量。
+
+正确：
+
+```mdx
+<Demo src="./demos/basic.demo.tsx" />
+<Demos glob="./demos/*.demo.tsx" columns={2} />
+```
+
+错误：
+
+```mdx
+<Demo src={demoPath} />
+<API {...props} />
+```
+
+路径选择逻辑应在生成前确定，而不是放到 MDX 运行时。
+
+## Demo 找不到或没有匹配
+
+检查：
+
+- 文件以 `.demo.tsx` 结尾；
+- 路径相对当前 MDX；
+- glob 使用 `/` 形式；
+- 文件大小写一致；
+- Demo 位于项目根内；
+- 新文件已经保存。
+
+在页面错误信息中比较解析后的相对位置，不要只看编辑器 tab 名。
+
+## Demo 运行错误
+
+先切到源码确认默认导出。然后检查：
+
+1. 组件 import；
+2. 组件 CSS；
+3. Preview 是否提供 Provider；
+4. 浏览器 API 是否可在 iframe 使用；
+5. 组件是否依赖未安装包；
+6. React 是否重复。
+
+Demo 错误会通过 `wake:error` 显示，不应导致整个文档站崩溃。
+
+## Demo 高度不正确
+
+首版使用 iframe 自动测高。确认 Demo 内容完成渲染后会触发布局变化；持续动画、绝对定位或门户内容可能无法代表正常文档流。不要依赖 `meta.height` 固定值，当前推荐 `auto`。
+
+## API 找不到 source 或 symbol
+
+检查：
+
+1. source 相对当前 MDX；
+2. 文件存在；
+3. symbol 是导出的 interface 或对象类型 alias；
+4. 本地 re-export 链正确；
+5. 拼写和大小写完全一致；
+6. 没有无法收敛的本地类型循环。
+
+找不到 source、symbol 或循环无法收敛时，生产构建会失败。
+
+## API 缺少说明或默认值
+
+属性说明来自 JSDoc，不来自变量名猜测。默认值优先使用 `@default`，其次尝试组件参数解构的静态字面量。
+
+复杂函数调用不会被执行：
+
+```tsx
+// 可以推断
+function Button({ size = "middle" }: ButtonProps) {}
+
+// 不保证推断
+function Button({ size = getDefaultSize() }: ButtonProps) {}
+```
+
+公共 API 建议显式写 `@default`。
+
+## 组件有 DOM 但没有样式
+
+Wake 会为从包根导入的 `@crab-dev/rc-*` 组件自动加载 `css/index.css`：
+
+```tsx
+import Button from "@crab-dev/rc-button";
+```
+
+如果仍然没有样式，确认没有绕过包根直接导入 `esm/index.mjs`，并确认已发布包中确实包含 `css/index.css`。生产构建后确认生成 CSS 文件，并检查页面 HTML 是否引用它。其他组件库仍按各自文档显式导入样式。
+
+## 暗色主题样式错误
+
+第三方 UI 的 fallback 可能只适合亮色。把它的语义变量映射到 Wake：
+
+```css
+:root {
+  --token-semantic-color-background-surface: var(--surface);
+  --token-semantic-color-text-primary: var(--text);
+  --token-semantic-color-border-default: var(--border);
+}
+```
+
+不要覆盖生成 hash class；升级包后 hash 可能变化。
+
+## 修改后没有更新
+
+1. 确认文件在 watch root；
+2. 看终端是否收到变化；
+3. 修复当前编译错误；
+4. 刷新页面；
+5. 重启开发命令；
+6. 最后删除 `.wake` 冷启动。
+
+删除 `.wake` 的 PowerShell 命令：
+
+```powershell
+Remove-Item -LiteralPath .wake -Recurse
+```
+
+Linux/macOS：
+
+```bash
+rm -rf .wake
+```
+
+只在项目根执行，并先确认当前目录。`.wake` 可再生成，但源码目录不可恢复。
+
+## public 资源冲突
+
+Wake Docs 复制 public 时，如果目标文件与构建产物同名会停止。重命名 public 文件，不能覆盖 chunk、CSS、manifest、路由 HTML 或 `404.html`。
+
+## 子路由刷新 404
+
+确认部署了完整 `docs-dist`：
+
+```text
+docs-dist/components/button/index.html
+docs-dist/404.html
+```
+
+如果部署在 `/ui/`：
+
+```bash
+wake docs build . --base /ui/
+```
+
+然后从真实地址直接打开 `/ui/components/button/`，不要只通过首页导航测试。
+
+## JS/CSS 请求路径错误
+
+检查：
+
+- 应用使用 `public_path`；
+- 文档使用 `[docs].base_path` 或 `--base`；
+- 值前后斜杠是否规范；
+- CDN/静态服务是否挂载在同一路径；
+- 旧 HTML 是否还缓存着上一版本 hash。
+
+## 开发成功但生产失败
+
+生产额外执行压缩、Tree Shaking、代码分割、资源 hash 和 draft 排除。用独立输出目录复现：
+
+```bash
+wake build --sourcemap --outdir dist-debug
+```
+
+如果 debug 成功而标准构建失败，问题更可能位于生产优化或第三方包压缩兼容。保留最小复现后报告。
+
+## 报告问题需要什么
+
+<Callout title="高质量问题报告" tone="info">
+请提供 Wake 版本、操作系统、完整命令、第一条完整诊断、最小复现目录、是否仅生产失败，以及删除 `.wake` 后是否仍复现。隐藏密钥、内部域名和用户数据。
+</Callout>
+
+推荐附上：
+
+```text
+wake --version:
+node --version:
+rustc --version:
+command:
+expected:
+actual:
+first diagnostic:
+reproduction steps:
+```
+
+不要只截错误最后一行；文件路径、错误代码和源码上下文通常是定位所需信息。

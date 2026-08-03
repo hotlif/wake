@@ -1,0 +1,27 @@
++++
+title = "Wake"
+description = "用同一套 Rust 工具链开发 React 19 应用并构建组件文档"
+group = "开始"
+group_order = 0
+order = 0
+slug = "/"
+status = "beta"
++++
+
+import { HomeHero, HomeFeatures, HomePaths, Callout } from "./site/components.tsx"
+
+# Wake
+
+<div className="wake-home">
+
+<HomeHero />
+
+<HomeFeatures />
+
+<HomePaths />
+
+<Callout title="Beta 阶段如何使用" tone="info">
+Wake 已覆盖解析、转换、打包、开发服务器和组件文档的完整链路。项目仍处于 <code>0.1.x</code>：用于团队项目时请固定 Wake 版本，把 <code>wake build</code> 和 <code>wake docs build</code> 加入 CI，并为重要生产项目保留可回退的构建方案。
+</Callout>
+
+</div>

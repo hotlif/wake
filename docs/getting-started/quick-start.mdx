@@ -1,0 +1,234 @@
++++
+title = "快速开始"
+description = "从源码安装 Wake，并完成第一个可以开发和构建的 React 19 应用"
+group = "开始"
+group_order = 0
+order = 10
+slug = "/getting-started/quick-start"
+status = "stable"
++++
+
+import { Callout } from "../site/components.tsx"
+
+# 快速开始
+
+本教程会创建一个最小但完整的 React 19 项目。完成后你将得到开发服务器、热更新和可部署的 `dist` 目录。
+
+<Callout title="完成本页后" tone="success">
+你会拥有一个包含入口、样式、Wake 配置和 npm 脚本的最小项目；可以修改 TSX 并立即看到结果，也可以生成带资源哈希的生产文件。示例中的每个文件都会完整给出，不需要猜测省略代码。
+</Callout>
+
+## 1. 检查环境
+
+| 工具 | 最低要求 | 检查命令 | 用途 |
+| --- | --- | --- | --- |
+| Rust | 1.95 | `rustc --version` | 编译 Wake CLI |
+| Cargo | 随 Rust 安装 | `cargo --version` | 管理 Rust workspace |
+| Node.js | 建议当前 LTS | `node --version` | 运行 npm 和安装前端依赖 |
+| npm | 与 Node.js 一起安装 | `npm --version` | 安装 React 19 |
+| React | 19 | 查看 `package.json` | 应用和 Wake Docs 运行时 |
+
+如果 `rustc` 或 `cargo` 不存在，先通过 rustup 安装 Rust；如果 `node` 不存在，先安装 Node.js LTS。修改系统 `PATH` 后要重新打开终端。
+
+<Callout title="React 版本要求" tone="warning">
+Wake Docs 会同时检查当前项目根的 <code>react</code> 和 <code>react-dom</code> 版本声明。最低主版本是 19；仅在父级 workspace 安装或仍使用 React 18 都会被拒绝。
+</Callout>
+
+## 2. 从源码构建 Wake
+
+```bash title="Linux 或 macOS"
+git clone https://github.com/hotlif/wake.git
+cd wake
+cargo build --release -p wake_cli
+./target/release/wake --help
+```
+
+Windows PowerShell：
+
+```powershell title="Windows PowerShell"
+git clone https://github.com/hotlif/wake.git
+Set-Location wake
+cargo build --release -p wake_cli
+.\target\release\wake.exe --help
+```
+
+看到 `build`、`dev`、`docs`、`parse` 和 `tokenize` 子命令，说明 CLI 已构建成功。
+
+为了在任意项目执行 `wake`，把 Wake 仓库的 `target/release` 目录加入 `PATH`。如果暂时不修改 `PATH`，后续命令可以改成 Wake 可执行文件的绝对路径。
+
+## 3. 创建项目目录
+
+```bash
+mkdir hello-wake
+cd hello-wake
+mkdir src
+```
+
+最终需要以下结构：
+
+```text
+hello-wake/
+├─ src/
+│  ├─ entry.tsx
+│  └─ styles.css
+├─ package.json
+└─ wake.config.toml
+```
+
+## 4. 创建 package.json
+
+```json title="package.json"
+{
+  "name": "hello-wake",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wake dev .",
+    "build": "wake build --outdir dist"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^6.0.0"
+  }
+}
+```
+
+执行 `npm install`。安装完成后应出现 `node_modules` 和锁文件；使用 npm 时应提交 `package-lock.json`，以保证团队和 CI 安装到一致版本。
+
+## 5. 编写 React 入口
+
+```tsx title="src/entry.tsx"
+import React from "react";
+import { createRoot } from "react-dom/client";
+import "./styles.css";
+
+function App() {
+  return (
+    <main className="page">
+      <p className="eyebrow">Wake + React 19</p>
+      <h1>第一个 Wake 应用</h1>
+      <p>修改这个文件并保存，浏览器会自动获得最新结果。</p>
+      <button type="button" onClick={() => window.alert("运行成功")}>
+        测试交互
+      </button>
+    </main>
+  );
+}
+
+const container = document.getElementById("root");
+if (!container) throw new Error("HTML 中缺少 #root 节点");
+
+createRoot(container).render(
+  <React.StrictMode><App /></React.StrictMode>,
+);
+```
+
+```css title="src/styles.css"
+:root {
+  color: #18181b;
+  background: #fafafa;
+  font-family: system-ui, sans-serif;
+}
+body { margin: 0; }
+.page {
+  width: min(680px, calc(100% - 40px));
+  margin: 80px auto;
+}
+.eyebrow { color: #7c3aed; font-weight: 700; }
+button {
+  padding: 10px 16px;
+  color: white;
+  border: 0;
+  border-radius: 8px;
+  background: #7c3aed;
+  cursor: pointer;
+}
+```
+
+Wake 没有找到自定义 HTML 模板时，会生成包含 `<div id="root"></div>` 的默认外壳，因此最小项目不需要手写 `index.html`。
+
+## 6. 添加最小配置
+
+```toml title="wake.config.toml"
+[html]
+entry = "src/entry.tsx"
+
+[react]
+enabled = true
+jsx_import_source = "react"
+
+[dev_server]
+host = "127.0.0.1"
+port = 5173
+open = false
+```
+
+TOML 使用 `键 = 值`，字符串必须加引号。所有相对路径都以项目根为基准。
+
+## 7. 启动开发服务器
+
+```bash
+npm run dev
+```
+
+终端会打印本地地址。打开后检查页面标题、按钮交互，并修改标题保存一次。如果端口被占用，可以执行 `wake dev . --port 5174`。
+
+普通 `wake dev` 的命令行端口默认是 5173，因此它会覆盖配置端口。Wake Docs 的端口优先级不同：命令行、配置、5173。
+
+## 8. 认识路径别名
+
+```ts
+import Button from "@/components/button"; // @ 指向 <项目根>/src
+import config from "@@/src/config";       // @@ 指向项目根
+```
+
+初期可以继续使用相对路径。目录层级变深后再使用别名，避免为了短路径而过早增加抽象。
+
+## 9. 创建生产构建
+
+```bash
+npm run build
+```
+
+成功后会生成：
+
+```text
+dist/
+├─ index.html
+├─ entry.<hash>.js
+├─ styles.<hash>.css
+└─ manifest.json
+```
+
+hash 来自文件内容。内容变化后文件名随之变化，因此浏览器和 CDN 可以长期缓存。
+
+<Callout title="输出目录会被清理" tone="warning">
+Wake 构建前会清理目标输出目录。不要在 <code>dist</code> 中保存手写文件。普通应用的图片和字体应从 TSX 或 CSS 导入，让 Wake 纳入资源管线；Wake Docs 需要原样复制的静态文件才放入 <code>public</code>。
+</Callout>
+
+## 10. 常见首次启动问题
+
+| 症状 | 先检查什么 |
+| --- | --- |
+| 找不到 `wake` 命令 | `target/release` 是否加入 PATH，或改用绝对路径 |
+| 找不到 `react` | 是否在当前项目执行过 `npm install` |
+| 页面空白 | 浏览器控制台是否提示缺少 `#root` 或模块运行错误 |
+| 端口占用 | 使用 `--port 5174`，或停止占用 5173 的进程 |
+| 找不到入口 | `[html].entry` 是否指向真实文件，大小写是否一致 |
+| TOML 解析失败 | 检查引号、数组逗号和节名称 |
+
+## 本页检查点
+
+- [ ] `wake --help` 可以运行；
+- [ ] React 页面能在开发服务器打开；
+- [ ] 保存 TSX 或 CSS 后能看到更新；
+- [ ] `wake build` 能生成 `dist`；
+- [ ] 知道源码、配置、依赖和产物分别放在哪里。
+
+接下来进入[第一个文档站](./first-docs-site)，在同一知识基础上加入中文 MDX、隔离 Demo 和 Props API。遇到安装或首次启动问题时，可直接查询[故障排查](../reference/troubleshooting)。

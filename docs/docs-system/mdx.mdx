@@ -1,0 +1,321 @@
++++
+title = "编写 MDX"
+description = "从 Markdown 基础到 Frontmatter、完整 MDX、自定义组件和代码高亮"
+group = "组件文档"
+group_order = 20
+order = 20
+slug = "/docs/mdx"
+status = "stable"
++++
+
+import { Callout } from "../site/components.tsx"
+
+# 编写 MDX
+
+MDX 是 Markdown 与 JSX 的组合。普通说明用 Markdown，交互展示用 React 组件；一篇文件同时保持易读和可编程。
+
+## 从页面模板开始
+
+````mdx title="docs/components/button.mdx"
++++
+title = "Button 按钮"
+description = "触发即时操作"
+group = "基础组件"
+group_order = 10
+order = 10
+slug = "/components/button"
+status = "stable"
+draft = false
++++
+
+import Badge from "../site/badge.tsx"
+
+# Button 按钮
+
+Button 用于触发一次明确操作。
+
+<Badge>React 19</Badge>
+
+## 基础示例
+
+<Demo src="./demos/basic.demo.tsx" />
+````
+
+文件分为三个区域：
+
+1. 顶部 `+++` 包围的是 TOML Frontmatter；
+2. `import` 和 `export` 是 MDX 的 ESM 区域；
+3. 标题、段落、代码和 JSX 是正文。
+
+Frontmatter 必须放在文件顶部。结束 `+++` 后留一个空行，可以避免内容边界难以阅读。
+
+## Markdown 基础
+
+### 标题和段落
+
+```md
+# 页面标题
+
+页面导语。段落之间留一个空行。
+
+## 二级标题
+
+### 三级标题
+```
+
+页面只保留一个 H1。Wake 会把第一个 H1 作为 `title` 的回退值，并把 H2/H3 加入页面目录和搜索索引。
+
+### 列表、链接和强调
+
+```md
+- 第一项
+- 第二项
+  - 嵌套项
+
+1. 先安装
+2. 再启动
+
+[查看快速开始](/getting-started/quick-start)
+
+**重要文字**、`inlineCode`
+```
+
+站内链接优先使用从站点根开始的 slug。部署到子路径时，Wake 运行时会基于 `base_path` 处理路由；图片等公共资源也要考虑相同前缀。
+
+### 表格和任务列表
+
+```md
+| 属性 | 类型 | 默认值 |
+| --- | --- | --- |
+| size | small / large | small |
+
+- [x] 编写 Demo
+- [ ] 检查暗色主题
+```
+
+宽表格会放入横向滚动容器，移动端不会把页面整体撑宽。
+
+## Frontmatter 字段
+
+| 字段 | 类型 | 默认或回退 | 用途 |
+| --- | --- | --- | --- |
+| `title` | 字符串 | 首个 H1，再回退文件名 | 浏览器标题、侧栏、搜索 |
+| `description` | 字符串 | 空字符串 | 页面导语和 HTML 描述 |
+| `group` | 字符串 | 当前目录名 | 侧栏分组 |
+| `group_order` | 整数 | `0` | 分组之间的顺序 |
+| `order` | 整数 | `0` | 同组页面顺序 |
+| `slug` | 字符串 | 相对 `source_dir` 的路径 | 页面 URL |
+| `status` | 枚举 | `stable` | 稳定性标签 |
+| `draft` | 布尔值 | `false` | 草稿控制 |
+
+`status` 支持：
+
+| 状态 | 建议含义 |
+| --- | --- |
+| `stable` | API 可用于正式项目，不显示额外标签 |
+| `beta` | 基本可用，但可能发生小范围变化 |
+| `experimental` | 正在探索，API 可能明显变化 |
+| `deprecated` | 不建议新项目使用，应说明替代方案 |
+
+开发模式显示草稿标记；生产构建完全排除 `draft = true` 页面。重复 slug、未知 status 或非法 TOML 会让构建失败。
+
+### 省略字段时的例子
+
+文件 `docs/forms/input.mdx`：
+
+```md
+# Input 输入框
+```
+
+如果没有 Frontmatter，通常会推导为：
+
+- title：`Input 输入框`；
+- group：`forms`；
+- slug：`/forms/input`；
+- status：`stable`；
+- order：`0`。
+
+团队文档仍建议显式写 title、description、group 和 order，使导航结构不依赖文件名。
+
+## 导入 React 组件
+
+```mdx
+import Alert from "../site/alert.tsx"
+import { Button } from "../../src/button"
+
+# 自定义内容
+
+<Alert tone="info">这是一条项目级提示。</Alert>
+
+<Button>可直接渲染的组件</Button>
+```
+
+相对导入从当前 MDX 文件出发。也可以从当前项目的 npm 依赖导入：
+
+```mdx
+import Tag from "@crab-dev/rc-tag"
+
+<Tag color="success">已发布</Tag>
+```
+
+组件 CSS 是否自动包含由组件包决定。Crab UI 使用独立 CSS 子路径，因此必须显式导入。
+
+## 表达式和导出
+
+```mdx
+export const versions = ["19", "20"]
+
+# React 版本
+
+当前列出 **{versions.length}** 个版本。
+
+{versions.map((version) => (
+  <code key={version}>React {version}</code>
+))}
+```
+
+表达式放在 `{}` 中，遵循 JavaScript 规则。不要在正文执行网络请求或依赖浏览器全局对象完成构建；需要交互状态时，把逻辑放进单独的 React 组件。
+
+<Callout title="安全提醒" tone="warning">
+MDX 中的 import、export 和表达式属于可信源码能力。不要把未审核的用户输入拼成 MDX，也不要把密钥写进表达式或代码示例。
+</Callout>
+
+## 代码块和语法高亮
+
+围栏代码在构建期高亮，不向浏览器下载 Prism、Shiki 或网络字体。
+
+````mdx
+```tsx title="button.tsx" {2,4-6}
+import { Button } from "./button";
+
+export function Example() {
+  return <Button>提交</Button>;
+}
+```
+````
+
+- `tsx` 指定语言；
+- `title="button.tsx"` 显示文件名；
+- `{2,4-6}` 强调第 2、4、5、6 行；
+- 多行代码自动显示行号；
+- 工具栏提供复制按钮。
+
+支持 TypeScript、JavaScript、TSX/JSX、Rust、Shell、PowerShell、Python、SQL、JSON、TOML、YAML、CSS/SCSS、HTML、MDX/Markdown、C、C++、Java 和 Go。未知语言会按纯文本安全显示。
+
+### 嵌套代码围栏
+
+当文档需要展示一整段 MDX 时，外层使用四个反引号，内层保留三个：
+
+`````mdx
+````mdx
+```tsx
+export function Demo() {
+  return <button>示例</button>;
+}
+```
+````
+`````
+
+## 编译期组件
+
+Wake 内置三个特殊组件：
+
+```mdx
+<Demo src="./demos/basic.demo.tsx" />
+
+<Demos
+  glob="./demos/*.demo.tsx"
+  columns={2}
+/>
+
+<API
+  source="../../src/button.tsx"
+  symbol="ButtonProps"
+  component="Button"
+/>
+```
+
+这些属性在生成阶段用于查找文件和类型，因此必须是静态字面量。合法写法包括字符串和静态数字表达式；不允许函数调用、变量或 spread：
+
+```mdx
+<!-- 错误：运行时才知道路径 -->
+<Demo src={chooseDemo()} />
+
+<!-- 错误：编译期组件不接受 spread -->
+<API {...apiOptions} />
+```
+
+错误诊断会指向原始 MDX 的行和列，而不是生成 TSX。
+
+## 图片和公共资源
+
+把无需模块处理的图片放进 `public/`：
+
+```md
+![组件结构](/images/button-anatomy.png)
+```
+
+生产部署在 `/ui/` 子路径时，应保证 `[docs].base_path = "/ui/"`，并在部署环境验证图片地址。组件源码中通过 import 引入的资源会进入 Wake 资源管线，小资源可能内联，大资源会生成带 hash 文件。
+
+图片应填写有意义的替代文本。纯装饰图片可使用空替代文本，但不要用文件名代替说明。
+
+## 创建可复用 MDX 组件
+
+```tsx title="docs/site/components.tsx"
+import React from "react";
+
+export function DoAndDont({
+  doText,
+  dontText,
+}: {
+  doText: string;
+  dontText: string;
+}) {
+  return (
+    <div className="do-dont">
+      <section><strong>推荐</strong><p>{doText}</p></section>
+      <section><strong>避免</strong><p>{dontText}</p></section>
+    </div>
+  );
+}
+```
+
+```mdx
+import { DoAndDont } from "../site/components.tsx"
+
+<DoAndDont
+  doText="使用描述动作结果的按钮文字"
+  dontText="所有按钮都写成确定"
+/>
+```
+
+复用展示逻辑时优先创建带 Props 类型的组件。首版不支持 remark/rehype JavaScript 插件。
+
+## 一篇高质量组件文档的结构
+
+建议按读者做决定的顺序组织：
+
+1. 一句话说明组件解决什么问题；
+2. 最常用的基础 Demo；
+3. “什么时候使用”和“什么时候不要使用”；
+4. 不同外观、尺寸和状态 Demo；
+5. 无障碍与键盘说明；
+6. 与其他组件组合的例子；
+7. Props API；
+8. 版本变化或迁移说明。
+
+不要只放 API 表格。新手通常先需要知道“应该什么时候用”，之后才需要属性细节。
+
+## 发布前检查
+
+- [ ] 页面只有一个 H1；
+- [ ] title、description、group、order 和 slug 清晰；
+- [ ] 示例可以运行，源码可以复制；
+- [ ] 链接和图片不是本机绝对路径；
+- [ ] 代码块声明正确语言；
+- [ ] 明暗主题下均可阅读；
+- [ ] `draft` 和 `status` 符合真实成熟度；
+- [ ] 没有在 MDX 中暴露密钥；
+- [ ] `wake docs build` 能成功完成。
+
+下一页将详细解释 Demo 元数据、Preview 包装器和 Props 提取。

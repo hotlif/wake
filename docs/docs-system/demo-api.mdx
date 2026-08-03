@@ -1,0 +1,307 @@
++++
+title = "Demo 与 Props API"
+description = "从第一个隔离预览到多示例编排、Preview 环境和 TypeScript Props 文档"
+group = "组件文档"
+group_order = 20
+order = 30
+slug = "/docs/demo-api"
+status = "stable"
++++
+
+import { Callout } from "../site/components.tsx"
+
+# Demo 与 Props API
+
+Demo 让读者直接操作组件，API 表格让读者查询精确属性。优秀的组件页通常先用 Demo 建立直觉，再用 API 补充完整细节。
+
+## 在线体验
+
+下面的内容由 Wake Docs 实时编译，不是截图。示例使用 npm 发布的 `@crab-dev/rc-button`，可以切换 Preview/Code、复制源码、调整预览宽度并进入全屏模式。
+
+<Demo src="../examples/demos/basic.demo.tsx" />
+
+再用 `<Demos>` 把外观和状态示例编排为响应式两列：
+
+<Demos glob="../examples/demos/showcase-*.demo.tsx" columns={2} />
+
+## 自动生成的 Props
+
+下面的表格来自本地文档适配组件的 TypeScript 接口。可以输入属性名或类型进行过滤；必填、默认值和说明均由源码与 JSDoc 提取。
+
+<API
+  source="../examples/crab-button.tsx"
+  symbol="DocumentedButtonProps"
+  component="DocumentedButton"
+/>
+
+<Callout title="真实消费边界" tone="success">
+Demo 实际运行 npm 包；本地适配组件只收敛本站要讲解的属性，并为 API 表格提供稳定、易读的中文说明。完整上游类型仍以 npm 包中的 <code>ButtonProps</code> 声明为准。
+</Callout>
+
+## 创建第一个 Demo
+
+文件名必须以 `.demo.tsx` 结尾，并默认导出 React 组件：
+
+```tsx title="docs/button/demos/basic.demo.tsx"
+import React from "react";
+import { Button } from "../../../src/button";
+
+export const meta = {
+  title: "基础用法",
+  description: "点击按钮触发一次操作",
+  background: "surface",
+  padding: "md",
+  isolation: "iframe",
+};
+
+export default function BasicDemo() {
+  return (
+    <Button onClick={() => window.alert("已提交")}>
+      提交
+    </Button>
+  );
+}
+```
+
+然后在同目录的 MDX 中引用：
+
+```mdx
+<Demo src="./demos/basic.demo.tsx" />
+```
+
+`src` 相对当前 MDX 文件，而不是项目根。文件被重命名后要同步修改引用。
+
+## Demo 元数据
+
+| 字段 | 推荐值 | 当前行为 |
+| --- | --- | --- |
+| `title` | 中文短标题 | 显示在 Demo 卡片标题栏；省略时从文件名生成 |
+| `description` | 一句话说明 | 显示在标题下方 |
+| `background` | `surface`、`muted`、`transparent` | 控制预览舞台背景 class |
+| `padding` | `none`、`sm`、`md`、`lg` | 对应 0、12、20、32px |
+| `height` | `auto` | iframe 通过消息自动测高；首版不承诺固定高度值 |
+| `viewport` | `responsive` | 首次使用自适应宽度，读者可切换 768px 和 390px |
+| `isolation` | `iframe` | 首版只支持 iframe 隔离 |
+
+建议只填写真正需要改变的字段。未填写时会使用自动标题、响应式宽度、`surface` 背景、`md` 内边距和 iframe 隔离。
+
+<Callout title="元数据边界" tone="info">
+首版的 <code>height</code>、<code>viewport</code> 和 <code>isolation</code> 保留了稳定约定，但运行时固定采用自动测高、初始自适应和 iframe。不要依赖未文档化的其他值。
+</Callout>
+
+## Demo 卡片怎么使用
+
+每张卡片提供：
+
+- “预览/源码”切换；
+- 源码复制；
+- 自适应、平板 768px、手机 390px 宽度；
+- 全屏 Playground；
+- 进入视口前的懒加载；
+- 运行错误覆盖层；
+- 文档主题到 iframe 的同步。
+
+宽度预设用于发现布局问题，不代表完整设备模拟。触摸行为、系统字体和浏览器差异仍需要真实设备测试。
+
+## 一次展示多个 Demo
+
+```mdx
+<Demos glob="./demos/*.demo.tsx" columns={2} />
+```
+
+Wake 会匹配 glob 并为每个文件创建卡片。适合外观、尺寸和状态等同级示例。
+
+推荐命名：
+
+```text
+demos/
+├─ basic.demo.tsx
+├─ appearance.demo.tsx
+├─ loading.demo.tsx
+├─ disabled.demo.tsx
+└─ accessibility.demo.tsx
+```
+
+`columns={2}` 在宽屏显示两列，移动端自动回到一列。只有一个重要示例时使用 `<Demo>`，避免空白或过密网格。
+
+## 让示例保持教学价值
+
+一个 Demo 只回答一个主要问题：
+
+- 基础用法：最少 Props；
+- 外观：并排比较所有 appearance；
+- 状态：loading、disabled、error；
+- 组合：与表单或弹窗协作；
+- 无障碍：标签、焦点和键盘；
+- 边界：长文本、空内容、窄容器。
+
+不要把组件所有能力塞进一张 Demo。源码越短，读者越容易复制并改造。
+
+## Preview 包装器
+
+在配置中指定：
+
+```toml
+[docs]
+preview = "docs/preview.tsx"
+```
+
+```tsx title="docs/preview.tsx"
+import React from "react";
+import { ThemeProvider } from "../src/theme";
+import "../src/global.css";
+
+export default function Preview({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <ThemeProvider>
+      <div className="docs-preview">{children}</div>
+    </ThemeProvider>
+  );
+}
+```
+
+Preview 适合放：
+
+- ThemeProvider 和设计令牌；
+- 国际化 Provider；
+- 状态管理 Provider；
+- 全局 reset 和组件库 CSS；
+- 所有 Demo 都需要的布局边界。
+
+不要在 Preview 中放某一个组件专属的状态。那会让 Demo 互相耦合，源码视图也无法完整表达运行条件。
+
+## iframe 消息协议
+
+运行时与 Demo iframe 使用以下消息：
+
+| 消息 | 方向 | 用途 |
+| --- | --- | --- |
+| `wake:ready` | iframe → 页面 | Demo 已挂载，可以同步主题 |
+| `wake:resize` | iframe → 页面 | 传递内容高度 |
+| `wake:error` | iframe → 页面 | 显示运行错误 |
+| `wake:theme` | 页面 → iframe | 同步 light 或 dark |
+
+通常不需要手工发送这些消息。只有自定义 Demo 容器或调试 iframe 生命周期时才需要理解它们。
+
+## 创建 Props 类型
+
+```tsx title="src/button.tsx"
+import type { ButtonHTMLAttributes, ReactNode } from "react";
+
+export interface ButtonProps
+  extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children"> {
+  /** 按钮外观
+   * @default "primary"
+   */
+  appearance?: "primary" | "secondary" | "danger";
+
+  /** 是否正在处理
+   * @default false
+   */
+  loading?: boolean;
+
+  /** 按钮内容 */
+  children: ReactNode;
+
+  /** 旧颜色参数
+   * @deprecated 使用 appearance
+   * @since 0.0.1
+   */
+  color?: string;
+}
+
+export function Button({
+  appearance = "primary",
+  loading = false,
+  children,
+  ...props
+}: ButtonProps) {
+  return <button {...props}>{loading ? "处理中…" : children}</button>;
+}
+```
+
+在 MDX 中加入：
+
+```mdx
+<API
+  source="../../src/button.tsx"
+  symbol="ButtonProps"
+  component="Button"
+/>
+```
+
+`source` 和 `symbol` 是必需的静态字符串。`component` 用于表达组件名称，但首版运行时主要依据 source 与 symbol 查找 API 数据。
+
+## JSDoc 如何进入表格
+
+| 写法 | API 中的结果 |
+| --- | --- |
+| 第一段普通文字 | 属性说明 |
+| `@default value` | 默认值 |
+| `@deprecated reason` | 废弃标记和说明 |
+| `@since version` | 版本信息 |
+| 没有 `@default` | 尝试从组件参数解构的静态字面量推断 |
+
+默认值优先级是 `@default` 高于组件解构推断。建议公共组件显式写 `@default`，因为实现重构后文档语义仍然清楚。
+
+## 支持的类型范围
+
+`wake_tsdoc` 可以处理：
+
+- interface；
+- 对象类型别名；
+- 联合、交叉和泛型文本；
+- 本地 import 与 re-export；
+- 本地 `Pick`、`Omit`、`Partial`、`Required`；
+- 本地类型继承；
+- JSDoc 与静态默认值。
+
+外部 React DOM 类型会折叠为可展开的继承来源，不会递归展开整个 `node_modules`。复杂条件类型或外部映射类型会保留原始类型文本并产生 warning。
+
+## API 设计建议
+
+让 Props 文档好用，源码也要可读：
+
+- Props 类型使用稳定、可搜索的导出名称；
+- 每个公共属性写清用途，而不是重复类型；
+- 布尔属性说明 true 时发生什么；
+- 回调说明触发时机和参数；
+- 字符串联合说明每个值的差异；
+- 废弃属性同时给出替代方案；
+- 不要用 `any` 隐藏尚未设计清楚的 API。
+
+## 常见错误
+
+### 找不到 Demo
+
+检查文件后缀是否为 `.demo.tsx`，路径是否相对 MDX，大小写是否一致。`Demos.glob` 没有匹配时页面会显示错误提示。
+
+### Demo 页面空白
+
+先切换源码确认默认导出存在，再查看错误覆盖层。组件如果依赖 Provider 或全局 CSS，应加入 Preview。
+
+### API 找不到 symbol
+
+确认类型已导出、拼写完全一致、`source` 指向声明所在文件或有效的本地重导出。类型循环无法收敛会直接构建失败。
+
+### API 没有默认值
+
+优先添加 `@default`。只有组件参数解构中的静态字符串、数字、布尔等字面量可以可靠推断；函数调用和复杂表达式不会被执行。
+
+## 完成标准
+
+一篇成熟组件页至少应包含：
+
+- [ ] 一个无需解释就能运行的基础 Demo；
+- [ ] 关键状态和边界 Demo；
+- [ ] title 与 description；
+- [ ] Preview 中所需的 Provider 和 CSS；
+- [ ] 可过滤的 Props API；
+- [ ] 默认值、废弃和版本说明；
+- [ ] 手机宽度、键盘与明暗主题检查。
+
+下一页通过完整 Button 实战把这些步骤串起来。
