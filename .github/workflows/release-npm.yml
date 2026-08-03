@@ -192,7 +192,7 @@ jobs:
             grep -qx 'package/LICENSE-APACHE' <<<"$list"
             grep -qx 'package/README.md' <<<"$list"
             native_count="$(grep -Ec '\.node$' <<<"$list" || true)"
-            if [[ "$archive" == *crab-dev-wake-0.1.1.tgz ]]; then
+            if [[ "$archive" == *crab-dev-wake-0.1.2.tgz ]]; then
               test "$native_count" -eq 0
               test "$(stat -c%s "$archive")" -le 524288
             else
@@ -200,9 +200,10 @@ jobs:
               test "$(stat -c%s "$archive")" -le 15728640
             fi
             version="$(tar -xOzf "$archive" package/package.json | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).version))")"
-            test "$version" = '0.1.1'
+            test "$version" = '0.1.2'
           done
       - uses: actions/attest-build-provenance@v3
+        if: github.event.repository.visibility == 'public'
         with:
           subject-path: artifacts/*.tgz
 
@@ -227,14 +228,16 @@ jobs:
       - name: Publish platform packages first
         run: |
           for package in artifacts/*wake-{win32,linux,darwin}-*.tgz; do
-            npm publish "$package" --access public --provenance
+            npm publish "$package" --access public
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: ${{ github.event.repository.visibility == 'public' }}
       - name: Publish root package last
-        run: npm publish artifacts/crab-dev-wake-0.1.1.tgz --access public --provenance
+        run: npm publish artifacts/crab-dev-wake-0.1.2.tgz --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: ${{ github.event.repository.visibility == 'public' }}
 
   smoke-glibc-228:
     needs: publish
@@ -260,7 +263,7 @@ jobs:
           mkdir smoke
           cd smoke
           npm init -y
-          npm install --ignore-scripts @crab-dev/wake@0.1.1
+          npm install --ignore-scripts @crab-dev/wake@0.1.2
           npx wake --version
           node -e "console.log(require('@crab-dev/wake').version())"
 
@@ -283,7 +286,7 @@ jobs:
           mkdir smoke
           cd smoke
           npm init -y
-          npm install --ignore-scripts @crab-dev/wake@0.1.1
+          npm install --ignore-scripts @crab-dev/wake@0.1.2
           node -e "let p=require('./package.json');p.scripts={'wake-smoke':'wake build'};require('node:fs').writeFileSync('package.json',JSON.stringify(p));require('node:fs').mkdirSync('src');require('node:fs').writeFileSync('wake.config.toml','[html]\nentry = \"src/index.js\"\n');require('node:fs').writeFileSync('src/index.js','export const value = 42\n')"
           npx @crab-dev/wake --version
           npx wake --version

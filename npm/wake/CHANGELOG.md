@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Updated the npm release pipeline for private GitHub repositories while preserving immutable tarball audits.
+
 ## 0.1.1
 
 - Fixed cross-platform output paths and source-map source names.
