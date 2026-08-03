@@ -420,6 +420,11 @@ pub struct ObjectProperty<'a> {
     pub method: bool,
     pub shorthand: bool,
     pub computed: bool,
+    /// Whether this is the special non-computed `__proto__: value` object-literal
+    /// prototype setter.  This is syntax-level information: methods, accessors,
+    /// shorthand properties and computed `['__proto__']` properties are ordinary
+    /// own properties even though they use the same property key.
+    pub prototype_setter: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

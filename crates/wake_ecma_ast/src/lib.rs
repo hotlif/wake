@@ -45,6 +45,12 @@ pub struct Program<'a> {
     pub body: AVec<'a, Statement<'a>>,
     /// 严格模式（模块恒为严格；脚本看 `"use strict"` 指令）。
     pub strict: bool,
+    /// spread lowering 需要的 per-module iterator helper 名；没有 spread 时不注入。
+    pub spread_helper: Option<Atom>,
+    /// object spread lowering 需要的 per-module own-enumerable-property helper。
+    pub object_spread_helper: Option<Atom>,
+    /// synchronous for-of lowering 需要的 per-module iterator-state helper。
+    pub for_of_helper: Option<Atom>,
 }
 
 impl<'a> Program<'a> {
@@ -54,6 +60,9 @@ impl<'a> Program<'a> {
             source_type,
             body: bumpalo::collections::Vec::new_in(arena),
             strict: source_type.is_module(),
+            spread_helper: None,
+            object_spread_helper: None,
+            for_of_helper: None,
         }
     }
 }

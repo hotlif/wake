@@ -7,11 +7,11 @@
 //! 基准组：**bundle_1k**（1000 模块）与 **bundle_2k**（2000 模块），
 //! 每组含 **cold**（新引擎全量构建）与 **incremental**（同实例、同内容第二遍，全缓存命中）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use wake_bundler::IncrementalBundler;
+use wake_bundler::{BuildOptions, BuildRequest, BuildSession, IncrementalBundler};
 use wake_common::MemoryFileSystem;
 
 /// 生成 N 模块合成项目：二叉树扇出 + 全体共享 `util`（= m{N-1}）。
@@ -71,6 +71,46 @@ fn bench_n(c: &mut Criterion, name: &str, n: usize) {
         group.bench_function("incremental_cached", |b| {
             b.iter(|| {
                 let out = bundler.build(Path::new("m0.js"));
+                assert!(!out.has_errors());
+            })
+        });
+        group.finish();
+    }
+
+    // generation_cached：watch/dev server 没有收到新文件事件时，直接借用已提交产物，
+    // 不重放模块图，也不复制 bundle。
+    {
+        let fs = Arc::new(gen_project(n));
+        let mut session = BuildSession::new(fs, BuildOptions::default());
+        let request = BuildRequest::new("m0.js");
+        let _ = session.build_current_ref(request.clone());
+        let mut group = c.benchmark_group(name);
+        group.sample_size(30);
+        group.bench_function("generation_cached", |b| {
+            b.iter(|| {
+                let out = session.build_current_ref(request.clone());
+                assert!(!out.has_errors());
+            })
+        });
+        group.finish();
+    }
+
+    // edit_one：watch 收到普通内容修改，只重新加载改动模块；其余模块复用 loader snapshot。
+    {
+        let fs = Arc::new(gen_project(n));
+        let mut session = BuildSession::new(fs.clone(), BuildOptions::default());
+        let request = BuildRequest::new("m0.js");
+        let _ = session.build_current_ref(request.clone());
+        let changed = format!("m{}.js", n - 1);
+        let mut revision = 0usize;
+        let mut group = c.benchmark_group(name);
+        group.sample_size(30);
+        group.bench_function("edit_one", |b| {
+            b.iter(|| {
+                revision += 1;
+                fs.insert(&changed, format!("export default {};\n", n + revision % 2));
+                session.invalidate_paths(&[PathBuf::from(&changed)], false);
+                let out = session.build_current_ref(request.clone());
                 assert!(!out.has_errors());
             })
         });

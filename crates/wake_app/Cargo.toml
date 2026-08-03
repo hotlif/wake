@@ -1,0 +1,22 @@
+[package]
+name = "wake_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Reusable Wake application services shared by CLI and Node-API"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_config.workspace = true
+wake_scan.workspace = true
+wake_html.workspace = true
+wake_bundler.workspace = true
+wake_dev_server.workspace = true
+wake_docs.workspace = true
+wake_ecma_transform.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,6 +1,6 @@
-//! # wake_scan — 组件自动扫描（CRUSTIFY-PARITY §M2）
+//! # wake_scan — 组件自动扫描（WAKE-COMPATIBILITY §M2）
 //!
-//! 对齐 crustify `AutoScanWebpackPlugin`：递归扫描一个目录，为每个文件生成**懒加载**条目
+//! 保持既定行为 `AutoScanWebpackPlugin`：递归扫描一个目录，为每个文件生成**懒加载**条目
 //! （动态 `import()`），并提取 **TOML frontmatter**——`.ts/.tsx/.js/.jsx` 取文件首个块注释、
 //! `.md/.mdx` 取 `+++ … +++` frontmatter。产出一段 JS 模块源码，经 `@@@/{namespace}` 别名被入口引用：
 //!
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-/// 扫描规则（路径已解析为绝对）。对齐 crustify `ComponentScanRule`。
+/// 扫描规则（路径已解析为绝对）。保持既定行为 `ComponentScanRule`。
 pub struct ScanRule<'a> {
     /// 命名空间（经 `@@@/{namespace}` 导入）。
     pub namespace: &'a str,
@@ -69,7 +69,7 @@ struct ScanEntry {
 
 /// 扫描 `rule.scan_dir` 并生成 `@@@/{namespace}` 懒加载模块源码。
 ///
-/// 目录不存在 → 生成空组件列表（不报错，对齐 crustify 的 ENOENT 处理）。文件读取失败者跳过。
+/// 目录不存在 → 生成空组件列表（不报错，保持既定行为 的 ENOENT 处理）。文件读取失败者跳过。
 /// 输出确定（文件按路径排序），便于缓存与快照。
 pub fn scan(rule: &ScanRule) -> Result<String, ScanError> {
     let include = compile(rule.include)?;
@@ -113,7 +113,7 @@ fn compile(pat: Option<&str>) -> Result<Option<Regex>, ScanError> {
 /// 递归收集文件：include（若设）须匹配、exclude（若设）不得匹配。对完整正斜杠路径判定。
 fn walk(dir: &Path, include: &Option<Regex>, exclude: &Option<Regex>, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return; // 目录不存在 / 不可读 → 空（对齐 crustify ENOENT）
+        return; // 目录不存在 / 不可读 → 空（保持既定行为 ENOENT）
     };
     for ent in rd.flatten() {
         let path = ent.path();
@@ -149,7 +149,7 @@ fn to_slash(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// 消毒为合法 JS 标识符：非字母数字 → `_`（对齐 crustify `replace(/[^a-zA-Z0-9]/g, "_")`）。
+/// 消毒为合法 JS 标识符：非字母数字 → `_`（保持既定行为 `replace(/[^a-zA-Z0-9]/g, "_")`）。
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -172,7 +172,7 @@ pub fn extract_frontmatter(path: &Path, source: &str) -> Option<toml::Value> {
 }
 
 /// 取源码首个块注释 `/* … */` 的内容（跳过前导空白与 `//` 行注释），逐行剥离前导 `*` 装饰。
-/// 对齐 crustify `getTypeScriptComment`。返回适合 TOML 解析的文本；无块注释 → `None`。
+/// 保持既定行为 `getTypeScriptComment`。返回适合 TOML 解析的文本；无块注释 → `None`。
 fn first_block_comment(src: &str) -> Option<String> {
     let bytes = src.as_bytes();
     let mut i = 0;

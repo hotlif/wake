@@ -1,11 +1,72 @@
 //! codegen 测试：往返幂等（parse→codegen→parse→codegen 稳定）+ 输出快照。
 
-use wake_common::Interner;
+use wake_common::{FxHashMap, Interner};
 use wake_ecma_ast::SourceType;
 use wake_ecma_minify::MinifyCtx;
 use wake_ecma_parser::parse;
 
 use crate::codegen;
+
+fn directive_helper_program(interner: &Interner) -> wake_ecma_ast::ModuleAst {
+    use wake_common::Span;
+    use wake_ecma_ast::{
+        AVec, CallExpression, Expression, ExpressionStatement, Ident, ModuleAst, Program,
+        SourceType, Statement, StringLiteral,
+    };
+
+    ModuleAst::from_builder(|arena| {
+        let marker_span = Span::new(0, 15);
+        let strict_span = Span::new(16, 28);
+        let boot_span = Span::new(29, 35);
+        let mut program = Program::new_in(arena, SourceType::Script);
+        program
+            .body
+            .push(Statement::Expression(arena.alloc(ExpressionStatement {
+                span: marker_span,
+                expression: Expression::StringLiteral(arena.alloc(StringLiteral {
+                    span: marker_span,
+                    value: interner.intern("wake-prologue"),
+                })),
+            })));
+        program
+            .body
+            .push(Statement::Expression(arena.alloc(ExpressionStatement {
+                span: strict_span,
+                expression: Expression::StringLiteral(arena.alloc(StringLiteral {
+                    span: strict_span,
+                    value: interner.intern("use strict"),
+                })),
+            })));
+        program
+            .body
+            .push(Statement::Expression(arena.alloc(ExpressionStatement {
+                span: boot_span,
+                expression: Expression::Call(arena.alloc(CallExpression {
+                    span: boot_span,
+                    callee: Expression::Identifier(
+                        arena.alloc(Ident::new(boot_span, interner.intern("boot"))),
+                    ),
+                    arguments: AVec::new_in(arena),
+                    optional: false,
+                })),
+            })));
+        program.spread_helper = Some(interner.intern("__wake_iter"));
+        program.object_spread_helper = Some(interner.intern("__wake_object"));
+        program.for_of_helper = Some(interner.intern("__wake_for_of"));
+        program.span = Span::new(0, 35);
+        program
+    })
+}
+
+fn for_of_helper_program(interner: &Interner) -> wake_ecma_ast::ModuleAst {
+    use wake_ecma_ast::{ModuleAst, Program, SourceType};
+
+    ModuleAst::from_builder(|arena| {
+        let mut program = Program::new_in(arena, SourceType::Script);
+        program.for_of_helper = Some(interner.intern("__wake_for_of"));
+        program
+    })
+}
 
 fn run(src: &str) -> String {
     let it = Interner::new();
@@ -428,6 +489,308 @@ impl crate::ModuleLinker for NoLinker {
 }
 
 #[test]
+fn program_helpers_follow_directive_prologue() {
+    let interner = Interner::new();
+    let module = directive_helper_program(&interner);
+    let js = module.with_ast(|program| codegen(program, &interner));
+
+    let marker = js.find("\"wake-prologue\";").expect("marker directive");
+    let strict = js.find("\"use strict\";").expect("strict directive");
+    let iterator = js
+        .find("function __wake_iter(value, limit)")
+        .expect("iterator helper");
+    let object = js
+        .find("function __wake_object(target)")
+        .expect("object helper");
+    let for_of = js
+        .find("function __wake_for_of(value)")
+        .expect("for-of helper");
+    let boot = js.find("boot();").expect("source body");
+    assert_eq!(marker, 0, "directive prologue must remain first:\n{js}");
+    assert!(
+        marker < strict
+            && strict < iterator
+            && iterator < object
+            && object < for_of
+            && for_of < boot,
+        "helpers must be emitted between directives and the source body:\n{js}"
+    );
+}
+
+#[test]
+fn for_of_helper_is_lazy_and_implements_iterator_close() {
+    let interner = Interner::new();
+    let module = for_of_helper_program(&interner);
+    let helper = module.with_ast(|program| codegen(program, &interner));
+
+    assert!(
+        helper.starts_with("function __wake_for_of(value)"),
+        "{helper}"
+    );
+    assert!(
+        helper.contains("state = {")
+            && helper.contains("s: function()")
+            && helper.contains("n: function()")
+            && helper.contains("e: function(caught)")
+            && helper.contains("f: function()")
+            && helper.contains("v: void 0"),
+        "the helper must expose the stable {{s,n,e,f,v}} state interface:\n{helper}"
+    );
+    assert!(
+        helper.contains("next = iterator.next")
+            && helper.contains("next.call(iterator)")
+            && helper.contains("var done = step.done")
+            && helper.contains("state.v = step.value"),
+        "iterator operations must be captured/read exactly at their state-machine boundary:\n{helper}"
+    );
+    assert!(
+        helper.contains("var returnMethod = iterator.return")
+            && helper.contains("returnMethod.call(iterator)")
+            && helper.contains("finally {")
+            && helper.contains("if (hasError) throw error"),
+        "IteratorClose must preserve a saved body exception:\n{helper}"
+    );
+    assert!(
+        !helper.contains("Array.isArray") && !helper.contains("slice("),
+        "for-of must require the iterator protocol instead of an array fallback:\n{helper}"
+    );
+
+    let node_available = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !node_available {
+        return;
+    }
+
+    let checks = r#"
+function assert(value, message) { if (!value) throw new Error(message); }
+var methodGets = 0, nextGets = 0, nextCalls = 0, doneGets = 0, valueGets = 0, returns = 0;
+var iterable = {};
+Object.defineProperty(iterable, Symbol.iterator, {
+  get: function() {
+    methodGets++;
+    return function() {
+      var iterator = {
+        return: function() { returns++; return {}; }
+      };
+      Object.defineProperty(iterator, "next", {
+        get: function() {
+          nextGets++;
+          return function() {
+            nextCalls++;
+            assert(this === iterator, "next receiver");
+            var step = {};
+            Object.defineProperty(step, "done", {
+              get: function() { doneGets++; return nextCalls > 1; }
+            });
+            Object.defineProperty(step, "value", {
+              get: function() { valueGets++; return 42; }
+            });
+            return step;
+          };
+        }
+      });
+      return iterator;
+    };
+  }
+});
+var state = __wake_for_of(iterable);
+assert(Object.keys(state).join(",") === "s,n,e,f,v", "state keys");
+assert(methodGets === 0 && nextGets === 0, "construction must be lazy");
+state.s();
+assert(methodGets === 1 && nextGets === 1, "GetIterator/next capture count");
+assert(state.n() === false && state.v === 42, "first step");
+assert(state.n() === true, "done step");
+assert(doneGets === 2 && valueGets === 1, "done/value read count");
+state.f();
+assert(returns === 0, "completed iterator must not close");
+
+var bodyError = new Error("body");
+var closeCalls = 0;
+var closing = {};
+closing[Symbol.iterator] = function() {
+  return {
+    next: function() { return { done: false, value: 1 }; },
+    return: function() { closeCalls++; throw new Error("close"); }
+  };
+};
+var closingState = __wake_for_of(closing), thrown;
+try {
+  closingState.s();
+  closingState.n();
+  try { throw bodyError; } catch (caught) { closingState.e(caught); }
+  finally { closingState.f(); }
+} catch (caught) { thrown = caught; }
+assert(thrown === bodyError && closeCalls === 1, "body error must override close error");
+
+var primitiveClose = {};
+primitiveClose[Symbol.iterator] = function() {
+  return { next: function() { return { done: false, value: 1 }; }, return: function() { return 0; } };
+};
+var primitiveState = __wake_for_of(primitiveClose), primitiveError;
+primitiveState.s(); primitiveState.n();
+try { primitiveState.f(); } catch (caught) { primitiveError = caught; }
+assert(primitiveError instanceof TypeError, "return result must be an object");
+
+function startError(value) {
+  var candidate = __wake_for_of(value);
+  try { candidate.s(); } catch (caught) { return caught; }
+}
+assert(startError(null) instanceof TypeError, "null");
+assert(startError(void 0) instanceof TypeError, "undefined");
+assert(startError({}) instanceof TypeError, "missing iterator");
+var nonObjectIterator = {};
+nonObjectIterator[Symbol.iterator] = function() { return 1; };
+assert(startError(nonObjectIterator) instanceof TypeError, "iterator object");
+var invalidStep = {};
+invalidStep[Symbol.iterator] = function() { return { next: function() { return 1; } }; };
+var invalidState = __wake_for_of(invalidStep), invalidError;
+invalidState.s();
+try { invalidState.n(); } catch (caught) { invalidError = caught; }
+assert(invalidError instanceof TypeError, "IteratorResult object");
+
+var valueReturnCalls = 0, valueFailure = {};
+valueFailure[Symbol.iterator] = function() {
+  return {
+    next: function() {
+      return { done: false, get value() { throw new Error("value"); } };
+    },
+    return: function() { valueReturnCalls++; return {}; }
+  };
+};
+var valueState = __wake_for_of(valueFailure), valueError;
+valueState.s();
+try { valueState.n(); } catch (caught) { valueError = caught; }
+valueState.f();
+assert(valueError && valueError.message === "value", "IteratorValue error");
+assert(valueReturnCalls === 0, "IteratorValue failure must not close a done iterator record");
+
+var savedSymbol = Symbol;
+globalThis.Symbol = void 0;
+assert(startError([]) instanceof TypeError, "missing Symbol must not use an array fallback");
+globalThis.Symbol = savedSymbol;
+process.stdout.write("OK");
+"#;
+    let script = format!("{helper}\n{checks}");
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "for-of helper runtime failed: {}\n{helper}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn minify_keeps_directives_and_breaks_incoming_sequence_at_helpers() {
+    use wake_common::Span;
+
+    let interner = Interner::new();
+    let module = directive_helper_program(&interner);
+    let js = module.with_ast(|program| {
+        let mut ctx = MinifyCtx::default();
+        // Model the real minifier plans: bare strings are normally DCE candidates, and all
+        // three adjacent source expressions are sequence-merge candidates.
+        ctx.remove_spans
+            .extend([Span::new(0, 15), Span::new(16, 28)]);
+        ctx.sequence_spans = vec![
+            (Span::new(0, 15), Span::new(16, 28)),
+            (Span::new(16, 28), Span::new(29, 35)),
+        ];
+        ctx.minify = true;
+        crate::codegen_module_shaken_mangled(
+            program,
+            &interner,
+            &NoLinker,
+            None,
+            &[],
+            true,
+            None,
+            Some(&ctx),
+            false,
+            false,
+        )
+    });
+
+    assert!(
+        js.starts_with("\"wake-prologue\";\"use strict\";function __wake_iter"),
+        "minify must preserve the complete directive prologue before helpers:\n{js}"
+    );
+    assert!(
+        js.contains("boot();"),
+        "the first body expression must not be skipped as an incoming sequence successor:\n{js}"
+    );
+}
+
+#[test]
+fn helper_insertion_keeps_statement_source_map_positions() {
+    let interner = Interner::new();
+    let module = directive_helper_program(&interner);
+    let (js, map) = module.with_ast(|program| {
+        crate::codegen_module_shaken_with_map(
+            program,
+            &interner,
+            &NoLinker,
+            None,
+            &[],
+            false,
+            None,
+            None,
+            false,
+            false,
+        )
+    });
+
+    let marker = map
+        .mappings
+        .iter()
+        .find(|mapping| mapping.src_offset == 0)
+        .expect("marker mapping");
+    let strict = map
+        .mappings
+        .iter()
+        .find(|mapping| mapping.src_offset == 16)
+        .expect("strict mapping");
+    let boot = map
+        .mappings
+        .iter()
+        .find(|mapping| mapping.src_offset == 29)
+        .expect("body mapping");
+    assert_eq!((marker.gen_line, marker.gen_col), (0, 0));
+    assert_eq!((strict.gen_line, strict.gen_col), (1, 0));
+    assert!(
+        boot.gen_line > strict.gen_line + 2,
+        "body mapping must account for injected helper lines: {map:?}\n{js}"
+    );
+    let generated_line = js
+        .lines()
+        .nth(boot.gen_line as usize)
+        .expect("mapped generated line");
+    assert!(generated_line.starts_with("boot();"), "{map:?}\n{js}");
+}
+
+#[test]
+fn decorator_helpers_follow_directive_prologue() {
+    let js = strip_ts("\"wake-prologue\";\"use strict\";@dec class C {}");
+    let marker = js.find("\"wake-prologue\";").expect("marker directive");
+    let strict = js.find("\"use strict\";").expect("strict directive");
+    let run = js
+        .find("var __runInitializers")
+        .expect("decorator initializer helper");
+    let decorate = js.find("var __esDecorate").expect("decorator helper");
+    let class = js.find("let C =").expect("lowered class");
+    assert_eq!(marker, 0, "{js}");
+    assert!(
+        marker < strict && strict < run && run < decorate && decorate < class,
+        "decorator helpers must follow all source directives:\n{js}"
+    );
+}
+
+#[test]
 fn m4b_dead_branch_strips_dev_block() {
     use crate::codegen_module_shaken_with;
     let it = Interner::new();
@@ -814,7 +1177,7 @@ fn shake_keeps_named_recursive_live_export() {
 }
 
 // ======================================================================
-// 标识符 mangling（CRUSTIFY-PARITY §M4）：侧表由 wake_ecma_minify 构建，codegen 按 span 替换。
+// 标识符 mangling（WAKE-COMPATIBILITY §M4）：侧表由 wake_ecma_minify 构建，codegen 按 span 替换。
 // ======================================================================
 
 /// mangle：parse → plan_mangle → codegen_module_shaken_mangled（minify），再 parse 校验合法。
@@ -1204,6 +1567,57 @@ fn prop_mangle_computed_object_key_not_mangled() {
     assert!(js.contains("]:1"), "计算键值对保留:\n{js}");
 }
 
+#[test]
+fn prop_mangle_cannot_rewrite_object_prototype_setter() {
+    let it = Interner::new();
+    let out = parse(
+        "const base = {}; const value = { __proto__: base }; value;",
+        &it,
+        SourceType::Module,
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let js = out.module.with_ast(|program| {
+        let wake_ecma_ast::Statement::VariableDeclaration(declaration) = &program.body[1] else {
+            panic!("expected value declaration")
+        };
+        let Some(wake_ecma_ast::Expression::Object(object)) = declaration.declarations[0].init
+        else {
+            panic!("expected object initializer")
+        };
+        let wake_ecma_ast::ObjectMember::Property(property) = &object.properties[0] else {
+            panic!("expected object property")
+        };
+        assert!(property.prototype_setter);
+        let wake_ecma_ast::PropertyKey::Ident(key) = property.key else {
+            panic!("expected identifier key")
+        };
+
+        // Even an externally supplied/stale rename table must not change this syntax into an own
+        // data property: prototype-setter semantics are carried explicitly by the AST node.
+        let mut renames = FxHashMap::default();
+        renames.insert(key.span, it.intern("renamed"));
+        let ctx = MinifyCtx {
+            defines: &[],
+            prop_rename: Some(&renames),
+            ..MinifyCtx::default()
+        };
+        crate::codegen_module_shaken_mangled(
+            program,
+            &it,
+            &NoLink,
+            None,
+            &[],
+            true,
+            None,
+            Some(&ctx),
+            false,
+            false,
+        )
+    });
+    assert!(js.contains("__proto__"), "{js}");
+    assert!(!js.contains("renamed:"), "{js}");
+}
+
 // ======================================================================
 // Scope hoisting（Phase 3.5）：var 声明提升至函数顶部
 // ======================================================================
@@ -1551,6 +1965,7 @@ fn jsx_dev_runtime_shape_matches_tsc() {
         jsx_import_source: "react",
         jsx_dev: true,
         file_name: "src/a.tsx",
+        ..ParseOptions::default()
     };
     let src = "const a = <div className=\"x\">hi</div>;";
     let out = parse_with(src, &it, SourceType::Tsx, opts);

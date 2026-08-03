@@ -123,9 +123,9 @@ pub fn codegen_module_shaken(
 
 /// 同 [`codegen_module_shaken`]，但可传入自定义 **define 表**（编译期常量替换）。
 ///
-/// crustify 用 webpack `mode`/`DefinePlugin` 决定 `process.env.NODE_ENV` 等常量；wake 由此接入：
+/// 旧实现使用 webpack `mode`/`DefinePlugin` 决定 `process.env.NODE_ENV` 等常量；wake 由此接入：
 /// prod 传 `[("process.env.NODE_ENV", "\"production\"")]` + 用户 `[define]`，dev 传 `"development"`
-/// （CRUSTIFY-PARITY §M3）。`define` 的每项为「静态成员链 → 字面量**源码**」（值含引号自便）。
+/// （WAKE-COMPATIBILITY §M3）。`define` 的每项为「静态成员链 → 字面量**源码**」（值含引号自便）。
 pub fn codegen_module_shaken_with(
     program: &Program,
     interner: &Interner,
@@ -156,7 +156,7 @@ pub fn codegen_module_shaken_with(
 /// `rename` 由 `wake_ecma_minify::plan_mangle` 构建（作用域安全、只重命名非模块作用域局部）。codegen
 /// 属编译核心（DESIGN §14.1，只依赖 `wake_common`/`wake_ecma_ast`），故语义分析在外部完成、映射传入；
 /// 此处仅在标识符发射点按 span 查表替换，并对**对象字面量/解构 shorthand** 在被重命名时展开为
-/// `key: value` 以免改变属性名（CRUSTIFY-PARITY §M4）。`None` = 不重命名。
+/// `key: value` 以免改变属性名（WAKE-COMPATIBILITY §M4）。`None` = 不重命名。
 pub fn codegen_module_shaken_mangled(
     program: &Program,
     interner: &Interner,
@@ -185,7 +185,7 @@ pub fn codegen_module_shaken_mangled(
     .0
 }
 
-/// 同 [`codegen_module_shaken_mangled`]，但**同时产出模块级 SourceMap 映射**（CRUSTIFY-PARITY §M4d）。
+/// 同 [`codegen_module_shaken_mangled`]，但**同时产出模块级 SourceMap 映射**（WAKE-COMPATIBILITY §M4d）。
 ///
 /// 返回 `(模块体源码, 映射)`。映射的产物坐标是**模块体内的局部坐标**（0 基行、0 基 UTF-16 列），
 /// `src_index` 恒为 0——bundler 把模块体拼进 bundle 时按行偏移平移、并重写为真实源文件下标。
@@ -410,12 +410,12 @@ struct Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// All identifier reads in the module. This remains available when tree shaking is disabled,
     /// allowing codegen-only rewrites that must preserve locally referenced declaration names.
     program_reads: FxHashSet<Atom>,
-    /// 紧凑（minify）输出：换行/缩进省略（语句均发显式 `;`/`}`，ASI 安全）。CRUSTIFY-PARITY §M4a。
+    /// 紧凑（minify）输出：换行/缩进省略（语句均发显式 `;`/`}`，ASI 安全）。WAKE-COMPATIBILITY §M4a。
     minify: bool,
     /// 跳过 `__esModule` 定义（用于单包模式，bundler 静态处理 interop）。
     no_esmodule: bool,
     /// 标识符 mangling 侧表（`span → 新名`，`None` = 不重命名）。由 `wake_ecma_minify::plan_mangle`
-    /// 构建、经调用方传入（codegen 属编译核心，不能反向依赖 parser 的语义分析）。CRUSTIFY-PARITY §M4。
+    /// 构建、经调用方传入（codegen 属编译核心，不能反向依赖 parser 的语义分析）。WAKE-COMPATIBILITY §M4。
     /// 只在**变量引用/绑定**发射点（[`Codegen::push_ident`]）按 span 查表；属性名/成员名/导出名不查。
     rename: Option<&'m FxHashMap<Span, Atom>>,
     /// Module-scope binding rename fallback for synthetic export references whose span is DUMMY.
@@ -432,7 +432,7 @@ struct Codegen<'i, 'l, 'd, 'm, 'mc> {
     skip_inline: bool,
     /// 本模块是否发射了装饰器降级 → 需在模块顶部注入 `__esDecorate`/`__runInitializers`。
     needs_decorator_helpers: std::cell::Cell<bool>,
-    /// SourceMap 采集（`None` = 不产 map，零开销）。CRUSTIFY-PARITY §M4d。
+    /// SourceMap 采集（`None` = 不产 map，零开销）。WAKE-COMPATIBILITY §M4d。
     smap: Option<SmapState>,
 }
 
@@ -687,10 +687,268 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     fn emit_program(&mut self, program: &Program) {
         let stmts = &program.body[..];
+        let directive_count = stmts
+            .iter()
+            .take_while(|statement| {
+                matches!(
+                    statement,
+                    Statement::Expression(expression)
+                        if matches!(expression.expression, Expression::StringLiteral(_))
+                )
+            })
+            .count();
+        let needs_decorator_helpers = program_has_decorated_class(stmts);
+        let has_runtime_helpers = program.spread_helper.is_some()
+            || program.object_spread_helper.is_some()
+            || program.for_of_helper.is_some()
+            || needs_decorator_helpers;
+
+        for (index, statement) in stmts[..directive_count].iter().enumerate() {
+            if index > 0 {
+                self.newline();
+            }
+            let Statement::Expression(directive) = statement else {
+                unreachable!("directive prefix contains only string expression statements")
+            };
+            self.emit_directive(directive);
+        }
+        if directive_count > 0 && has_runtime_helpers {
+            self.newline();
+        }
+
+        if let Some(helper) = program.spread_helper {
+            self.push("function ");
+            self.push_name(helper);
+            self.push("(value, limit) {");
+            self.newline();
+            self.push("if (Array.isArray(value)) return limit === void 0 ? value.slice() : value.slice(0, limit);");
+            self.newline();
+            self.push(
+                "if (value == null) throw new TypeError(\"Cannot spread null or undefined\");",
+            );
+            self.newline();
+            self.push("var method = typeof Symbol !== \"undefined\" && value[Symbol.iterator];");
+            self.newline();
+            self.push("if (method) {");
+            self.newline();
+            self.push("var iterator = method.call(value), result = [], step, error, done = false;");
+            self.newline();
+            self.push("try { while (limit === void 0 || result.length < limit) { step = iterator.next(); if (step.done) { done = true; break; } result.push(step.value); } }");
+            self.newline();
+            self.push("catch (caught) { error = caught; }");
+            self.newline();
+            self.push("finally {");
+            self.newline();
+            self.push("try { if (!done && iterator.return) iterator.return(); }");
+            self.newline();
+            self.push("finally { if (error) throw error; }");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("return result;");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("if (typeof value === \"string\") {");
+            self.newline();
+            self.push("var chars = [], index = 0, first, second;");
+            self.newline();
+            self.push("while (index < value.length && (limit === void 0 || chars.length < limit)) { first = value.charCodeAt(index++); if (first >= 55296 && first <= 56319 && index < value.length) { second = value.charCodeAt(index); if (second >= 56320 && second <= 57343) { chars.push(value.slice(index - 1, ++index)); continue; } } chars.push(String.fromCharCode(first)); }");
+            self.newline();
+            self.push("return chars;");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("throw new TypeError(\"Value is not iterable\");");
+            self.newline();
+            self.push("}");
+            self.newline();
+        }
+
+        if let Some(helper) = program.object_spread_helper {
+            self.push("function ");
+            self.push_name(helper);
+            self.push("(target) {");
+            self.newline();
+            self.push("for (var sourceIndex = 1; sourceIndex < arguments.length; sourceIndex++) {");
+            self.newline();
+            self.push("var source = arguments[sourceIndex];");
+            self.newline();
+            self.push("if (source == null) continue;");
+            self.newline();
+            self.push("var keys = Object.keys(Object(source));");
+            self.newline();
+            self.push("if (typeof Object.getOwnPropertySymbols === \"function\") {");
+            self.newline();
+            self.push("var symbols = Object.getOwnPropertySymbols(source);");
+            self.newline();
+            self.push("for (var symbolIndex = 0; symbolIndex < symbols.length; symbolIndex++) if (Object.prototype.propertyIsEnumerable.call(source, symbols[symbolIndex])) keys.push(symbols[symbolIndex]);");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) { var key = keys[keyIndex]; Object.defineProperty(target, key, { value: source[key], enumerable: true, configurable: true, writable: true }); }");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("return target;");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push_name(helper);
+            self.push(".define = function(target, source) {");
+            self.newline();
+            self.push("var keys = Object.keys(source);");
+            self.newline();
+            self.push("if (typeof Object.getOwnPropertySymbols === \"function\") { var symbols = Object.getOwnPropertySymbols(source); for (var symbolIndex = 0; symbolIndex < symbols.length; symbolIndex++) if (Object.prototype.propertyIsEnumerable.call(source, symbols[symbolIndex])) keys.push(symbols[symbolIndex]); }");
+            self.newline();
+            self.push("for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) {");
+            self.newline();
+            self.push("var key = keys[keyIndex], descriptor = Object.getOwnPropertyDescriptor(source, key);");
+            self.newline();
+            self.push("if (!(\"value\" in descriptor)) { var previous = Object.getOwnPropertyDescriptor(target, key); if (previous && !(\"value\" in previous)) { if (descriptor.get === void 0) descriptor.get = previous.get; if (descriptor.set === void 0) descriptor.set = previous.set; } }");
+            self.newline();
+            self.push("Object.defineProperty(target, key, descriptor);");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("return target;");
+            self.newline();
+            self.push("};");
+            self.newline();
+            self.push_name(helper);
+            self.push(".proto = function(target, value) {");
+            self.newline();
+            self.push("var type = typeof value;");
+            self.newline();
+            self.push("if (value !== null && type !== \"object\" && type !== \"function\") return target;");
+            self.newline();
+            self.push("if (Object.setPrototypeOf) Object.setPrototypeOf(target, value);");
+            self.newline();
+            self.push("else { var descriptor = Object.getOwnPropertyDescriptor(Object.prototype, \"__proto__\"); if (descriptor && descriptor.set) descriptor.set.call(target, value); }");
+            self.newline();
+            self.push("return target;");
+            self.newline();
+            self.push("};");
+            self.newline();
+            self.push_name(helper);
+            self.push(".rest = function(source, excluded) {");
+            self.newline();
+            self.push("if (source == null) throw new TypeError(\"Cannot destructure null or undefined\");");
+            self.newline();
+            self.push("var target = {}, keys = Object.keys(Object(source));");
+            self.newline();
+            self.push("if (typeof Object.getOwnPropertySymbols === \"function\") { var symbols = Object.getOwnPropertySymbols(source); for (var symbolIndex = 0; symbolIndex < symbols.length; symbolIndex++) if (Object.prototype.propertyIsEnumerable.call(source, symbols[symbolIndex])) keys.push(symbols[symbolIndex]); }");
+            self.newline();
+            self.push("for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) { var key = keys[keyIndex], skip = false; for (var excludedIndex = 0; excludedIndex < excluded.length; excludedIndex++) if (excluded[excludedIndex] === key) { skip = true; break; } if (!skip) Object.defineProperty(target, key, { value: source[key], enumerable: true, configurable: true, writable: true }); }");
+            self.newline();
+            self.push("return target;");
+            self.newline();
+            self.push("};");
+            self.newline();
+        }
+
+        if let Some(helper) = program.for_of_helper {
+            self.push("function ");
+            self.push_name(helper);
+            self.push("(value) {");
+            self.newline();
+            self.push("var iterator, next, normal = true, error, hasError = false, state;");
+            self.newline();
+            self.push("state = {");
+            self.newline();
+            self.push("s: function() {");
+            self.newline();
+            self.push("if (value == null || typeof Symbol === \"undefined\") throw new TypeError(\"Value is not iterable\");");
+            self.newline();
+            self.push("var iteratorSymbol = Symbol.iterator;");
+            self.newline();
+            self.push(
+                "if (iteratorSymbol == null) throw new TypeError(\"Value is not iterable\");",
+            );
+            self.newline();
+            self.push("var method = value[iteratorSymbol];");
+            self.newline();
+            self.push("if (typeof method !== \"function\") throw new TypeError(\"Value is not iterable\");");
+            self.newline();
+            self.push("iterator = method.call(value);");
+            self.newline();
+            self.push("if (iterator == null || (typeof iterator !== \"object\" && typeof iterator !== \"function\")) throw new TypeError(\"Iterator is not an object\");");
+            self.newline();
+            self.push("next = iterator.next;");
+            self.newline();
+            self.push("if (typeof next !== \"function\") throw new TypeError(\"Iterator next is not callable\");");
+            self.newline();
+            self.push("},");
+            self.newline();
+            self.push("n: function() {");
+            self.newline();
+            // IteratorStep failures do not trigger IteratorClose. Mark the iteration normal
+            // before invoking the captured `next`, then switch it back only after `done` is false.
+            self.push("normal = true;");
+            self.newline();
+            self.push("var step = next.call(iterator);");
+            self.newline();
+            self.push("if (step == null || (typeof step !== \"object\" && typeof step !== \"function\")) throw new TypeError(\"Iterator result is not an object\");");
+            self.newline();
+            self.push("var done = step.done;");
+            self.newline();
+            self.push("if (done) return true;");
+            self.newline();
+            // IteratorValue failures mark the iterator record done and do not trigger
+            // IteratorClose. Switch to an active loop body only after `value` was read.
+            self.push("state.v = step.value;");
+            self.newline();
+            self.push("normal = false;");
+            self.newline();
+            self.push("return false;");
+            self.newline();
+            self.push("},");
+            self.newline();
+            self.push("e: function(caught) { hasError = true; error = caught; },");
+            self.newline();
+            self.push("f: function() {");
+            self.newline();
+            self.push("try {");
+            self.newline();
+            self.push("if (!normal) {");
+            self.newline();
+            self.push("var returnMethod = iterator.return;");
+            self.newline();
+            self.push("if (returnMethod != null) {");
+            self.newline();
+            self.push("if (typeof returnMethod !== \"function\") throw new TypeError(\"Iterator return is not callable\");");
+            self.newline();
+            self.push("var closeResult = returnMethod.call(iterator);");
+            self.newline();
+            self.push("if (closeResult == null || (typeof closeResult !== \"object\" && typeof closeResult !== \"function\")) throw new TypeError(\"Iterator return result is not an object\");");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("} finally {");
+            self.newline();
+            // This finally is nested inside the transformed loop's finally. A saved body error
+            // therefore wins even when GetMethod(return), return.call or validation also throws.
+            self.push("if (hasError) throw error;");
+            self.newline();
+            self.push("}");
+            self.newline();
+            self.push("},");
+            self.newline();
+            self.push("v: void 0");
+            self.newline();
+            self.push("};");
+            self.newline();
+            self.push("return state;");
+            self.newline();
+            self.push("}");
+            self.newline();
+        }
 
         // 装饰器运行时辅助：先探测本模块是否含需降级的类，若有则在模块顶部注入
         // `__esDecorate` / `__runInitializers`（对齐 tsc 的 per-file helper）。
-        if program_has_decorated_class(stmts) {
+        if needs_decorator_helpers {
             self.push(crate::decorators::RUN_INITIALIZERS);
             self.push(crate::decorators::ES_DECORATE);
             self.newline();
@@ -704,9 +962,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.prune_zombie_reads(stmts);
         }
 
-        let mut i = 0;
+        let mut i = directive_count;
         while i < stmts.len() {
-            if i > 0 {
+            if i > directive_count
+                || (i == directive_count && directive_count > 0 && !has_runtime_helpers)
+            {
                 self.newline();
             }
             if let Statement::VariableDeclaration(decl) = &stmts[i]
@@ -725,7 +985,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 i += 1;
                 continue;
             }
-            i = self.emit_merged_statement(stmts, i);
+            i = self.emit_merged_statement_from(stmts, i, directive_count);
         }
     }
 
@@ -884,6 +1144,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
             }
         }
+    }
+
+    fn emit_directive(&mut self, directive: &ExpressionStatement) {
+        self.mark(directive.span);
+        self.emit_expr(&directive.expression, P_SEQUENCE);
+        self.push(";");
     }
 
     fn emit_statement(&mut self, stmt: &Statement) {
@@ -1242,6 +1508,17 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// Emit one statement from a list, applying Phase 3 merges.
     /// Returns the index of the next statement to process.
     fn emit_merged_statement(&mut self, stmts: &[Statement], i: usize) -> usize {
+        self.emit_merged_statement_from(stmts, i, 0)
+    }
+
+    /// As [`Self::emit_merged_statement`], but statements before `lower_bound` were emitted by a
+    /// separate path and therefore cannot satisfy an incoming statement merge.
+    fn emit_merged_statement_from(
+        &mut self,
+        stmts: &[Statement],
+        i: usize,
+        lower_bound: usize,
+    ) -> usize {
         let stmt = &stmts[i];
 
         // 合成语句（Span::DUMMY，如 enum IIFE 内的成员赋值、参数属性注入）不参与任何
@@ -1271,7 +1548,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     }
                 }
                 Statement::Expression(e) => {
-                    if ctx.sequence_spans.iter().any(|(_, b)| *b == e.span) {
+                    if i > lower_bound && ctx.sequence_spans.iter().any(|(_, b)| *b == e.span) {
                         return i + 1;
                     }
                     if ctx.sequence_spans.iter().any(|(a, _)| *a == e.span) {
@@ -3089,6 +3366,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             && !p.method
             && p.kind == PropertyKind::Init
             && !p.shorthand
+            && !p.prototype_setter
             && let PropertyKey::Ident(id) = &p.key
             && !id.span.is_dummy()
             && let Some(map) = self.prop_rename
@@ -3472,10 +3750,33 @@ fn truncate_after_terminator<'s, 'a>(stmts: &'s [Statement<'a>]) -> &'s [Stateme
         return stmts;
     };
     let tail = &stmts[pos + 1..];
-    if tail.is_empty() || tail.iter().any(has_hoisted_decl) {
+    if tail.is_empty()
+        || tail.iter().any(has_hoisted_decl)
+        || tail.iter().any(is_dormant_transform_lexical_binding)
+    {
         return stmts;
     }
     &stmts[..=pos]
+}
+
+/// A transform may intentionally jump over a lexical declaration so its binding is instantiated
+/// for the surrounding block but never initialized (the synchronous for-of RHS TDZ sentinel).
+/// Unlike ordinary unreachable statements, removing this node changes name resolution and the
+/// behavior of closures created before it. DUMMY declaration/binding spans plus missing
+/// initializers form a private AST marker that source declarations cannot accidentally match.
+fn is_dormant_transform_lexical_binding(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::VariableDeclaration(declaration)
+            if declaration.span.is_dummy()
+                && declaration.kind != VarKind::Var
+                && !declaration.declarations.is_empty()
+                && declaration.declarations.iter().all(|declarator| {
+                    declarator.span.is_dummy()
+                        && declarator.id.span().is_dummy()
+                        && declarator.init.is_none()
+                })
+    )
 }
 
 /// 该语句是否使控制流离开当前语句序列。

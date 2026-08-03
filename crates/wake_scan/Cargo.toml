@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "组件自动扫描：目录遍历 + TOML frontmatter 提取 + 懒加载模块生成（CRUSTIFY-PARITY §M2）。"
+description = "组件自动扫描：目录遍历 + TOML frontmatter 提取 + 懒加载模块生成（WAKE-COMPATIBILITY §M2）。"
 
 [lints]
 workspace = true

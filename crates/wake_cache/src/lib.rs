@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// 缓存文件魔数。
 const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 
 /// 一条依赖（说明符 + 种类判别值 + 源码位置）。`kind` 用 `u8`（由调用方与 `DependencyKind` 互转），
 /// 使本 crate 不依赖 AST 类型。
@@ -43,13 +43,36 @@ pub struct CachedUse {
     pub names: Vec<String>,
 }
 
-/// 一个模块的摘要：依赖 + 静态使用 + 是否含顶层 await。足以建图 + 算 keep + 算 async 子图，无需 parse。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedNamedImport {
+    pub local: String,
+    pub spec: String,
+    pub imported: String,
+}
+
+/// 链接阶段需要的绑定活跃性。跨持久化边界只存字符串，不存进程内 `Atom`。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedLiveness {
+    pub decls: Vec<(String, Vec<String>)>,
+    pub root_refs: Vec<String>,
+    pub named_imports: Vec<CachedNamedImport>,
+    pub namespace_imports: Vec<(String, String)>,
+    pub reexport_star: Vec<String>,
+    pub ns_reexports: Vec<(String, String)>,
+    pub reexport_named: Vec<(String, String, String)>,
+    pub exports: Vec<(String, Option<String>)>,
+}
+
+/// 一个模块的摘要：依赖、静态使用及链接分析。足以建图、tree shaking 和 concat，无需重建 AST。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleSummary {
     pub deps: Vec<CachedDep>,
     pub uses: Vec<CachedUse>,
     /// 模块顶层出现过 `await` / `for await` → 打包器把它包成 `async function`。
     pub has_top_level_await: bool,
+    pub liveness: CachedLiveness,
+    pub concat_is_esm: bool,
+    pub concat_block_safe: bool,
 }
 
 /// 持久化构建缓存：摘要表 + 产物表。
@@ -160,6 +183,9 @@ impl BuildCache {
                 }
             }
             b.push(s.has_top_level_await as u8);
+            put_liveness(&mut b, &s.liveness);
+            b.push(s.concat_is_esm as u8);
+            b.push(s.concat_block_safe as u8);
         }
         // bodies
         put_u32(&mut b, self.bodies.len() as u32);
@@ -215,12 +241,18 @@ impl BuildCache {
                 });
             }
             let has_top_level_await = c.u8()? != 0;
+            let liveness = c.liveness()?;
+            let concat_is_esm = c.u8()? != 0;
+            let concat_block_safe = c.u8()? != 0;
             cache.summaries.insert(
                 key,
                 ModuleSummary {
                     deps,
                     uses,
                     has_top_level_await,
+                    liveness,
+                    concat_is_esm,
+                    concat_block_safe,
                 },
             );
         }
@@ -247,6 +279,53 @@ fn put_u128(b: &mut Vec<u8>, v: u128) {
 fn put_str(b: &mut Vec<u8>, s: &str) {
     put_u32(b, s.len() as u32);
     b.extend_from_slice(s.as_bytes());
+}
+
+fn put_strings(b: &mut Vec<u8>, values: &[String]) {
+    put_u32(b, values.len() as u32);
+    for value in values {
+        put_str(b, value);
+    }
+}
+
+fn put_liveness(b: &mut Vec<u8>, l: &CachedLiveness) {
+    put_u32(b, l.decls.len() as u32);
+    for (name, refs) in &l.decls {
+        put_str(b, name);
+        put_strings(b, refs);
+    }
+    put_strings(b, &l.root_refs);
+    put_u32(b, l.named_imports.len() as u32);
+    for import in &l.named_imports {
+        put_str(b, &import.local);
+        put_str(b, &import.spec);
+        put_str(b, &import.imported);
+    }
+    put_u32(b, l.namespace_imports.len() as u32);
+    for (local, spec) in &l.namespace_imports {
+        put_str(b, local);
+        put_str(b, spec);
+    }
+    put_strings(b, &l.reexport_star);
+    put_u32(b, l.ns_reexports.len() as u32);
+    for (name, spec) in &l.ns_reexports {
+        put_str(b, name);
+        put_str(b, spec);
+    }
+    put_u32(b, l.reexport_named.len() as u32);
+    for (name, spec, imported) in &l.reexport_named {
+        put_str(b, name);
+        put_str(b, spec);
+        put_str(b, imported);
+    }
+    put_u32(b, l.exports.len() as u32);
+    for (name, local) in &l.exports {
+        put_str(b, name);
+        b.push(local.is_some() as u8);
+        if let Some(local) = local {
+            put_str(b, local);
+        }
+    }
 }
 
 // —— 读游标 ——
@@ -277,6 +356,64 @@ impl<'a> Cursor<'a> {
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).ok()
     }
+    fn strings(&mut self) -> Option<Vec<String>> {
+        let n = self.u32()? as usize;
+        (0..n).map(|_| self.str()).collect()
+    }
+    fn liveness(&mut self) -> Option<CachedLiveness> {
+        let decl_count = self.u32()? as usize;
+        let mut decls = Vec::with_capacity(decl_count);
+        for _ in 0..decl_count {
+            decls.push((self.str()?, self.strings()?));
+        }
+        let root_refs = self.strings()?;
+        let import_count = self.u32()? as usize;
+        let mut named_imports = Vec::with_capacity(import_count);
+        for _ in 0..import_count {
+            named_imports.push(CachedNamedImport {
+                local: self.str()?,
+                spec: self.str()?,
+                imported: self.str()?,
+            });
+        }
+        let namespace_count = self.u32()? as usize;
+        let mut namespace_imports = Vec::with_capacity(namespace_count);
+        for _ in 0..namespace_count {
+            namespace_imports.push((self.str()?, self.str()?));
+        }
+        let reexport_star = self.strings()?;
+        let ns_count = self.u32()? as usize;
+        let mut ns_reexports = Vec::with_capacity(ns_count);
+        for _ in 0..ns_count {
+            ns_reexports.push((self.str()?, self.str()?));
+        }
+        let named_count = self.u32()? as usize;
+        let mut reexport_named = Vec::with_capacity(named_count);
+        for _ in 0..named_count {
+            reexport_named.push((self.str()?, self.str()?, self.str()?));
+        }
+        let export_count = self.u32()? as usize;
+        let mut exports = Vec::with_capacity(export_count);
+        for _ in 0..export_count {
+            let name = self.str()?;
+            let local = if self.u8()? != 0 {
+                Some(self.str()?)
+            } else {
+                None
+            };
+            exports.push((name, local));
+        }
+        Some(CachedLiveness {
+            decls,
+            root_refs,
+            named_imports,
+            namespace_imports,
+            reexport_star,
+            ns_reexports,
+            reexport_named,
+            exports,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +438,12 @@ mod tests {
                     names: vec!["useState".into(), "default".into()],
                 }],
                 has_top_level_await: true,
+                liveness: CachedLiveness {
+                    root_refs: vec!["sideEffect".into()],
+                    ..CachedLiveness::default()
+                },
+                concat_is_esm: true,
+                concat_block_safe: true,
             },
         );
         c.put_body(
@@ -321,6 +464,10 @@ mod tests {
         );
         assert_eq!(back.summary(0xDEAD_BEEF).unwrap().uses[0].names.len(), 2);
         assert!(back.summary(0xDEAD_BEEF).unwrap().has_top_level_await);
+        assert_eq!(
+            back.summary(0xDEAD_BEEF).unwrap().liveness.root_refs,
+            ["sideEffect"]
+        );
         assert_eq!(
             back.body(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
                 .as_deref()

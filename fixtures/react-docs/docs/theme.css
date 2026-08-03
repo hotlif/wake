@@ -1,0 +1,2 @@
+:root { --fixture-ring: color-mix(in srgb, var(--wake-accent) 34%, transparent); }
+.fixture-button:focus-visible { outline: 3px solid var(--fixture-ring); outline-offset: 3px; }

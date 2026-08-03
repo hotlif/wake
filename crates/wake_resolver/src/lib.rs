@@ -25,7 +25,7 @@ pub struct ResolveOptions {
     pub main_fields: Vec<String>,
     /// 路径别名 `(前缀, 绝对目标)`（如 `@`→`<root>/src`、`@@`→`<root>`、`@@@/{ns}`→扫描产物）。
     /// 匹配规则：说明符 == 前缀 或以 `前缀/` 开头；命中最长前缀，重写后走文件/目录解析。
-    /// 对齐 crustify webpack `resolve.alias`（CRUSTIFY-PARITY §H）。默认空 → 行为与接入前逐字节一致。
+    /// 保持既定行为 webpack `resolve.alias`（WAKE-COMPATIBILITY §H）。默认空 → 行为与接入前逐字节一致。
     pub alias: Vec<(String, PathBuf)>,
 }
 
@@ -127,6 +127,13 @@ impl Resolver {
         let resolved = self.resolve_uncached(specifier, from_dir);
         self.cache.lock().unwrap().insert(key, resolved.clone());
         resolved.ok_or_else(|| self.err(specifier, from_dir))
+    }
+
+    /// 文件系统 generation 变化后清空路径解析结果。
+    ///
+    /// Resolver 会缓存成功与失败；watch 中新增、删除或重命名文件后，旧结果都可能失效。
+    pub fn clear_cache(&self) {
+        self.cache.lock().unwrap().clear();
     }
 
     fn err(&self, specifier: &str, from_dir: &Path) -> ResolveError {

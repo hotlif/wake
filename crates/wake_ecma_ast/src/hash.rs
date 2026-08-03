@@ -9,11 +9,26 @@ use crate::expr::Expression;
 use crate::module::{ImportAttributes, ModuleExportName};
 use crate::stmt::Statement;
 use crate::visit::{Visit, walk_expression, walk_statement};
-use crate::{Ident, Program};
+use crate::{Ident, ObjectMember, Program, PropertyKey};
 
 /// 计算一个 Program 的结构指纹。同结构 → 同值；跨实例/重启稳定（不含指针）。
 pub fn structure_hash(program: &Program) -> Hash64 {
     let mut fold = HashFold { state: FNV_OFFSET };
+    fold.mix_u64(
+        program
+            .spread_helper
+            .map_or(u64::MAX, |atom| u64::from(atom.as_u32())),
+    );
+    fold.mix_u64(
+        program
+            .object_spread_helper
+            .map_or(u64::MAX - 1, |atom| u64::from(atom.as_u32())),
+    );
+    fold.mix_u64(
+        program
+            .for_of_helper
+            .map_or(u64::MAX - 2, |atom| u64::from(atom.as_u32())),
+    );
     fold.visit_program(program);
     fold.state
 }
@@ -115,6 +130,33 @@ impl<'a> Visit<'a> for HashFold {
             Expression::TemplateLiteral(t) => {
                 for q in t.quasis.iter() {
                     self.mix_u64(q.raw.as_u32() as u64);
+                }
+            }
+            Expression::Object(object) => {
+                for member in object.properties.iter() {
+                    self.mix_disc(std::mem::discriminant(member));
+                    if let ObjectMember::Property(property) = member {
+                        self.mix_disc(std::mem::discriminant(&property.kind));
+                        self.mix_u64(
+                            u64::from(property.method)
+                                | (u64::from(property.shorthand) << 1)
+                                | (u64::from(property.computed) << 2)
+                                | (u64::from(property.prototype_setter) << 3),
+                        );
+                        self.mix_disc(std::mem::discriminant(&property.key));
+                        match property.key {
+                            PropertyKey::Ident(ident) | PropertyKey::Private(ident) => {
+                                self.mix_u64(ident.name.as_u32() as u64);
+                            }
+                            PropertyKey::String(string) => {
+                                self.mix_u64(string.value.as_u32() as u64);
+                            }
+                            PropertyKey::Number(number) => {
+                                self.mix_u64(number.value.to_bits());
+                            }
+                            PropertyKey::Computed(_) => {}
+                        }
+                    }
                 }
             }
             _ => {}

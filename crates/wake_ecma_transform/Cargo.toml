@@ -11,3 +11,4 @@ workspace = true
 [dependencies]
 wake_common.workspace = true
 wake_ecma_ast.workspace = true
+bumpalo.workspace = true

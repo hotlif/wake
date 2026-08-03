@@ -1,8 +1,7 @@
 use wake_common::{Atom, FxHashMap, FxHashSet, Interner, Span};
-use wake_ecma_ast::visit::{Visit, walk_expression};
+use wake_ecma_ast::visit::{Visit, walk_expression, walk_statement};
 use wake_ecma_ast::*;
-use wake_ecma_parser::analyze;
-use wake_ecma_parser::semantic::{DeclKind, ScopeId, SemanticModel, SymbolId};
+use wake_ecma_semantic::{DeclKind, ScopeId, SemanticModel, SymbolId, analyze};
 
 use crate::const_eval::expr_is_pure;
 use crate::mangle::has_hazard;
@@ -104,6 +103,7 @@ pub fn analyze_vars_with_model(
     let exported = collect_exported_names(program);
     let init_map = collect_init_map(program);
     let write_spans = collect_write_spans(program);
+    let initialized_declaration_counts = collect_initialized_declaration_counts(program);
 
     let mut unused_vars = FxHashSet::default();
     let mut unused_var_spans = FxHashSet::default();
@@ -131,7 +131,14 @@ pub fn analyze_vars_with_model(
 
         if ref_count == 0 {
             unused_vars.insert(sym.name);
-            unused_var_spans.insert(sym.span);
+            // `Span::DUMMY` is shared by every synthetic binding. It cannot identify one
+            // declaration in a span-indexed side table: marking one unused synthetic temporary
+            // would make codegen remove every synthetic declaration with the same sentinel span,
+            // including transform temporaries that are still read. Keep synthetic bindings
+            // conservatively; their producers can omit them when they can prove they are unused.
+            if !sym.span.is_dummy() {
+                unused_var_spans.insert(sym.span);
+            }
             // Import bindings have no initializer in the source AST and are emitted specially by
             // the linker. They may be omitted, but must never enter the normal inline path.
             if sym.decl_kind == DeclKind::Import {
@@ -145,6 +152,19 @@ pub fn analyze_vars_with_model(
             single_use_vars.insert(sym.name, ref_span);
 
             if write_spans.contains(&ref_span) {
+                continue;
+            }
+
+            // Repeated initialized declarations of the same name can denote one hoisted `var`
+            // binding (`var x=0; for (var x of values) ...`). The semantic model intentionally
+            // merges those declarations, so its canonical declaration span may still point at
+            // the first literal initializer. Inlining that literal at the final read would erase
+            // later declaration writes. Name-wide counting is conservative across shadowed
+            // scopes but keeps the span-side-table design sound.
+            if initialized_declaration_counts
+                .get(&sym.name)
+                .is_some_and(|count| *count > 1)
+            {
                 continue;
             }
 
@@ -165,6 +185,36 @@ pub fn analyze_vars_with_model(
         inline_candidates,
         inline_ref_spans,
     }
+}
+
+fn collect_initialized_declaration_counts(program: &Program) -> FxHashMap<Atom, usize> {
+    struct Collector {
+        counts: FxHashMap<Atom, usize>,
+    }
+
+    impl<'a> Visit<'a> for Collector {
+        fn visit_statement(&mut self, statement: &Statement<'a>) {
+            if let Statement::VariableDeclaration(declaration) = statement {
+                for declarator in declaration.declarations.iter() {
+                    if declarator.init.is_none() {
+                        continue;
+                    }
+                    let mut names = FxHashSet::default();
+                    pattern_names(&declarator.id, &mut names);
+                    for name in names {
+                        *self.counts.entry(name).or_default() += 1;
+                    }
+                }
+            }
+            walk_statement(self, statement);
+        }
+    }
+
+    let mut collector = Collector {
+        counts: FxHashMap::default(),
+    };
+    collector.visit_program(program);
+    collector.counts
 }
 
 /// 只内联**字面量**（常量值，与求值位置无关）。
@@ -625,6 +675,13 @@ mod tests {
     fn pure_read_still_inlined() {
         let (a, it) = analyze("function f(){ var x = 1; return x + 2; }");
         assert!(contains_in_map(&a.inline_candidates, &it, "x"));
+    }
+
+    #[test]
+    fn repeated_initialized_var_declaration_is_not_inlined() {
+        let (a, it) = analyze("function f(){var x=0;{var x=1;}return x;}");
+        assert!(contains_in_map(&a.single_use_vars, &it, "x"));
+        assert!(!contains_in_map(&a.inline_candidates, &it, "x"));
     }
 
     #[test]

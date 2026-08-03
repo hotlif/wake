@@ -1,0 +1,14 @@
+[package]
+name = "wake_tsdoc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wake docs TypeScript props documentation extractor."
+
+[lints]
+workspace = true
+
+[dependencies]
+regex.workspace = true
+serde.workspace = true

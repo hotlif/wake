@@ -4,6 +4,8 @@
 //! 把它内联进 parser 的同一遍以省一次遍历；那是 P2.5/优化期的事，此处先保证语义正确、供
 //! tree-shaking（P6）与 minifier（P7）复用。
 //!
+//! 独立 crate 边界避免 parser 改动触发 minifier 与 codegen 的级联重编译。
+//!
 //! 覆盖：作用域层级（module/function/block/catch）、var/function 提升（hoisting）、
 //! let/const/class 块级绑定、参数/导入/catch 绑定、标识符引用解析（解析不到 = 全局/未声明）。
 
@@ -111,6 +113,10 @@ pub fn analyze(program: &Program) -> SemanticModel {
     r.stack.push(module);
     // 顶层提升。
     r.hoist(&program.body, module);
+    // Lexical/module bindings are instantiated before any statement executes. Besides ordinary
+    // TDZ correctness, this is required by transform-generated dormant declarations whose
+    // binding deliberately affects expressions that precede the declaration node.
+    r.predeclare_lexical(&program.body, module);
     for stmt in program.body.iter() {
         r.visit_statement(stmt);
     }
@@ -287,6 +293,62 @@ impl Resolver {
         self.hoist_stmt(body, func_scope);
     }
 
+    /// Predeclare direct lexical bindings for one statement list.
+    ///
+    /// ECMAScript creates `let`/`const`/`class`/`using` and import bindings when entering their
+    /// scope, not when execution reaches the declaration. Keeping this phase separate from
+    /// [`Self::hoist`] is useful: these bindings resolve earlier references, but retain TDZ
+    /// runtime behavior and must never be treated as `var`/function declarations.
+    fn predeclare_lexical(&mut self, stmts: &[Statement], scope: ScopeId) {
+        for statement in stmts {
+            self.predeclare_statement_lexical(statement, scope);
+        }
+    }
+
+    fn predeclare_statement_lexical(&mut self, statement: &Statement, scope: ScopeId) {
+        match statement {
+            Statement::VariableDeclaration(declaration) if declaration.kind != VarKind::Var => {
+                let kind = match declaration.kind {
+                    VarKind::Let => DeclKind::Let,
+                    VarKind::Const => DeclKind::Const,
+                    VarKind::Using | VarKind::AwaitUsing => DeclKind::Using,
+                    VarKind::Var => unreachable!("var was excluded by the match guard"),
+                };
+                for declarator in declaration.declarations.iter() {
+                    self.declare_pattern(scope, &declarator.id, kind);
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = class.id {
+                    self.declare(scope, id.name, DeclKind::Class, id.span);
+                }
+            }
+            Statement::Import(declaration) => {
+                for specifier in declaration.specifiers.iter() {
+                    let local = match specifier {
+                        ImportSpecifier::Named { local, .. }
+                        | ImportSpecifier::Default { local, .. }
+                        | ImportSpecifier::Namespace { local, .. } => local,
+                    };
+                    self.declare(scope, local.name, DeclKind::Import, local.span);
+                }
+            }
+            Statement::ExportNamed(export) => {
+                if let Some(declaration) = &export.declaration {
+                    self.predeclare_statement_lexical(declaration, scope);
+                }
+            }
+            Statement::ExportDefault(export) => {
+                if let ExportDefaultKind::Class(class) = export.declaration
+                    && let Some(id) = class.id
+                {
+                    self.declare(scope, id.name, DeclKind::Class, id.span);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ==================================================================
     // 绑定模式
     // ==================================================================
@@ -379,7 +441,8 @@ impl Resolver {
                 self.visit_class(c);
             }
             Statement::Block(b) => {
-                self.enter(ScopeKind::Block);
+                let scope = self.enter(ScopeKind::Block);
+                self.predeclare_lexical(&b.body, scope);
                 for s in b.body.iter() {
                     self.visit_statement(s);
                 }
@@ -424,7 +487,10 @@ impl Resolver {
             }
             Statement::Switch(s) => {
                 self.visit_expression(&s.discriminant);
-                self.enter(ScopeKind::Block);
+                let scope = self.enter(ScopeKind::Block);
+                for case in s.cases.iter() {
+                    self.predeclare_lexical(&case.consequent, scope);
+                }
                 for case in s.cases.iter() {
                     if let Some(t) = &case.test {
                         self.visit_expression(t);
@@ -442,7 +508,8 @@ impl Resolver {
             }
             Statement::Throw(s) => self.visit_expression(&s.argument),
             Statement::Try(s) => {
-                self.enter(ScopeKind::Block);
+                let scope = self.enter(ScopeKind::Block);
+                self.predeclare_lexical(&s.block.body, scope);
                 for st in s.block.body.iter() {
                     self.visit_statement(st);
                 }
@@ -453,13 +520,15 @@ impl Resolver {
                         self.declare_pattern(self.cur_scope(), p, DeclKind::CatchParam);
                         self.visit_pattern_defaults(p);
                     }
+                    self.predeclare_lexical(&h.body.body, self.cur_scope());
                     for st in h.body.body.iter() {
                         self.visit_statement(st);
                     }
                     self.exit();
                 }
                 if let Some(f) = &s.finalizer {
-                    self.enter(ScopeKind::Block);
+                    let scope = self.enter(ScopeKind::Block);
+                    self.predeclare_lexical(&f.body, scope);
                     for st in f.body.iter() {
                         self.visit_statement(st);
                     }
@@ -531,6 +600,7 @@ impl Resolver {
         }
         if let Some(body) = f.body {
             self.hoist(&body.statements, fscope);
+            self.predeclare_lexical(&body.statements, fscope);
             for st in body.statements.iter() {
                 self.visit_statement(st);
             }
@@ -630,6 +700,7 @@ impl Resolver {
                 match a.body {
                     ArrowBody::Block(b) => {
                         self.hoist(&b.statements, fscope);
+                        self.predeclare_lexical(&b.statements, fscope);
                         for st in b.statements.iter() {
                             self.visit_statement(st);
                         }
@@ -715,84 +786,5 @@ impl SemanticModel {
                 None => return None,
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod semantic_tests {
-    use super::*;
-    use crate::parse;
-    use wake_common::Interner;
-
-    fn analyze_src(src: &str) -> (SemanticModel, Interner) {
-        let interner = Interner::new();
-        let out = parse(src, &interner, SourceType::Module);
-        assert!(!out.has_errors(), "{:?}", out.diagnostics);
-        let model = out.module.with_ast(analyze);
-        (model, interner)
-    }
-
-    #[test]
-    fn basic_bindings_and_refs() {
-        let (m, it) = analyze_src("const a = 1; let b = a + 1; b;");
-        // a、b 两个符号。
-        let names: Vec<String> = m.symbols.iter().map(|s| it.resolve(s.name)).collect();
-        assert!(names.contains(&"a".to_string()));
-        assert!(names.contains(&"b".to_string()));
-        // `a` 的引用解析到符号，`b` 的引用解析到符号。
-        assert_eq!(m.unresolved_count(), 0);
-    }
-
-    #[test]
-    fn undeclared_is_unresolved() {
-        let (m, _) = analyze_src("x + y;");
-        // x、y 未声明 → 两个未解析引用。
-        assert_eq!(m.unresolved_count(), 2);
-    }
-
-    #[test]
-    fn var_hoisting() {
-        // 前向引用：函数体里在 var 声明前使用 v，应解析到提升后的符号。
-        let (m, _) = analyze_src("function f() { return v; var v = 1; }");
-        assert_eq!(m.unresolved_count(), 0);
-    }
-
-    #[test]
-    fn block_scoping() {
-        // let 是块级：块外引用块内的 c 应未解析。
-        let (m, it) = analyze_src("{ let c = 1; } c;");
-        // 块内 c 已声明，块外 c 引用未解析。
-        let c_atom = it.intern("c");
-        let outer_ref = m.references.iter().find(|r| r.name == c_atom).unwrap();
-        assert!(outer_ref.resolved.is_none());
-    }
-
-    #[test]
-    fn function_params_and_closures() {
-        let (m, _) =
-            analyze_src("function outer(a, b) { return function inner(c) { return a + b + c; }; }");
-        // a、b、c 全部可解析。
-        assert_eq!(m.unresolved_count(), 0);
-    }
-
-    #[test]
-    fn destructuring_bindings() {
-        let (m, _) = analyze_src("const { x, y: z, ...rest } = obj; x; z; rest;");
-        // obj 未声明（1），x/z/rest 已声明。
-        assert_eq!(m.unresolved_count(), 1);
-    }
-
-    #[test]
-    fn imports_are_bound() {
-        let (m, _) = analyze_src("import def, { named } from 'mod'; def; named;");
-        assert_eq!(m.unresolved_count(), 0);
-    }
-
-    #[test]
-    fn scope_tree_shape() {
-        let (m, _) = analyze_src("function f() { { let a = 1; } }");
-        // module + function + block ≥ 3 个作用域。
-        assert!(m.scopes.len() >= 3);
-        assert_eq!(m.scopes[0].kind, ScopeKind::Module);
     }
 }

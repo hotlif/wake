@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "标识符 mangling 计划器（作用域安全重命名 → span→新名 侧表）。CRUSTIFY-PARITY §M4"
+description = "标识符 mangling 计划器（作用域安全重命名 → span→新名 侧表）。WAKE-COMPATIBILITY §M4"
 
 [lints]
 workspace = true
@@ -12,7 +12,8 @@ workspace = true
 [dependencies]
 wake_common.workspace = true
 wake_ecma_ast.workspace = true
-wake_ecma_parser.workspace = true
+wake_ecma_semantic.workspace = true
 
 [dev-dependencies]
+wake_ecma_parser.workspace = true
 insta.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "wake_docs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wake-native React component documentation compiler and runtime generator."
+
+[lints]
+workspace = true
+
+[dependencies]
+markdown.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+wake_tsdoc.workspace = true
+
+[dev-dependencies]

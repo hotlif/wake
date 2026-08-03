@@ -1,0 +1,11 @@
+[docs]
+source_dir = "docs"
+title = "Wake Components"
+description = "Native React component documentation"
+logo = "/logo.svg"
+repository_url = "https://github.com/hotlif/wake"
+base_path = "/"
+preview = "docs/preview.tsx"
+theme_css = "docs/theme.css"
+default_theme = "system"
+accent_color = "#8b5cf6"

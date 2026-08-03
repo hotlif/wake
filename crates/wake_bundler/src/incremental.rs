@@ -19,9 +19,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use wake_cache::{BuildCache, CachedDep, CachedUse, ModuleSummary};
+use wake_cache::{
+    BuildCache, CachedDep, CachedLiveness, CachedNamedImport, CachedUse, ModuleSummary,
+};
 use wake_common::{
     Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, SourceFile, Span, fs::normalize,
 };
@@ -38,9 +41,10 @@ use wake_ecma_minify::{
     is_undefined_shadowed, plan_mangle_with_model_and_protected, plan_simplifications,
 };
 use wake_ecma_parser::{analyze, parse_with};
+use wake_ecma_transform::{FeatureSet, TargetEnv};
 use wake_graph::{
-    ImportUse, LiveResult, ModuleLiveness, collect_module_liveness, collect_static_uses,
-    compute_live_keep,
+    ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
+    collect_static_uses, compute_live_keep,
 };
 use wake_resolver::{ResolveOptions, Resolver};
 use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, query};
@@ -57,6 +61,93 @@ type Content = Arc<str>;
 
 /// 「说明符 → 内部模块 id」映射（dep 顺序确定，指纹稳定）。
 type DepIds = Vec<(String, u32)>;
+type LoadedResult = (u32, PathBuf, std::io::Result<Arc<Loaded>>);
+type ResolveResult = Result<PathBuf, wake_resolver::ResolveError>;
+
+/// I/O 小任务的目标批次数：既给工作窃取留出余量，又避免为数千个小文件逐个分配
+/// `Job`、逐个经 channel 回传。最终顺序仍由调用方的索引槽位恢复。
+const IO_BATCHES_PER_WORKER: usize = 4;
+
+fn into_bounded_batches<T>(items: Vec<T>, max_batches: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let batch_count = items.len().min(max_batches.max(1));
+    let batch_size = items.len().div_ceil(batch_count);
+    let mut items = items.into_iter();
+    std::iter::from_fn(|| {
+        let batch: Vec<T> = items.by_ref().take(batch_size).collect();
+        (!batch.is_empty()).then_some(batch)
+    })
+    .collect()
+}
+
+/// 小模块的 parse/codegen 本身很快，逐模块穿过 `Executor` 的 boxed job + mpsc 会放大固定开销。
+/// 外层每个任务处理一个连续小批次；`Engine::enter` 仍覆盖批内全部 query，结果按批次与批内顺序展平。
+fn par_request_batched<T, F>(engine: &Arc<Engine>, exec: &Executor, requests: Vec<F>) -> Vec<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let max_batches = exec.num_threads().saturating_mul(IO_BATCHES_PER_WORKER);
+    let batches: Vec<_> = into_bounded_batches(requests, max_batches)
+        .into_iter()
+        .map(|batch| {
+            move || {
+                batch
+                    .into_iter()
+                    .map(|request| request())
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect();
+    engine
+        .par_request(exec, batches)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_batches_preserve_order_and_limit_task_count() {
+        for (len, max_batches) in [(0, 0), (1, 0), (7, 3), (257, 16)] {
+            let batches = into_bounded_batches((0..len).collect::<Vec<_>>(), max_batches);
+            assert!(batches.len() <= len.min(max_batches.max(1)));
+            assert_eq!(
+                batches.into_iter().flatten().collect::<Vec<_>>(),
+                (0..len).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn batched_engine_requests_preserve_order() {
+        let engine = Arc::new(Engine::new());
+        let exec = Executor::new(2);
+        let requests: Vec<_> = (0..257usize).map(|value| move || value).collect();
+        assert_eq!(
+            par_request_batched(&engine, &exec, requests),
+            (0..257).collect::<Vec<_>>()
+        );
+    }
+}
+#[derive(Clone)]
+struct MemoryScanSummary {
+    persisted: Arc<ModuleSummary>,
+    deps: Vec<ParsedDep>,
+    liveness: Arc<ModuleLiveness>,
+    block_info: ConcatBlockInfo,
+}
+
+struct StableModuleGraph {
+    entry: PathBuf,
+    next_id: u32,
+    modules: FxHashMap<u32, ModuleRec>,
+}
 
 /// scan 阶段单模块的解析结果：(依赖, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
 /// 摘要命中时后两者为 `None`（不 parse）；未命中时携带新 parse 的 AST 与句柄。
@@ -65,7 +156,19 @@ type ScanParsed = (
     bool,
     Option<Arc<ParsedModule>>,
     Option<Vc<ParsedModule>>,
+    Option<Arc<ModuleLiveness>>,
+    Option<ConcatBlockInfo>,
 );
+
+/// parse miss 的工作线程结果。解析后的只读 AST 分析与 parse 同批并行完成，驱动层只做
+/// 确定性的缓存/图记账，不再逐模块串行扫描 AST。
+struct ParsedLayerResult {
+    parse_vc: Vc<ParsedModule>,
+    parsed: Arc<ParsedModule>,
+    uses: Vec<(String, ImportUse)>,
+    liveness: Option<Arc<ModuleLiveness>>,
+    block_info: Option<ConcatBlockInfo>,
+}
 
 /// linker 输入 cell 的类型：依赖映射 + Tree Shaking 保留集 + 动态 import 的 chunk 落点。
 ///
@@ -102,6 +205,14 @@ pub struct ParsedDep {
     pub span: Span,
 }
 
+fn same_dependency_shape(old: &[ParsedDep], new: &[ParsedDep]) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|(a, b)| a.specifier == b.specifier && a.kind == b.kind)
+}
+
 // 指纹只取 AST 结构 hash + 依赖（诊断是内容的函数，内容变则 AST 变、指纹变，无需入指纹）。
 impl std::hash::Hash for ParsedModule {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -124,6 +235,21 @@ pub struct IncrementalBundler {
     content_cells: FxHashMap<PathBuf, Vc<Content>>,
     /// 规范化路径 → linker 输入 cell（跨构建保留）。
     linker_cells: FxHashMap<PathBuf, Vc<LinkerData>>,
+    /// watch generation 间复用的 loader 结果。文件事件按路径精确移除，未变模块不再触碰磁盘。
+    load_cache: Arc<Mutex<FxHashMap<PathBuf, Arc<Loaded>>>>,
+    load_exec_count: Arc<AtomicU64>,
+    load_cache_enabled: bool,
+    /// generation 间稳定的解析边：(issuer dir, specifier) → resolved path/error。
+    resolve_edge_cache: Arc<Mutex<FxHashMap<(PathBuf, String), ResolveResult>>>,
+    resolve_exec_count: Arc<AtomicU64>,
+    /// generation-aware session 的拥有型 scan 摘要。未变模块无需再次请求 parse 或重算活跃性。
+    memory_summaries: FxHashMap<u64, MemoryScanSummary>,
+    memory_parse_vcs: FxHashMap<u64, Vc<ParsedModule>>,
+    /// 上一成功 generation 的完整模块图。普通内容编辑在依赖形状不变时直接复用稳定 id/边。
+    stable_graph: Option<StableModuleGraph>,
+    topology_invalidated: AtomicBool,
+    topology_reuse_count: AtomicU64,
+    last_module_count: usize,
     /// 是否启用 Tree Shaking（默认关闭；prod build 开启）。DESIGN §5.3 / PLAN §6.6。
     tree_shaking: bool,
     /// 是否启用代码分割（默认关闭；prod build 开启）。DESIGN §6.3 / PLAN §6.5。
@@ -141,7 +267,7 @@ pub struct IncrementalBundler {
     pnp_detected: Option<bool>,
     /// 编译期常量替换表（`静态成员链 → 字面量源码`）。默认 `process.env.NODE_ENV → "production"`
     /// （对齐既有 codegen 默认，prod 口径）；dev/prod + 用户 `[define]` 由 CLI/dev-server 经
-    /// [`set_define`](Self::set_define) 覆盖（CRUSTIFY-PARITY §M3）。
+    /// [`set_define`](Self::set_define) 覆盖（WAKE-COMPATIBILITY §M3）。
     define: Arc<[(String, String)]>,
     /// `define` 的稳定指纹，混入产物缓存键——define 变（如 dev↔prod）→ 精确失效产物缓存。
     define_hash: u64,
@@ -151,29 +277,32 @@ pub struct IncrementalBundler {
     asset_inline_limit: usize,
     /// 资源 URL 的 `publicPath` 前缀（默认 `/`）。
     public_path: String,
-    /// 紧凑（minify）codegen（默认关；prod build 开）。省换行/缩进（CRUSTIFY-PARITY §M4a）。
+    /// 紧凑（minify）codegen（默认关；prod build 开）。省换行/缩进（WAKE-COMPATIBILITY §M4a）。
     minify: bool,
     /// 死模块消除（默认关；prod build 开）：codegen DCE 剥离死 `require` 后，从 entry 重算可达模块、
     /// 丢弃不可达者（如 `if(false)` 里 `require('…development')` 拉进图但已不可达的 dev 包）。§M4b 后续。
     dead_module_elimination: bool,
     /// 标识符 mangling（默认关；prod build 开）：作用域安全地把非模块作用域局部/参数重命名为短名。
-    /// 每模块 `wake_ecma_minify::plan_mangle` 构建 `span→新名` 侧表传入 codegen（CRUSTIFY-PARITY §M4）。
+    /// 每模块 `wake_ecma_minify::plan_mangle` 构建 `span→新名` 侧表传入 codegen（WAKE-COMPATIBILITY §M4）。
     /// 影响产物缓存键（[`MANGLE_SALT`]）。
     mangle: bool,
     /// 移除 `console.*` 调用（默认关；prod build 可选开）。
     drop_console: bool,
     /// 移除 `debugger` 语句（默认关；prod build 可选开）。
     drop_debugger: bool,
-    /// 产出 Source Map（CRUSTIFY-PARITY §M4d）。当前仅支持 **非 minify 单包**路径：
+    /// 产出 Source Map（WAKE-COMPATIBILITY §M4d）。当前仅支持 **非 minify 单包**路径：
     /// 该路径下模块体逐行原样拼接（仅前缀 2 空格缩进），行偏移法精确成立。
     /// minify 路径会 scope-hoist + 改写模块体文本，映射会错位，故 [`IncrementalBundler::build`]
     /// 在 minify 时不产 map（见 emit 处的守卫）。
     sourcemap: bool,
     /// 零运行时 CSS-in-JS（Linaria 子集）：构建期把 `` css`...` `` 抽取为静态 CSS
-    /// （CRUSTIFY-PARITY §M5）。见 [`IncrementalBundler::enable_css_in_js`]。
+    /// （WAKE-COMPATIBILITY §M5）。见 [`IncrementalBundler::enable_css_in_js`]。
     css_in_js: bool,
     /// JSX 运行时口径（dev runtime / jsxImportSource）。见 [`IncrementalBundler::set_jsx_runtime`]。
     jsx: JsxRuntimeOptions,
+    /// 目标环境指纹。即使 pass 尚未覆盖某语法，目标变化也不能复用旧转换缓存。
+    target_fingerprint: u64,
+    transform_features: FeatureSet,
 }
 
 /// 扫描完成的一个模块记录。
@@ -188,7 +317,7 @@ struct ModuleRec {
     deps: Vec<ParsedDep>,
     dep_ids: DepIds,
     /// 绑定级活跃性（Tree Shaking 用；仅 prod + 新 parse 的模块有；缓存摘要命中 → `None` → 保守全保留）。
-    liveness: Option<ModuleLiveness>,
+    liveness: Option<Arc<ModuleLiveness>>,
     /// 单包 concat 块安全信息（`{}` vs IIFE；缓存摘要命中 → `None` → 保守走 IIFE + 不加 strict）。
     block_info: Option<ConcatBlockInfo>,
     /// 模块顶层含 `await`（来自 parse 或缓存摘要）。async 子图的种子。
@@ -206,7 +335,10 @@ struct LayerItem {
     source_type: SourceType,
     content_key: u64,
     /// 缓存摘要命中则为 `Some`（该模块跳过 parse）。
-    cached: Option<ModuleSummary>,
+    cached: Option<Arc<ModuleSummary>>,
+    memory_liveness: Option<Arc<ModuleLiveness>>,
+    memory_block_info: Option<ConcatBlockInfo>,
+    memory_deps: Option<Vec<ParsedDep>>,
 }
 
 /// 驱动层两遍处理的中转态：Pass 1（串行）算好 deps/liveness/block_info 并收集 resolve 请求，
@@ -220,7 +352,7 @@ struct PendingModule {
     source_type: SourceType,
     content_vc: Vc<Content>,
     deps: Vec<ParsedDep>,
-    liveness: Option<ModuleLiveness>,
+    liveness: Option<Arc<ModuleLiveness>>,
     block_info: Option<ConcatBlockInfo>,
     has_top_level_await: bool,
     parse_vc_opt: Option<Vc<ParsedModule>>,
@@ -235,6 +367,7 @@ impl IncrementalBundler {
             "\"production\"".to_string(),
         )]);
         let define_hash = hash_define(&default_define);
+        let default_target = TargetEnv::default();
         IncrementalBundler {
             resolver: Arc::new(Resolver::new(fs.clone())),
             resolve_options: ResolveOptions::default(),
@@ -246,6 +379,17 @@ impl IncrementalBundler {
             define_hash,
             content_cells: FxHashMap::default(),
             linker_cells: FxHashMap::default(),
+            load_cache: Arc::new(Mutex::new(FxHashMap::default())),
+            load_exec_count: Arc::new(AtomicU64::new(0)),
+            load_cache_enabled: false,
+            resolve_edge_cache: Arc::new(Mutex::new(FxHashMap::default())),
+            resolve_exec_count: Arc::new(AtomicU64::new(0)),
+            memory_summaries: FxHashMap::default(),
+            memory_parse_vcs: FxHashMap::default(),
+            stable_graph: None,
+            topology_invalidated: AtomicBool::new(true),
+            topology_reuse_count: AtomicU64::new(0),
+            last_module_count: 0,
             tree_shaking: false,
             code_splitting: false,
             content_hash: true,
@@ -264,7 +408,34 @@ impl IncrementalBundler {
             sourcemap: false,
             css_in_js: false,
             jsx: JsxRuntimeOptions::default(),
+            target_fingerprint: default_target.fingerprint(),
+            transform_features: default_target.required_features(),
         }
+    }
+
+    /// 设置已规范化目标环境，并将其稳定指纹混入 parse/transform 内容键。
+    pub fn set_target_env(&mut self, target: TargetEnv) -> &mut Self {
+        let fingerprint = target.fingerprint();
+        if fingerprint != self.target_fingerprint {
+            // Parse tasks close over the selected transform set. A target change on a long-lived
+            // bundler must not reuse task nodes created under the old target. Configuration
+            // changes are rare, so rebuilding this in-memory graph is simpler and safer than
+            // keeping a second configuration input on every parse edge.
+            self.reset_parse_graph();
+        }
+        self.target_fingerprint = fingerprint;
+        self.transform_features = target.required_features();
+        self
+    }
+
+    fn reset_parse_graph(&mut self) {
+        self.engine = Arc::new(Engine::new());
+        self.content_cells.clear();
+        self.linker_cells.clear();
+        self.memory_summaries.clear();
+        self.memory_parse_vcs.clear();
+        self.stable_graph = None;
+        self.topology_invalidated.store(true, Ordering::Release);
     }
 
     /// 若入口所在项目根（含祖先）存在 `.pnp.cjs`，启用 Yarn PnP：
@@ -298,7 +469,7 @@ impl IncrementalBundler {
 
     /// 设置解析选项（含路径别名 `@`/`@@`/`@@@`）。须在首次 `build()` 前调用（CLI 读配置后）。
     /// 重建解析器；跨构建保留选项，供 PnP 检测切换解析器时复用（不丢别名）。
-    /// 对齐 crustify `resolve.alias`（CRUSTIFY-PARITY §M1/§H）。
+    /// 保持既定行为 `resolve.alias`（WAKE-COMPATIBILITY §M1/§H）。
     pub fn set_resolve_options(&mut self, options: ResolveOptions) -> &mut Self {
         self.resolver = Arc::new(Resolver::with_options(self.fs.clone(), options.clone()));
         self.resolve_options = options;
@@ -307,14 +478,14 @@ impl IncrementalBundler {
 
     /// 设置编译期 define 表（`静态成员链 → 字面量源码`），如
     /// `[("process.env.NODE_ENV", "\"development\"")]`。指纹混入产物缓存键，
-    /// dev↔prod 切换自动失效旧产物。CRUSTIFY-PARITY §M3。
+    /// dev↔prod 切换自动失效旧产物。WAKE-COMPATIBILITY §M3。
     pub fn set_define(&mut self, define: Vec<(String, String)>) -> &mut Self {
         self.define = Arc::from(define);
         self.define_hash = hash_define(&self.define);
         self
     }
 
-    /// 启用 prod CSS 抽取（CRUSTIFY-PARITY §M3）：CSS 不注入 `<style>`，聚合为独立 `.css` 产物
+    /// 启用 prod CSS 抽取（WAKE-COMPATIBILITY §M3）：CSS 不注入 `<style>`，聚合为独立 `.css` 产物
     /// （见 [`BuildOutput::assets`]）。dev 保持关闭（运行时 `<style>` 注入利于 HMR）。
     pub fn enable_css_extraction(&mut self) -> &mut Self {
         self.extract_css = true;
@@ -334,13 +505,13 @@ impl IncrementalBundler {
         self
     }
 
-    /// 启用紧凑 codegen（省换行/缩进，CRUSTIFY-PARITY §M4a）。prod build 用；影响产物缓存键。
+    /// 启用紧凑 codegen（省换行/缩进，WAKE-COMPATIBILITY §M4a）。prod build 用；影响产物缓存键。
     pub fn enable_minify(&mut self) -> &mut Self {
         self.minify = true;
         self
     }
 
-    /// 启用死模块消除（CRUSTIFY-PARITY §M4b 后续）：emit 前从 entry 按存活 `require` 边重算可达模块，
+    /// 启用死模块消除（WAKE-COMPATIBILITY §M4b 后续）：emit 前从 entry 按存活 `require` 边重算可达模块，
     /// 丢弃不可达者。与 `enable_minify` 搭配（DCE 剥离死 `require` 后才有不可达模块可删）。安全：
     /// 边提取误判只会「多留」不会「错删」。
     pub fn enable_dead_module_elimination(&mut self) -> &mut Self {
@@ -348,7 +519,7 @@ impl IncrementalBundler {
         self
     }
 
-    /// 启用标识符 mangling（CRUSTIFY-PARITY §M4）：每模块规划作用域安全的短名重命名（只动非模块
+    /// 启用标识符 mangling（WAKE-COMPATIBILITY §M4）：每模块规划作用域安全的短名重命名（只动非模块
     /// 作用域局部/参数，模块顶层与 import/export 名保留）。须与 [`enable_minify`](Self::enable_minify)
     /// 搭配（mangle 侧表只在紧凑 codegen 路径生效）；影响产物缓存键。
     pub fn enable_mangle(&mut self) -> &mut Self {
@@ -356,7 +527,7 @@ impl IncrementalBundler {
         self
     }
 
-    /// 启用 **Source Map** 产出（CRUSTIFY-PARITY §M4d）。
+    /// 启用 **Source Map** 产出（WAKE-COMPATIBILITY §M4d）。
     ///
     /// 产物 chunk 的 [`OutputChunk::source_map`](crate::OutputChunk::source_map) 将带上 V3 JSON，
     /// 由调用方决定写盘（`<chunk>.js.map`）或经 dev server 提供。
@@ -477,11 +648,15 @@ impl IncrementalBundler {
     /// 该口径会**改变解析出的依赖说明符**，故已混入 `content_key`（见 [`content_key_of`]）——
     /// dev 与 prod 的模块摘要缓存彼此隔离，不会交叉复用。
     pub fn set_jsx_runtime(&mut self, dev: bool, import_source: &'static str) -> &mut Self {
-        self.jsx = JsxRuntimeOptions { dev, import_source };
+        let next = JsxRuntimeOptions { dev, import_source };
+        if self.jsx != next {
+            self.reset_parse_graph();
+        }
+        self.jsx = next;
         self
     }
 
-    /// 启用**零运行时 CSS-in-JS**（Linaria / wyw-in-js 子集，CRUSTIFY-PARITY §M5）。
+    /// 启用**零运行时 CSS-in-JS**（Linaria / wyw-in-js 子集，WAKE-COMPATIBILITY §M5）。
     ///
     /// 从 `@linaria/core` 等 import 的 `` css`...` `` 标签模板在构建期求值并抽取为静态 CSS，
     /// 表达式替换为类名字符串——运行时零样式计算。插值支持字面量/模板/对象/数组/成员访问，
@@ -542,6 +717,262 @@ impl IncrementalBundler {
         self.engine.exec_count()
     }
 
+    /// 实际执行 loader/文件读取的累计次数；load snapshot 命中不增加。
+    pub fn load_exec_count(&self) -> u64 {
+        self.load_exec_count.load(Ordering::Relaxed)
+    }
+
+    pub fn resolve_exec_count(&self) -> u64 {
+        self.resolve_exec_count.load(Ordering::Relaxed)
+    }
+
+    pub fn topology_reuse_count(&self) -> u64 {
+        self.topology_reuse_count.load(Ordering::Relaxed)
+    }
+
+    /// 由 generation-aware `BuildSession` 启用。直接打包器保持每次读取文件的兼容语义。
+    pub(crate) fn enable_load_cache(&mut self) {
+        self.load_cache_enabled = true;
+    }
+
+    /// 通知文件系统 generation 已变化。内容 cell 会在下一次扫描时按文本精确更新；
+    /// resolver 的成功/失败路径缓存必须立即清空，以识别新增、删除和重命名文件。
+    pub fn invalidate_filesystem(&self) {
+        self.resolver.clear_cache();
+        self.load_cache.lock().unwrap().clear();
+        self.resolve_edge_cache.lock().unwrap().clear();
+        self.topology_invalidated.store(true, Ordering::Release);
+    }
+
+    /// 精确失效 watcher 报告的路径。创建/删除/重命名还会使路径解析结果失效；
+    /// 普通内容修改保留 resolver cache。
+    pub fn invalidate_paths(&self, paths: &[PathBuf], structural: bool) {
+        let normalized: FxHashSet<PathBuf> = paths.iter().map(|p| normalize(p)).collect();
+        let resolution_metadata_changed = normalized.iter().any(|p| {
+            p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "package.json"
+                            | "wake.toml"
+                            | ".pnp.cjs"
+                            | "yarn.lock"
+                            | "package-lock.json"
+                            | "pnpm-lock.yaml"
+                    )
+                })
+        });
+        let asset_changed = normalized.iter().any(|p| {
+            p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                matches!(
+                    e,
+                    "png"
+                        | "jpg"
+                        | "jpeg"
+                        | "gif"
+                        | "svg"
+                        | "webp"
+                        | "avif"
+                        | "ico"
+                        | "bmp"
+                        | "woff"
+                        | "woff2"
+                        | "ttf"
+                        | "otf"
+                        | "eot"
+                )
+            })
+        });
+        self.load_cache.lock().unwrap().retain(|path, _| {
+            !(normalized.contains(path)
+                || asset_changed
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("css")))
+        });
+        if structural || resolution_metadata_changed {
+            self.resolver.clear_cache();
+            self.resolve_edge_cache.lock().unwrap().clear();
+            self.topology_invalidated.store(true, Ordering::Release);
+        }
+    }
+
+    /// 刷新上一 generation 中 loader snapshot 已失效的模块。
+    ///
+    /// 只有依赖的说明符、种类及顺序都保持不变时才提交更新；任一模块改变依赖形状便返回
+    /// `None`，调用方回退确定性的全量 BFS。这样普通实现编辑可复用稳定 id/解析边，而新增、
+    /// 删除、重命名及 import 图变化仍走完整发现流程。
+    fn refresh_stable_graph(
+        &mut self,
+        graph: &mut StableModuleGraph,
+        load_opts: Arc<LoadOptions>,
+        need_uses: bool,
+        timing: bool,
+        read_time: &mut std::time::Duration,
+    ) -> Option<()> {
+        let dirty: Vec<(u32, PathBuf)> = {
+            let cache = self.load_cache.lock().unwrap();
+            (0..graph.next_id)
+                .filter_map(|id| {
+                    let rec = graph.modules.get(&id)?;
+                    (!cache.contains_key(&rec.path)).then(|| (id, rec.path.clone()))
+                })
+                .collect()
+        };
+        if dirty.is_empty() {
+            self.topology_reuse_count.fetch_add(1, Ordering::Relaxed);
+            return Some(());
+        }
+
+        let jobs: Vec<_> = dirty
+            .into_iter()
+            .map(|(id, path)| {
+                let fs = self.fs.clone();
+                let opts = load_opts.clone();
+                let load_cache = self.load_cache.clone();
+                let load_exec_count = self.load_exec_count.clone();
+                move || {
+                    load_exec_count.fetch_add(1, Ordering::Relaxed);
+                    let loaded = load_source(fs.as_ref(), &path, opts.as_ref()).map(|loaded| {
+                        let loaded = Arc::new(loaded);
+                        load_cache
+                            .lock()
+                            .unwrap()
+                            .insert(path.clone(), loaded.clone());
+                        loaded
+                    });
+                    (id, path, loaded)
+                }
+            })
+            .collect();
+        let tr = timing.then(std::time::Instant::now);
+        let loaded_results = self.exec.parallel(jobs);
+        if let Some(t) = tr {
+            *read_time += t.elapsed();
+        }
+        if loaded_results.iter().any(|(_, _, loaded)| loaded.is_err()) {
+            return None;
+        }
+
+        struct RefreshItem {
+            id: u32,
+            path: PathBuf,
+            loaded: Arc<Loaded>,
+            content_key: u64,
+            content_vc: Vc<Content>,
+        }
+
+        let mut items = Vec::with_capacity(loaded_results.len());
+        for (id, path, loaded) in loaded_results {
+            let loaded = loaded.ok()?;
+            let content_key = content_key_of(
+                &loaded.source,
+                loaded.source_type,
+                self.jsx.salt(),
+                self.target_fingerprint,
+            );
+            let content_vc = self.content_cell(&path, &loaded.source);
+            items.push(RefreshItem {
+                id,
+                path,
+                loaded,
+                content_key,
+                content_vc,
+            });
+        }
+
+        let requests: Vec<_> = items
+            .iter()
+            .map(|item| {
+                let cell = item.content_vc;
+                let st = item.loaded.source_type;
+                let interner = self.interner.clone();
+                let jsx = self.jsx;
+                let transform_features = self.transform_features;
+                let file_name: Arc<str> =
+                    Arc::from(item.path.to_string_lossy().replace('\\', "/").as_str());
+                move || parse_request(cell, interner, st, jsx, transform_features, file_name)
+            })
+            .collect();
+        let engine = Arc::clone(&self.engine);
+        let parsed_results = par_request_batched(&engine, &self.exec, requests);
+
+        // 先验证全部依赖形状，再修改持久图。失败时整个候选图被调用方丢弃并走全量扫描。
+        for (item, (_, parsed)) in items.iter().zip(&parsed_results) {
+            let old = graph.modules.get(&item.id)?;
+            if old.source_type != item.loaded.source_type
+                || !same_dependency_shape(&old.deps, &parsed.deps)
+            {
+                return None;
+            }
+        }
+
+        for (item, (parse_vc, parsed)) in items.into_iter().zip(parsed_results) {
+            let deps = parsed.deps.clone();
+            let uses = if need_uses {
+                parsed
+                    .ast
+                    .with_ast(|p| collect_static_uses(p, self.interner.as_ref()))
+            } else {
+                Vec::new()
+            };
+            let liveness = (self.cache.is_some() || self.load_cache_enabled || self.tree_shaking)
+                .then(|| {
+                    Arc::new(
+                        parsed
+                            .ast
+                            .with_ast(|p| collect_module_liveness(p, self.interner.as_ref())),
+                    )
+                });
+            let block_info = (self.cache.is_some() || self.load_cache_enabled || self.minify)
+                .then(|| parsed.ast.with_ast(concat_block_info));
+
+            self.memory_parse_vcs.insert(item.content_key, parse_vc);
+            if parsed.diagnostics.is_empty() && (self.cache.is_some() || self.load_cache_enabled) {
+                let live = liveness
+                    .as_ref()
+                    .expect("cache summary always includes liveness");
+                let block = block_info.expect("cache summary always includes concat info");
+                let summary = Arc::new(ModuleSummary {
+                    deps: deps.iter().map(parsed_dep_to_cached).collect(),
+                    uses: uses.iter().map(import_use_to_cached).collect(),
+                    has_top_level_await: parsed.has_top_level_await,
+                    liveness: runtime_liveness_to_cached(live, &self.interner),
+                    concat_is_esm: block.is_esm,
+                    concat_block_safe: block.block_safe,
+                });
+                self.memory_summaries.insert(
+                    item.content_key,
+                    MemoryScanSummary {
+                        persisted: summary.clone(),
+                        deps: deps.clone(),
+                        liveness: live.clone(),
+                        block_info: block,
+                    },
+                );
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.put_summary(item.content_key, (*summary).clone());
+                }
+            }
+
+            let rec = graph.modules.get_mut(&item.id)?;
+            rec.content_key = item.content_key;
+            rec.source_type = item.loaded.source_type;
+            rec.content_vc = item.content_vc;
+            rec.deps = deps;
+            rec.liveness = self.tree_shaking.then_some(liveness).flatten();
+            rec.block_info = self.minify.then_some(block_info).flatten();
+            rec.has_top_level_await = parsed.has_top_level_await;
+            rec.parse_vc = Some(parse_vc);
+            rec.parsed = Some(parsed);
+        }
+
+        self.topology_reuse_count.fetch_add(1, Ordering::Relaxed);
+        Some(())
+    }
+
     /// 从 `entry` 增量 + 并行打包。
     pub fn build(&mut self, entry: &Path) -> BuildOutput {
         // 首次 build 前惰性探测 Yarn PnP（从入口目录向上找 `.pnp.cjs`）。命中则 fs 变 zip 感知、
@@ -558,26 +989,70 @@ impl IncrementalBundler {
         let mut read_time = std::time::Duration::ZERO;
 
         let mut diagnostics = Vec::new();
-        let mut path_to_id: FxHashMap<PathBuf, u32> = FxHashMap::default();
-        let mut next_id: u32 = 0;
-        let mut modules: FxHashMap<u32, ModuleRec> = FxHashMap::default();
-
         let entry_norm = normalize(entry);
-        let entry_id = assign_id(&mut path_to_id, &mut next_id, entry_norm.clone());
-        let mut frontier: Vec<(u32, PathBuf)> = vec![(entry_id, entry_norm)];
 
         // uses 只进缓存摘要（Tree Shaking 的 keep 集走绑定级 liveness，不读 uses），无缓存则白算。
-        let need_uses = self.cache.is_some();
+        let need_uses = self.cache.is_some() || self.load_cache_enabled;
 
-        // 加载选项（CSS 抽取 / 资源阈值 / publicPath）+ 带外产物收集（CRUSTIFY-PARITY §M3）。
+        // 加载选项（CSS 抽取 / 资源阈值 / publicPath）+ 带外产物收集（WAKE-COMPATIBILITY §M3）。
         // Arc 包裹：每层并行读取时克隆句柄进 worker 闭包（`'static` 约束）。
         let load_opts = Arc::new(LoadOptions {
             extract_css: self.extract_css,
             asset_inline_limit: self.asset_inline_limit,
             public_path: self.public_path.clone(),
         });
+
+        let mut path_to_id: FxHashMap<PathBuf, u32> =
+            FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
+        let mut next_id: u32 = 0;
+        let mut modules: FxHashMap<u32, ModuleRec> =
+            FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
+        let entry_id = assign_id(&mut path_to_id, &mut next_id, entry_norm.clone());
+        let mut frontier: Vec<(u32, PathBuf)> = vec![(entry_id, entry_norm.clone())];
         let mut collected_assets: Vec<(String, Vec<u8>)> = Vec::new();
         let mut collected_css: Vec<(u32, String)> = Vec::new();
+
+        // 普通内容编辑：取出上一成功 generation 的图，只刷新 loader snapshot 缺失的模块。
+        // 依赖形状不变则 frontier 清空，后续直接进入 link/codegen；否则丢弃候选并走下方完整 BFS。
+        if self.load_cache_enabled
+            && !self.topology_invalidated.load(Ordering::Acquire)
+            && let Some(mut graph) = self.stable_graph.take()
+            && graph.entry == entry_norm
+            && self
+                .refresh_stable_graph(
+                    &mut graph,
+                    load_opts.clone(),
+                    need_uses,
+                    timing,
+                    &mut read_time,
+                )
+                .is_some()
+        {
+            next_id = graph.next_id;
+            modules = graph.modules;
+            frontier.clear();
+
+            // 全量扫描时带外产物在 loader 消费处收集；复用图时从仍有效的 snapshot 按稳定 id 重放。
+            let cache = self.load_cache.lock().unwrap();
+            for id in 0..next_id {
+                let Some(rec) = modules.get(&id) else {
+                    continue;
+                };
+                if let Some(parsed) = &rec.parsed {
+                    diagnostics.extend(parsed.diagnostics.iter().cloned());
+                }
+                let Some(loaded) = cache.get(&rec.path) else {
+                    continue;
+                };
+                collected_assets.extend(loaded.assets.iter().cloned());
+                if let Some(css) = &loaded.css {
+                    collected_css.push((id, css.clone()));
+                }
+            }
+        } else {
+            // 候选图不匹配/已失效时不得留到下一次 generation。
+            self.stable_graph = None;
+        }
 
         // —— 分层 BFS：每层并行 parse（命中缓存摘要的模块跳过 parse）——
         while !frontier.is_empty() {
@@ -590,20 +1065,69 @@ impl IncrementalBundler {
             // 记账（这些依赖共享可变状态，本就该串行；它们很便宜）。
             let frontier_items: Vec<(u32, PathBuf)> = std::mem::take(&mut frontier);
             let tr = timing.then(std::time::Instant::now);
-            let loaded_results: Vec<(u32, PathBuf, std::io::Result<Loaded>)> = {
-                let jobs: Vec<_> = frontier_items
+            let loaded_results: Vec<LoadedResult> = {
+                let mut slots: Vec<Option<LoadedResult>> = std::iter::repeat_with(|| None)
+                    .take(frontier_items.len())
+                    .collect();
+                let mut misses = Vec::new();
+                {
+                    let cache = self.load_cache.lock().unwrap();
+                    for (index, (id, path)) in frontier_items.into_iter().enumerate() {
+                        if self.load_cache_enabled
+                            && let Some(loaded) = cache.get(&path).cloned()
+                        {
+                            slots[index] = Some((id, path, Ok(loaded)));
+                        } else {
+                            misses.push((index, id, path));
+                        }
+                    }
+                }
+
+                // 2k 小模块场景中，逐文件提交任务的调度成本会高于读取本身。将 miss 限制为
+                // 每 worker 少量批次；批内仍逐项计数，并用原始 index 恢复确定性顺序。
+                let max_batches = self
+                    .exec
+                    .num_threads()
+                    .saturating_mul(IO_BATCHES_PER_WORKER);
+                let jobs: Vec<_> = into_bounded_batches(misses, max_batches)
                     .into_iter()
-                    .map(|(id, path)| {
+                    .map(|batch| {
                         let fs = self.fs.clone();
                         let opts = load_opts.clone();
-                        // 非 JS 资源（CSS/JSON/图片/字体）在此翻译成等价 JS 模块源码，再走统一管线（DESIGN §8）。
+                        let load_exec_count = self.load_exec_count.clone();
                         move || {
-                            let loaded = load_source(fs.as_ref(), &path, opts.as_ref());
-                            (id, path, loaded)
+                            batch
+                                .into_iter()
+                                .map(|(index, id, path)| {
+                                    load_exec_count.fetch_add(1, Ordering::Relaxed);
+                                    let loaded = load_source(fs.as_ref(), &path, opts.as_ref())
+                                        .map(Arc::new);
+                                    (index, id, path, loaded)
+                                })
+                                .collect::<Vec<_>>()
                         }
                     })
                     .collect();
-                self.exec.parallel(jobs)
+
+                // 聚合后一次持锁回填缓存，避免每个小文件各抢一次全局 mutex。
+                let batches = self.exec.parallel(jobs);
+                let mut cache = self
+                    .load_cache_enabled
+                    .then(|| self.load_cache.lock().unwrap());
+                for batch in batches {
+                    for (index, id, path, loaded) in batch {
+                        if let Some(cache) = cache.as_mut()
+                            && let Ok(value) = &loaded
+                        {
+                            cache.insert(path.clone(), value.clone());
+                        }
+                        slots[index] = Some((id, path, loaded));
+                    }
+                }
+                slots
+                    .into_iter()
+                    .map(|slot| slot.expect("every load slot is filled"))
+                    .collect()
             };
             if let Some(t) = tr {
                 read_time += t.elapsed();
@@ -612,12 +1136,11 @@ impl IncrementalBundler {
             let mut layer: Vec<LayerItem> = Vec::new();
             for (id, path, loaded) in loaded_results {
                 match loaded {
-                    Ok(Loaded {
-                        source: src,
-                        source_type: st,
-                        assets: module_assets,
-                        css,
-                    }) => {
+                    Ok(loaded) => {
+                        let src = loaded.source.as_str();
+                        let st = loaded.source_type;
+                        let module_assets = loaded.assets.clone();
+                        let css = loaded.css.clone();
                         // 带外产物：超阈值资源文件（JS import 的资源 + CSS `url()` 引出的
                         // 字体/图片）+ prod 抽取的 CSS 文本（按模块 id 记序）。
                         collected_assets.extend(module_assets);
@@ -625,13 +1148,20 @@ impl IncrementalBundler {
                             collected_css.push((id, text));
                         }
                         // content_key 仅缓存启用时需要（缓存主键）；否则跳过 xxh3。
-                        let content_key = if self.cache.is_some() {
-                            content_key_of(&src, st, self.jsx.salt())
+                        let content_key = if self.cache.is_some() || self.load_cache_enabled {
+                            content_key_of(src, st, self.jsx.salt(), self.target_fingerprint)
                         } else {
                             0
                         };
-                        let content_vc = self.content_cell(&path, &src);
-                        let cached = self.cache.as_mut().and_then(|c| c.summary(content_key));
+                        let content_vc = self.content_cell(&path, src);
+                        let disk_cached = self
+                            .cache
+                            .as_mut()
+                            .and_then(|c| c.summary(content_key))
+                            .map(Arc::new);
+                        let memory_cached = self.memory_summaries.get(&content_key).cloned();
+                        let cached = disk_cached
+                            .or_else(|| memory_cached.as_ref().map(|m| m.persisted.clone()));
                         layer.push(LayerItem {
                             id,
                             path,
@@ -639,6 +1169,12 @@ impl IncrementalBundler {
                             source_type: st,
                             content_key,
                             cached,
+                            memory_liveness: memory_cached.as_ref().map(|m| m.liveness.clone()),
+                            memory_block_info: memory_cached.map(|m| m.block_info),
+                            memory_deps: self
+                                .memory_summaries
+                                .get(&content_key)
+                                .map(|m| m.deps.clone()),
                         });
                     }
                     // `Unsupported` 是 loader 对「识别得出、但 wake 有意不支持」的文件类型
@@ -658,14 +1194,17 @@ impl IncrementalBundler {
                 break;
             }
 
-            // 2. 并行 parse 缓存未命中的模块。Tree Shaking / concat minify 还需要缓存摘要
-            // 尚未持久化的 AST 分析结果，因此即使摘要命中也必须重建分析，保证冷热产物一致。
+            // 2. 并行 parse 缓存未命中的模块。摘要持久化了链接所需的活跃性与 concat 信息，
+            // 因此 tree shaking/minify 的跨进程热构建也可跳过 AST 重建。
             let to_parse: Vec<usize> = layer
                 .iter()
                 .enumerate()
-                .filter(|(_, it)| it.cached.is_none() || self.tree_shaking || self.minify)
+                .filter(|(_, it)| it.cached.is_none())
                 .map(|(i, _)| i)
                 .collect();
+            let analyze_liveness =
+                self.cache.is_some() || self.load_cache_enabled || self.tree_shaking;
+            let analyze_block_info = self.cache.is_some() || self.load_cache_enabled || self.minify;
             let requests: Vec<_> = to_parse
                 .iter()
                 .map(|&i| {
@@ -673,27 +1212,61 @@ impl IncrementalBundler {
                     let st = layer[i].source_type;
                     let interner = self.interner.clone();
                     let jsx = self.jsx;
+                    let transform_features = self.transform_features;
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
                     let file_name: Arc<str> =
                         Arc::from(layer[i].path.to_string_lossy().replace('\\', "/").as_str());
-                    move || parse_request(cell, interner, st, jsx, file_name)
+                    move || {
+                        let (parse_vc, parsed) = parse_request(
+                            cell,
+                            interner.clone(),
+                            st,
+                            jsx,
+                            transform_features,
+                            file_name,
+                        );
+                        // 三项只读分析共享一次 AST holder 访问，并留在 parse worker 上并行执行。
+                        let (uses, liveness, block_info) = parsed.ast.with_ast(|program| {
+                            let uses = if need_uses {
+                                collect_static_uses(program, interner.as_ref())
+                            } else {
+                                Vec::new()
+                            };
+                            let liveness = analyze_liveness.then(|| {
+                                Arc::new(collect_module_liveness(program, interner.as_ref()))
+                            });
+                            let block_info = analyze_block_info.then(|| concat_block_info(program));
+                            (uses, liveness, block_info)
+                        });
+                        ParsedLayerResult {
+                            parse_vc,
+                            parsed,
+                            uses,
+                            liveness,
+                            block_info,
+                        }
+                    }
                 })
                 .collect();
             let engine = Arc::clone(&self.engine);
-            let parsed_results = engine.par_request(&self.exec, requests);
-            let mut parsed_by_idx: FxHashMap<usize, (Vc<ParsedModule>, Arc<ParsedModule>)> =
-                FxHashMap::default();
+            let parsed_results = par_request_batched(&engine, &self.exec, requests);
+            // layer 索引天然稠密，直接槽位寻址比为每个模块建立哈希表更便宜。
+            let mut parsed_by_idx: Vec<Option<ParsedLayerResult>> =
+                std::iter::repeat_with(|| None).take(layer.len()).collect();
             for (&i, res) in to_parse.iter().zip(parsed_results) {
-                parsed_by_idx.insert(i, res);
+                if self.load_cache_enabled {
+                    self.memory_parse_vcs
+                        .insert(layer[i].content_key, res.parse_vc);
+                }
+                parsed_by_idx[i] = Some(res);
             }
-
             // 3. 驱动层：取 deps（parse 或缓存）+ resolve 依赖 + 下一层（BFS 去重处理循环）。
             //
-            // 拆三步：Pass 1 串行取 deps/liveness/block_info（依赖 parsed AST 与 `&mut self` 缓存）
+            // 拆三步：Pass 1 串行取预分析结果并做缓存记账（AST 分析已随 parse 并行完成）
             // 并收集扁平 resolve 请求；Pass P 并行 resolve（FS 探测密集）；Pass 2 串行按「模块序×依赖序」
             // 消费结果做 assign_id/建图——**顺序严格复刻原单层循环**，产物逐字节不变。
 
-            // —— Pass 1：串行取 deps/liveness/block_info + 收集 resolve 请求 ——
+            // —— Pass 1：串行取预分析结果 + 缓存记账 + 收集 resolve 请求 ——
             let mut pending: Vec<PendingModule> = Vec::with_capacity(layer.len());
             let mut resolve_reqs: Vec<(String, PathBuf)> = Vec::new();
             for (i, it) in layer.into_iter().enumerate() {
@@ -704,72 +1277,133 @@ impl IncrementalBundler {
                     source_type,
                     content_key,
                     cached,
+                    memory_liveness,
+                    memory_block_info,
+                    memory_deps,
                 } = it;
-                let (deps, has_tla, parsed_opt, parse_vc_opt): ScanParsed = match cached {
+                let (
+                    deps,
+                    has_tla,
+                    parsed_opt,
+                    parse_vc_opt,
+                    cached_liveness,
+                    cached_block_info,
+                ): ScanParsed = match cached {
                     Some(sum) => {
-                        let parsed = parsed_by_idx.remove(&i);
+                        let parsed = parsed_by_idx[i]
+                            .take()
+                            .map(|result| (result.parse_vc, result.parsed));
+                        let memory_parse_vc =
+                            self.memory_parse_vcs.get(&content_key).copied();
                         if let Some((_, parsed)) = &parsed {
                             diagnostics.extend(parsed.diagnostics.iter().cloned());
                         }
+                        let liveness = self.tree_shaking.then(|| {
+                            memory_liveness.unwrap_or_else(|| {
+                                Arc::new(cached_liveness_to_runtime(
+                                    &sum.liveness,
+                                    &self.interner,
+                                ))
+                            })
+                        });
+                        let block_info = self.minify.then_some(
+                            memory_block_info.unwrap_or(ConcatBlockInfo {
+                                is_esm: sum.concat_is_esm,
+                                block_safe: sum.concat_block_safe,
+                            }),
+                        );
                         (
-                            sum.deps.iter().map(cached_dep_to_parsed).collect(),
+                            memory_deps.unwrap_or_else(|| {
+                                sum.deps.iter().map(cached_dep_to_parsed).collect()
+                            }),
                             sum.has_top_level_await,
                             parsed.as_ref().map(|(_, parsed)| Arc::clone(parsed)),
-                            parsed.map(|(parse_vc, _)| parse_vc),
+                            parsed
+                                .map(|(parse_vc, _)| parse_vc)
+                                .or(memory_parse_vc),
+                            liveness,
+                            block_info,
                         )
                     }
                     None => {
-                        let (parse_vc, parsed) =
-                            parsed_by_idx.remove(&i).expect("miss 模块应已 parse");
+                        let ParsedLayerResult {
+                            parse_vc,
+                            parsed,
+                            uses,
+                            liveness,
+                            block_info,
+                        } = parsed_by_idx[i].take().expect("miss 模块应已 parse");
                         diagnostics.extend(parsed.diagnostics.iter().cloned());
                         let deps = parsed.deps.clone();
-                        let uses = if need_uses {
-                            parsed
-                                .ast
-                                .with_ast(|p| collect_static_uses(p, self.interner.as_ref()))
-                        } else {
-                            Vec::new()
-                        };
-                        // 存缓存摘要——仅无诊断的干净模块（否则会吞掉告警）。
+                        // 存拥有型 scan 摘要——仅无诊断的干净模块（否则会吞掉告警）。
                         if parsed.diagnostics.is_empty()
-                            && let Some(c) = self.cache.as_mut()
+                            && (self.cache.is_some() || self.load_cache_enabled)
                         {
-                            c.put_summary(
+                            let live = liveness
+                                .as_ref()
+                                .expect("cache summary always includes liveness");
+                            let block =
+                                block_info.expect("cache summary always includes concat info");
+                            let summary = Arc::new(ModuleSummary {
+                                deps: deps.iter().map(parsed_dep_to_cached).collect(),
+                                uses: uses.iter().map(import_use_to_cached).collect(),
+                                has_top_level_await: parsed.has_top_level_await,
+                                liveness: runtime_liveness_to_cached(live, &self.interner),
+                                concat_is_esm: block.is_esm,
+                                concat_block_safe: block.block_safe,
+                            });
+                            self.memory_summaries.insert(
                                 content_key,
-                                ModuleSummary {
-                                    deps: deps.iter().map(parsed_dep_to_cached).collect(),
-                                    uses: uses.iter().map(import_use_to_cached).collect(),
-                                    has_top_level_await: parsed.has_top_level_await,
+                                MemoryScanSummary {
+                                    persisted: summary.clone(),
+                                    deps: deps.clone(),
+                                    liveness: live.clone(),
+                                    block_info: block,
                                 },
                             );
+                            if let Some(c) = self.cache.as_mut() {
+                                c.put_summary(content_key, (*summary).clone());
+                            }
                         }
                         let has_tla = parsed.has_top_level_await;
-                        (deps, has_tla, Some(parsed), Some(parse_vc))
+                        (
+                            deps,
+                            has_tla,
+                            Some(parsed),
+                            Some(parse_vc),
+                            self.tree_shaking.then_some(liveness).flatten(),
+                            self.minify.then_some(block_info).flatten(),
+                        )
                     }
                 };
 
                 let from_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
                 // resolve 请求按依赖序压入（Pass 2 按同序消费）。
-                for dep in &deps {
+                for dep in deps.iter() {
                     resolve_reqs.push((dep.specifier.clone(), from_dir.clone()));
                 }
                 // 绑定级活跃性（仅 tree-shaking 且本模块有新 parse 的 AST 时；缓存摘要命中 → None → 保守全保留）。
-                let liveness = if self.tree_shaking {
-                    parsed_opt.as_ref().map(|p| {
-                        p.ast
-                            .with_ast(|prog| collect_module_liveness(prog, self.interner.as_ref()))
-                    })
-                } else {
-                    None
-                };
+                let liveness = cached_liveness.or_else(|| {
+                    if self.tree_shaking {
+                        parsed_opt.as_ref().map(|p| {
+                            Arc::new(p.ast.with_ast(|prog| {
+                                collect_module_liveness(prog, self.interner.as_ref())
+                            }))
+                        })
+                    } else {
+                        None
+                    }
+                });
                 // 单包 concat 块安全（仅 minify + 有新 parse AST 时；缓存命中 → None → 保守 IIFE）。
-                let block_info = if self.minify {
-                    parsed_opt
-                        .as_ref()
-                        .map(|p| p.ast.with_ast(concat_block_info))
-                } else {
-                    None
-                };
+                let block_info = cached_block_info.or_else(|| {
+                    if self.minify {
+                        parsed_opt
+                            .as_ref()
+                            .map(|p| p.ast.with_ast(concat_block_info))
+                    } else {
+                        None
+                    }
+                });
                 pending.push(PendingModule {
                     id,
                     path,
@@ -786,25 +1420,72 @@ impl IncrementalBundler {
             }
 
             // —— Pass P：并行 resolve 全部请求（保序）。FS 探测（is_file/扩展名补全）密集，串行 ~77ms ——
-            let resolved_flat: Vec<Result<PathBuf, wake_resolver::ResolveError>> =
-                if resolve_reqs.is_empty() {
-                    Vec::new()
-                } else {
-                    let tr = timing.then(std::time::Instant::now);
-                    let jobs: Vec<_> = resolve_reqs
-                        .into_iter()
-                        .map(|(spec, dir)| {
-                            let resolver = Arc::clone(&self.resolver);
-                            move || resolver.resolve(&spec, &dir)
-                        })
-                        .collect();
-                    let out = self.exec.parallel(jobs);
-                    if let Some(t) = tr {
-                        resolve_time += t.elapsed();
+            let resolved_flat: Vec<ResolveResult> = if resolve_reqs.is_empty() {
+                Vec::new()
+            } else {
+                let tr = timing.then(std::time::Instant::now);
+                let mut slots: Vec<Option<ResolveResult>> = std::iter::repeat_with(|| None)
+                    .take(resolve_reqs.len())
+                    .collect();
+                let mut misses = Vec::new();
+                {
+                    let cache = self.resolve_edge_cache.lock().unwrap();
+                    for (index, (spec, dir)) in resolve_reqs.into_iter().enumerate() {
+                        let key = (dir.clone(), spec.clone());
+                        if self.load_cache_enabled
+                            && let Some(resolved) = cache.get(&key).cloned()
+                        {
+                            slots[index] = Some(resolved);
+                        } else {
+                            misses.push((index, spec, dir));
+                        }
                     }
-                    out
-                };
+                }
 
+                let max_batches = self
+                    .exec
+                    .num_threads()
+                    .saturating_mul(IO_BATCHES_PER_WORKER);
+                let jobs: Vec<_> = into_bounded_batches(misses, max_batches)
+                    .into_iter()
+                    .map(|batch| {
+                        let resolver = Arc::clone(&self.resolver);
+                        let resolve_exec_count = self.resolve_exec_count.clone();
+                        move || {
+                            batch
+                                .into_iter()
+                                .map(|(index, spec, dir)| {
+                                    resolve_exec_count.fetch_add(1, Ordering::Relaxed);
+                                    let resolved = resolver.resolve(&spec, &dir);
+                                    (index, (dir, spec), resolved)
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .collect();
+
+                // 同读取缓存一样聚合回填，避免每条 import 都单独竞争 edge-cache 锁。
+                let batches = self.exec.parallel(jobs);
+                let mut cache = self
+                    .load_cache_enabled
+                    .then(|| self.resolve_edge_cache.lock().unwrap());
+                for batch in batches {
+                    for (index, key, resolved) in batch {
+                        if let Some(cache) = cache.as_mut() {
+                            cache.insert(key, resolved.clone());
+                        }
+                        slots[index] = Some(resolved);
+                    }
+                }
+                let out = slots
+                    .into_iter()
+                    .map(|slot| slot.expect("every resolve slot is filled"))
+                    .collect();
+                if let Some(t) = tr {
+                    resolve_time += t.elapsed();
+                }
+                out
+            };
             // —— Pass 2：串行按「模块序×依赖序」消费 resolve 结果，assign_id + 建图 + 建 ModuleRec ——
             let mut next: Vec<(u32, PathBuf)> = Vec::new();
             let mut flat_idx = 0usize;
@@ -823,7 +1504,7 @@ impl IncrementalBundler {
                     parsed_opt,
                 } = pm;
                 let mut dep_ids: DepIds = Vec::new();
-                for dep in &deps {
+                for dep in deps.iter() {
                     let resolved = &resolved_flat[flat_idx];
                     flat_idx += 1;
                     match resolved {
@@ -873,6 +1554,7 @@ impl IncrementalBundler {
         }
 
         let t_scan = t0.elapsed();
+        let t_link_start = timing.then(std::time::Instant::now);
 
         // —— Link 阶段：Tree Shaking——算每个模块的「保留导出名」（DESIGN §5.3 / PLAN §6.6）——
         let keep = self.compute_keep_exports(&modules, entry_id, next_id);
@@ -887,9 +1569,12 @@ impl IncrementalBundler {
 
         // —— Link 阶段：顶层 await——算 async 子图（含 TLA 的模块 + 静态导入它们的模块）——
         let async_ids = async_module_ids(&modules);
+        let link_time = t_link_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let t_codegen_start = timing.then(std::time::Instant::now);
 
         // —— codegen 阶段：设 linker cell（驱动）+ 查产物缓存 + 并行 codegen 未命中者 ——
         let ordered: Vec<u32> = (0..next_id).filter(|id| modules.contains_key(id)).collect();
+        self.last_module_count = ordered.len();
 
         // CSS-in-JS 是否真的用得上：全项目无人 import `@linaria/core` 时整体跳过——
         // 既省掉静态导出求值，也让产物磁盘缓存照常命中（见下方缓存守卫），
@@ -972,14 +1657,15 @@ impl IncrementalBundler {
                     let st = rec.source_type;
                     let interner = self.interner.clone();
                     let jsx = self.jsx;
+                    let transform_features = self.transform_features;
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
                     let file_name: Arc<str> =
                         Arc::from(rec.path.to_string_lossy().replace('\\', "/").as_str());
-                    move || parse_request(cell, interner, st, jsx, file_name)
+                    move || parse_request(cell, interner, st, jsx, transform_features, file_name)
                 })
                 .collect();
             let engine = Arc::clone(&self.engine);
-            let results = engine.par_request(&self.exec, reqs);
+            let results = par_request_batched(&engine, &self.exec, reqs);
             for (&i, (pvc, parsed)) in need_parse.iter().zip(results) {
                 let rec = modules.get_mut(&plans[i].id).unwrap();
                 rec.parse_vc = Some(pvc);
@@ -1051,7 +1737,7 @@ impl IncrementalBundler {
             })
             .collect();
         let engine = Arc::clone(&self.engine);
-        let miss_bodies = engine.par_request(&self.exec, requests);
+        let miss_bodies = par_request_batched(&engine, &self.exec, requests);
 
         // 3d. 新算的 body 写回缓存；汇总所有 body（命中 + 新算），按 `ordered` 出序。
         let mut body_of: FxHashMap<u32, Arc<String>> = FxHashMap::default();
@@ -1095,19 +1781,8 @@ impl IncrementalBundler {
         };
         // 存活模块 id（升序，= 过滤后的 `ordered`）——供 module_count 与单包 module_ids。
         let live_ids: Vec<u32> = bodies.iter().map(|(id, _)| *id).collect();
-
-        if timing {
-            let t_cg = t0.elapsed();
-            eprintln!(
-                "[wake-timing] 模块={} | scan(parse+resolve)={:.1?} 其中 read={:.1?} resolve={:.1?} | link+codegen={:.1?} | 总={:.1?}",
-                ordered.len(),
-                t_scan,
-                read_time,
-                resolve_time,
-                t_cg - t_scan,
-                t_cg,
-            );
-        }
+        let codegen_time = t_codegen_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let t_emit_start = timing.then(std::time::Instant::now);
 
         // —— Emit：双路（无 async chunk → 旧单包，逐字节不变；有 → 多 chunk 全局 registry）——
         // 模块 id / 数量用 `live_ids`（DME 后；未启用 DME 时 = 全量 `ordered`）。
@@ -1232,6 +1907,34 @@ impl IncrementalBundler {
             let _ = cache.store(path);
         }
 
+        if timing {
+            let total = t0.elapsed();
+            let emit_time = t_emit_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+            eprintln!(
+                "[wake-timing] 模块={} | scan={:.1?} (read={:.1?} resolve={:.1?}) | link={:.1?} | codegen={:.1?} | emit={:.1?} | 总={:.1?}",
+                ordered.len(),
+                t_scan,
+                read_time,
+                resolve_time,
+                link_time,
+                codegen_time,
+                emit_time,
+                total,
+            );
+        }
+
+        if output.has_errors() || !self.load_cache_enabled {
+            self.stable_graph = None;
+            self.topology_invalidated.store(true, Ordering::Release);
+        } else {
+            self.stable_graph = Some(StableModuleGraph {
+                entry: entry_norm,
+                next_id,
+                modules,
+            });
+            self.topology_invalidated.store(false, Ordering::Release);
+        }
+
         output
     }
 
@@ -1305,7 +2008,7 @@ impl IncrementalBundler {
         // 有绑定分析的模块（prod 冷构建通常全覆盖）。
         let live_mods: FxHashMap<u32, &ModuleLiveness> = modules
             .iter()
-            .filter_map(|(&id, rec)| rec.liveness.as_ref().map(|l| (id, l)))
+            .filter_map(|(&id, rec)| rec.liveness.as_ref().map(|l| (id, l.as_ref())))
             .collect();
 
         // force_all：① 动态 import / require 目标（不可 shake）；② **缺绑定分析**的模块（缓存摘要命中）
@@ -1316,7 +2019,7 @@ impl IncrementalBundler {
             if !has_live {
                 force_all.insert(id);
             }
-            for dep in &rec.deps {
+            for dep in rec.deps.iter() {
                 let dyn_or_req = matches!(
                     dep.kind,
                     DependencyKind::DynamicImport | DependencyKind::Require
@@ -1412,7 +2115,7 @@ struct CgPlan {
 }
 
 /// 内容键：`hash(源类型 ‖ 源文本)`。源类型作 seed——同字节不同源类型（.ts vs .js）解析不同，须区分。
-fn content_key_of(src: &str, st: SourceType, jsx_salt: u64) -> u64 {
+fn content_key_of(src: &str, st: SourceType, jsx_salt: u64, target_fingerprint: u64) -> u64 {
     let seed = match st {
         SourceType::Module => 1,
         SourceType::Script => 2,
@@ -1422,7 +2125,7 @@ fn content_key_of(src: &str, st: SourceType, jsx_salt: u64) -> u64 {
     };
     // JSX 口径改变解析产出的依赖（`react/jsx-runtime` ↔ `react/jsx-dev-runtime`），
     // 必须参与主键，否则跨 dev/prod 复用摘要会带错依赖。
-    xxh3_64_with_seed(src.as_bytes(), seed ^ jsx_salt)
+    xxh3_64_with_seed(src.as_bytes(), seed ^ jsx_salt ^ target_fingerprint)
 }
 
 /// JSX 运行时口径（随 bundler 恒定，传入 parse 任务）。
@@ -1529,20 +2232,117 @@ fn import_use_to_cached(u: &(String, ImportUse)) -> CachedUse {
         },
     }
 }
+
+fn runtime_liveness_to_cached(l: &ModuleLiveness, interner: &Interner) -> CachedLiveness {
+    let resolve = |atom| interner.resolve(atom);
+    let sorted_refs = |refs: &FxHashSet<_>| {
+        let mut values: Vec<String> = refs.iter().map(|&atom| resolve(atom)).collect();
+        values.sort();
+        values
+    };
+    CachedLiveness {
+        decls: l
+            .decls
+            .iter()
+            .map(|(name, refs)| (resolve(*name), sorted_refs(refs)))
+            .collect(),
+        root_refs: sorted_refs(&l.root_refs),
+        named_imports: l
+            .named_imports
+            .iter()
+            .map(|import| CachedNamedImport {
+                local: resolve(import.local),
+                spec: import.spec.clone(),
+                imported: resolve(import.imported),
+            })
+            .collect(),
+        namespace_imports: l
+            .namespace_imports
+            .iter()
+            .map(|(local, spec)| (resolve(*local), spec.clone()))
+            .collect(),
+        reexport_star: l.reexport_star.clone(),
+        ns_reexports: l
+            .ns_reexports
+            .iter()
+            .map(|(name, spec)| (resolve(*name), spec.clone()))
+            .collect(),
+        reexport_named: l
+            .reexport_named
+            .iter()
+            .map(|(name, spec, imported)| (resolve(*name), spec.clone(), resolve(*imported)))
+            .collect(),
+        exports: l
+            .exports
+            .iter()
+            .map(|(name, local)| (resolve(*name), local.map(resolve)))
+            .collect(),
+    }
+}
+
+fn cached_liveness_to_runtime(l: &CachedLiveness, interner: &Interner) -> ModuleLiveness {
+    let intern = |name: &str| interner.intern(name);
+    ModuleLiveness {
+        decls: l
+            .decls
+            .iter()
+            .map(|(name, refs)| (intern(name), refs.iter().map(|name| intern(name)).collect()))
+            .collect(),
+        root_refs: l.root_refs.iter().map(|name| intern(name)).collect(),
+        named_imports: l
+            .named_imports
+            .iter()
+            .map(|import| NamedImport {
+                local: intern(&import.local),
+                spec: import.spec.clone(),
+                imported: intern(&import.imported),
+            })
+            .collect(),
+        namespace_imports: l
+            .namespace_imports
+            .iter()
+            .map(|(local, spec)| (intern(local), spec.clone()))
+            .collect(),
+        reexport_star: l.reexport_star.clone(),
+        ns_reexports: l
+            .ns_reexports
+            .iter()
+            .map(|(name, spec)| (intern(name), spec.clone()))
+            .collect(),
+        reexport_named: l
+            .reexport_named
+            .iter()
+            .map(|(name, spec, imported)| (intern(name), spec.clone(), intern(imported)))
+            .collect(),
+        exports: l
+            .exports
+            .iter()
+            .map(|(name, local)| (intern(name), local.as_deref().map(intern)))
+            .collect(),
+    }
+}
+
 /// parse 请求（在 worker 线程的 `enter` 上下文内执行）：登记 parse 任务、返回句柄 + 结果。
 fn parse_request(
     cell: Vc<Content>,
     interner: Arc<Interner>,
     source_type: SourceType,
     jsx: JsxRuntimeOptions,
+    transform_features: FeatureSet,
     file_name: Arc<str>,
 ) -> (Vc<ParsedModule>, Arc<ParsedModule>) {
-    // JSX 口径在同一 bundler 内恒定（同 define/minify/mangle 的处理），故不入 TaskId；
-    // **但必须入 `content_key`**——它改变解析出的依赖说明符（`jsx-runtime` ↔ `jsx-dev-runtime`），
-    // 否则 prod 构建落盘的模块摘要会在 dev 构建里被复用、带出错误依赖。
+    // Target/JSX changes rebuild the in-memory parse graph in their setters. JSX and target
+    // fingerprints also enter `content_key`, preventing cross-configuration disk-cache reuse.
     let id = TaskId::of("wake_bundler", "parse", &[cell.arg_ref()]);
     let vc = query(id, move || {
-        parse_module(cell, &interner, source_type, jsx, file_name.clone())
+        parse_module(
+            cell,
+            &interner,
+            source_type,
+            jsx,
+            transform_features,
+            file_name.clone(),
+        )
     });
     let arc = vc.read();
     (vc, arc)
@@ -1612,7 +2412,7 @@ fn collect_export_var_pairs(program: &Program, interner: &Interner) -> Vec<(Stri
     pairs
 }
 
-/// codegen 任务产物：模块体 + 可选的 SourceMap 映射（CRUSTIFY-PARITY §M4d）。
+/// codegen 任务产物：模块体 + 可选的 SourceMap 映射（WAKE-COMPATIBILITY §M4d）。
 ///
 /// `code` 用 `Arc<String>` 内嵌（而非裸 `String`），使下游 `bodies` 与产物磁盘缓存得以
 /// 沿用 `Arc<String>` 类型、取出时只做引用计数自增，接入 sourcemap 无需改动既有拼接与缓存路径。
@@ -1916,6 +2716,7 @@ fn parse_module(
     interner: &Interner,
     source_type: SourceType,
     jsx: JsxRuntimeOptions,
+    transform_features: FeatureSet,
     file_name: Arc<str>,
 ) -> ParsedModule {
     let src = cell.read(); // Arc<Content>；读取即登记对内容 cell 的依赖
@@ -1928,6 +2729,7 @@ fn parse_module(
             jsx_import_source: jsx.import_source,
             jsx_dev: jsx.dev,
             file_name: &file_name,
+            transform_features,
         },
     );
     let source: Arc<str> = (*src).clone();
@@ -2931,7 +3733,7 @@ fn async_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
     for (&id, rec) in modules {
         let spec2id: FxHashMap<&str, u32> =
             rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
-        for dep in &rec.deps {
+        for dep in rec.deps.iter() {
             if !matches!(
                 dep.kind,
                 DependencyKind::Import | DependencyKind::ExportFrom
@@ -2971,7 +3773,7 @@ fn build_module_edges(modules: &FxHashMap<u32, ModuleRec>) -> FxHashMap<u32, Mod
             rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
         let mut st = Vec::new();
         let mut dy = Vec::new();
-        for dep in &rec.deps {
+        for dep in rec.deps.iter() {
             if let Some(&tid) = spec2id.get(dep.specifier.as_str()) {
                 if dep.kind == DependencyKind::DynamicImport {
                     dy.push(tid);

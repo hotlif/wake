@@ -50,7 +50,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             TokenKind::Keyword(Keyword::Class) => Statement::ClassDeclaration(self.parse_class(lo)),
             TokenKind::Keyword(Keyword::If) => self.parse_if(lo),
-            TokenKind::Keyword(Keyword::For) => self.parse_for(lo),
+            TokenKind::Keyword(Keyword::For) => self.parse_for(lo, &[]),
             TokenKind::Keyword(Keyword::While) => self.parse_while(lo),
             TokenKind::Keyword(Keyword::Do) => self.parse_do_while(lo),
             TokenKind::Keyword(Keyword::Switch) => self.parse_switch(lo),
@@ -117,18 +117,55 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }
                 // 标签语句：ident `:`。
                 if self.at_ident_name() && self.peek().kind == TokenKind::Colon {
-                    let label = self.parse_ident_name();
-                    self.bump(); // :
-                    let body = self.parse_statement();
-                    return Statement::Labeled(self.alloc(LabeledStatement {
-                        span: self.span_to(lo),
-                        label,
-                        body,
-                    }));
+                    return self.parse_labeled_statement(lo);
                 }
                 self.parse_expression_statement(lo)
             }
         }
+    }
+
+    /// Parse a complete contiguous label chain in one step. If it directly targets a `for`
+    /// statement, pass the labels into `parse_for`: synchronous for-of lowering must relocate
+    /// them onto its generated inner loop so `continue label` stays valid. Other statements keep
+    /// the ordinary outer wrappers.
+    fn parse_labeled_statement(&mut self, lo: u32) -> Statement<'a> {
+        let mut labels = Vec::new();
+        loop {
+            labels.push(self.parse_ident_name());
+            self.expect(TokenKind::Colon);
+            if !(self.at_ident_name() && self.peek().kind == TokenKind::Colon) {
+                break;
+            }
+        }
+
+        if self.at_keyword(Keyword::For) {
+            let for_lo = self.start();
+            return self.parse_for(for_lo, &labels);
+        }
+
+        let body = self.parse_statement();
+        self.wrap_statement_labels(body, &labels, lo)
+    }
+
+    fn wrap_statement_labels(
+        &self,
+        mut body: Statement<'a>,
+        labels: &[Ident],
+        fallback_lo: u32,
+    ) -> Statement<'a> {
+        for label in labels.iter().rev() {
+            let lo = if label.span.is_dummy() {
+                fallback_lo
+            } else {
+                label.span.lo
+            };
+            body = Statement::Labeled(self.alloc(LabeledStatement {
+                span: Span::new(lo, body.span().hi),
+                label: *label,
+                body,
+            }));
+        }
+        body
     }
 
     /// `let` 是否作为声明起始（后跟 `[`/`{`/标识符名）。
@@ -257,11 +294,40 @@ impl<'a, 'src> Parser<'a, 'src> {
             } else {
                 None
             };
-            declarations.push(VariableDeclarator {
+            let declarator = VariableDeclarator {
                 span: self.span_to(dlo),
                 id,
                 init,
-            });
+            };
+            if wake_ecma_transform::binding_pattern_needs_lowering(
+                self.options.transform_features,
+                id,
+            ) && init.is_some()
+            {
+                let iterator_helper = self.spread_helper_atom();
+                let object_helper = if wake_ecma_transform::pattern_has_object_rest(id) {
+                    self.object_spread_helper_atom()
+                } else {
+                    iterator_helper
+                };
+                let temporary_count =
+                    wake_ecma_transform::destructuring_temporary_count(declarator.id);
+                let temporaries = (0..temporary_count)
+                    .map(|_| self.fresh_transform_atom())
+                    .collect::<Vec<_>>();
+                declarations.extend(wake_ecma_transform::lower_variable_destructuring(
+                    self.arena,
+                    self.interner,
+                    iterator_helper,
+                    object_helper,
+                    self.options.transform_features,
+                    kind,
+                    declarator,
+                    &temporaries,
+                ));
+            } else {
+                declarations.push(declarator);
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -378,7 +444,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         }))
     }
 
-    fn parse_for(&mut self, lo: u32) -> Statement<'a> {
+    fn parse_for(&mut self, lo: u32, labels: &[Ident]) -> Statement<'a> {
         self.bump(); // for
         let is_await = self.eat_keyword(Keyword::Await);
         if is_await && self.ctx.top_level {
@@ -394,7 +460,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             let decl = self.with_allow_in(false, |p| p.parse_var_declaration_no_semi(kind));
             Some(ForInit::Variable(decl))
         } else {
+            let previous_for_head = self.in_for_head_init;
+            self.in_for_head_init = true;
             let expr = self.with_allow_in(false, |p| p.parse_expression());
+            self.in_for_head_init = previous_for_head;
             Some(ForInit::Expression(expr))
         };
 
@@ -417,21 +486,56 @@ impl<'a, 'src> Parser<'a, 'src> {
             };
             self.expect(TokenKind::RParen);
             let body = self.parse_statement();
+            let tdz_pattern = match left {
+                ForLeft::Variable(declaration)
+                    if matches!(declaration.kind, VarKind::Let | VarKind::Const)
+                        && declaration.declarations.len() == 1
+                        && declaration.declarations[0].init.is_none() =>
+                {
+                    Some(declaration.declarations[0].id)
+                }
+                _ => None,
+            };
+            let (left, body) = self.lower_for_destructuring(left, body);
             return if is_of {
-                Statement::ForOf(self.alloc(ForOfStatement {
+                let statement = self.alloc(ForOfStatement {
                     span: self.span_to(lo),
                     left,
                     right,
                     body,
                     is_await,
-                }))
+                });
+                if wake_ecma_transform::for_of_needs_lowering(
+                    self.options.transform_features,
+                    statement,
+                ) {
+                    let helper = self.for_of_helper_atom();
+                    let state = self.fresh_transform_atom();
+                    let error = self.fresh_transform_atom();
+                    let tdz_label = self.fresh_transform_atom();
+                    wake_ecma_transform::lower_for_of(
+                        self.arena,
+                        self.interner,
+                        helper,
+                        state,
+                        error,
+                        tdz_label,
+                        self.options.transform_features,
+                        labels,
+                        tdz_pattern,
+                        statement,
+                    )
+                } else {
+                    self.wrap_statement_labels(Statement::ForOf(statement), labels, lo)
+                }
             } else {
-                Statement::ForIn(self.alloc(ForInStatement {
+                let statement = Statement::ForIn(self.alloc(ForInStatement {
                     span: self.span_to(lo),
                     left,
                     right,
                     body,
-                }))
+                }));
+                self.wrap_statement_labels(statement, labels, lo)
             };
         }
 
@@ -450,13 +554,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         self.expect(TokenKind::RParen);
         let body = self.parse_statement();
-        Statement::For(self.alloc(ForStatement {
+        let statement = Statement::For(self.alloc(ForStatement {
             span: self.span_to(lo),
             init,
             test,
             update,
             body,
-        }))
+        }));
+        self.wrap_statement_labels(statement, labels, lo)
     }
 
     fn var_kind_here(&self) -> Option<VarKind> {
@@ -486,6 +591,172 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     fn parse_var_declaration_no_semi(&mut self, kind: VarKind) -> &'a VariableDeclaration<'a> {
         self.parse_var_declaration(kind, false)
+    }
+
+    /// Lower declaration and assignment-pattern `for-in` / `for-of` heads to a collision-free
+    /// value binding, then initialize the original bindings/targets at the start of each iteration.
+    ///
+    /// Keep an existing block body as a nested block. The loop-head pattern is initialized before
+    /// the body's lexical environment exists; flattening the generated declaration into that body
+    /// would make defaults incorrectly observe body-local `let` / `const` bindings in their TDZ.
+    fn lower_for_destructuring(
+        &mut self,
+        left: ForLeft<'a>,
+        body: Statement<'a>,
+    ) -> (ForLeft<'a>, Statement<'a>) {
+        match left {
+            ForLeft::Variable(declaration) => {
+                self.lower_for_declaration_destructuring(declaration, body)
+            }
+            ForLeft::Target(target) => self.lower_for_target_destructuring(target, body),
+        }
+    }
+
+    fn lower_for_declaration_destructuring(
+        &mut self,
+        declaration: &'a VariableDeclaration<'a>,
+        body: Statement<'a>,
+    ) -> (ForLeft<'a>, Statement<'a>) {
+        let original_left = ForLeft::Variable(declaration);
+        if declaration.kind.is_using() || declaration.declarations.len() != 1 {
+            return (original_left, body);
+        }
+        let declarator = &declaration.declarations[0];
+        if !wake_ecma_transform::binding_pattern_needs_lowering(
+            self.options.transform_features,
+            declarator.id,
+        ) || declarator.init.is_some()
+        {
+            return (original_left, body);
+        }
+
+        let value_atom = self.fresh_transform_atom();
+        let value_ident = self.alloc(Ident::new(declarator.id.span(), value_atom));
+        let head_declarator = VariableDeclarator {
+            span: declarator.span,
+            id: Pattern::Ident(value_ident),
+            init: None,
+        };
+        let mut head_declarations = self.new_vec::<VariableDeclarator>();
+        head_declarations.push(head_declarator);
+        let head = self.alloc(VariableDeclaration {
+            span: declaration.span,
+            kind: declaration.kind,
+            declarations: head_declarations,
+        });
+
+        let initialization = self.lower_destructuring_binding_declaration(
+            declaration.kind,
+            declarator.id,
+            Expression::Identifier(value_ident),
+        );
+        let mut statements = self.new_vec::<Statement>();
+        statements.push(Statement::VariableDeclaration(initialization));
+        statements.push(body);
+        let body = Statement::Block(self.alloc(BlockStatement {
+            span: body.span(),
+            body: statements,
+        }));
+        (ForLeft::Variable(head), body)
+    }
+
+    /// Lower an assignment-pattern loop head (`for ([a, ...rest] of values)`) through the same
+    /// assignment transform used outside loops. A fresh `var` receives each iteration value; the
+    /// generated assignment runs before the untouched source body in a separate outer block.
+    ///
+    /// If assignment lowering conservatively declines (for example an `await` default moved into
+    /// a synchronous IIFE), keep the original head and body together.
+    fn lower_for_target_destructuring(
+        &mut self,
+        target: Expression<'a>,
+        body: Statement<'a>,
+    ) -> (ForLeft<'a>, Statement<'a>) {
+        let original_left = ForLeft::Target(target);
+        if !wake_ecma_transform::destructuring_assignment_needs_lowering(
+            self.options.transform_features,
+            target,
+        ) {
+            return (original_left, body);
+        }
+
+        let value_atom = self.fresh_transform_atom();
+        let value_ident = self.alloc(Ident::new(target.span(), value_atom));
+        let initialization = self.lower_destructuring_assignment_expression(
+            target.span(),
+            target,
+            Expression::Identifier(value_ident),
+        );
+        if matches!(
+            initialization,
+            Expression::Assignment(assignment)
+                if assignment.operator == AssignmentOperator::Assign
+                    && wake_ecma_transform::is_destructuring_assignment_target(assignment.left)
+        ) {
+            return (original_left, body);
+        }
+
+        let mut head_declarations = self.new_vec::<VariableDeclarator>();
+        head_declarations.push(VariableDeclarator {
+            span: target.span(),
+            id: Pattern::Ident(value_ident),
+            init: None,
+        });
+        let head = self.alloc(VariableDeclaration {
+            span: target.span(),
+            kind: VarKind::Var,
+            declarations: head_declarations,
+        });
+
+        let initialization = Statement::Expression(self.alloc(ExpressionStatement {
+            span: target.span(),
+            expression: initialization,
+        }));
+        let mut statements = self.new_vec::<Statement>();
+        statements.push(initialization);
+        statements.push(body);
+        let body = Statement::Block(self.alloc(BlockStatement {
+            span: body.span(),
+            body: statements,
+        }));
+        (ForLeft::Variable(head), body)
+    }
+
+    fn lower_destructuring_binding_declaration(
+        &mut self,
+        kind: VarKind,
+        pattern: Pattern<'a>,
+        value: Expression<'a>,
+    ) -> &'a VariableDeclaration<'a> {
+        let iterator_helper = self.spread_helper_atom();
+        let object_helper = if wake_ecma_transform::pattern_has_object_rest(pattern) {
+            self.object_spread_helper_atom()
+        } else {
+            iterator_helper
+        };
+        let temporary_count = wake_ecma_transform::destructuring_temporary_count(pattern);
+        let temporaries = (0..temporary_count)
+            .map(|_| self.fresh_transform_atom())
+            .collect::<Vec<_>>();
+        let declarator = VariableDeclarator {
+            span: pattern.span(),
+            id: pattern,
+            init: Some(value),
+        };
+        let declarations = wake_ecma_transform::lower_variable_destructuring(
+            self.arena,
+            self.interner,
+            iterator_helper,
+            object_helper,
+            self.options.transform_features,
+            kind,
+            declarator,
+            &temporaries,
+        );
+        self.alloc(VariableDeclaration {
+            span: pattern.span(),
+            kind,
+            declarations,
+        })
     }
 
     fn parse_switch(&mut self, lo: u32) -> Statement<'a> {
@@ -582,7 +853,36 @@ impl<'a, 'src> Parser<'a, 'src> {
             } else {
                 None
             };
+            let param = if param.is_none()
+                && self
+                    .options
+                    .transform_features
+                    .contains(wake_ecma_transform::EcmaFeature::OptionalCatchBinding)
+            {
+                let temp = self.fresh_transform_atom();
+                wake_ecma_transform::lower_optional_catch_binding(
+                    self.arena,
+                    temp,
+                    self.options.transform_features,
+                    param,
+                    self.span_to(clo),
+                )
+            } else {
+                param
+            };
             let body = self.parse_block();
+            let (param, body) = match param {
+                Some(pattern)
+                    if wake_ecma_transform::binding_pattern_needs_lowering(
+                        self.options.transform_features,
+                        pattern,
+                    ) =>
+                {
+                    let (pattern, body) = self.lower_catch_destructuring(pattern, body);
+                    (Some(pattern), body)
+                }
+                _ => (param, body),
+            };
             Some(self.alloc(CatchClause {
                 span: self.span_to(clo),
                 param,
@@ -605,6 +905,30 @@ impl<'a, 'src> Parser<'a, 'src> {
             handler,
             finalizer,
         }))
+    }
+
+    /// Catch-pattern bindings live outside the catch body lexical environment. Preserve that
+    /// separation by keeping the original body as a nested block after the generated initializer.
+    fn lower_catch_destructuring(
+        &mut self,
+        pattern: Pattern<'a>,
+        body: &'a BlockStatement<'a>,
+    ) -> (Pattern<'a>, &'a BlockStatement<'a>) {
+        let value_atom = self.fresh_transform_atom();
+        let value_ident = self.alloc(Ident::new(pattern.span(), value_atom));
+        let initialization = self.lower_destructuring_binding_declaration(
+            VarKind::Let,
+            pattern,
+            Expression::Identifier(value_ident),
+        );
+        let mut statements = self.new_vec::<Statement>();
+        statements.push(Statement::VariableDeclaration(initialization));
+        statements.push(Statement::Block(body));
+        let lowered_body = self.alloc(BlockStatement {
+            span: body.span,
+            body: statements,
+        });
+        (Pattern::Ident(value_ident), lowered_body)
     }
 
     fn parse_with(&mut self, lo: u32) -> Statement<'a> {
@@ -643,21 +967,24 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.ctx.in_async = is_async;
         self.ctx.in_generator = is_generator;
         self.ctx.top_level = false;
+        self.push_transform_temp_scope(false);
         let params = self.parse_params();
         self.ts_type_annotation(); // 返回类型 `): T {`（类型文法遇 `{` 自然停）
+        let _ = self.pop_transform_temp_scope();
         let body = self.parse_function_body();
         self.ctx.in_async = saved.0;
         self.ctx.in_generator = saved.1;
         self.ctx.top_level = saved.2;
 
-        self.alloc(Function {
+        let function = self.alloc(Function {
             span: self.span_to(lo),
             id,
             params,
             body: Some(body),
             is_async,
             is_generator,
-        })
+        });
+        self.lower_parsed_function_parameters(function)
     }
 
     pub(crate) fn parse_method_function(
@@ -671,8 +998,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.ctx.in_async = is_async;
         self.ctx.in_generator = is_generator;
         self.ctx.top_level = false;
+        self.push_transform_temp_scope(false);
         let (params, param_props) = self.parse_params_collecting();
         self.ts_type_annotation(); // 方法返回类型（含类型谓词）
+        let _ = self.pop_transform_temp_scope();
         // 无函数体 → 重载签名 / abstract / declare 方法：body 置 None，供 class 层擦除。
         let body = if self.at(TokenKind::LBrace) {
             let b = self.parse_function_body();
@@ -689,14 +1018,78 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.ctx.in_async = saved.0;
         self.ctx.in_generator = saved.1;
         self.ctx.top_level = saved.2;
-        self.alloc(Function {
+        let function = self.alloc(Function {
             span: self.span_to(lo),
             id: None,
             params,
             body,
             is_async,
             is_generator,
-        })
+        });
+        self.lower_parsed_function_parameters(function)
+    }
+
+    fn lower_parsed_function_parameters(&mut self, function: &'a Function<'a>) -> &'a Function<'a> {
+        let temporary_count = wake_ecma_transform::complex_parameter_temporary_count_for_features(
+            self.options.transform_features,
+            &function.params,
+        );
+        let needs_binding_lowering = function.params.iter().copied().any(|param| {
+            wake_ecma_transform::binding_pattern_needs_lowering(
+                self.options.transform_features,
+                param,
+            )
+        });
+        let needs_parameter_lowering = self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::FunctionParameters)
+            || needs_binding_lowering;
+        if !needs_parameter_lowering {
+            return function;
+        }
+        if function.body.is_some_and(|body| {
+            wake_ecma_transform::parameter_lowering_has_body_binding_conflict(
+                self.options.transform_features,
+                &function.params,
+                body,
+            )
+        }) {
+            // Source parameter expressions execute outside the body lexical/variable
+            // environments. Preserve the whole list when moving one would capture a body
+            // declaration; importantly, do this before allocating any lowering helper/temp.
+            return function;
+        }
+        let iterator_helper = if wake_ecma_transform::complex_parameters_need_iterator_helper(
+            self.options.transform_features,
+            &function.params,
+        ) {
+            self.spread_helper_atom()
+        } else {
+            self.interner.intern("__wake_unused_iterator_helper")
+        };
+        let object_helper = if function
+            .params
+            .iter()
+            .copied()
+            .any(wake_ecma_transform::pattern_has_object_rest)
+        {
+            self.object_spread_helper_atom()
+        } else {
+            iterator_helper
+        };
+        let temporaries = (0..temporary_count)
+            .map(|_| self.fresh_transform_atom())
+            .collect::<Vec<_>>();
+        wake_ecma_transform::lower_complex_parameters(
+            self.arena,
+            self.interner,
+            iterator_helper,
+            object_helper,
+            self.options.transform_features,
+            function,
+            &temporaries,
+        )
     }
 
     /// 在函数体的 `super(...)` 之后（无则体首）注入参数属性赋值 `this.name = name`。
@@ -823,7 +1216,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     pub(crate) fn parse_function_body(&mut self) -> &'a FunctionBody<'a> {
+        self.parse_function_body_with_transform_temps(true)
+    }
+
+    pub(crate) fn parse_function_body_with_transform_temps(
+        &mut self,
+        enable_transform_temps: bool,
+    ) -> &'a FunctionBody<'a> {
         let lo = self.start();
+        // Once a function/method/arrow body starts, an enclosing parenthesized cover no longer
+        // makes expressions inside this independent scope ambiguous arrow parameters. Restore the
+        // outer flag after the body so the containing cover can still finish conservatively.
+        let previous_cover = self.in_cover_paren;
+        self.in_cover_paren = false;
+        self.push_transform_temp_scope(enable_transform_temps);
         self.expect(TokenKind::LBrace);
         let mut statements = self.new_vec::<Statement>();
         let strict = self.parse_directive_prologue(&mut statements);
@@ -841,6 +1247,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.expect(TokenKind::RBrace);
         self.ctx.strict = saved_strict;
+        let transform_temps = self.pop_transform_temp_scope();
+        self.in_cover_paren = previous_cover;
+        let statements = self.inject_transform_temp_declaration(statements, &transform_temps);
         self.alloc(FunctionBody {
             span: self.span_to(lo),
             statements,
@@ -889,6 +1298,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect(TokenKind::LBrace);
         let saved_strict = self.ctx.strict;
         self.ctx.strict = true; // 类体恒严格。
+        self.push_transform_temp_scope(false);
         let mut body = self.new_vec::<ClassMember>();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             if self.eat(TokenKind::Semicolon) {
@@ -903,6 +1313,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.bump();
             }
         }
+        let _ = self.pop_transform_temp_scope();
         self.expect(TokenKind::RBrace);
         self.ctx.strict = saved_strict;
         self.alloc(Class {

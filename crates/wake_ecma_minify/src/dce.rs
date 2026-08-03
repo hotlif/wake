@@ -13,7 +13,7 @@
 
 use wake_common::{FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
-use wake_ecma_parser::analyze;
+use wake_ecma_semantic::analyze;
 
 use crate::const_eval::has_hoisted_decl;
 use crate::purity::call_is_pure;
@@ -65,6 +65,15 @@ struct DceAnalyzer<'a> {
 }
 
 impl DceAnalyzer<'_> {
+    fn mark_removed(&mut self, span: Span) {
+        // DUMMY is shared by every synthetic statement. Besides being unusable as a codegen
+        // removal key, admitting it here would make downstream variable analysis ignore every
+        // synthetic reference enclosed by any DUMMY statement (including live transform writes).
+        if !span.is_dummy() {
+            self.remove_spans.insert(span);
+        }
+    }
+
     /// Analyze a sequence of statements (block body) sequentially.
     fn analyze_seq(&mut self, stmts: &[Statement]) {
         let mut unreachable = false;
@@ -73,7 +82,7 @@ impl DceAnalyzer<'_> {
                 if has_hoisted_decl(stmt) {
                     // Hoisted declarations are preserved but we still recurse.
                 } else {
-                    self.remove_spans.insert(stmt.span());
+                    self.mark_removed(stmt.span());
                 }
                 // Always recurse in case there are nested function bodies.
                 self.analyze_single(stmt);
@@ -83,13 +92,13 @@ impl DceAnalyzer<'_> {
             // Check for individually removable statements.
             match stmt {
                 Statement::Empty(span) => {
-                    self.remove_spans.insert(*span);
+                    self.mark_removed(*span);
                 }
                 Statement::Debugger(span) if self.drop_debugger => {
-                    self.remove_spans.insert(*span);
+                    self.mark_removed(*span);
                 }
                 Statement::Expression(es) if self.is_removable_expr_stmt(&es.expression) => {
-                    self.remove_spans.insert(es.span);
+                    self.mark_removed(es.span);
                 }
                 Statement::Return(_)
                 | Statement::Throw(_)

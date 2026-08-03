@@ -438,6 +438,7 @@ impl<'a> Visit<'a> for PropCollector<'a> {
                             if !p.computed
                                 && !p.method
                                 && !p.shorthand
+                                && !p.prototype_setter
                                 && p.kind == PropertyKind::Init
                                 && let PropertyKey::Ident(id) = &p.key
                                 && !self.should_skip(id.name, false)

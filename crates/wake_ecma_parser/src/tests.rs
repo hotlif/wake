@@ -3,7 +3,7 @@
 use wake_common::Interner;
 use wake_ecma_ast::*;
 
-use crate::parse;
+use crate::{ParseOptions, parse, parse_with};
 
 /// 无诊断地解析并对根 AST 运行断言。
 fn with_program(src: &str, f: impl FnOnce(&Program<'_>)) {
@@ -62,6 +62,107 @@ fn arrow_functions() {
 }
 
 #[test]
+fn parenthesized_concise_arrow_owns_transform_temps_but_its_parameters_do_not() {
+    let interner = Interner::new();
+    let mut transform_features = wake_ecma_transform::FeatureSet::default();
+    transform_features.insert(wake_ecma_transform::EcmaFeature::ArrowFunction);
+    transform_features.insert(wake_ecma_transform::EcmaFeature::NullishCoalescing);
+    let out = parse_with(
+        "const nested = ((value) => read(value) ?? 'fallback');\
+         const parameter = ((value = read(null) ?? 'parameter') => value);",
+        &interner,
+        SourceType::Module,
+        ParseOptions {
+            transform_features,
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.module.with_ast(|program| {
+        let Statement::VariableDeclaration(nested_declaration) = program.body[0] else {
+            panic!("expected nested arrow declaration")
+        };
+        let Expression::Function(nested_function) = nested_declaration.declarations[0]
+            .init
+            .expect("nested arrow initializer")
+        else {
+            panic!("expected the nested arrow to lower to a function")
+        };
+        let nested_body = nested_function.body.expect("lowered arrow body");
+        assert!(
+            matches!(
+                nested_body.statements[0],
+                Statement::VariableDeclaration(declaration) if declaration.kind == VarKind::Var
+            ),
+            "the nested arrow must own its transform temp: {:?}",
+            nested_body.statements
+        );
+
+        let Statement::VariableDeclaration(parameter_declaration) = program.body[1] else {
+            panic!("expected parameter arrow declaration")
+        };
+        let Expression::Function(parameter_function) = parameter_declaration.declarations[0]
+            .init
+            .expect("parameter arrow initializer")
+        else {
+            panic!("expected the parameter arrow to lower to a function")
+        };
+        let Pattern::Assignment(default) = parameter_function.params[0] else {
+            panic!("expected default parameter")
+        };
+        assert!(
+            matches!(
+                default.right,
+                Expression::Logical(logical)
+                    if logical.operator == LogicalOperator::Coalesce
+            ),
+            "the ambiguous parameter cover must remain conservative: {:?}",
+            default.right
+        );
+        assert!(
+            parameter_function
+                .body
+                .is_some_and(|body| matches!(body.statements[0], Statement::Return(_))),
+            "the parameter cover must not inject a temp declaration into its arrow body"
+        );
+    });
+}
+
+#[test]
+fn jsx_runtime_import_follows_directive_prologue() {
+    let interner = Interner::new();
+    let out = parse(
+        "\"use client\"; \"wake marker\"; const view = <div />;",
+        &interner,
+        SourceType::Tsx,
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.module.with_ast(|program| {
+        assert!(
+            matches!(
+                program.body[0],
+                Statement::Expression(expression)
+                    if matches!(expression.expression, Expression::StringLiteral(_))
+            ),
+            "first directive must remain first"
+        );
+        assert!(
+            matches!(
+                program.body[1],
+                Statement::Expression(expression)
+                    if matches!(expression.expression, Expression::StringLiteral(_))
+            ),
+            "the complete directive prologue must stay contiguous"
+        );
+        assert!(
+            matches!(program.body[2], Statement::Import(_)),
+            "automatic-runtime import must follow directives: {:?}",
+            program.body
+        );
+    });
+}
+
+#[test]
 fn control_flow() {
     let src = "if (a) b(); else { c(); }
         for (let i = 0; i < 10; i++) log(i);
@@ -109,6 +210,64 @@ fn functions_and_generators() {
 fn optional_chaining_and_calls() {
     with_program("a?.b?.[c]?.(d).e.f();", |p| {
         assert!(matches!(p.body[0], Statement::Expression(_)));
+    });
+}
+
+#[test]
+fn parenthesized_optional_call_keeps_a_distinct_callee_boundary() {
+    with_program("const value=(obj?.method)();", |program| {
+        let Statement::VariableDeclaration(declaration) = program.body[0] else {
+            panic!("expected declaration")
+        };
+        let Expression::Call(call) = declaration.declarations[0].init.expect("initializer") else {
+            panic!("expected outer call")
+        };
+        let Expression::Sequence(group) = call.callee else {
+            panic!("modern parenthesized optional callee must retain a grouping marker")
+        };
+        assert_eq!(group.expressions.len(), 1);
+        assert!(matches!(
+            group.expressions[0],
+            Expression::Member(member) if member.optional
+        ));
+    });
+
+    let interner = Interner::new();
+    let mut transform_features = wake_ecma_transform::FeatureSet::default();
+    transform_features.insert(wake_ecma_transform::EcmaFeature::OptionalChaining);
+    let out = parse_with(
+        "const value=(obj?.method)();",
+        &interner,
+        SourceType::Module,
+        ParseOptions {
+            transform_features,
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.module.with_ast(|program| {
+        assert!(
+            matches!(
+                program.body[0],
+                Statement::VariableDeclaration(declaration) if declaration.kind == VarKind::Var
+            ),
+            "{:?}",
+            program.body
+        );
+        let Statement::VariableDeclaration(declaration) = program.body[1] else {
+            panic!("expected transformed declaration")
+        };
+        let Expression::Call(call) = declaration.declarations[0].init.expect("initializer") else {
+            panic!("expected outer call")
+        };
+        let Expression::Sequence(callee) = call.callee else {
+            panic!("lowered callee must capture then return a forwarding function")
+        };
+        assert!(matches!(
+            callee.expressions.last(),
+            Some(Expression::Function(_))
+        ));
+        assert!(!wake_ecma_transform::has_optional_chain(call.callee));
     });
 }
 

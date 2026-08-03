@@ -1,0 +1,30 @@
+[package]
+name = "wake_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Node-API bindings for Wake"
+
+[lints]
+workspace = true
+
+[lib]
+name = "wake"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi.workspace = true
+napi-derive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wake_app.workspace = true
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_codegen.workspace = true
+wake_ecma_lexer.workspace = true
+wake_ecma_parser.workspace = true
+wake_ecma_semantic.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true

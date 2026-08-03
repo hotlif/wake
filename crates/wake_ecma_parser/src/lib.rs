@@ -7,19 +7,25 @@
 
 mod expr;
 mod jsx;
-pub mod semantic;
+/// 兼容导出：语义分析已拆到独立 crate，parser 调用方无需立即迁移路径。
+pub mod semantic {
+    pub use wake_ecma_semantic::*;
+}
 mod stmt;
 mod ts;
 mod ts_value;
 
-pub use semantic::{SemanticModel, analyze};
+pub use wake_ecma_semantic::{SemanticModel, analyze};
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
 
 use bumpalo::Bump;
 use wake_common::{Atom, Diagnostic, FxHashMap, Interner, Span};
-use wake_ecma_ast::{AVec, Dependency, ModuleAst, Program, SourceType, Statement};
+use wake_ecma_ast::{
+    AVec, Dependency, Ident, ModuleAst, Pattern, Program, SourceType, Statement, VarKind,
+    VariableDeclaration, VariableDeclarator,
+};
 use wake_ecma_lexer::{Keyword, Lexer, LexerCheckpoint, Token, TokenKind, regex_allowed_after};
 
 /// 解析结果。
@@ -53,6 +59,8 @@ pub struct ParseOptions<'o> {
     pub jsx_dev: bool,
     /// dev runtime 的 `fileName`（源文件路径）。
     pub file_name: &'o str,
+    /// 由 Browserslist 目标计算出的实际 lowering pass。
+    pub transform_features: wake_ecma_transform::FeatureSet,
 }
 
 impl Default for ParseOptions<'_> {
@@ -61,6 +69,7 @@ impl Default for ParseOptions<'_> {
             jsx_import_source: "react",
             jsx_dev: false,
             file_name: "",
+            transform_features: wake_ecma_transform::FeatureSet::default(),
         }
     }
 }
@@ -189,6 +198,27 @@ pub(crate) struct Parser<'a, 'src> {
     /// JSX 常量名（`children`/`_jsx`/`_jsxs`/`_Fragment`）的惰性预驻留：非 JSX 模块永不触发，
     /// JSX 模块首个元素驻留一次后复用，省去每元素对固定分片的锁 + 哈希 + 查找。
     jsx_atoms: Cell<Option<JsxAtoms>>,
+    /// 为 lowering IIFE 生成与源码标识符不冲突的局部参数名。
+    transform_temp: u32,
+    /// 正在解析的可注入 `var` 的词法作用域。`None` 是参数/class 等保守区，禁止把
+    /// 临时绑定泄漏到外层；`Some` 收集该 Program/函数/同步箭头自身使用的名字。
+    transform_temp_scopes: Vec<Option<Vec<Atom>>>,
+    /// 首次 spread lowering 时分配；最终写入 Program 供 codegen 注入 iterator helper。
+    spread_helper: Option<Atom>,
+    object_spread_helper: Option<Atom>,
+    /// Synchronous for-of lowering 的 collision-free per-module 状态 helper。
+    for_of_helper: Option<Atom>,
+    /// cover grammar 内的数组/对象可能稍后重解释为箭头参数，暂缓 spread lowering。
+    in_cover_paren: bool,
+    /// 单项 cover 括号里因没有安全 temp scope 而保留了 optional chain。外层 lhs tail
+    /// 只消费一次此标记，避免离开 cover 后又把同一条链错误地注入到父作用域。
+    preserve_optional_chain_tail: bool,
+    /// `delete (chain?.member)` 必须等括号边界确定后才能决定是删除 member，还是先求出
+    /// chain 的值再删除括号外的后缀。此标记让 cover 内先保留原 optional AST。
+    suppress_optional_chain_in_delete_cover: bool,
+    /// 正在解析 `for (...)` 的非声明初始化项。数组/对象后紧跟顶层 `in` / `of` 时，
+    /// spread 形态是赋值 rest，而不是表达式 spread。
+    in_for_head_init: bool,
 }
 
 impl<'a, 'src> Parser<'a, 'src> {
@@ -229,7 +259,127 @@ impl<'a, 'src> Parser<'a, 'src> {
             ident_cache: RefCell::new(FxHashMap::default()),
             require_atom: interner.intern("require"),
             jsx_atoms: Cell::new(None),
+            transform_temp: 0,
+            transform_temp_scopes: Vec::new(),
+            spread_helper: None,
+            object_spread_helper: None,
+            for_of_helper: None,
+            in_cover_paren: false,
+            preserve_optional_chain_tail: false,
+            suppress_optional_chain_in_delete_cover: false,
+            in_for_head_init: false,
         }
+    }
+
+    fn fresh_transform_atom(&mut self) -> Atom {
+        loop {
+            let candidate = format!("__wake_t{}", self.transform_temp);
+            self.transform_temp += 1;
+            // 标识符文本完全不出现在源码中，必然不会捕获用户绑定或自由引用。
+            if !self.source.contains(&candidate) {
+                return self.interner.intern(&candidate);
+            }
+        }
+    }
+
+    fn push_transform_temp_scope(&mut self, enabled: bool) {
+        self.transform_temp_scopes
+            .push(enabled.then(Vec::<Atom>::new));
+    }
+
+    fn pop_transform_temp_scope(&mut self) -> Vec<Atom> {
+        self.transform_temp_scopes
+            .pop()
+            .expect("transform temp scopes are balanced")
+            .unwrap_or_default()
+    }
+
+    /// 分配并登记一个属于当前 Program/函数/同步箭头的 `var` 临时名。
+    /// cover grammar 和显式禁用区返回 `None`，调用方必须保留原语法。
+    fn fresh_scoped_transform_atom(&mut self) -> Option<Atom> {
+        if self.in_cover_paren || !matches!(self.transform_temp_scopes.last(), Some(Some(_))) {
+            return None;
+        }
+        let atom = self.fresh_transform_atom();
+        self.transform_temp_scopes
+            .last_mut()
+            .and_then(Option::as_mut)
+            .expect("enabled transform temp scope exists")
+            .push(atom);
+        Some(atom)
+    }
+
+    fn has_scoped_transform_temp_scope(&self) -> bool {
+        !self.in_cover_paren && matches!(self.transform_temp_scopes.last(), Some(Some(_)))
+    }
+
+    pub(crate) fn transform_temp_declaration(&self, temps: &[Atom]) -> Option<Statement<'a>> {
+        if temps.is_empty() {
+            return None;
+        }
+        let mut declarations = self.new_vec::<VariableDeclarator>();
+        declarations.extend(temps.iter().copied().map(|atom| VariableDeclarator {
+            span: Span::DUMMY,
+            id: Pattern::Ident(self.alloc(Ident::new(Span::DUMMY, atom))),
+            init: None,
+        }));
+        Some(Statement::VariableDeclaration(self.alloc(
+            VariableDeclaration {
+                span: Span::DUMMY,
+                kind: VarKind::Var,
+                declarations,
+            },
+        )))
+    }
+
+    pub(crate) fn inject_transform_temp_declaration(
+        &self,
+        mut statements: AVec<'a, Statement<'a>>,
+        temps: &[Atom],
+    ) -> AVec<'a, Statement<'a>> {
+        let Some(declaration) = self.transform_temp_declaration(temps) else {
+            return statements;
+        };
+        let directive_count = statements
+            .iter()
+            .take_while(|statement| {
+                matches!(
+                    statement,
+                    Statement::Expression(expression)
+                        if matches!(expression.expression, wake_ecma_ast::Expression::StringLiteral(_))
+                )
+            })
+            .count();
+        statements.insert(directive_count, declaration);
+        statements
+    }
+
+    fn spread_helper_atom(&mut self) -> Atom {
+        if let Some(atom) = self.spread_helper {
+            return atom;
+        }
+        let atom = self.fresh_transform_atom();
+        self.spread_helper = Some(atom);
+        atom
+    }
+
+    fn object_spread_helper_atom(&mut self) -> Atom {
+        if let Some(atom) = self.object_spread_helper {
+            return atom;
+        }
+        let atom = self.fresh_transform_atom();
+        self.object_spread_helper = Some(atom);
+        atom
+    }
+
+    /// Allocate the synchronous for-of state helper lazily.
+    fn for_of_helper_atom(&mut self) -> Atom {
+        if let Some(atom) = self.for_of_helper {
+            return atom;
+        }
+        let atom = self.fresh_transform_atom();
+        self.for_of_helper = Some(atom);
+        atom
     }
 
     // ==================================================================
@@ -403,6 +553,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_program(&mut self) -> Program<'a> {
         let mut program = Program::new_in(self.arena, self.source_type);
         let lo = self.start();
+        self.push_transform_temp_scope(true);
 
         // 指令序言（"use strict"）：脚本据此进入严格模式。
         let strict_directive = self.parse_directive_prologue(&mut program.body);
@@ -421,14 +572,37 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
 
+        let transform_temps = self.pop_transform_temp_scope();
+        program.body = self.inject_transform_temp_declaration(program.body, &transform_temps);
+
         // 用到 JSX：在模块顶部注入 automatic runtime 的 import，并记录依赖（DESIGN §4.3）。
         // 降级产出的 `_jsx`/`_jsxs`/`_Fragment` 由此 import 绑定；codegen 与依赖扇出全走现有机制。
         if self.used_jsx {
             let import = self.build_jsx_runtime_import();
-            program.body.insert(0, import);
+            // React/Next.js 等工具把 `"use client"` / `"use server"` 当真正的 Directive
+            // Prologue。运行时 import 必须位于完整的连续字符串指令之后，否则会悄悄改变
+            // 文件语义。transform temp 声明也在指令之后，因此 import 会自然排在它之前。
+            let directive_count = program
+                .body
+                .iter()
+                .take_while(|statement| {
+                    matches!(
+                        statement,
+                        Statement::Expression(expression)
+                            if matches!(
+                                expression.expression,
+                                wake_ecma_ast::Expression::StringLiteral(_)
+                            )
+                    )
+                })
+                .count();
+            program.body.insert(directive_count, import);
             self.record_jsx_runtime_dependency();
         }
 
+        program.spread_helper = self.spread_helper;
+        program.object_spread_helper = self.object_spread_helper;
+        program.for_of_helper = self.for_of_helper;
         program.span = self.span_to(lo);
         let lex_diags = self.lexer.take_diagnostics();
         self.diagnostics.extend(lex_diags);
@@ -461,5 +635,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 }
 
+#[cfg(test)]
+mod semantic_tests;
 #[cfg(test)]
 mod tests;

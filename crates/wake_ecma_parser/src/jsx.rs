@@ -19,7 +19,7 @@
 //!   {fileName,lineNumber,columnNumber}, this)`（对齐 tsc `--jsx react-jsxdev`），
 //!   供 React DevTools 显示组件栈。
 //!
-//! 未覆盖：classic runtime / `@jsx` pragma——**不在 crustify 对齐范围**（crustify 显式配置
+//! 未覆盖：classic runtime / `@jsx` pragma——**不在 legacy tool 对齐范围**（legacy tool 显式配置
 //! `@babel/preset-react` 的 `runtime: "automatic"`）；多行属性字符串中的 JS 转义。
 
 use wake_common::{Atom, Span};
@@ -279,6 +279,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                             method: false,
                             shorthand: false,
                             computed,
+                            prototype_setter: false,
                         });
                         members.push(ObjectMember::Property(prop));
                     }
@@ -400,7 +401,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// - children 归入 props 的 `children`（1 个直接放，≥2 个放数组用 `_jsxs`）；
     /// - `key` 作为第 3 个实参。
     fn build_jsx_call(
-        &self,
+        &mut self,
         lo: u32,
         type_expr: Expression<'a>,
         key: Option<Expression<'a>>,
@@ -431,14 +432,35 @@ impl<'a, 'src> Parser<'a, 'src> {
                 method: false,
                 shorthand: false,
                 computed: false,
+                prototype_setter: false,
             });
             members.push(ObjectMember::Property(prop));
         }
 
-        let props = Expression::Object(self.alloc(ObjectExpression {
+        let props_object = self.alloc(ObjectExpression {
             span,
             properties: members,
-        }));
+        });
+        let props = if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
+            && props_object
+                .properties
+                .iter()
+                .any(|member| matches!(member, ObjectMember::Spread(_)))
+        {
+            let helper = self.object_spread_helper_atom();
+            wake_ecma_transform::lower_object_spread(
+                self.arena,
+                self.interner,
+                helper,
+                self.options.transform_features,
+                props_object,
+            )
+        } else {
+            Expression::Object(props_object)
+        };
 
         let atoms = self.jsx_atoms();
         let mut args = self.new_vec::<Expression>();
@@ -493,6 +515,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 method: false,
                 shorthand: false,
                 computed: false,
+                prototype_setter: false,
             })));
         };
         push(

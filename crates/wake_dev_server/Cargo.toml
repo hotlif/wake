@@ -12,6 +12,7 @@ workspace = true
 wake_common.workspace = true
 wake_turbo.workspace = true
 wake_bundler.workspace = true
+wake_ecma_transform.workspace = true
 actix-web.workspace = true
 actix-ws.workspace = true
 awc.workspace = true

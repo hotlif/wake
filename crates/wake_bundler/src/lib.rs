@@ -28,6 +28,7 @@ pub struct Bundler {
 }
 
 /// 打包产物。
+#[derive(Clone)]
 pub struct BuildOutput {
     /// 入口 chunk 源码（= `chunks[entry_chunk].code`；向后兼容单产物调用方）。
     pub bundle: String,
@@ -39,12 +40,13 @@ pub struct BuildOutput {
     pub chunks: Vec<OutputChunk>,
     /// 入口 chunk 在 `chunks` 的下标。
     pub entry_chunk: usize,
-    /// 带外产物（非 JS chunk）：超阈值独立资源文件 + prod 抽取的 `.css`（CRUSTIFY-PARITY §M3）。
+    /// 带外产物（非 JS chunk）：超阈值独立资源文件 + prod 抽取的 `.css`（WAKE-COMPATIBILITY §M3）。
     /// 由 CLI 写盘；CSS 产物供 HTML `<link>` 注入。默认空（dev / 未开启抽取）。
     pub assets: Vec<OutputAsset>,
 }
 
 /// 一个带外产物（独立写盘的资源文件）。
+#[derive(Clone)]
 pub struct OutputAsset {
     /// 写盘文件名（含内容 hash，如 `logo.a1b2c3d4.png` / `styles.e5f6g7h8.css`）。
     pub file_name: String,
@@ -55,6 +57,7 @@ pub struct OutputAsset {
 }
 
 /// 一个产物 chunk（DESIGN §6.3）。
+#[derive(Clone)]
 pub struct OutputChunk {
     /// chunk 名（entry 用入口 stem，async 用根模块 stem，shared 用 `shared`+序号）。
     pub name: String,
@@ -72,7 +75,7 @@ pub struct OutputChunk {
     pub module_ids: Vec<u32>,
     /// 依赖的其它 chunk 文件名（须先加载；供 manifest）。
     pub imports: Vec<String>,
-    /// Source Map V3 JSON（`None` = 未启用或该路径不支持）。CRUSTIFY-PARITY §M4d。
+    /// Source Map V3 JSON（`None` = 未启用或该路径不支持）。WAKE-COMPATIBILITY §M4d。
     /// 由 CLI 写为 `<file_name>.map` 或经 dev server 提供；`code` 末尾对应追加 `sourceMappingURL`。
     pub source_map: Option<String>,
 }

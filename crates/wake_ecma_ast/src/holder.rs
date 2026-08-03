@@ -133,7 +133,10 @@ impl std::hash::Hash for ModuleAst {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Expression, Pattern, Statement};
+    use crate::{
+        Expression, ExpressionStatement, Ident, ObjectExpression, ObjectMember, ObjectProperty,
+        Pattern, PropertyKey, PropertyKind, SourceType, Statement,
+    };
 
     #[test]
     fn build_and_borrow() {
@@ -178,6 +181,69 @@ mod tests {
         // 相同结构 → 相同指纹（且不含指针地址，故可跨实例相等）。
         assert_eq!(a.structure_hash(), b.structure_hash());
         assert_ne!(a.structure_hash(), c.structure_hash());
+    }
+
+    #[test]
+    fn structure_hash_includes_for_of_helper_metadata() {
+        fn build(interner: &Interner, with_helper: bool) -> ModuleAst {
+            let helper = interner.intern("__wake_for_of");
+            ModuleAst::from_builder(move |arena| {
+                let mut program = Program::new_in(arena, SourceType::Module);
+                if with_helper {
+                    program.for_of_helper = Some(helper);
+                }
+                program
+            })
+        }
+
+        let interner = Interner::new();
+        let plain = build(&interner, false);
+        let with_helper = build(&interner, true);
+        assert_ne!(plain.structure_hash(), with_helper.structure_hash());
+        plain.with_ast(|program| assert!(program.for_of_helper.is_none()));
+        with_helper.with_ast(|program| {
+            assert_eq!(
+                program.for_of_helper,
+                Some(interner.intern("__wake_for_of"))
+            )
+        });
+    }
+
+    #[test]
+    fn structure_hash_includes_object_prototype_setter_semantics() {
+        fn build(interner: &Interner, prototype_setter: bool) -> ModuleAst {
+            let proto = interner.intern("__proto__");
+            let base = interner.intern("base");
+            ModuleAst::from_builder(move |arena| {
+                let span = wake_common::Span::new(0, 17);
+                let property = arena.alloc(ObjectProperty {
+                    span,
+                    key: PropertyKey::Ident(Ident::new(span, proto)),
+                    value: Expression::Identifier(arena.alloc(Ident::new(span, base))),
+                    kind: PropertyKind::Init,
+                    method: false,
+                    shorthand: false,
+                    computed: false,
+                    prototype_setter,
+                });
+                let mut properties = crate::AVec::new_in(arena);
+                properties.push(ObjectMember::Property(property));
+                let object = Expression::Object(arena.alloc(ObjectExpression { span, properties }));
+                let mut program = Program::new_in(arena, SourceType::Module);
+                program
+                    .body
+                    .push(Statement::Expression(arena.alloc(ExpressionStatement {
+                        span,
+                        expression: object,
+                    })));
+                program
+            })
+        }
+
+        let interner = Interner::new();
+        let ordinary = build(&interner, false);
+        let prototype = build(&interner, true);
+        assert_ne!(ordinary.structure_hash(), prototype.structure_hash());
     }
 
     #[test]

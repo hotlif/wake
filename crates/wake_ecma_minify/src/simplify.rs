@@ -18,7 +18,7 @@
 //! | `` `hello ${1+2}` `` | `"hello 3"` | all-const template literal |
 
 use crate::const_eval::{self, ConstCtx, ConstVal, expr_is_pure};
-use wake_common::{FxHashMap, Interner, Span};
+use wake_common::{FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
 
 /// A planned simplification at a specific span location.
@@ -51,10 +51,17 @@ pub fn plan_simplifications(
     source: &str,
     interner: &Interner,
 ) -> SimplifyPlan {
+    // Parser-time transforms deliberately reuse the original source span for their synthetic
+    // parent/child nodes. A span-keyed rewrite is only safe when that span identifies exactly one
+    // expression; otherwise a folded child such as the `0` in synthetic `void 0` can overwrite
+    // the entry for the whole optional-chain sequence and replace it with `0` at codegen time.
+    let mut span_audit = ExpressionSpanAudit::default();
+    span_audit.visit_program(program);
     let mut planner = SimplifyPlanner {
         actions: FxHashMap::default(),
         constants: FxHashMap::default(),
         bracket_names: FxHashMap::default(),
+        ambiguous_spans: span_audit.ambiguous,
         source,
         interner,
     };
@@ -70,8 +77,25 @@ struct SimplifyPlanner<'a> {
     actions: FxHashMap<Span, SimplifyAction>,
     constants: FxHashMap<Span, ConstVal>,
     bracket_names: FxHashMap<Span, String>,
+    ambiguous_spans: FxHashSet<Span>,
     source: &'a str,
     interner: &'a Interner,
+}
+
+#[derive(Default)]
+struct ExpressionSpanAudit {
+    seen: FxHashSet<Span>,
+    ambiguous: FxHashSet<Span>,
+}
+
+impl<'ast> Visit<'ast> for ExpressionSpanAudit {
+    fn visit_expression(&mut self, node: &Expression<'ast>) {
+        let span = node.span();
+        if span.is_dummy() || !self.seen.insert(span) {
+            self.ambiguous.insert(span);
+        }
+        walk_expression(self, node);
+    }
 }
 
 impl<'a> SimplifyPlanner<'a> {
@@ -90,6 +114,10 @@ impl<'a> SimplifyPlanner<'a> {
 
 impl<'s, 'ast> Visit<'ast> for SimplifyPlanner<'s> {
     fn visit_expression(&mut self, node: &Expression<'ast>) {
+        if node.span().is_dummy() || self.ambiguous_spans.contains(&node.span()) {
+            walk_expression(self, node);
+            return;
+        }
         // Try constant-folding for every expression (populates MinifyCtx.constants)
         let ctx = self.const_ctx();
         if let Some(val) = const_eval::const_eval(node, &ctx) {

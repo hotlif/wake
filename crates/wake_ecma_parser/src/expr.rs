@@ -93,13 +93,48 @@ impl<'a, 'src> Parser<'a, 'src> {
 
         if let Some(op) = assignment_op(self.cur.kind) {
             self.bump();
+            // In cover grammar only the left side may later become an arrow binding pattern. The
+            // initializer/RHS is an ordinary expression and can safely run its own transforms.
+            let previous_cover = self.in_cover_paren;
+            self.in_cover_paren = false;
             let right = self.parse_assignment_expression();
-            return Expression::Assignment(self.alloc(AssignmentExpression {
-                span: self.span_to(lo),
-                operator: op,
+            self.in_cover_paren = previous_cover;
+            if op == AssignmentOperator::Assign
+                && wake_ecma_transform::destructuring_assignment_needs_lowering(
+                    self.options.transform_features,
+                    left,
+                )
+                && !self.in_cover_paren
+            {
+                return self.lower_destructuring_assignment_expression(
+                    self.span_to(lo),
+                    left,
+                    right,
+                );
+            }
+            let temps = wake_ecma_transform::assignment_needs_temporaries(
+                self.options.transform_features,
+                op,
+                left,
+            )
+            .then_some(())
+            .and_then(|()| {
+                Some([
+                    self.fresh_scoped_transform_atom()?,
+                    self.fresh_scoped_transform_atom()?,
+                    self.fresh_scoped_transform_atom()?,
+                ])
+            });
+            return wake_ecma_transform::lower_assignment(
+                self.arena,
+                self.interner,
+                temps,
+                self.options.transform_features,
+                self.span_to(lo),
+                op,
                 left,
                 right,
-            }));
+            );
         }
         left
     }
@@ -171,18 +206,33 @@ impl<'a, 'src> Parser<'a, 'src> {
             let right = self.parse_binary_expression(next_min);
             let span = self.span_to(lo);
             left = match op {
-                BinOp::Binary(b) => Expression::Binary(self.alloc(BinaryExpression {
+                BinOp::Binary(b) => wake_ecma_transform::lower_binary(
+                    self.arena,
+                    self.interner,
+                    self.options.transform_features,
                     span,
-                    operator: b,
+                    b,
                     left,
                     right,
-                })),
-                BinOp::Logical(l) => Expression::Logical(self.alloc(LogicalExpression {
-                    span,
-                    operator: l,
-                    left,
-                    right,
-                })),
+                ),
+                BinOp::Logical(l) => {
+                    let features = self.options.transform_features;
+                    let temp = if l == LogicalOperator::Coalesce
+                        && features.contains(wake_ecma_transform::EcmaFeature::NullishCoalescing)
+                        && !wake_ecma_transform::is_repeatable(left)
+                    {
+                        if features.contains(wake_ecma_transform::EcmaFeature::ArrowFunction) {
+                            self.fresh_scoped_transform_atom()
+                        } else {
+                            Some(self.fresh_transform_atom())
+                        }
+                    } else {
+                        None
+                    };
+                    wake_ecma_transform::lower_logical(
+                        self.arena, temp, features, span, l, left, right,
+                    )
+                }
             };
             let _ = logical;
         }
@@ -262,6 +312,43 @@ impl<'a, 'src> Parser<'a, 'src> {
         // 一元运算符。
         if let Some(operator) = unary_op(self.cur.kind) {
             self.bump();
+            if operator == UnaryOperator::Delete
+                && !(self.ts && !self.jsx && self.at(TokenKind::Lt))
+                && !matches!(self.cur.kind, TokenKind::PlusPlus | TokenKind::MinusMinus)
+                && unary_op(self.cur.kind).is_none()
+                && !(self.at_keyword(Keyword::Await) && self.ctx.in_async)
+            {
+                let argument_lo = self.start();
+                let (mut argument, mut optional_delete_lowered) = self
+                    .parse_lhs_expression_with_optional_mode(
+                        wake_ecma_transform::OptionalChainMode::Delete,
+                    );
+                if matches!(self.cur.kind, TokenKind::PlusPlus | TokenKind::MinusMinus)
+                    && !self.newline_before()
+                {
+                    let update_operator = if self.at(TokenKind::PlusPlus) {
+                        UpdateOperator::Increment
+                    } else {
+                        UpdateOperator::Decrement
+                    };
+                    self.bump();
+                    argument = Expression::Update(self.alloc(UpdateExpression {
+                        span: self.span_to(argument_lo),
+                        operator: update_operator,
+                        prefix: false,
+                        argument,
+                    }));
+                    optional_delete_lowered = false;
+                }
+                if optional_delete_lowered {
+                    return argument;
+                }
+                return Expression::Unary(self.alloc(UnaryExpression {
+                    span: self.span_to(lo),
+                    operator,
+                    argument,
+                }));
+            }
             let argument = self.parse_unary_expression();
             return Expression::Unary(self.alloc(UnaryExpression {
                 span: self.span_to(lo),
@@ -309,13 +396,28 @@ impl<'a, 'src> Parser<'a, 'src> {
     // ==================================================================
 
     pub(crate) fn parse_lhs_expression(&mut self) -> Expression<'a> {
+        self.parse_lhs_expression_with_optional_mode(wake_ecma_transform::OptionalChainMode::Value)
+            .0
+    }
+
+    fn parse_lhs_expression_with_optional_mode(
+        &mut self,
+        mode: wake_ecma_transform::OptionalChainMode,
+    ) -> (Expression<'a>, bool) {
         let lo = self.start();
+        let delete_cover =
+            mode == wake_ecma_transform::OptionalChainMode::Delete && self.at(TokenKind::LParen);
+        let previous_delete_cover = self.suppress_optional_chain_in_delete_cover;
+        if delete_cover {
+            self.suppress_optional_chain_in_delete_cover = true;
+        }
         let expr = if self.at_keyword(Keyword::New) {
             self.parse_new_expression()
         } else {
             self.parse_primary_expression()
         };
-        self.parse_call_member_tail(lo, expr)
+        self.suppress_optional_chain_in_delete_cover = previous_delete_cover;
+        self.parse_call_member_tail(lo, expr, mode)
     }
 
     fn parse_new_expression(&mut self) -> Expression<'a> {
@@ -332,11 +434,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             }));
         }
         // callee：member 表达式（不含调用）。
-        let callee_base = if self.at_keyword(Keyword::New) {
+        let mut callee_base = if self.at_keyword(Keyword::New) {
             self.parse_new_expression()
         } else {
             self.parse_primary_expression()
         };
+        if std::mem::take(&mut self.preserve_optional_chain_tail) {
+            // `new (obj?.Ctor)()` has the same parenthesized chain boundary as an ordinary
+            // call, but constructor invocation does not consume a Reference receiver. Lower the
+            // inner value when possible and retain explicit grouping in every target mode.
+            if self
+                .options
+                .transform_features
+                .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+            {
+                callee_base = self.lower_optional_chain_expression(
+                    callee_base,
+                    wake_ecma_transform::OptionalChainMode::Value,
+                );
+            }
+            callee_base = self.parenthesized_expression(callee_base);
+        }
         let callee = self.parse_member_tail_no_call(lo, callee_base);
         // TS：`new C<T>(...)` 的类型实参（仅当其后紧跟 `(` 才认定，避免误吃比较）。
         if self.ts && self.at(TokenKind::Lt) {
@@ -347,11 +465,31 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             self.new_vec()
         };
-        Expression::New(self.alloc(NewExpression {
+        let new = self.alloc(NewExpression {
             span: self.span_to(lo),
             callee,
             arguments,
-        }))
+        });
+        if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::Spread)
+            && new
+                .arguments
+                .iter()
+                .any(|argument| matches!(argument, Expression::Spread(_)))
+        {
+            let helper = self.spread_helper_atom();
+            wake_ecma_transform::lower_new_spread(
+                self.arena,
+                self.interner,
+                helper,
+                self.options.transform_features,
+                new,
+            )
+        } else {
+            Expression::New(new)
+        }
     }
 
     /// 只解析成员访问（`.x` / `[x]`），不解析调用——用于 `new` 的 callee。
@@ -385,7 +523,55 @@ impl<'a, 'src> Parser<'a, 'src> {
         expr
     }
 
-    fn parse_call_member_tail(&mut self, lo: u32, mut expr: Expression<'a>) -> Expression<'a> {
+    fn parse_call_member_tail(
+        &mut self,
+        lo: u32,
+        mut expr: Expression<'a>,
+        mode: wake_ecma_transform::OptionalChainMode,
+    ) -> (Expression<'a>, bool) {
+        let mut preserve_optional_chain = std::mem::take(&mut self.preserve_optional_chain_tail);
+        let defer_parenthesized_invocation = preserve_optional_chain
+            && (matches!(
+                self.cur.kind,
+                TokenKind::LParen | TokenKind::TemplateNoSub | TokenKind::TemplateHead
+            ) || self.ts_parenthesized_optional_invocation_ahead());
+        let mut preserve_native_parenthesized_call = false;
+        let has_outer_tail = matches!(
+            self.cur.kind,
+            TokenKind::Dot
+                | TokenKind::QuestionDot
+                | TokenKind::LBracket
+                | TokenKind::LParen
+                | TokenKind::TemplateNoSub
+                | TokenKind::TemplateHead
+        ) || (self.ts
+            && matches!(self.cur.kind, TokenKind::Bang | TokenKind::Lt));
+        if !defer_parenthesized_invocation
+            && preserve_optional_chain
+            && has_outer_tail
+            && self
+                .options
+                .transform_features
+                .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+        {
+            // Parentheses end an optional chain. Lower the inner chain before rebuilding an outer
+            // `.x`/`()` tail so codegen cannot accidentally merge the two chain units.
+            expr = self.lower_optional_chain_expression(
+                expr,
+                wake_ecma_transform::OptionalChainMode::Value,
+            );
+            preserve_optional_chain = wake_ecma_transform::has_optional_chain(expr);
+        } else if preserve_optional_chain
+            && mode == wake_ecma_transform::OptionalChainMode::Delete
+            && !self
+                .options
+                .transform_features
+                .contains(wake_ecma_transform::EcmaFeature::ArrowFunction)
+        {
+            // Arrow-capable targets can use a lexical capture after the cover has been resolved.
+            // This makes `delete (get()?.x)` delete `x`, rather than deleting a conditional value.
+            preserve_optional_chain = false;
+        }
         loop {
             match self.cur.kind {
                 TokenKind::Dot => {
@@ -458,6 +644,11 @@ impl<'a, 'src> Parser<'a, 'src> {
                     // 成功：cur 现在是 `(` 或模板头，交由下一轮循环处理调用。
                 }
                 TokenKind::LParen => {
+                    if preserve_optional_chain {
+                        (expr, preserve_native_parenthesized_call) =
+                            self.prepare_parenthesized_optional_callee(expr);
+                        preserve_optional_chain = false;
+                    }
                     let arguments = self.parse_arguments();
                     let call = self.alloc(CallExpression {
                         span: self.span_to(lo),
@@ -466,10 +657,64 @@ impl<'a, 'src> Parser<'a, 'src> {
                         optional: false,
                     });
                     self.maybe_record_require(call);
-                    expr = Expression::Call(call);
+                    if self
+                        .options
+                        .transform_features
+                        .contains(wake_ecma_transform::EcmaFeature::Spread)
+                        && !preserve_native_parenthesized_call
+                        && !wake_ecma_transform::has_optional_chain(call.callee)
+                        && call
+                            .arguments
+                            .iter()
+                            .any(|argument| matches!(argument, Expression::Spread(_)))
+                    {
+                        // All ordinary member calls need receiver/function captures: a getter may
+                        // rebind even a simple identifier receiver before spread arguments run.
+                        // Only execution scopes that can own the corresponding `var` declarations
+                        // may lower; conservative regions retain the complete native call and do
+                        // not allocate an unused iterator helper.
+                        let can_lower = self.has_scoped_transform_temp_scope()
+                            && !matches!(call.callee, Expression::Super(_));
+                        let temps = if can_lower
+                            && matches!(
+                                call.callee,
+                                Expression::Member(member)
+                                    if !matches!(member.object, Expression::Super(_))
+                            ) {
+                            Some([
+                                self.fresh_scoped_transform_atom()
+                                    .expect("enabled spread-call temp scope"),
+                                self.fresh_scoped_transform_atom()
+                                    .expect("enabled spread-call temp scope"),
+                            ])
+                        } else {
+                            None
+                        };
+                        if can_lower {
+                            let helper = self.spread_helper_atom();
+                            expr = wake_ecma_transform::lower_call_spread(
+                                self.arena,
+                                self.interner,
+                                helper,
+                                temps,
+                                self.options.transform_features,
+                                call,
+                            );
+                        } else {
+                            expr = Expression::Call(call);
+                        }
+                    } else {
+                        expr = Expression::Call(call);
+                    }
+                    preserve_native_parenthesized_call = false;
                 }
                 // 标签模板 `` tag`...` ``。
                 TokenKind::TemplateNoSub | TokenKind::TemplateHead => {
+                    if preserve_optional_chain {
+                        let (prepared, _) = self.prepare_parenthesized_optional_callee(expr);
+                        expr = prepared;
+                        preserve_optional_chain = false;
+                    }
                     let quasi = self.parse_template_literal();
                     if let Expression::TemplateLiteral(q) = quasi {
                         expr = Expression::TaggedTemplate(self.alloc(TaggedTemplateExpression {
@@ -478,11 +723,190 @@ impl<'a, 'src> Parser<'a, 'src> {
                             quasi: q,
                         }));
                     }
+                    preserve_native_parenthesized_call = false;
                 }
                 _ => break,
             }
         }
-        expr
+        if !preserve_optional_chain
+            && self
+                .options
+                .transform_features
+                .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+            && wake_ecma_transform::has_optional_chain(expr)
+        {
+            let lowered = self.lower_optional_chain_expression(expr, mode);
+            let delete_lowered = mode == wake_ecma_transform::OptionalChainMode::Delete
+                && !wake_ecma_transform::has_optional_chain(lowered);
+            (lowered, delete_lowered)
+        } else {
+            (expr, false)
+        }
+    }
+
+    fn lower_optional_chain_expression(
+        &mut self,
+        expression: Expression<'a>,
+        mode: wake_ecma_transform::OptionalChainMode,
+    ) -> Expression<'a> {
+        let has_call_spread = wake_ecma_transform::has_call_spread(expression);
+        let needs_spread_helper = self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::Spread)
+            && has_call_spread;
+        // Spread arguments may contain lexical `await`/`yield`/`this`/`arguments`. If this region
+        // cannot own scope temporaries, retain the whole optional call instead of lowering it
+        // through a nested lexical-IIFE path and allocating a helper that cannot be used safely.
+        let force_sequence_capture = has_call_spread && self.has_scoped_transform_temp_scope();
+        let temporaries = if has_call_spread {
+            if force_sequence_capture {
+                Some([
+                    self.fresh_scoped_transform_atom()
+                        .expect("enabled optional-spread temp scope"),
+                    self.fresh_scoped_transform_atom()
+                        .expect("enabled optional-spread temp scope"),
+                ])
+            } else {
+                None
+            }
+        } else {
+            self.optional_chain_temporaries()
+        };
+        let spread_helper = if needs_spread_helper && temporaries.is_some() {
+            Some(self.spread_helper_atom())
+        } else {
+            None
+        };
+        wake_ecma_transform::lower_optional_chain(
+            self.arena,
+            self.interner,
+            spread_helper,
+            temporaries,
+            force_sequence_capture,
+            self.interner.intern("call"),
+            self.options.transform_features,
+            mode,
+            expression,
+        )
+    }
+
+    fn lower_parenthesized_optional_callee_expression(
+        &mut self,
+        expression: Expression<'a>,
+    ) -> Expression<'a> {
+        let temporaries = [
+            self.fresh_scoped_transform_atom()
+                .expect("enabled parenthesized optional-call temp scope"),
+            self.fresh_scoped_transform_atom()
+                .expect("enabled parenthesized optional-call temp scope"),
+        ];
+        let spread_helper = if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::Spread)
+            && wake_ecma_transform::has_call_spread(expression)
+        {
+            Some(self.spread_helper_atom())
+        } else {
+            None
+        };
+        wake_ecma_transform::lower_parenthesized_optional_callee(
+            self.arena,
+            self.interner,
+            spread_helper,
+            temporaries,
+            self.interner.intern("call"),
+            self.options.transform_features,
+            expression,
+        )
+    }
+
+    fn prepare_parenthesized_optional_callee(
+        &mut self,
+        expression: Expression<'a>,
+    ) -> (Expression<'a>, bool) {
+        if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+            && self.has_scoped_transform_temp_scope()
+        {
+            // Parentheses preserve a Member Reference when it is immediately invoked:
+            // `(obj?.method)()` must use `obj` as `this`, while a nullish base must still
+            // evaluate the outer arguments before throwing. Lower the inner chain to a
+            // forwarding callable rather than flattening the outer invocation into that chain.
+            (
+                self.lower_parenthesized_optional_callee_expression(expression),
+                false,
+            )
+        } else {
+            // A single-item sequence is emitted with parentheses in callee/tag position. It is
+            // used as an AST-level grouping marker for modern targets and conservative regions,
+            // whose optional syntax must remain native without merging the outer invocation.
+            (self.parenthesized_expression(expression), true)
+        }
+    }
+
+    fn ts_parenthesized_optional_invocation_ahead(&mut self) -> bool {
+        if !self.ts || !matches!(self.cur.kind, TokenKind::Bang | TokenKind::Lt) {
+            return false;
+        }
+        let checkpoint = self.checkpoint();
+        while self.at(TokenKind::Bang) && !self.newline_before() {
+            self.bump();
+        }
+        let follows = if matches!(
+            self.cur.kind,
+            TokenKind::LParen | TokenKind::TemplateNoSub | TokenKind::TemplateHead
+        ) {
+            true
+        } else if self.at(TokenKind::Lt) {
+            self.try_ts_type_arguments()
+        } else {
+            false
+        };
+        self.rewind(checkpoint);
+        follows
+    }
+
+    fn parenthesized_expression(&mut self, expression: Expression<'a>) -> Expression<'a> {
+        let mut expressions = self.new_vec::<Expression>();
+        expressions.push(expression);
+        Expression::Sequence(self.alloc(SequenceExpression {
+            span: expression.span(),
+            expressions,
+        }))
+    }
+
+    fn optional_chain_temporaries(&mut self) -> Option<[wake_common::Atom; 2]> {
+        if self.suppress_optional_chain_in_delete_cover {
+            return None;
+        }
+        if self.in_cover_paren
+            && self.at(TokenKind::RParen)
+            && matches!(
+                self.peek().kind,
+                TokenKind::LParen | TokenKind::TemplateNoSub | TokenKind::TemplateHead
+            )
+        {
+            // Defer `(chain?.member)(...)` until the cover has closed. Lowering the member to a
+            // lexical-IIFE value here would discard the Reference receiver before the parser can
+            // see that the parenthesized expression is immediately called.
+            return None;
+        }
+        if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::ArrowFunction)
+        {
+            Some([
+                self.fresh_scoped_transform_atom()?,
+                self.fresh_scoped_transform_atom()?,
+            ])
+        } else {
+            Some([self.fresh_transform_atom(), self.fresh_transform_atom()])
+        }
     }
 
     fn parse_member_property(&mut self) -> MemberProperty<'a> {
@@ -556,7 +980,19 @@ impl<'a, 'src> Parser<'a, 'src> {
                     flags,
                 }))
             }
-            TokenKind::TemplateNoSub | TokenKind::TemplateHead => self.parse_template_literal(),
+            TokenKind::TemplateNoSub | TokenKind::TemplateHead => {
+                let template = self.parse_template_literal();
+                if let Expression::TemplateLiteral(template) = template {
+                    wake_ecma_transform::lower_template(
+                        self.arena,
+                        self.interner,
+                        self.options.transform_features,
+                        template,
+                    )
+                } else {
+                    template
+                }
+            }
             TokenKind::Keyword(Keyword::True) => {
                 self.bump();
                 Expression::BooleanLiteral(self.alloc(BooleanLiteral { span, value: true }))
@@ -651,6 +1087,16 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     fn parse_array_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
+        // Raw assignment/for targets such as `[{a, ...rest}] = rhs` and
+        // `for ([a, ...rest] of values)` have no surrounding cover parens. Scan only for this
+        // array's matching `]` before parsing, so nested rest is not prematurely lowered as
+        // expression spread.
+        let previous_cover = self.in_cover_paren;
+        if !previous_cover
+            && self.delimited_expression_needs_cover(TokenKind::LBracket, TokenKind::RBracket)
+        {
+            self.in_cover_paren = true;
+        }
         self.bump(); // [
         let mut elements = self.new_vec::<Option<Expression>>();
         while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
@@ -677,14 +1123,76 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
         self.expect(TokenKind::RBracket);
-        Expression::Array(self.alloc(ArrayExpression {
+        self.in_cover_paren = previous_cover;
+        let array = self.alloc(ArrayExpression {
             span: self.span_to(lo),
             elements,
-        }))
+        });
+        // A spread-shaped element before `=` / a for-head `in` / `of` is rest, not array spread.
+        let destructuring_cover = self.at(TokenKind::Eq)
+            || (self.in_for_head_init
+                && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of)));
+        if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::Spread)
+            && !self.in_cover_paren
+            && !destructuring_cover
+            && array
+                .elements
+                .iter()
+                .any(|element| matches!(element, Some(Expression::Spread(_))))
+        {
+            let helper = self.spread_helper_atom();
+            wake_ecma_transform::lower_array_spread(
+                self.arena,
+                self.interner,
+                helper,
+                self.options.transform_features,
+                array,
+            )
+        } else {
+            Expression::Array(array)
+        }
+    }
+
+    fn delimited_expression_needs_cover(&mut self, open: TokenKind, close: TokenKind) -> bool {
+        let checkpoint = self.checkpoint();
+        let mut depth = 0usize;
+        loop {
+            if self.cur.kind == open {
+                depth += 1;
+            } else if self.cur.kind == close {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                self.bump();
+                if depth == 0 {
+                    break;
+                }
+                continue;
+            } else if self.at(TokenKind::Eof) {
+                break;
+            }
+            self.bump();
+        }
+        let followed = depth == 0
+            && (self.at(TokenKind::Eq)
+                || (self.in_for_head_init
+                    && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of))));
+        self.rewind(checkpoint);
+        followed
     }
 
     fn parse_object_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
+        let previous_cover = self.in_cover_paren;
+        if !previous_cover
+            && self.delimited_expression_needs_cover(TokenKind::LBrace, TokenKind::RBrace)
+        {
+            self.in_cover_paren = true;
+        }
         self.bump(); // {
         let mut properties = self.new_vec::<ObjectMember>();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -705,10 +1213,36 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
         self.expect(TokenKind::RBrace);
-        Expression::Object(self.alloc(ObjectExpression {
+        self.in_cover_paren = previous_cover;
+        let object = self.alloc(ObjectExpression {
             span: self.span_to(lo),
             properties,
-        }))
+        });
+        let destructuring_cover = self.at(TokenKind::Eq)
+            || (self.in_for_head_init
+                && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of)));
+        if self
+            .options
+            .transform_features
+            .contains(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
+            && !self.in_cover_paren
+            && !destructuring_cover
+            && object
+                .properties
+                .iter()
+                .any(|member| matches!(member, ObjectMember::Spread(_)))
+        {
+            let helper = self.object_spread_helper_atom();
+            wake_ecma_transform::lower_object_spread(
+                self.arena,
+                self.interner,
+                helper,
+                self.options.transform_features,
+                object,
+            )
+        } else {
+            Expression::Object(object)
+        }
     }
 
     fn parse_object_property(&mut self) -> &'a ObjectProperty<'a> {
@@ -749,15 +1283,29 @@ impl<'a, 'src> Parser<'a, 'src> {
                 key,
                 value: Expression::Function(func),
                 kind,
-                method: kind == PropertyKind::Init,
+                method: kind == PropertyKind::Init
+                    && (!wake_ecma_transform::lower_object_shorthand(
+                        self.options.transform_features,
+                    ) || wake_ecma_transform::object_method_uses_lexical_super(func)),
                 shorthand: false,
                 computed,
+                prototype_setter: false,
             });
         }
 
         // `key: value`
         if self.eat(TokenKind::Colon) {
             let value = self.with_allow_in(true, |p| p.parse_assignment_expression());
+            let prototype_setter = !computed
+                && match key {
+                    PropertyKey::Ident(ident) => self
+                        .interner
+                        .with_resolved(ident.name, |name| name == "__proto__"),
+                    PropertyKey::String(string) => self
+                        .interner
+                        .with_resolved(string.value, |name| name == "__proto__"),
+                    _ => false,
+                };
             return self.alloc(ObjectProperty {
                 span: self.span_to(lo),
                 key,
@@ -766,6 +1314,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 method: false,
                 shorthand: false,
                 computed,
+                prototype_setter,
             });
         }
 
@@ -794,8 +1343,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             value,
             kind: PropertyKind::Init,
             method: false,
-            shorthand: true,
+            shorthand: !wake_ecma_transform::lower_object_shorthand(
+                self.options.transform_features,
+            ),
             computed,
+            prototype_setter: false,
         })
     }
 
@@ -909,6 +1461,12 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     fn parse_cover_paren(&mut self) -> CoverParen<'a> {
         self.expect(TokenKind::LParen);
+        let previous_cover = self.in_cover_paren;
+        self.in_cover_paren = true;
+        // Until `=>` is seen these expressions may become parameter initializers. Keep their
+        // temporary registrations transactional by using a disabled child scope; a failed cover
+        // remains conservatively unlowered instead of leaking a binding into the parent scope.
+        self.push_transform_temp_scope(false);
         let mut items = self.new_vec::<Expression>();
         let mut rest: Option<&'a RestElement<'a>> = None;
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
@@ -938,6 +1496,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
         self.expect(TokenKind::RParen);
+        let _ = self.pop_transform_temp_scope();
+        self.in_cover_paren = previous_cover;
         CoverParen { items, rest }
     }
 
@@ -966,12 +1526,143 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Expression::NullLiteral(self.span_to(lo));
         }
         if n == 1 {
-            return cover.items[0];
+            let expression = self.lower_deferred_cover_spread(cover.items[0]);
+            if wake_ecma_transform::has_optional_chain(expression) {
+                self.preserve_optional_chain_tail = true;
+            }
+            return expression;
         }
+        let mut expressions = self.new_vec::<Expression>();
+        expressions.extend(
+            cover
+                .items
+                .iter()
+                .copied()
+                .map(|expression| self.lower_deferred_cover_spread(expression)),
+        );
         Expression::Sequence(self.alloc(SequenceExpression {
             span: self.span_to(lo),
-            expressions: cover.items,
+            expressions,
         }))
+    }
+
+    fn lower_deferred_cover_spread(&mut self, expression: Expression<'a>) -> Expression<'a> {
+        // Parenthesized destructuring (`([a, ...rest] = rhs)` / `({a, ...rest} = rhs)`) passes
+        // through cover grammar. At this point `=` is still unconsumed, so do not reinterpret rest
+        // as expression spread before the assignment pass sees the target.
+        if (self.at(TokenKind::Eq)
+            || (self.in_for_head_init
+                && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of))))
+            && wake_ecma_transform::is_destructuring_assignment_target(expression)
+        {
+            return expression;
+        }
+        match expression {
+            Expression::Assignment(assignment)
+                if assignment.operator == AssignmentOperator::Assign
+                    && wake_ecma_transform::destructuring_assignment_needs_lowering(
+                        self.options.transform_features,
+                        assignment.left,
+                    ) =>
+            {
+                self.lower_destructuring_assignment_expression(
+                    assignment.span,
+                    assignment.left,
+                    assignment.right,
+                )
+            }
+            Expression::Array(array)
+                if self
+                    .options
+                    .transform_features
+                    .contains(wake_ecma_transform::EcmaFeature::Spread)
+                    && array
+                        .elements
+                        .iter()
+                        .any(|element| matches!(element, Some(Expression::Spread(_)))) =>
+            {
+                let helper = self.spread_helper_atom();
+                wake_ecma_transform::lower_array_spread(
+                    self.arena,
+                    self.interner,
+                    helper,
+                    self.options.transform_features,
+                    array,
+                )
+            }
+            Expression::Object(object)
+                if self
+                    .options
+                    .transform_features
+                    .contains(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
+                    && object
+                        .properties
+                        .iter()
+                        .any(|member| matches!(member, ObjectMember::Spread(_))) =>
+            {
+                let helper = self.object_spread_helper_atom();
+                wake_ecma_transform::lower_object_spread(
+                    self.arena,
+                    self.interner,
+                    helper,
+                    self.options.transform_features,
+                    object,
+                )
+            }
+            _ => expression,
+        }
+    }
+
+    pub(crate) fn lower_destructuring_assignment_expression(
+        &mut self,
+        span: Span,
+        left: Expression<'a>,
+        right: Expression<'a>,
+    ) -> Expression<'a> {
+        if !wake_ecma_transform::destructuring_assignment_needs_lowering(
+            self.options.transform_features,
+            left,
+        ) {
+            return Expression::Assignment(self.alloc(AssignmentExpression {
+                span,
+                operator: AssignmentOperator::Assign,
+                left,
+                right,
+            }));
+        }
+
+        let temporary_count = wake_ecma_transform::destructuring_assignment_temporary_count(left);
+        let Some(temporaries) = (0..temporary_count)
+            .map(|_| self.fresh_scoped_transform_atom())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Expression::Assignment(self.alloc(AssignmentExpression {
+                span,
+                operator: AssignmentOperator::Assign,
+                left,
+                right,
+            }));
+        };
+
+        // Helpers are requested only after the entire scope-owned temporary set is available. This
+        // keeps parameter/cover/class/async-arrow conservative paths free of unused runtime code.
+        let iterator_helper = self.spread_helper_atom();
+        let object_helper = if wake_ecma_transform::assignment_target_has_object_rest(left) {
+            self.object_spread_helper_atom()
+        } else {
+            iterator_helper
+        };
+        wake_ecma_transform::lower_destructuring_assignment(
+            self.arena,
+            self.interner,
+            iterator_helper,
+            object_helper,
+            self.options.transform_features,
+            span,
+            left,
+            right,
+            &temporaries,
+        )
     }
 
     fn finish_arrow(&mut self, lo: u32, cover: CoverParen<'a>, is_async: bool) -> Expression<'a> {
@@ -1007,21 +1698,115 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.ctx.top_level = false;
 
         let body = if self.at(TokenKind::LBrace) {
-            ArrowBody::Block(self.parse_function_body())
+            ArrowBody::Block(self.parse_function_body_with_transform_temps(!is_async))
         } else {
-            ArrowBody::Expression(self.parse_assignment_expression())
+            // A concise arrow is an independent execution scope even when it occurs while an
+            // enclosing parenthesized cover is still being resolved. Clear only the inherited
+            // cover flag while parsing its body; the arrow's own parameter cover has already
+            // finished and remains conservative through its disabled transactional scope.
+            let previous_cover = self.in_cover_paren;
+            self.in_cover_paren = false;
+            // Async-arrow lowering is not available yet. Give it a disabled child scope so a
+            // temporary can neither be injected into nor leak out of the arrow.
+            self.push_transform_temp_scope(!is_async);
+            let expression = self.parse_assignment_expression();
+            let transform_temps = self.pop_transform_temp_scope();
+            self.in_cover_paren = previous_cover;
+            if let Some(declaration) = self.transform_temp_declaration(&transform_temps) {
+                let span = self.span_to(lo);
+                let mut statements = self.new_vec::<Statement>();
+                statements.push(declaration);
+                statements.push(Statement::Return(self.alloc(ReturnStatement {
+                    span,
+                    argument: Some(expression),
+                })));
+                ArrowBody::Block(self.alloc(FunctionBody {
+                    span,
+                    statements,
+                    strict: false,
+                }))
+            } else {
+                ArrowBody::Expression(expression)
+            }
         };
 
         self.ctx.in_async = saved_async;
         self.ctx.in_generator = saved_gen;
         self.ctx.top_level = saved_top;
 
-        Expression::Arrow(self.alloc(ArrowFunction {
+        let arrow = self.alloc(ArrowFunction {
             span: self.span_to(lo),
             params,
             body,
             is_async,
-        }))
+        });
+        let features = self.options.transform_features;
+        let needs_binding_lowering = arrow
+            .params
+            .iter()
+            .copied()
+            .any(|param| wake_ecma_transform::binding_pattern_needs_lowering(features, param));
+        let can_lower_async_binding_parameters = !arrow.is_async
+            || (!features.contains(wake_ecma_transform::EcmaFeature::ArrowFunction)
+                && !features.contains(wake_ecma_transform::EcmaFeature::AsyncAwait)
+                && !features.contains(wake_ecma_transform::EcmaFeature::FunctionParameters));
+        let needs_parameter_lowering = (features
+            .contains(wake_ecma_transform::EcmaFeature::FunctionParameters)
+            || needs_binding_lowering)
+            && can_lower_async_binding_parameters;
+        if needs_parameter_lowering
+            && matches!(
+                arrow.body,
+                ArrowBody::Block(body)
+                    if wake_ecma_transform::parameter_lowering_has_body_binding_conflict(
+                        features,
+                        &arrow.params,
+                        body,
+                    )
+            )
+        {
+            // Lowering the arrow syntax as well would still move its parameter expressions into
+            // the body. Keep the complete arrow before allocating parameter helpers/temps.
+            return Expression::Arrow(arrow);
+        }
+        let temporary_count = if needs_parameter_lowering {
+            wake_ecma_transform::complex_parameter_temporary_count_for_features(
+                features,
+                &arrow.params,
+            )
+        } else {
+            0
+        };
+        let iterator_helper = if needs_parameter_lowering
+            && wake_ecma_transform::complex_parameters_need_iterator_helper(features, &arrow.params)
+        {
+            self.spread_helper_atom()
+        } else {
+            self.interner.intern("__wake_unused_iterator_helper")
+        };
+        let object_helper = if needs_parameter_lowering
+            && arrow
+                .params
+                .iter()
+                .copied()
+                .any(wake_ecma_transform::pattern_has_object_rest)
+        {
+            self.object_spread_helper_atom()
+        } else {
+            iterator_helper
+        };
+        let parameter_temporaries = (0..temporary_count)
+            .map(|_| self.fresh_transform_atom())
+            .collect::<Vec<_>>();
+        wake_ecma_transform::lower_arrow(
+            self.arena,
+            self.interner,
+            iterator_helper,
+            object_helper,
+            &parameter_temporaries,
+            features,
+            arrow,
+        )
     }
 
     /// 把一个表达式重解释为绑定模式（cover grammar 转换）。

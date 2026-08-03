@@ -11,8 +11,7 @@ use wake_ecma_ast::{
     Expression, ModuleExportName, Pattern, Program, Statement, Visit, walk_expression,
     walk_statement,
 };
-use wake_ecma_parser::analyze;
-use wake_ecma_parser::semantic::{DeclKind, ScopeId, SemanticModel, Symbol, SymbolId};
+use wake_ecma_semantic::{DeclKind, ScopeId, SemanticModel, Symbol, SymbolId, analyze};
 
 /// Mangling plan: every identifier occurrence (decl + ref) that gets renamed, mapped to its new name.
 #[derive(Debug, Default)]
@@ -251,7 +250,7 @@ pub fn plan_mangle_with_model_and_protected(
 
     let mut new_name: Vec<Option<Atom>> = vec![None; model.symbols.len()];
     let mut ctx = AssignCtx {
-        model: &model,
+        model,
         scope_symbols: &scope_symbols,
         children: &children,
         candidates: &candidates,
@@ -297,7 +296,7 @@ fn is_renameable(sym: &Symbol, _exported_names: &FxHashSet<Atom>) -> bool {
 }
 
 struct AssignCtx<'a> {
-    model: &'a wake_ecma_parser::SemanticModel,
+    model: &'a SemanticModel,
     scope_symbols: &'a [Vec<SymbolId>],
     children: &'a [Vec<ScopeId>],
     candidates: &'a [Atom],

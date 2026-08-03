@@ -1,6 +1,6 @@
 //! # wake_css_in_js — 零运行时 CSS-in-JS（Linaria / wyw-in-js 子集）
 //!
-//! CRUSTIFY-PARITY §M5。把源码里的 `` css`...` `` 标签模板在**构建期**求值并抽取为静态 CSS，
+//! WAKE-COMPATIBILITY §M5。把源码里的 `` css`...` `` 标签模板在**构建期**求值并抽取为静态 CSS，
 //! 表达式本身替换为类名字符串字面量——运行时不含任何样式计算。
 //!
 //! ```js

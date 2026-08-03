@@ -1,6 +1,6 @@
 # Fixtures — 端到端打包用例
 
-> 约定来源：DESIGN §11、docs/TESTING.md §3。从 Phase 3（MVP 打包器）起填充。
+> 端到端测试约定见 [工程测试规范](../engineering/TESTING.md#3-必补回归矩阵)。
 
 ## 布局
 
@@ -28,6 +28,7 @@ fixtures/
 | `hello-esm` | 最小 ESM | 3 模块 ESM import/export 打包验证 |
 | `react-ts-app` | React 19 + TypeScript | 真实 React+TS 项目（npm 依赖） |
 | `react-ts-app-yarn-pnp` | Yarn PnP | 同上，使用 Yarn Plug'n'Play zip 依赖 |
+| `react-docs` | React 19+ 组件文档 | Wake 原生 MDX、Demo、Props API 与主题运行时 |
 | `2k-modules` | 合成压力测试 | 2000 模块二叉树 + 共享 util，用于跨工具性能对比 |
 
 ### `2k-modules` — 使用方式

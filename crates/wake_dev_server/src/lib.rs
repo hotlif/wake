@@ -13,7 +13,12 @@
 
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
@@ -21,8 +26,9 @@ use futures_util::StreamExt as _;
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::broadcast;
 
-use wake_bundler::{IncrementalBundler, ResolveOptions};
+use wake_bundler::{BuildRequest, BuildSession, IncrementalBundler, ResolveOptions};
 use wake_common::{Diagnostic, OsFileSystem};
+use wake_ecma_transform::TargetEnv;
 
 // —— 终端着色（tty + 非 NO_COLOR 时启用）——
 const RESET: &str = "\x1b[0m";
@@ -30,11 +36,13 @@ const RESET: &str = "\x1b[0m";
 #[derive(Clone, Copy)]
 struct Sty {
     color: bool,
+    quiet: bool,
 }
 impl Sty {
-    fn detect() -> Sty {
+    fn detect(quiet: bool) -> Sty {
         Sty {
             color: std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            quiet,
         }
     }
     fn p(&self, code: &str, s: &str) -> String {
@@ -92,7 +100,7 @@ struct BundleState {
     chunks: std::collections::HashMap<String, String>,
     /// 带外资源产物：`文件名 → 字节`（超阈值的图片/字体等）。
     assets: std::collections::HashMap<String, Vec<u8>>,
-    /// 最近一次构建的 Source Map V3 JSON（`None` = 未产出）。CRUSTIFY-PARITY §M4d。
+    /// 最近一次构建的 Source Map V3 JSON（`None` = 未产出）。WAKE-COMPATIBILITY §M4d。
     map: Option<String>,
     /// 若最近一次构建失败，格式化后的诊断文本；否则 `None`。
     error: Option<String>,
@@ -107,11 +115,24 @@ struct AppState {
     html: Arc<RwLock<String>>,
     /// 代理规则（已编译）；命中前缀的请求转发到后端 target。
     proxies: Arc<Vec<CompiledProxy>>,
-    /// `public/` 静态资源目录（对齐 crustify / Vite：原样映射到 URL 根）。
+    /// `public/` 静态资源目录（保持既定行为 / Vite：原样映射到 URL 根）。
     public_dir: PathBuf,
 }
 
-/// Dev server 选项（由 CLI 读 `wake.config.toml` 装配）。CRUSTIFY-PARITY §M3。
+/// 文件变化后、BuildSession 失效前运行的生成钩子。返回需要一并失效的生成文件。
+pub type BeforeRebuild =
+    Arc<dyn Fn(&[PathBuf]) -> Result<Vec<PathBuf>, String> + Send + Sync + 'static>;
+#[derive(Debug, Clone)]
+pub enum ServerEvent {
+    RebuildStart { changed_paths: Vec<PathBuf> },
+    Rebuilt { modules: usize, duration_ms: f64 },
+    Diagnostic { message: String },
+    Closed,
+}
+
+pub type EventHandler = Arc<dyn Fn(ServerEvent) + Send + Sync + 'static>;
+
+/// Dev server 选项（由 CLI 读 `wake.config.toml` 装配）。WAKE-COMPATIBILITY §M3。
 pub struct ServeOptions {
     /// 已由调用方解析完成的入口文件。
     pub entry: PathBuf,
@@ -123,8 +144,20 @@ pub struct ServeOptions {
     pub host: String,
     /// 启动后自动打开浏览器。
     pub open: bool,
-    /// 代理规则（转发匹配前缀的请求到后端 target，对齐 crustify `devServer.proxy`）。
+    /// 代理规则（转发匹配前缀的请求到后端 target，保持既定行为 `devServer.proxy`）。
     pub proxy: Vec<ProxyRule>,
+    /// 已由配置层解析并规范化的浏览器目标。
+    pub target_env: TargetEnv,
+    /// React automatic runtime 包名（`react`、`preact` 等）。
+    pub jsx_import_source: String,
+    /// 额外监听根目录；为空时保持普通应用的 `src/` 默认行为。
+    pub watch_roots: Vec<PathBuf>,
+    /// 文档/扫描模块等生成步骤，在 BuildSession 失效之前执行。
+    pub before_rebuild: Option<BeforeRebuild>,
+    /// Suppress terminal presentation; library frontends should enable this.
+    pub quiet: bool,
+    /// Optional structured event sink used by library frontends.
+    pub event_handler: Option<EventHandler>,
 }
 
 impl Default for ServeOptions {
@@ -136,11 +169,17 @@ impl Default for ServeOptions {
             host: "127.0.0.1".to_string(),
             open: false,
             proxy: Vec::new(),
+            target_env: TargetEnv::default(),
+            jsx_import_source: "react".to_string(),
+            watch_roots: Vec::new(),
+            before_rebuild: None,
+            quiet: false,
+            event_handler: None,
         }
     }
 }
 
-/// 一条代理规则（对齐 crustify `Proxy`）。
+/// 一条代理规则（保持既定行为 `Proxy`）。
 #[derive(Clone)]
 pub struct ProxyRule {
     /// 匹配的路径前缀（如 `["/api"]`）。
@@ -155,6 +194,16 @@ pub struct ProxyRule {
 
 /// 启动 dev server（阻塞直到进程退出）。`root` 为项目根，`port` 为监听端口，`options` 见 [`ServeOptions`]。
 pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<()> {
+    start(root, port, options)?.wait()
+}
+
+fn run_server(
+    root: &Path,
+    port: u16,
+    options: ServeOptions,
+    started_tx: mpsc::Sender<Result<StartedServer, String>>,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     let ServeOptions {
         entry,
         resolve_options,
@@ -162,6 +211,12 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
         host,
         open,
         proxy,
+        target_env,
+        jsx_import_source,
+        watch_roots,
+        before_rebuild,
+        quiet,
+        event_handler,
     } = options;
     // 编译代理规则（pathRewrite 正则一次编译）。非法正则跳过并告警。
     let proxies: Vec<CompiledProxy> = proxy
@@ -182,7 +237,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     }
     let html = Arc::new(RwLock::new(load_html_template(&root)));
 
-    let sty = Sty::detect();
+    let sty = Sty::detect(quiet);
     let bundle = Arc::new(RwLock::new(BundleState {
         js: String::new(),
         chunks: std::collections::HashMap::new(),
@@ -193,24 +248,28 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     let (tx, _rx) = broadcast::channel::<String>(64);
 
     // 品牌行保持克制；运行状态与构建数据在首次构建结束后统一展示。
-    println!();
-    println!(
-        "  {}  {} {} {}  {}",
-        sty.warn("⚡"),
-        sty.brand("wake"),
-        sty.dim("/"),
-        sty.bold("dev"),
-        sty.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-    );
+    if !sty.quiet {
+        println!();
+        println!(
+            "  {}  {} {} {}  {}",
+            sty.warn("⚡"),
+            sty.brand("wake"),
+            sty.dim("/"),
+            sty.bold("dev"),
+            sty.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        );
+    }
 
     // —— 监听线程：独占 bundler，负责首次构建 + 增量重建 + 广播 ——
     let (ready_tx, ready_rx) = mpsc::channel::<Option<BuildSummary>>();
-    {
+    let watcher_stop = Arc::clone(&stop);
+    let watcher_join = {
         let bundle = bundle.clone();
         let tx = tx.clone();
         let html = html.clone();
         let entry = entry.clone();
         let watch_root = root.clone();
+        let watcher_events = event_handler.clone();
         std::thread::Builder::new()
             .name("wake-dev-watch".into())
             .spawn(move || {
@@ -224,10 +283,16 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
                     sty,
                     resolve_options,
                     define,
+                    target_env,
+                    jsx_import_source,
+                    watch_roots,
+                    before_rebuild,
+                    watcher_stop,
+                    watcher_events,
                 );
             })
-            .expect("spawn watcher thread");
-    }
+            .expect("spawn watcher thread")
+    };
     // 等首次构建完成再开始服务（保证第一屏有产物）。
     let summary = ready_rx.recv().ok().flatten();
 
@@ -239,47 +304,49 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     };
     let url = format!("http://{display_host}:{port}/");
 
-    if let Some(summary) = &summary {
-        println!();
-        println!(
-            "  {}  {}",
-            sty.ok("●"),
-            sty.bold(&format!("Ready in {}", summary.duration))
-        );
-    }
-
-    println!();
-    println!("     {}  {}", sty.dim("Local"), sty.accent(&url));
-
-    if let Some(summary) = summary {
-        println!();
-        println!(
-            "     {}   {}   {}",
-            sty.accent(&format!("{} modules", summary.modules)),
-            sty.dim(&format!("{} chunks", summary.chunks)),
-            sty.dim(&format!("{} assets", summary.assets))
-        );
-        println!(
-            "     {}",
-            sty.dim("HMR on  ·  source maps on  ·  watching for changes")
-        );
-    }
-
-    if !proxies.is_empty() {
-        println!();
-        for p in &proxies {
+    if !sty.quiet {
+        if let Some(summary) = &summary {
+            println!();
             println!(
-                "     {}  {} {} {}",
-                sty.dim("Proxy"),
-                sty.dim(&p.context.join(",")),
-                sty.accent("→"),
-                sty.accent(&p.target)
+                "  {}  {}",
+                sty.ok("●"),
+                sty.bold(&format!("Ready in {}", summary.duration))
             );
         }
+
+        println!();
+        println!("     {}  {}", sty.dim("Local"), sty.accent(&url));
+
+        if let Some(summary) = summary {
+            println!();
+            println!(
+                "     {}   {}   {}",
+                sty.accent(&format!("{} modules", summary.modules)),
+                sty.dim(&format!("{} chunks", summary.chunks)),
+                sty.dim(&format!("{} assets", summary.assets))
+            );
+            println!(
+                "     {}",
+                sty.dim("HMR on  ·  source maps on  ·  watching for changes")
+            );
+        }
+
+        if !proxies.is_empty() {
+            println!();
+            for p in &proxies {
+                println!(
+                    "     {}  {} {} {}",
+                    sty.dim("Proxy"),
+                    sty.dim(&p.context.join(",")),
+                    sty.accent("→"),
+                    sty.accent(&p.target)
+                );
+            }
+        }
+        println!();
+        println!("     {}", sty.dim("Press Ctrl+C to stop"));
+        println!();
     }
-    println!();
-    println!("     {}", sty.dim("Press Ctrl+C to stop"));
-    println!();
 
     // 自动打开浏览器（启动后）。
     if open {
@@ -293,24 +360,49 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
         proxies: Arc::new(proxies),
         public_dir: root.join("public"),
     });
-    actix_web::rt::System::new().block_on(async move {
-        HttpServer::new(move || {
-            App::new()
-                .app_data(data.clone())
-                // 放宽负载上限，便于代理转发较大的 POST 请求体。
-                .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
-                .route("/bundle.js", web::get().to(serve_bundle))
-                .route("/bundle.js.map", web::get().to(serve_bundle_map))
-                .route("/__wake/client.js", web::get().to(serve_client))
-                .route("/__wake_hmr", web::get().to(ws_handler))
-                // 默认服务：先试代理转发（任意方法），未命中且为 GET 则回退 SPA HTML。
-                .default_service(web::to(serve_default))
-        })
-        .bind((host.as_str(), port))?
-        .workers(2)
-        .run()
-        .await
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(data.clone())
+            // 放宽负载上限，便于代理转发较大的 POST 请求体。
+            .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+            .route("/bundle.js", web::get().to(serve_bundle))
+            .route("/bundle.js.map", web::get().to(serve_bundle_map))
+            .route("/__wake/client.js", web::get().to(serve_client))
+            .route("/__wake_hmr", web::get().to(ws_handler))
+            // 默认服务：先试代理转发（任意方法），未命中且为 GET 则回退 SPA HTML。
+            .default_service(web::to(serve_default))
     })
+    .bind((host.as_str(), port));
+    let server = match server {
+        Ok(server) => server.workers(2).run(),
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            let _ = watcher_join.join();
+            return Err(error);
+        }
+    };
+    let handle = server.handle();
+    if started_tx
+        .send(Ok(StartedServer {
+            url: url.clone(),
+            handle: handle.clone(),
+        }))
+        .is_err()
+    {
+        stop.store(true, Ordering::Release);
+        actix_web::rt::System::new().block_on(handle.stop(false));
+        let _ = watcher_join.join();
+        return Err(std::io::Error::other(
+            "Wake dev server startup receiver was dropped",
+        ));
+    }
+    let result = actix_web::rt::System::new().block_on(server);
+    stop.store(true, Ordering::Release);
+    let _ = watcher_join.join();
+    if let Some(handler) = event_handler {
+        handler(ServerEvent::Closed);
+    }
+    result
 }
 
 /// 已编译的代理规则（pathRewrite 正则预编译）。
@@ -381,12 +473,19 @@ fn watch_and_rebuild(
     sty: Sty,
     resolve_options: ResolveOptions,
     define: Vec<(String, String)>,
+    target_env: TargetEnv,
+    jsx_import_source: String,
+    watch_roots: Vec<PathBuf>,
+    before_rebuild: Option<BeforeRebuild>,
+    stop: Arc<AtomicBool>,
+    event_handler: Option<EventHandler>,
 ) {
     let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
     // 别名（@/@@）+ define（dev 口径）须在首次 build 前设置，dev 与 build 一致。
     bundler.set_resolve_options(resolve_options);
     bundler.set_define(define);
-    // dev 走非 minify 单包路径 → 可产出精确 sourcemap（CRUSTIFY-PARITY §M4d）。
+    bundler.set_target_env(target_env);
+    // dev 走非 minify 单包路径 → 可产出精确 sourcemap（WAKE-COMPATIBILITY §M4d）。
     bundler.enable_sourcemap();
     // 零运行时 CSS-in-JS（§M5）：dev 不抽取 `.css`，抽出的样式随模块体 `<style>` 注入，
     // 与 `.css` 模块的 dev 行为一致。项目未用 Linaria 时零开销。
@@ -395,25 +494,55 @@ fn watch_and_rebuild(
     // 懒加载模块被内联进单包（能跑但不懒加载），与生产产物结构不一致、掩盖分割相关问题。
     bundler.enable_code_splitting();
     // JSX **dev runtime**：`jsxDEV` 携带 `{fileName,lineNumber,columnNumber}`，
-    // React DevTools 借此显示组件栈、报错能定位到源文件行列（对齐 crustify 的 dev 口径）。
+    // React DevTools 借此显示组件栈、报错能定位到源文件行列（保持既定行为 的 dev 口径）。
     // 该口径已混入 `content_key`，与 prod 的模块摘要缓存互不干扰。
-    bundler.set_jsx_runtime(true, "react");
+    bundler.set_jsx_runtime(true, Box::leak(jsx_import_source.into_boxed_str()));
+    let mut session = BuildSession::from_incremental(bundler);
     // 首次构建。
-    let summary = rebuild(&mut bundler, &entry, &bundle, &tx, true, sty);
+    let summary = rebuild(
+        &mut session,
+        &entry,
+        &bundle,
+        &tx,
+        true,
+        sty,
+        event_handler.as_ref(),
+    );
     let _ = ready_tx.send(summary);
 
-    // notify：源码与 public 分开监听，避免递归监听整个项目带来的 node_modules/dist 噪声。
-    let watch_dir = {
+    // 普通应用默认监听 src；文档模式可提供 docs/src 等多个根目录。
+    let default_watch_dir = {
         let src = root.join("src");
         if src.is_dir() { src } else { root.clone() }
     };
-    let (evt_tx, evt_rx) = mpsc::channel::<()>();
+    let mut watch_targets: Vec<(PathBuf, RecursiveMode)> = if watch_roots.is_empty() {
+        vec![(default_watch_dir.clone(), RecursiveMode::Recursive)]
+    } else {
+        watch_roots
+            .into_iter()
+            .filter_map(|path| {
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                };
+                if path.is_dir() {
+                    Some((path, RecursiveMode::Recursive))
+                } else {
+                    path.parent()
+                        .map(|parent| (parent.to_path_buf(), RecursiveMode::NonRecursive))
+                }
+            })
+            .collect()
+    };
+    let (evt_tx, evt_rx) = mpsc::channel::<(Vec<PathBuf>, bool)>();
     let mut watcher =
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res
                 && is_source_event(&ev)
             {
-                let _ = evt_tx.send(());
+                let structural = is_structural_event(&ev);
+                let _ = evt_tx.send((ev.paths, structural));
             }
         }) {
             Ok(w) => w,
@@ -422,37 +551,81 @@ fn watch_and_rebuild(
                 return;
             }
         };
-    if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
-        eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), watch_dir.display());
-        return;
-    }
     let public_dir = root.join("public");
-    if public_dir.is_dir()
-        && public_dir != watch_dir
-        && let Err(e) = watcher.watch(&public_dir, RecursiveMode::Recursive)
-    {
-        eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), public_dir.display());
-        return;
+    if public_dir.is_dir() {
+        watch_targets.push((public_dir, RecursiveMode::Recursive));
     }
-    // 同时支持位于项目根的 `index.html`，仅监听根目录本身，不递归进入依赖与产物目录。
-    if root != watch_dir
-        && let Err(e) = watcher.watch(&root, RecursiveMode::NonRecursive)
-    {
-        eprintln!("  {} 无法监听 {}：{e}", sty.err("✗"), root.display());
-        return;
-    }
-    loop {
-        // 阻塞等第一个事件。
-        if evt_rx.recv().is_err() {
-            break;
+    watch_targets.push((root.clone(), RecursiveMode::NonRecursive));
+    watch_targets.sort_by(|left, right| left.0.cmp(&right.0));
+    watch_targets.dedup_by(|left, right| left.0 == right.0);
+    for (watch_dir, mode) in watch_targets {
+        if let Err(error) = watcher.watch(&watch_dir, mode) {
+            eprintln!(
+                "  {} 无法监听 {}：{error}",
+                sty.err("✗"),
+                watch_dir.display()
+            );
+            return;
         }
+    }
+    while !stop.load(Ordering::Acquire) {
+        let (mut changed, mut structural) = match evt_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         // 落盘沉降：给 OS 少许时间完成写入（避免读到未 flush 的旧内容），
         // 再排空同批事件直到 20ms 静默（防抖）。
         std::thread::sleep(Duration::from_millis(30));
-        while evt_rx.recv_timeout(Duration::from_millis(20)).is_ok() {}
+        while let Ok((paths, event_structural)) = evt_rx.recv_timeout(Duration::from_millis(20)) {
+            changed.extend(paths);
+            structural |= event_structural;
+        }
+        changed.sort();
+        changed.dedup();
+        if let Some(handler) = &event_handler {
+            handler(ServerEvent::RebuildStart {
+                changed_paths: changed.clone(),
+            });
+        }
+        if let Some(regenerate) = &before_rebuild {
+            match regenerate(&changed) {
+                Ok(mut generated) => {
+                    structural |= !generated.is_empty();
+                    changed.append(&mut generated);
+                    changed.sort();
+                    changed.dedup();
+                }
+                Err(error) => {
+                    {
+                        let mut state = bundle.write().unwrap();
+                        state.error = Some(error.clone());
+                    }
+                    if !sty.quiet {
+                        eprintln!("  {} 生成步骤失败：{error}", sty.err("✗"));
+                    }
+                    if let Some(handler) = &event_handler {
+                        handler(ServerEvent::Diagnostic {
+                            message: error.clone(),
+                        });
+                    }
+                    let _ = tx.send(msg_error(&error));
+                    continue;
+                }
+            }
+        }
         // HTML 外壳不经过 bundler，必须在通知浏览器刷新前单独刷新共享模板。
         *html.write().unwrap() = load_html_template(&root);
-        let _ = rebuild(&mut bundler, &entry, &bundle, &tx, false, sty);
+        session.invalidate_paths(&changed, structural);
+        let _ = rebuild(
+            &mut session,
+            &entry,
+            &bundle,
+            &tx,
+            false,
+            sty,
+            event_handler.as_ref(),
+        );
     }
 }
 
@@ -469,6 +642,15 @@ fn is_source_event(ev: &notify::Event) -> bool {
     })
 }
 
+fn is_structural_event(ev: &notify::Event) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+    matches!(
+        ev.kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
 /// 触发重建的扩展名。
 ///
 /// 图片与字体必须在内：它们既可能被 JS `import`，也可能被 CSS 的 `url()` 引用，两条路径
@@ -477,6 +659,8 @@ fn is_watched_ext(e: &str) -> bool {
     matches!(
         e,
         "ts" | "tsx"
+            | "md"
+            | "mdx"
             | "js"
             | "jsx"
             | "mts"
@@ -506,16 +690,18 @@ fn is_watched_ext(e: &str) -> bool {
 
 /// 执行一次（增量）构建并更新共享状态 + 广播 HMR 事件。
 fn rebuild(
-    bundler: &mut IncrementalBundler,
+    session: &mut BuildSession,
     entry: &Path,
     bundle: &Arc<RwLock<BundleState>>,
     tx: &broadcast::Sender<String>,
     first: bool,
     sty: Sty,
+    event_handler: Option<&EventHandler>,
 ) -> Option<BuildSummary> {
     let t = Instant::now();
-    let out = bundler.build(entry);
-    let dur = human_dur(t.elapsed());
+    let out = session.build_current_ref(BuildRequest::new(entry));
+    let elapsed = t.elapsed();
+    let dur = human_dur(elapsed);
     let sep = sty.dim("·");
     if out.has_errors() {
         let errs = out.diagnostics.iter().filter(|d| d.is_error()).count();
@@ -524,14 +710,21 @@ fn rebuild(
             let mut s = bundle.write().unwrap();
             s.error = Some(err.clone());
         }
-        eprintln!(
-            "  {}  {}  {sep}  {}",
-            sty.err("✗"),
-            sty.bold("构建失败"),
-            sty.err(&format!("{errs} 个错误"))
-        );
-        for line in err.lines() {
-            eprintln!("    {}", sty.dim(line));
+        if !sty.quiet {
+            eprintln!(
+                "  {}  {}  {sep}  {}",
+                sty.err("✗"),
+                sty.bold("构建失败"),
+                sty.err(&format!("{errs} 个错误"))
+            );
+            for line in err.lines() {
+                eprintln!("    {}", sty.dim(line));
+            }
+        }
+        if let Some(handler) = event_handler {
+            handler(ServerEvent::Diagnostic {
+                message: err.clone(),
+            });
         }
         let _ = tx.send(msg_error(&err));
         None
@@ -570,7 +763,7 @@ fn rebuild(
             s.map = map;
             s.error = None;
         }
-        if !first {
+        if !first && !sty.quiet {
             eprintln!(
                 "  {}  {}  {sep}  {}  {sep}  {}",
                 sty.ok("✓"),
@@ -581,6 +774,12 @@ fn rebuild(
         }
         if !first {
             let _ = tx.send(r#"{"type":"reload"}"#.to_string());
+            if let Some(handler) = event_handler {
+                handler(ServerEvent::Rebuilt {
+                    modules: out.module_count,
+                    duration_ms: elapsed.as_secs_f64() * 1000.0,
+                });
+            }
         }
         Some(summary)
     }
@@ -637,7 +836,7 @@ async fn serve_html(data: web::Data<AppState>) -> HttpResponse {
 /// ① 代理前缀（任意方法）→ 转发后端；
 /// ② 分割产生的 async/shared **chunk**（按文件名）；
 /// ③ 带外**资源产物**（超阈值图片/字体等）；
-/// ④ **`public/` 静态文件**（对齐 crustify / Vite，原样映射到 URL 根）；
+/// ④ **`public/` 静态文件**（保持既定行为 / Vite，原样映射到 URL 根）；
 /// ⑤ SPA 回退 —— **仅当路径不像文件时**。
 ///
 /// ⑤ 的限定是关键：此前任何未知 GET 都返回 HTML，于是 `/logo.png`、`/a.chunk.js` 一律拿到
@@ -1055,4 +1254,114 @@ mod static_serving_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+struct StartedServer {
+    url: String,
+    handle: actix_web::dev::ServerHandle,
+}
+
+struct ServerInner {
+    url: String,
+    handle: actix_web::dev::ServerHandle,
+    stop: Arc<AtomicBool>,
+    join: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
+    closed: AtomicBool,
+}
+
+#[derive(Clone)]
+pub struct ServerHandle {
+    inner: Arc<ServerInner>,
+}
+
+impl ServerHandle {
+    pub fn url(&self) -> &str {
+        &self.inner.url
+    }
+
+    /// Request shutdown without joining worker threads. Safe for language-runtime finalizers.
+    pub fn request_close(&self) {
+        self.inner.stop.store(true, Ordering::Release);
+        if !self.inner.closed.swap(true, Ordering::AcqRel) {
+            let handle = self.inner.handle.clone();
+            if std::thread::Builder::new()
+                .name("wake-dev-shutdown".to_string())
+                .spawn(move || {
+                    actix_web::rt::System::new().block_on(handle.stop(false));
+                })
+                .is_err()
+            {
+                self.inner.closed.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    pub fn close(&self) -> std::io::Result<()> {
+        if !self.inner.closed.swap(true, Ordering::AcqRel) {
+            self.inner.stop.store(true, Ordering::Release);
+            actix_web::rt::System::new().block_on(self.inner.handle.stop(true));
+        }
+        self.join()
+    }
+
+    pub fn wait(&self) -> std::io::Result<()> {
+        self.join()
+    }
+
+    fn join(&self) -> std::io::Result<()> {
+        let mut join = self
+            .inner
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match join.take() {
+            Some(join) => join
+                .join()
+                .map_err(|_| std::io::Error::other("Wake dev server thread panicked"))?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ServerInner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let handle = self.handle.clone();
+            let _ = std::thread::Builder::new()
+                .name("wake-dev-shutdown".to_string())
+                .spawn(move || {
+                    actix_web::rt::System::new().block_on(handle.stop(false));
+                });
+        }
+    }
+}
+
+pub fn start(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<ServerHandle> {
+    let root = root.to_path_buf();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let (started_tx, started_rx) = mpsc::channel();
+    let error_tx = started_tx.clone();
+    let join = std::thread::Builder::new()
+        .name("wake-dev-server".to_string())
+        .spawn(move || {
+            let result = run_server(&root, port, options, started_tx, thread_stop);
+            if let Err(error) = &result {
+                let _ = error_tx.send(Err(error.to_string()));
+            }
+            result
+        })?;
+    let started = started_rx
+        .recv()
+        .map_err(|_| std::io::Error::other("Wake dev server exited during startup"))?
+        .map_err(std::io::Error::other)?;
+    Ok(ServerHandle {
+        inner: Arc::new(ServerInner {
+            url: started.url,
+            handle: started.handle,
+            stop,
+            join: Mutex::new(Some(join)),
+            closed: AtomicBool::new(false),
+        }),
+    })
 }

@@ -91,7 +91,7 @@ fn minify_uses_dot_access_for_identifier_export_names() {
 
 #[test]
 fn set_define_dev_replaces_node_env() {
-    // dev 口径：set_define 覆盖默认 prod，`process.env.NODE_ENV` → `"development"`（CRUSTIFY-PARITY §M3）。
+    // dev 口径：set_define 覆盖默认 prod，`process.env.NODE_ENV` → `"development"`（WAKE-COMPATIBILITY §M3）。
     let fs =
         MemoryFileSystem::from_files([("src/index.js", "export const m = process.env.NODE_ENV;")]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
@@ -111,7 +111,7 @@ fn set_define_dev_replaces_node_env() {
 
 #[test]
 fn css_extraction_and_asset_threshold() {
-    // prod：CSS 抽取为独立 `.css`（不注入 <style>）+ 超阈值资源独立产物（CRUSTIFY-PARITY §M3）。
+    // prod：CSS 抽取为独立 `.css`（不注入 <style>）+ 超阈值资源独立产物（WAKE-COMPATIBILITY §M3）。
     let big = "X".repeat(5000);
     let files: Vec<(String, String)> = vec![
         (
@@ -578,6 +578,2399 @@ fn typescript_project_erases_types() {
 }
 
 #[test]
+fn browserslist_target_lowers_exponentiation() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const base = 2; console.log(base ** 3);",
+    )]));
+    let mut old = IncrementalBundler::new(fs.clone());
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "49"),
+    ]));
+    let lowered = old.build(Path::new("src/index.js"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(
+        lowered.bundle.contains("Math.pow(base, 3)"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(!lowered.bundle.contains("base**3"), "{}", lowered.bundle);
+
+    let mut modern = IncrementalBundler::new(fs);
+    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let preserved = modern.build(Path::new("src/index.js"));
+    assert!(!preserved.has_errors(), "{:?}", preserved.diagnostics);
+    assert!(
+        preserved.bundle.contains("base ** 3"),
+        "{}",
+        preserved.bundle
+    );
+}
+
+#[test]
+fn browserslist_target_lowers_safe_nullish_and_logical_assignments() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let a; let b = a ?? 2; a ||= 3; a &&= 4; a ??= 5; export { a, b };",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "49"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("??"), "{}", out.bundle);
+    assert!(!out.bundle.contains("||="), "{}", out.bundle);
+    assert!(!out.bundle.contains("&&="), "{}", out.bundle);
+    assert!(out.bundle.contains("a !== null"), "{}", out.bundle);
+}
+
+#[test]
+fn browserslist_target_lowers_array_call_and_new_spread() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const iterable=new Set([2,3]); \
+         const values=[1,...iterable,4]; \
+         const receiver={base:10,add(a,b,c,d){return this.base+a+b+c+d}}; \
+         const called=receiver.add(...values); \
+         let receiverCalls=0,keyCalls=0; \
+         function getReceiver(){receiverCalls++;return receiver} \
+         function getKey(){keyCalls++;return 'add'} \
+         const complex=getReceiver()[getKey()](...values); \
+         function Box(a,b,c,d){this.total=a+b+c+d} \
+         const built=new Box(...values); \
+         let closed=false; \
+         const bad={ [Symbol.iterator](){return {next(){return {done:false,get value(){throw Error('stop')}}},return(){closed=true;return {done:true}}}}}; \
+         try{[...bad]}catch(error){} \
+         export {values,called,complex,receiverCalls,keyCalls,built,closed};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("..."), "{}", out.bundle);
+    assert!(!out.bundle.contains("Array.from"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("Symbol.iterator")
+            && out.bundle.contains("value.slice(0, limit)")
+            && out.bundle.contains("(iterable)"),
+        "iterator helper must be injected and used: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains(".add") && out.bundle.contains(".apply(__wake_t"),
+        "method receiver and function value must be captured: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("Function.prototype.bind.apply"),
+        "constructor spread must use bind/apply: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_spread_transform_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?}); \
+         if(JSON.stringify(r.values)!=='[1,2,3,4]'||r.called!==20||r.complex!==20||r.receiverCalls!==1||r.keyCalls!==1||r.built.total!==10||!r.closed)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn super_member_spread_preserves_receiver_order_and_direct_super_call() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const order=[]; \
+         function key(){order.push('key');return 'collect'} \
+         const iterable={\
+           [Symbol.iterator](){\
+             order.push('iterator');let index=0;\
+             return {next(){order.push('next'+index);return index<2?{done:false,value:++index}:{done:true}}}\
+           }\
+         };\
+         class Base {\
+           constructor(value){this.base=value}\
+           collect(a,b){order.push('call');return [this.base,a,b,this instanceof Derived]}\
+         }\
+         class Derived extends Base {\
+           constructor(...args){super(...args)}\
+           simple(args){return super.collect(...args)}\
+           computed(){return super[key()](...iterable)}\
+         }\
+         const value=new Derived(10);\
+         const simple=value.simple([3,4]);\
+         order.length=0;\
+         const computed=value.computed();\
+         export {simple,computed,order};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains("super.collect.apply(this"),
+        "simple super member call must use lexical this: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("super[key()].apply(this"),
+        "computed super member call must use lexical this: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("super(...args)"),
+        "direct super spread must remain syntactic until class lowering: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("super.apply"),
+        "direct super spread must never become super.apply: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_super_spread_transform_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});\
+         if(JSON.stringify(r.simple)!=='[10,3,4,true]'||\
+            JSON.stringify(r.computed)!=='[10,1,2,true]'||\
+            JSON.stringify(r.order)!=='[\"key\",\"iterator\",\"next0\",\"next1\",\"next2\",\"call\"]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "super spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn optional_calls_with_spread_short_circuit_and_preserve_receiver() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let iterations=0,receiverCalls=0; \
+         const args={ [Symbol.iterator](){let done=false;return {next(){iterations++;if(done)return {done:true};done=true;return {done:false,value:4}}}}}; \
+         const missing=null; const skipped=missing?.(...args); \
+         const receiver={base:3,method(value){return this.base+value}}; \
+         function getReceiver(){receiverCalls++;return receiver} \
+         const result=getReceiver().method?.(...args); \
+         export {skipped,result,iterations,receiverCalls};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    // Chrome 45 supports arrows, but still needs spread and optional-chaining lowering.
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "45"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(!out.bundle.contains("...args"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_optional_spread_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.skipped!==undefined||r.result!==7||r.iterations!==2||r.receiverCalls!==1)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "optional spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn variable_destructuring_lowers_nested_defaults_and_array_rest() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let rhsCalls=0,nestedGets=0; \
+         function source(){rhsCalls++;return {a:2,get nested(){nestedGets++;return {b:undefined}}}} \
+         const {a,nested:{b=5}}=source(); \
+         const iterable=new Set([10,20,30,40]); \
+         const [first,,third,...tail]=iterable; \
+         export {a,b,first,third,tail,rhsCalls,nestedGets};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("const {"), "{}", out.bundle);
+    assert!(!out.bundle.contains("const ["), "{}", out.bundle);
+    assert!(out.bundle.contains("Symbol.iterator"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_destructuring_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.a!==2||r.b!==5||r.first!==10||r.third!==30||JSON.stringify(r.tail)!=='[40]'||r.rhsCalls!==1||r.nestedGets!==1)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "destructuring runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn destructuring_materializes_only_needed_iterator_values() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const log=[];
+        function tracked(name,values){
+          return {[Symbol.iterator](){
+            log.push(name+":iterator");
+            let index=0;
+            return {
+              next(){
+                log.push(name+":next"+index);
+                return index<values.length
+                  ? {done:false,value:values[index++]}
+                  : {done:true};
+              },
+              return(){log.push(name+":return");return {done:true}}
+            };
+          }};
+        }
+        const []=tracked("empty",[1]);
+        const [,second,third=30]=tracked("limited",[10,20,undefined,40]);
+        const [head,...tail]=tracked("rest",[1,2,3]);
+        let assigned;
+        [assigned]=tracked("assignment",[9,10]);
+        let generatorClosed=false,generatorYieldedSecond=false;
+        function* generated(){try{yield 11;generatorYieldedSecond=true;yield 12}finally{generatorClosed=true}}
+        const [generatedFirst]=generated();
+        const [unicodeFirst]="😀x";
+        const originalSymbol=Symbol;
+        global.Symbol=undefined;
+        const [unicodeFallback]="😀x";
+        global.Symbol=originalSymbol;
+        let arrayTailReads=0;
+        const arrayValue=[4];
+        Object.defineProperty(arrayValue,1,{get(){arrayTailReads++;return 5}});
+        const [arrayFirst]=arrayValue;
+        const [...[nestedFirst,nestedSecond]]=tracked("nested",[6,7,8]);
+        export {log,second,third,head,tail,assigned,generatorClosed,generatorYieldedSecond,generatedFirst,unicodeFirst,unicodeFallback,arrayFirst,arrayTailReads,nestedFirst,nestedSecond};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("(value, limit)"), "{}", out.bundle);
+    assert!(out.bundle.contains(", 0)"), "{}", out.bundle);
+    assert!(out.bundle.contains(", 3)"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_destructuring_iterator_limit_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        r#"const r=require({:?});
+        const expected=["empty:iterator","empty:return","limited:iterator","limited:next0","limited:next1","limited:next2","limited:return","rest:iterator","rest:next0","rest:next1","rest:next2","rest:next3","assignment:iterator","assignment:next0","assignment:return","nested:iterator","nested:next0","nested:next1","nested:next2","nested:next3"];
+        if(JSON.stringify(r.log)!==JSON.stringify(expected)||r.second!==20||r.third!==30||r.head!==1||JSON.stringify(r.tail)!=='[2,3]'||r.assigned!==9||!r.generatorClosed||r.generatorYieldedSecond||r.generatedFirst!==11||r.unicodeFirst!=="😀"||r.unicodeFallback!=="😀"||r.arrayFirst!==4||r.arrayTailReads!==0||r.nestedFirst!==6||r.nestedSecond!==7)process.exit(2);"#,
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "limited destructuring runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn complex_destructuring_parameters_lower_in_functions_and_methods() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "function sum({a,nested:{b=2}}={a:1,nested:{}},[first,...rest]=[3,4,5]){return a+b+first+rest.length} \
+         const object={method({value}){return value*2}}; \
+         const direct=sum({a:10,nested:{}},new Set([20,30,40])); \
+         const defaults=sum(); \
+         const method=object.method({value:6}); \
+         export {direct,defaults,method};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("function sum({"), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("method: function ({"),
+        "{}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_complex_params_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.direct!==34||r.defaults!==8||r.method!==12)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "complex parameters runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn object_spread_copies_enumerable_string_and_symbol_properties() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const symbol=Symbol('value');let gets=0; \
+         const source={get a(){gets++;return 2},[symbol]:3}; \
+         Object.defineProperty(source,'hidden',{value:9,enumerable:false}); \
+         const result={before:1,...null,...source,a:4,after:5}; \
+         export {result,symbol,gets};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...source"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("getOwnPropertySymbols"),
+        "{}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_object_spread_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.result.before!==1||r.result.a!==4||r.result.after!==5||r.result[r.symbol]!==3||'hidden' in r.result||r.gets!==1)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "object spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn object_spread_preserves_explicit_descriptors_and_proto_setters() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let getCalls=0,setCalls=0,pairSet=0; \
+         const baseA={base:'a'},baseB={base:'b'},inherited={}; \
+         Object.defineProperty(inherited,'blocked',{set(v){setCalls++}}); \
+         const sym=Symbol('s'),order=[]; \
+         const key={toString(){order.push('key');return 'computed'}}; \
+         function makeSpread(){order.push('spread');return {spread:1,blocked:4}} \
+         const result={__proto__:inherited,...makeSpread(),get kept(){getCalls++;return 7},set pair(v){pairSet=v},get pair(){return 6},method(){return this.spread+10},blocked:5,[key]:(order.push('value'),2),[sym]:(order.push('symbol'),3)}; \
+         const builtGetCalls=getCalls,builtSetCalls=setCalls,kept=Object.getOwnPropertyDescriptor(result,'kept'); \
+         result.pair=8;const firstPairSet=pairSet,pairValue=result.pair; \
+         const overwritten={...{},get x(){getCalls++;return 1},...{x:9}}; \
+         const overwrittenDescriptor=Object.getOwnPropertyDescriptor(overwritten,'x'); \
+         const pairedAcrossSpread={...{},get y(){return 4},...{},set y(v){pairSet=v}}; \
+         const acrossValue=pairedAcrossSpread.y;pairedAcrossSpread.y=12; \
+         const acrossPairSet=pairSet,acrossDescriptor=Object.getOwnPropertyDescriptor(pairedAcrossSpread,'y'); \
+         const before={__proto__:baseA,...{x:1}},after={...{x:1},__proto__:baseB}; \
+         const ignored={...{},__proto__:1},nil={...{},__proto__:null}; \
+         const functionProto=function(){};const functionBased={...{},__proto__:functionProto}; \
+         const computed={...{},['__proto__']:23}; \
+         const __proto__=31,shorthand={...{},__proto__}; \
+         const protoMethod={...{},__proto__(){return 33}}; \
+         const ownKeys=Reflect.ownKeys(result); \
+         export {result,sym,order,builtGetCalls,builtSetCalls,kept,firstPairSet,pairValue,overwrittenDescriptor,getCalls,acrossValue,acrossPairSet,acrossDescriptor,before,after,baseA,baseB,ignored,nil,functionBased,functionProto,computed,shorthand,protoMethod,ownKeys};",
+    )]));
+
+    let mut old = IncrementalBundler::new(fs.clone());
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let lowered = old.build(Path::new("src/index.js"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(
+        !lowered.bundle.contains("...makeSpread"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(
+        lowered.bundle.contains(".define = function"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(
+        lowered.bundle.contains(".proto = function"),
+        "{}",
+        lowered.bundle
+    );
+
+    let modern = IncrementalBundler::new(fs).build(Path::new("src/index.js"));
+    assert!(!modern.has_errors(), "{:?}", modern.diagnostics);
+    assert!(modern.bundle.contains("...makeSpread"), "{}", modern.bundle);
+    assert!(
+        !modern.bundle.contains(".define = function"),
+        "{}",
+        modern.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_object_spread_descriptors_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &lowered.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});const own=Object.prototype.hasOwnProperty;\
+         if(r.builtGetCalls!==0||r.builtSetCalls!==0||typeof r.kept.get!=='function'||'value' in r.kept||\
+            r.firstPairSet!==8||r.pairValue!==6||r.result.method()!==11||r.result.blocked!==5||\
+            r.overwrittenDescriptor.value!==9||r.getCalls!==0||r.acrossValue!==4||r.acrossPairSet!==12||\
+            typeof r.acrossDescriptor.get!=='function'||typeof r.acrossDescriptor.set!=='function'||\
+            Object.getPrototypeOf(r.before)!==r.baseA||Object.getPrototypeOf(r.after)!==r.baseB||\
+            Object.getPrototypeOf(r.ignored)!==Object.prototype||Object.getPrototypeOf(r.nil)!==null||\
+            Object.getPrototypeOf(r.functionBased)!==r.functionProto||\
+            !own.call(r.computed,'__proto__')||r.computed.__proto__!==23||Object.getPrototypeOf(r.computed)!==Object.prototype||\
+            !own.call(r.shorthand,'__proto__')||r.shorthand.__proto__!==31||\
+            !own.call(r.protoMethod,'__proto__')||r.protoMethod.__proto__()!==33||\
+            r.order.join(',')!=='spread,key,value,symbol'||r.ownKeys[r.ownKeys.length-1]!==r.sym)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "object descriptor/proto spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        lowered.bundle
+    );
+}
+
+#[test]
+fn jsx_attribute_spread_follows_object_spread_target_and_order() {
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "src/index.jsx",
+            "const symbol=Symbol('value');let gets=0; \
+             function Widget(){} \
+             const source={get value(){gets++;return 2},[symbol]:3}; \
+             Object.defineProperty(source,'hidden',{value:9,enumerable:false}); \
+             const element=<Widget before={1} {...null} {...source} value={4}>child</Widget>; \
+             export {element,symbol,gets};",
+        ),
+        (
+            "node_modules/react/jsx-runtime.js",
+            "function h(type,props,key){return {type:type,props:props||{},key:key}} \
+             exports.jsx=h;exports.jsxs=h;exports.Fragment='#frag';",
+        ),
+    ]));
+
+    let mut old = IncrementalBundler::new(fs.clone());
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let lowered = old.build(Path::new("src/index.jsx"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(!lowered.bundle.contains("...source"), "{}", lowered.bundle);
+    assert!(
+        lowered.bundle.contains("getOwnPropertySymbols"),
+        "{}",
+        lowered.bundle
+    );
+
+    let modern = IncrementalBundler::new(fs).build(Path::new("src/index.jsx"));
+    assert!(!modern.has_errors(), "{:?}", modern.diagnostics);
+    assert!(modern.bundle.contains("...source"), "{}", modern.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_jsx_spread_transform_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &lowered.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?}),p=r.element.props;if(p.before!==1||p.value!==4||p.children!=='child'||p[r.symbol]!==3||'hidden' in p||r.gets!==1)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "JSX spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        lowered.bundle
+    );
+}
+
+#[test]
+fn object_rest_excludes_static_computed_and_symbol_keys_once() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const symbol=Symbol('s');let keyCalls=0,gets=0; \
+         function key(){keyCalls++;return 'a'} \
+         const source={get a(){gets++;return 1},b:2,[symbol]:3}; \
+         const {[key()]:a,[symbol]:s,...rest}=source; \
+         function pick({x,...tail}){return [x,tail]} \
+         const picked=pick({x:4,y:5}); \
+         export {a,s,rest,picked,keyCalls,gets,symbol};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...rest"), "{}", out.bundle);
+    assert!(!out.bundle.contains("...tail"), "{}", out.bundle);
+    assert!(out.bundle.contains(".rest("), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_object_rest_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.a!==1||r.s!==3||r.rest.b!==2||'a' in r.rest||r.symbol in r.rest||r.picked[0]!==4||r.picked[1].y!==5||'x' in r.picked[1]||r.keyCalls!==1||r.gets!==1)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "object rest runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn empty_object_binding_patterns_throw_before_later_work() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let calls=0;function source(value){calls++;return value} \
+         function throws(callback){try{callback();return false}catch(error){return error instanceof TypeError}} \
+         const variableThrows=throws(function(){const {}=source(null)}); \
+         function parameter({}){} \
+         const parameterThrows=throws(function(){parameter(source(undefined))}); \
+         const catchThrows=throws(function(){try{throw source(null)}catch({}){}}); \
+         const loopThrows=throws(function(){for(const {} of [source(undefined)]){}}); \
+         export {calls,variableThrows,parameterThrows,catchThrows,loopThrows};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("const {}"), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("function parameter({})"),
+        "{}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("catch ({})"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_empty_object_bindings_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.calls!==4||!r.variableThrows||!r.parameterThrows||!r.catchThrows||!r.loopThrows)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "empty object binding runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn object_rest_uses_property_keys_for_numeric_symbol_and_object_keys() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const symbol=Symbol('symbol');let keyCalls=0,conversions=0,hints=[]; \
+         const objectKey={};objectKey[Symbol.toPrimitive]=function(hint){conversions++;hints.push(hint);return 'chosen'}; \
+         function key(){keyCalls++;return objectKey} \
+         const source={1:'one',chosen:'selected',keep:3,[symbol]:4}; \
+         const {1:one,[key()]:chosen,[symbol]:symbolValue,...rest}=source; \
+         export {one,chosen,symbolValue,rest,symbol,keyCalls,conversions,hints};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...rest"), "{}", out.bundle);
+    assert!(out.bundle.contains("String("), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_object_rest_property_keys_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.one!=='one'||r.chosen!=='selected'||r.symbolValue!==4||r.rest.keep!==3||'1' in r.rest||'chosen' in r.rest||r.symbol in r.rest||r.keyCalls!==1||r.conversions!==1||JSON.stringify(r.hints)!=='[\"string\"]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "object-rest property-key runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn destructuring_assignments_lower_in_order_and_return_the_rhs() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const log=[];let sourceObject,memberHits=0,assigned=0;const holder={get value(){return assigned},set value(value){log.push('set');assigned=value}}; \
+         function rhs(){log.push('rhs');sourceObject={get chosen(){log.push('get');return undefined},nested:{value:8},keep:9};return sourceObject} \
+         function key(){log.push('key');return 'chosen'} \
+         function fallback(){log.push('default');return 4} \
+         function target(){log.push('target');memberHits++;return holder} \
+         let nested,rest;const returned=({[key()]:target().value=fallback(),nested:{value:nested},...rest}=rhs()); \
+         let first,nestedArray,tail;const arraySource=new Set([undefined,{deep:6},7,8]); \
+         const arrayReturned=([first=5,{deep:nestedArray},...tail]=arraySource); \
+         let rawNested,rawRest;[{deep:rawNested,...rawRest}]=[{deep:10,extra:11}]; \
+         export {log,holder,nested,rest,memberHits,first,nestedArray,tail,returned,sourceObject,arrayReturned,arraySource,rawNested,rawRest};",
+    )]));
+
+    let mut old = IncrementalBundler::new(fs.clone());
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let lowered = old.build(Path::new("src/index.js"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(!lowered.bundle.contains("...rest"), "{}", lowered.bundle);
+    assert!(!lowered.bundle.contains("...tail"), "{}", lowered.bundle);
+    assert!(!lowered.bundle.contains("...rawRest"), "{}", lowered.bundle);
+    assert!(!lowered.bundle.contains("=>"), "{}", lowered.bundle);
+    assert!(lowered.bundle.contains(".rest("), "{}", lowered.bundle);
+
+    let modern = IncrementalBundler::new(fs).build(Path::new("src/index.js"));
+    assert!(!modern.has_errors(), "{:?}", modern.diagnostics);
+    assert!(modern.bundle.contains("...rest"), "{}", modern.bundle);
+    assert!(modern.bundle.contains("...tail"), "{}", modern.bundle);
+    assert!(modern.bundle.contains("...rawRest"), "{}", modern.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_assignment_destructuring_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &lowered.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.log)!=='[\"rhs\",\"key\",\"target\",\"get\",\"default\",\"set\"]'||r.holder.value!==4||r.nested!==8||r.rest.keep!==9||'chosen' in r.rest||'nested' in r.rest||r.memberHits!==1||r.first!==5||r.nestedArray!==6||JSON.stringify(r.tail)!=='[7,8]'||r.returned!==r.sourceObject||r.arrayReturned!==r.arraySource||r.rawNested!==10||r.rawRest.extra!==11||'deep' in r.rawRest)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "assignment destructuring runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        lowered.bundle
+    );
+}
+
+#[test]
+fn destructuring_assignment_for_heads_lower_for_in_of_and_for_await() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let first,tail,keyValue,objectRest;const member={};let defaultHits=0;const __wake_t0='collision'; \
+         for ([first=++defaultHits,...tail] of [[undefined,2,3]]) {} \
+         for ({chosen:member.value,...objectRest} of [{chosen:4,keep:5}]) {} \
+         for ([keyValue] in {xy:1}) {} \
+         const pending=(async function(){let awaited,awaitRest;for await ({value:awaited,...awaitRest} of [{value:6,extra:7}]){}return [awaited,awaitRest.extra]})(); \
+         export {first,tail,keyValue,objectRest,member,defaultHits,__wake_t0,pending};",
+    )]));
+
+    let mut old = IncrementalBundler::new(fs.clone());
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let lowered = old.build(Path::new("src/index.js"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(!lowered.bundle.contains("for (["), "{}", lowered.bundle);
+    assert!(!lowered.bundle.contains("for ({"), "{}", lowered.bundle);
+    assert!(
+        !lowered.bundle.contains("for await ({"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(
+        lowered.bundle.contains("for (var __wake_t"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(lowered.bundle.contains(".rest("), "{}", lowered.bundle);
+    assert!(!lowered.bundle.contains("=>"), "{}", lowered.bundle);
+
+    let mut object_rest_only = IncrementalBundler::new(fs.clone());
+    object_rest_only.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let rest_lowered = object_rest_only.build(Path::new("src/index.js"));
+    assert!(!rest_lowered.has_errors(), "{:?}", rest_lowered.diagnostics);
+    assert!(
+        rest_lowered.bundle.contains("...tail"),
+        "{}",
+        rest_lowered.bundle
+    );
+    assert!(
+        !rest_lowered.bundle.contains("...objectRest"),
+        "{}",
+        rest_lowered.bundle
+    );
+    assert!(
+        !rest_lowered.bundle.contains("...awaitRest"),
+        "{}",
+        rest_lowered.bundle
+    );
+
+    let modern = IncrementalBundler::new(fs).build(Path::new("src/index.js"));
+    assert!(!modern.has_errors(), "{:?}", modern.diagnostics);
+    assert!(modern.bundle.contains("...tail"), "{}", modern.bundle);
+    assert!(modern.bundle.contains("...objectRest"), "{}", modern.bundle);
+    assert!(modern.bundle.contains("...awaitRest"), "{}", modern.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_for_target_destructuring_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &lowered.bundle).unwrap();
+    let script = format!(
+        "(async()=>{{const r=require({:?});const pending=await r.pending;if(r.first!==1||JSON.stringify(r.tail)!=='[2,3]'||r.keyValue!=='x'||r.member.value!==4||r.objectRest.keep!==5||'chosen' in r.objectRest||r.defaultHits!==1||r.__wake_t0!=='collision'||JSON.stringify(pending)!=='[6,7]')process.exit(2)}})().catch(error=>{{console.error(error);process.exit(3)}});",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "for-head destructuring runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        lowered.bundle
+    );
+}
+
+#[test]
+fn destructuring_assignment_for_heads_preserve_super_and_await_context() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "class Base{set slot(value){this.seen=value}}class Derived extends Base{run(values){for ({value:super.slot} of values){}return this.seen}} \
+         async function pick(values){let value;for ([value=await Promise.resolve(3)] of values){}return value} \
+         export const result=new Derived().run([{value:2}]);export const pending=pick([[undefined]]);",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("for ({"), "{}", out.bundle);
+    assert!(!out.bundle.contains("for (["), "{}", out.bundle);
+    assert!(out.bundle.contains("super.slot ="), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("await Promise.resolve(3)"),
+        "{}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_for_target_context_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "Promise.resolve(require({:?}).pending).then(value=>{{const r=require({:?});if(r.result!==2||value!==3)process.exit(2)}}).catch(error=>{{console.error(error);process.exit(3)}});",
+        bundle_path.to_string_lossy(),
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "for-head context runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn destructuring_assignment_preserves_await_and_yield_context() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "async function pick(source){let value;const returned=({value=await Promise.resolve(3)}=source);return [value,returned===source]} \
+         function* choose(source){let value;const returned=({value=yield 4}=source);return [value,returned===source]} \
+         const iterator=choose({});const yielded=iterator.next();const resumed=iterator.next(5);export {pick,yielded,resumed};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains("await Promise.resolve(3)"),
+        "{}",
+        out.bundle
+    );
+    assert!(out.bundle.contains("yield 4"), "{}", out.bundle);
+    assert!(!out.bundle.contains("{ value = await"), "{}", out.bundle);
+    assert!(!out.bundle.contains("{ value = yield"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_assignment_suspension_context_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "Promise.resolve(require({:?}).pick({{}})).then(value=>{{const r=require({:?});if(JSON.stringify(value)!=='[3,true]'||r.yielded.value!==4||r.yielded.done||JSON.stringify(r.resumed.value)!=='[5,true]'||!r.resumed.done)process.exit(2)}}).catch(error=>{{console.error(error);process.exit(3)}});",
+        bundle_path.to_string_lossy(),
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "assignment suspension runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn scoped_destructuring_assignment_preserves_arrow_lexical_context() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const source={chosen:undefined,keep:9};function Box(fallback){this.keyHits=0;this.key=function(){this.keyHits++;return 'chosen'}; \
+         const assign=input=>({[this.key()]:this.value=new.target===Box?arguments[0]:0,...this.rest}=input); \
+         const returned=assign(source);this.result=[returned===source,this.value,this.rest.keep,this.keyHits]}export const result=new Box(7).result;",
+    )]));
+
+    let mut arrow_capable = IncrementalBundler::new(fs.clone());
+    arrow_capable.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "45"),
+    ]));
+    let lowered = arrow_capable.build(Path::new("src/index.js"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(lowered.bundle.contains("=>"), "{}", lowered.bundle);
+    assert!(
+        !lowered.bundle.contains("...this.rest"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(lowered.bundle.contains(".rest("), "{}", lowered.bundle);
+    assert!(lowered.bundle.contains("new.target"), "{}", lowered.bundle);
+    assert!(
+        lowered.bundle.contains("arguments[0]"),
+        "{}",
+        lowered.bundle
+    );
+    assert!(
+        lowered.bundle.contains("var __wake_t"),
+        "{}",
+        lowered.bundle
+    );
+
+    let modern = IncrementalBundler::new(fs).build(Path::new("src/index.js"));
+    assert!(!modern.has_errors(), "{:?}", modern.diagnostics);
+    assert!(modern.bundle.contains("...this.rest"), "{}", modern.bundle);
+    assert!(!modern.bundle.contains(".rest("), "{}", modern.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_assignment_arrow_lexical_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &lowered.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.result)!=='[true,7,9,1]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "arrow lexical assignment runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        lowered.bundle
+    );
+}
+
+#[test]
+fn destructuring_assignment_keeps_conservative_regions_helper_free() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let value,rest;const source={value:1,keep:2}; \
+         function parameter(arg=({value,...rest}=source)){return arg} \
+         const parameterArrow=(arg=({value,...rest}=source))=>arg; \
+         class Holder{field=({value,...rest}=source);static{({value,...rest}=source)}} \
+         const asyncArrow=async()=>({value,...rest}=source);export {parameter,parameterArrow,Holder,asyncArrow};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.matches("...rest").count() >= 3, "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("getOwnPropertySymbols"),
+        "{}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains(".rest("), "{}", out.bundle);
+}
+
+#[test]
+fn arrow_complex_parameters_lower_with_object_and_array_rest() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const context={base:10,run(){const calculate=({a,...rest}={a:1,b:2},[first,...tail]=new Set([3,4]))=>this.base+a+rest.b+first+tail.length;return calculate()}}; \
+         export const result=context.run();",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...rest"), "{}", out.bundle);
+    assert!(!out.bundle.contains("...tail"), "{}", out.bundle);
+    assert!(out.bundle.contains(".bind(this)"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_arrow_complex_params_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.result!==17)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "arrow complex parameters runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn mixed_parameter_lowering_preserves_left_to_right_initialization() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const log=[];function mark(value){log.push(value);return value} \
+         function mixed(a=mark('a'),{b=mark('b')}={},c=mark('c'),...rest){return [a,b,c,rest.length]} \
+         const result=mixed(undefined,undefined,undefined,1,2);export {log,result};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_mixed_params_order_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.log)!=='[\"a\",\"b\",\"c\"]'||JSON.stringify(r.result)!=='[\"a\",\"b\",\"c\",2]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mixed parameter order failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn catch_and_declared_loop_destructuring_lower_with_separate_body_scope() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let outer=7,loopTotal=0,keys='',caught; \
+         for(const {a=outer,...rest} of [{a:undefined,b:2},{a:3,b:4}]){let outer=100;loopTotal+=a+rest.b} \
+         for(const [first,...tail] in {ab:1,cd:1}){keys+=first+tail.join('')} \
+         try{throw {message:undefined,code:5,extra:9}}catch({message=outer,code,...rest}){let outer=100;caught=[message,code,rest.extra]} \
+         export {loopTotal,keys,caught};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("for (const {"), "{}", out.bundle);
+    assert!(!out.bundle.contains("for (const ["), "{}", out.bundle);
+    assert!(!out.bundle.contains("catch ({"), "{}", out.bundle);
+    assert!(out.bundle.contains(".rest("), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_loop_catch_destructuring_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.loopTotal!==16||r.keys!=='abcd'||JSON.stringify(r.caught)!=='[7,5,9]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "loop/catch destructuring runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn object_rest_only_target_lowers_every_binding_context() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const source={a:1,b:2,c:3}; \
+         const {a,...variableRest}=source; \
+         function pick({b,...functionRest}){return b+functionRest.a+functionRest.c} \
+         const arrow=({c,...arrowRest})=>c+arrowRest.a+arrowRest.b; \
+         let catchResult=0;try{throw source}catch({a:caughtA,...catchRest}){catchResult=caughtA+catchRest.b+catchRest.c} \
+         let loopResult=0;for(const {b:loopB,...loopRest} of [source]){loopResult+=loopB+loopRest.a+loopRest.c} \
+         export const results=[a+variableRest.b+variableRest.c,pick(source),arrow(source),catchResult,loopResult];",
+    )]));
+
+    // Chrome 55 supports ordinary destructuring but not object rest/spread.
+    let mut old = IncrementalBundler::new(fs.clone());
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let lowered = old.build(Path::new("src/index.js"));
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    assert!(!lowered.bundle.contains("..."), "{}", lowered.bundle);
+    assert!(lowered.bundle.contains(".rest("), "{}", lowered.bundle);
+
+    let modern = IncrementalBundler::new(fs).build(Path::new("src/index.js"));
+    assert!(!modern.has_errors(), "{:?}", modern.diagnostics);
+    assert!(
+        modern.bundle.contains("...variableRest"),
+        "{}",
+        modern.bundle
+    );
+    assert!(
+        modern.bundle.contains("...functionRest"),
+        "{}",
+        modern.bundle
+    );
+    assert!(modern.bundle.contains("...arrowRest"), "{}", modern.bundle);
+    assert!(modern.bundle.contains("...catchRest"), "{}", modern.bundle);
+    assert!(modern.bundle.contains("...loopRest"), "{}", modern.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_object_rest_only_bindings_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &lowered.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.results)!=='[6,6,6,6,6]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "object-rest-only binding runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        lowered.bundle
+    );
+}
+
+#[test]
+fn nullish_side_effect_operand_is_evaluated_through_lexical_iife() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let calls=0; function get(){ calls++; return null; } \
+         const value=get() ?? 7; export { calls, value };",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    // Chrome 70 supports arrows but not nullish coalescing.
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "70"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("??"), "{}", out.bundle);
+    assert!(out.bundle.contains("__wake_t0) =>"), "{}", out.bundle);
+    assert_eq!(out.bundle.matches(")(get())").count(), 1, "{}", out.bundle);
+}
+
+#[test]
+fn optional_member_chain_lowers_as_one_short_circuit_unit() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let hits=0; function get(){hits++;return {x:{y:3},m(){return this.x.y}}} \
+         const a=get()?.x.y; const b=get()?.m(); const c=null?.x; \
+         const obj={x:9,m(){return this.x}}; const d=obj.m?.(); \
+         const e=get().m?.(); export {a,b,c,d,e,hits};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "70"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(out.bundle.contains("__wake_t"), "{}", out.bundle);
+    assert!(out.bundle.contains(".x.y"), "suffix must stay in alternate");
+    assert!(
+        out.bundle.contains(".m()"),
+        "method call must preserve receiver"
+    );
+    assert!(
+        out.bundle.matches(".call(__wake_t").count() >= 2,
+        "optional method calls must use their captured receivers: {}",
+        out.bundle
+    );
+}
+
+#[test]
+fn parenthesized_optional_method_calls_preserve_receiver_and_argument_order() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        const order=[];
+        const replacement={tag:"replacement"};
+        let holder;
+        const original={
+          tag:"original",
+          get method(){order.push("getter:normal");holder=replacement;return function(value){order.push("call:"+this.tag);return this.tag+":"+value}}
+        };
+        holder=original;
+        const normal=(holder?.method)((order.push("arg:normal"),"normal"));
+
+        let spreadHolder;
+        const spreadReplacement={tag:"spread-replacement"};
+        const spreadOriginal={
+          tag:"spread-original",
+          get method(){order.push("getter:spread");spreadHolder=spreadReplacement;return function(value){order.push("call:"+this.tag);return this.tag+":"+value}}
+        };
+        spreadHolder=spreadOriginal;
+        const spreadArgs={
+          [Symbol.iterator](){order.push("iterator:spread");let done=false;return {next(){order.push(done?"next:spread:done":"next:spread:value");if(done)return {done:true};done=true;return {done:false,value:"spread"}}}}
+        };
+        const spread=(spreadHolder?.method)(...spreadArgs);
+
+        let nullCallThrew=false;
+        try{(null?.method)((order.push("arg:null"),0))}catch(error){nullCallThrew=error instanceof TypeError}
+        const nullArgs={
+          [Symbol.iterator](){order.push("iterator:null");let done=false;return {next(){order.push(done?"next:null:done":"next:null:value");if(done)return {done:true};done=true;return {done:false,value:0}}}}
+        };
+        let nullSpreadThrew=false;
+        try{(null?.method)(...nullArgs)}catch(error){nullSpreadThrew=error instanceof TypeError}
+        let optionalArgumentCalls=0;
+        const optionalSkipped=(null?.method)?.(optionalArgumentCalls++);
+        export {normal,spread,nullCallThrew,nullSpreadThrew,optionalArgumentCalls,optionalSkipped,order};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(!out.bundle.contains("...spreadArgs"), "{}", out.bundle);
+    assert!(!out.bundle.contains("...nullArgs"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_parenthesized_optional_call_chrome40_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let expected = r#"["getter:normal","arg:normal","call:original","getter:spread","iterator:spread","next:spread:value","next:spread:done","call:spread-original","arg:null","iterator:null","next:null:value","next:null:done"]"#;
+    let script = format!(
+        "const r=require({:?});\
+         if(r.normal!=='original:normal'||r.spread!=='spread-original:spread'||\
+            !r.nullCallThrew||!r.nullSpreadThrew||r.optionalArgumentCalls!==0||\
+            r.optionalSkipped!==undefined||JSON.stringify(r.order)!=={:?})process.exit(2);",
+        bundle_path.to_string_lossy(),
+        expected
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parenthesized optional-call runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn modern_parenthesized_optional_method_call_keeps_chain_boundary() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        const obj={tag:"native",method(value){return this.tag+value}};
+        let argumentCalls=0;
+        const value=(obj?.method)("!");
+        let threw=false;
+        try{(null?.method)(argumentCalls++)}catch(error){threw=error instanceof TypeError}
+        let optionalArgumentCalls=0;
+        const optionalSkipped=(null?.method)?.(optionalArgumentCalls++);
+        export {value,threw,argumentCalls,optionalArgumentCalls,optionalSkipped};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains("(obj?.method)(\"!\")"),
+        "{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("(null?.method)(argumentCalls++)"),
+        "{}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("__wake_t"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_parenthesized_optional_call_modern_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.value!=='native!'||!r.threw||r.argumentCalls!==1||\
+         r.optionalArgumentCalls!==0||r.optionalSkipped!==undefined)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "modern parenthesized optional-call runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn typescript_erasure_keeps_parenthesized_optional_call_receiver() {
+    let source = r#"
+        "use strict";
+        const order=[];
+        const replacement={tag:"replacement"};
+        let holder;
+        const original={
+          tag:"original",
+          get method(){order.push("getter");holder=replacement;return function(value){order.push("call:"+this.tag);return this.tag+":"+value}}
+        };
+        holder=original;
+        const asserted=(holder?.method)!("asserted");
+        holder=original;
+        const generic=(holder?.method)<string>("generic");
+        let argumentCalls=0;
+        let threw=false;
+        try{(null?.method)!(argumentCalls++)}catch(error){threw=error instanceof TypeError}
+        export {asserted,generic,argumentCalls,threw,order};
+    "#;
+    let fs = Arc::new(MemoryFileSystem::from_files([("src/index.ts", source)]));
+    let mut old = IncrementalBundler::new(fs);
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let old_out = old.build(Path::new("src/index.ts"));
+    assert!(!old_out.has_errors(), "{:?}", old_out.diagnostics);
+    assert!(!old_out.bundle.contains("?."), "{}", old_out.bundle);
+    assert!(!old_out.bundle.contains("<string>"), "{}", old_out.bundle);
+
+    let modern_fs = Arc::new(MemoryFileSystem::from_files([("src/index.ts", source)]));
+    let modern_out = IncrementalBundler::new(modern_fs).build(Path::new("src/index.ts"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(
+        modern_out.bundle.matches("(holder?.method)(").count() >= 2,
+        "{}",
+        modern_out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_ts_parenthesized_optional_call_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &old_out.bundle).unwrap();
+    let expected = r#"["getter","call:original","getter","call:original"]"#;
+    let script = format!(
+        "const r=require({:?});if(r.asserted!=='original:asserted'||r.generic!=='original:generic'||\
+         r.argumentCalls!==1||!r.threw||JSON.stringify(r.order)!=={:?})process.exit(2);",
+        bundle_path.to_string_lossy(),
+        expected
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "TS parenthesized optional-call runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        old_out.bundle
+    );
+}
+
+#[test]
+fn parenthesized_optional_tag_and_constructor_keep_chain_boundaries() {
+    let source = r#"
+        "use strict";
+        const order=[];
+        const replacement={name:"replacement"};
+        function Box(value){this.value=value}
+        let holder;
+        const original={
+          name:"original",
+          get tag(){order.push("getter:tag");holder=replacement;return function(strings,value){order.push("tag:"+this.name);return this.name+":"+value}},
+          get Ctor(){order.push("getter:ctor");holder=replacement;return Box}
+        };
+        holder=original;
+        const tagged=(holder?.tag)`prefix:${(order.push("sub:tag"),"value")}`;
+        holder=original;
+        const made=new (holder?.Ctor)((order.push("arg:new"),7));
+        let nullTagThrew=false;
+        try{(null?.tag)`missing:${(order.push("sub:null-tag"),0)}`}catch(error){nullTagThrew=error instanceof TypeError}
+        let nullNewThrew=false;
+        try{new (null?.Ctor)((order.push("arg:null-new"),0))}catch(error){nullNewThrew=error instanceof TypeError}
+        export {tagged,made,nullTagThrew,nullNewThrew,order};
+    "#;
+    let fs = Arc::new(MemoryFileSystem::from_files([("src/index.js", source)]));
+    let mut old = IncrementalBundler::new(fs);
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let old_out = old.build(Path::new("src/index.js"));
+    assert!(!old_out.has_errors(), "{:?}", old_out.diagnostics);
+    assert!(!old_out.bundle.contains("?."), "{}", old_out.bundle);
+
+    let modern_fs = Arc::new(MemoryFileSystem::from_files([("src/index.js", source)]));
+    let modern_out = IncrementalBundler::new(modern_fs).build(Path::new("src/index.js"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(
+        modern_out.bundle.contains("(holder?.tag)`"),
+        "{}",
+        modern_out.bundle
+    );
+    assert!(
+        modern_out.bundle.contains("new (holder?.Ctor)("),
+        "{}",
+        modern_out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_parenthesized_optional_tag_new_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &old_out.bundle).unwrap();
+    let expected = r#"["getter:tag","sub:tag","tag:original","getter:ctor","arg:new","sub:null-tag","arg:null-new"]"#;
+    let script = format!(
+        "const r=require({:?});if(r.tagged!=='original:value'||r.made.value!==7||\
+         !r.nullTagThrew||!r.nullNewThrew||JSON.stringify(r.order)!=={:?})process.exit(2);",
+        bundle_path.to_string_lossy(),
+        expected
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parenthesized optional tag/new runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        old_out.bundle
+    );
+}
+
+#[test]
+fn chrome_40_optional_chains_use_scope_temporaries_and_preserve_semantics() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        let baseCalls=0,keyCalls=0,argCalls=0,iteratorSteps=0;
+        function make(value){baseCalls++;return value}
+        const skipped=make(null)?.[(()=>{keyCalls++;return "method"})()](argCalls++);
+        const nested=make(null)?.deep.value;
+        let holder;
+        const replacement={tag:"replacement"};
+        const original={tag:"original",get method(){holder=replacement;return function(suffix){return this.tag+suffix}}};
+        holder=original;
+        const rebound=holder.method?.("!");
+        function scoped(value){"use strict";return make(value)?.deep?.value}
+        const scopedValues=[scoped({deep:{value:8}}),scoped(null)];
+        const arrow=value=>make(value)?.deep?.value;
+        const arrowValue=arrow({deep:{value:9}});
+        const runner={prefix:"method",run(value){return make(value)?.call(this)}};
+        const callable=function(){return this.prefix};
+        const methodResult=runner.run(callable);
+        const iterable={
+          [Symbol.iterator](){
+            let done=false;
+            return {next(){iteratorSteps++;if(done)return {done:true};done=true;return {done:false,value:"?"}}}
+          }
+        };
+        let spreadHolder;
+        const spreadReplacement={tag:"spread-replacement"};
+        const spreadOriginal={tag:"spread-original",get method(){spreadHolder=spreadReplacement;return function(suffix){return this.tag+suffix}}};
+        spreadHolder=spreadOriginal;
+        const spreadResult=spreadHolder?.method(...iterable);
+        const spreadSkipped=null?.method(...iterable);
+        class Base{get optional(){return function(){return this.kind}}}
+        class Child extends Base{constructor(){super();this.kind="child"}run(){return super.optional?.()}}
+        const superResult=new Child().run();
+        const doomed={x:1};
+        const deleted=delete doomed?.x;
+        const deleteSkipped=delete (null)?.[(()=>{keyCalls++;return "x"})()];
+        const leaked=Object.keys(globalThis).some(function(key){return key.indexOf("__wake_t")===0});
+        export {skipped,nested,rebound,scopedValues,arrowValue,methodResult,spreadResult,spreadSkipped,superResult,deleted,deleteSkipped,doomed,baseCalls,keyCalls,argCalls,iteratorSteps,leaked};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(
+        out.bundle.matches("var __wake_t").count() >= 5,
+        "Program/functions/methods/sync arrows must own their temps: {}",
+        out.bundle
+    );
+    let strict = out.bundle.find("\"use strict\";").expect("directive");
+    let program_temp = out.bundle[strict..]
+        .find("var __wake_t")
+        .map(|offset| strict + offset)
+        .expect("program temp declaration");
+    assert!(
+        strict < program_temp,
+        "directive must precede temps: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle
+            .contains("function scoped(value) {\n    \"use strict\";\n    var __wake_t"),
+        "function directives must precede scoped temps: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_scoped_optional_chrome40_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});\
+         if(r.skipped!==undefined||r.nested!==undefined||r.rebound!=='original!'||\
+            JSON.stringify(r.scopedValues)!=='[8,null]'||r.arrowValue!==9||r.methodResult!=='method'||\
+            r.spreadResult!=='spread-original?'||r.spreadSkipped!==undefined||r.superResult!=='child'||\
+            r.deleted!==true||r.deleteSkipped!==true||Object.prototype.hasOwnProperty.call(r.doomed,'x')||\
+            r.baseCalls!==6||r.keyCalls!==0||r.argCalls!==0||r.iteratorSteps!==2||r.leaked)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scoped-optional runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn minify_keeps_live_scoped_transform_temps_with_dummy_spans() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        let calls=0;
+        function make(value){calls++;return value}
+        function scoped(value){"use strict";return [typeof this,make(value)?.value]}
+        const present=make({value:7})?.value;
+        const missing=make(null)?.value;
+        const scopedResult=scoped.call(1,{value:9});
+        export {present,missing,scopedResult,calls};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("var __wake_t"),
+        "a live transform temp must not be removed because an unused sibling shares DUMMY: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_minified_scoped_temp_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.present!==7||r.missing!==undefined||JSON.stringify(r.scopedResult)!=='[\"number\",9]'||r.calls!==3)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "minified scoped-temp runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn optional_chain_temps_are_absent_for_modern_and_conservative_regions() {
+    let modern_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const obj={x:1};const value=obj?.x;const removed=delete obj?.x;export {value,removed,obj};",
+    )]));
+    let mut modern = IncrementalBundler::new(modern_fs);
+    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let modern_out = modern.build(Path::new("src/index.js"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(
+        modern_out.bundle.contains("obj?.x"),
+        "{}",
+        modern_out.bundle
+    );
+    assert!(
+        modern_out.bundle.contains("delete obj?.x"),
+        "modern delete optional chain must remain native: {}",
+        modern_out.bundle
+    );
+    assert!(
+        !modern_out.bundle.contains("__wake_t"),
+        "{}",
+        modern_out.bundle
+    );
+
+    let conservative_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let calls=0;function get(){calls++;return {x:1}}\
+         const covered=(get()?.x);\
+         const removed=delete (get()?.x);\
+         const asyncArrow=async()=>((await Promise.resolve(get()))?.x);\
+         function defaulted(value=get()?.x){return value}\
+         const arrowDefault=(value=get()?.x)=>value;\
+         class Box{field=get()?.x;static{this.value=get()?.x}}\
+         export {covered,removed,asyncArrow,defaulted,arrowDefault,Box,calls};",
+    )]));
+    let mut conservative = IncrementalBundler::new(conservative_fs);
+    conservative.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let conservative_out = conservative.build(Path::new("src/index.js"));
+    assert!(
+        !conservative_out.has_errors(),
+        "{:?}",
+        conservative_out.diagnostics
+    );
+    assert!(
+        conservative_out.bundle.matches("?.").count() >= 6,
+        "cover/default/class/async-arrow chains are intentionally preserved: {}",
+        conservative_out.bundle
+    );
+    assert!(
+        conservative_out.bundle.contains("delete get()?.x"),
+        "conservative delete must retain the native delete operator: {}",
+        conservative_out.bundle
+    );
+    assert!(
+        !conservative_out.bundle.contains("var __wake_t"),
+        "conservative regions must not leak temps into Program: {}",
+        conservative_out.bundle
+    );
+}
+
+#[test]
+fn parenthesized_optional_delete_keeps_its_chain_boundary() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        let calls=0;
+        const direct={x:1};
+        function getDirect(){calls++;return direct}
+        const deletedDirect=delete (getDirect()?.x);
+        const child={y:2};
+        const parent={x:child};
+        function getParent(){calls++;return parent}
+        const deletedSuffix=delete (getParent()?.x).y;
+        let threw=false;
+        try{delete (null?.x).y}catch(error){threw=error instanceof TypeError}
+        const deletedMissing=delete (null?.x);
+        export {calls,direct,parent,child,deletedDirect,deletedSuffix,deletedMissing,threw};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    // Chrome 70 retains the existing lexical-arrow capture path while still needing optional
+    // chaining lowering. Parentheses must not turn `delete member` into `delete conditional`.
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "70"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_parenthesized_optional_delete_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});\
+         if(r.calls!==2||r.deletedDirect!==true||Object.prototype.hasOwnProperty.call(r.direct,'x')||\
+            r.deletedSuffix!==true||!Object.prototype.hasOwnProperty.call(r.parent,'x')||\
+            Object.prototype.hasOwnProperty.call(r.child,'y')||r.deletedMissing!==true||!r.threw)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parenthesized optional delete runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn complex_member_assignments_preserve_evaluation_order() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const log=[];
+        let backing=2;
+        const target={
+          get value(){log.push("get");return backing},
+          set value(v){log.push("set:"+v);backing=v}
+        };
+        function object(){log.push("object");return target}
+        function key(){log.push("key");return "value"}
+        object()[key()] **= (log.push("rhs-exp"),3);
+        object()[key()] ||= (log.push("rhs-or"),9);
+        backing=0;
+        object()[key()] ||= (log.push("rhs-or2"),5);
+        backing=null;
+        object()[key()] ??= (log.push("rhs-null"),7);
+        export default JSON.stringify({backing,log});
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "49"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("**="), "{}", out.bundle);
+    assert!(!out.bundle.contains("||="), "{}", out.bundle);
+    assert!(!out.bundle.contains("??="), "{}", out.bundle);
+    assert!(out.bundle.contains("Math.pow"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_transform_member_assignment");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = r#"{"backing":7,"log":["object","key","get","rhs-exp","set:8","object","key","get","object","key","get","rhs-or2","set:5","object","key","get","rhs-null","set:7"]}"#;
+    assert_eq!(stdout.trim(), expected);
+}
+
+#[test]
+fn chrome_40_member_assignments_use_execution_scope_temporaries() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        const log=[];
+        const results=[];
+        let backing=2;
+        let current;
+        const second={set value(v){log.push("set:second:"+v)}};
+        const first={
+          get value(){log.push("get:first");current=second;return backing},
+          set value(v){log.push("set:first:"+v);backing=v}
+        };
+        const key={
+          [Symbol.toPrimitive](hint){log.push("key:"+hint);return "value"}
+        };
+        current=first;
+        results.push(current[key] **= (log.push("rhs:exp"),3));
+        current=first;backing=0;
+        results.push(current[key] &&= (log.push("rhs:and"),4));
+        current=first;backing=0;
+        results.push(current[key] ||= (log.push("rhs:or"),5));
+        current=first;backing=null;
+        results.push(current[key] ??= (log.push("rhs:null"),7));
+        function normal(box){return box.value ||= 9}
+        const holder={method(box){return box.value &&= 10}};
+        const arrow=box=>{return box.value ??= 11};
+        normal({value:1});holder.method({value:1});arrow({value:null});
+        export default JSON.stringify({backing,results,log});
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("**="), "{}", out.bundle);
+    assert!(!out.bundle.contains("&&="), "{}", out.bundle);
+    assert!(!out.bundle.contains("||="), "{}", out.bundle);
+    assert!(!out.bundle.contains("??="), "{}", out.bundle);
+    assert!(!out.bundle.contains("=>"), "{}", out.bundle);
+    assert!(out.bundle.contains("Math.pow"), "{}", out.bundle);
+    assert!(
+        out.bundle.matches("var __wake_t").count() >= 4,
+        "Program, function, method and arrow must own their temporaries: {}",
+        out.bundle
+    );
+    let directive = out.bundle.find("\"use strict\"").unwrap();
+    let first_temp = out.bundle.find("var __wake_t").unwrap();
+    assert!(directive < first_temp, "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_scoped_member_assignment_chrome40");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = r#"{"backing":7,"results":[8,0,5,7],"log":["key:string","get:first","rhs:exp","set:first:8","key:string","get:first","key:string","get:first","rhs:or","set:first:5","key:string","get:first","rhs:null","set:first:7"]}"#;
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+}
+
+#[test]
+fn scoped_member_assignments_preserve_super_private_await_and_yield() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const log=[];
+        const key={
+          [Symbol.toPrimitive](hint){log.push("key:"+hint);return "value"}
+        };
+        const proto={
+          get value(){log.push("super-get:"+this.name);return this._value},
+          set value(v){log.push("super-set:"+v+":"+this.name);this._value=v}
+        };
+        const child={
+          __proto__:proto,name:"child",_value:null,
+          run(){return super[key] ??= (log.push("super-rhs"),4)}
+        };
+        class Box{
+          #value=null;
+          update(){return this.#value ??= 5}
+        }
+        async function asyncUpdate(object){
+          return object.value ??= await Promise.resolve(6)
+        }
+        function* generatorUpdate(object){
+          return object.value ??= yield 7
+        }
+        const superValue=child.run();
+        const box=new Box();
+        const privateFirst=box.update();
+        const privateSecond=box.update();
+        const generatorObject={value:null};
+        const iterator=generatorUpdate(generatorObject);
+        const first=iterator.next();
+        const second=iterator.next(8);
+        const asyncObject={value:null};
+        export default asyncUpdate(asyncObject).then(function(asyncValue){
+          return JSON.stringify({
+            superValue,childValue:child._value,privateFirst,privateSecond,
+            yielded:[first.value,first.done,second.value,second.done],
+            generatorValue:generatorObject.value,asyncValue,asyncValueOnObject:asyncObject.value,log
+          })
+        });
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "80"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("??="), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("=>"),
+        "member lowering must not synthesize arrows: {}",
+        out.bundle
+    );
+    assert!(out.bundle.contains(".#value"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("await Promise.resolve(6)"),
+        "{}",
+        out.bundle
+    );
+    assert!(out.bundle.contains("yield 7"), "{}", out.bundle);
+    assert!(out.bundle.contains("super["), "{}", out.bundle);
+    assert!(out.bundle.contains("var __wake_t"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_scoped_member_assignment_contexts");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\nPromise.resolve(module.exports.default).then(function(value){{console.log(value)}},function(error){{console.error(error);process.exitCode=1}});",
+            out.bundle
+        ),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = r#"{"superValue":4,"childValue":4,"privateFirst":5,"privateSecond":5,"yielded":[7,false,8,true],"generatorValue":8,"asyncValue":6,"asyncValueOnObject":6,"log":["key:string","super-get:child","super-rhs","super-set:4:child"]}"#;
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+}
+
+#[test]
+fn member_assignment_scoped_temps_are_gated_and_do_not_leak_from_cover_regions() {
+    let modern_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const box={value:null};box.value ??= 1;export default box.value;",
+    )]));
+    let mut modern = IncrementalBundler::new(modern_fs);
+    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let modern_out = modern.build(Path::new("src/index.js"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(modern_out.bundle.contains("??="), "{}", modern_out.bundle);
+    assert!(
+        !modern_out.bundle.contains("__wake_t"),
+        "{}",
+        modern_out.bundle
+    );
+
+    let conservative_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const box={value:null};const covered=(box.value ??= 1);export {covered,box};",
+    )]));
+    let mut conservative = IncrementalBundler::new(conservative_fs);
+    conservative.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let conservative_out = conservative.build(Path::new("src/index.js"));
+    assert!(
+        !conservative_out.has_errors(),
+        "{:?}",
+        conservative_out.diagnostics
+    );
+    assert!(
+        conservative_out.bundle.contains("??="),
+        "cover grammar has no safe temp scope and must preserve syntax: {}",
+        conservative_out.bundle
+    );
+    assert!(
+        !conservative_out.bundle.contains("var __wake_t"),
+        "a failed cover transform must not register a Program temp: {}",
+        conservative_out.bundle
+    );
+}
+
+#[test]
+fn arrow_functions_lower_and_preserve_lexical_this() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const add=(a,b)=>a+b;
+        const obj={x:4,method(){const read=()=>this.x;return read()}};
+        export default add(obj.method(),3);
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("=>"), "{}", out.bundle);
+    assert!(out.bundle.contains(".bind(this)"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_transform_arrow");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "7");
+}
+
+#[test]
+fn untagged_template_literals_lower_without_numeric_addition() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const x=2; export default `a${x}${3}z`;",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains('`'), "{}", out.bundle);
+    assert!(out.bundle.contains(".concat("), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_transform_template");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "a23z");
+}
+
+#[test]
+fn shorthand_properties_and_optional_catch_binding_lower() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const x=1; const o={x,m(){return this.x}}; let caught=false; \
+         try{throw 1}catch{caught=true} export default o.m()+\":\"+caught;",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("{ x: x, m: function"), "{}", out.bundle);
+    assert!(out.bundle.contains("catch (__wake_t"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_transform_shorthand_catch");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1:true");
+}
+
+#[test]
+fn object_methods_with_lexical_super_keep_home_object_on_old_targets() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const base={key:"picked",value:4,read(value){return this.value+value}};
+        const child={
+          __proto__:base,
+          plain(){return 3},
+          arrowOnly(){const read=()=>super.value;return read()},
+          run(value=super.value,{[super.key]:picked}={picked:5}){
+            return super.read(value)+picked;
+          }
+        };
+        export default child.plain()+":"+child.run()+":"+child.arrowOnly();
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains("plain: function"),
+        "ordinary methods must still lower: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("read: function"),
+        "ordinary prototype methods must still lower: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("run(") && !out.bundle.contains("run: function"),
+        "a method using lexical super must keep method syntax: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("arrowOnly(") && !out.bundle.contains("arrowOnly: function"),
+        "super inherited by a nested arrow must keep the containing method syntax: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("super.value")
+            && out.bundle.contains("super.key")
+            && out.bundle.contains("super.read(value)"),
+        "super in defaults, computed binding keys and the body must survive: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_object_method_super_transform");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "object method super runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3:13:4");
+}
+
+#[test]
+fn default_and_rest_parameters_lower_across_functions_methods_and_arrows() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        function f(a=2,...rest){return [a,rest.join(",")]}
+        const obj={m(x=4,...xs){return x+xs.length}};
+        const arrow=(x=3,...xs)=>x+xs.length;
+        export default JSON.stringify([f(undefined,5,6),obj.m(undefined,1,2),arrow(undefined,8)]);
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...rest"), "{}", out.bundle);
+    assert!(!out.bundle.contains("...xs"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("Array.prototype.slice.call(arguments"),
+        "{}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_transform_parameters");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bundle.js");
+    std::fs::write(
+        &path,
+        format!("{}\nconsole.log(module.exports.default);", out.bundle),
+    )
+    .unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "[[2,\"5,6\"],6,4]"
+    );
+}
+
+#[test]
 fn typescript_bundle_runs_in_node() {
     if std::process::Command::new("node")
         .arg("--version")
@@ -930,6 +3323,57 @@ fn css_import_bundles() {
     );
     // 生成的样式注入代码。
     assert!(out.bundle.contains("document.createElement(\"style\")"));
+}
+
+#[test]
+fn crab_component_styles_auto_import_in_dependency_order() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import Card from '@crab-dev/rc-card'; export default Card();",
+        ),
+        (
+            "node_modules/@crab-dev/rc-card/package.json",
+            r#"{"module":"esm/index.mjs","main":"cjs/index.cjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-card/esm/index.mjs",
+            "import Skeleton from '@crab-dev/rc-skeleton'; export default function Card() { return Skeleton(); }",
+        ),
+        (
+            "node_modules/@crab-dev/rc-card/css/index.css",
+            ".card { color: purple; }",
+        ),
+        (
+            "node_modules/@crab-dev/rc-skeleton/package.json",
+            r#"{"module":"esm/index.mjs","main":"cjs/index.cjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-skeleton/esm/index.mjs",
+            "export default function Skeleton() { return 1; }",
+        ),
+        (
+            "node_modules/@crab-dev/rc-skeleton/css/index.css",
+            ".skeleton { color: gray; }",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_extraction();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(
+        out.module_count, 5,
+        "入口、两个组件和两份 CSS 都应进入模块图"
+    );
+    let css = out
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8_lossy(&asset.bytes))
+        .expect("应生成 CSS 产物");
+    let skeleton = css.find(".skeleton").expect("子组件样式");
+    let card = css.find(".card").expect("父组件样式");
+    assert!(skeleton < card, "依赖样式应先于父组件样式:\n{css}");
 }
 
 #[test]
@@ -1602,12 +4046,14 @@ fn persistent_cache_preserves_tree_shaking_output() {
 
     let mut cold = IncrementalBundler::new(Arc::new(shake_fixture()));
     cold.enable_tree_shaking()
+        .enable_minify()
         .enable_persistent_cache(cache_path.clone());
     let cold_out = cold.build(Path::new("src/index.js"));
     assert!(!cold_out.has_errors(), "{:?}", cold_out.diagnostics);
 
     let mut warm = IncrementalBundler::new(Arc::new(shake_fixture()));
     warm.enable_tree_shaking()
+        .enable_minify()
         .enable_persistent_cache(cache_path.clone());
     let warm_out = warm.build(Path::new("src/index.js"));
     assert!(!warm_out.has_errors(), "{:?}", warm_out.diagnostics);
@@ -1618,6 +4064,11 @@ fn persistent_cache_preserves_tree_shaking_output() {
     );
     assert_eq!(warm_out.chunks.len(), cold_out.chunks.len());
     assert_eq!(warm_out.assets.len(), cold_out.assets.len());
+    assert_eq!(
+        warm.task_exec_count(),
+        0,
+        "tree-shaking 热缓存应同时跳过 parse 与 codegen"
+    );
 
     let _ = std::fs::remove_file(cache_path);
 }
@@ -3067,7 +5518,7 @@ fn css_url_assets_work_in_dev_injection_path() {
 #[test]
 fn public_path_injected_into_chunk_loader() {
     // `set_public_path` 必须贯穿到 async chunk 的加载 URL：否则子路径部署下 import() 按当前
-    // 页面 URL 相对解析 → 404（CRUSTIFY-PARITY 切片 2）。
+    // 页面 URL 相对解析 → 404（WAKE-COMPATIBILITY 切片 2）。
     let mut b = IncrementalBundler::new(Arc::new(split_fixture()));
     b.enable_code_splitting().set_public_path("/app/");
     let out = b.build(Path::new("src/index.js"));
@@ -3534,4 +5985,1427 @@ var css_default=css;
         "合成 CJS 导出不得引用已被 mangle 的旧名:\n{}",
         out.bundle
     );
+}
+
+#[test]
+fn structured_rest_parameters_lower_for_chrome_40() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const log=[];function mark(value){log.push(value);return value} \
+         function old(a=mark('a'),{b=mark('b')}={},...[c=mark('c'),...tail]){return [this.base,a,b,c,tail.length]} \
+         const functionResult=old.call({base:10},undefined,undefined,undefined,4,5); \
+         const holder={base:20,method(...[x,y]){return this.base+x+y},run(){const arrow=(...{length,...rest})=>this.base+length+rest[1]+Object.keys(rest).length;return arrow(3,4,5)}}; \
+         const methodResult=holder.method(1,2);const arrowResult=holder.run(); \
+         export {log,functionResult,methodResult,arrowResult};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...["), "{}", out.bundle);
+    assert!(!out.bundle.contains("...{"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("slice.call(arguments"),
+        "structured rest must read the owning function's arguments: {}",
+        out.bundle
+    );
+    assert!(out.bundle.contains(".bind(this)"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_structured_rest_chrome40_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.log)!=='[\"a\",\"b\",\"c\"]'||JSON.stringify(r.functionResult)!=='[10,\"a\",\"b\",\"c\",2]'||r.methodResult!==23||r.arrowResult!==30)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "chrome 40 structured-rest runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn structured_rest_parameters_keep_native_collection_for_chrome_55() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "function collect(...{0:first,...rest}){return [this.tag,first,rest[1]]} \
+         const functionResult=collect.call({tag:'f'},1,2); \
+         const holder={tag:'m',method(...{0:first,...rest}){return [this.tag,first,rest[1]]},run(...values){const arrow=(...{0:first,...rest})=>[this.tag,first,rest[1]];return arrow(...values)}}; \
+         const methodResult=holder.method(3,4);const arrowResult=holder.run(5,6); \
+         export {functionResult,methodResult,arrowResult};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...{"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("...__wake_t"),
+        "native rest should collect into a collision-free binding: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("=>"),
+        "arrow syntax should remain native: {}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains(".bind(this)"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_structured_rest_chrome55_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.functionResult)!=='[\"f\",1,2]'||JSON.stringify(r.methodResult)!=='[\"m\",3,4]'||JSON.stringify(r.arrowResult)!=='[\"m\",5,6]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "chrome 55 structured-rest runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn structured_rest_parameters_are_preserved_for_modern_targets() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "function collect(...{length,...rest}){return length+rest[1]}const arrow=(...[first,second])=>first*second;export const result=collect(2,3)+arrow(4,5);",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("...{"), "{}", out.bundle);
+    assert!(out.bundle.contains("...["), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("slice.call(arguments"),
+        "{}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("getOwnPropertySymbols"),
+        "{}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_structured_rest_modern_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.result!==25)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "modern structured-rest runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn async_arrow_binding_parameters_lower_for_chrome_55() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "function build(){const fn=async ({head,...rest}={head:this.prefix,value:3},...{0:[first],1:second,...tail})=>[this.prefix,head,rest.value,first,second,tail[2],await Promise.resolve(7)];return fn(undefined,[4],5,6)}export const result=build.call({prefix:'P'});",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("async"), "{}", out.bundle);
+    assert!(out.bundle.contains("=>"), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("...{"),
+        "structured async-arrow rest must lower: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("getOwnPropertySymbols"),
+        "object rest helper must be emitted: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("slice.call(arguments"),
+        "native async-arrow rest collection must not read lexical arguments: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains(".bind(this)"),
+        "the async arrow itself must remain lexical: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_async_arrow_params_chrome55_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "Promise.resolve(require({:?}).result).then(value=>{{if(JSON.stringify(value)!=='[\"P\",\"P\",3,4,5,6,7]')process.exit(2)}}).catch(error=>{{console.error(error);process.exit(3)}});",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "chrome 55 async-arrow parameter runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn async_arrow_binding_parameters_stay_conservative_for_chrome_40() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const fn=async ({head,...rest}={head:1,value:2},...{0:[first],...tail})=>[head,rest.value,first,tail[1]];export const result=fn(undefined,[3],4);",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("async"), "{}", out.bundle);
+    assert!(out.bundle.contains("=>"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("...{"),
+        "unsupported async/arrow/parameter syntax must retain the whole parameter list: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("slice.call(arguments"),
+        "async-arrow rest must never be emulated through lexical arguments: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("getOwnPropertySymbols"),
+        "the conservative path must not allocate an unused object-rest helper: {}",
+        out.bundle
+    );
+}
+
+#[test]
+fn async_arrow_binding_parameters_are_preserved_for_modern_targets() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const fn=async ({head,...rest}={head:1,value:2},...{0:[first],...tail})=>[head,rest.value,first,tail[1]];export const result=fn(undefined,[3],4);",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("async"), "{}", out.bundle);
+    assert!(out.bundle.contains("=>"), "{}", out.bundle);
+    assert!(out.bundle.contains("...{"), "{}", out.bundle);
+    assert!(
+        !out.bundle.contains("getOwnPropertySymbols"),
+        "{}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("slice.call(arguments"),
+        "{}",
+        out.bundle
+    );
+}
+
+#[test]
+fn transformed_helpers_preserve_directive_prologue_in_minified_bundle() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "wake-prologue";
+        "use strict";
+        var values=[0,...new Set([1,2])];
+        var copy={...{value:3}};
+        var strictThis=(function(){return this})()===void 0;
+        var undeclaredThrows=false;
+        try{__wake_directive_probe__=1}catch(error){undeclaredThrows=error instanceof ReferenceError}
+        module.exports={values:values,copy:copy,strictThis:strictThis,undeclaredThrows:undeclaredThrows};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler
+        .set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+            wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+        ]))
+        .enable_minify();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("..."), "{}", out.bundle);
+
+    let marker = out
+        .bundle
+        .find("\"wake-prologue\";")
+        .expect("marker directive");
+    let strict = out.bundle[marker..]
+        .find("\"use strict\";")
+        .map(|offset| marker + offset)
+        .expect("source strict directive");
+    let iterator = out.bundle[strict..]
+        .find("(value, limit) {")
+        .map(|offset| strict + offset)
+        .expect("iterator helper");
+    let object = out.bundle[iterator..]
+        .find("(target) {for (var sourceIndex")
+        .map(|offset| iterator + offset)
+        .expect("object-spread helper");
+    let body = out.bundle[object..]
+        .find("var values=")
+        .map(|offset| object + offset)
+        .expect("first source body statement");
+    assert!(
+        marker < strict && strict < iterator && iterator < object && object < body,
+        "directives, helpers, and source body are out of order:\n{}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_directive_helper_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.values)!=='[0,1,2]'||r.copy.value!==3||!r.strictThis||!r.undeclaredThrows)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "directive/helper runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn chrome_40_nullish_temporaries_are_local_to_each_execution_scope() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "\"use strict\";\
+         let calls=0;function read(value){calls++;return value}\
+         const programValue=read(null)??'program';\
+         function outer(fallback){\"use strict\";\
+           const local=read(null)??fallback;\
+           function nested(){return read(null)??'nested'}\
+           const arrow=()=>read(null)??'arrow';\
+           return [local,nested(),arrow()]}\
+         function context(arg){return [read(this.missing)??'this',read(arguments[0])??'arguments',new.target??'target']}\
+         async function asynchronous(){return (await Promise.resolve(null))??'async'}\
+         function* generated(){return (yield null)??'generator'}\
+         const outerValue=outer('local');const contextValue=context.call({},null);\
+         const iterator=generated();iterator.next();const generatorValue=iterator.next(null).value;\
+         const asyncValue=asynchronous();\
+         export {programValue,outerValue,contextValue,generatorValue,asyncValue,calls};",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("??"), "{}", out.bundle);
+    assert!(
+        out.bundle.matches("var __wake_t").count() >= 7,
+        "each program/function/arrow execution scope must own its temp: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("  \"use strict\";\n  var __wake_t"),
+        "program directive must precede its temp declaration: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle
+            .contains("function outer(fallback) {\n    \"use strict\";\n    var __wake_t"),
+        "function directive must precede its temp declaration: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_scoped_nullish_chrome40_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "(async()=>{{const r=require({:?});const a=await r.asyncValue;if(r.programValue!=='program'||JSON.stringify(r.outerValue)!=='[\"local\",\"nested\",\"arrow\"]'||JSON.stringify(r.contextValue)!=='[\"this\",\"arguments\",\"target\"]'||r.generatorValue!=='generator'||a!=='async'||r.calls!==6)process.exit(2)}})().catch(e=>{{console.error(e);process.exit(3)}});",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scoped-nullish runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn parenthesized_concise_arrows_lower_inside_cover_without_leaking_parameter_temps() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        let calls=0,holder;
+        function read(value){calls++;return value}
+        const nullish=((value)=>read(value)??"fallback");
+        const optional=((value)=>value?.deep?.item);
+        const replacement={tag:"replacement"};
+        const original={
+          tag:"original",
+          get method(){holder=replacement;return function(a,b){return [this.tag,a,b]}}
+        };
+        const spread=((args)=>holder.method("head",...args));
+        const parameter=((value=read(null)??"parameter")=>value);
+        holder=original;
+        const values=[
+          nullish(null),nullish("value"),optional(null),optional({deep:{item:7}}),
+          spread(["tail"]),parameter()
+        ];
+        export {values,calls};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(
+        out.bundle.matches("??").count(),
+        1,
+        "only the default-parameter cover must remain conservative: {}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(!out.bundle.contains("...args"), "{}", out.bundle);
+    assert!(
+        out.bundle.matches("var __wake_t").count() >= 3,
+        "each nested concise arrow must own its transform temps: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_cover_concise_arrow_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.values)!=='[\"fallback\",\"value\",null,7,[\"original\",\"head\",\"tail\"],\"parameter\"]'||r.calls!==3)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cover concise-arrow runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn nullish_scoped_temporaries_are_absent_for_modern_and_conservative_regions() {
+    let modern_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const program=get()??1;function nested(){return get()??2}const arrow=()=>get()??3;export {program,nested,arrow};",
+    )]));
+    let mut modern = IncrementalBundler::new(modern_fs);
+    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let modern_out = modern.build(Path::new("src/index.js"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(modern_out.bundle.contains("??"), "{}", modern_out.bundle);
+    assert!(
+        !modern_out.bundle.contains("__wake_t"),
+        "modern output must not allocate transform temps: {}",
+        modern_out.bundle
+    );
+
+    let conservative_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const covered=(get()??1);const asyncArrow=async()=>((await get())??2);function defaulted(value=get()??3){return value}const arrowDefault=(value=get()??4)=>value;class Box{field=get()??5;static{this.value=get()??6}}export {covered,asyncArrow,defaulted,arrowDefault,Box};",
+    )]));
+    let mut conservative = IncrementalBundler::new(conservative_fs);
+    conservative.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let conservative_out = conservative.build(Path::new("src/index.js"));
+    assert!(
+        !conservative_out.has_errors(),
+        "{:?}",
+        conservative_out.diagnostics
+    );
+    assert!(
+        conservative_out.bundle.contains("??"),
+        "cover/async-arrow/class regions are intentionally preserved until they own a safe scope: {}",
+        conservative_out.bundle
+    );
+    assert!(
+        !conservative_out.bundle.contains("var __wake_t"),
+        "conservative regions must not leak scoped temps into Program: {}",
+        conservative_out.bundle
+    );
+}
+
+#[test]
+fn arrow_parameter_initializers_preserve_lexical_context() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const holder={value:7,run(){const bound=(value=this.value)=>value;return bound()}};\
+         function outer(value){const lexical=(item=arguments[0])=>item;return lexical()}\
+         export const result=[holder.run(),outer(9)];",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains(".bind(this)"),
+        "a default using lexical this must bind the lowered function: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("=>"),
+        "an arguments-dependent default must remain an arrow until lexical capture is available: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_arrow_parameter_lexical_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.result)!=='[7,9]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "arrow parameter lexical runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn chrome_40_member_spread_calls_use_scope_temps_and_preserve_native_order() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        "use strict";
+        let holder,order=[],coercions=0;
+        const replacement={tag:"replacement"};
+        const original={
+          tag:"original",
+          get method(){
+            order.push("get");
+            holder=replacement;
+            return function(a,b,c){order.push("call");return {receiver:this.tag,values:[a,b,c]}}
+          }
+        };
+        const iterable={
+          [Symbol.iterator](){
+            order.push("iterator");
+            let index=0;
+            return {next(){order.push("next"+index);return index++===0?{done:false,value:"spread"}:{done:true}}}
+          }
+        };
+        holder=original;
+        const rebound=holder.method(...iterable);
+        const reboundOrder=order.slice();
+        order.length=0;
+        const key={
+          [Symbol.toPrimitive](hint){coercions++;order.push("key:"+hint);return "method"}
+        };
+        holder=original;
+        const computed=holder[key](...iterable);
+        const computedOrder=order.slice();
+        function strictDirect(){"use strict";return this}
+        const directThis=strictDirect(...[]);
+        function context(first){
+          if(new.target&&!this.tag)this.tag="constructed";
+          holder=original;
+          return holder.method(...[this.tag,arguments[0],new.target?"new":"call"])
+        }
+        const lexical=context.call({tag:"context"},"argument");
+        const constructed=new context("constructor");
+        async function asyncContext(value){
+          holder=original;
+          return holder.method(...[await value,"async","done"])
+        }
+        const pending=asyncContext(Promise.resolve("awaited"));
+        function* generatorContext(){
+          holder=original;
+          return holder.method(...[yield "pause","generator","done"])
+        }
+        const generator=generatorContext();
+        const yielded=generator.next().value;
+        const generated=generator.next("resumed").value;
+        let skippedSteps=0;
+        const skippedIterable={
+          [Symbol.iterator](){return {next(){skippedSteps++;return {done:true}}}}
+        };
+        const shortCircuited=false&&holder.method(...skippedIterable);
+        const optionalSkipped=null?.method(...skippedIterable);
+        export {rebound,reboundOrder,computed,computedOrder,coercions,directThis,lexical,constructed,pending,yielded,generated,shortCircuited,optionalSkipped,skippedSteps};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("..."), "{}", out.bundle);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("var __wake_t") && out.bundle.contains(".apply(void 0"),
+        "spread calls must use scope-owned vars and an undefined direct-call receiver: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("(function (__wake_t"),
+        "member spread calls must not use ordinary-function capture IIFEs: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_scoped_member_spread_chrome40_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});Promise.resolve(r.pending).then(p=>{{\
+         const rebound={{receiver:'original',values:['spread',null,null]}};\
+         const lexical={{receiver:'original',values:['context','argument','call']}};\
+         const constructed={{receiver:'original',values:['constructed','constructor','new']}};\
+         const pending={{receiver:'original',values:['awaited','async','done']}};\
+         const generated={{receiver:'original',values:['resumed','generator','done']}};\
+         if(JSON.stringify(r.rebound)!==JSON.stringify(rebound)||JSON.stringify(r.computed)!==JSON.stringify(rebound)||\
+            JSON.stringify(r.reboundOrder)!=='[\"get\",\"iterator\",\"next0\",\"next1\",\"call\"]'||\
+            JSON.stringify(r.computedOrder)!=='[\"key:string\",\"get\",\"iterator\",\"next0\",\"next1\",\"call\"]'||\
+            r.coercions!==1||r.directThis!==undefined||JSON.stringify(r.lexical)!==JSON.stringify(lexical)||\
+            JSON.stringify(r.constructed)!==JSON.stringify(constructed)||JSON.stringify(p)!==JSON.stringify(pending)||\
+            r.yielded!=='pause'||JSON.stringify(r.generated)!==JSON.stringify(generated)||r.shortCircuited!==false||\
+            r.optionalSkipped!==undefined||r.skippedSteps!==0)process.exit(2);\
+         }}).catch(error=>{{console.error(error);process.exit(3)}});",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scoped member-spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn arrow_capable_target_keeps_spread_captures_in_the_arrow_scope() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const owner={
+          tag:"outer",
+          make(first){
+            let holder;
+            const replacement={tag:"replacement"};
+            const original={tag:"original",get method(){holder=replacement;return function(a,b,c){return [this.tag,a,b,c]}}};
+            holder=original;
+            return args=>holder.method(this.tag,arguments[0],...args)
+          }
+        };
+        const arrow=owner.make("argument");
+        export const result=arrow(["tail"]);
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    // Chrome 45 supports arrows but still requires call-spread lowering.
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "45"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("...args"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("=> {") && out.bundle.contains("var __wake_t"),
+        "the concise arrow must become a block that owns its spread temps: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("(function (__wake_t"),
+        "arrow-capable targets must not use an ordinary capture IIFE: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_scoped_member_spread_arrow_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.result)!=='[\"original\",\"outer\",\"argument\",\"tail\"]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "arrow-scoped member-spread runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn spread_calls_are_conservative_without_a_scope_and_native_for_modern_targets() {
+    let conservative_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const holder={method(){return 1}},args=[];
+        const covered=(holder.method(...args));
+        function parameter(value=holder.method(...args)){return value}
+        const asyncArrow=async()=>holder.method(...args);
+        const asyncOptional=async()=>holder?.method(...args);
+        class Box{field=holder.method(...args);static{holder.method(...args)}}
+        export {covered,parameter,asyncArrow,asyncOptional,Box};
+        "#,
+    )]));
+    let mut conservative = IncrementalBundler::new(conservative_fs);
+    conservative.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let conservative_out = conservative.build(Path::new("src/index.js"));
+    assert!(
+        !conservative_out.has_errors(),
+        "{:?}",
+        conservative_out.diagnostics
+    );
+    assert!(
+        conservative_out.bundle.matches("...args").count() >= 6
+            && conservative_out.bundle.contains("holder?.method(...args)"),
+        "cover/parameter/class/async-arrow spread calls must remain native: {}",
+        conservative_out.bundle
+    );
+    assert!(
+        !conservative_out.bundle.contains("(value, limit) {")
+            && !conservative_out.bundle.contains("var __wake_t"),
+        "conservative spread sites must not allocate unused helpers or temps: {}",
+        conservative_out.bundle
+    );
+
+    let modern_fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const holder={method(value){return value}},args=[1];export const result=holder.method(...args);",
+    )]));
+    let mut modern = IncrementalBundler::new(modern_fs);
+    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let modern_out = modern.build(Path::new("src/index.js"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(
+        modern_out.bundle.contains("holder.method(...args)"),
+        "{}",
+        modern_out.bundle
+    );
+    assert!(
+        !modern_out.bundle.contains("(value, limit) {")
+            && !modern_out.bundle.contains("var __wake_t"),
+        "modern output must not allocate spread infrastructure: {}",
+        modern_out.bundle
+    );
+}
+
+#[test]
+fn arrow_capable_optional_spread_keeps_await_and_yield_in_their_owner_scope() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        let holder,steps=0;
+        const replacement={tag:"replacement"};
+        const original={
+          tag:"original",
+          get method(){holder=replacement;return function(a,b,c){return {receiver:this.tag,values:[a,b,c]}}}
+        };
+        async function asyncRun(value){
+          holder=original;
+          return holder.method?.(...[await Promise.resolve(value),this.tag,arguments[0]])
+        }
+        function* generatorRun(value){
+          holder=original;
+          return holder.method?.(...[yield "pause",this.tag,arguments[0]])
+        }
+        async function asyncSkip(){return null?.method(...[await Promise.resolve(++steps)])}
+        function* generatorSkip(){return null?.method(...[yield "bad"])}
+        const pending=asyncRun.call({tag:"async-this"},"awaited");
+        const generator=generatorRun.call({tag:"generator-this"},"argument");
+        const yielded=generator.next().value;
+        const generated=generator.next("resumed").value;
+        const skipPending=asyncSkip();
+        const skippedGenerator=generatorSkip().next();
+        export {pending,yielded,generated,skipPending,skippedGenerator,steps};
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    // Chrome 70 supports arrows, async/generators and spread, but not optional chaining.
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "70"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("?."), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("async function asyncRun")
+            && out.bundle.contains("function* generatorRun")
+            && out.bundle.contains("var __wake_t"),
+        "async/generator functions must own optional-spread captures: {}",
+        out.bundle
+    );
+    assert!(
+        out.bundle.contains("...")
+            && !out.bundle.contains("(value, limit) {")
+            && !out.bundle.contains("=>"),
+        "native spread must stay in place without a helper or capture arrow: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_optional_spread_async_generator_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});Promise.all([r.pending,r.skipPending]).then(values=>{{\
+         const asyncValue={{receiver:'original',values:['awaited','async-this','awaited']}};\
+         const generated={{receiver:'original',values:['resumed','generator-this','argument']}};\
+         if(JSON.stringify(values[0])!==JSON.stringify(asyncValue)||values[1]!==undefined||\
+            r.yielded!=='pause'||JSON.stringify(r.generated)!==JSON.stringify(generated)||\
+            !r.skippedGenerator.done||r.skippedGenerator.value!==undefined||r.steps!==0)process.exit(2);\
+         }}).catch(error=>{{console.error(error);process.exit(3)}});",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "optional-spread async/generator runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn parameter_lowering_preserves_function_body_environment_boundaries() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        r#"
+        const outer="outer";
+        function lexical(value=outer){let outer="inner";return value}
+        function variable(value=outer){var outer="inner";return value}
+        function declaration(value=outer){function outer(){return "inner"}return value}
+        const arrow=(value=outer)=>{const outer="inner";return value};
+        const holder={
+          method({value=outer}={}){class outer{};return value},
+          computed({[outer]:value}={outer:9}){let outer="inner";return value}
+        };
+        export const results=[lexical(),variable(),declaration(),arrow(),holder.method(),holder.computed()];
+        "#,
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.matches("value = outer").count() >= 5
+            && out.bundle.contains("[outer]")
+            && out.bundle.contains("=>"),
+        "conflicting parameter lists and arrow syntax must remain native: {}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("var __wake_t")
+            && !out.bundle.contains("(value, limit) {")
+            && !out.bundle.contains("getOwnPropertySymbols"),
+        "a conservative parameter site must not allocate lowering infrastructure: {}",
+        out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_parameter_environment_chrome40_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(JSON.stringify(r.results)!=='[\"outer\",\"outer\",\"outer\",\"outer\",\"outer\",9]')process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "parameter environment runtime failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
+#[test]
+fn async_arrow_parameter_environment_conflict_is_target_gated() {
+    let conflict_source = r#"
+        let outer="outer";
+        const fn=async ({x=outer,...rest}={})=>{let outer="inner";return [x,Object.keys(rest).length]};
+        export const result=fn();
+    "#;
+    let mut conflicting = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        conflict_source,
+    )])));
+    conflicting.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let conflict_out = conflicting.build(Path::new("src/index.js"));
+    assert!(!conflict_out.has_errors(), "{:?}", conflict_out.diagnostics);
+    assert!(
+        conflict_out.bundle.contains("...rest") && conflict_out.bundle.contains("async"),
+        "the conflicting Chrome 55 async-arrow parameter must remain native: {}",
+        conflict_out.bundle
+    );
+    assert!(
+        !conflict_out.bundle.contains("getOwnPropertySymbols")
+            && !conflict_out.bundle.contains("var __wake_t"),
+        "the conflict gate must run before helper/temp allocation: {}",
+        conflict_out.bundle
+    );
+
+    let safe_source = r#"
+        let outer="outer";
+        const fn=async (first=outer,{x="safe",...rest}={extra:1})=>{let outer="inner";return [first,x,rest.extra]};
+        export const result=fn();
+    "#;
+    let mut chrome_55 = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        safe_source,
+    )])));
+    chrome_55.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "55"),
+    ]));
+    let chrome_55_out = chrome_55.build(Path::new("src/index.js"));
+    assert!(
+        !chrome_55_out.has_errors(),
+        "{:?}",
+        chrome_55_out.diagnostics
+    );
+    assert!(
+        !chrome_55_out.bundle.contains("...rest")
+            && chrome_55_out.bundle.contains("getOwnPropertySymbols")
+            && chrome_55_out.bundle.contains("first = outer"),
+        "an unrelated native default must not block safe Chrome 55 object-rest lowering: {}",
+        chrome_55_out.bundle
+    );
+
+    let mut modern = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        safe_source,
+    )])));
+    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "120"),
+    ]));
+    let modern_out = modern.build(Path::new("src/index.js"));
+    assert!(!modern_out.has_errors(), "{:?}", modern_out.diagnostics);
+    assert!(
+        modern_out.bundle.contains("...rest")
+            && !modern_out.bundle.contains("getOwnPropertySymbols")
+            && !modern_out.bundle.contains("var __wake_t"),
+        "modern targets must keep native parameters without lowering infrastructure: {}",
+        modern_out.bundle
+    );
+
+    if !node_available() {
+        return;
+    }
+    for (name, output, expected) in [
+        ("conflict", &conflict_out, "[\"outer\",0]"),
+        ("safe", &chrome_55_out, "[\"outer\",\"safe\",1]"),
+        ("modern", &modern_out, "[\"outer\",\"safe\",1]"),
+    ] {
+        let dir = std::env::temp_dir().join(format!("wake_parameter_environment_{name}_e2e"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_path = dir.join("bundle.cjs");
+        std::fs::write(&bundle_path, &output.bundle).unwrap();
+        let script = format!(
+            "Promise.resolve(require({:?}).result).then(value=>{{if(JSON.stringify(value)!=={:?})process.exit(2)}}).catch(error=>{{console.error(error);process.exit(3)}});",
+            bundle_path.to_string_lossy(),
+            expected
+        );
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{name} async-arrow parameter runtime failed: {}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            output.bundle
+        );
+    }
+}
+
+#[test]
+fn synchronous_for_of_lowering_preserves_iterator_close_labels_bindings_and_tdz() {
+    let source = r#"
+        function tracked(values,options){
+          options=options||{};
+          let index=0;
+          const stats={iteratorCalls:0,nextGets:0,nextCalls:0,returnGets:0,returnCalls:0,nextThis:true,returnThis:true};
+          let iterator;
+          iterator={
+            get next(){
+              stats.nextGets++;
+              return function(){
+                stats.nextThis=stats.nextThis&&this===iterator;
+                stats.nextCalls++;
+                if(options.nextThrow)throw new Error("next");
+                if(options.primitiveStep)return 1;
+                if(index>=values.length)return {done:true};
+                const value=values[index++];
+                if(options.valueThrow)return {done:false,get value(){throw new Error("value")}};
+                return {done:false,value};
+              };
+            },
+            get return(){
+              stats.returnGets++;
+              return function(){
+                stats.returnThis=stats.returnThis&&this===iterator;
+                stats.returnCalls++;
+                if(options.closeThrow)throw new Error("close");
+                if(options.returnPrimitive)return 1;
+                return {done:true};
+              };
+            }
+          };
+          const iterable={
+            [Symbol.iterator](){stats.iteratorCalls++;return iterator}
+          };
+          return {iterable,stats};
+        }
+
+        const normal=tracked([1,2]);
+        const normalValues=[];
+        for(const value of normal.iterable)normalValues.push(value);
+
+        const broken=tracked([1,2]);
+        for(const value of broken.iterable){if(value===1)break}
+
+        const continued=tracked([1,2]);
+        for(const value of continued.iterable){if(value===1)continue}
+
+        const returned=tracked([7,8]);
+        function first(){for(const value of returned.iterable)return value}
+        const firstValue=first();
+
+        const bodyFailure=tracked([1],{closeThrow:true});
+        let bodyMessage="";
+        try{for(const value of bodyFailure.iterable){throw new Error("body")}}catch(error){bodyMessage=error.message}
+
+        const closeFailure=tracked([1],{closeThrow:true});
+        let closeMessage="";
+        try{for(const value of closeFailure.iterable)break}catch(error){closeMessage=error.message}
+
+        const closePrimitive=tracked([1],{returnPrimitive:true});
+        let closePrimitiveType=false;
+        try{for(const value of closePrimitive.iterable)break}catch(error){closePrimitiveType=error instanceof TypeError}
+
+        const nextFailure=tracked([1],{nextThrow:true});
+        let nextMessage="";
+        try{for(const value of nextFailure.iterable){}}catch(error){nextMessage=error.message}
+
+        const primitiveStep=tracked([1],{primitiveStep:true});
+        let primitiveStepType=false;
+        try{for(const value of primitiveStep.iterable){}}catch(error){primitiveStepType=error instanceof TypeError}
+
+        const valueFailure=tracked([1],{valueThrow:true});
+        let valueMessage="";
+        try{for(const value of valueFailure.iterable){}}catch(error){valueMessage=error.message}
+
+        const bindingFailure=tracked([null]);
+        let bindingFailureType=false;
+        try{for(const {} of bindingFailure.iterable){}}catch(error){bindingFailureType=error instanceof TypeError}
+
+        const nested=[];
+        outer: for(const outerValue of [1,2]){
+          const current=tracked([1,2]);
+          nested.push(current.stats);
+          inner: for(const innerValue of current.iterable){
+            if(innerValue===1)continue outer;
+          }
+        }
+        const sameLoop=tracked([1,2]);
+        firstLabel: secondLabel: for(const value of sameLoop.iterable){
+          if(value===1)continue firstLabel;
+        }
+
+        const closures=[];
+        for(let value of [1,2])closures.push(()=>value);
+        var varValue=0;
+        for(var varValue of [3,4]){}
+        let assigned=0;
+        for(assigned of [5,6]){}
+        let destructured=0;
+        for({x:destructured} of [{x:7}]){}
+
+        let shadow=[1];
+        let directTdz=false;
+        try{for(let shadow of shadow){}}catch(error){directTdz=error instanceof ReferenceError}
+        let captured;
+        for(let lexical of (captured=()=>lexical,[1]))break;
+        let closureTdz=false;
+        try{captured()}catch(error){closureTdz=error instanceof ReferenceError}
+
+        let rhsCalls=0;
+        function rhs(){rhsCalls++;return [1,2]}
+        for(const value of rhs()){}
+
+        const baseStatsOk=record=>record.stats.iteratorCalls===1&&record.stats.nextGets===1&&record.stats.nextThis&&record.stats.returnThis;
+        const ok=JSON.stringify(normalValues)==="[1,2]"&&baseStatsOk(normal)&&normal.stats.nextCalls===3&&normal.stats.returnCalls===0&&
+          baseStatsOk(broken)&&broken.stats.nextCalls===1&&broken.stats.returnGets===1&&broken.stats.returnCalls===1&&
+          baseStatsOk(continued)&&continued.stats.nextCalls===3&&continued.stats.returnCalls===0&&
+          firstValue===7&&baseStatsOk(returned)&&returned.stats.returnCalls===1&&
+          bodyMessage==="body"&&bodyFailure.stats.returnCalls===1&&closeMessage==="close"&&closeFailure.stats.returnCalls===1&&
+          closePrimitiveType&&closePrimitive.stats.returnCalls===1&&nextMessage==="next"&&nextFailure.stats.returnCalls===0&&
+          primitiveStepType&&primitiveStep.stats.returnCalls===0&&valueMessage==="value"&&valueFailure.stats.returnCalls===0&&
+          bindingFailureType&&bindingFailure.stats.returnCalls===1&&
+          nested.length===2&&nested.every(stats=>stats.returnCalls===1)&&sameLoop.stats.returnCalls===0&&
+          JSON.stringify(closures.map(read=>read()))==="[1,2]"&&varValue===4&&assigned===6&&destructured===7&&
+          directTdz&&closureTdz&&rhsCalls===1;
+        export {ok};
+    "#;
+    let mut readable = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        source,
+    )])));
+    readable.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "50"),
+    ]));
+    let readable_out = readable.build(Path::new("src/index.js"));
+    assert!(!readable_out.has_errors(), "{:?}", readable_out.diagnostics);
+    assert!(
+        readable_out
+            .bundle
+            .contains("Iterator result is not an object"),
+        "for-of helper must be injected: {}",
+        readable_out.bundle
+    );
+    assert!(
+        !readable_out.bundle.contains(" of "),
+        "all synchronous for-of statements should be lowered: {}",
+        readable_out.bundle
+    );
+
+    let mut minified = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        source,
+    )])));
+    minified
+        .set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+            wake_ecma_transform::BrowserTarget::new("chrome", "50"),
+        ]))
+        .enable_minify()
+        .enable_mangle();
+    let minified_out = minified.build(Path::new("src/index.js"));
+    assert!(!minified_out.has_errors(), "{:?}", minified_out.diagnostics);
+
+    if !node_available() {
+        return;
+    }
+    for (name, output) in [("readable", &readable_out), ("minified", &minified_out)] {
+        let dir = std::env::temp_dir().join(format!("wake_for_of_{name}_e2e"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_path = dir.join("bundle.cjs");
+        std::fs::write(&bundle_path, &output.bundle).unwrap();
+        let script = format!(
+            "const result=require({:?});if(!result.ok){{console.error(result);process.exit(2)}}",
+            bundle_path.to_string_lossy()
+        );
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{name} for-of runtime failed: {}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            output.bundle
+        );
+    }
+}
+
+#[test]
+fn for_of_target_gate_and_conservative_async_using_boundaries() {
+    let sync_source = "let total=0;for(const value of [1,2])total+=value;export {total};";
+    let mut old = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        sync_source,
+    )])));
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "50"),
+    ]));
+    let old_out = old.build(Path::new("src/index.js"));
+    assert!(!old_out.has_errors(), "{:?}", old_out.diagnostics);
+    assert!(old_out.bundle.contains("Iterator result is not an object"));
+    assert!(!old_out.bundle.contains(" of "), "{}", old_out.bundle);
+
+    let mut native = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        sync_source,
+    )])));
+    native.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "51"),
+    ]));
+    let native_out = native.build(Path::new("src/index.js"));
+    assert!(!native_out.has_errors(), "{:?}", native_out.diagnostics);
+    assert!(native_out.bundle.contains(" of "), "{}", native_out.bundle);
+    assert!(
+        !native_out
+            .bundle
+            .contains("Iterator result is not an object")
+    );
+
+    let boundary_source = r#"
+        async function consume(values){for await(const value of values){use(value)}}
+        for(using resource of resources){use(resource)}
+        export {consume};
+    "#;
+    let mut boundaries = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        boundary_source,
+    )])));
+    boundaries.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+    ]));
+    let boundary_out = boundaries.build(Path::new("src/index.js"));
+    assert!(!boundary_out.has_errors(), "{:?}", boundary_out.diagnostics);
+    assert!(boundary_out.bundle.contains("for await ("));
+    assert!(
+        boundary_out
+            .bundle
+            .contains("for (using resource of resources)")
+    );
+    assert!(
+        !boundary_out
+            .bundle
+            .contains("Iterator result is not an object"),
+        "preserved async/using loops must not allocate the sync helper: {}",
+        boundary_out.bundle
+    );
+}
+
+#[test]
+fn default_browser_baseline_and_runtime_target_switch_do_not_reuse_old_ast() {
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "let total=0;for(const value of [1,2])total+=value;const nested={value:total};export const result=nested?.value;",
+    )]));
+    let mut bundler = IncrementalBundler::new(fs);
+
+    let baseline = bundler.build(Path::new("src/index.js"));
+    assert!(!baseline.has_errors(), "{:?}", baseline.diagnostics);
+    assert!(baseline.bundle.contains(" of "), "{}", baseline.bundle);
+    assert!(baseline.bundle.contains("?."), "{}", baseline.bundle);
+    assert!(
+        !baseline.bundle.contains("Iterator result is not an object"),
+        "{}",
+        baseline.bundle
+    );
+
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+        wake_ecma_transform::BrowserTarget::new("chrome", "50"),
+    ]));
+    let legacy = bundler.build(Path::new("src/index.js"));
+    assert!(!legacy.has_errors(), "{:?}", legacy.diagnostics);
+    assert!(!legacy.bundle.contains(" of "), "{}", legacy.bundle);
+    assert!(!legacy.bundle.contains("?."), "{}", legacy.bundle);
+    assert!(
+        legacy.bundle.contains("Iterator result is not an object"),
+        "{}",
+        legacy.bundle
+    );
+
+    bundler.set_target_env(wake_ecma_transform::TargetEnv::default());
+    let restored = bundler.build(Path::new("src/index.js"));
+    assert!(!restored.has_errors(), "{:?}", restored.diagnostics);
+    assert!(restored.bundle.contains(" of "), "{}", restored.bundle);
+    assert!(restored.bundle.contains("?."), "{}", restored.bundle);
+    assert!(
+        !restored.bundle.contains("Iterator result is not an object"),
+        "{}",
+        restored.bundle
+    );
+}
+
+#[test]
+fn lowered_for_of_destructuring_head_preserves_rhs_tdz() {
+    let source = r#"
+        let shadow=[{shadow:1}];
+        let directTdz=false;
+        try{
+          for(let {shadow} of shadow){}
+        }catch(error){
+          directTdz=error instanceof ReferenceError;
+        }
+
+        let captured;
+        for(let {value:inner} of (captured=()=>inner,[{value:1}]))break;
+        let closureTdz=false;
+        try{
+          captured();
+        }catch(error){
+          closureTdz=error instanceof ReferenceError;
+        }
+
+        export const ok=directTdz&&closureTdz;
+    "#;
+
+    for (name, minify) in [("readable", false), ("minified", true)] {
+        let mut bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+            "src/index.js",
+            source,
+        )])));
+        bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+            wake_ecma_transform::BrowserTarget::new("chrome", "40"),
+        ]));
+        if minify {
+            bundler.enable_minify().enable_mangle();
+        }
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert!(
+            !output.bundle.contains(" of "),
+            "sync for-of must be lowered after destructuring: {}",
+            output.bundle
+        );
+
+        if !node_available() {
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("wake_for_of_destructuring_tdz_{name}_e2e"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_path = dir.join("bundle.cjs");
+        std::fs::write(&bundle_path, &output.bundle).unwrap();
+        let script = format!(
+            "const result=require({:?});if(!result.ok){{console.error(result);process.exit(2)}}",
+            bundle_path.to_string_lossy()
+        );
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{name} destructuring for-of TDZ runtime failed: {}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            output.bundle
+        );
+    }
 }

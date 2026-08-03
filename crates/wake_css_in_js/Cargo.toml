@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "零运行时 CSS-in-JS（Linaria / wyw-in-js 子集）：构建期抽取 css`` 为静态 CSS。CRUSTIFY-PARITY §M5"
+description = "零运行时 CSS-in-JS（Linaria / wyw-in-js 子集）：构建期抽取 css`` 为静态 CSS。WAKE-COMPATIBILITY §M5"
 
 [lints]
 workspace = true

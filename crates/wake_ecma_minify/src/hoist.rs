@@ -109,6 +109,16 @@ fn collect_hoisted_impl(
     body_span: Span,
     out: &mut FxHashMap<Span, Vec<Span>>,
 ) {
+    // Hoisted declarations are emitted before the original body. Doing that in a function with
+    // a directive prologue would move code ahead of `"use strict"` (or framework directives) and
+    // silently change the function's semantics. Keep such bodies in source order.
+    if matches!(
+        stmts.first(),
+        Some(Statement::Expression(expression))
+            if matches!(expression.expression, Expression::StringLiteral(_))
+    ) {
+        return;
+    }
     let mut hoisted = Vec::new();
     collect_recursive(stmts, &mut hoisted);
     if !hoisted.is_empty() {
@@ -119,7 +129,7 @@ fn collect_hoisted_impl(
 fn collect_recursive(stmts: &[Statement], out: &mut Vec<Span>) {
     for stmt in stmts {
         match stmt {
-            Statement::VariableDeclaration(d) if d.kind == VarKind::Var => {
+            Statement::VariableDeclaration(d) if d.kind == VarKind::Var && !d.span.is_dummy() => {
                 out.push(d.span);
             }
             // Descend into unconditional containers

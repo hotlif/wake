@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "声明式项目配置加载（wake.config.toml）。对齐 crustify Config（CRUSTIFY-PARITY §M1）。"
+description = "声明式项目配置加载（wake.config.toml）。保持既定行为 Config（WAKE-COMPATIBILITY §M1）。"
 
 [lints]
 workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
+browserslist-rs.workspace = true

@@ -1,6 +1,6 @@
 //! # Source Map V3 —— Base64 VLQ 编码与序列化
 //!
-//! DESIGN §4.6 / CRUSTIFY-PARITY §M4d。codegen 在发射时记录「产物位置 ↔ 源码字节偏移」
+//! DESIGN §4.6 / WAKE-COMPATIBILITY §M4d。codegen 在发射时记录「产物位置 ↔ 源码字节偏移」
 //! （[`Mapping`]），bundler 拼接 bundle 时按行偏移平移合并，最终由 [`SourceMap`] 序列化为
 //! 规范的 V3 JSON。
 //!
