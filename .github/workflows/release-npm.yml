@@ -63,7 +63,7 @@ jobs:
           key: release-${{ matrix.target }}
       - run: npm ci --ignore-scripts
       - run: >-
-          npx napi build --platform --release --strip
+          npx --no-install napi build --platform --release --strip
           --cwd crates/wake_node
           --output-dir ../../npm/wake
           --package-json-path ../../npm/wake/package.json
@@ -115,7 +115,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: >-
-          npx napi build --platform --release --strip
+          npx --no-install napi build --platform --release --strip
           --cwd crates/wake_node
           --output-dir ../../npm/wake
           --package-json-path ../../npm/wake/package.json
