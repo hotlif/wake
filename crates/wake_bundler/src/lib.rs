@@ -22,6 +22,20 @@ pub use session::{BuildOptions, BuildRequest, BuildSession};
 // 供 CLI 组装别名而无需直接依赖 wake_resolver。
 pub use wake_resolver::ResolveOptions;
 
+/// 把宿主或外来平台路径转换成产物使用的正斜杠形式，并移除 Windows verbatim 前缀。
+///
+/// 不能依赖 Path::components 解析其它平台的路径：Unix 会把 Windows 反斜杠视为普通字符。
+pub(crate) fn path_to_slash(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = value.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = value.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        value
+    }
+}
+
 /// 打包器。持有文件系统与全局 interner（跨模块共享 Atom，DESIGN §4.1）。
 pub struct Bundler {
     session: Mutex<BuildSession>,

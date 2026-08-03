@@ -146,7 +146,14 @@ fn rel_path(root: &Path, file: &Path) -> String {
 
 /// 路径 → 正斜杠字符串（Windows `\` → `/`）。
 fn to_slash(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
+    let value = p.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = value.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = value.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        value
+    }
 }
 
 /// 消毒为合法 JS 标识符：非字母数字 → `_`（保持既定行为 `replace(/[^a-zA-Z0-9]/g, "_")`）。
@@ -280,6 +287,18 @@ fn push_js_string(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_paths_strip_windows_verbatim_prefixes() {
+        assert_eq!(
+            to_slash(Path::new(r"\\?\C:\proj\src\button.tsx")),
+            "C:/proj/src/button.tsx"
+        );
+        assert_eq!(
+            to_slash(Path::new(r"\\?\UNC\server\share\src\button.tsx")),
+            "//server/share/src/button.tsx"
+        );
+    }
 
     #[test]
     fn sanitize_import_name() {

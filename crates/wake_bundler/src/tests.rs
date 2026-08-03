@@ -4450,6 +4450,28 @@ fn sourcemap_source_names_are_normalized() {
     // cwd 未加前缀、路径加了前缀（dev server 的真实情形）也应相对化
     assert_eq!(map_source_name(p, Some(Path::new(r"C:\proj"))), "src/a.js");
 
+    // 相对化不能依赖 runner 的宿主路径语义；UNC 与普通 Unix 路径都应稳定。
+    assert_eq!(
+        map_source_name(
+            Path::new(r"\\?\UNC\server\share\proj\src\a.js"),
+            Some(Path::new(r"\\server\share\proj")),
+        ),
+        "src/a.js"
+    );
+    assert_eq!(
+        map_source_name(Path::new("/proj/src/a.js"), Some(Path::new("/proj"))),
+        "src/a.js"
+    );
+
+    // 只允许在路径段边界相对化，不能把 `project` 当成 `proj` 的子路径。
+    assert_eq!(
+        map_source_name(
+            Path::new(r"C:\project\src\a.js"),
+            Some(Path::new(r"C:\proj")),
+        ),
+        "C:/project/src/a.js"
+    );
+
     // 不在 cwd 之下 → 保留绝对路径，但仍去前缀并转正斜杠
     let outside = map_source_name(p, Some(Path::new(r"C:\other")));
     assert!(

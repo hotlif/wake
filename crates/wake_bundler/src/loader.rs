@@ -17,6 +17,8 @@ use std::path::Path;
 use wake_common::FileSystem;
 use wake_ecma_ast::SourceType;
 
+use crate::path_to_slash;
+
 /// 加载选项（prod/dev 差异，WAKE-COMPATIBILITY §M3）。
 pub(crate) struct LoadOptions {
     /// prod CSS 抽取：CSS 模块不再运行时注入 `<style>`，CSS 文本经 [`Loaded::css`] 带出聚合为 `.css`。
@@ -179,7 +181,7 @@ fn prepare_css(fs: &dyn FileSystem, path: &Path, text: &str, opts: &LoadOptions)
     // （`transform_modules` 不记录 url 位置，故对其结果重跑一次 `analyze`——此时 `@import`
     // 已被移除，`analyze` 对余下文本是恒等的，偏移因而对齐 `code`。）
     let (imports, base_code, exports) = if is_css_module_path(path) {
-        let seed = path.to_string_lossy();
+        let seed = path_to_slash(path);
         let m = wake_css::transform_modules(text, &seed);
         (m.imports, m.code, Some(m.exports))
     } else {
@@ -361,7 +363,7 @@ fn crab_component_style_specifier(fs: &dyn FileSystem, path: &Path) -> Option<St
                 == Some("node_modules")
     })?;
     let relative = path.strip_prefix(package_dir).ok()?;
-    let entry = relative.to_string_lossy().replace('\\', "/");
+    let entry = path_to_slash(relative);
     if !matches!(
         entry.as_str(),
         "esm/index.mjs"
@@ -640,6 +642,26 @@ mod tests {
         assert!(js.contains("import \"./reset.css\";"));
         assert!(js.contains(".a { color: red; }"));
         assert!(js.contains("document.createElement(\"style\")"));
+    }
+
+    #[test]
+    fn css_module_names_ignore_platform_path_syntax() {
+        let fs = MemoryFileSystem::new();
+        let source = ".button { color: red; }";
+        let windows = prepare_css(
+            &fs,
+            Path::new(r"\\?\C:\proj\src\button.module.css"),
+            source,
+            &LoadOptions::default(),
+        );
+        let slash = prepare_css(
+            &fs,
+            Path::new("C:/proj/src/button.module.css"),
+            source,
+            &LoadOptions::default(),
+        );
+        assert_eq!(windows.exports, slash.exports);
+        assert_eq!(windows.code, slash.code);
     }
 
     #[test]

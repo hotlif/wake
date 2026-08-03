@@ -2169,7 +2169,14 @@ fn js_braced(value: &str) -> String {
     format!("{{{}}}", js_string(value))
 }
 fn slash_path(path: impl AsRef<Path>) -> String {
-    path.as_ref().to_string_lossy().replace('\\', "/")
+    let value = path.as_ref().to_string_lossy().replace('\\', "/");
+    if let Some(rest) = value.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = value.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        value
+    }
 }
 
 fn root_relative_alias(root: &Path, path: &Path) -> Result<String, DocsError> {
@@ -2210,6 +2217,18 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, DocsError> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn slash_paths_strip_windows_verbatim_prefixes() {
+        assert_eq!(
+            slash_path(Path::new(r"\\?\C:\proj\docs\index.mdx")),
+            "C:/proj/docs/index.mdx"
+        );
+        assert_eq!(
+            slash_path(Path::new(r"\\?\UNC\server\share\docs\index.mdx")),
+            "//server/share/docs/index.mdx"
+        );
+    }
 
     fn fixture() -> PathBuf {
         let id = SystemTime::now()

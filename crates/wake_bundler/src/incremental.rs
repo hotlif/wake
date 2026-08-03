@@ -54,6 +54,7 @@ use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
 use crate::loader::{LoadOptions, Loaded, load_source, push_js_string};
 use crate::{
     BuildOutput, ChunkKind, Linker, OutputAsset, OutputChunk, POSTLUDE, PRELUDE, PRELUDE_ASYNC,
+    path_to_slash,
 };
 
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
@@ -622,7 +623,7 @@ impl IncrementalBundler {
 
             // ② 带着该作用域算本模块的导出，供下游模块引用（多层传播的关键）。
             // seed 须与 codegen 期 `transform` 用的完全一致，否则跨模块引用到的类名会对不上。
-            let seed = rec.path.to_string_lossy().replace('\\', "/");
+            let seed = path_to_slash(&rec.path);
             let ex = parsed.ast.with_ast(|p| {
                 wake_css_in_js::collect_static_exports_with(p, &self.interner, &seed, &scope)
             });
@@ -891,8 +892,7 @@ impl IncrementalBundler {
                 let interner = self.interner.clone();
                 let jsx = self.jsx;
                 let transform_features = self.transform_features;
-                let file_name: Arc<str> =
-                    Arc::from(item.path.to_string_lossy().replace('\\', "/").as_str());
+                let file_name: Arc<str> = Arc::from(path_to_slash(&item.path));
                 move || parse_request(cell, interner, st, jsx, transform_features, file_name)
             })
             .collect();
@@ -1214,8 +1214,7 @@ impl IncrementalBundler {
                     let jsx = self.jsx;
                     let transform_features = self.transform_features;
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
-                    let file_name: Arc<str> =
-                        Arc::from(layer[i].path.to_string_lossy().replace('\\', "/").as_str());
+                    let file_name: Arc<str> = Arc::from(path_to_slash(&layer[i].path));
                     move || {
                         let (parse_vc, parsed) = parse_request(
                             cell,
@@ -1659,8 +1658,7 @@ impl IncrementalBundler {
                     let jsx = self.jsx;
                     let transform_features = self.transform_features;
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
-                    let file_name: Arc<str> =
-                        Arc::from(rec.path.to_string_lossy().replace('\\', "/").as_str());
+                    let file_name: Arc<str> = Arc::from(path_to_slash(&rec.path));
                     move || parse_request(cell, interner, st, jsx, transform_features, file_name)
                 })
                 .collect();
@@ -1707,13 +1705,7 @@ impl IncrementalBundler {
                 let want_map = self.sourcemap;
                 let id = plans[i].id;
                 let cij = cij_scopes.get(&id).cloned();
-                let cij_seed: Arc<str> = Arc::from(
-                    modules[&id]
-                        .path
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                        .as_str(),
-                );
+                let cij_seed: Arc<str> = Arc::from(path_to_slash(&modules[&id].path));
                 // dev（未开抽取）时把 CSS 以 `<style>` 注入模块体；prod 带出聚合。
                 let inject_style = !self.extract_css;
                 move || {
@@ -3629,23 +3621,37 @@ fn count_lines(s: &str) -> u32 {
 /// 泄漏成 `//?/C:/…` 且让 DevTools 无法定位；② 尽量取相对 `cwd` 的路径，避免把构建机的
 /// 目录结构写死进 map；③ 统一用正斜杠（sourcemap 规范的路径分隔符）。
 pub(crate) fn map_source_name(path: &Path, cwd: Option<&Path>) -> String {
-    /// 去掉 `\\?\`（及 UNC 形式 `\\?\UNC\`）前缀。
-    fn strip_verbatim(p: &Path) -> PathBuf {
-        let s = p.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            PathBuf::from(format!(r"\\{rest}"))
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            PathBuf::from(rest)
-        } else {
-            p.to_path_buf()
-        }
+    /// 先转成 SourceMap 使用的 `/`，再去掉 Windows verbatim 前缀。
+    ///
+    /// 这里刻意不借助 [`Path::components`]：在 Unix 上，`C:\foo` 的反斜杠只是普通字符，
+    /// 用宿主路径语义处理其它平台的路径会导致相对化结果随 CI runner 改变。
+    fn normalize(p: &Path) -> String {
+        path_to_slash(p)
     }
-    let clean = strip_verbatim(path);
-    let rel = cwd
-        .map(strip_verbatim)
-        .and_then(|c| clean.strip_prefix(&c).map(Path::to_path_buf).ok())
-        .unwrap_or(clean);
-    rel.to_string_lossy().replace('\\', "/")
+
+    /// 仅在完整路径段边界上相对化，避免 `/proj` 误匹配 `/project`。
+    fn strip_base<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+        let base = if base == "/" {
+            base
+        } else {
+            base.trim_end_matches('/')
+        };
+        if base.is_empty() {
+            return None;
+        }
+        if path == base {
+            return Some("");
+        }
+        if base == "/" {
+            return path.strip_prefix('/');
+        }
+        path.strip_prefix(base)?.strip_prefix('/')
+    }
+
+    let clean = normalize(path);
+    cwd.map(normalize)
+        .and_then(|base| strip_base(&clean, &base).map(str::to_string))
+        .unwrap_or(clean)
 }
 
 /// 序列化 [`SourceMap`] 为 V3 JSON：把各映射的**源字节偏移**换算为 0 基行 + UTF-16 列。
@@ -4018,7 +4024,7 @@ fn hash8(s: &str) -> String {
 
 /// 构建命名空间 token（隔离同进程多 bundle 的全局 registry）：`__wake_<hash8(入口路径#模块数)>__`。
 fn build_token(entry_norm: &Path, n: usize) -> String {
-    let mut s = entry_norm.to_string_lossy().into_owned();
+    let mut s = path_to_slash(entry_norm);
     s.push('#');
     s.push_str(&n.to_string());
     format!("__wake_{}__", hash8(&s))
