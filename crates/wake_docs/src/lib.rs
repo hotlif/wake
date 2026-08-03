@@ -12,12 +12,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 const RUNTIME_APP: &str = include_str!("../runtime/app.tsx");
 const RUNTIME_ENTRY: &str = include_str!("../runtime/entry.tsx");
 const RUNTIME_STYLE: &str = include_str!("../runtime/styles.css");
 const MINIMUM_REACT_MAJOR: u64 = 19;
+static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildMode {
@@ -1862,6 +1867,9 @@ fn remove_stale_generated_files(
 }
 
 fn atomic_write_if_changed(path: &Path, content: &[u8]) -> Result<bool, DocsError> {
+    let _write_guard = ATOMIC_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if fs::read(path).is_ok_and(|current| current == content) {
         return Ok(false);
     }
@@ -1869,35 +1877,40 @@ fn atomic_write_if_changed(path: &Path, content: &[u8]) -> Result<bool, DocsErro
         fs::create_dir_all(parent)
             .map_err(|error| DocsError::Io(parent.to_path_buf(), error.to_string()))?;
     }
-    let temporary = path.with_extension(format!(
-        "{}.wake-next",
-        path.extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("tmp")
-    ));
-    fs::write(&temporary, content)
-        .map_err(|error| DocsError::Io(temporary.clone(), error.to_string()))?;
-    if path.exists() {
-        let backup = path.with_extension(format!(
-            "{}.wake-previous",
+
+    let operation_id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let sibling = |marker: &str| {
+        path.with_extension(format!(
+            "{}.{marker}-{}-{operation_id}",
             path.extension()
                 .and_then(|value| value.to_str())
-                .unwrap_or("tmp")
-        ));
+                .unwrap_or("tmp"),
+            std::process::id()
+        ))
+    };
+    let temporary = sibling("wake-next");
+    fs::write(&temporary, content)
+        .map_err(|error| DocsError::Io(temporary.clone(), error.to_string()))?;
+
+    if path.exists() {
+        let backup = sibling("wake-previous");
         if backup.exists() {
             fs::remove_file(&backup)
                 .map_err(|error| DocsError::Io(backup.clone(), error.to_string()))?;
         }
-        fs::rename(path, &backup)
-            .map_err(|error| DocsError::Io(path.to_path_buf(), error.to_string()))?;
+        if let Err(error) = fs::rename(path, &backup) {
+            let _ = fs::remove_file(&temporary);
+            return Err(DocsError::Io(path.to_path_buf(), error.to_string()));
+        }
         if let Err(error) = fs::rename(&temporary, path) {
             let _ = fs::rename(&backup, path);
+            let _ = fs::remove_file(&temporary);
             return Err(DocsError::Io(path.to_path_buf(), error.to_string()));
         }
         fs::remove_file(&backup).map_err(|error| DocsError::Io(backup, error.to_string()))?;
-    } else {
-        fs::rename(&temporary, path)
-            .map_err(|error| DocsError::Io(path.to_path_buf(), error.to_string()))?;
+    } else if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(DocsError::Io(path.to_path_buf(), error.to_string()));
     }
     Ok(true)
 }
@@ -2216,7 +2229,9 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, DocsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Barrier};
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn slash_paths_strip_windows_verbatim_prefixes() {
@@ -2230,12 +2245,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_atomic_writes_do_not_share_staging_files() {
+        let output = fixture().join(".wake/docs/generated/pages/shared.tsx");
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let output = output.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for round in 0..16 {
+                        let content = format!("worker={worker};round={round}");
+                        atomic_write_if_changed(&output, content.as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let content = fs::read_to_string(&output).unwrap();
+        assert!(content.starts_with("worker="), "{content}");
+        let leftovers: Vec<_> = fs::read_dir(output.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name != "shared.tsx")
+            .collect();
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
     fn fixture() -> PathBuf {
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("wake-docs-{id}"));
+        let root = loop {
+            let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let candidate =
+                std::env::temp_dir().join(format!("wake-docs-{}-{id}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("fixture root: {error}"),
+            }
+        };
         fs::create_dir_all(root.join("docs/demos")).expect("fixture docs");
         fs::create_dir_all(root.join("src")).expect("fixture src");
         fs::write(
