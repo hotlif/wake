@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2024",
+    "lib": ["ES2024", "ESNext.Disposable", "DOM"],
+    "types": ["node"]
+  },
+  "include": ["types.ts"]
+}

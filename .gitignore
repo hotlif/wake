@@ -19,7 +19,9 @@ node_modules
 # fixture 打包产物（由 wake build / webpack 生成）
 fixtures/*/dist/
 fixtures/*/dist-*/
+fixtures/*/docs-dist/
 /dist/
+/docs-dist/
 
 # 合成模块 fixture 生成源文件（由 generate.mjs 生成，不入库）
 fixtures/*/input/src/
@@ -29,3 +31,8 @@ fixtures/*/input/src/
 .vscode/*
 !.vscode/extensions.json
 .DS_Store
+
+# Local Node-API build outputs; release jobs copy only the matching binary into
+# a platform package staging directory.
+/npm/*/*.node
+/npm/wake/native.d.ts

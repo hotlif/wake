@@ -1,0 +1,30 @@
+{
+  "name": "@crab-dev/wake-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "Wake native binary for win32 x64",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hotlif/wake.git"
+  },
+  "main": "./wake.win32-x64-msvc.node",
+  "files": [
+    "wake.win32-x64-msvc.node",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=22.14 <27"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

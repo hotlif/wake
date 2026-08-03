@@ -1,0 +1,27 @@
+# @crab-dev/wake
+
+Wake is a Rust-native web builder exposed as both a Node.js library and the
+`wake` command.
+
+```sh
+npm install --save-dev @crab-dev/wake
+npx wake build
+```
+
+```js
+import { build, startDevServer } from '@crab-dev/wake'
+
+await build({ cwd: process.cwd() })
+
+const server = await startDevServer({ port: 5173 })
+console.log(server.url)
+await server.waitUntilClosed()
+```
+
+Compiler primitives are intentionally isolated under
+`@crab-dev/wake/experimental`. A `ParsedModule` is an opaque, disposable
+native handle and cannot be cloned, persisted, or transferred to a Worker.
+
+Wake supports Node.js 22.14 through 26 on Windows x64, Linux glibc x64/arm64,
+and macOS x64/arm64. Installing the package never compiles Rust code and does
+not run a postinstall script.

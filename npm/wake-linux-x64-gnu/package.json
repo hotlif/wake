@@ -1,0 +1,33 @@
+{
+  "name": "@crab-dev/wake-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "Wake native binary for linux x64",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hotlif/wake.git"
+  },
+  "main": "./wake.linux-x64-gnu.node",
+  "files": [
+    "wake.linux-x64-gnu.node",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=22.14 <27"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

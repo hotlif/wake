@@ -1,0 +1,35 @@
+{
+  "name": "wake-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "npm/wake"
+  ],
+  "scripts": {
+    "docs:dev": "cargo run -q -p wake_cli -- docs dev .",
+    "docs:build": "cargo run -q -p wake_cli -- docs build .",
+    "native:build": "napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts",
+    "npm:test": "node --test npm/wake/test/*.test.mjs",
+    "npm:typecheck": "tsc -p npm/wake/test/tsconfig.json",
+    "npm:pack:check": "node scripts/check-npm-packs.mjs",
+    "versions:check": "node scripts/check-versions.mjs"
+  },
+  "dependencies": {
+    "@crab-dev/rc-alert": "^0.0.2",
+    "@crab-dev/rc-button": "^0.0.2",
+    "@crab-dev/rc-card": "^0.0.2",
+    "@crab-dev/rc-prose": "^0.0.2",
+    "@crab-dev/rc-tag": "^0.0.2",
+    "@linaria/core": "^8.1.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.8.2",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "name": "@crab-dev/wake",
+  "version": "0.1.0",
+  "description": "Wake native web build tools for Node.js",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hotlif/wake.git"
+  },
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.cjs"
+    },
+    "./experimental": {
+      "types": "./experimental.d.ts",
+      "import": "./experimental.mjs",
+      "require": "./experimental.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "wake": "./bin/wake.mjs"
+  },
+  "napi": {
+    "binaryName": "wake"
+  },
+  "files": [
+    "bin",
+    "*.cjs",
+    "*.mjs",
+    "index.d.ts",
+    "experimental.d.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=22.14 <27"
+  },
+  "optionalDependencies": {
+    "@crab-dev/wake-win32-x64-msvc": "0.1.0",
+    "@crab-dev/wake-linux-x64-gnu": "0.1.0",
+    "@crab-dev/wake-linux-arm64-gnu": "0.1.0",
+    "@crab-dev/wake-darwin-x64": "0.1.0",
+    "@crab-dev/wake-darwin-arm64": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

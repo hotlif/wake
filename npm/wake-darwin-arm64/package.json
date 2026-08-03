@@ -1,0 +1,30 @@
+{
+  "name": "@crab-dev/wake-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Wake native binary for darwin arm64",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hotlif/wake.git"
+  },
+  "main": "./wake.darwin-arm64.node",
+  "files": [
+    "wake.darwin-arm64.node",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=22.14 <27"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
