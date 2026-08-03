@@ -189,7 +189,7 @@ jobs:
             grep -qx 'package/LICENSE-APACHE' <<<"$list"
             grep -qx 'package/README.md' <<<"$list"
             native_count="$(grep -Ec '\.node$' <<<"$list" || true)"
-            if [[ "$archive" == *crab-dev-wake-0.1.0.tgz ]]; then
+            if [[ "$archive" == *crab-dev-wake-0.1.1.tgz ]]; then
               test "$native_count" -eq 0
               test "$(stat -c%s "$archive")" -le 524288
             else
@@ -197,7 +197,7 @@ jobs:
               test "$(stat -c%s "$archive")" -le 15728640
             fi
             version="$(tar -xOzf "$archive" package/package.json | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).version))")"
-            test "$version" = '0.1.0'
+            test "$version" = '0.1.1'
           done
       - uses: actions/attest-build-provenance@v3
         with:
@@ -229,7 +229,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish root package last
-        run: npm publish artifacts/crab-dev-wake-0.1.0.tgz --access public --provenance
+        run: npm publish artifacts/crab-dev-wake-0.1.1.tgz --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -257,7 +257,7 @@ jobs:
           mkdir smoke
           cd smoke
           npm init -y
-          npm install --ignore-scripts @crab-dev/wake@0.1.0
+          npm install --ignore-scripts @crab-dev/wake@0.1.1
           npx wake --version
           node -e "console.log(require('@crab-dev/wake').version())"
 
@@ -280,7 +280,7 @@ jobs:
           mkdir smoke
           cd smoke
           npm init -y
-          npm install --ignore-scripts @crab-dev/wake@0.1.0
+          npm install --ignore-scripts @crab-dev/wake@0.1.1
           node -e "let p=require('./package.json');p.scripts={'wake-smoke':'wake build'};require('node:fs').writeFileSync('package.json',JSON.stringify(p));require('node:fs').mkdirSync('src');require('node:fs').writeFileSync('wake.config.toml','[html]\nentry = \"src/index.js\"\n');require('node:fs').writeFileSync('src/index.js','export const value = 42\n')"
           npx @crab-dev/wake --version
           npx wake --version
