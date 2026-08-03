@@ -5331,12 +5331,24 @@ fn using_fixture() -> MemoryFileSystem {
 
 #[test]
 fn using_declarations_dispose_in_node() {
-    if std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    // 不能只检查 node 是否存在：Node 22 暴露 Symbol.dispose，但解析器仍不接受
+    // using / await using。先探测测试真正依赖的语法能力，避免 runner 预装版本变化
+    // 导致与 bundler 无关的 SyntaxError。
+    let probe = std::process::Command::new("node")
+        .arg("-e")
+        .arg(
+            "async function __wake_using_probe(){using a={ [Symbol.dispose](){} };await using b={ async [Symbol.asyncDispose](){} };}",
+        )
+        .output();
+    let Ok(probe) = probe else {
         eprintln!("node 不可用，跳过 using e2e");
+        return;
+    };
+    if !probe.status.success() {
+        eprintln!(
+            "当前 node 不支持 using / await using，跳过 e2e：{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
         return;
     }
     // 关闭/开启 minify+mangle 各跑一遍：未用绑定消除、变量重命名都不得破坏 dispose 语义。
