@@ -1,7 +1,9 @@
 //! wake_cache — wake_turbo 任务图与产物的**持久化层**（DESIGN §10.3 / PLAN §7.1）。
 //!
-//! 目标：让一个**全新进程**的冷构建跳过未变模块的 parse + codegen——把两类纯函数输出落盘：
+//! 目标：让一个**全新进程**的冷构建跳过未变模块的源码读取、parse 与 codegen——把三类数据落盘：
 //!
+//! - **路径快照**：`path → (mtime, size, content_key, source)`，元数据命中时只 stat 一次。
+//!   源码从单个缓存文件恢复，避免 Windows 对数千个小文件逐个触盘。
 //! - **模块摘要**（`ModuleSummary`）：`content_key → (deps, uses, 顶层 await 标志)`。`content_key = hash(源类型 ‖ 源文本)`。
 //!   有它就能不 parse 直接建依赖图、算 Tree Shaking 保留集。
 //! - **codegen 产物**（`body`）：`(content_key, linker_key) → String`。`linker_key = hash(依赖 id 映射 ‖ keep ‖ dyn_chunks)`。
@@ -9,19 +11,21 @@
 //!
 //! **健壮性**：值全是 `String`/`Vec`/整数——**绝不落 `ModuleAst`（自引用 arena）也绝不落 `Atom`**
 //! （interner id 跨进程无意义；说明符已在此前解成 `String`）。这正是 PLAN「Atom 不落盘」的落地。
-//! 任一字节变化 → `content_key` 变 → 未命中 → 重算，故**不可能产出陈旧结果**。
+//! 常规文件变化会改变 mtime 或 size，从而重新读取并由 `content_key` 做内容级失效。若外部工具刻意
+//! 保留同一 mtime 与 size 却替换内容，需要清理缓存；这是用一次 stat 换取跨进程免读源码的明确取舍。
+//! CSS、JSON、资源和依赖邻接文件系统状态的 loader 不使用路径快照。
 //!
 //! **格式**：手写小端二进制 + `MAGIC`+`SCHEMA` 头；schema 不符（wake 自身的 parse/codegen 语义
 //! 变更时应 bump `SCHEMA`）直接当空缓存忽略。rkyv 的零拷贝是更大规模时的优化，可后续替换（API 不变）。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 缓存文件魔数。
 const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
-const SCHEMA: u32 = 3;
+const SCHEMA: u32 = 4;
 
 /// 一条依赖（说明符 + 种类判别值 + 源码位置）。`kind` 用 `u8`（由调用方与 `DependencyKind` 互转），
 /// 使本 crate 不依赖 AST 类型。
@@ -75,10 +79,33 @@ pub struct ModuleSummary {
     pub concat_block_safe: bool,
 }
 
+/// 原文件元数据。命中时无需重新读取该小文件；`content_key` 仍负责内容级缓存寻址。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub size: u64,
+    pub modified_ns: u128,
+}
+
+/// 路径索引命中项。源码随单个缓存文件顺序读取，避免 Windows 对大量源文件逐个触盘。
+#[derive(Clone, Debug)]
+pub struct CachedSource {
+    pub stamp: FileStamp,
+    pub content_key: u64,
+    pub source: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+struct PathEntry {
+    variant: u64,
+    cached: CachedSource,
+}
+
 /// 持久化构建缓存：摘要表 + 产物表。
 #[derive(Default)]
 pub struct BuildCache {
     summaries: HashMap<u64, ModuleSummary>,
+    /// 规范路径 → 文件元数据、配置变体、内容键与源码快照。
+    paths: HashMap<PathBuf, PathEntry>,
     /// codegen 产物体。存 `Arc<String>`：命中返回引用计数自增而非整体拷贝，
     /// 与 bundler 拼接侧的 `Arc<String>` 同构，消除全命中路径的两次全 bundle memcpy。
     bodies: HashMap<u128, Arc<String>>,
@@ -118,6 +145,44 @@ impl BuildCache {
         }
     }
 
+    /// 查询路径源码快照；配置变体不一致时视为 miss。
+    pub fn cached_source(&self, path: &Path, variant: u64) -> Option<CachedSource> {
+        let entry = self.paths.get(path)?;
+        (entry.variant == variant).then(|| entry.cached.clone())
+    }
+
+    /// 更新路径索引。内容完全相同时不置 dirty，避免全命中构建重写缓存文件。
+    pub fn put_source(
+        &mut self,
+        path: &Path,
+        stamp: FileStamp,
+        variant: u64,
+        content_key: u64,
+        source: &str,
+    ) {
+        let unchanged = self.paths.get(path).is_some_and(|entry| {
+            entry.variant == variant
+                && entry.cached.stamp == stamp
+                && entry.cached.content_key == content_key
+                && entry.cached.source.as_ref() == source
+        });
+        if unchanged {
+            return;
+        }
+        self.paths.insert(
+            path.to_path_buf(),
+            PathEntry {
+                variant,
+                cached: CachedSource {
+                    stamp,
+                    content_key,
+                    source: Arc::from(source),
+                },
+            },
+        );
+        self.dirty = true;
+    }
+
     /// 查模块摘要（命中计数 +1）。
     pub fn summary(&mut self, content_key: u64) -> Option<ModuleSummary> {
         let s = self.summaries.get(&content_key).cloned();
@@ -152,7 +217,7 @@ impl BuildCache {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.summaries.is_empty() && self.bodies.is_empty()
+        self.paths.is_empty() && self.summaries.is_empty() && self.bodies.is_empty()
     }
 
     // —— 编解码（手写小端二进制）——
@@ -161,6 +226,16 @@ impl BuildCache {
         let mut b = Vec::with_capacity(4096);
         b.extend_from_slice(MAGIC);
         put_u32(&mut b, SCHEMA);
+        // path index
+        put_u32(&mut b, self.paths.len() as u32);
+        for (path, entry) in &self.paths {
+            put_str(&mut b, &path.to_string_lossy());
+            put_u64(&mut b, entry.variant);
+            put_u64(&mut b, entry.cached.stamp.size);
+            put_u128(&mut b, entry.cached.stamp.modified_ns);
+            put_u64(&mut b, entry.cached.content_key);
+            put_str(&mut b, &entry.cached.source);
+        }
         // summaries
         put_u32(&mut b, self.summaries.len() as u32);
         for (k, s) in &self.summaries {
@@ -205,6 +280,28 @@ impl BuildCache {
             return None; // schema 变更 → 忽略旧缓存
         }
         let mut cache = BuildCache::default();
+        let n_paths = c.u32()?;
+        for _ in 0..n_paths {
+            let path = PathBuf::from(c.str()?);
+            let variant = c.u64()?;
+            let stamp = FileStamp {
+                size: c.u64()?,
+                modified_ns: c.u128()?,
+            };
+            let content_key = c.u64()?;
+            let source: Arc<str> = Arc::from(c.str()?);
+            cache.paths.insert(
+                path,
+                PathEntry {
+                    variant,
+                    cached: CachedSource {
+                        stamp,
+                        content_key,
+                        source,
+                    },
+                },
+            );
+        }
         let n_sum = c.u32()?;
         for _ in 0..n_sum {
             let key = c.u64()?;
@@ -450,6 +547,16 @@ mod tests {
             0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
             Arc::new("exports.x = 1;".to_string()),
         );
+        c.put_source(
+            Path::new("src/index.js"),
+            FileStamp {
+                size: 19,
+                modified_ns: 42,
+            },
+            7,
+            0xDEAD_BEEF,
+            "export const x=1;",
+        );
         c
     }
 
@@ -475,6 +582,13 @@ mod tests {
             Some("exports.x = 1;")
         );
         assert!(back.body(0).is_none());
+        let source = back
+            .cached_source(Path::new("src/index.js"), 7)
+            .expect("path source");
+        assert_eq!(source.stamp.modified_ns, 42);
+        assert_eq!(source.content_key, 0xDEAD_BEEF);
+        assert_eq!(source.source.as_ref(), "export const x=1;");
+        assert!(back.cached_source(Path::new("src/index.js"), 8).is_none());
     }
 
     #[test]

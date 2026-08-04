@@ -333,6 +333,26 @@ pub(crate) fn source_type_for(path: &Path) -> SourceType {
     }
 }
 
+/// 可安全从持久路径索引恢复的纯源码模块。
+///
+/// CSS/JSON/资源会产生派生产物，不能只恢复源码；Crab 组件入口还依赖相邻样式文件是否存在，
+/// 因而也保守回退到真实 loader。
+pub(crate) fn cached_source_type(path: &Path) -> Option<SourceType> {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "@crab-dev")
+    {
+        return None;
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("js" | "mjs" | "cjs") => Some(SourceType::Module),
+        Some("ts" | "mts" | "cts") => Some(SourceType::TypeScript),
+        Some("jsx") => Some(SourceType::Jsx),
+        Some("tsx") => Some(SourceType::Tsx),
+        _ => None,
+    }
+}
+
 /// 为 `@crab-dev/rc-*` 的真实 npm 入口补上同包 `css/index.css`。
 ///
 /// 这是 Wake 对 `babel-plugin-auto-import-style` 的原生等价实现：样式仍作为普通 CSS
@@ -622,6 +642,31 @@ pub(crate) fn push_js_string(out: &mut String, s: &str) {
 mod tests {
     use super::*;
     use wake_common::MemoryFileSystem;
+
+    #[test]
+    fn persistent_source_snapshot_only_accepts_pure_source_modules() {
+        assert_eq!(
+            cached_source_type(Path::new("a.js")),
+            Some(SourceType::Module)
+        );
+        assert_eq!(
+            cached_source_type(Path::new("a.ts")),
+            Some(SourceType::TypeScript)
+        );
+        assert_eq!(
+            cached_source_type(Path::new("a.jsx")),
+            Some(SourceType::Jsx)
+        );
+        assert_eq!(
+            cached_source_type(Path::new("a.tsx")),
+            Some(SourceType::Tsx)
+        );
+        assert!(cached_source_type(Path::new("a.css")).is_none());
+        assert!(cached_source_type(Path::new("a.json")).is_none());
+        assert!(cached_source_type(Path::new("a.png")).is_none());
+        assert!(cached_source_type(Path::new("a.raw")).is_none());
+        assert!(cached_source_type(Path::new("node_modules/@crab-dev/rc-a/index.js")).is_none());
+    }
 
     /// 用内存 FS 走**真实** [`load_source`] 路径加载一个 CSS 文件（dev 形态：不抽取、全内联）。
     fn load_css(

@@ -23,6 +23,7 @@ wake_css_in_js.workspace = true
 wake_graph.workspace = true
 wake_cache.workspace = true
 xxhash-rust.workspace = true
+crossbeam-utils.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

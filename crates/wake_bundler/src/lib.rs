@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use wake_common::{Diagnostic, FileSystem, FxHashMap, FxHashSet};
+use wake_common::{Diagnostic, FileSystem, FxHashMap};
 use wake_ecma_codegen::ModuleLinker;
 
 mod chunk;
@@ -48,6 +48,11 @@ pub struct BuildOutput {
     pub bundle: String,
     /// 模块数。
     pub module_count: usize,
+    /// 本轮实际重新执行 codegen 的模块数。未改变产物的模块和缓存命中均不计入。
+    /// 首次构建调用方通常展示 `module_count`，增量构建展示此字段。
+    pub updated_module_count: usize,
+    /// 本轮复用既有 codegen 产物的模块数（内存红绿缓存 + 持久化缓存）。
+    pub cached_module_count: usize,
     /// 诊断（读文件失败 / 解析错误 / 依赖解析失败）。
     pub diagnostics: Vec<Diagnostic>,
     /// 全部产物 chunk（至少 1 个 = entry）。代码分割（6.5）时含 async/shared chunk。
@@ -144,6 +149,8 @@ pub(crate) fn single_chunk(
     BuildOutput {
         bundle,
         module_count,
+        updated_module_count: 0,
+        cached_module_count: 0,
         diagnostics,
         chunks: vec![chunk],
         entry_chunk: 0,
@@ -168,20 +175,51 @@ impl Bundler {
     }
 }
 
-pub(crate) struct Linker {
-    pub(crate) map: FxHashMap<String, u32>,
-    /// 动态 import 说明符 → async/shared chunk id（代码分割，6.5）。空 = 不分割。
-    pub(crate) dyn_chunk: FxHashMap<String, u32>,
-    /// 本模块依赖里属于 async 子图（顶层 await 传染）的模块 id。空 = 无顶层 await。
-    pub(crate) async_ids: FxHashSet<u32>,
+const SMALL_LINKER_LOOKUP: usize = 8;
+
+pub(crate) enum SpecifierLookup<'a> {
+    Slice(&'a [(String, u32)]),
+    Map(FxHashMap<&'a str, u32>),
 }
 
-impl ModuleLinker for Linker {
+impl<'a> SpecifierLookup<'a> {
+    pub(crate) fn new(entries: &'a [(String, u32)]) -> Self {
+        if entries.len() <= SMALL_LINKER_LOOKUP {
+            Self::Slice(entries)
+        } else {
+            Self::Map(
+                entries
+                    .iter()
+                    .map(|(specifier, id)| (specifier.as_str(), *id))
+                    .collect(),
+            )
+        }
+    }
+
+    fn get(&self, specifier: &str) -> Option<u32> {
+        match self {
+            Self::Slice(entries) => entries
+                .iter()
+                .find_map(|(candidate, id)| (candidate == specifier).then_some(*id)),
+            Self::Map(entries) => entries.get(specifier).copied(),
+        }
+    }
+}
+
+pub(crate) struct Linker<'a> {
+    pub(crate) map: SpecifierLookup<'a>,
+    /// 动态 import 说明符 → async/shared chunk id（代码分割，6.5）。空 = 不分割。
+    pub(crate) dyn_chunk: SpecifierLookup<'a>,
+    /// 本模块依赖里属于 async 子图（顶层 await 传染）的模块 id。空 = 无顶层 await。
+    pub(crate) async_ids: &'a [u32],
+}
+
+impl ModuleLinker for Linker<'_> {
     fn module_id(&self, specifier: &str) -> Option<u32> {
-        self.map.get(specifier).copied()
+        self.map.get(specifier)
     }
     fn dynamic_chunk(&self, specifier: &str) -> Option<u32> {
-        self.dyn_chunk.get(specifier).copied()
+        self.dyn_chunk.get(specifier)
     }
     fn is_async_module(&self, id: u32) -> bool {
         self.async_ids.contains(&id)

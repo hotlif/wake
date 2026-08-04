@@ -299,6 +299,8 @@ mod tests {
         let request = BuildRequest::new("src/index.js");
         let first = session.build_current(request.clone());
         assert!(!first.has_errors());
+        assert_eq!(first.updated_module_count, first.module_count);
+        assert_eq!(first.cached_module_count, 0);
         let loads = session.load_exec_count();
         let tasks = session.task_exec_count();
         let resolves = session.resolve_exec_count();
@@ -310,6 +312,8 @@ mod tests {
         let rebuilt = session.build_current(request);
 
         assert!(!rebuilt.has_errors());
+        assert_eq!(rebuilt.updated_module_count, 1);
+        assert_eq!(rebuilt.cached_module_count, 1);
         assert_eq!(session.load_exec_count() - loads, 1);
         assert_eq!(session.task_exec_count() - tasks, 2);
         assert_eq!(

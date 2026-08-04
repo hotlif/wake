@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use wake_common::MemoryFileSystem;
+use wake_common::{MemoryFileSystem, OsFileSystem};
 
 use crate::{Bundler, IncrementalBundler};
 
@@ -235,6 +235,8 @@ fn second_build_is_fully_cached() {
 
     let out1 = bundler.build(Path::new("src/index.js"));
     assert!(!out1.has_errors());
+    assert_eq!(out1.updated_module_count, out1.module_count);
+    assert_eq!(out1.cached_module_count, 0);
     let after_first = bundler.task_exec_count();
     assert_eq!(
         after_first, 6,
@@ -244,6 +246,8 @@ fn second_build_is_fully_cached() {
     // 同实例、同内容再打一遍：parse 与 codegen 任务全部浅绿命中，零重执行（Gate-3 缓存命中）。
     let out2 = bundler.build(Path::new("src/index.js"));
     assert!(!out2.has_errors());
+    assert_eq!(out2.updated_module_count, 0);
+    assert_eq!(out2.cached_module_count, out2.module_count);
     assert_eq!(
         bundler.task_exec_count(),
         after_first,
@@ -3988,6 +3992,48 @@ fn persistent_cache_skips_parse_and_codegen_on_fresh_process() {
     );
 
     let _ = std::fs::remove_file(&cache_path);
+}
+
+#[test]
+fn persistent_path_index_skips_unchanged_os_source_reads() {
+    let unique = format!(
+        "wake_path_index_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).unwrap();
+    let entry = root.join("index.js");
+    let dep = root.join("dep.js");
+    std::fs::write(
+        &entry,
+        "import { value } from './dep.js'; export default value;",
+    )
+    .unwrap();
+    std::fs::write(&dep, "export const value = 42;").unwrap();
+    let cache_path = root.join("cache.bin");
+    let mut b1 = IncrementalBundler::new(Arc::new(OsFileSystem));
+    b1.enable_persistent_cache(cache_path.clone());
+    let out1 = b1.build(&entry);
+    assert!(!out1.has_errors(), "{:?}", out1.diagnostics);
+    assert_eq!(b1.load_exec_count(), 2);
+    let mut b2 = IncrementalBundler::new(Arc::new(OsFileSystem));
+    b2.enable_persistent_cache(cache_path.clone());
+    let out2 = b2.build(&entry);
+    assert!(!out2.has_errors(), "{:?}", out2.diagnostics);
+    assert_eq!(out2.bundle, out1.bundle);
+    assert_eq!(b2.load_exec_count(), 0, "热缓存应只 stat，不重新读取源码");
+    std::fs::write(&dep, "export const value = 4300;").unwrap();
+    let mut b3 = IncrementalBundler::new(Arc::new(OsFileSystem));
+    b3.enable_persistent_cache(cache_path);
+    let out3 = b3.build(&entry);
+    assert!(!out3.has_errors(), "{:?}", out3.diagnostics);
+    assert_eq!(b3.load_exec_count(), 1, "只有变化的依赖需要重新读取");
+    assert!(out3.bundle.contains("4300"), "产物必须反映源码变化");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
