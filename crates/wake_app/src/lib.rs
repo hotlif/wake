@@ -204,8 +204,8 @@ fn execute_build(
     let started = Instant::now();
     let prepared = prepare_build(&options)?;
     cancellation.check()?;
-    let mut session = create_session(&prepared, &options, project_defaults)?;
-    let output = session.build(BuildRequest::new(&prepared.entry));
+    let mut bundler = create_bundler(&prepared, &options, project_defaults)?;
+    let output = bundler.build(&prepared.entry);
     cancellation.check()?;
     finish_output(
         &prepared,
@@ -320,11 +320,11 @@ fn prepare_aliases_and_scans(
     Ok(aliases)
 }
 
-fn create_session(
+fn create_bundler(
     prepared: &PreparedBuild,
     options: &BuildOptions,
     project_defaults: bool,
-) -> Result<BuildSession, WakeError> {
+) -> Result<IncrementalBundler, WakeError> {
     let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
     bundler.set_resolve_options(ResolveOptions {
         alias: prepared.aliases.clone(),
@@ -366,7 +366,19 @@ fn create_session(
             .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&cache_dir))?;
         bundler.enable_persistent_cache(cache_dir.join("cache.bin"));
     }
-    Ok(BuildSession::from_incremental(bundler))
+    Ok(bundler)
+}
+
+fn create_session(
+    prepared: &PreparedBuild,
+    options: &BuildOptions,
+    project_defaults: bool,
+) -> Result<BuildSession, WakeError> {
+    Ok(BuildSession::from_incremental(create_bundler(
+        prepared,
+        options,
+        project_defaults,
+    )?))
 }
 
 fn finish_output(
@@ -956,8 +968,8 @@ pub fn build_docs(
         write: true,
         ..BuildOptions::default()
     };
-    let mut session = create_session(&prepared, &build_options, true)?;
-    let output = session.build(BuildRequest::new(&prepared.entry));
+    let mut bundler = create_bundler(&prepared, &build_options, true)?;
+    let output = bundler.build(&prepared.entry);
     cancellation.check()?;
     if output.has_errors() {
         return Err(
