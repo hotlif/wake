@@ -6,7 +6,7 @@
 //! **正确性纪律（DESIGN §10.3）**：`Atom` 是进程内句柄，**禁止落盘**——
 //! 持久化前必须还原为字符串。因此这里刻意 **不** 为 `Atom` 实现 `Serialize`/`rkyv`。
 
-use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 use rustc_hash::FxHashMap;
 
@@ -54,17 +54,17 @@ impl std::fmt::Debug for Atom {
 
 #[derive(Default)]
 struct Shard {
-    /// 去重：`&str`（借自 `store`）→ 片内序号。用 `Box<str>` 拥有所有权。
-    map: FxHashMap<Box<str>, u32>,
-    /// 片内序号 → 驻留字符串。`Box<str>` 一经插入地址稳定。
-    store: Vec<Box<str>>,
+    /// 去重 map；map/store 通过 `Arc<str>` 共享同一份字符数据。
+    map: FxHashMap<Arc<str>, u32>,
+    /// 片内序号 → 驻留字符串。
+    store: Vec<Arc<str>>,
 }
 
 /// 字符串驻留表。分片锁，`intern` 无需全局锁；`resolve` 只锁对应分片。
 ///
 /// 通常整个进程共享一个 `Interner`（放进编译上下文里以 `&` 传递）。
 pub struct Interner {
-    shards: Box<[Mutex<Shard>]>,
+    shards: Box<[RwLock<Shard>]>,
 }
 
 impl Default for Interner {
@@ -76,7 +76,7 @@ impl Default for Interner {
 impl Interner {
     pub fn new() -> Interner {
         let shards = (0..SHARD_COUNT)
-            .map(|_| Mutex::new(Shard::default()))
+            .map(|_| RwLock::new(Shard::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Interner { shards }
@@ -93,13 +93,21 @@ impl Interner {
     /// 驻留一个字符串，返回其 [`Atom`]。同一字符串多次调用返回相同 Atom。
     pub fn intern(&self, s: &str) -> Atom {
         let shard_idx = self.shard_of(s);
-        let mut shard = self.shards[shard_idx].lock().unwrap();
+        {
+            let shard = self.shards[shard_idx].read().unwrap();
+            if let Some(&index) = shard.map.get(s) {
+                return Atom::encode(shard_idx, index);
+            }
+        }
+
+        // miss 获取写锁，并在读锁释放到写锁获取之间的窗口后二次确认。
+        let mut shard = self.shards[shard_idx].write().unwrap();
         if let Some(&index) = shard.map.get(s) {
             return Atom::encode(shard_idx, index);
         }
         let index = shard.store.len() as u32;
-        let owned: Box<str> = s.into();
-        shard.store.push(owned.clone());
+        let owned: Arc<str> = Arc::from(s);
+        shard.store.push(Arc::clone(&owned));
         shard.map.insert(owned, index);
         Atom::encode(shard_idx, index)
     }
@@ -108,13 +116,13 @@ impl Interner {
     ///
     /// 热路径不应调用此函数（比较用 Atom 即可）；仅诊断 / codegen / 落盘前使用。
     pub fn resolve(&self, atom: Atom) -> String {
-        let shard = self.shards[atom.shard()].lock().unwrap();
+        let shard = self.shards[atom.shard()].read().unwrap();
         shard.store[atom.index() as usize].as_ref().to_owned()
     }
 
     /// 以闭包借用形式还原，避免分配（诊断渲染热路径用）。
     pub fn with_resolved<R>(&self, atom: Atom, f: impl FnOnce(&str) -> R) -> R {
-        let shard = self.shards[atom.shard()].lock().unwrap();
+        let shard = self.shards[atom.shard()].read().unwrap();
         f(shard.store[atom.index() as usize].as_ref())
     }
 }
