@@ -26,12 +26,13 @@ wake docs build --help
 ## 全局语法
 
 ```text
-wake [--no-color] <COMMAND>
+wake [--no-color] [--ui auto|tui|plain] <COMMAND>
 ```
 
 | 选项 | 说明 |
 | --- | --- |
 | `--no-color` | 强制关闭 ANSI 彩色输出 |
+| `--ui auto|tui|plain` | 选择长驻命令的全屏或流式界面；默认 `auto` |
 | `--help` | 显示当前层级帮助 |
 | `--version` | 显示 Wake 版本 |
 
@@ -43,6 +44,26 @@ wake --no-color docs build .
 
 全局选项放在子命令之前最清楚。
 
+## 终端界面
+
+`wake dev`、`wake docs dev` 和 Rust CLI 的 `wake build --watch` 在交互式终端中默认进入全屏控制台。界面展示服务地址、项目根、当前构建状态、模块/chunk/资源数量、最近活动和运行时间。
+
+| 模式 | 行为 |
+| --- | --- |
+| `auto` | stdin 与 stderr 都是 TTY 且 `TERM` 不是 `dumb` 时使用 TUI，否则自动降级为普通日志 |
+| `tui` | 强制全屏；终端不支持或用于一次性命令时直接报错 |
+| `plain` | 始终使用不控制光标的流式日志，仍可保留颜色 |
+
+全屏快捷键：`↑`/`↓`、`PgUp`/`PgDn` 滚动活动，`End` 回到最新记录，`c` 清空活动，`q` 或 `Ctrl-C` 退出。退出后 Wake 会恢复 raw mode、光标和原屏幕，再留下简短的运行摘要。
+
+`--no-color` 和 `NO_COLOR` 只关闭颜色，不会关闭支持无色显示的 TUI。重定向或 CI 输出不会包含备用屏、光标控制或其他 TUI 转义序列。
+
+Wake 将品牌界面、进度和诊断写入 stderr；AST、token 与 JSON 数据写入 stdout，因此可以安全地单独重定向数据：
+
+```powershell
+wake parse src/entry.tsx --format json > parse.json
+wake tokenize src/entry.tsx --format json > tokens.json
+```
 ## wake build
 
 ```text
@@ -154,10 +175,10 @@ wake docs build . --base /design-system/ --outdir docs-dist
 ## wake parse
 
 ```text
-wake parse FILE [--ast]
+wake parse FILE [--ast] [--format auto|human|json]
 ```
 
-解析 JavaScript、TypeScript、JSX 或 TSX 文件。默认输出解析结果摘要；`--ast` 输出 JSON AST：
+解析 JavaScript、TypeScript、JSX 或 TSX 文件。默认在 TTY 中输出解析摘要，stdout 被重定向时输出 JSON；`--format` 可显式覆盖。`--ast` 输出原始调试 AST，并且不能与 `--format` 同用：
 
 ```bash
 wake parse src/entry.tsx
@@ -170,13 +191,13 @@ AST 输出可能很长，PowerShell 可以保存：
 
 ```powershell
 wake parse src/entry.tsx --ast |
-  Set-Content -Encoding utf8 ast.json
+  Set-Content -Encoding utf8 ast.txt
 ```
 
 ## wake tokenize
 
 ```text
-wake tokenize FILE
+wake tokenize FILE [--format auto|human|json]
 ```
 
 输出词法 token 流：
@@ -185,7 +206,7 @@ wake tokenize FILE
 wake tokenize src/entry.tsx
 ```
 
-它适合定位字符串、模板、正则、JSX 边界等词法问题。普通应用开发不需要日常使用。
+它适合定位字符串、模板、正则、JSX 边界等词法问题。TTY 默认显示对齐表格，stdout 被重定向时默认输出稳定 JSON；也可用 `--format human|json` 显式选择。普通应用开发不需要日常使用。
 
 ## 项目脚本
 

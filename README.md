@@ -98,7 +98,7 @@ npx wake build --outdir dist
 ## CLI
 
 ```text
-wake [--no-color] <COMMAND>
+wake [--no-color] [--ui auto|tui|plain] <COMMAND>
 ```
 
 | 命令 | 用途 |
@@ -109,6 +109,8 @@ wake [--no-color] <COMMAND>
 | `wake docs build [ROOT]` | 创建可部署的静态文档站 |
 | `wake parse <FILE>` | 解析源码并打印 AST |
 | `wake tokenize <FILE>` | 对源码执行词法分析并打印 token 流 |
+
+交互式终端中的 `dev`、`docs dev` 和 `build --watch` 默认使用品牌化全屏控制台；重定向或 CI 环境自动降级为普通日志。使用全局 `--ui plain` 可显式关闭全屏模式，`--no-color` 或 `NO_COLOR` 只关闭颜色。`parse` 与 `tokenize` 支持 `--format auto|human|json`，并将机器数据与界面输出分别写入 stdout 和 stderr。
 
 使用 `wake <COMMAND> --help` 查看当前版本支持的参数。更详细的组合、默认值和退出行为见 [CLI 参考](docs/reference/cli.mdx)。
 
