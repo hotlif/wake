@@ -72,6 +72,8 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 mimalloc = "0.1"
 ctrlc = "3.5.1"
 signal-hook = "0.4.4"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+crossterm = "0.29.0"
 
 # —— 内部 crate（路径依赖）——
 wake_common = { path = "crates/wake_common" }

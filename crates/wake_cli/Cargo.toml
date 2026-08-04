@@ -23,3 +23,6 @@ clap.workspace = true
 notify.workspace = true
 ctrlc.workspace = true
 signal-hook.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+serde_json.workspace = true
