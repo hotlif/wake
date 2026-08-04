@@ -164,6 +164,27 @@ pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
+            #[cfg(windows)]
+            Component::Prefix(prefix) => {
+                use std::ffi::OsString;
+                use std::path::Prefix;
+
+                match prefix.kind() {
+                    Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                        let mut disk = OsString::from(char::from(drive).to_string());
+                        disk.push(":");
+                        out.push(disk);
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                        let mut unc = OsString::from(r"\\");
+                        unc.push(server);
+                        unc.push(r"\");
+                        unc.push(share);
+                        out.push(unc);
+                    }
+                    _ => out.push(prefix.as_os_str()),
+                }
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 // 仅当末段是真实目录名（Normal）时才消解；否则（空 / 末段已是 `..` / 根）
@@ -236,5 +257,17 @@ mod tests {
             PathBuf::from("../../../cache/x")
         );
         assert_eq!(normalize(Path::new("a/../../b")), PathBuf::from("../b"));
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize(Path::new(r"\\?\C:\work\src\index.js")),
+                normalize(Path::new(r"C:\work\src\index.js"))
+            );
+            assert_eq!(
+                normalize(Path::new(r"\\?\UNC\server\share\src\index.js")),
+                normalize(Path::new(r"\\server\share\src\index.js"))
+            );
+        }
     }
 }

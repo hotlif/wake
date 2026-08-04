@@ -16,6 +16,9 @@ mod pnpfs;
 pub use pnp::PnpManifest;
 pub use pnpfs::PnpFileSystem;
 
+type ResolutionCache = FxHashMap<PathBuf, FxHashMap<String, Option<PathBuf>>>;
+type PackageRootCache = FxHashMap<PathBuf, FxHashMap<String, Arc<[PathBuf]>>>;
+
 /// 解析选项。
 #[derive(Clone, Debug)]
 pub struct ResolveOptions {
@@ -68,10 +71,14 @@ impl std::error::Error for ResolveError {}
 pub struct Resolver {
     fs: Arc<dyn FileSystem>,
     options: ResolveOptions,
-    /// `(from_dir, specifier)` → 解析结果（`None` = 未找到）。
+    /// 两级缓存：`from_dir → specifier → 解析结果`（`None` = 未找到）。
     /// `Mutex` 而非 `RefCell`：使 `Resolver: Sync`，让打包器能经 `Arc<Resolver>` 在工作窃取
     /// 执行器上**并行 resolve**（临界区仅包住 cache 的 get/insert，昂贵的 FS 探测在锁外，竞争极小）。
-    cache: Mutex<FxHashMap<(PathBuf, String), Option<PathBuf>>>,
+    cache: Mutex<ResolutionCache>,
+    /// package.json 路径 → 入口字段。失败也缓存，避免不同 issuer 重复读取、解析同一清单。
+    package_entries: Mutex<FxHashMap<PathBuf, Option<String>>>,
+    /// issuer 目录 → 包名 → 向上搜索到的全部 package root。
+    package_roots: Mutex<PackageRootCache>,
     /// Yarn PnP 清单。`Some` 时裸说明符走 PnP 依赖图（不走 `node_modules` 上溯）。
     pnp: Option<Arc<PnpManifest>>,
 }
@@ -86,6 +93,8 @@ impl Resolver {
             fs,
             options,
             cache: Mutex::new(FxHashMap::default()),
+            package_entries: Mutex::new(FxHashMap::default()),
+            package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
         }
     }
@@ -109,23 +118,35 @@ impl Resolver {
             fs,
             options,
             cache: Mutex::new(FxHashMap::default()),
+            package_entries: Mutex::new(FxHashMap::default()),
+            package_roots: Mutex::new(FxHashMap::default()),
             pnp: Some(manifest),
         }
     }
 
     /// 从 `from_dir` 解析 `specifier` 到一个规范文件路径。
     pub fn resolve(&self, specifier: &str, from_dir: &Path) -> Result<PathBuf, ResolveError> {
-        let key = (from_dir.to_path_buf(), specifier.to_string());
+        let cached = self
+            .cache
+            .lock()
+            .unwrap()
+            .get(from_dir)
+            .and_then(|by_specifier| by_specifier.get(specifier))
+            .cloned();
         // 先取 cache（锁瞬间释放：`.cloned()` 拷出 Option 后 guard 即析构）——**关键**是别把锁
         // 持到 `resolve_uncached` 的 FS 探测期间，否则并行退化为串行。
-        let cached = self.cache.lock().unwrap().get(&key).cloned();
         if let Some(resolved) = cached {
             return resolved.ok_or_else(|| self.err(specifier, from_dir));
         }
         // 未命中：昂贵的 FS 探测在锁外进行（并行的收益全在这里）。两个线程同 key 竞争时都会算一遍
         // 再各自 insert——幂等无害，换取零锁争用。
         let resolved = self.resolve_uncached(specifier, from_dir);
-        self.cache.lock().unwrap().insert(key, resolved.clone());
+        self.cache
+            .lock()
+            .unwrap()
+            .entry(from_dir.to_path_buf())
+            .or_default()
+            .insert(specifier.to_owned(), resolved.clone());
         resolved.ok_or_else(|| self.err(specifier, from_dir))
     }
 
@@ -134,6 +155,8 @@ impl Resolver {
     /// Resolver 会缓存成功与失败；watch 中新增、删除或重命名文件后，旧结果都可能失效。
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
+        self.package_entries.lock().unwrap().clear();
+        self.package_roots.lock().unwrap().clear();
     }
 
     fn err(&self, specifier: &str, from_dir: &Path) -> ResolveError {
@@ -241,38 +264,71 @@ impl Resolver {
     }
 
     fn resolve_node_modules(&self, specifier: &str, from_dir: &Path) -> Option<PathBuf> {
-        let (pkg_name, subpath) = split_package(specifier);
-        let mut dir = Some(normalize(from_dir));
-        while let Some(d) = dir {
-            let pkg_dir = d.join("node_modules").join(&pkg_name);
-            if self.fs.is_dir(&pkg_dir) {
-                let target = if subpath.is_empty() {
-                    if let Some(f) = self.resolve_as_directory(&pkg_dir) {
-                        return Some(f);
-                    }
-                    pkg_dir.clone()
-                } else {
-                    pkg_dir.join(&subpath)
-                };
-                if let Some(r) = self.resolve_as_file_or_dir(&target) {
-                    return Some(r);
+        let (pkg_name, subpath) = split_package_ref(specifier);
+        for pkg_dir in self.package_roots(pkg_name, from_dir).iter() {
+            let target = if subpath.is_empty() {
+                if let Some(f) = self.resolve_as_directory(pkg_dir) {
+                    return Some(f);
                 }
+                pkg_dir.clone()
+            } else {
+                pkg_dir.join(subpath)
+            };
+            if let Some(r) = self.resolve_as_file_or_dir(&target) {
+                return Some(r);
             }
-            dir = d.parent().map(|p| p.to_path_buf());
         }
         None
     }
 
+    fn package_roots(&self, pkg_name: &str, from_dir: &Path) -> Arc<[PathBuf]> {
+        if let Some(roots) = self
+            .package_roots
+            .lock()
+            .unwrap()
+            .get(from_dir)
+            .and_then(|by_package| by_package.get(pkg_name))
+            .cloned()
+        {
+            return roots;
+        }
+        let mut roots = Vec::new();
+        let mut dir = Some(normalize(from_dir));
+        while let Some(d) = dir {
+            let pkg_dir = d.join("node_modules").join(pkg_name);
+            if self.fs.is_dir(&pkg_dir) {
+                roots.push(pkg_dir);
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        let roots: Arc<[PathBuf]> = roots.into();
+        self.package_roots
+            .lock()
+            .unwrap()
+            .entry(from_dir.to_path_buf())
+            .or_default()
+            .insert(pkg_name.to_owned(), Arc::clone(&roots));
+        roots
+    }
+
     /// 读 package.json 的入口字段（按 main_fields 优先级）。
     fn read_pkg_entry(&self, pkg: &Path) -> Option<String> {
-        let text = self.fs.read_to_string(pkg).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-        for field in &self.options.main_fields {
-            if let Some(s) = json.get(field).and_then(|v| v.as_str()) {
-                return Some(s.to_string());
-            }
+        if let Some(entry) = self.package_entries.lock().unwrap().get(pkg) {
+            return entry.clone();
         }
-        None
+        let entry = self.fs.read_to_string(pkg).ok().and_then(|text| {
+            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+            self.options.main_fields.iter().find_map(|field| {
+                json.get(field)
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+        });
+        self.package_entries
+            .lock()
+            .unwrap()
+            .insert(pkg.to_path_buf(), entry.clone());
+        entry
     }
 }
 
@@ -297,21 +353,28 @@ fn append_ext(path: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn split_package_ref(specifier: &str) -> (&str, &str) {
+    if specifier.starts_with('@') {
+        let package_end = specifier
+            .char_indices()
+            .filter_map(|(index, ch)| (ch == '/').then_some(index))
+            .nth(1)
+            .unwrap_or(specifier.len());
+        (
+            &specifier[..package_end],
+            specifier[package_end..].trim_start_matches('/'),
+        )
+    } else {
+        specifier
+            .split_once('/')
+            .map_or((specifier, ""), |(name, subpath)| (name, subpath))
+    }
+}
+
 /// 拆分裸说明符为 (包名, 子路径)。处理 scoped 包 `@scope/name/sub`。
 pub(crate) fn split_package(specifier: &str) -> (String, String) {
-    if let Some(rest) = specifier.strip_prefix('@') {
-        // @scope/name[/sub]
-        let mut parts = rest.splitn(3, '/');
-        let scope = parts.next().unwrap_or("");
-        let name = parts.next().unwrap_or("");
-        let sub = parts.next().unwrap_or("");
-        (format!("@{scope}/{name}"), sub.to_string())
-    } else {
-        match specifier.split_once('/') {
-            Some((name, sub)) => (name.to_string(), sub.to_string()),
-            None => (specifier.to_string(), String::new()),
-        }
-    }
+    let (package, subpath) = split_package_ref(specifier);
+    (package.to_owned(), subpath.to_owned())
 }
 
 #[cfg(test)]
