@@ -86,9 +86,12 @@ fn human_dur(d: Duration) -> String {
 
 struct BuildSummary {
     modules: usize,
+    updated_modules: usize,
+    cached_modules: usize,
     chunks: usize,
     assets: usize,
     duration: String,
+    duration_ms: f64,
 }
 
 /// 当前产物状态（跨线程共享）。
@@ -124,9 +127,21 @@ pub type BeforeRebuild =
     Arc<dyn Fn(&[PathBuf]) -> Result<Vec<PathBuf>, String> + Send + Sync + 'static>;
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
-    RebuildStart { changed_paths: Vec<PathBuf> },
-    Rebuilt { modules: usize, duration_ms: f64 },
-    Diagnostic { message: String },
+    RebuildStart {
+        changed_paths: Vec<PathBuf>,
+    },
+    Rebuilt {
+        initial: bool,
+        modules: usize,
+        updated_modules: usize,
+        cached_modules: usize,
+        chunks: usize,
+        assets: usize,
+        duration_ms: f64,
+    },
+    Diagnostic {
+        message: String,
+    },
     Closed,
 }
 
@@ -569,7 +584,7 @@ fn watch_and_rebuild(
         }
     }
     while !stop.load(Ordering::Acquire) {
-        let (mut changed, mut structural) = match evt_rx.recv_timeout(Duration::from_millis(100)) {
+        let (mut changed, mut structural) = match evt_rx.recv_timeout(Duration::from_millis(25)) {
             Ok(event) => event,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -731,9 +746,12 @@ fn rebuild(
     } else {
         let summary = BuildSummary {
             modules: out.module_count,
+            updated_modules: out.updated_module_count,
+            cached_modules: out.cached_module_count,
             chunks: out.chunks.len(),
             assets: out.assets.len(),
             duration: dur.clone(),
+            duration_ms: elapsed.as_secs_f64() * 1000.0,
         };
         {
             let mut s = bundle.write().unwrap();
@@ -765,21 +783,27 @@ fn rebuild(
         }
         if !first && !sty.quiet {
             eprintln!(
-                "  {}  {}  {sep}  {}  {sep}  {}",
+                "  {}  {}  {sep}  {}  {sep}  {}  {sep}  {}",
                 sty.ok("✓"),
                 sty.bold("已更新"),
-                sty.accent(&format!("{} 模块", out.module_count)),
+                sty.accent(&format!("{} 模块", summary.updated_modules)),
+                sty.dim(&format!("{} 缓存命中", summary.cached_modules)),
                 sty.dim(&format!("耗时 {dur}")),
             );
         }
         if !first {
             let _ = tx.send(r#"{"type":"reload"}"#.to_string());
-            if let Some(handler) = event_handler {
-                handler(ServerEvent::Rebuilt {
-                    modules: out.module_count,
-                    duration_ms: elapsed.as_secs_f64() * 1000.0,
-                });
-            }
+        }
+        if let Some(handler) = event_handler {
+            handler(ServerEvent::Rebuilt {
+                initial: first,
+                modules: summary.modules,
+                updated_modules: summary.updated_modules,
+                cached_modules: summary.cached_modules,
+                chunks: summary.chunks,
+                assets: summary.assets,
+                duration_ms: summary.duration_ms,
+            });
         }
         Some(summary)
     }
@@ -1298,7 +1322,7 @@ impl ServerHandle {
     pub fn close(&self) -> std::io::Result<()> {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             self.inner.stop.store(true, Ordering::Release);
-            actix_web::rt::System::new().block_on(self.inner.handle.stop(true));
+            actix_web::rt::System::new().block_on(self.inner.handle.stop(false));
         }
         self.join()
     }

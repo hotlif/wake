@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { appendFile, cp, mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { createServer } from 'node:net'
+import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
@@ -106,6 +106,24 @@ async function listen(server, port = 0) {
   return server.address().port
 }
 
+async function openHmrSocket(port) {
+  const socket = createConnection({ host: '127.0.0.1', port })
+  await once(socket, 'connect', { signal: AbortSignal.timeout(10_000) })
+  socket.write([
+    'GET /__wake_hmr HTTP/1.1',
+    `Host: 127.0.0.1:${port}`,
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+    'Sec-WebSocket-Version: 13',
+    '',
+    '',
+  ].join('\r\n'))
+  const [response] = await once(socket, 'data', { signal: AbortSignal.timeout(10_000) })
+  assert.match(response.toString(), /^HTTP\/1\.1 101 /)
+  return socket
+}
+
 test('emits rebuild events and releases the port on idempotent close', async () => {
   const source = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
   const cwd = await mkdtemp(join(tmpdir(), 'wake-node-dev-'))
@@ -115,17 +133,40 @@ test('emits rebuild events and releases the port on idempotent close', async () 
   await new Promise((resolve) => reservation.close(resolve))
 
   const server = await startDevServer({ cwd, port })
+  let hmrSocket
   let closedEvents = 0
   server.on('closed', () => closedEvents += 1)
   try {
     assert.equal(server.url, `http://127.0.0.1:${port}/`)
+    const [initial] = await once(server, 'rebuilt', { signal: AbortSignal.timeout(10_000) })
+    assert.equal(initial.initial, true)
+    assert.ok(initial.modules > 0)
+    assert.equal(initial.updatedModules + initial.cachedModules, initial.modules)
+    assert.ok(initial.chunks > 0)
+    hmrSocket = await openHmrSocket(port)
+    const rebuilding = once(server, 'rebuildStart', { signal: AbortSignal.timeout(10_000) })
     const rebuilt = once(server, 'rebuilt', { signal: AbortSignal.timeout(10_000) })
-    await appendFile(join(cwd, 'src/index.js'), '\n')
+    await appendFile(join(cwd, 'src/index.js'), '\nexport const changed = true;\n')
+    const [start] = await rebuilding
+    assert.equal(start.type, 'rebuildStart')
+    assert.equal(start.changedPaths.length, 1)
     const [event] = await rebuilt
     assert.equal(event.type, 'rebuilt')
+    assert.equal(event.initial, false)
     assert.ok(event.modules > 0)
+    assert.equal(event.updatedModules, 1)
+    assert.equal(event.cachedModules, event.modules - 1)
+    assert.equal(event.updatedModules + event.cachedModules, event.modules)
+    assert.ok(event.durationMs >= 0)
   } finally {
-    await Promise.all([server.close(), server.waitUntilClosed()])
+    const closingAt = performance.now()
+    try {
+      await Promise.all([server.close(), server.waitUntilClosed()])
+      const closeDurationMs = performance.now() - closingAt
+      assert.ok(closeDurationMs < 2_000, `dev server close took ${closeDurationMs.toFixed(0)}ms`)
+    } finally {
+      hmrSocket?.destroy()
+    }
     await server.close()
   }
   assert.equal(closedEvents, 1)

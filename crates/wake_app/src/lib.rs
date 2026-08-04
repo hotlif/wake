@@ -142,6 +142,8 @@ pub struct OutputFile {
 pub struct BuildResult {
     pub success: bool,
     pub module_count: usize,
+    pub updated_module_count: usize,
+    pub cached_module_count: usize,
     pub duration_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
@@ -432,6 +434,8 @@ fn finish_output(
     Ok(BuildResult {
         success: true,
         module_count: output.module_count,
+        updated_module_count: output.updated_module_count,
+        cached_module_count: output.cached_module_count,
         duration_ms,
         output_dir,
         code: (!options.write).then(|| output.bundle.clone()),
@@ -790,11 +794,27 @@ pub struct DevServerOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum DevServerEvent {
-    RebuildStart { changed_paths: Vec<String> },
-    Rebuilt { modules: usize, duration_ms: f64 },
-    Diagnostic { message: String },
+    RebuildStart {
+        changed_paths: Vec<String>,
+    },
+    Rebuilt {
+        initial: bool,
+        modules: usize,
+        updated_modules: usize,
+        cached_modules: usize,
+        chunks: usize,
+        assets: usize,
+        duration_ms: f64,
+    },
+    Diagnostic {
+        message: String,
+    },
     Closed,
 }
 
@@ -841,10 +861,20 @@ impl DevServer {
                     }
                 }
                 wake_dev_server::ServerEvent::Rebuilt {
+                    initial,
                     modules,
+                    updated_modules,
+                    cached_modules,
+                    chunks,
+                    assets,
                     duration_ms,
                 } => DevServerEvent::Rebuilt {
+                    initial,
                     modules,
+                    updated_modules,
+                    cached_modules,
+                    chunks,
+                    assets,
                     duration_ms,
                 },
                 wake_dev_server::ServerEvent::Diagnostic { message } => {
@@ -1272,6 +1302,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(server.url(), format!("http://127.0.0.1:{port}/"));
+        let initial_events = server.drain_events();
+        assert!(initial_events.iter().any(|event| matches!(
+            event,
+            DevServerEvent::Rebuilt {
+                initial: true,
+                modules,
+                updated_modules: _,
+                chunks,
+                duration_ms,
+                ..
+            } if *modules > 0 && *chunks > 0 && *duration_ms >= 0.0
+        )));
         let closing = server.clone();
         let waiting = server.clone();
         let closing = thread::spawn(move || closing.close());

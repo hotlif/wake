@@ -47,6 +47,8 @@ export interface OutputFile {
 export interface BuildResult {
   success: true
   moduleCount: number
+  updatedModuleCount: number
+  cachedModuleCount: number
   durationMs: number
   outputDir?: string
   code?: string
@@ -96,7 +98,12 @@ export interface DevServerRebuildStartEvent {
 
 export interface DevServerRebuiltEvent {
   type: 'rebuilt'
+  initial: boolean
   modules: number
+  updatedModules: number
+  cachedModules: number
+  chunks: number
+  assets: number
   durationMs: number
 }
 
