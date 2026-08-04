@@ -13,7 +13,7 @@ use wake_ecma_lexer::{Keyword, TokenKind};
 
 use crate::Parser;
 
-impl<'a, 'src> Parser<'a, 'src> {
+impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
     // 对外集成入口
     // ==================================================================

@@ -6,7 +6,7 @@ use wake_ecma_lexer::{Keyword, TokenKind};
 
 use crate::Parser;
 
-impl<'a, 'src> Parser<'a, 'src> {
+impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
     // 语句分派
     // ==================================================================
@@ -299,10 +299,12 @@ impl<'a, 'src> Parser<'a, 'src> {
                 id,
                 init,
             };
-            if wake_ecma_transform::binding_pattern_needs_lowering(
-                self.options.transform_features,
-                id,
-            ) && init.is_some()
+            if LOWER
+                && wake_ecma_transform::binding_pattern_needs_lowering(
+                    self.options.transform_features,
+                    id,
+                )
+                && init.is_some()
             {
                 let iterator_helper = self.spread_helper_atom();
                 let object_helper = if wake_ecma_transform::pattern_has_object_rest(id) {
@@ -505,10 +507,12 @@ impl<'a, 'src> Parser<'a, 'src> {
                     body,
                     is_await,
                 });
-                if wake_ecma_transform::for_of_needs_lowering(
-                    self.options.transform_features,
-                    statement,
-                ) {
+                if LOWER
+                    && wake_ecma_transform::for_of_needs_lowering(
+                        self.options.transform_features,
+                        statement,
+                    )
+                {
                     let helper = self.for_of_helper_atom();
                     let state = self.fresh_transform_atom();
                     let error = self.fresh_transform_atom();
@@ -604,6 +608,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         left: ForLeft<'a>,
         body: Statement<'a>,
     ) -> (ForLeft<'a>, Statement<'a>) {
+        if !LOWER {
+            return (left, body);
+        }
         match left {
             ForLeft::Variable(declaration) => {
                 self.lower_for_declaration_destructuring(declaration, body)
@@ -854,10 +861,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 None
             };
             let param = if param.is_none()
-                && self
-                    .options
-                    .transform_features
-                    .contains(wake_ecma_transform::EcmaFeature::OptionalCatchBinding)
+                && self.lowers(wake_ecma_transform::EcmaFeature::OptionalCatchBinding)
             {
                 let temp = self.fresh_transform_atom();
                 wake_ecma_transform::lower_optional_catch_binding(
@@ -873,10 +877,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             let body = self.parse_block();
             let (param, body) = match param {
                 Some(pattern)
-                    if wake_ecma_transform::binding_pattern_needs_lowering(
-                        self.options.transform_features,
-                        pattern,
-                    ) =>
+                    if LOWER
+                        && wake_ecma_transform::binding_pattern_needs_lowering(
+                            self.options.transform_features,
+                            pattern,
+                        ) =>
                 {
                     let (pattern, body) = self.lower_catch_destructuring(pattern, body);
                     (Some(pattern), body)
@@ -1030,6 +1035,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     fn lower_parsed_function_parameters(&mut self, function: &'a Function<'a>) -> &'a Function<'a> {
+        if !LOWER {
+            return function;
+        }
+
         let temporary_count = wake_ecma_transform::complex_parameter_temporary_count_for_features(
             self.options.transform_features,
             &function.params,
@@ -1041,9 +1050,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             )
         });
         let needs_parameter_lowering = self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::FunctionParameters)
+            .lowers(wake_ecma_transform::EcmaFeature::FunctionParameters)
             || needs_binding_lowering;
         if !needs_parameter_lowering {
             return function;

@@ -12,7 +12,16 @@ struct CoverParen<'a> {
     rest: Option<&'a RestElement<'a>>,
 }
 
-impl<'a, 'src> Parser<'a, 'src> {
+#[inline]
+fn has_optional_chain(expression: Expression<'_>) -> bool {
+    match expression {
+        Expression::Member(member) => member.optional || has_optional_chain(member.object),
+        Expression::Call(call) => call.optional || has_optional_chain(call.callee),
+        _ => false,
+    }
+}
+
+impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
     // 顶层表达式
     // ==================================================================
@@ -99,38 +108,37 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.in_cover_paren = false;
             let right = self.parse_assignment_expression();
             self.in_cover_paren = previous_cover;
-            if op == AssignmentOperator::Assign
-                && wake_ecma_transform::destructuring_assignment_needs_lowering(
-                    self.options.transform_features,
-                    left,
-                )
-                && !self.in_cover_paren
-            {
-                return self.lower_destructuring_assignment_expression(
-                    self.span_to(lo),
+            let features = self.options.transform_features;
+            let span = self.span_to(lo);
+            if !LOWER {
+                return Expression::Assignment(self.alloc(AssignmentExpression {
+                    span,
+                    operator: op,
                     left,
                     right,
-                );
+                }));
             }
-            let temps = wake_ecma_transform::assignment_needs_temporaries(
-                self.options.transform_features,
-                op,
-                left,
-            )
-            .then_some(())
-            .and_then(|()| {
-                Some([
-                    self.fresh_scoped_transform_atom()?,
-                    self.fresh_scoped_transform_atom()?,
-                    self.fresh_scoped_transform_atom()?,
-                ])
-            });
+            if op == AssignmentOperator::Assign
+                && wake_ecma_transform::destructuring_assignment_needs_lowering(features, left)
+                && !self.in_cover_paren
+            {
+                return self.lower_destructuring_assignment_expression(span, left, right);
+            }
+            let temps = wake_ecma_transform::assignment_needs_temporaries(features, op, left)
+                .then_some(())
+                .and_then(|()| {
+                    Some([
+                        self.fresh_scoped_transform_atom()?,
+                        self.fresh_scoped_transform_atom()?,
+                        self.fresh_scoped_transform_atom()?,
+                    ])
+                });
             return wake_ecma_transform::lower_assignment(
                 self.arena,
                 self.interner,
                 temps,
-                self.options.transform_features,
-                self.span_to(lo),
+                features,
+                span,
                 op,
                 left,
                 right,
@@ -182,6 +190,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let lo = self.start();
         let mut left = self.parse_unary_expression();
 
+        let features = self.options.transform_features;
         loop {
             // TS：`expr as Type` / `expr satisfies Type`（同行）→ 擦除类型，保留表达式。
             if self.ts
@@ -205,18 +214,36 @@ impl<'a, 'src> Parser<'a, 'src> {
             let next_min = if right_assoc { prec } else { prec + 1 };
             let right = self.parse_binary_expression(next_min);
             let span = self.span_to(lo);
+            if !LOWER {
+                left = match op {
+                    BinOp::Binary(operator) => Expression::Binary(self.alloc(BinaryExpression {
+                        span,
+                        operator,
+                        left,
+                        right,
+                    })),
+                    BinOp::Logical(operator) => {
+                        Expression::Logical(self.alloc(LogicalExpression {
+                            span,
+                            operator,
+                            left,
+                            right,
+                        }))
+                    }
+                };
+                continue;
+            }
             left = match op {
                 BinOp::Binary(b) => wake_ecma_transform::lower_binary(
                     self.arena,
                     self.interner,
-                    self.options.transform_features,
+                    features,
                     span,
                     b,
                     left,
                     right,
                 ),
                 BinOp::Logical(l) => {
-                    let features = self.options.transform_features;
                     let temp = if l == LogicalOperator::Coalesce
                         && features.contains(wake_ecma_transform::EcmaFeature::NullishCoalescing)
                         && !wake_ecma_transform::is_repeatable(left)
@@ -443,11 +470,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // `new (obj?.Ctor)()` has the same parenthesized chain boundary as an ordinary
             // call, but constructor invocation does not consume a Reference receiver. Lower the
             // inner value when possible and retain explicit grouping in every target mode.
-            if self
-                .options
-                .transform_features
-                .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
-            {
+            if self.lowers(wake_ecma_transform::EcmaFeature::OptionalChaining) {
                 callee_base = self.lower_optional_chain_expression(
                     callee_base,
                     wake_ecma_transform::OptionalChainMode::Value,
@@ -470,10 +493,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             callee,
             arguments,
         });
-        if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::Spread)
+        if self.lowers(wake_ecma_transform::EcmaFeature::Spread)
             && new
                 .arguments
                 .iter()
@@ -549,10 +569,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         if !defer_parenthesized_invocation
             && preserve_optional_chain
             && has_outer_tail
-            && self
-                .options
-                .transform_features
-                .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+            && self.lowers(wake_ecma_transform::EcmaFeature::OptionalChaining)
         {
             // Parentheses end an optional chain. Lower the inner chain before rebuilding an outer
             // `.x`/`()` tail so codegen cannot accidentally merge the two chain units.
@@ -563,10 +580,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             preserve_optional_chain = wake_ecma_transform::has_optional_chain(expr);
         } else if preserve_optional_chain
             && mode == wake_ecma_transform::OptionalChainMode::Delete
-            && !self
-                .options
-                .transform_features
-                .contains(wake_ecma_transform::EcmaFeature::ArrowFunction)
+            && !self.lowers(wake_ecma_transform::EcmaFeature::ArrowFunction)
         {
             // Arrow-capable targets can use a lexical capture after the cover has been resolved.
             // This makes `delete (get()?.x)` delete `x`, rather than deleting a conditional value.
@@ -657,10 +671,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                         optional: false,
                     });
                     self.maybe_record_require(call);
-                    if self
-                        .options
-                        .transform_features
-                        .contains(wake_ecma_transform::EcmaFeature::Spread)
+                    if self.lowers(wake_ecma_transform::EcmaFeature::Spread)
                         && !preserve_native_parenthesized_call
                         && !wake_ecma_transform::has_optional_chain(call.callee)
                         && call
@@ -729,10 +740,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
         if !preserve_optional_chain
-            && self
-                .options
-                .transform_features
-                .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+            && self.lowers(wake_ecma_transform::EcmaFeature::OptionalChaining)
             && wake_ecma_transform::has_optional_chain(expr)
         {
             let lowered = self.lower_optional_chain_expression(expr, mode);
@@ -750,11 +758,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         mode: wake_ecma_transform::OptionalChainMode,
     ) -> Expression<'a> {
         let has_call_spread = wake_ecma_transform::has_call_spread(expression);
-        let needs_spread_helper = self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::Spread)
-            && has_call_spread;
+        let needs_spread_helper =
+            self.lowers(wake_ecma_transform::EcmaFeature::Spread) && has_call_spread;
         // Spread arguments may contain lexical `await`/`yield`/`this`/`arguments`. If this region
         // cannot own scope temporaries, retain the whole optional call instead of lowering it
         // through a nested lexical-IIFE path and allocating a helper that cannot be used safely.
@@ -801,10 +806,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.fresh_scoped_transform_atom()
                 .expect("enabled parenthesized optional-call temp scope"),
         ];
-        let spread_helper = if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::Spread)
+        let spread_helper = if self.lowers(wake_ecma_transform::EcmaFeature::Spread)
             && wake_ecma_transform::has_call_spread(expression)
         {
             Some(self.spread_helper_atom())
@@ -826,10 +828,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         &mut self,
         expression: Expression<'a>,
     ) -> (Expression<'a>, bool) {
-        if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::OptionalChaining)
+        if self.lowers(wake_ecma_transform::EcmaFeature::OptionalChaining)
             && self.has_scoped_transform_temp_scope()
         {
             // Parentheses preserve a Member Reference when it is immediately invoked:
@@ -895,11 +894,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // see that the parenthesized expression is immediately called.
             return None;
         }
-        if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::ArrowFunction)
-        {
+        if self.lowers(wake_ecma_transform::EcmaFeature::ArrowFunction) {
             Some([
                 self.fresh_scoped_transform_atom()?,
                 self.fresh_scoped_transform_atom()?,
@@ -983,6 +978,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             TokenKind::TemplateNoSub | TokenKind::TemplateHead => {
                 let template = self.parse_template_literal();
                 if let Expression::TemplateLiteral(template) = template {
+                    if !LOWER {
+                        return Expression::TemplateLiteral(template);
+                    }
                     wake_ecma_transform::lower_template(
                         self.arena,
                         self.interner,
@@ -1031,12 +1029,14 @@ impl<'a, 'src> Parser<'a, 'src> {
             TokenKind::LBrace => self.parse_object_expression(),
             TokenKind::Ident => {
                 self.bump();
-                Expression::Identifier(self.alloc(Ident::new(span, self.intern_ident(span))))
+                let name = self.intern_ident(span);
+                Expression::Identifier(self.alloc(Ident::new(span, name)))
             }
             TokenKind::Keyword(kw) if !kw.is_reserved() => {
                 // 上下文关键字作标识符（async/of/let/...）。
                 self.bump();
-                Expression::Identifier(self.alloc(Ident::new(span, self.intern_ident(span))))
+                let name = self.intern_ident(span);
+                Expression::Identifier(self.alloc(Ident::new(span, name)))
             }
             _ => {
                 self.error(span, "期望一个表达式");
@@ -1132,10 +1132,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let destructuring_cover = self.at(TokenKind::Eq)
             || (self.in_for_head_init
                 && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of)));
-        if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::Spread)
+        if self.lowers(wake_ecma_transform::EcmaFeature::Spread)
             && !self.in_cover_paren
             && !destructuring_cover
             && array
@@ -1221,10 +1218,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let destructuring_cover = self.at(TokenKind::Eq)
             || (self.in_for_head_init
                 && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of)));
-        if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
+        if self.lowers(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
             && !self.in_cover_paren
             && !destructuring_cover
             && object
@@ -1284,9 +1278,8 @@ impl<'a, 'src> Parser<'a, 'src> {
                 value: Expression::Function(func),
                 kind,
                 method: kind == PropertyKind::Init
-                    && (!wake_ecma_transform::lower_object_shorthand(
-                        self.options.transform_features,
-                    ) || wake_ecma_transform::object_method_uses_lexical_super(func)),
+                    && (!self.lowers(wake_ecma_transform::EcmaFeature::ShorthandProperties)
+                        || wake_ecma_transform::object_method_uses_lexical_super(func)),
                 shorthand: false,
                 computed,
                 prototype_setter: false,
@@ -1343,9 +1336,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             value,
             kind: PropertyKind::Init,
             method: false,
-            shorthand: !wake_ecma_transform::lower_object_shorthand(
-                self.options.transform_features,
-            ),
+            shorthand: !self.lowers(wake_ecma_transform::EcmaFeature::ShorthandProperties),
             computed,
             prototype_setter: false,
         })
@@ -1527,7 +1518,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         if n == 1 {
             let expression = self.lower_deferred_cover_spread(cover.items[0]);
-            if wake_ecma_transform::has_optional_chain(expression) {
+            if has_optional_chain(expression) {
                 self.preserve_optional_chain_tail = true;
             }
             return expression;
@@ -1547,6 +1538,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     fn lower_deferred_cover_spread(&mut self, expression: Expression<'a>) -> Expression<'a> {
+        if !LOWER {
+            return expression;
+        }
         // Parenthesized destructuring (`([a, ...rest] = rhs)` / `({a, ...rest} = rhs)`) passes
         // through cover grammar. At this point `=` is still unconsumed, so do not reinterpret rest
         // as expression spread before the assignment pass sees the target.
@@ -1572,10 +1566,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 )
             }
             Expression::Array(array)
-                if self
-                    .options
-                    .transform_features
-                    .contains(wake_ecma_transform::EcmaFeature::Spread)
+                if self.lowers(wake_ecma_transform::EcmaFeature::Spread)
                     && array
                         .elements
                         .iter()
@@ -1591,10 +1582,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 )
             }
             Expression::Object(object)
-                if self
-                    .options
-                    .transform_features
-                    .contains(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
+                if self.lowers(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
                     && object
                         .properties
                         .iter()
@@ -1741,6 +1729,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             is_async,
         });
         let features = self.options.transform_features;
+        if !LOWER {
+            return Expression::Arrow(arrow);
+        }
         let needs_binding_lowering = arrow
             .params
             .iter()

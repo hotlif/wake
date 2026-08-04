@@ -16,7 +16,7 @@ use wake_ecma_lexer::TokenKind;
 
 use crate::Parser;
 
-impl<'a, 'src> Parser<'a, 'src> {
+impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 解析 `enum E { .. }`（`const` 已由调用方消费；当前 token 为 `enum`）。
     pub(crate) fn parse_enum(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // enum

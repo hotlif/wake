@@ -61,15 +61,29 @@ impl ModuleAst {
     where
         F: for<'a> FnOnce(&'a Bump) -> Program<'a>,
     {
+        Self::from_builder_with_hash(|arena| {
+            let program = build(arena);
+            let structure_hash = crate::structure_hash(&program);
+            (program, structure_hash)
+        })
+    }
+
+    /// 使用调用方在构建期得到的稳定指纹创建 AST。
+    ///
+    /// parser 已持有完整源码，可用源码内容指纹覆盖 AST、span 及所有解析侧输出，避免构建后
+    /// 再遍历整棵 AST。其它手工 AST 构造继续使用 [`Self::from_builder`] 的结构遍历。
+    #[doc(hidden)]
+    pub fn from_builder_with_hash<F>(build: F) -> ModuleAst
+    where
+        F: for<'a> FnOnce(&'a Bump) -> (Program<'a>, Hash64),
+    {
         // 堆分配 arena，转为裸指针持有——绝不再以 `Box`/`&mut` 断言唯一性（不变量 2）。
         let ptr = NonNull::new(Box::into_raw(Box::new(Bump::new()))).expect("Box 指针非空");
         // SAFETY: `ptr` 指向刚分配、当前唯一持有的 Bump；以 **共享** 引用构建 program
         //（bumpalo 的 alloc 走 `&self` 内部可变，共享引用足够）。此共享 tag 在结构体存活期内
         // 不会被任何 Unique retag 弹出（我们此后只经共享引用只读访问 arena）。
         let arena_ref: &Bump = unsafe { ptr.as_ref() };
-        let program: Program<'_> = build(arena_ref);
-        // 构建期顺手算结构指纹（此时 program 仍是短生命周期，随意遍历）。
-        let structure_hash = crate::structure_hash(&program);
+        let (program, structure_hash): (Program<'_>, Hash64) = build(arena_ref);
 
         // SAFETY: `program` 只引用 `*ptr` 内的分配（不变量 1，由 F 的 `for<'a>` 签名强制）。
         // 把生命周期擦写为 'static 仅改变类型层面的借用记账，不改变运行时表示（引用即指针）。
@@ -85,6 +99,31 @@ impl ModuleAst {
         }
     }
 
+    /// 使用调用方预先计算的稳定指纹创建 AST，避免构建后再次遍历。
+    /// 调用方必须保证该指纹覆盖所有会影响下游输出的输入。
+    #[doc(hidden)]
+    pub fn from_builder_prehashed<F>(structure_hash: Hash64, build: F) -> ModuleAst
+    where
+        F: for<'a> FnOnce(&'a Bump) -> Program<'a>,
+    {
+        // 堆分配 arena，转为裸指针持有——绝不再以 `Box`/`&mut` 断言唯一性（不变量 2）。
+        let ptr = NonNull::new(Box::into_raw(Box::new(Bump::new()))).expect("Box 指针非空");
+        // SAFETY: `ptr` 指向刚分配、当前唯一持有的 Bump；以共享引用构建 program。
+        // bumpalo 的 alloc 走内部可变；构建完成后只经共享引用只读访问 arena。
+        let arena_ref: &Bump = unsafe { ptr.as_ref() };
+        let program: Program<'_> = build(arena_ref);
+
+        // SAFETY: `program` 只引用 `*ptr` 内的分配；arena 与 program 一并封入返回值，
+        // 由 ArenaOwner 保证在 program 之后释放，对外只经 with_ast 缩短生命周期。
+        let program: Program<'static> =
+            unsafe { std::mem::transmute::<Program<'_>, Program<'static>>(program) };
+
+        ModuleAst {
+            program,
+            _arena: ArenaOwner(ptr),
+            structure_hash,
+        }
+    }
     /// 便捷构造：样例 AST `let sum = 0 + 1 + ... + depth;`（spike 演示用）。
     pub fn build_sample(interner: &Interner, depth: u32) -> ModuleAst {
         ModuleAst::from_builder(|arena| crate::build_sample(arena, interner, depth))

@@ -661,6 +661,54 @@ fn top_level_await_rejected_in_script_and_sync_fn() {
 }
 
 #[test]
+fn parse_fingerprint_isolated_by_parse_configuration() {
+    let interner = Interner::new();
+    let source = "const value = input?.field;";
+    let module = parse(source, &interner, SourceType::Module);
+    let script = parse(source, &interner, SourceType::Script);
+    assert_ne!(
+        module.module.structure_hash(),
+        script.module.structure_hash(),
+        "同一源码的 module/script 解析结果必须使用不同指纹"
+    );
+
+    let mut transform_features = wake_ecma_transform::FeatureSet::default();
+    transform_features.insert(wake_ecma_transform::EcmaFeature::OptionalChaining);
+    let lowered = parse_with(
+        source,
+        &interner,
+        SourceType::Module,
+        ParseOptions {
+            transform_features,
+            ..ParseOptions::default()
+        },
+    );
+    assert_ne!(
+        module.module.structure_hash(),
+        lowered.module.structure_hash(),
+        "lowering 配置必须参与指纹"
+    );
+
+    let jsx = "const view = <Widget />;";
+    let production = parse_with(jsx, &interner, SourceType::Jsx, ParseOptions::default());
+    let development = parse_with(
+        jsx,
+        &interner,
+        SourceType::Jsx,
+        ParseOptions {
+            jsx_dev: true,
+            file_name: "src/view.jsx",
+            ..ParseOptions::default()
+        },
+    );
+    assert_ne!(
+        production.module.structure_hash(),
+        development.module.structure_hash(),
+        "JSX dev 与 production 解析结果必须使用不同指纹"
+    );
+}
+
+#[test]
 fn no_panic_on_garbage() {
     // 错误恢复：乱码不应 panic，且总能到达 EOF。
     let interner = Interner::new();

@@ -33,7 +33,7 @@ use wake_ecma_lexer::TokenKind;
 
 use crate::Parser;
 
-impl<'a, 'src> Parser<'a, 'src> {
+impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 驻留任意字符串为 Atom。
     fn intern_str(&self, s: &str) -> Atom {
         self.interner.intern(s)
@@ -441,10 +441,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             span,
             properties: members,
         });
-        let props = if self
-            .options
-            .transform_features
-            .contains(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
+        let props = if self.lowers(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
             && props_object
                 .properties
                 .iter()

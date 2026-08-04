@@ -27,6 +27,7 @@ use wake_ecma_ast::{
     VariableDeclaration, VariableDeclarator,
 };
 use wake_ecma_lexer::{Keyword, Lexer, LexerCheckpoint, Token, TokenKind, regex_allowed_after};
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 /// 解析结果。
 pub struct ParseOutput {
@@ -86,12 +87,28 @@ pub fn parse_with(
     source_type: SourceType,
     options: ParseOptions<'_>,
 ) -> ParseOutput {
+    if options.transform_features.is_empty() {
+        parse_with_mode::<false>(source, interner, source_type, options)
+    } else {
+        parse_with_mode::<true>(source, interner, source_type, options)
+    }
+}
+
+/// `LOWER=false` 是现代目标的整条专用路径；编译器会移除所有 lowering 分支。
+fn parse_with_mode<const LOWER: bool>(
+    source: &str,
+    interner: &Interner,
+    source_type: SourceType,
+    options: ParseOptions<'_>,
+) -> ParseOutput {
     let deps = RefCell::new(Vec::new());
     let diags = RefCell::new(Vec::new());
     let tla = Cell::new(false);
 
-    let module = ModuleAst::from_builder(|arena| {
-        let mut parser = Parser::new(source, interner, arena, source_type, options);
+    // 源码指纹比构建后重新遍历 AST 更便宜；seed 覆盖所有会改变解析结果的配置输入。
+    let source_hash = parse_fingerprint(source, source_type, options);
+    let module = ModuleAst::from_builder_prehashed(source_hash, |arena| {
+        let mut parser = Parser::<LOWER>::new(source, interner, arena, source_type, options);
         let program = parser.parse_program();
         *deps.borrow_mut() = std::mem::take(&mut parser.dependencies);
         *diags.borrow_mut() = std::mem::take(&mut parser.diagnostics);
@@ -105,6 +122,25 @@ pub fn parse_with(
         diagnostics: diags.into_inner(),
         has_top_level_await: tla.get(),
     }
+}
+
+#[inline]
+fn parse_fingerprint(source: &str, source_type: SourceType, options: ParseOptions<'_>) -> u64 {
+    let source_type_seed = match source_type {
+        SourceType::Module => 1_u64,
+        SourceType::Script => 2,
+        SourceType::TypeScript => 3,
+        SourceType::Tsx => 4,
+        SourceType::Jsx => 5,
+    };
+    let mut seed = source_type_seed
+        ^ options.transform_features.bits().rotate_left(7)
+        ^ xxh3_64(options.jsx_import_source.as_bytes()).rotate_left(23);
+    if options.jsx_dev {
+        seed ^= 0x9e37_79b9_7f4a_7c15;
+        seed ^= xxh3_64(options.file_name.as_bytes()).rotate_left(41);
+    }
+    xxh3_64_with_seed(source.as_bytes(), seed)
 }
 
 /// 上下文标志，随递归传递并在特定语法位保存/恢复（DESIGN §4.4）。
@@ -159,7 +195,7 @@ pub(crate) struct JsxAtoms {
     pub column_number: Atom,
 }
 
-pub(crate) struct Parser<'a, 'src> {
+pub(crate) struct Parser<'a, 'src, const LOWER: bool> {
     source: &'src str,
     lexer: Lexer<'src>,
     interner: &'src Interner,
@@ -221,14 +257,14 @@ pub(crate) struct Parser<'a, 'src> {
     in_for_head_init: bool,
 }
 
-impl<'a, 'src> Parser<'a, 'src> {
+impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     fn new(
         source: &'src str,
         interner: &'src Interner,
         arena: &'a Bump,
         source_type: SourceType,
         options: ParseOptions<'src>,
-    ) -> Parser<'a, 'src> {
+    ) -> Parser<'a, 'src, LOWER> {
         let mut lexer = Lexer::new(source);
         // 表达式起始位置：首 token 允许正则。
         let cur = lexer.next(true);
@@ -271,6 +307,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    #[inline(always)]
+    fn lowers(&self, feature: wake_ecma_transform::EcmaFeature) -> bool {
+        LOWER && self.options.transform_features.contains(feature)
+    }
+
     fn fresh_transform_atom(&mut self) -> Atom {
         loop {
             let candidate = format!("__wake_t{}", self.transform_temp);
@@ -283,11 +324,17 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     fn push_transform_temp_scope(&mut self, enabled: bool) {
+        if !LOWER {
+            return;
+        }
         self.transform_temp_scopes
             .push(enabled.then(Vec::<Atom>::new));
     }
 
     fn pop_transform_temp_scope(&mut self) -> Vec<Atom> {
+        if !LOWER {
+            return Vec::new();
+        }
         self.transform_temp_scopes
             .pop()
             .expect("transform temp scopes are balanced")

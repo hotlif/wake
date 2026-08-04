@@ -661,6 +661,12 @@ pub fn pattern_has_object_rest(pattern: Pattern<'_>) -> bool {
 /// `ObjectRestSpread` is intentionally considered independently from `Destructuring`: targets
 /// such as Chrome 55 support ordinary destructuring while still requiring object-rest lowering.
 pub fn binding_pattern_needs_lowering(features: FeatureSet, pattern: Pattern<'_>) -> bool {
+    if !features.contains(EcmaFeature::Destructuring)
+        && !features.contains(EcmaFeature::ObjectRestSpread)
+    {
+        return false;
+    }
+
     match pattern {
         Pattern::Ident(_) => false,
         Pattern::Rest(rest) => binding_pattern_needs_lowering(features, rest.argument),
@@ -699,6 +705,13 @@ pub fn complex_parameter_temporary_count_for_features(
     features: FeatureSet,
     params: &[Pattern<'_>],
 ) -> usize {
+    if !features.contains(EcmaFeature::FunctionParameters)
+        && !features.contains(EcmaFeature::Destructuring)
+        && !features.contains(EcmaFeature::ObjectRestSpread)
+    {
+        return 0;
+    }
+
     params
         .iter()
         .copied()
@@ -1797,6 +1810,10 @@ fn member<'a>(
 pub struct FeatureSet(u64);
 
 impl FeatureSet {
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     pub const fn insert(&mut self, feature: EcmaFeature) {
         self.0 |= 1 << feature as u8;
     }
@@ -1966,10 +1983,15 @@ pub fn assignment_target_has_object_rest(target: Expression<'_>) -> bool {
 /// Assignment destructuring must run either when all destructuring syntax is unsupported, or when
 /// only object rest is unsupported by an otherwise destructuring-capable target.
 pub fn destructuring_assignment_needs_lowering(features: FeatureSet, left: Expression<'_>) -> bool {
+    if !features.contains(EcmaFeature::Destructuring)
+        && !features.contains(EcmaFeature::ObjectRestSpread)
+    {
+        return false;
+    }
+
     is_destructuring_assignment_target(left)
         && (features.contains(EcmaFeature::Destructuring)
-            || (features.contains(EcmaFeature::ObjectRestSpread)
-                && assignment_target_has_object_rest(left)))
+            || assignment_target_has_object_rest(left))
 }
 
 /// Number of collision-free scope-owned `var` names needed by assignment destructuring.
@@ -2567,6 +2589,12 @@ pub fn assignment_needs_temporaries(
     operator: AssignmentOperator,
     left: Expression<'_>,
 ) -> bool {
+    if !features.contains(EcmaFeature::ExponentiationOperator)
+        && !features.contains(EcmaFeature::LogicalAssignment)
+    {
+        return false;
+    }
+
     if !matches!(left, Expression::Member(_)) {
         return false;
     }
