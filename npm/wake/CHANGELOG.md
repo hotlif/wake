@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Improved the npm development-server terminal panel with Rust CLI-aligned styling, startup timing, rebuild progress, diagnostics, and color controls.
+
 ## 0.1.2
 
 - Updated the npm release pipeline for private GitHub repositories while preserving immutable tarball audits.

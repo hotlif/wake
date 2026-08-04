@@ -9,6 +9,13 @@ import {
   version,
 } from '../index.mjs'
 import { parse, tokenize } from '../experimental.mjs'
+import {
+  createUi,
+  formatBanner,
+  formatServerReady,
+  observeServer,
+  supportsColor,
+} from './terminal.mjs'
 
 const HELP = `Wake ${version()}
 
@@ -20,6 +27,9 @@ Usage:
   wake parse <file>
   wake tokenize <file>
   wake --version
+
+Options:
+  --no-color  Disable terminal colors
 `
 
 function takeOption(args, name) {
@@ -52,10 +62,17 @@ function printResult(result) {
   if (result.outputDir) console.log(`wake: output ${result.outputDir}`)
 }
 
-async function runServer(factory, options) {
+function printLines(lines) {
+  for (const line of lines) console.log(line)
+}
+
+async function runServer(factory, options, command, ui) {
   const controller = new AbortController()
+  printLines(formatBanner(ui, command, version()))
+  const startedAt = performance.now()
   const server = await factory({ ...options, signal: controller.signal })
-  console.log(`wake: listening on ${server.url}`)
+  printLines(formatServerReady(ui, server.url, performance.now() - startedAt))
+  const stopObserving = observeServer(server, ui)
 
   let stopping = false
   const stop = async (signal) => {
@@ -68,13 +85,23 @@ async function runServer(factory, options) {
       process.exitCode = signal === 'SIGINT' ? 130 : 143
     }
   }
-  process.once('SIGINT', () => void stop('SIGINT'))
-  process.once('SIGTERM', () => void stop('SIGTERM'))
-  await server.waitUntilClosed()
+  const onSigint = () => void stop('SIGINT')
+  const onSigterm = () => void stop('SIGTERM')
+  process.once('SIGINT', onSigint)
+  process.once('SIGTERM', onSigterm)
+  try {
+    await server.waitUntilClosed()
+  } finally {
+    stopObserving()
+    process.off('SIGINT', onSigint)
+    process.off('SIGTERM', onSigterm)
+  }
 }
 
 export async function runCli(argv = process.argv.slice(2)) {
   const args = [...argv]
+  const noColor = takeFlag(args, '--no-color')
+  const ui = createUi(!noColor && supportsColor())
   if (takeFlag(args, '--version') || takeFlag(args, '-V')) {
     console.log(version())
     return 0
@@ -105,7 +132,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     options.open = takeFlag(args, '--open')
     if (args[0]) options.cwd = args.shift()
     if (args.length) throw new Error(`unknown dev arguments: ${args.join(' ')}`)
-    await runServer(startDevServer, options)
+    await runServer(startDevServer, options, 'dev', ui)
     return process.exitCode || 0
   }
 
@@ -125,7 +152,7 @@ export async function runCli(argv = process.argv.slice(2)) {
       return 0
     }
     if (action === 'dev') {
-      await runServer(startDocsDevServer, options)
+      await runServer(startDocsDevServer, options, 'docs dev', ui)
       return process.exitCode || 0
     }
     throw new Error('docs requires build or dev')
