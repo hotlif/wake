@@ -35,3 +35,10 @@ test('forced TUI is rejected for static commands without control sequences', () 
   assert.match(result.stderr, /only available/)
   assert.doesNotMatch(result.stderr, /\x1b\[/)
 })
+
+test('validates the docs mode before starting a build', () => {
+  const result = run(['docs', 'build', '.', '--mode', 'storybook'])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /--mode must be one of: site, components/)
+  assert.doesNotMatch(result.stderr, /WAKE \/ DOCS BUILD/)
+})

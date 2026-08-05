@@ -33,8 +33,8 @@ Usage:
   wake [--ui auto|tui|plain] [--no-color] <command>
   wake build [entry] [--outdir DIR] [--cache] [--sourcemap]
   wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open]
-  wake docs build [root] [--outdir DIR] [--base PATH]
-  wake docs dev [root] [--host HOST] [--port PORT] [--open]
+  wake docs build [root] [--mode site|components] [--outdir DIR] [--base PATH]
+  wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
   wake parse <file> [--format auto|human|json]
   wake tokenize <file> [--format auto|human|json]
   wake --version
@@ -121,7 +121,9 @@ async function runServer(factory, options, command, root, ui, uiMode) {
     root: root || '.',
     watchLabel: command === 'docs dev'
       ? 'MDX · HMR · search index · watching'
-      : 'HMR · source maps · watching',
+      : command === 'docs components'
+        ? 'Demo · Controls · HMR · watching'
+        : 'HMR · source maps · watching',
   })
   state.version = version()
   let dashboard
@@ -263,6 +265,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     const options = commonOptions(args)
     options.outdir = takeOption(args, '--outdir')
     options.basePath = takeOption(args, '--base')
+    options.mode = validateChoice(takeOption(args, '--mode') || 'site', '--mode', ['site', 'components'])
     options.host = takeOption(args, '--host')
     const port = takeOption(args, '--port')
     if (port) options.port = Number(port)
@@ -271,13 +274,17 @@ export async function runCli(argv = process.argv.slice(2)) {
     if (args.length) throw new Error(`unknown docs arguments: ${args.join(' ')}`)
     if (action === 'build') {
       ensureStaticMode(uiMode)
-      printLines(formatBanner(ui, 'docs build', version()))
+      const components = options.mode === 'components'
+      printLines(formatBanner(ui, components ? 'docs components build' : 'docs build', version()))
       const result = await buildDocs(options)
-      printResult(ui, result, 'Documentation built', `  ${ui.dim('·')} ${(result.routes || []).length} routes`)
+      const count = components ? (result.demos || []).length : (result.routes || []).length
+      const noun = components ? 'demos' : 'routes'
+      printResult(ui, result, components ? 'Component workbench built' : 'Documentation built', `  ${ui.dim('·')} ${count} ${noun}`)
       return 0
     }
     if (action === 'dev') {
-      const reason = await runServer(startDocsDevServer, options, 'docs dev', options.cwd, ui, uiMode)
+      const commandName = options.mode === 'components' ? 'docs components' : 'docs dev'
+      const reason = await runServer(startDocsDevServer, options, commandName, options.cwd, ui, uiMode)
       if (reason === 'SIGINT') return 130
       if (reason === 'SIGTERM') return 143
       return 0

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { appendFile, cp, mkdtemp, rm } from 'node:fs/promises'
+import { access, appendFile, cp, mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -221,10 +221,27 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   const result = await buildDocs({ cwd, outdir })
   assert.equal(result.success, true)
   assert.ok(result.routes.length > 0)
+  const componentsCwd = fileURLToPath(new URL('../../../fixtures/react-docs/', import.meta.url))
+  const componentsRoot = await mkdtemp(join(tmpdir(), 'wake-components-api-'))
+  const componentsOutdir = join(componentsRoot, 'dist')
+  const workbench = await buildDocs({
+    cwd: componentsCwd,
+    outdir: componentsOutdir,
+    basePath: '/workbench/',
+    mode: 'components',
+  })
+  assert.equal(workbench.mode, 'components')
+  assert.deepEqual(workbench.routes, [])
+  assert.ok(workbench.demos.some((demo) => demo.component === 'Button' && demo.controlCount > 0))
+  await Promise.all([
+    access(join(componentsOutdir, 'index.html')),
+    access(join(componentsOutdir, '404.html')),
+  ])
 
   const reservation = createServer()
   const port = await listen(reservation)
   await new Promise((resolve) => reservation.close(resolve))
+  await rm(componentsRoot, { recursive: true, force: true })
   const server = await startDocsDevServer({ cwd, port })
   await server.close()
   const probe = createServer()

@@ -107,6 +107,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // 元素名 → intrinsic 字符串 或 组件标识符/成员。
         let name = self.parse_jsx_element_name();
+        // TSX JSX 类型实参只参与类型检查，运行时直接擦除：`<Form<T> ... />`。
+        if self.ts && self.at(TokenKind::Lt) {
+            self.ts_type_arguments();
+        }
         // 属性 → 对象成员 + key。
         let (members, key) = self.parse_jsx_attributes();
 

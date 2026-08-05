@@ -13,6 +13,7 @@ export interface Diagnostic {
   severity: 'error' | 'warning' | 'note' | 'help'
   code?: string
   message: string
+  path?: string
   start?: number
   end?: number
   notes?: string[]
@@ -61,6 +62,8 @@ export interface BundleResult extends BuildResult {
   outputDir?: undefined
 }
 
+export type DocsMode = 'site' | 'components'
+
 export interface DocsRoute {
   id: string
   file: string
@@ -74,14 +77,26 @@ export interface DocsRoute {
   draft: boolean
   headings: Array<{ depth: number; title: string; id: string }>
 }
+export interface DocsDemo {
+  id: string
+  title: string
+  group: string
+  component: string
+  order: number
+  controlCount: number
+  warnings: string[]
+}
 
 export interface DocsBuildOptions extends ProjectOptions {
   outdir?: string
   basePath?: string
+  mode?: DocsMode
 }
 
 export interface DocsBuildResult extends BuildResult {
   routes: DocsRoute[]
+  mode: DocsMode
+  demos: DocsDemo[]
 }
 
 export interface DevServerOptions extends ProjectOptions {
@@ -89,6 +104,9 @@ export interface DevServerOptions extends ProjectOptions {
   host?: string
   port?: number
   open?: boolean
+}
+export interface DocsDevServerOptions extends DevServerOptions {
+  mode?: DocsMode
 }
 
 export interface DevServerRebuildStartEvent {
@@ -133,7 +151,7 @@ export function build(options?: BuildOptions): Promise<BuildResult>
 export function createBuildContext(options?: BuildOptions): Promise<BuildContext>
 export function startDevServer(options?: DevServerOptions): Promise<DevServer>
 export function buildDocs(options?: DocsBuildOptions): Promise<DocsBuildResult>
-export function startDocsDevServer(options?: DevServerOptions): Promise<DevServer>
+export function startDocsDevServer(options?: DocsDevServerOptions): Promise<DevServer>
 
 declare const wake: {
   BuildContext: typeof BuildContext

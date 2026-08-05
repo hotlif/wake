@@ -80,6 +80,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         optional: false,
                     }));
                 }
+                TokenKind::Lt if self.ts => {
+                    // TSX 中 `async <T,>(value: T) => value` 必须先按泛型箭头试探，
+                    // 否则 `<T>` 会落入比较/JSX 分支并产生级联诊断。
+                    let checkpoint = self.checkpoint();
+                    self.bump(); // async
+                    self.ts_type_parameters();
+                    if self.at(TokenKind::LParen) {
+                        let cover = self.parse_cover_paren();
+                        self.skip_arrow_return_type_if_arrow();
+                        if self.at(TokenKind::Arrow) && !self.newline_before() {
+                            return self.finish_arrow(lo, cover, true);
+                        }
+                    }
+                    self.rewind(checkpoint);
+                }
                 _ if is_ident_name_kind(p.kind) => {
                     self.bump(); // async
                     let id = self.parse_binding_ident();
@@ -1473,15 +1488,38 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.ts_type_annotation();
                 break;
             }
-            // TS：可选参数 `(x?: T)` 的 `?`（cover grammar 里表达式后紧跟 `?:` 会被误当条件，
-            // 故这里先吃掉 `?`）。
-            items.push(self.with_allow_in(true, |p| p.parse_assignment_expression()));
-            if self.ts && self.at(TokenKind::Question) && self.peek().kind == TokenKind::Colon {
+            let item_lo = self.start();
+            // 可选标识符参数必须在条件表达式之前识别，否则 `x?: T` 会被当作 `x ? ... : ...`。
+            let optional_identifier = self.ts_optional_arrow_parameter_ahead();
+            let mut item = if optional_identifier {
+                let ident = self.parse_binding_ident();
+                Expression::Identifier(self.alloc(ident))
+            } else {
+                self.with_allow_in(true, |p| p.parse_assignment_expression())
+            };
+            if optional_identifier
+                || (self.ts && self.at(TokenKind::Question) && self.peek().kind == TokenKind::Colon)
+            {
                 self.bump(); // ?
             }
             // TS：箭头参数类型注解 `(x: T)` 擦除。cover grammar 把参数当表达式解析，
             // 表达式在 `:` 处自然停下，此处消费 `: T`（非空断言 `x!` 已在 tail 处理）。
             self.ts_type_annotation();
+            // 类型注解位于绑定与默认值之间：`(x: T = initial) => ...`。表达式 parser
+            // 无法跨过已擦除的类型来构造 Assignment，因此在 cover 中补建该节点。
+            if self.ts && self.eat(TokenKind::Eq) {
+                let previous_cover = self.in_cover_paren;
+                self.in_cover_paren = false;
+                let right = self.with_allow_in(true, |p| p.parse_assignment_expression());
+                self.in_cover_paren = previous_cover;
+                item = Expression::Assignment(self.alloc(AssignmentExpression {
+                    span: self.span_to(item_lo),
+                    operator: AssignmentOperator::Assign,
+                    left: item,
+                    right,
+                }));
+            }
+            items.push(item);
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -1490,6 +1528,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let _ = self.pop_transform_temp_scope();
         self.in_cover_paren = previous_cover;
         CoverParen { items, rest }
+    }
+
+    fn ts_optional_arrow_parameter_ahead(&mut self) -> bool {
+        if !self.ts || !self.at_ident_name() || self.peek().kind != TokenKind::Question {
+            return false;
+        }
+        let checkpoint = self.checkpoint();
+        self.bump(); // identifier
+        self.bump(); // ?
+        let is_optional_parameter = matches!(
+            self.cur.kind,
+            TokenKind::Colon | TokenKind::Comma | TokenKind::RParen | TokenKind::Eq
+        );
+        self.rewind(checkpoint);
+        is_optional_parameter
     }
 
     /// TS：箭头返回类型注解 `(...): R =>` 擦除。仅当 `)` 后为 `: 类型`（或类型谓词）且紧跟 `=>`

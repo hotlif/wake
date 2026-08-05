@@ -82,6 +82,9 @@ export default function BasicDemo() {
 | `height` | `auto` | iframe 通过消息自动测高；首版不承诺固定高度值 |
 | `viewport` | `responsive` | 首次使用自适应宽度，读者可切换 768px 和 390px |
 | `isolation` | `iframe` | 首版只支持 iframe 隔离 |
+| `group` / `component` | 导航名称 | 在组件工作台覆盖路径推导的分组和组件名 |
+| `order` | 整数 | 在同一组件内排序；相同时按标题排序 |
+| `args` | 静态 JSON 值 | 组件工作台的初始 Props，优先级最高 |
 
 建议只填写真正需要改变的字段。未填写时会使用自动标题、响应式宽度、`surface` 背景、`md` 内边距和 iframe 隔离。
 
@@ -89,6 +92,50 @@ export default function BasicDemo() {
 首版的 <code>height</code>、<code>viewport</code> 和 <code>isolation</code> 保留了稳定约定，但运行时固定采用自动测高、初始自适应和 iframe。不要依赖未文档化的其他值。
 </Callout>
 
+## 组件工作台模式
+
+组件开发时不必先写 MDX。下面两条命令只扫描 `[docs].source_dir` 中的 `.demo.tsx`：
+
+```bash
+wake docs dev . --mode components
+wake docs build . --mode components --outdir components-dist
+```
+
+工作台左侧按分组和组件列出 Demo，中间 Canvas 继续使用 iframe 与 Preview，右侧根据默认导出函数第一个参数的类型生成 Controls。源码、视口、主题、重置、深链接和运行错误都在同一界面中。
+
+```tsx title="docs/button/demos/primary.demo.tsx"
+import type { ButtonProps } from "../../../src/button";
+import { Button } from "../../../src/button";
+
+export const meta = {
+  title: "Primary",
+  group: "Actions",
+  component: "Button",
+  order: 10,
+  args: {
+    children: "Save",
+    appearance: "primary",
+  },
+};
+
+export default function PrimaryButton(props: ButtonProps) {
+  return <Button {...props} />;
+}
+```
+
+Wake 支持函数声明、带类型参数的箭头函数、解构参数、本地类型和相对 import/re-export。没有参数类型的旧 Demo 仍然可以预览，只是不生成可编辑控件。初始值按 `meta.args`、JSDoc `@default`、参数静态解构默认值、`undefined` 的顺序选择；`meta.args` 出现函数、标识符计算或其他非 JSON 值时会警告并忽略。
+
+| Props 类型 | 工作台控件 |
+| --- | --- |
+| `boolean` | 开关 |
+| `string` / `number` | 文本框 / 数字框 |
+| 字符串或数字字面量联合 | 下拉框 |
+| 数组和对象 | 带校验的 JSON 编辑器 |
+| 函数、复杂泛型、`ReactNode` | 只读类型信息 |
+
+可选属性可以清除回 `undefined`。废弃标记、必填状态、描述和类型来自同一份 Props/JSDoc 数据。类型无法安全展开时只降级相关属性，不会阻断预览、HMR 或静态构建。
+
+组件树默认把 Demo 路径中最后一个非 `demos` 目录作为组件，把之前的目录作为分组；缺失时使用文件名和 `Other`。当前 Demo、非默认 Args 与视口写入 hash URL，所以复制链接、刷新和普通静态托管都能恢复调试状态。
 ## Demo 卡片怎么使用
 
 每张卡片提供：
@@ -184,6 +231,7 @@ Preview 适合放：
 | `wake:resize` | iframe → 页面 | 传递内容高度 |
 | `wake:error` | iframe → 页面 | 显示运行错误 |
 | `wake:theme` | 页面 → iframe | 同步 light 或 dark |
+| `wake:args` | 工作台 → iframe | 更新 Props 并原地重新渲染 Demo |
 
 通常不需要手工发送这些消息。只有自定义 Demo 容器或调试 iframe 生命周期时才需要理解它们。
 

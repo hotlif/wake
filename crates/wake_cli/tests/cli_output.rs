@@ -24,6 +24,16 @@ fn parse_json_keeps_stdout_machine_readable() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(value["statementCount"].as_u64().unwrap() > 0);
     assert!(value["diagnostics"].is_array());
+
+    let tsx_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/react-docs/docs/components/demos/basic.demo.tsx");
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["parse", tsx_fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["diagnostics"], serde_json::json!([]));
 }
 
 #[test]

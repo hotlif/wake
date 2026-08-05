@@ -292,6 +292,7 @@ struct RawDevServerOptions {
     host: Option<String>,
     port: Option<u16>,
     open: Option<bool>,
+    mode: Option<wake_app::DocsMode>,
 }
 
 impl RawDevServerOptions {
@@ -304,8 +305,9 @@ impl RawDevServerOptions {
             .unwrap_or_else(|| Ok(Self::default()))
     }
 
-    fn into_app(self) -> wake_app::DevServerOptions {
-        wake_app::DevServerOptions {
+    fn into_app(self) -> (wake_app::DevServerOptions, wake_app::DocsMode) {
+        let mode = self.mode.unwrap_or_default();
+        let options = wake_app::DevServerOptions {
             project: wake_app::ProjectOptions {
                 cwd: self.cwd.map(PathBuf::from),
                 config_path: self.config_path.map(PathBuf::from),
@@ -314,7 +316,8 @@ impl RawDevServerOptions {
             host: self.host,
             port: self.port,
             open: self.open,
-        }
+        };
+        (options, mode)
     }
 }
 
@@ -338,10 +341,12 @@ impl Task for StartServerTask {
         let kind = &self.kind;
         Ok(
             match catch_unwind(AssertUnwindSafe(|| {
-                let options = RawDevServerOptions::parse(options)?.into_app();
+                let (options, docs_mode) = RawDevServerOptions::parse(options)?.into_app();
                 match kind {
                     ServerKind::Application => wake_app::start_dev_server(options),
-                    ServerKind::Documentation => wake_app::start_docs_dev_server(options),
+                    ServerKind::Documentation => {
+                        wake_app::start_docs_dev_server_with_mode(options, docs_mode)
+                    }
                 }
             })) {
                 Ok(result) => result,
@@ -455,6 +460,7 @@ struct RawDocsOptions {
     config_path: Option<String>,
     outdir: Option<String>,
     base_path: Option<String>,
+    mode: Option<wake_app::DocsMode>,
 }
 
 #[napi(js_name = "buildDocs")]
@@ -475,7 +481,8 @@ pub fn build_docs(
                         .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()))
                 })
                 .unwrap_or_else(|| Ok(RawDocsOptions::default()))?;
-            let result = wake_app::build_docs(
+            let docs_mode = options.mode.unwrap_or_default();
+            let result = wake_app::build_docs_with_mode(
                 wake_app::DocsBuildOptions {
                     project: wake_app::ProjectOptions {
                         cwd: options.cwd.map(PathBuf::from),
@@ -484,6 +491,7 @@ pub fn build_docs(
                     outdir: options.outdir.map(PathBuf::from),
                     base_path: options.base_path,
                 },
+                docs_mode,
                 &cancellation,
             )?;
             serde_json::to_value(result)

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use wake_common::{FileSystem, OsFileSystem, RenderStyle, SourceFile, render};
 
 mod dashboard;
@@ -96,6 +96,9 @@ enum DocsCommand {
         /// Listening port; configuration or 5173 is used when omitted.
         #[arg(long)]
         port: Option<u16>,
+        /// Documentation site or component workbench.
+        #[arg(long, value_enum, default_value_t = DocsModeArg::Site)]
+        mode: DocsModeArg,
     },
     /// Generate a deployable static documentation site.
     Build {
@@ -108,7 +111,24 @@ enum DocsCommand {
         /// Public deployment path overriding [docs].base_path.
         #[arg(long, value_name = "PATH")]
         base: Option<String>,
+        /// Documentation site or component workbench.
+        #[arg(long, value_enum, default_value_t = DocsModeArg::Site)]
+        mode: DocsModeArg,
     },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DocsModeArg {
+    Site,
+    Components,
+}
+
+impl From<DocsModeArg> for wake_app::DocsMode {
+    fn from(value: DocsModeArg) -> Self {
+        match value {
+            DocsModeArg::Site => Self::Site,
+            DocsModeArg::Components => Self::Components,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -137,9 +157,14 @@ fn main() -> ExitCode {
         }
         Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port, ui, cli.ui),
         Command::Docs { command } => match command {
-            DocsCommand::Dev { root, port } => cmd_docs_dev(&root, port, ui, cli.ui),
-            DocsCommand::Build { root, outdir, base } => ensure_static_mode(cli.ui)
-                .and_then(|()| cmd_docs_build(&root, outdir.as_deref(), base.as_deref(), ui)),
+            DocsCommand::Dev { root, port, mode } => cmd_docs_dev(&root, port, mode, ui, cli.ui),
+            DocsCommand::Build {
+                root,
+                outdir,
+                base,
+                mode,
+            } => ensure_static_mode(cli.ui)
+                .and_then(|()| cmd_docs_build(&root, outdir.as_deref(), base.as_deref(), mode, ui)),
         },
         Command::Parse { file, ast, format } => {
             ensure_static_mode(cli.ui).and_then(|()| cmd_parse(&file, ast, format, style, ui))
@@ -624,27 +649,42 @@ fn cmd_dev(
     run_server(server, &ui, &mut dashboard, &mut state)
 }
 
-fn cmd_docs_dev(root: &Path, port: Option<u16>, ui: Ui, mode: UiMode) -> Result<(), ExitCode> {
-    let mut state = DashboardState::new(
-        "docs dev",
-        root,
-        "LOCAL",
-        "MDX · HMR · search index · watching",
-    );
-    let mut dashboard = start_dashboard(mode, &ui, &state)?;
-    let server = match wake_app::start_docs_dev_server(wake_app::DevServerOptions {
-        project: wake_app::ProjectOptions {
-            cwd: Some(root.to_path_buf()),
-            config_path: None,
+fn cmd_docs_dev(
+    root: &Path,
+    port: Option<u16>,
+    docs_mode: DocsModeArg,
+    ui: Ui,
+    ui_mode: UiMode,
+) -> Result<(), ExitCode> {
+    let components = docs_mode == DocsModeArg::Components;
+    let command = if components {
+        "docs components"
+    } else {
+        "docs dev"
+    };
+    let watch = if components {
+        "Demo · Controls · HMR · watching"
+    } else {
+        "MDX · HMR · search index · watching"
+    };
+    let mut state = DashboardState::new(command, root, "LOCAL", watch);
+    let mut dashboard = start_dashboard(ui_mode, &ui, &state)?;
+    let server = match wake_app::start_docs_dev_server_with_mode(
+        wake_app::DevServerOptions {
+            project: wake_app::ProjectOptions {
+                cwd: Some(root.to_path_buf()),
+                config_path: None,
+            },
+            entry: None,
+            host: None,
+            port,
+            open: None,
         },
-        entry: None,
-        host: None,
-        port,
-        open: None,
-    }) {
+        docs_mode.into(),
+    ) {
         Ok(server) => server,
         Err(error) => {
-            return Err(restore_for_error(&mut dashboard, &ui, "docs dev", &error));
+            return Err(restore_for_error(&mut dashboard, &ui, command, &error));
         }
     };
     run_server(server, &ui, &mut dashboard, &mut state)
@@ -831,10 +871,16 @@ fn cmd_docs_build(
     root: &Path,
     outdir: Option<&Path>,
     base: Option<&str>,
+    docs_mode: DocsModeArg,
     ui: Ui,
 ) -> Result<(), ExitCode> {
-    ui.header("docs build");
-    let result = wake_app::build_docs(
+    let components = docs_mode == DocsModeArg::Components;
+    ui.header(if components {
+        "docs components build"
+    } else {
+        "docs build"
+    });
+    let result = wake_app::build_docs_with_mode(
         wake_app::DocsBuildOptions {
             project: wake_app::ProjectOptions {
                 cwd: Some(root.to_path_buf()),
@@ -843,14 +889,27 @@ fn cmd_docs_build(
             outdir: outdir.map(Path::to_path_buf),
             base_path: base.map(str::to_string),
         },
+        docs_mode.into(),
         &wake_app::CancellationToken::default(),
     )
     .map_err(|error| {
         ui.app_error(&error);
         ExitCode::FAILURE
     })?;
-    let extra = format!("  {} {} routes", ui.dim("·"), result.routes.len());
-    ui.build_result("Documentation built", &result.build, Some(&extra));
+    let extra = if components {
+        format!("  {} {} demos", ui.dim("·"), result.demos.len())
+    } else {
+        format!("  {} {} routes", ui.dim("·"), result.routes.len())
+    };
+    ui.build_result(
+        if components {
+            "Component workbench built"
+        } else {
+            "Documentation built"
+        },
+        &result.build,
+        Some(&extra),
+    );
     Ok(())
 }
 
@@ -877,10 +936,12 @@ fn cmd_parse(
             return Err(ExitCode::FAILURE);
         }
     };
-    let source_type = if file.extension().is_some_and(|extension| extension == "cjs") {
-        wake_ecma_ast::SourceType::Script
-    } else {
-        wake_ecma_ast::SourceType::Module
+    let source_type = match file.extension().and_then(|extension| extension.to_str()) {
+        Some("cjs") => wake_ecma_ast::SourceType::Script,
+        Some("ts" | "mts" | "cts") => wake_ecma_ast::SourceType::TypeScript,
+        Some("tsx") => wake_ecma_ast::SourceType::Tsx,
+        Some("jsx") => wake_ecma_ast::SourceType::Jsx,
+        _ => wake_ecma_ast::SourceType::Module,
     };
     let interner = wake_common::Interner::new();
     let output = wake_ecma_parser::parse(&source_text, &interner, source_type);

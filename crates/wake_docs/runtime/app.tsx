@@ -491,30 +491,49 @@ function NotFound() {
 function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
   const demo = demos.find((item) => item.id === id);
   const [module, setModule] = useState<any>(null);
+  const [args, setArgs] = useState<Record<string, unknown>>({});
   const [error, setError] = useState("");
   useEffect(() => {
     if (!demo) return;
-    demo.load().then(setModule).catch((reason) => setError(String(reason?.stack || reason)));
+    setError("");
+    demo.load().then((nextModule) => {
+      setModule(nextModule);
+      const initialArgs = nextModule.meta?.args;
+      if (initialArgs && typeof initialArgs === "object" && !Array.isArray(initialArgs)) {
+        try {
+          setArgs(JSON.parse(JSON.stringify(initialArgs)));
+        } catch {
+          setArgs({});
+        }
+      }
+    }).catch((reason) => setError(String(reason?.stack || reason)));
   }, [demo]);
   useEffect(() => {
     const send = (message: any) => window.parent.postMessage(message, "*");
     const resize = new ResizeObserver(() => send({ type: "wake:resize", height: Math.ceil(document.documentElement.scrollHeight) }));
     resize.observe(document.documentElement);
     const receive = (event: MessageEvent) => {
-      if (event.data?.type === "wake:theme") document.documentElement.dataset.theme = event.data.theme;
+      if (event.source !== window.parent || !event.data) return;
+      if (event.data.type === "wake:theme") document.documentElement.dataset.theme = event.data.theme;
+      if (event.data.type === "wake:args" && (!event.data.id || event.data.id === id)) {
+        const nextArgs = event.data.args;
+        if (nextArgs && typeof nextArgs === "object" && !Array.isArray(nextArgs)) setArgs(nextArgs);
+      }
     };
     const onError = (event: ErrorEvent) => send({ type: "wake:error", error: event.error?.stack || event.message });
     window.addEventListener("message", receive);
     window.addEventListener("error", onError);
     document.documentElement.dataset.theme = resolved;
-    send({ type: "wake:ready" });
     return () => { resize.disconnect(); window.removeEventListener("message", receive); window.removeEventListener("error", onError); };
-  }, [resolved]);
+  }, [id, resolved]);
+  useEffect(() => {
+    if (module) window.parent.postMessage({ type: "wake:ready", id }, "*");
+  }, [id, module]);
   if (!demo) return <div className="frame-error">{text("Demo not found", "找不到演示")}: {id}</div>;
   if (error) { window.parent.postMessage({ type: "wake:error", error }, "*"); return <div className="frame-error">{error}</div>; }
   if (!module) return <div className="frame-loading">{text("Loading preview…", "正在加载预览…")}</div>;
   const Component = module.default;
-  return <div className="demo-frame-root"><Preview><Component /></Preview></div>;
+  return <div className="demo-frame-root"><Preview><Component {...args} /></Preview></div>;
 }
 
 export function App() {

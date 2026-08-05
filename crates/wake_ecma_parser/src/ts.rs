@@ -173,6 +173,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             if self.at(TokenKind::Lt) {
                 self.ts_type_arguments();
             }
+            // 类型查询同样可以继续索引：`typeof VALUE[keyof typeof VALUE]`。
+            while !self.newline_before() && self.at(TokenKind::LBracket) {
+                self.ts_skip_balanced();
+            }
             return;
         }
         // infer T (extends U)?

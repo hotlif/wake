@@ -371,6 +371,58 @@ fn parse_ok(src: &str, st: SourceType) -> crate::ParseOutput {
 }
 
 #[test]
+fn ts_arrow_parameters_support_optional_types_and_defaults() {
+    parse_ok(
+        "type Item = { id: string };
+         const sort = (items: Item[] = []): Item[] => items;
+         const lookup = (value?: string | null) => value;
+         const destructured = ({ id }: Item = { id: 'x' }) => id;",
+        SourceType::Tsx,
+    );
+}
+
+#[test]
+fn parenthesized_conditionals_are_not_optional_arrow_parameters() {
+    parse_ok(
+        "const payload = { ...(enabled ? { key: value } : {}) };
+         const selected = useMemo(
+             () => (activeId ? values.get(activeId) ?? null : null),
+             [activeId, values],
+         );",
+        SourceType::Tsx,
+    );
+}
+
+#[test]
+fn tsx_async_generic_arrows_are_not_parsed_as_jsx() {
+    parse_ok(
+        "const post = useCallback(async <T,>(body: T): Promise<T> => body, []);",
+        SourceType::Tsx,
+    );
+}
+
+#[test]
+fn ts_type_queries_allow_indexed_access() {
+    parse_ok(
+        "const VALUES = { A: 0, B: 1 } as const;
+         export type Value = typeof VALUES[keyof typeof VALUES];",
+        SourceType::TypeScript,
+    );
+}
+
+#[test]
+fn tsx_jsx_elements_erase_type_arguments() {
+    parse_ok(
+        "interface Props<T> { value: T }
+         declare const Form: unknown;
+         function View<T>({ value }: Props<T>) {
+             return <Form<T> value={value} />;
+         }",
+        SourceType::Tsx,
+    );
+}
+
+#[test]
 fn ts_import_equals_and_export_assign() {
     let interner = Interner::new();
     let src = "import fs = require('fs');

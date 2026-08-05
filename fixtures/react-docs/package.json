@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "docs:dev": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- docs dev .",
-    "docs:build": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- docs build ."
+    "docs:build": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- docs build .",
+    "components:dev": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- docs dev . --mode components",
+    "components:build": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- docs build . --mode components"
   },
   "dependencies": {
     "react": "^19.2.8",

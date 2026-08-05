@@ -18,8 +18,10 @@ use std::sync::{
 };
 
 const RUNTIME_APP: &str = include_str!("../runtime/app.tsx");
+const RUNTIME_COMPONENTS: &str = include_str!("../runtime/components.tsx");
 const RUNTIME_ENTRY: &str = include_str!("../runtime/entry.tsx");
 const RUNTIME_STYLE: &str = include_str!("../runtime/styles.css");
+const RUNTIME_COMPONENT_STYLE: &str = include_str!("../runtime/components.css");
 const MINIMUM_REACT_MAJOR: u64 = 19;
 static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +30,22 @@ static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 pub enum BuildMode {
     Development,
     Production,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocsMode {
+    #[default]
+    Site,
+    Components,
+}
+
+impl DocsMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Site => "site",
+            Self::Components => "components",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +89,9 @@ pub struct GeneratedProject {
     pub aliases: Vec<(String, PathBuf)>,
     pub watch_roots: Vec<PathBuf>,
     pub routes: Vec<RouteInfo>,
+    pub mode: DocsMode,
+    pub demos: Vec<DemoDescriptor>,
+    pub warnings: Vec<String>,
     pub changed_files: Vec<PathBuf>,
 }
 
@@ -185,20 +206,80 @@ struct ApiEntry {
     value: wake_tsdoc::ApiDoc,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DemoDescriptor {
+    pub id: String,
+    pub title: String,
+    pub group: String,
+    pub component: String,
+    pub order: i32,
+    pub control_count: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DemoControl {
+    name: String,
+    type_text: String,
+    kind: String,
+    required: bool,
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: Option<String>,
+    options: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct DemoInfo {
     id: String,
     title: String,
+    group: String,
+    component: String,
+    order: i32,
+    controls: Vec<DemoControl>,
+    warnings: Vec<String>,
     source: String,
     source_module: String,
     import_path: String,
 }
 
-/// Scan, compile, and atomically materialize the generated docs module tree.
+impl DemoInfo {
+    fn descriptor(&self) -> DemoDescriptor {
+        DemoDescriptor {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            group: self.group.clone(),
+            component: self.component.clone(),
+            order: self.order,
+            control_count: self
+                .controls
+                .iter()
+                .filter(|control| control.kind != "readonly")
+                .count(),
+            warnings: self.warnings.clone(),
+        }
+    }
+}
+
+/// Generate the normal documentation site. This compatibility wrapper keeps the pre-workbench
+/// API and behavior unchanged.
 pub fn generate(
     project_root: impl AsRef<Path>,
     options: &DocsOptions,
     mode: BuildMode,
+) -> Result<GeneratedProject, DocsError> {
+    generate_with_mode(project_root, options, mode, DocsMode::Site)
+}
+/// Scan, compile, and atomically materialize the generated docs module tree.
+pub fn generate_with_mode(
+    project_root: impl AsRef<Path>,
+    options: &DocsOptions,
+    mode: BuildMode,
+    docs_mode: DocsMode,
 ) -> Result<GeneratedProject, DocsError> {
     validate_options(options)?;
     let root = canonical_dir(project_root.as_ref())?;
@@ -220,6 +301,9 @@ pub fn generate(
     scan_files(&source_dir, &mut mdx_files, &mut demo_files)?;
     mdx_files.sort();
     demo_files.sort();
+    if docs_mode == DocsMode::Components {
+        mdx_files.clear();
+    }
 
     let mut pages = Vec::new();
     for path in &mdx_files {
@@ -238,7 +322,7 @@ pub fn generate(
     });
     ensure_unique_routes(&pages)?;
 
-    let demos = compile_demos(&root, &demo_files)?;
+    let demos = compile_demos(&root, &source_dir, &demo_files, docs_mode)?;
     let mut changed_files = Vec::new();
     let mut generated_files = BTreeSet::new();
     for (source_path, page) in &pages {
@@ -288,13 +372,15 @@ pub fn generate(
         .flat_map(|(_, page)| page.api_entries.iter())
         .collect();
     let registry = render_registry(&source_dir, &pages, &demos, &api_entries)?;
-    let config = render_config(&root, options)?;
+    let config = render_config(&root, options, docs_mode)?;
     let fixed = [
         ("registry.ts", registry.as_str()),
         ("config.tsx", config.as_str()),
         ("runtime/app.tsx", RUNTIME_APP),
+        ("runtime/components.tsx", RUNTIME_COMPONENTS),
         ("runtime/entry.tsx", RUNTIME_ENTRY),
         ("runtime/styles.css", RUNTIME_STYLE),
+        ("runtime/components.css", RUNTIME_COMPONENT_STYLE),
     ];
     for (relative, content) in fixed {
         let path = generated_dir.join(relative);
@@ -327,6 +413,12 @@ pub fn generate(
     watch_roots.sort();
     watch_roots.dedup();
 
+    let demo_descriptors = demos.iter().map(DemoInfo::descriptor).collect();
+    let warnings = demos
+        .iter()
+        .flat_map(|demo| demo.warnings.iter().cloned())
+        .collect();
+
     Ok(GeneratedProject {
         root: root.clone(),
         generated_dir: generated_dir.clone(),
@@ -337,6 +429,9 @@ pub fn generate(
         ],
         watch_roots,
         routes,
+        mode: docs_mode,
+        demos: demo_descriptors,
+        warnings,
         changed_files,
     })
 }
@@ -613,34 +708,529 @@ fn relativize_api_sources(root: &Path, doc: &mut wake_tsdoc::ApiDoc) {
     }
 }
 
-fn compile_demos(root: &Path, files: &[PathBuf]) -> Result<Vec<DemoInfo>, DocsError> {
-    files
-        .iter()
-        .map(|path| {
-            let source = fs::read_to_string(path)
-                .map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
-            let relative = path.strip_prefix(root).map_err(|_| {
-                DocsError::InvalidConfig(format!(
-                    "demo `{}` is outside project root",
-                    path.display()
-                ))
-            })?;
-            let id = slash_path(relative);
-            let source_module = slash_path(relative.with_extension("source.tsx"));
-            let stem = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("Demo")
-                .trim_end_matches(".demo");
-            Ok(DemoInfo {
-                id: id.clone(),
-                title: title_case(stem),
-                source,
-                source_module,
-                import_path: format!("@wake/docs-project/{id}"),
+#[derive(Debug, Default)]
+struct StaticDemoMeta {
+    title: Option<String>,
+    group: Option<String>,
+    component: Option<String>,
+    order: i32,
+}
+
+fn compile_demos(
+    root: &Path,
+    source_dir: &Path,
+    files: &[PathBuf],
+    docs_mode: DocsMode,
+) -> Result<Vec<DemoInfo>, DocsError> {
+    let mut demos = Vec::new();
+    for path in files {
+        let source = fs::read_to_string(path)
+            .map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            DocsError::InvalidConfig(format!("demo {} is outside project root", path.display()))
+        })?;
+        let source_relative = path.strip_prefix(source_dir).map_err(|_| {
+            DocsError::InvalidConfig(format!(
+                "demo {} is outside docs source_dir",
+                path.display()
+            ))
+        })?;
+        let id = slash_path(relative);
+        let source_module = slash_path(relative.with_extension("source.tsx"));
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Demo")
+            .trim_end_matches(".demo");
+        let static_meta = extract_static_demo_meta(&source);
+        let (derived_group, derived_component) = derive_demo_location(source_relative, stem);
+        let mut warnings = Vec::new();
+        if docs_mode == DocsMode::Components
+            && static_demo_args(&source).is_some_and(|value| !is_json_literal(value))
+        {
+            warnings.push(format!(
+                "{id}: meta.args contains a dynamic or non-JSON value; it will be ignored"
+            ));
+        }
+        let controls = if docs_mode == DocsMode::Components {
+            match wake_tsdoc::extract_demo_props(path) {
+                Ok(Some(mut api)) => {
+                    relativize_api_sources(root, &mut api);
+                    warnings.extend(
+                        api.warnings
+                            .iter()
+                            .map(|warning| format!("{id}: {warning}")),
+                    );
+                    api.props.iter().map(control_from_prop).collect()
+                }
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    warnings.push(format!("{id}: cannot infer demo props: {error}"));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        demos.push(DemoInfo {
+            id: id.clone(),
+            title: static_meta.title.unwrap_or_else(|| title_case(stem)),
+            group: static_meta.group.unwrap_or(derived_group),
+            component: static_meta.component.unwrap_or(derived_component),
+            order: static_meta.order,
+            controls,
+            warnings,
+            source,
+            source_module,
+            import_path: format!("@wake/docs-project/{id}"),
+        });
+    }
+    demos.sort_by(|left, right| {
+        left.group
+            .to_ascii_lowercase()
+            .cmp(&right.group.to_ascii_lowercase())
+            .then_with(|| {
+                left.component
+                    .to_ascii_lowercase()
+                    .cmp(&right.component.to_ascii_lowercase())
             })
+            .then_with(|| left.order.cmp(&right.order))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    Ok(demos)
+}
+
+fn derive_demo_location(relative: &Path, stem: &str) -> (String, String) {
+    let mut directories = relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
         })
-        .collect()
+        .filter(|value| !value.eq_ignore_ascii_case("demos"))
+        .map(title_case)
+        .collect::<Vec<_>>();
+    let component = directories.pop().unwrap_or_else(|| title_case(stem));
+    let group = if directories.is_empty() {
+        "Other".to_string()
+    } else {
+        directories.join(" / ")
+    };
+    (group, component)
+}
+
+fn extract_static_demo_meta(source: &str) -> StaticDemoMeta {
+    let Some(body) = static_demo_meta_body(source) else {
+        return StaticDemoMeta::default();
+    };
+    StaticDemoMeta {
+        title: static_demo_string(body, "title"),
+        group: static_demo_string(body, "group"),
+        component: static_demo_string(body, "component"),
+        order: static_demo_i32(body, "order").unwrap_or_default(),
+    }
+}
+
+fn static_demo_meta_body(source: &str) -> Option<&str> {
+    let pattern = Regex::new(r"(?s)export\s+const\s+meta\s*=\s*\{").expect("valid demo meta regex");
+    let found = pattern.find(source)?;
+    let open = found.end() - 1;
+    let close = find_js_matching(source, open, '{', '}')?;
+    Some(&source[open + 1..close])
+}
+
+fn static_demo_property<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = source.as_bytes();
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    let mut depths = [0usize; 3];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while offset < bytes.len() {
+        let byte = bytes[offset];
+        let next = bytes.get(offset + 1).copied();
+        if line_comment {
+            line_comment = byte != b'\n';
+            offset += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && next == Some(b'/') {
+                block_comment = false;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+            offset += 1;
+            continue;
+        }
+
+        match (byte, next) {
+            (b'/', Some(b'/')) => {
+                line_comment = true;
+                offset += 2;
+                continue;
+            }
+            (b'/', Some(b'*')) => {
+                block_comment = true;
+                offset += 2;
+                continue;
+            }
+            _ => {}
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'{' => depths[0] += 1,
+            b'}' => depths[0] = depths[0].saturating_sub(1),
+            b'[' => depths[1] += 1,
+            b']' => depths[1] = depths[1].saturating_sub(1),
+            b'(' => depths[2] += 1,
+            b')' => depths[2] = depths[2].saturating_sub(1),
+            b',' if depths == [0, 0, 0] => {
+                if let Some(value) = static_demo_entry(&source[start..offset], key) {
+                    return Some(value);
+                }
+                start = offset + 1;
+            }
+            _ => {}
+        }
+        offset += 1;
+    }
+    static_demo_entry(&source[start..], key)
+}
+
+fn static_demo_entry<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
+    let mut entry = entry.trim_start();
+    loop {
+        if let Some(comment) = entry.strip_prefix("//") {
+            entry = comment.split_once('\n')?.1.trim_start();
+        } else if let Some(comment) = entry.strip_prefix("/*") {
+            entry = comment.split_once("*/")?.1.trim_start();
+        } else {
+            break;
+        }
+    }
+    entry
+        .strip_prefix(key)?
+        .trim_start()
+        .strip_prefix(':')
+        .map(str::trim)
+}
+
+fn static_demo_string(source: &str, key: &str) -> Option<String> {
+    let value = static_demo_property(source, key)?;
+    if value.starts_with('"') && value.ends_with('"') {
+        serde_json::from_str(value).ok()
+    } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        Some(
+            value[1..value.len() - 1]
+                .replace("\\'", "'")
+                .replace("\\\\", "\\"),
+        )
+    } else {
+        None
+    }
+}
+
+fn static_demo_i32(source: &str, key: &str) -> Option<i32> {
+    static_demo_property(source, key)?.parse().ok()
+}
+
+fn static_demo_args(source: &str) -> Option<&str> {
+    let body = static_demo_meta_body(source)?;
+    static_demo_property(body, "args")
+}
+
+fn is_json_literal(source: &str) -> bool {
+    let mut parser = JsonLiteralParser { source, offset: 0 };
+    parser.value() && {
+        parser.trivia();
+        parser.offset == source.len()
+    }
+}
+
+struct JsonLiteralParser<'a> {
+    source: &'a str,
+    offset: usize,
+}
+
+impl JsonLiteralParser<'_> {
+    fn value(&mut self) -> bool {
+        self.trivia();
+        match self.peek() {
+            Some('{') => self.object(),
+            Some('[') => self.array(),
+            Some('"' | '\'') => self.string(),
+            Some('-' | '0'..='9') => self.number(),
+            Some(_) => ["true", "false", "null"]
+                .into_iter()
+                .any(|keyword| self.keyword(keyword)),
+            None => false,
+        }
+    }
+
+    fn object(&mut self) -> bool {
+        self.bump();
+        self.trivia();
+        if self.consume('}') {
+            return true;
+        }
+        loop {
+            self.trivia();
+            if matches!(self.peek(), Some('"' | '\'')) {
+                if !self.string() {
+                    return false;
+                }
+            } else if !self.identifier() {
+                return false;
+            }
+            self.trivia();
+            if !self.consume(':') || !self.value() {
+                return false;
+            }
+            self.trivia();
+            if self.consume('}') {
+                return true;
+            }
+            if !self.consume(',') {
+                return false;
+            }
+            self.trivia();
+            if self.consume('}') {
+                return true;
+            }
+        }
+    }
+
+    fn array(&mut self) -> bool {
+        self.bump();
+        self.trivia();
+        if self.consume(']') {
+            return true;
+        }
+        loop {
+            if !self.value() {
+                return false;
+            }
+            self.trivia();
+            if self.consume(']') {
+                return true;
+            }
+            if !self.consume(',') {
+                return false;
+            }
+            self.trivia();
+            if self.consume(']') {
+                return true;
+            }
+        }
+    }
+
+    fn string(&mut self) -> bool {
+        let Some(quote @ ('"' | '\'')) = self.bump() else {
+            return false;
+        };
+        let mut escaped = false;
+        while let Some(character) = self.bump() {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == quote {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn number(&mut self) -> bool {
+        let start = self.offset;
+        while self.peek().is_some_and(|character| {
+            character.is_ascii_digit() || matches!(character, '-' | '+' | '.' | 'e' | 'E')
+        }) {
+            self.bump();
+        }
+        self.source[start..self.offset].parse::<f64>().is_ok()
+    }
+
+    fn keyword(&mut self, keyword: &str) -> bool {
+        if self.source[self.offset..].starts_with(keyword) {
+            self.offset += keyword.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn identifier(&mut self) -> bool {
+        let Some(first) = self.peek() else {
+            return false;
+        };
+        if !first.is_ascii_alphabetic() && !matches!(first, '_' | '$') {
+            return false;
+        }
+        self.bump();
+        while self.peek().is_some_and(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+        }) {
+            self.bump();
+        }
+        true
+    }
+
+    fn trivia(&mut self) {
+        loop {
+            while self.peek().is_some_and(char::is_whitespace) {
+                self.bump();
+            }
+            if self.source[self.offset..].starts_with("//") {
+                self.offset += 2;
+                while self.peek().is_some_and(|character| character != '\n') {
+                    self.bump();
+                }
+            } else if self.source[self.offset..].starts_with("/*") {
+                let Some(end) = self.source[self.offset + 2..].find("*/") else {
+                    self.offset = self.source.len();
+                    return;
+                };
+                self.offset += end + 4;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn consume(&mut self, expected: char) -> bool {
+        if self.peek() == Some(expected) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source[self.offset..].chars().next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let character = self.peek()?;
+        self.offset += character.len_utf8();
+        Some(character)
+    }
+}
+fn find_js_matching(source: &str, open: usize, open_char: char, close_char: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, character) in source[open..].char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') || character == '\u{60}' {
+            quote = Some(character);
+        } else if character == open_char {
+            depth += 1;
+        } else if character == close_char {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(open + offset);
+            }
+        }
+    }
+    None
+}
+fn control_from_prop(prop: &wake_tsdoc::ApiProp) -> DemoControl {
+    let type_text = prop.type_text.trim();
+    let options = literal_union_options(type_text);
+    let kind = if !options.is_empty() {
+        "select"
+    } else if type_text == "boolean" {
+        "boolean"
+    } else if type_text == "string" {
+        "string"
+    } else if type_text == "number" {
+        "number"
+    } else if type_text.starts_with('{')
+        || type_text.starts_with('[')
+        || type_text.ends_with("[]")
+        || type_text.starts_with("Array<")
+        || type_text.starts_with("ReadonlyArray<")
+        || type_text.starts_with("Record<")
+    {
+        "json"
+    } else {
+        "readonly"
+    };
+    DemoControl {
+        name: prop.name.clone(),
+        type_text: prop.type_text.clone(),
+        kind: kind.to_string(),
+        required: prop.required,
+        description: prop.description.clone(),
+        default_value: prop
+            .default_value
+            .as_deref()
+            .and_then(parse_static_json_value),
+        deprecated: prop.deprecated.clone(),
+        options,
+    }
+}
+
+fn literal_union_options(type_text: &str) -> Vec<serde_json::Value> {
+    let parts = type_text.split('|').map(str::trim).collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+    let literal_parts = parts
+        .iter()
+        .copied()
+        .filter(|part| *part != "undefined" && *part != "null")
+        .collect::<Vec<_>>();
+    let options = literal_parts
+        .iter()
+        .filter_map(|part| parse_static_json_value(part))
+        .collect::<Vec<_>>();
+    (options.len() == literal_parts.len())
+        .then_some(options)
+        .unwrap_or_default()
+}
+
+fn parse_static_json_value(value: &str) -> Option<serde_json::Value> {
+    let value = value.trim();
+    if value == "undefined" {
+        return None;
+    }
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        return Some(serde_json::Value::String(
+            value[1..value.len() - 1]
+                .replace("\\'", "'")
+                .replace("\\\\", "\\"),
+        ));
+    }
+    serde_json::from_str(value).ok()
 }
 
 fn render_registry(
@@ -663,10 +1253,18 @@ fn render_registry(
     }
     output.push_str("] as const;\nexport const demos = [\n");
     for demo in demos {
+        let metadata = serde_json::to_string(&json!({
+            "id": demo.id,
+            "title": demo.title,
+            "group": demo.group,
+            "component": demo.component,
+            "order": demo.order,
+            "controls": demo.controls,
+            "warnings": demo.warnings,
+        }))
+        .expect("serializable demo metadata");
         output.push_str(&format!(
-            "  {{ id: {}, title: {}, load: () => import({}), loadSource: () => import(\"@wake/docs/demo-source/{}\") }},\n",
-            js_string(&demo.id),
-            js_string(&demo.title),
+            "  {{ ...{metadata}, load: () => import({}), loadSource: () => import(\"@wake/docs/demo-source/{}\") }},\n",
             js_string(&demo.import_path),
             demo.source_module
         ));
@@ -681,7 +1279,11 @@ fn render_registry(
     Ok(output)
 }
 
-fn render_config(root: &Path, options: &DocsOptions) -> Result<String, DocsError> {
+fn render_config(
+    root: &Path,
+    options: &DocsOptions,
+    docs_mode: DocsMode,
+) -> Result<String, DocsError> {
     let mut output = String::from("import React from \"react\";\n");
     if let Some(css) = &options.theme_css {
         output.push_str(&format!(
@@ -706,6 +1308,7 @@ fn render_config(root: &Path, options: &DocsOptions) -> Result<String, DocsError
         "title": options.title, "description": options.description, "locale": options.locale, "logo": logo,
         "repositoryUrl": options.repository_url, "basePath": base_path,
         "defaultTheme": options.default_theme, "accentColor": options.accent_color,
+        "mode": docs_mode.as_str(),
     });
     output.push_str(&format!(
         "export const siteConfig = {} as const;\n",
@@ -2604,5 +3207,112 @@ const count: number = 2
             public_asset_url("/crab/", "https://cdn.example/logo.svg"),
             "https://cdn.example/logo.svg"
         );
+    }
+    #[test]
+    fn component_mode_builds_a_typed_demo_catalog_without_mdx() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/demos/basic.demo.tsx"),
+            r#"
+                import type { ButtonProps } from "../../src/button";
+                export const meta = {
+                    title: "Editable",
+                    group: "Actions",
+                    component: "Button",
+                    order: 7,
+                    args: { label: "Create" },
+                };
+                export default function Demo(props: ButtonProps) {
+                    return <button>{props.label}</button>;
+                }
+            "#,
+        )
+        .unwrap();
+
+        let generated = generate_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Components,
+        )
+        .unwrap();
+
+        assert_eq!(generated.mode, DocsMode::Components);
+        assert!(generated.routes.is_empty());
+        assert!(generated.warnings.is_empty());
+        assert_eq!(generated.demos.len(), 1);
+        let demo = &generated.demos[0];
+        assert_eq!(demo.title, "Editable");
+        assert_eq!(demo.group, "Actions");
+        assert_eq!(demo.component, "Button");
+        assert_eq!(demo.order, 7);
+        assert_eq!(demo.control_count, 1);
+
+        let registry = fs::read_to_string(generated.generated_dir.join("registry.ts")).unwrap();
+        assert!(registry.contains(r#""kind":"string""#));
+        assert!(registry.contains(r#""name":"label""#));
+        let config = fs::read_to_string(generated.generated_dir.join("config.tsx")).unwrap();
+        assert!(config.contains(r#""mode":"components""#));
+        assert!(
+            generated
+                .generated_dir
+                .join("runtime/components.tsx")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn component_metadata_only_reads_top_level_overrides() {
+        let source = r#"
+            export const meta = {
+                args: { group: "Nested", component: "Nested", order: 99 },
+                // Only these top-level values describe the catalog entry.
+                group: "Actions",
+                component: "Button",
+                order: 3,
+            };
+        "#;
+
+        let meta = extract_static_demo_meta(source);
+        assert_eq!(meta.group.as_deref(), Some("Actions"));
+        assert_eq!(meta.component.as_deref(), Some("Button"));
+        assert_eq!(meta.order, 3);
+        assert_eq!(
+            static_demo_args(source),
+            Some(r#"{ group: "Nested", component: "Nested", order: 99 }"#)
+        );
+    }
+
+    #[test]
+    fn component_mode_warns_and_ignores_dynamic_meta_args() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/demos/basic.demo.tsx"),
+            r#"
+                import type { ButtonProps } from "../../src/button";
+                const dynamicLabel = () => "Create";
+                export const meta = { args: { label: dynamicLabel() } };
+                export default function Demo(props: ButtonProps) {
+                    return <button>{props.label}</button>;
+                }
+            "#,
+        )
+        .unwrap();
+
+        let generated = generate_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Production,
+            DocsMode::Components,
+        )
+        .unwrap();
+        assert_eq!(generated.demos.len(), 1);
+        assert!(
+            generated
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("meta.args"))
+        );
+        assert_eq!(generated.demos[0].warnings, generated.warnings);
     }
 }

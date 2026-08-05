@@ -151,6 +151,9 @@ impl Ui {
                 self.warn(&diagnostic.severity.to_uppercase()),
                 diagnostic.message
             );
+            if let Some(path) = &diagnostic.path {
+                eprintln!("        {} {}", self.dim("-->"), self.accent(path));
+            }
         }
         eprintln!();
         let _ = io::stderr().flush();
@@ -178,6 +181,9 @@ impl Ui {
                 self.warn(&diagnostic.severity.to_uppercase()),
                 diagnostic.message
             );
+            if let Some(path) = &diagnostic.path {
+                eprintln!("        {} {}", self.dim("-->"), self.accent(path));
+            }
             for note in &diagnostic.notes {
                 eprintln!("        {} {note}", self.dim("·"));
             }

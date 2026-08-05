@@ -3171,8 +3171,21 @@ fn unresolved_dependency_reports_error() {
     assert!(
         out.diagnostics
             .iter()
-            .any(|d| d.message.contains("missing.js"))
+            .any(|d| d.message.contains("missing.js")
+                && d.path.as_deref().is_some_and(|path| path.ends_with("a.js")))
     );
+}
+
+#[test]
+fn parser_diagnostic_reports_its_module_path() {
+    let fs = MemoryFileSystem::from_files([("broken.tsx", "export const view = <div>;")]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("broken.tsx"));
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.is_error())
+        .unwrap();
+    assert_eq!(diagnostic.path.as_deref(), Some("broken.tsx"));
 }
 
 #[test]

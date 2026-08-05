@@ -7,6 +7,7 @@ import {
   bundle,
   createBuildContext,
   startDevServer,
+  startDocsDevServer,
 } from '@crab-dev/wake'
 import {
   ParsedModule,
@@ -21,6 +22,11 @@ async function api() {
   result.files.forEach((file) => console.log(file.path))
   await bundle({ entry: 'src/index.ts' })
   await buildDocs({ basePath: '/docs/' })
+  const workbench = await buildDocs({ mode: 'components' })
+  workbench.demos.forEach((demo) => console.log(demo.component, demo.controlCount))
+  const docsServer = await startDocsDevServer({ mode: 'components' })
+  await docsServer.close()
+
 
   const context: BuildContext = await createBuildContext()
   await context.rebuild(['src/index.ts'])

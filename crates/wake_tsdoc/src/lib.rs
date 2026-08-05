@@ -102,6 +102,129 @@ pub fn extract_api(
         warnings: resolved.warnings,
     })
 }
+/// Extract the props shape from the first typed parameter of a demo's default export.
+///
+/// Wake demos remain valid when they have no parameter or no type annotation; in that case this
+/// returns Ok(None). Named local types, relative type imports/re-exports, inline object types and
+/// the utility types supported by extract_api are resolved. Types that cannot be flattened are
+/// preserved as inherited sources and reported through ApiDoc::warnings.
+pub fn extract_demo_props(source: impl AsRef<Path>) -> Result<Option<ApiDoc>, ApiError> {
+    let source_path = canonical(source.as_ref())?;
+    let source_text = read(&source_path)?;
+    let Some(parameter) = default_export_parameter(&source_text) else {
+        return Ok(None);
+    };
+    let Some(colon) = find_top_level(parameter, ':') else {
+        return Ok(None);
+    };
+    let pattern = parameter[..colon].trim();
+    let expression = strip_parameter_initializer(parameter[colon + 1..].trim());
+    if expression.is_empty() {
+        return Ok(None);
+    }
+
+    let imports = parse_imports(&source_text);
+    let mut resolver = Resolver::default();
+    let mut resolved = Resolved::default();
+    resolver.merge_expression(
+        &source_path,
+        &imports,
+        expression,
+        &mut Vec::new(),
+        &mut resolved,
+    )?;
+    let defaults = infer_parameter_defaults(pattern);
+    for prop in &mut resolved.props {
+        if prop.default_value.is_none() {
+            prop.default_value = defaults.get(&prop.name).cloned();
+        }
+    }
+    resolved.props.sort_by(|a, b| {
+        b.required
+            .cmp(&a.required)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    deduplicate(&mut resolved);
+    Ok(Some(ApiDoc {
+        symbol: expression.to_string(),
+        source: source_path.to_string_lossy().into_owned(),
+        description: resolved.description,
+        props: resolved.props,
+        inherited: resolved.inherited,
+        warnings: resolved.warnings,
+    }))
+}
+
+fn default_export_parameter(source: &str) -> Option<&str> {
+    let function =
+        Regex::new(r"(?s)export\s+default\s+(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?")
+            .expect("valid default function regex");
+    if let Some(found) = function.find(source)
+        && let Some(open_offset) = source[found.end()..].find('(')
+    {
+        let open = found.end() + open_offset;
+        if let Some(close) = find_matching(source, open, '(', ')') {
+            return first_parameter(&source[open + 1..close]);
+        }
+    }
+
+    let direct_arrow = Regex::new(r"(?s)export\s+default\s+(?:async\s+)?(?:<[^;{}]*>\s*)?\(")
+        .expect("valid default arrow regex");
+    if let Some(found) = direct_arrow.find(source) {
+        let open = found.end() - 1;
+        if let Some(close) = find_matching(source, open, '(', ')') {
+            return first_parameter(&source[open + 1..close]);
+        }
+    }
+
+    let named = Regex::new(r"(?m)export\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*;?")
+        .expect("valid named default export regex");
+    let name = named.captures(source)?.get(1)?.as_str();
+    let binding = Regex::new(&format!(
+        r"(?s)(?:const|let|var)\s+{}(?:\s*:[^=;]+)?\s*=\s*(?:async\s+)?(?:<[^;{{}}]*>\s*)?\(",
+        regex::escape(name)
+    ))
+    .expect("valid demo binding regex");
+    let found = binding.find(source)?;
+    let open = found.end() - 1;
+    let close = find_matching(source, open, '(', ')')?;
+    first_parameter(&source[open + 1..close])
+}
+
+fn first_parameter(parameters: &str) -> Option<&str> {
+    let end = find_top_level(parameters, ',').unwrap_or(parameters.len());
+    let parameter = parameters[..end].trim();
+    (!parameter.is_empty()).then_some(parameter)
+}
+
+fn strip_parameter_initializer(value: &str) -> &str {
+    find_top_level(value, '=')
+        .map(|index| value[..index].trim())
+        .unwrap_or_else(|| value.trim())
+}
+
+fn infer_parameter_defaults(pattern: &str) -> BTreeMap<String, String> {
+    let pattern = pattern.trim();
+    if !pattern.starts_with('{') {
+        return BTreeMap::new();
+    }
+    let Some(close) = find_matching(pattern, 0, '{', '}') else {
+        return BTreeMap::new();
+    };
+    split_top_level(&pattern[1..close], ',')
+        .into_iter()
+        .filter_map(|item| {
+            let equal = find_top_level(&item, '=')?;
+            let mut name = item[..equal].trim();
+            if let Some(colon) = find_top_level(name, ':') {
+                name = name[colon + 1..].trim();
+            }
+            let value = item[equal + 1..].trim();
+            (is_property_name(name) && is_static_literal(value))
+                .then(|| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Default)]
 struct Resolved {
@@ -340,6 +463,8 @@ fn parse_imports(source: &str) -> BTreeMap<String, Import> {
             let pair = match words.as_slice() {
                 [name] => Some((*name, *name)),
                 [name, "as", alias] => Some((*name, *alias)),
+                ["type", name] => Some((*name, *name)),
+                ["type", name, "as", alias] => Some((*name, *alias)),
                 _ => None,
             };
             if let Some((imported, local)) = pair {
@@ -866,5 +991,103 @@ mod tests {
             extract_api(root.join("cycle.ts"), "A", None),
             Err(ApiError::CircularType(_))
         ));
+    }
+    #[test]
+    fn extracts_demo_parameter_props_and_defaults() {
+        let root = fixture(&[
+            (
+                "button.ts",
+                r#"
+                    export interface ButtonProps {
+                        /**
+                         * Label.
+                         * @default "Docs"
+                         */
+                        label?: string;
+                        count?: number;
+                        disabled?: boolean;
+                    }
+                "#,
+            ),
+            (
+                "demo.tsx",
+                r#"
+                    import type { ButtonProps } from "./button";
+                    export const meta = { title: "Typed" };
+                    export default function Demo(
+                        { label = "Demo", count = 2 }: ButtonProps
+                    ) { return <button disabled={false}>{label}{count}</button>; }
+                "#,
+            ),
+        ]);
+        let doc = extract_demo_props(root.join("demo.tsx"))
+            .unwrap()
+            .expect("typed demo");
+        assert_eq!(doc.props.len(), 3);
+        let label = doc.props.iter().find(|prop| prop.name == "label").unwrap();
+        assert_eq!(label.default_value.as_deref(), Some("\"Docs\""));
+        let count = doc.props.iter().find(|prop| prop.name == "count").unwrap();
+        assert_eq!(count.default_value.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn extracts_named_typed_arrow_demo_and_ignores_untyped_demo() {
+        let root = fixture(&[
+            (
+                "typed.tsx",
+                r#"
+                    interface Props { value: string; enabled?: boolean; }
+                    const Demo = (props: Props) => <span>{props.value}</span>;
+                    export default Demo;
+                "#,
+            ),
+            (
+                "untyped.tsx",
+                "export default function Demo() { return <span />; }",
+            ),
+        ]);
+        let typed = extract_demo_props(root.join("typed.tsx"))
+            .unwrap()
+            .expect("typed arrow demo");
+        assert!(typed.props.iter().any(|prop| prop.name == "value"));
+        assert!(
+            extract_demo_props(root.join("untyped.tsx"))
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn resolves_direct_arrow_demo_through_a_relative_reexport() {
+        let root = fixture(&[
+            (
+                "base.ts",
+                "export interface ButtonProps { label?: string; count: number; }",
+            ),
+            ("index.ts", "export { ButtonProps } from \"./base\";"),
+            (
+                "demo.tsx",
+                r#"
+                    import type { ButtonProps } from "./index";
+                    export default ({ label = "Create", count }: ButtonProps) => (
+                        <button>{label}{count}</button>
+                    );
+                "#,
+            ),
+            (
+                "broken.tsx",
+                "export default (props: MissingProps) => <span />;",
+            ),
+        ]);
+        let doc = extract_demo_props(root.join("demo.tsx"))
+            .unwrap()
+            .expect("typed direct arrow demo");
+        assert!(doc.props.iter().any(|prop| prop.name == "count"));
+        let label = doc.props.iter().find(|prop| prop.name == "label").unwrap();
+        assert_eq!(label.default_value.as_deref(), Some("\"Create\""));
+        let broken = extract_demo_props(root.join("broken.tsx"))
+            .unwrap()
+            .expect("unresolved typed demo");
+        assert!(broken.props.is_empty());
+        assert!(!broken.warnings.is_empty());
     }
 }

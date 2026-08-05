@@ -16,6 +16,8 @@ use std::time::Instant;
 use serde::Serialize;
 use wake_bundler::{BuildOutput, BuildRequest, BuildSession, IncrementalBundler, ResolveOptions};
 use wake_common::{Diagnostic, OsFileSystem};
+
+pub use wake_docs::DocsMode;
 use wake_ecma_transform::{BrowserTarget, TargetEnv};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -79,6 +81,8 @@ pub struct DiagnosticInfo {
     pub code: Option<String>,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<u32>,
@@ -93,6 +97,7 @@ impl From<&Diagnostic> for DiagnosticInfo {
             severity: value.severity.as_str().to_string(),
             code: value.code.as_ref().map(ToString::to_string),
             message: value.message.clone(),
+            path: value.path.clone(),
             start: span.map(|span| span.lo),
             end: span.map(|span| span.hi),
             notes: value.notes.clone(),
@@ -940,6 +945,10 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         entry: prepared.entry,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
+            conditions: ["browser", "development", "import", "module", "default"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
             ..ResolveOptions::default()
         },
         define: build_defines(config, true),
@@ -974,15 +983,25 @@ pub struct DocsBuildResult {
     #[serde(flatten)]
     pub build: BuildResult,
     pub routes: Vec<wake_docs::RouteInfo>,
+    pub mode: DocsMode,
+    pub demos: Vec<wake_docs::DemoDescriptor>,
 }
 
 pub fn build_docs(
     options: DocsBuildOptions,
     cancellation: &CancellationToken,
 ) -> Result<DocsBuildResult, WakeError> {
+    build_docs_with_mode(options, DocsMode::Site, cancellation)
+}
+pub fn build_docs_with_mode(
+    options: DocsBuildOptions,
+    docs_mode: DocsMode,
+    cancellation: &CancellationToken,
+) -> Result<DocsBuildResult, WakeError> {
     cancellation.check()?;
     let started = Instant::now();
-    let (mut prepared, docs, routes) = prepare_docs(&options, wake_docs::BuildMode::Production)?;
+    let (mut prepared, docs, routes, demos, warnings) =
+        prepare_docs(&options, wake_docs::BuildMode::Production, docs_mode)?;
     prepared.outdir = absolute_from(
         &prepared.root,
         options
@@ -1027,12 +1046,24 @@ pub fn build_docs(
             public_path: prepared.config.public_path(),
         },
     );
-    let result = finish_output(
+    let mut result = finish_output(
         &prepared,
         &build_options,
         output,
         started.elapsed().as_secs_f64() * 1000.0,
     )?;
+    result
+        .diagnostics
+        .extend(warnings.into_iter().map(|message| DiagnosticInfo {
+            severity: "warning".to_string(),
+            code: Some("WAKE_DOCS".to_string()),
+            message,
+            path: None,
+            start: None,
+            end: None,
+            notes: Vec::new(),
+        }));
+
     wake_docs::write_route_shells(
         &prepared.outdir,
         &routes,
@@ -1047,16 +1078,25 @@ pub fn build_docs(
     Ok(DocsBuildResult {
         build: result,
         routes,
+        mode: docs_mode,
+        demos,
     })
 }
 
 pub fn start_docs_dev_server(options: DevServerOptions) -> Result<DevServer, WakeError> {
+    start_docs_dev_server_with_mode(options, DocsMode::Site)
+}
+pub fn start_docs_dev_server_with_mode(
+    options: DevServerOptions,
+    docs_mode: DocsMode,
+) -> Result<DevServer, WakeError> {
     let docs_options = DocsBuildOptions {
         project: options.project.clone(),
         outdir: None,
         base_path: None,
     };
-    let (prepared, docs, _routes) = prepare_docs(&docs_options, wake_docs::BuildMode::Development)?;
+    let (prepared, docs, _routes, _demos, warnings) =
+        prepare_docs(&docs_options, wake_docs::BuildMode::Development, docs_mode)?;
     let config = &prepared.config;
     let port = options.port.or(config.dev_server.port).unwrap_or(5173);
     let host = options
@@ -1064,15 +1104,28 @@ pub fn start_docs_dev_server(options: DevServerOptions) -> Result<DevServer, Wak
         .or_else(|| config.dev_server.host.clone())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let (event_tx, event_rx) = mpsc::channel();
+    for warning in warnings {
+        let _ = event_tx.send(wake_dev_server::ServerEvent::Diagnostic { message: warning });
+    }
+    let rebuild_event_tx = event_tx.clone();
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
         let _ = event_tx.send(event);
     });
     let docs_root = prepared.root.clone();
     let docs_scan_config = config.clone();
     let before_rebuild: wake_dev_server::BeforeRebuild = Arc::new(move |_| {
-        let mut changed = wake_docs::generate(&docs_root, &docs, wake_docs::BuildMode::Development)
-            .map(|generated| generated.changed_files)
-            .map_err(|error| error.to_string())?;
+        let generated = wake_docs::generate_with_mode(
+            &docs_root,
+            &docs,
+            wake_docs::BuildMode::Development,
+            docs_mode,
+        )
+        .map_err(|error| error.to_string())?;
+        for warning in generated.warnings {
+            let _ = rebuild_event_tx
+                .send(wake_dev_server::ServerEvent::Diagnostic { message: warning });
+        }
+        let mut changed = generated.changed_files;
         changed.extend(
             prepare_aliases_and_scans(&docs_scan_config, &docs_root)
                 .map_err(|error| error.to_string())?
@@ -1085,6 +1138,10 @@ pub fn start_docs_dev_server(options: DevServerOptions) -> Result<DevServer, Wak
         entry: prepared.entry,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
+            conditions: ["browser", "development", "import", "module", "default"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
             ..ResolveOptions::default()
         },
         define: build_defines(config, true),
@@ -1112,6 +1169,12 @@ pub fn start_docs_dev_server(options: DevServerOptions) -> Result<DevServer, Wak
                 prepared.root.join(&config.docs.source_dir),
                 prepared.root.join("src"),
             ];
+            if let Some(preview) = &config.docs.preview {
+                roots.push(prepared.root.join(preview));
+            }
+            if let Some(theme_css) = &config.docs.theme_css {
+                roots.push(prepared.root.join(theme_css));
+            }
             roots.extend(
                 config
                     .component_scan
@@ -1137,11 +1200,14 @@ pub fn start_docs_dev_server(options: DevServerOptions) -> Result<DevServer, Wak
 fn prepare_docs(
     options: &DocsBuildOptions,
     mode: wake_docs::BuildMode,
+    docs_mode: DocsMode,
 ) -> Result<
     (
         PreparedBuild,
         wake_docs::DocsOptions,
         Vec<wake_docs::RouteInfo>,
+        Vec<wake_docs::DemoDescriptor>,
+        Vec<String>,
     ),
     WakeError,
 > {
@@ -1156,11 +1222,13 @@ fn prepare_docs(
     let root = normalize_path(&config.resolved_root(&config_dir));
     let mut aliases = prepare_aliases_and_scans(&config, &root)?;
     let docs = docs_options(&config, options.base_path.as_deref());
-    let generated = wake_docs::generate(&root, &docs, mode)
+    let generated = wake_docs::generate_with_mode(&root, &docs, mode, docs_mode)
         .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
     aliases.retain(|(name, _)| name != "@wake/docs" && name != "@wake/docs-project");
     aliases.extend(generated.aliases);
     let routes = generated.routes;
+    let demos = generated.demos;
+    let warnings = generated.warnings;
     Ok((
         PreparedBuild {
             root: root.clone(),
@@ -1171,6 +1239,8 @@ fn prepare_docs(
         },
         docs,
         routes,
+        demos,
+        warnings,
     ))
 }
 

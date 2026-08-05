@@ -1088,7 +1088,7 @@ impl IncrementalBundler {
                     continue;
                 };
                 if let Some(parsed) = &rec.parsed {
-                    diagnostics.extend(parsed.diagnostics.iter().cloned());
+                    extend_module_diagnostics(&mut diagnostics, &parsed.diagnostics, &rec.path);
                 }
                 let Some(loaded) = cache.get(&rec.path) else {
                     continue;
@@ -1267,11 +1267,13 @@ impl IncrementalBundler {
                     Err(e) if e.kind() == std::io::ErrorKind::Unsupported => diagnostics.push(
                         Diagnostic::error(format!("不支持的文件类型 `{}`", path.display()))
                             .with_code("WAKE0302")
+                            .with_path(path.to_string_lossy().into_owned())
                             .with_note(e.to_string()),
                     ),
                     Err(e) => diagnostics.push(
                         Diagnostic::error(format!("无法读取模块 `{}`：{e}", path.display()))
-                            .with_code("WAKE0300"),
+                            .with_code("WAKE0300")
+                            .with_path(path.to_string_lossy().into_owned()),
                     ),
                 }
             }
@@ -1382,7 +1384,11 @@ impl IncrementalBundler {
                         let memory_parse_vc =
                             self.memory_parse_vcs.get(&content_key).copied();
                         if let Some((_, parsed)) = &parsed {
-                            diagnostics.extend(parsed.diagnostics.iter().cloned());
+                            extend_module_diagnostics(
+                                &mut diagnostics,
+                                &parsed.diagnostics,
+                                &path,
+                            );
                         }
                         let liveness = self.tree_shaking.then(|| {
                             memory_liveness.unwrap_or_else(|| {
@@ -1419,7 +1425,7 @@ impl IncrementalBundler {
                             liveness,
                             block_info,
                         } = parsed_by_idx[i].take().expect("miss 模块应已 parse");
-                        diagnostics.extend(parsed.diagnostics.iter().cloned());
+                        extend_module_diagnostics(&mut diagnostics, &parsed.diagnostics, &path);
                         let deps = parsed.deps.clone();
                         // 存拥有型 scan 摘要——仅无诊断的干净模块（否则会吞掉告警）。
                         if parsed.diagnostics.is_empty()
@@ -1588,6 +1594,7 @@ impl IncrementalBundler {
                                 dep.specifier
                             ))
                             .with_code("WAKE0301")
+                            .with_path(path.to_string_lossy().into_owned())
                             .with_primary(dep.span, "此依赖"),
                         ),
                     }
@@ -1694,6 +1701,7 @@ impl IncrementalBundler {
             let linker_vc = self.linker_cell(&path, data);
             plans.push(CgPlan {
                 id,
+                path,
                 body_key,
                 linker_vc,
                 cached_body,
@@ -1726,6 +1734,7 @@ impl IncrementalBundler {
             let results = par_request_batched(&engine, &self.exec, reqs);
             for (&i, (pvc, parsed)) in need_parse.iter().zip(results) {
                 let rec = modules.get_mut(&plans[i].id).unwrap();
+                extend_module_diagnostics(&mut diagnostics, &parsed.diagnostics, &rec.path);
                 rec.parse_vc = Some(pvc);
                 rec.parsed = Some(parsed);
             }
@@ -1813,7 +1822,7 @@ impl IncrementalBundler {
             if let Some(c) = &out.css {
                 collected_css.push((plans[i].id, (**c).clone()));
             }
-            diagnostics.extend(out.diagnostics.iter().cloned());
+            extend_module_diagnostics(&mut diagnostics, &out.diagnostics, &plans[i].path);
             body_of.insert(plans[i].id, out.code.clone());
         }
         for p in &plans {
@@ -2173,9 +2182,24 @@ fn is_node_builtin(spec: &str) -> bool {
 /// codegen 阶段一个模块的计划：产物键 + linker 句柄 + 命中的缓存体（`None` = 需 codegen）。
 struct CgPlan {
     id: u32,
+    path: PathBuf,
     body_key: u128,
     linker_vc: Vc<LinkerData>,
     cached_body: Option<Arc<String>>,
+}
+
+fn extend_module_diagnostics(
+    target: &mut Vec<Diagnostic>,
+    diagnostics: &[Diagnostic],
+    path: &Path,
+) {
+    let path = path.to_string_lossy().into_owned();
+    target.extend(
+        diagnostics
+            .iter()
+            .cloned()
+            .map(|diagnostic| diagnostic.with_path(path.clone())),
+    );
 }
 
 /// 内容键：源码、源类型及所有影响 parse/codegen 的配置。JSX dev 还必须隔离文件路径，

@@ -71,6 +71,8 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub code: Option<Cow<'static, str>>,
     pub message: String,
+    /// 产生诊断的模块路径。解析器本身不知道路径，由打包器在模块边界补充。
+    pub path: Option<String>,
     pub labels: Vec<Label>,
     /// 附加的行尾说明（`= note: ...`）。
     pub notes: Vec<String>,
@@ -82,6 +84,7 @@ impl Diagnostic {
             severity,
             code: None,
             message: message.into(),
+            path: None,
             labels: Vec::new(),
             notes: Vec::new(),
         }
@@ -97,6 +100,11 @@ impl Diagnostic {
 
     pub fn with_code(mut self, code: impl Into<Cow<'static, str>>) -> Diagnostic {
         self.code = Some(code.into());
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Diagnostic {
+        self.path = Some(path.into());
         self
     }
 

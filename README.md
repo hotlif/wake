@@ -105,8 +105,8 @@ wake [--no-color] [--ui auto|tui|plain] <COMMAND>
 | --- | --- |
 | `wake build [ENTRY]` | 创建生产构建，默认输出到 `dist` |
 | `wake dev [ROOT]` | 启动应用开发服务器和 HMR |
-| `wake docs dev [ROOT]` | 启动组件文档开发服务器 |
-| `wake docs build [ROOT]` | 创建可部署的静态文档站 |
+| `wake docs dev [ROOT] [--mode site\|components]` | 启动文档站或组件工作台开发服务器 |
+| `wake docs build [ROOT] [--mode site\|components]` | 创建可部署的静态文档站或组件工作台 |
 | `wake parse <FILE>` | 解析源码并打印 AST |
 | `wake tokenize <FILE>` | 对源码执行词法分析并打印 token 流 |
 
@@ -151,7 +151,7 @@ await server.waitUntilClosed();
 Wake Docs 将文档页面、组件示例和类型信息编译为静态站点。它支持：
 
 - 带 Frontmatter 的 MDX 页面与分组导航；
-- 隔离运行的 React Demo；
+- 隔离运行的 React Demo；`--mode components` 可直接打开无需 MDX 的组件工作台；
 - 从 TypeScript Props 和 JSDoc 生成 API 表格；
 - Preview 包装器、自定义主题、搜索索引和静态子路由；
 - 开发时增量更新，以及带 `base_path` 的生产部署。
@@ -172,7 +172,7 @@ npx wake docs dev .
 npx wake docs build . --outdir docs-dist
 ```
 
-从零搭建文档站请阅读[第一个文档站](docs/getting-started/first-docs-site.mdx)，MDX、Demo 和 Props API 的详细说明位于 [`docs/docs-system`](docs/docs-system/overview.mdx)。
+从零搭建文档站请阅读[第一个文档站](docs/getting-started/first-docs-site.mdx)，MDX、Demo 和 Props API 的详细说明位于 [`docs/docs-system`](docs/docs-system/overview.mdx)。 组件模式只扫描 `[docs].source_dir` 下的 `.demo.tsx`，复用 Preview、主题和 `base_path`；选择项、非默认 Props 与视口保存在 hash URL 中，可直接部署到普通静态托管。
 
 ## 安装包与平台
 

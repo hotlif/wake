@@ -129,7 +129,7 @@ wake dev . --entry src/playground.tsx --port 5175
 ## wake docs dev
 
 ```text
-wake docs dev [ROOT] [--port 5173]
+wake docs dev [ROOT] [--mode site|components] [--port 5173]
 ```
 
 例子：
@@ -138,22 +138,17 @@ wake docs dev [ROOT] [--port 5173]
 wake docs dev .
 wake docs dev packages/ui
 wake docs dev . --port 5174
+wake docs dev . --mode components
 ```
 
-该命令会：
+`--mode` 默认为 `site`。Site 模式扫描 MDX、Demo 和 API，生成路由、侧栏与搜索索引。Components 模式只扫描 `[docs].source_dir` 内的 `.demo.tsx`，不要求 MDX，并生成带组件树、隔离 Canvas、Controls、源码与错误面板的工作台。两种模式都会增量生成并启动 HMR。
 
-- 扫描 MDX 和 Demo；
-- 提取 API；
-- 生成路由、侧栏和搜索索引；
-- 启动开发服务器；
-- 在文件新增、修改、删除时增量再生成。
-
-端口优先级是命令行、`[dev_server].port`、5173。
+端口优先级是命令行、`[dev_server].port`、5173。组件模式继续复用 `[docs].preview`、`theme_css`、`base_path` 和 `[dev_server]`。
 
 ## wake docs build
 
 ```text
-wake docs build [ROOT] [--outdir docs-dist] [--base /path/]
+wake docs build [ROOT] [--mode site|components] [--outdir docs-dist] [--base /path/]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -161,6 +156,7 @@ wake docs build [ROOT] [--outdir docs-dist] [--base /path/]
 | `ROOT` | `.` | 文档项目根 |
 | `--outdir` | `docs-dist` | 静态输出目录 |
 | `--base` | `[docs].base_path` | 临时覆盖部署路径 |
+| `--mode` | `site` | `site` 构建文档站，`components` 构建组件工作台 |
 
 例子：
 
@@ -168,9 +164,10 @@ wake docs build [ROOT] [--outdir docs-dist] [--base /path/]
 wake docs build .
 wake docs build packages/ui --outdir site
 wake docs build . --base /design-system/ --outdir docs-dist
+wake docs build . --mode components --outdir components-dist
 ```
 
-相对 outdir 以解析后的项目根为基准。生产模式排除 draft 页面。
+相对 outdir 以解析后的项目根为基准。Site 生产模式排除 draft 页面。Components 构建生成根 `index.html`、`404.html` 和资源文件，不为每个 Demo 创建目录外壳；深链接写入 hash，因此静态托管无需路由重写。
 
 ## wake parse
 
@@ -218,7 +215,9 @@ wake tokenize src/entry.tsx
     "dev": "wake dev .",
     "build": "wake build --outdir dist",
     "docs:dev": "wake docs dev .",
-    "docs:build": "wake docs build . --outdir docs-dist"
+    "docs:build": "wake docs build . --outdir docs-dist",
+    "components:dev": "wake docs dev . --mode components",
+    "components:build": "wake docs build . --mode components --outdir components-dist"
   }
 }
 ```
