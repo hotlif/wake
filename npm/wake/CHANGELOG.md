@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5
+
+- Stabilized Windows incremental rebuild events by coalescing delayed file notifications.
+
 ## 0.1.4
 
 - Added the opt-in Storybook-like documentation component workbench.

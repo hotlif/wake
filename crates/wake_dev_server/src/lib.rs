@@ -1,7 +1,7 @@
 //! wake_dev_server — Dev Server + HMR（DESIGN §7 / PLAN Phase 5）。
 //!
 //! `wake dev <root>`：以 actix-web 起 HTTP 服务，从**内存**服务增量打包产物；notify 监听源码变更
-//! （20ms 防抖）→ `IncrementalBundler` 增量重建 → 经 WebSocket 广播事件 → 浏览器 client runtime
+//! （75ms 静默窗口防抖）→ `IncrementalBundler` 增量重建 → 经 WebSocket 广播事件 → 浏览器 client runtime
 //! 触发 live-reload / 显示错误 overlay / 断连自动重连。SPA fallback：未知路径回退到 HTML。
 //!
 //! 本切片实现 5.1 文件监听 + 5.4 dev server + 5.5 HMR 协议（live-reload 兜底形态）。
@@ -32,6 +32,7 @@ use wake_ecma_transform::TargetEnv;
 
 // —— 终端着色（tty + 非 NO_COLOR 时启用）——
 const RESET: &str = "\x1b[0m";
+const WATCH_SETTLE_QUIET: Duration = Duration::from_millis(75);
 
 #[derive(Clone, Copy)]
 struct Sty {
@@ -589,10 +590,10 @@ fn watch_and_rebuild(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // 落盘沉降：给 OS 少许时间完成写入（避免读到未 flush 的旧内容），
-        // 再排空同批事件直到 20ms 静默（防抖）。
-        std::thread::sleep(Duration::from_millis(30));
-        while let Ok((paths, event_structural)) = evt_rx.recv_timeout(Duration::from_millis(20)) {
+        // Windows 的 ReadDirectoryChangesW 可能把一次写入拆成 size / last-write 等多个
+        // Modify(Any) 通知。等待最后一个通知后的完整静默窗口，避免在 CI 负载下先用旧内容
+        // 触发一次 updated_modules=0 的空重建，再收到真正的内容事件。
+        while let Ok((paths, event_structural)) = evt_rx.recv_timeout(WATCH_SETTLE_QUIET) {
             changed.extend(paths);
             structural |= event_structural;
         }

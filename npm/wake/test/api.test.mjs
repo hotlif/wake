@@ -30,7 +30,7 @@ after(async () => {
 })
 
 test('loads the same API from ESM and CommonJS', () => {
-  assert.equal(version(), '0.1.4')
+  assert.equal(version(), '0.1.5')
   assert.equal(commonjs.version(), version())
   assert.equal(typeof commonjs.build, 'function')
 })
@@ -124,6 +124,27 @@ async function openHmrSocket(port) {
   return socket
 }
 
+function onceMatching(emitter, eventName, predicate, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error(`Timed out waiting for matching ${eventName} event`))
+    }, timeoutMs)
+    timeout.unref()
+
+    const onEvent = (event) => {
+      if (!predicate(event)) return
+      cleanup()
+      resolve(event)
+    }
+    const cleanup = () => {
+      clearTimeout(timeout)
+      emitter.off(eventName, onEvent)
+    }
+    emitter.on(eventName, onEvent)
+  })
+}
+
 test('emits rebuild events and releases the port on idempotent close', async () => {
   const source = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
   const cwd = await mkdtemp(join(tmpdir(), 'wake-node-dev-'))
@@ -145,12 +166,18 @@ test('emits rebuild events and releases the port on idempotent close', async () 
     assert.ok(initial.chunks > 0)
     hmrSocket = await openHmrSocket(port)
     const rebuilding = once(server, 'rebuildStart', { signal: AbortSignal.timeout(10_000) })
-    const rebuilt = once(server, 'rebuilt', { signal: AbortSignal.timeout(10_000) })
+    // Windows can emit more than one watcher notification for one append. Ignore an
+    // intermediate no-op rebuild, but still time out if no substantive rebuild follows.
+    const rebuilt = onceMatching(
+      server,
+      'rebuilt',
+      (event) => !event.initial && event.updatedModules > 0,
+    )
     await appendFile(join(cwd, 'src/index.js'), '\nexport const changed = true;\n')
     const [start] = await rebuilding
     assert.equal(start.type, 'rebuildStart')
     assert.equal(start.changedPaths.length, 1)
-    const [event] = await rebuilt
+    const event = await rebuilt
     assert.equal(event.type, 'rebuilt')
     assert.equal(event.initial, false)
     assert.ok(event.modules > 0)

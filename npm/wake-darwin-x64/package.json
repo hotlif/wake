@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/wake-darwin-x64",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Wake native binary for darwin x64",
   "license": "MIT OR Apache-2.0",
   "repository": {
