@@ -399,7 +399,7 @@ fn resolve_exports_target(
             Some((prefix.len() + suffix.len(), capture, value))
         })
         .collect::<Vec<_>>();
-    patterns.sort_by(|left, right| right.0.cmp(&left.0));
+    patterns.sort_by_key(|item| std::cmp::Reverse(item.0));
     let (_, capture, value) = patterns.into_iter().next()?;
     resolve_conditional_target(value, conditions).map(|target| target.replace('*', capture))
 }

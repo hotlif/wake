@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+
+- Added the opt-in Storybook-like documentation component workbench.
+- Fixed Yarn PnP packages that expose entries and subpaths through `package.json#exports`.
+- Expanded TypeScript and TSX parsing for optional arrow parameters, generic JSX, generic async arrows, and indexed type queries.
+- Added source module paths to build diagnostics and corrected `wake parse` source-type selection.
+
 ## 0.1.3
 
 - Improved the npm development-server terminal panel with Rust CLI-aligned styling, startup timing, rebuild progress, diagnostics, and color controls.

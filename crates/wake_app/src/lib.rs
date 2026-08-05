@@ -187,6 +187,14 @@ struct PreparedBuild {
     aliases: Vec<(String, PathBuf)>,
 }
 
+type PreparedDocs = (
+    PreparedBuild,
+    wake_docs::DocsOptions,
+    Vec<wake_docs::RouteInfo>,
+    Vec<wake_docs::DemoDescriptor>,
+    Vec<String>,
+);
+
 pub fn build(
     options: BuildOptions,
     cancellation: &CancellationToken,
@@ -1201,16 +1209,7 @@ fn prepare_docs(
     options: &DocsBuildOptions,
     mode: wake_docs::BuildMode,
     docs_mode: DocsMode,
-) -> Result<
-    (
-        PreparedBuild,
-        wake_docs::DocsOptions,
-        Vec<wake_docs::RouteInfo>,
-        Vec<wake_docs::DemoDescriptor>,
-        Vec<String>,
-    ),
-    WakeError,
-> {
+) -> Result<PreparedDocs, WakeError> {
     let cwd = options
         .project
         .cwd

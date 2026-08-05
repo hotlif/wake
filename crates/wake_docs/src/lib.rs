@@ -1213,9 +1213,11 @@ fn literal_union_options(type_text: &str) -> Vec<serde_json::Value> {
         .iter()
         .filter_map(|part| parse_static_json_value(part))
         .collect::<Vec<_>>();
-    (options.len() == literal_parts.len())
-        .then_some(options)
-        .unwrap_or_default()
+    if options.len() == literal_parts.len() {
+        options
+    } else {
+        Vec::new()
+    }
 }
 
 fn parse_static_json_value(value: &str) -> Option<serde_json::Value> {
