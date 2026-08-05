@@ -4850,6 +4850,72 @@ fn css_in_js_cross_module_class_reference() {
         "跨模块类名引用未生效\nbase={base_cls}\ncss={css}"
     );
 }
+/// Runtime factory parameters must be allocated outside the identifiers already emitted by a
+/// module. Real packages commonly import `jsxDEV as m`; `$` and `_r` are legal aliases as well.
+#[test]
+fn runtime_factory_names_avoid_existing_import_bindings() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/dep.js",
+            "export const a=1;export const b=2;export const c=3;",
+        ),
+        (
+            "src/index.js",
+            "import {a as m,b as $,c as _r} from './dep.js';export default m+$+_r;",
+        ),
+    ]);
+    let mut b = IncrementalBundler::new(Arc::new(fs));
+    b.enable_minify().enable_mangle();
+    let out = b.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    assert!(
+        out.bundle.contains("function(m1,$1,_r1)"),
+        "factory parameters should avoid source bindings:\n{}",
+        &out.bundle[..out.bundle.len().min(1200)]
+    );
+    assert!(
+        out.bundle.contains("r.m=t;r.c=c"),
+        "runtime should expose module and cache namespaces:\n{}",
+        &out.bundle[..out.bundle.len().min(1200)]
+    );
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_runtime_names_regression");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bundle.cjs");
+    std::fs::write(&p, &out.bundle).unwrap();
+    let syntax = std::process::Command::new("node")
+        .arg("--check")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        syntax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&syntax.stderr)
+    );
+    let script = format!(
+        "const r=require({:?});if((r.default??r)!==6)process.exit(2);",
+        p.to_string_lossy()
+    );
+    let run = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
 
 /// 回归：`module.exports = X` 形态的 CJS 模块在 minify 路径下必须真正导出。
 ///

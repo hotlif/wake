@@ -80,12 +80,14 @@ pub fn analyze_vars_with_model(
         return VarAnalysis::default();
     }
 
+    let shorthand_read_spans = collect_shorthand_read_spans(program);
     let mut ref_counts: FxHashMap<SymbolId, usize> = FxHashMap::default();
     let mut sole_ref_spans: FxHashMap<SymbolId, Span> = FxHashMap::default();
     for r in &model.references {
-        if ignored_statement_spans
-            .iter()
-            .any(|span| span.lo <= r.span.lo && r.span.hi <= span.hi)
+        if !shorthand_read_spans.contains(&r.span)
+            && ignored_statement_spans
+                .iter()
+                .any(|span| span.lo <= r.span.lo && r.span.hi <= span.hi)
         {
             continue;
         }
@@ -185,6 +187,34 @@ pub fn analyze_vars_with_model(
         inline_candidates,
         inline_ref_spans,
     }
+}
+
+fn collect_shorthand_read_spans(program: &Program) -> FxHashSet<Span> {
+    struct Collector {
+        spans: FxHashSet<Span>,
+    }
+
+    impl<'a> Visit<'a> for Collector {
+        fn visit_expression(&mut self, expression: &Expression<'a>) {
+            if let Expression::Object(object) = expression {
+                for member in object.properties.iter() {
+                    if let ObjectMember::Property(property) = member
+                        && property.shorthand
+                        && let Expression::Identifier(identifier) = &property.value
+                    {
+                        self.spans.insert(identifier.span);
+                    }
+                }
+            }
+            walk_expression(self, expression);
+        }
+    }
+
+    let mut collector = Collector {
+        spans: FxHashSet::default(),
+    };
+    collector.visit_program(program);
+    collector.spans
 }
 
 fn collect_initialized_declaration_counts(program: &Program) -> FxHashMap<Atom, usize> {

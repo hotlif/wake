@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9
+
+- Added webpack-style runtime module and cache namespaces.
+- Prevented module-factory parameter collisions with imported bindings.
+- Stabilized large generated modules against linker, tree-shaking, and mangle divergence.
+
 ## 0.1.8
 
 - Prevented empty hoisted registry bodies from emitting invalid comma-only JavaScript expressions.

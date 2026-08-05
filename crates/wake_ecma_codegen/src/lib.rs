@@ -2089,7 +2089,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     // 值随 mangle：本地 re-export 的 local 可能被重命名（按其 span 查表）。
                     let local_atom = module_export_name_atom(&spec.local);
                     let local_val = match &spec.local {
-                        ModuleExportName::Ident(id) => self.renamed_or(local_atom, id.span),
+                        ModuleExportName::Ident(_) => self
+                            .module_renames
+                            .get(&local_atom)
+                            .copied()
+                            .unwrap_or(local_atom),
                         ModuleExportName::String(_) => local_atom,
                     };
                     self.emit_property_access("exports", &exported);

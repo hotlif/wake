@@ -2569,13 +2569,26 @@ fn codegen_request(
     let vc = query(id, move || {
         codegen_exec_counts[codegen_counter_shard].fetch_add(1, Ordering::Relaxed);
         let parsed = parse_vc.read();
+        // Large generated modules expose span-keyed rename/liveness divergence between source
+        // declarations and linker-generated reads. Keep their names/exports stable until the
+        // optimizer is keyed end-to-end by SymbolId; small modules retain the normal fast path.
+        let compatibility_mode = mangle && parsed.source.len() >= 4096;
+        let mangle = mangle && !compatibility_mode;
+        let minify_names = minify_names && !compatibility_mode;
         let data = linker_vc.read();
         let linker = Linker {
             map: SpecifierLookup::new(&data.deps),
             dyn_chunk: SpecifierLookup::new(&data.dyn_chunks),
             async_ids: &data.async_deps,
         };
-        let keep = data.keep_exports.as_deref();
+        // Cross-module export shaking is disabled until declaration removal and synthesized
+        // export writes share one SymbolId-based liveness model. Unreachable modules are still
+        // removed by the graph phase.
+        let keep: Option<&[String]> = if compatibility_mode {
+            None
+        } else {
+            data.keep_exports.as_deref()
+        };
         // define / minify / mangle 是每个 bundler 的常量（TaskId 未纳入——同一引擎内不变；
         // 跨引擎无共享内存缓存）。产物磁盘缓存键则由 body_key 混入 define/minify/mangle 指纹区分。
         let dv: Vec<(&str, &str)> = define
@@ -2595,13 +2608,20 @@ fn codegen_request(
             // emit 把每个模块包成 `function(m,$,_r){…}`（`m`=module、`$`=exports、`_r`=require 的
             // 压缩名）。声明为保留名，mangler 不会把局部压成它们而与包装器参数撞车（曾致 React
             // 产物 `class m{}` 与参数 `m` 重复声明 → SyntaxError）。
+            let export_pairs = collect_export_var_pairs(program, &interner);
+            let mut protected_names = vec!["m", "$", "_r"];
+            protected_names.extend(
+                export_pairs
+                    .iter()
+                    .map(|(_, local_name, _)| local_name.as_str()),
+            );
             let semantic = (minify || mangle).then(|| analyze(program));
             let semantic_safe = !has_hazard(program, &interner);
             let plan = (mangle && semantic_safe).then(|| {
                 plan_mangle_with_model_and_protected(
                     program,
                     &interner,
-                    &["m", "$", "_r"],
+                    &protected_names,
                     semantic.as_ref().expect("semantic model was requested"),
                     cij.as_ref()
                         .map(|c| c.verbatim_replacement_spans.as_slice())
@@ -3178,14 +3198,67 @@ mod inline_reg_tests {
 /// （曾致任何 `module.exports = X` 形态的 CJS 包整包失效，如 `@linaria/core` 的 `cx`）。
 ///
 /// 用占位符隔离，避免后一步的 `exports`→`$` 把刚写好的 `m.exports` 又改回 `m.$`。
-fn compact_body_names(body: &str) -> String {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeNames {
+    module: String,
+    exports: String,
+    require: String,
+}
+
+impl RuntimeNames {
+    fn for_bodies<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Self {
+        let bodies: Vec<&str> = bodies.into_iter().collect();
+        let mut used = FxHashSet::default();
+        let mut pick = |preferred: &str| {
+            for suffix in 0u32.. {
+                let candidate = if suffix == 0 {
+                    preferred.to_string()
+                } else {
+                    format!("{preferred}{suffix}")
+                };
+                if !used.contains(&candidate)
+                    && !bodies
+                        .iter()
+                        .any(|body| contains_identifier(body, &candidate))
+                {
+                    used.insert(candidate.clone());
+                    return candidate;
+                }
+            }
+            unreachable!()
+        };
+        Self {
+            module: pick("m"),
+            exports: pick("$"),
+            require: pick("_r"),
+        }
+    }
+}
+
+fn contains_identifier(source: &str, needle: &str) -> bool {
+    fn ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$') || b >= 0x80
+    }
+    let bytes = source.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    bytes.windows(needle.len()).enumerate().any(|(i, window)| {
+        window == needle
+            && (i == 0 || !ident_byte(bytes[i - 1]))
+            && (i + needle.len() == bytes.len() || !ident_byte(bytes[i + needle.len()]))
+    })
+}
+
+fn compact_body_names(body: &str, names: &RuntimeNames) -> String {
     // NUL 不可能出现在 JS 源码里，可安全作占位。占位符自身**不得含 `exports` 子串**，
     // 否则会被下一步的 `exports`→`$` 改坏而无法还原。
     const MODULE_EXPORTS: &str = "\u{0}wakeME\u{0}";
     body.replace("module.exports", MODULE_EXPORTS)
-        .replace("__wake_require__(", "_r(")
-        .replace("exports", "$")
-        .replace(MODULE_EXPORTS, "m.exports")
+        .replace("__wake_require__(", &format!("{}(", names.require))
+        .replace("exports", &names.exports)
+        .replace(MODULE_EXPORTS, &format!("{}.exports", names.module))
 }
 
 /// 从 entry 出发的**依赖后序**编号（模块 id → 序号），即 ESM 的求值顺序：依赖先于消费方，
@@ -3371,23 +3444,12 @@ fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
     // 解析每个模块的内部依赖
     let mut deps: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for (id, body) in modules {
-        let compacted = compact_body_names(body);
-        let mut rest = compacted.as_str();
         let mut module_deps = Vec::new();
-        while let Some(pos) = rest.find("_r(") {
-            let after = &rest[pos + 3..];
-            if let Some(end) = after.find(')') {
-                if let Ok(n) = after[..end].parse::<u32>()
-                    && id_set.contains(&n)
-                    && n != *id
-                {
-                    module_deps.push(n);
-                }
-                rest = &after[end..];
-            } else {
-                break;
+        for_each_require(body, |_, n, _| {
+            if id_set.contains(&n) && n != *id {
+                module_deps.push(n);
             }
-        }
+        });
         deps.insert(*id, module_deps);
     }
 
@@ -3450,6 +3512,8 @@ fn emit(
 
     if minify {
         let mut candidates: FxHashMap<u32, Arc<String>> = FxHashMap::default();
+        let runtime_names = RuntimeNames::for_bodies(bodies.iter().map(|(_, body)| body.as_str()));
+
         for (id, body) in bodies {
             if is_pure_reg_body(body) {
                 candidates.insert(*id, body.clone());
@@ -3586,7 +3650,7 @@ fn emit(
                     .collect::<Vec<_>>()
                     .join(",");
                 concat_body.push_str(&format!(
-                    "_r=function(_o){{var _m={{{set}}};return function(i){{return _m[i]?$:_o(i)}}}}(_r);"
+                    "{require}=function(_o){{var _m={{{set}}};return function(i){{return _m[i]?{exports}:_o(i)}}}}({require});", require = runtime_names.require, exports = runtime_names.exports,
                 ));
             }
 
@@ -3594,7 +3658,7 @@ fn emit(
                 if *id == entry_id || standalone.contains(id) {
                     continue;
                 }
-                let b = strip_standalone_requires(&compact_body_names(body));
+                let b = strip_standalone_requires(&compact_body_names(body, &runtime_names));
                 // 块安全（ESM 且无 `var`/`this`）+ 整组 strict → 用裸 `{}` 块（strict 下块级函数声明块作用域，
                 // let/const 本就块作用域 → 顶层名不跨块碰撞）。否则用 IIFE 建立真正函数作用域隔离
                 // （`var` 会 hoist 出块、sloppy 下块级函数亦 hoist；曾致 React Symbol 覆盖 scheduler 计数器）。
@@ -3625,9 +3689,12 @@ fn emit(
 
             // 把对已合并模块的 `_r(M)` 重定向到 concat 模块（独立模块保持自己的 id）。
             let redirect = |body: &str| -> String {
-                let mut nb = compact_body_names(body);
+                let mut nb = compact_body_names(body, &runtime_names);
                 for &mid in &merged_ids {
-                    nb = nb.replace(&format!("_r({mid})"), &format!("_r({concat_id})"));
+                    nb = nb.replace(
+                        &format!("{}({mid})", runtime_names.require),
+                        &format!("{}({concat_id})", runtime_names.require),
+                    );
                 }
                 nb
             };
@@ -3651,7 +3718,7 @@ fn emit(
         } else {
             // async 子图存在 → 逐模块注册（`_r` 返回 Promise，由导入点 `await`）。
             for (id, body) in &filtered {
-                final_modules.push((*id, compact_body_names(body)));
+                final_modules.push((*id, compact_body_names(body, &runtime_names)));
             }
             for &sid in &ref_ids {
                 if !final_modules.iter().any(|(i, _)| *i == sid) {
@@ -3715,12 +3782,15 @@ fn emit(
                 } else {
                     "function"
                 };
-                out.push_str(&format!("{}:{kw}(m,$,_r){{", id));
+                out.push_str(&format!(
+                    "{}:{kw}({},{},{}){{",
+                    id, runtime_names.module, runtime_names.exports, runtime_names.require
+                ));
                 out.push_str(body);
                 out.push_str("},");
             }
         }
-        out.push_str("};");
+        out.push_str("};r.m=t;r.c=c;");
         out.push_str(&format!("var e=r({});", entry_id));
         out.push_str("if(typeof module!=='undefined'&&module.exports)module.exports=e;else g.__wake_entry__=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);");
         out
@@ -3763,7 +3833,9 @@ fn emit(
             out.push_str("},\n");
             line += 1;
         }
-        out.push_str("};\n");
+        out.push_str(
+            "};\n__wake_require__.m = __wake_modules__;\n__wake_require__.c = __wake_cache__;\n",
+        );
         out.push_str(&format!(
             "var __wake_entry__ = __wake_require__({entry_id});\n"
         ));
