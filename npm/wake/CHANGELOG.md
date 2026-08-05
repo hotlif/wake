@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+- Prevented empty hoisted registry bodies from emitting invalid comma-only JavaScript expressions.
+
 ## 0.1.6
 
 - Lowered import.meta.hot and import.meta.url for classic-script chunks.

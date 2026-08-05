@@ -30,7 +30,7 @@ after(async () => {
 })
 
 test('loads the same API from ESM and CommonJS', () => {
-  assert.equal(version(), '0.1.6')
+  assert.equal(version(), '0.1.7')
   assert.equal(commonjs.version(), version())
   assert.equal(typeof commonjs.build, 'function')
 })
