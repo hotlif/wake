@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8
+
+- Prevented empty hoisted registry bodies from emitting invalid comma-only JavaScript expressions.
+- Restored reproducible release builds by locking available compatible transitive dependencies.
+
 ## 0.1.7
 
 - Prevented empty hoisted registry bodies from emitting invalid comma-only JavaScript expressions.
