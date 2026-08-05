@@ -3095,6 +3095,80 @@ fn exact_reg_assignment(body: &str) -> Option<&str> {
     Some(value)
 }
 
+/// 输出非空的内联 registry body，并仅在实际输出项之间添加逗号。
+///
+/// hoist 候选模块的 body 在剥离 require/barrel 语句后可能为空。如果按原候选下标添加
+/// 分隔符，会生成 `;,,,;` 这样的非法 JavaScript。
+fn append_inline_regs(out: &mut String, inline_regs: &[String]) {
+    let mut emitted = false;
+    let mut registry_ready = false;
+
+    for reg in inline_regs {
+        let compact = compact_reg_body(reg);
+        let compact = compact.trim().trim_end_matches(';').trim_end();
+        if compact.is_empty() {
+            continue;
+        }
+
+        if emitted {
+            out.push(',');
+        } else {
+            out.push(';');
+            emitted = true;
+        }
+
+        if let Some(assignment) = exact_reg_assignment(compact) {
+            if registry_ready {
+                out.push_str("q.");
+                out.push_str(assignment);
+            } else {
+                out.push_str("q=globalThis.__reg||(globalThis.__reg={}),q.");
+                out.push_str(assignment);
+                registry_ready = true;
+            }
+        } else {
+            out.push_str(compact);
+            registry_ready = false;
+        }
+    }
+
+    if emitted {
+        out.push(';');
+    }
+}
+
+#[cfg(test)]
+mod inline_reg_tests {
+    use super::append_inline_regs;
+
+    #[test]
+    fn skips_empty_registry_bodies_without_leaving_commas() {
+        let regs = vec![
+            String::new(),
+            " ;;;".to_string(),
+            "globalThis.__reg || (globalThis.__reg = {});globalThis.__reg.a = 1;".to_string(),
+            "  ".to_string(),
+            "globalThis.__reg || (globalThis.__reg = {});globalThis.__reg.b = 2;".to_string(),
+        ];
+        let mut out = "runtime".to_string();
+
+        append_inline_regs(&mut out, &regs);
+
+        assert_eq!(
+            out,
+            "runtime;q=globalThis.__reg||(globalThis.__reg={}),q.a=1,q.b=2;"
+        );
+        assert!(!out.contains(",,"));
+    }
+
+    #[test]
+    fn emits_nothing_when_all_registry_bodies_are_empty() {
+        let mut out = "runtime".to_string();
+        append_inline_regs(&mut out, &[String::new(), " ; ".to_string()]);
+        assert_eq!(out, "runtime");
+    }
+}
+
 /// 紧凑模块 body 中的运行时引用：`__wake_require__`→`_r`，自由变量 `exports`→`$`。
 ///
 /// **`module.exports` 必须改写成 `m.exports`，不能是 `m.$`**：包装器
@@ -3623,33 +3697,7 @@ fn emit(
             "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
         });
 
-        if !inline_regs.is_empty() {
-            out.push(';');
-            let mut registry_ready = false;
-            for (index, reg) in inline_regs.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                let compact = compact_reg_body(reg);
-                let compact = compact.trim_end_matches(';');
-                if let Some(assignment) = exact_reg_assignment(compact) {
-                    if registry_ready {
-                        out.push_str("q.");
-                        out.push_str(assignment);
-                    } else {
-                        out.push_str("q=globalThis.__reg||(globalThis.__reg={}),q.");
-                        out.push_str(assignment);
-                        registry_ready = true;
-                    }
-                } else {
-                    out.push_str(compact);
-                    if !compact.is_empty() {
-                        registry_ready = false;
-                    }
-                }
-            }
-            out.push(';');
-        }
+        append_inline_regs(&mut out, &inline_regs);
 
         if needs_interop_default {
             out.push_str(interop_default);
