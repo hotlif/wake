@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6
+
+- Lowered import.meta.hot and import.meta.url for classic-script chunks.
+- Preserved explicit keys in nested object destructuring patterns.
+- Preserved required parentheses when nullish coalescing is mixed with logical operators.
+- Prevented mangled declarations from colliding with preserved import aliases.
+- Parenthesized retained object and anonymous-class initializers after tree shaking.
+
 ## 0.1.5
 
 - Stabilized Windows incremental rebuild events by coalescing delayed file notifications.

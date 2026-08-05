@@ -34,10 +34,17 @@ impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             resolve: ResolveOptions::default(),
-            define: vec![(
-                "process.env.NODE_ENV".to_string(),
-                "\"production\"".to_string(),
-            )],
+            define: vec![
+                (
+                    "process.env.NODE_ENV".to_string(),
+                    "\"production\"".to_string(),
+                ),
+                ("import.meta.hot".to_string(), "false".to_string()),
+                (
+                    "import.meta.url".to_string(),
+                    "__wake_require__.metaUrl()".to_string(),
+                ),
+            ],
             extract_css: false,
             asset_inline_limit: usize::MAX,
             public_path: "/".to_string(),

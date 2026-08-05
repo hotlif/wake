@@ -110,6 +110,26 @@ fn set_define_dev_replaces_node_env() {
 }
 
 #[test]
+fn default_bundle_lowers_import_meta_for_classic_script_chunks() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export const hot = import.meta.hot;\n\
+         export const url = import.meta.url;",
+    )]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("const hot = false;"), "{}", out.bundle);
+    assert!(!out.bundle.contains("import.meta"), "{}", out.bundle);
+    assert!(
+        out.bundle
+            .contains("const url = __wake_require__.metaUrl();"),
+        "{}",
+        out.bundle
+    );
+}
+
+#[test]
 fn css_extraction_and_asset_threshold() {
     // prod：CSS 抽取为独立 `.css`（不注入 <style>）+ 超阈值资源独立产物（WAKE-COMPATIBILITY §M3）。
     let big = "X".repeat(5000);

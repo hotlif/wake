@@ -412,10 +412,17 @@ struct PendingModule {
 impl IncrementalBundler {
     pub fn new(fs: Arc<dyn FileSystem>) -> IncrementalBundler {
         // 默认 define：`process.env.NODE_ENV → "production"`（与旧 codegen 硬编码默认逐字节一致）。
-        let default_define: Arc<[(String, String)]> = Arc::from(vec![(
-            "process.env.NODE_ENV".to_string(),
-            "\"production\"".to_string(),
-        )]);
+        let default_define: Arc<[(String, String)]> = Arc::from(vec![
+            (
+                "process.env.NODE_ENV".to_string(),
+                "\"production\"".to_string(),
+            ),
+            ("import.meta.hot".to_string(), "false".to_string()),
+            (
+                "import.meta.url".to_string(),
+                "__wake_require__.metaUrl()".to_string(),
+            ),
+        ]);
         let define_hash = hash_define(&default_define);
         let default_target = TargetEnv::default();
         IncrementalBundler {
@@ -4219,6 +4226,9 @@ if (typeof process !== "undefined" && process.versions && process.versions.node 
   __wake__.npath = require("path");
 }
 var __wake_require__ = __wake__.require;
+__wake_require__.metaUrl = function () {
+  return typeof document !== "undefined" ? new URL(__wake__.publicPath || ".", document.baseURI).href : "";
+};
 var __wake_interop_default = __wake__.interopDefault;
 var __wake_interop_star = __wake__.interopStar;
 "#;

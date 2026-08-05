@@ -308,6 +308,19 @@ struct AssignCtx<'a> {
 impl AssignCtx<'_> {
     fn assign(&mut self, scope: ScopeId, path: &mut FxHashSet<Atom>) {
         let mut added: Vec<Atom> = Vec::new();
+        // Hoisted declarations are recorded before lexical/import bindings, regardless of their
+        // source order. Reserve every binding that must keep its original name before assigning
+        // short names, otherwise a hoisted function can steal a later import's name (for example
+        // `import { useEffect as a } ...; function compare() {}`).
+        for &sid in &self.scope_symbols[scope as usize] {
+            let sym = &self.model.symbols[sid as usize];
+            if (!is_renameable(sym, self.exported_names) || self.synthetic.contains(&sid))
+                && path.insert(sym.name)
+            {
+                added.push(sym.name);
+            }
+        }
+
         let mut counter = 0usize;
         for &sid in &self.scope_symbols[scope as usize] {
             let sym = &self.model.symbols[sid as usize];
@@ -322,10 +335,6 @@ impl AssignCtx<'_> {
                 self.new_name[sid as usize] = Some(atom);
                 path.insert(atom);
                 added.push(atom);
-            } else {
-                if path.insert(sym.name) {
-                    added.push(sym.name);
-                }
             }
         }
         for &child in &self.children[scope as usize] {

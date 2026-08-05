@@ -894,6 +894,33 @@ fn define_replaces_process_env_node_env() {
 }
 
 /// 往返幂等：codegen 的输出再 parse+codegen 应完全一致（强语义等价信号）。
+#[test]
+fn define_replaces_import_meta_hot_but_preserves_other_meta_properties() {
+    use crate::codegen_module_shaken_with;
+
+    let interner = Interner::new();
+    let src = "export const hot = import.meta.hot;\n\
+               export const url = import.meta.url;";
+    let parsed = parse(src, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+    let esm = parsed
+        .module
+        .with_ast(|program| codegen(program, &interner));
+    assert!(esm.contains("import.meta.hot"), "{esm}");
+    assert!(esm.contains("import.meta.url"), "{esm}");
+
+    let define = [("import.meta.hot", "false")];
+    let bundled = parsed.module.with_ast(|program| {
+        codegen_module_shaken_with(
+            program, &interner, &NoLinker, None, &define, false, false, false,
+        )
+    });
+    assert!(bundled.contains("const hot = false;"), "{bundled}");
+    assert!(!bundled.contains("import.meta.hot"), "{bundled}");
+    assert!(bundled.contains("import.meta.url"), "{bundled}");
+}
+
 fn assert_stable(src: &str) {
     let it = Interner::new();
     let out1 = parse(src, &it, SourceType::Module);
@@ -934,6 +961,10 @@ fn roundtrip_expressions() {
         "new Foo(a, b).bar();",
         "a?.b?.[c]?.(d);",
         "x++ + ++y;",
+        "left ?? (middle || right);",
+        "(left || middle) ?? right;",
+        "left ?? (middle && right);",
+        "(left && middle) ?? right;",
         "[...a, b, , c];",
         "({ a: 1, b, [c]: 2, ...d });",
         "`a${b + c}d${e}`;",
@@ -944,6 +975,23 @@ fn roundtrip_expressions() {
     ] {
         assert_stable(src);
     }
+}
+
+#[test]
+fn object_pattern_preserves_explicit_keys_and_nested_aliases() {
+    let js = run(
+        "const { alias: local, context: { placement, elements: { floating } }, style: { transform, ...restStyle } = {} } = props;",
+    );
+
+    assert!(js.contains("alias: local"), "{js}");
+    assert!(
+        js.contains("context: { placement, elements: { floating } }"),
+        "{js}"
+    );
+    assert!(
+        js.contains("style: { transform, ...restStyle } = {}"),
+        "{js}"
+    );
 }
 
 #[test]
@@ -1076,6 +1124,29 @@ fn shake_keeps_side_effect_initializer() {
         "副作用应保留:\n{js}"
     );
     assert!(!js.contains("exports[\"x\"]"), "绑定应移除:\n{js}");
+}
+
+#[test]
+fn shake_parenthesizes_preserved_object_and_class_initializers() {
+    let object = shake(
+        "const unused = { value: sideEffect() }; export const keep = 1;",
+        Some(&["keep"]),
+    );
+    assert!(
+        object.contains("({ value: sideEffect() });"),
+        "对象表达式必须在语句位置加括号:\n{object}"
+    );
+
+    let class = shake(
+        "const unused = class { [sideEffect()]() {} }; export const keep = 1;",
+        Some(&["keep"]),
+    );
+    assert!(
+        class.contains("(class {"),
+        "匿名类表达式必须在语句位置加括号:\n{class}"
+    );
+    let reparsed = parse(&class, &Interner::new(), SourceType::Module);
+    assert!(!reparsed.has_errors(), "产物必须可重新解析:\n{class}");
 }
 
 #[test]

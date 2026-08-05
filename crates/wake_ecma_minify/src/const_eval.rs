@@ -454,6 +454,11 @@ fn build_static_chain_from_expr(e: &Expression, interner: Option<&Interner>) -> 
             let name = interner?.resolve(id.name);
             Some(name)
         }
+        Expression::MetaProperty(m) => {
+            let meta = interner?.resolve(m.meta);
+            let property = interner?.resolve(m.property);
+            Some(format!("{}.{}", meta, property))
+        }
         Expression::Member(m) if !m.optional => match &m.property {
             MemberProperty::Ident(p) => {
                 let base = build_static_chain_from_expr(&m.object, interner)?;

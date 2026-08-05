@@ -74,6 +74,17 @@ fn imports_not_renamed() {
 }
 
 #[test]
+fn hoisted_declaration_does_not_collide_with_import_alias() {
+    let (m, it) =
+        plan("import { useEffect as a } from 'react'; function compare(){ return a; } compare;");
+    assert_eq!(m.renamed_symbols, 1);
+    assert_eq!(
+        new_names(&m, &it),
+        ["b"].into_iter().map(str::to_string).collect()
+    );
+}
+
+#[test]
 fn function_params_and_locals_renamed() {
     // 函数名 f 现在也重命名（f + 参数 x）。
     let (m, it) = plan("function f(x){ return x + 1; } f;");

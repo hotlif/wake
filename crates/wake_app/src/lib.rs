@@ -518,7 +518,16 @@ fn build_defines(config: &wake_config::Config, development: bool) -> Vec<(String
     } else {
         "\"production\""
     };
-    let mut values = vec![("process.env.NODE_ENV".to_string(), node_env.to_string())];
+    let mut values = vec![
+        ("process.env.NODE_ENV".to_string(), node_env.to_string()),
+        // Wake emits classic-script chunks and currently provides live reload rather than
+        // a module-level HMR API. Do not leak this ESM-only syntax into those chunks.
+        ("import.meta.hot".to_string(), "false".to_string()),
+        (
+            "import.meta.url".to_string(),
+            "__wake_require__.metaUrl()".to_string(),
+        ),
+    ];
     for (key, value) in &config.define {
         if let Some(existing) = values.iter_mut().find(|(name, _)| name == key) {
             existing.1 = value.clone();
@@ -1275,6 +1284,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn build_defines_disable_esm_hmr_syntax_in_classic_script_chunks() {
+        let config = wake_config::Config::default();
+        let defines = build_defines(&config, true);
+
+        assert!(
+            defines
+                .iter()
+                .any(|(key, value)| key == "import.meta.hot" && value == "false")
+        );
+        assert!(
+            defines
+                .iter()
+                .any(|(key, value)| key == "import.meta.url"
+                    && value == "__wake_require__.metaUrl()")
+        );
+    }
 
     struct Fixture(PathBuf);
 

@@ -1646,7 +1646,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             let plo = self.start();
             let (key, computed) = self.parse_property_key();
-            let value = if self.eat(TokenKind::Colon) {
+            let has_colon = self.eat(TokenKind::Colon);
+            let value = if has_colon {
                 self.parse_binding_element()
             } else {
                 // 简写 `{ x }` 或 `{ x = default }`。
@@ -1672,7 +1673,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 span: self.span_to(plo),
                 key,
                 value,
-                shorthand: !computed,
+                shorthand: !computed && !has_colon,
                 computed,
             });
             if !self.eat(TokenKind::Comma) {

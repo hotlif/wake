@@ -247,6 +247,9 @@ function __wake_interop_star(m) {
   ns.default = m;
   return ns;
 }
+__wake_require__.metaUrl = function () {
+  return typeof document !== "undefined" ? document.baseURI : "";
+};
 "#;
 
 /// mini runtime 前半的 **async 变体**：产物含顶层 await 时启用（DESIGN §6.1.1）。
@@ -277,6 +280,9 @@ function __wake_interop_star(m) {
   ns.default = m;
   return ns;
 }
+__wake_require__.metaUrl = function () {
+  return typeof document !== "undefined" ? document.baseURI : "";
+};
 "#;
 
 /// mini runtime 后半（入口执行之后，导出到 module.exports 或全局）。

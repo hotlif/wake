@@ -1023,7 +1023,14 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     if emitted {
                         self.push(";");
                     }
+                    let needs_paren = starts_with_problematic(init);
+                    if needs_paren {
+                        self.push("(");
+                    }
                     self.emit_expr(init, P_SEQUENCE);
+                    if needs_paren {
+                        self.push(")");
+                    }
                     emitted = true;
                     in_declaration = false;
                 }
@@ -3095,9 +3102,25 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             }
             Expression::Logical(l) => {
                 let prec = logical_prec(l.operator);
-                self.emit_expr(&l.left, prec);
+                let group_left = l.operator == LogicalOperator::Coalesce
+                    && self.is_and_or_logical_after_inline(&l.left);
+                if group_left {
+                    self.push("(");
+                }
+                self.emit_expr(&l.left, if group_left { P_ASSIGN } else { prec });
+                if group_left {
+                    self.push(")");
+                }
                 self.binop(l.operator.as_str());
-                self.emit_expr(&l.right, prec + 1);
+                let group_right = l.operator == LogicalOperator::Coalesce
+                    && self.is_and_or_logical_after_inline(&l.right);
+                if group_right {
+                    self.push("(");
+                }
+                self.emit_expr(&l.right, if group_right { P_ASSIGN } else { prec + 1 });
+                if group_right {
+                    self.push(")");
+                }
             }
             Expression::Assignment(a) => {
                 self.skip_inline = true;
@@ -3248,6 +3271,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.interner.with_resolved(id.name, |s| out.push_str(s));
                 true
             }
+            Expression::MetaProperty(m) => {
+                self.interner.with_resolved(m.meta, |s| out.push_str(s));
+                out.push('.');
+                self.interner.with_resolved(m.property, |s| out.push_str(s));
+                true
+            }
             Expression::Member(m) if !m.optional => match &m.property {
                 MemberProperty::Ident(p) => {
                     if !self.build_static_chain(&m.object, out) {
@@ -3261,6 +3290,24 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             },
             _ => false,
         }
+    }
+
+    fn is_and_or_logical_after_inline(&self, expr: &Expression) -> bool {
+        let effective = if let Expression::Identifier(id) = expr
+            && let Some(ctx) = self.minify_ctx
+            && !id.span.is_dummy()
+            && let Some(inline_expr) = ctx.inline_vars.get(&id.span)
+        {
+            inline_expr
+        } else {
+            expr
+        };
+        matches!(
+            effective,
+            Expression::Logical(logical)
+                if logical.operator == LogicalOperator::And
+                    || logical.operator == LogicalOperator::Or
+        )
     }
 
     fn emit_member(&mut self, m: &MemberExpression) {
