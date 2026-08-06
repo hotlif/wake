@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Preserved mangled names for exports declared through object and array destructuring.
+- Fixed `cancelFrame is not defined` in bundled Motion dependencies.
+
 ## 0.1.9
 
 - Added webpack-style runtime module and cache namespaces.
