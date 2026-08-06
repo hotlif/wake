@@ -44,6 +44,23 @@ wake docs build . --outdir docs-dist
 
 `.` 是项目根。文档输出目录默认 `docs-dist`，相对路径以项目根解析。
 
+## 依赖扁平化
+
+Wake 在扫描模块图时，以 npm 包的 `name@version` 和包内相对路径作为依赖身份，而不是直接使用磁盘上的安装路径。例如，下列两个文件会进入同一个模块实例：
+
+```text
+node_modules/a/node_modules/shared/index.js  → shared@1.2.0/index.js
+node_modules/b/node_modules/shared/index.js  → shared@1.2.0/index.js
+```
+
+因此，同名、同版本、同子路径的依赖只会打包一次；`shared@1.2.0` 和 `shared@2.0.0` 则会保留为两个独立实例。这一规则同样适用于 npm、pnpm 以及 Yarn PnP 的物理安装布局。
+
+<Callout title="有上下文的包不会被错误合并" tone="info">
+带 `peerDependencies` 的包、Yarn PnP 虚拟包以及本地 workspace 包会保留安装上下文。它们即使名称和版本相同，也可能绑定不同的宿主依赖或本地源码，因此不会仅凭 `name@version` 强行合并。
+</Callout>
+
+扁平化只统一模块身份，不会把多个 CommonJS 模块拼成一个共享闭包。CommonJS 的初始化顺序、循环依赖和 `module.exports` 生命周期仍由独立模块工厂管理。
+
 ## 默认生产优化
 
 应用和文档生产构建会使用以下能力：

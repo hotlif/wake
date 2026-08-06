@@ -15,6 +15,42 @@ mod pnpfs;
 pub use pnp::PnpManifest;
 pub use pnpfs::PnpFileSystem;
 
+/// 一份 npm 包内容的逻辑身份。普通 registry 包按 `name@version` 扁平去重；
+/// `context` 仅用于 Yarn PnP/pnpm peer 虚拟实例和本地 workspace，避免把解析上下文不同的
+/// 同名同版本包错误合并。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PackageKey {
+    pub name: String,
+    pub version: String,
+    pub context: Option<String>,
+}
+
+impl PackageKey {
+    pub fn display_name(&self) -> String {
+        match &self.context {
+            Some(context) => format!("{}@{}#{context}", self.name, self.version),
+            None => format!("{}@{}", self.name, self.version),
+        }
+    }
+}
+
+/// 打包器使用的稳定逻辑模块身份。安装器的物理布局只用于读取源码，不参与普通 npm 包的去重。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ModuleIdentity {
+    Package {
+        package: PackageKey,
+        subpath: String,
+    },
+    File(PathBuf),
+}
+
+/// 路径解析与逻辑身份解析的组合结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedModule {
+    pub path: PathBuf,
+    pub identity: ModuleIdentity,
+}
+
 type ResolutionCache = FxHashMap<PathBuf, FxHashMap<String, Option<PathBuf>>>;
 type PackageRootCache = FxHashMap<PathBuf, FxHashMap<String, Arc<[PathBuf]>>>;
 
@@ -56,6 +92,9 @@ impl Default for ResolveOptions {
 struct PackageConfig {
     entry: Option<String>,
     exports: Option<serde_json::Value>,
+    name: Option<String>,
+    version: Option<String>,
+    has_peer_dependencies: bool,
 }
 
 /// 解析失败。
@@ -88,6 +127,8 @@ pub struct Resolver {
     cache: Mutex<ResolutionCache>,
     /// package.json 路径 → 入口与 exports。失败也缓存，避免不同 issuer 重复读取清单。
     package_configs: Mutex<FxHashMap<PathBuf, Option<PackageConfig>>>,
+    /// 物理文件路径 → 扁平逻辑模块身份。
+    module_identities: Mutex<FxHashMap<PathBuf, ModuleIdentity>>,
     /// issuer 目录 → 包名 → 向上搜索到的全部 package root。
     package_roots: Mutex<PackageRootCache>,
     /// Yarn PnP 清单。`Some` 时裸说明符走 PnP 依赖图（不走 `node_modules` 上溯）。
@@ -105,6 +146,7 @@ impl Resolver {
             options,
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
+            module_identities: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
         }
@@ -130,6 +172,7 @@ impl Resolver {
             options,
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
+            module_identities: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: Some(manifest),
         }
@@ -161,12 +204,64 @@ impl Resolver {
         resolved.ok_or_else(|| self.err(specifier, from_dir))
     }
 
+    /// 同时返回物理路径和按 npm 包名、版本、子路径归一后的逻辑身份。
+    pub fn resolve_module(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+    ) -> Result<ResolvedModule, ResolveError> {
+        let path = self.resolve(specifier, from_dir)?;
+        let identity = self.module_identity(&path);
+        Ok(ResolvedModule { path, identity })
+    }
+
+    /// 将一个已解析文件归一为逻辑模块身份。
+    pub fn module_identity(&self, path: &Path) -> ModuleIdentity {
+        let path = normalize(path);
+        if let Some(identity) = self.module_identities.lock().unwrap().get(&path).cloned() {
+            return identity;
+        }
+        let identity = self.module_identity_uncached(&path);
+        self.module_identities
+            .lock()
+            .unwrap()
+            .insert(path, identity.clone());
+        identity
+    }
+
+    fn module_identity_uncached(&self, path: &Path) -> ModuleIdentity {
+        let Some(root) = Self::find_package_root(self.fs.as_ref(), path) else {
+            return ModuleIdentity::File(path.to_path_buf());
+        };
+        let Some(config) = self.read_package_config(&root.join("package.json")) else {
+            return ModuleIdentity::File(path.to_path_buf());
+        };
+        let (Some(name), Some(version)) = (config.name, config.version) else {
+            return ModuleIdentity::File(path.to_path_buf());
+        };
+        let subpath = path
+            .strip_prefix(&root)
+            .ok()
+            .map(Self::path_to_logical_string)
+            .unwrap_or_else(|| Self::path_to_logical_string(path));
+        let context = Self::package_context(&root, config.has_peer_dependencies);
+        ModuleIdentity::Package {
+            package: PackageKey {
+                name,
+                version,
+                context,
+            },
+            subpath,
+        }
+    }
+
     /// 文件系统 generation 变化后清空路径解析结果。
     ///
     /// Resolver 会缓存成功与失败；watch 中新增、删除或重命名文件后，旧结果都可能失效。
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
         self.package_configs.lock().unwrap().clear();
+        self.module_identities.lock().unwrap().clear();
         self.package_roots.lock().unwrap().clear();
     }
 
@@ -317,6 +412,65 @@ impl Resolver {
         None
     }
 
+    fn find_package_root(fs: &dyn FileSystem, path: &Path) -> Option<PathBuf> {
+        let start = path.parent()?;
+        for dir in start.ancestors() {
+            let parent = dir.parent();
+            let direct = parent
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "node_modules");
+            let scoped = parent
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('@'))
+                && parent
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "node_modules");
+            if direct || scoped {
+                return Some(normalize(dir));
+            }
+        }
+        start
+            .ancestors()
+            .find(|dir| fs.is_file(&dir.join("package.json")))
+            .map(normalize)
+    }
+
+    fn path_to_logical_string(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn package_context(root: &Path, has_peer_dependencies: bool) -> Option<String> {
+        let logical = Self::path_to_logical_string(root);
+        if logical.contains("/__virtual__/") || logical.contains("/$$virtual/") {
+            return Some(format!("pnp:{logical}"));
+        }
+        let components = root
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect::<Vec<_>>();
+        if let Some(index) = components
+            .iter()
+            .position(|component| *component == ".pnpm")
+            && let Some(locator) = components.get(index + 1)
+            && (locator.contains('_') || locator.contains('('))
+        {
+            return Some(format!("pnpm:{locator}"));
+        }
+        let installed = components.iter().any(|component| {
+            matches!(
+                *component,
+                "node_modules" | ".pnp-store" | ".yarn" | ".pnpm"
+            )
+        });
+        if has_peer_dependencies || !installed {
+            Some(format!("root:{logical}"))
+        } else {
+            None
+        }
+    }
+
     fn package_roots(&self, pkg_name: &str, from_dir: &Path) -> Arc<[PathBuf]> {
         if let Some(roots) = self
             .package_roots
@@ -366,6 +520,18 @@ impl Resolver {
             Some(PackageConfig {
                 entry,
                 exports: json.get("exports").cloned(),
+                name: json
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                version: json
+                    .get("version")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                has_peer_dependencies: json
+                    .get("peerDependencies")
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|peers| !peers.is_empty()),
             })
         });
         self.package_configs
@@ -548,6 +714,89 @@ mod tests {
         assert_eq!(
             r.resolve("react", Path::new("src")).unwrap(),
             PathBuf::from("node_modules/react/esm/react.js")
+        );
+    }
+
+    #[test]
+    fn module_identity_flattens_same_name_and_version_across_install_paths() {
+        let r = resolver(&[
+            (
+                "node_modules/a/node_modules/shared/package.json",
+                r#"{"name":"shared","version":"1.2.0"}"#,
+            ),
+            ("node_modules/a/node_modules/shared/index.js", "// a"),
+            (
+                "node_modules/b/node_modules/shared/package.json",
+                r#"{"name":"shared","version":"1.2.0"}"#,
+            ),
+            ("node_modules/b/node_modules/shared/index.js", "// b"),
+        ]);
+        let a = r.module_identity(Path::new("node_modules/a/node_modules/shared/index.js"));
+        let b = r.module_identity(Path::new("node_modules/b/node_modules/shared/index.js"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn module_identity_keeps_versions_and_peer_contexts_separate() {
+        let r = resolver(&[
+            (
+                "node_modules/a/node_modules/shared/package.json",
+                r#"{"name":"shared","version":"1.2.0"}"#,
+            ),
+            ("node_modules/a/node_modules/shared/index.js", "// v1"),
+            (
+                "node_modules/b/node_modules/shared/package.json",
+                r#"{"name":"shared","version":"2.0.0"}"#,
+            ),
+            ("node_modules/b/node_modules/shared/index.js", "// v2"),
+            (
+                "node_modules/x/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0","peerDependencies":{"react":"*"}}"#,
+            ),
+            ("node_modules/x/node_modules/widget/index.js", "// react 18"),
+            (
+                "node_modules/y/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0","peerDependencies":{"react":"*"}}"#,
+            ),
+            ("node_modules/y/node_modules/widget/index.js", "// react 19"),
+        ]);
+        assert_ne!(
+            r.module_identity(Path::new("node_modules/a/node_modules/shared/index.js")),
+            r.module_identity(Path::new("node_modules/b/node_modules/shared/index.js"))
+        );
+        assert_ne!(
+            r.module_identity(Path::new("node_modules/x/node_modules/widget/index.js")),
+            r.module_identity(Path::new("node_modules/y/node_modules/widget/index.js"))
+        );
+    }
+
+    #[test]
+    fn module_identity_keeps_yarn_pnp_virtual_instances_separate() {
+        let r = resolver(&[
+            (
+                ".yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0"}"#,
+            ),
+            (
+                ".yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/index.js",
+                "// react 18",
+            ),
+            (
+                ".yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0"}"#,
+            ),
+            (
+                ".yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/index.js",
+                "// react 19",
+            ),
+        ]);
+        assert_ne!(
+            r.module_identity(Path::new(
+                ".yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/index.js"
+            )),
+            r.module_identity(Path::new(
+                ".yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/index.js"
+            ))
         );
     }
 

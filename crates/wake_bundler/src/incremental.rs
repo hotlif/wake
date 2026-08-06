@@ -8,7 +8,7 @@
 //! ## cycle-safe 说明
 //!
 //! parse/codegen 任务**互不递归请求**（parse 只依赖自己的内容 cell）——任务图是「从内容 cell
-//! 发散的星形」，**无环**。模块*依赖*图的循环由驱动层 BFS 的 `path_to_id` 去重集合处理，
+//! 发散的星形」，**无环**。模块*依赖*图的循环由驱动层 BFS 的逻辑模块身份去重集合处理，
 //! 不会造成任务图环 / single-flight 死锁。故并行 scan **不需要 SCC 成组**（那是「full scan-as-tasks」
 //! 递归请求路线才需要的，此处务实绕开）。
 //!
@@ -47,7 +47,7 @@ use wake_graph::{
     ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
     collect_static_uses, compute_live_keep,
 };
-use wake_resolver::{ResolveOptions, Resolver};
+use wake_resolver::{ModuleIdentity, ResolveOptions, ResolvedModule, Resolver};
 use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -70,7 +70,7 @@ type LoadedResult = (
     Option<FileStamp>,
     Option<u64>,
 );
-type ResolveResult = Result<PathBuf, wake_resolver::ResolveError>;
+type ResolveResult = Result<ResolvedModule, wake_resolver::ResolveError>;
 type CodegenExecCounts = Arc<[CachePadded<AtomicU64>]>;
 
 /// I/O 小任务的目标批次数：既给工作窃取留出余量，又避免为数千个小文件逐个分配
@@ -1063,12 +1063,13 @@ impl IncrementalBundler {
             jsx_import_source: self.jsx.import_source,
         });
 
-        let mut path_to_id: FxHashMap<PathBuf, u32> =
+        let mut module_to_id: FxHashMap<ModuleIdentity, u32> =
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
         let mut next_id: u32 = 0;
         let mut modules: FxHashMap<u32, ModuleRec> =
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
-        let entry_id = assign_id(&mut path_to_id, &mut next_id, entry_norm.clone());
+        let entry_identity = self.resolver.module_identity(&entry_norm);
+        let entry_id = assign_id(&mut module_to_id, &mut next_id, entry_identity);
         let mut frontier: Vec<(u32, PathBuf)> = vec![(entry_id, entry_norm.clone())];
         let mut collected_assets: Vec<(String, Vec<u8>)> = Vec::new();
         let mut collected_css: Vec<(u32, String)> = Vec::new();
@@ -1542,7 +1543,7 @@ impl IncrementalBundler {
                                 .into_iter()
                                 .map(|(index, (specifier, from_dir))| {
                                     resolve_exec_count.fetch_add(1, Ordering::Relaxed);
-                                    (index, resolver.resolve(&specifier, &from_dir))
+                                    (index, resolver.resolve_module(&specifier, &from_dir))
                                 })
                                 .collect::<Vec<_>>()
                         }
@@ -1586,10 +1587,14 @@ impl IncrementalBundler {
                     flat_idx += 1;
                     match resolved {
                         Ok(resolved) => {
-                            let known = path_to_id.contains_key(resolved);
-                            let did = assign_id(&mut path_to_id, &mut next_id, resolved.clone());
+                            let known = module_to_id.contains_key(&resolved.identity);
+                            let did = assign_id(
+                                &mut module_to_id,
+                                &mut next_id,
+                                resolved.identity.clone(),
+                            );
                             if !known {
-                                next.push((did, resolved.clone()));
+                                next.push((did, resolved.path.clone()));
                             }
                             dep_ids.push((dep.specifier.clone(), did));
                         }
@@ -3194,6 +3199,21 @@ mod inline_reg_tests {
     }
 }
 
+#[test]
+fn detects_only_modules_inside_dependency_cycles() {
+    let modules = vec![
+        (1, "const a = __wake_require__(2);".to_string()),
+        (2, "const b = __wake_require__(1);".to_string()),
+        (3, "const c = __wake_require__(2);".to_string()),
+        (4, "const d = __wake_require__(4);".to_string()),
+    ];
+    let cyclic = cyclic_module_ids(&modules);
+    assert!(cyclic.contains(&1));
+    assert!(cyclic.contains(&2));
+    assert!(!cyclic.contains(&3));
+    assert!(cyclic.contains(&4));
+}
+
 /// 紧凑模块 body 中的运行时引用：`__wake_require__`→`_r`，自由变量 `exports`→`$`。
 ///
 /// **`module.exports` 必须改写成 `m.exports`，不能是 `m.$`**：包装器
@@ -3441,8 +3461,89 @@ fn strip_standalone_requires(body: &str) -> String {
     result
 }
 
+/// 返回处于依赖环中的模块 id。循环模块必须保留独立 factory，不能共享 concat exports。
+fn cyclic_module_ids(modules: &[(u32, String)]) -> FxHashSet<u32> {
+    let ids: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
+    let mut edges: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut reverse: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (id, body) in modules {
+        let mut targets = Vec::new();
+        for_each_require(body, |_, target, _| {
+            if ids.contains(&target) {
+                targets.push(target);
+            }
+        });
+        targets.sort_unstable();
+        targets.dedup();
+        for target in &targets {
+            reverse.entry(*target).or_default().push(*id);
+        }
+        edges.insert(*id, targets);
+    }
+
+    fn visit(
+        id: u32,
+        graph: &FxHashMap<u32, Vec<u32>>,
+        seen: &mut FxHashSet<u32>,
+        order: &mut Vec<u32>,
+    ) {
+        if !seen.insert(id) {
+            return;
+        }
+        if let Some(next) = graph.get(&id) {
+            for target in next {
+                visit(*target, graph, seen, order);
+            }
+        }
+        order.push(id);
+    }
+
+    fn collect(
+        id: u32,
+        graph: &FxHashMap<u32, Vec<u32>>,
+        seen: &mut FxHashSet<u32>,
+        component: &mut Vec<u32>,
+    ) {
+        if !seen.insert(id) {
+            return;
+        }
+        component.push(id);
+        if let Some(next) = graph.get(&id) {
+            for target in next {
+                collect(*target, graph, seen, component);
+            }
+        }
+    }
+
+    let mut order = Vec::with_capacity(modules.len());
+    let mut seen = FxHashSet::default();
+    let mut sorted_ids = ids.iter().copied().collect::<Vec<_>>();
+    sorted_ids.sort_unstable();
+    for id in sorted_ids {
+        visit(id, &edges, &mut seen, &mut order);
+    }
+
+    let mut cyclic = FxHashSet::default();
+    seen.clear();
+    while let Some(id) = order.pop() {
+        if seen.contains(&id) {
+            continue;
+        }
+        let mut component = Vec::new();
+        collect(id, &reverse, &mut seen, &mut component);
+        let self_cycle = component.len() == 1
+            && edges
+                .get(&component[0])
+                .is_some_and(|targets| targets.contains(&component[0]));
+        if component.len() > 1 || self_cycle {
+            cyclic.extend(component);
+        }
+    }
+    cyclic
+}
 /// 拓扑排序：按依赖顺序排列模块，确保依赖方先于被依赖方执行。
-/// 解析各模块 body 中的 `_r(N)` 调用构建依赖图，忽略对自身和不在集合内的引用。
+/// 解析各模块 body 中的 require 调用构建依赖图，忽略对自身和不在集合内的引用。
+
 fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
     let id_set: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
 
@@ -3610,9 +3711,15 @@ fn emit(
 
             // 整体重新赋值 `module.exports` 的 CJS 模块必须留作**独立注册模块**：它们会把
             // `module.exports` 换成新对象，与 concat 共享的 `$` 分裂成两个导出对象。
+            let cyclic = cyclic_module_ids(&filtered);
             let mut standalone: FxHashSet<u32> = filtered
                 .iter()
-                .filter(|(id, body)| *id != entry_id && reassigns_module_exports(body))
+                .filter(|(id, body)| {
+                    *id != entry_id
+                        && (reassigns_module_exports(body)
+                            || cyclic.contains(id)
+                            || !block_infos.get(id).is_some_and(|info| info.is_esm))
+                })
                 .map(|(id, _)| *id)
                 .collect();
 
@@ -4372,12 +4479,16 @@ var __wake_interop_star = __wake__.interopStar;
 "#;
 
 /// 分配/复用模块 id（无 worklist；纯 id 记账）。
-fn assign_id(path_to_id: &mut FxHashMap<PathBuf, u32>, next_id: &mut u32, path: PathBuf) -> u32 {
-    if let Some(&id) = path_to_id.get(&path) {
+fn assign_id(
+    module_to_id: &mut FxHashMap<ModuleIdentity, u32>,
+    next_id: &mut u32,
+    identity: ModuleIdentity,
+) -> u32 {
+    if let Some(&id) = module_to_id.get(&identity) {
         return id;
     }
     let id = *next_id;
     *next_id += 1;
-    path_to_id.insert(path, id);
+    module_to_id.insert(identity, id);
     id
 }

@@ -71,6 +71,71 @@ fn direct_and_incremental_default_paths_are_equivalent() {
 }
 
 #[test]
+fn package_identity_flattens_same_version_and_keeps_multiple_versions() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "const a=require('a');const b=require('b');const c=require('c');module.exports=[a,b,c];",
+        ),
+        (
+            "node_modules/a/package.json",
+            r#"{"name":"a","version":"1.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/a/index.js",
+            "module.exports=require('shared');",
+        ),
+        (
+            "node_modules/a/node_modules/shared/package.json",
+            r#"{"name":"shared","version":"1.2.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/a/node_modules/shared/index.js",
+            "module.exports='shared-v1';",
+        ),
+        (
+            "node_modules/b/package.json",
+            r#"{"name":"b","version":"1.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/b/index.js",
+            "module.exports=require('shared');",
+        ),
+        (
+            "node_modules/b/node_modules/shared/package.json",
+            r#"{"name":"shared","version":"1.2.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/b/node_modules/shared/index.js",
+            "module.exports='shared-v1';",
+        ),
+        (
+            "node_modules/c/package.json",
+            r#"{"name":"c","version":"1.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/c/index.js",
+            "module.exports=require('shared');",
+        ),
+        (
+            "node_modules/c/node_modules/shared/package.json",
+            r#"{"name":"shared","version":"2.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/c/node_modules/shared/index.js",
+            "module.exports='shared-v2';",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.module_count, 6, "同版本 shared 应折叠为一个模块");
+    assert_eq!(output.bundle.matches("shared-v1").count(), 1);
+    assert_eq!(output.bundle.matches("shared-v2").count(), 1);
+}
+
+#[test]
 fn minify_uses_dot_access_for_identifier_export_names() {
     let fs = MemoryFileSystem::from_files([(
         "src/index.js",

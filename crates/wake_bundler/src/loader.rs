@@ -199,9 +199,14 @@ fn should_shim_react_jsx_dev_runtime(fs: &dyn FileSystem, path: &Path, opts: &Lo
 
 fn react_jsx_dev_runtime_compat_source() -> String {
     r#"'use strict';
-var runtime = require('./jsx-runtime.js');
-exports.Fragment = runtime.Fragment;
+Object.defineProperty(exports, 'Fragment', {
+  enumerable: true,
+  get: function() {
+    return require('./jsx-runtime.js').Fragment;
+  }
+});
 exports.jsxDEV = function(type, props, key, isStaticChildren) {
+  var runtime = require('./jsx-runtime.js');
   return (isStaticChildren ? runtime.jsxs : runtime.jsx)(type, props, key);
 };
 "#
@@ -770,7 +775,17 @@ mod tests {
         )
         .expect("load");
         assert!(loaded.source.contains("require('./jsx-runtime.js')"));
+        assert!(
+            loaded
+                .source
+                .contains("Object.defineProperty(exports, 'Fragment'")
+        );
         assert!(loaded.source.contains("runtime.jsxs : runtime.jsx"));
+        assert!(
+            loaded.source.find("exports.jsxDEV").unwrap()
+                < loaded.source.find("var runtime").unwrap(),
+            "runtime 必须在 jsxDEV 调用时延迟获取"
+        );
         assert!(!loaded.source.contains("jsxDEV = undefined"));
     }
 
