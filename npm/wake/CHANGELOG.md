@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.11
+
+- Added production compatibility for dependencies published with React jsxDEV, including Yarn Plug'n'Play package layouts.
+- Documented and verified relative public_path = "./" assets for Electron and file:// builds.
+
 ## 0.1.10
 
 - Preserved mangled names for exports declared through object and array destructuring.
