@@ -3625,6 +3625,35 @@ fn collect_reads(program: &Program) -> FxHashSet<Atom> {
     c.reads
 }
 
+fn collect_pattern_renames(
+    pattern: &Pattern,
+    rename: &FxHashMap<Span, Atom>,
+    out: &mut FxHashMap<Atom, Atom>,
+) {
+    match pattern {
+        Pattern::Ident(id) => {
+            if let Some(&new_name) = rename.get(&id.span) {
+                out.insert(id.name, new_name);
+            }
+        }
+        Pattern::Array(array) => {
+            for element in array.elements.iter().flatten() {
+                collect_pattern_renames(element, rename, out);
+            }
+        }
+        Pattern::Object(object) => {
+            for property in object.properties.iter() {
+                collect_pattern_renames(&property.value, rename, out);
+            }
+            if let Some(rest) = &object.rest {
+                collect_pattern_renames(&rest.argument, rename, out);
+            }
+        }
+        Pattern::Assignment(assignment) => collect_pattern_renames(&assignment.left, rename, out),
+        Pattern::Rest(rest) => collect_pattern_renames(&rest.argument, rename, out),
+    }
+}
+
 fn collect_module_renames(
     program: &Program,
     rename: Option<&FxHashMap<Span, Atom>>,
@@ -3636,11 +3665,7 @@ fn collect_module_renames(
     let mut collect = |stmt: &Statement| match stmt {
         Statement::VariableDeclaration(decl) => {
             for item in decl.declarations.iter() {
-                if let Pattern::Ident(id) = &item.id
-                    && let Some(&new_name) = rename.get(&id.span)
-                {
-                    out.insert(id.name, new_name);
-                }
+                collect_pattern_renames(&item.id, rename, &mut out);
             }
         }
         Statement::FunctionDeclaration(function) => {

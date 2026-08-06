@@ -4917,6 +4917,50 @@ fn runtime_factory_names_avoid_existing_import_bindings() {
     );
 }
 
+#[test]
+fn destructured_export_uses_the_mangled_binding_name() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/dep.js",
+            "const source={cancel(){return 7}};const {cancel:cancelFrame}=source;export {cancelFrame};",
+        ),
+        (
+            "src/index.js",
+            "import {cancelFrame} from './dep.js';export default cancelFrame();",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_destructured_export_mangle_regression");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if((r.default??r)!==7)process.exit(2);",
+        bundle_path.to_string_lossy()
+    );
+    let run = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 /// 回归：`module.exports = X` 形态的 CJS 模块在 minify 路径下必须真正导出。
 ///
 /// 曾因 `compact_body_names` 把 `module.exports` 改写成 `m.$`（`$` 是 exports 的**值**，
