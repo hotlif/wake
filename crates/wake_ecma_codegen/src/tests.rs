@@ -2250,6 +2250,26 @@ fn elim_gen(src: &str) -> String {
 }
 
 #[test]
+fn used_trailing_parameter_after_destructured_parameter_is_preserved() {
+    let js = elim_gen(
+        "function useInitialMotionValues({transformTemplate},visualState){return useMemo(()=>{const state=createHtmlRenderState();buildHTMLStyles(state,visualState,transformTemplate);return Object.assign({},state.vars,state.style)},[visualState])}\n\
+         function useStyle(props,visualState){const styleProp=props.style||{};const style={};copyRawValuesOnly(style,styleProp,props);Object.assign(style,useInitialMotionValues(props,visualState));return style}",
+    );
+    assert!(
+        js.contains("function useStyle(props,visualState)"),
+        "used trailing parameter was removed:\n{js}"
+    );
+}
+
+#[test]
+fn unused_trailing_parameter_is_preserved_during_minification() {
+    let js = elim_gen("function keepArity(first,second){return first}");
+    assert!(
+        js.contains("function keepArity(first,second)"),
+        "parameter list was trimmed:\n{js}"
+    );
+}
+#[test]
 fn unused_using_declaration_is_never_eliminated() {
     // `using _ = acquire()` 的**零引用**形态恰是 using 最典型的用法：绑定虽无人读，
     // 但离开作用域时的 dispose 调用是可观测副作用，声明必须原样保留。

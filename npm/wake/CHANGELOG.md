@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13
+
+- Preserved complete function parameter lists during production minification, preventing undefined bindings in Motion and Framer Motion bundles.
+
 ## 0.1.12
 
 - Flattened installed dependencies by npm name, version, and package subpath while preserving distinct versions, peer contexts, Yarn PnP virtual instances, and local workspaces.

@@ -14,7 +14,7 @@ for (let index = 0; index < 5; index += 1) {
     encoding: 'utf8',
   })
   const elapsed = performance.now() - started
-  if (result.status !== 0 || result.stdout.trim() !== '0.1.12') {
+  if (result.status !== 0 || result.stdout.trim() !== '0.1.13') {
     throw new Error(
       `wake --version failed: ${result.stderr || result.stdout || result.status}`,
     )

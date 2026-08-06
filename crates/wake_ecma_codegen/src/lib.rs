@@ -2426,28 +2426,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     }
 
     fn emit_params(&mut self, params: &AVec<Pattern>) {
-        let end = if let Some(ctx) = self.minify_ctx
-            && ctx.minify
-        {
-            let mut last_used = params.len();
-            for (i, p) in params.iter().enumerate().rev() {
-                if let Pattern::Ident(id) = p {
-                    // 按参数声明 span 判断（非名字）：否则某处同名参数未使用时，会把
-                    // 本函数在用的末尾参数一并删掉（曾致 react-dom `jf is not defined`）。
-                    if ctx.unused_var_spans.contains(&id.span) {
-                        last_used = i;
-                        continue;
-                    }
-                }
-                break;
-            }
-            last_used
-        } else {
-            params.len()
-        };
-
+        // Preserve the complete parameter list even under minification. Removing trailing
+        // parameters saves very little and is unsafe when an earlier transformation leaves a
+        // live reference that is not represented by the variable-analysis side table. In that
+        // case codegen used to emit a renamed reference without its binding (`f is not defined`).
         self.push("(");
-        for i in 0..end {
+        for i in 0..params.len() {
             if i > 0 {
                 self.punct(", ");
             }
