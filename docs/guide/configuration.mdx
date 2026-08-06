@@ -136,11 +136,21 @@ root_dir = "packages/web"
 
 ### public_path
 
+部署到网站子路径：
+
 ```toml
 public_path = "/console/"
 ```
 
-只用于普通应用。文档站使用 `[docs].base_path`，不要混用。
+通过 Electron 的 `file://` 或其他本地文件方式加载普通应用：
+
+```toml
+public_path = "./"
+```
+
+相对模式会让入口脚本、CSS、异步 chunk 和独立资源使用 `./` 前缀。
+
+`public_path` 只用于普通应用。文档站使用 `[docs].base_path`，不要混用。
 
 ## 浏览器目标
 

@@ -124,6 +124,15 @@ mod tests {
     }
 
     #[test]
+    fn relative_public_path_is_preserved_for_file_protocol_builds() {
+        let scripts = vec!["main.js".to_string()];
+        let styles = vec!["main.css".to_string()];
+        let html = generate(None, &inputs(&scripts, &styles, "./"));
+        assert!(html.contains("src=\"./main.js\""));
+        assert!(html.contains("href=\"./main.css\""));
+    }
+
+    #[test]
     fn custom_template_preserved() {
         let tpl = "<html><head><title>Mine</title></head><body><main></main></body></html>";
         let scripts = vec!["b.js".to_string()];

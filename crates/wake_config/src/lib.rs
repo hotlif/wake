@@ -36,7 +36,7 @@ pub const DEFAULT_BROWSER_TARGETS: [(&str, &str); 5] = [
 pub struct Config {
     /// 项目根（相对配置文件所在目录）。缺省 = 配置所在目录 / cwd。
     pub root_dir: Option<String>,
-    /// 静态资源公共路径，部署到子路径时设置（如 `/app/`）。缺省 `/`。
+    /// 静态资源公共路径（如 `/app/`）；Electron/file URL 使用 `./`。缺省 `/`。
     pub public_path: Option<String>,
     /// 路径别名（前缀 → 相对根的路径）。CLI 会叠加默认 `@`→`src`、`@@`→根。
     pub alias: BTreeMap<String, String>,

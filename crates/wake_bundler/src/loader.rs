@@ -28,6 +28,10 @@ pub(crate) struct LoadOptions {
     pub asset_inline_limit: usize,
     /// 资源 URL 的 `publicPath` 前缀（如 `/` 或 `/app/`）。
     pub public_path: String,
+    /// 当前是否使用 JSX development runtime。
+    pub jsx_dev: bool,
+    /// JSX automatic runtime 包名。生产兼容层当前只针对 React。
+    pub jsx_import_source: &'static str,
 }
 
 impl Default for LoadOptions {
@@ -36,6 +40,8 @@ impl Default for LoadOptions {
             extract_css: false,
             asset_inline_limit: usize::MAX,
             public_path: "/".to_string(),
+            jsx_dev: false,
+            jsx_import_source: "react",
         }
     }
 }
@@ -98,6 +104,14 @@ pub(crate) fn load_source(
         ))
     } else {
         let text = fs.read_to_string(path)?;
+        if should_shim_react_jsx_dev_runtime(fs, path, opts) {
+            return Ok(Loaded {
+                source: react_jsx_dev_runtime_compat_source(),
+                source_type: SourceType::Module,
+                assets: Vec::new(),
+                css: None,
+            });
+        }
         if is_css_path(path) {
             // CSS 里的 `url()`（`@font-face` 的字体、`background-image` 的图片）先落地为真实
             // 产物并改写 URL——dev/prod、普通 CSS/CSS Modules 四条路径统一处理。
@@ -161,6 +175,37 @@ pub(crate) fn load_source(
             })
         }
     }
+}
+
+/// React 的 production `jsx-dev-runtime` 会按设计导出 `jsxDEV = undefined`。某些已经发布的
+/// 第三方包却错误地把开发期 `jsxDEV` 调用保留到了 ESM/CJS 产物中。生产构建加载 React 的
+/// package entry 时，用官方 `jsx-runtime` 的 `jsx/jsxs` 做兼容转接，避免依赖压缩后的模块 id。
+fn should_shim_react_jsx_dev_runtime(fs: &dyn FileSystem, path: &Path, opts: &LoadOptions) -> bool {
+    if opts.jsx_dev || opts.jsx_import_source != "react" {
+        return false;
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some("jsx-dev-runtime.js") {
+        return false;
+    }
+    let Some(package_root) = path.parent() else {
+        return false;
+    };
+    fs.read_to_string(&package_root.join("package.json"))
+        .ok()
+        .and_then(|source| serde_json::from_str::<serde_json::Value>(&source).ok())
+        .and_then(|json| json.get("name")?.as_str().map(str::to_owned))
+        .is_some_and(|name| name == "react")
+}
+
+fn react_jsx_dev_runtime_compat_source() -> String {
+    r#"'use strict';
+var runtime = require('./jsx-runtime.js');
+exports.Fragment = runtime.Fragment;
+exports.jsxDEV = function(type, props, key, isStaticChildren) {
+  return (isStaticChildren ? runtime.jsxs : runtime.jsx)(type, props, key);
+};
+"#
+    .to_string()
 }
 
 /// [`prepare_css`] 的产出：`@import` 依赖 + `url()` 已改写的 CSS + 引出的资源产物
@@ -707,6 +752,58 @@ mod tests {
         );
         assert_eq!(windows.exports, slash.exports);
         assert_eq!(windows.code, slash.code);
+    }
+
+    #[test]
+    fn production_react_jsx_dev_runtime_uses_official_runtime_compatibility() {
+        let fs = MemoryFileSystem::from_files([
+            ("node_modules/react/package.json", r#"{"name":"react"}"#),
+            (
+                "node_modules/react/jsx-dev-runtime.js",
+                "exports.jsxDEV = undefined;",
+            ),
+        ]);
+        let loaded = load_source(
+            &fs,
+            Path::new("node_modules/react/jsx-dev-runtime.js"),
+            &LoadOptions::default(),
+        )
+        .expect("load");
+        assert!(loaded.source.contains("require('./jsx-runtime.js')"));
+        assert!(loaded.source.contains("runtime.jsxs : runtime.jsx"));
+        assert!(!loaded.source.contains("jsxDEV = undefined"));
+    }
+
+    #[test]
+    fn development_and_custom_jsx_runtimes_are_not_shimmed() {
+        let fs = MemoryFileSystem::from_files([
+            ("node_modules/react/package.json", r#"{"name":"react"}"#),
+            (
+                "node_modules/react/jsx-dev-runtime.js",
+                "exports.jsxDEV = original;",
+            ),
+        ]);
+        let dev = load_source(
+            &fs,
+            Path::new("node_modules/react/jsx-dev-runtime.js"),
+            &LoadOptions {
+                jsx_dev: true,
+                ..LoadOptions::default()
+            },
+        )
+        .expect("dev load");
+        assert_eq!(dev.source, "exports.jsxDEV = original;");
+
+        let custom = load_source(
+            &fs,
+            Path::new("node_modules/react/jsx-dev-runtime.js"),
+            &LoadOptions {
+                jsx_import_source: "preact",
+                ..LoadOptions::default()
+            },
+        )
+        .expect("custom load");
+        assert_eq!(custom.source, "exports.jsxDEV = original;");
     }
 
     #[test]

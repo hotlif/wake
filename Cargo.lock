@@ -2719,6 +2719,7 @@ version = "0.1.10"
 dependencies = [
  "criterion",
  "crossbeam-utils",
+ "serde_json",
  "wake_cache",
  "wake_common",
  "wake_css",

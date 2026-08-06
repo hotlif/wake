@@ -101,6 +101,12 @@ public_path = "/"
 public_path = "/console/"
 ```
 
+Electron 或 `file://` 本地页面：
+
+```toml
+public_path = "./"
+```
+
 它会影响异步 chunk 和资源 URL。常见错误是 HTML 能打开，但动态页面或图片请求到了域名根。
 
 文档站使用独立配置：

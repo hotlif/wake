@@ -92,7 +92,7 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 }
 
 fn persistent_source_variant(jsx_salt: u64, target_fingerprint: u64) -> u64 {
-    target_fingerprint ^ jsx_salt.rotate_left(23) ^ 0x7061_7468_2d76_3100
+    target_fingerprint ^ jsx_salt.rotate_left(23) ^ 0x7061_7468_2d76_3200
 }
 
 fn new_codegen_exec_counts() -> CodegenExecCounts {
@@ -708,6 +708,9 @@ impl IncrementalBundler {
         let next = JsxRuntimeOptions { dev, import_source };
         if self.jsx != next {
             self.reset_parse_graph();
+            // loader 会在 React production 下为错误发布的 jsxDEV 依赖生成兼容入口；
+            // 长生命周期 bundler 切换 dev/prod 后不能复用另一口径的已加载源码。
+            self.load_cache.lock().unwrap().clear();
         }
         self.jsx = next;
         self
@@ -1056,6 +1059,8 @@ impl IncrementalBundler {
             extract_css: self.extract_css,
             asset_inline_limit: self.asset_inline_limit,
             public_path: self.public_path.clone(),
+            jsx_dev: self.jsx.dev,
+            jsx_import_source: self.jsx.import_source,
         });
 
         let mut path_to_id: FxHashMap<PathBuf, u32> =

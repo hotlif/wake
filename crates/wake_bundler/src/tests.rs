@@ -4232,6 +4232,100 @@ fn pnp_fixture() -> MemoryFileSystem {
     ])
 }
 
+/// PnP 包位置不含 `node_modules`：验证 JSX 兼容识别基于 package identity，而非目录布局。
+fn pnp_jsxdev_fixture() -> MemoryFileSystem {
+    let pnp_data = r#"{
+        "enableTopLevelFallback": true,
+        "fallbackExclusionList": [],
+        "fallbackPool": [],
+        "packageRegistryData": [
+            [null, [[null, {
+                "packageLocation": "./",
+                "packageDependencies": [["broken-ui", "npm:1.0.0"]],
+                "linkType": "SOFT"
+            }]]],
+            ["broken-ui", [["npm:1.0.0", {
+                "packageLocation": "./.pnp-store/broken-ui/",
+                "packageDependencies": [
+                    ["broken-ui", "npm:1.0.0"],
+                    ["react", "npm:19.2.8"]
+                ],
+                "linkType": "HARD"
+            }]]],
+            ["react", [["npm:19.2.8", {
+                "packageLocation": "./.pnp-store/react/",
+                "packageDependencies": [["react", "npm:19.2.8"]],
+                "linkType": "HARD"
+            }]]]
+        ]
+    }"#;
+    let pnp_cjs = format!("#!/usr/bin/env node\nconst RAW_RUNTIME_STATE =\n'{pnp_data}';\n");
+    MemoryFileSystem::from_files([
+        (".pnp.cjs".to_string(), pnp_cjs),
+        (
+            "src/index.js".to_string(),
+            "import value from 'broken-ui';export {value};".to_string(),
+        ),
+        (
+            ".pnp-store/broken-ui/package.json".to_string(),
+            r#"{"name":"broken-ui","module":"index.mjs"}"#.to_string(),
+        ),
+        (
+            ".pnp-store/broken-ui/index.mjs".to_string(),
+            "import{jsxDEV as h}from'react/jsx-dev-runtime';export default h('button',{children:'PnP'},'pnp-key',false);".to_string(),
+        ),
+        (
+            ".pnp-store/react/package.json".to_string(),
+            r#"{"name":"react","main":"index.js"}"#.to_string(),
+        ),
+        (
+            ".pnp-store/react/jsx-dev-runtime.js".to_string(),
+            "exports.jsxDEV=undefined;".to_string(),
+        ),
+        (
+            ".pnp-store/react/jsx-runtime.js".to_string(),
+            "exports.Fragment='fragment';exports.jsx=(type,props,key)=>({factory:'jsx',type,props,key});exports.jsxs=(type,props,key)=>({factory:'jsxs',type,props,key});".to_string(),
+        ),
+    ])
+}
+
+#[test]
+fn pnp_production_dependency_jsx_dev_runtime_is_compatible() {
+    let mut bundler = IncrementalBundler::new(Arc::new(pnp_jsxdev_fixture()));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(bundler.is_pnp(), "应检测到 .pnp.cjs 并启用 PnP");
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("jsxDEV=undefined"), "{}", out.bundle);
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_pnp_production_jsxdev_compat_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bundle.cjs");
+    std::fs::write(&path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.value.factory!=='jsx'||r.value.type!=='button'||r.value.key!=='pnp-key'||r.value.props.children!=='PnP')process.exit(2);",
+        path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={} bundle={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
 #[test]
 fn pnp_project_resolves_via_manifest() {
     let mut bundler = IncrementalBundler::new(Arc::new(pnp_fixture()));
@@ -5292,6 +5386,89 @@ fn jsx_dev_runtime_wired_through_bundler() {
     assert!(!out2.bundle.contains("lineNumber"), "prod 不应带源位置");
 }
 
+/// 已发布依赖即使错误地保留 `jsxDEV`，production bundle 也必须通过官方 jsx/jsxs 运行。
+#[test]
+fn production_dependency_jsx_dev_runtime_is_compatible() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "node_modules/react/package.json",
+            r#"{"name":"react","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/react/jsx-dev-runtime.js",
+            "'use strict';module.exports=require('./cjs/react-jsx-dev-runtime.production.js');",
+        ),
+        (
+            "node_modules/react/cjs/react-jsx-dev-runtime.production.js",
+            "exports.Fragment='fragment';exports.jsxDEV=undefined;",
+        ),
+        (
+            "node_modules/react/jsx-runtime.js",
+            "'use strict';module.exports=require('./cjs/react-jsx-runtime.production.js');",
+        ),
+        (
+            "node_modules/react/cjs/react-jsx-runtime.production.js",
+            "exports.Fragment='fragment';exports.jsx=(type,props,key)=>({factory:'jsx',type,props,key});exports.jsxs=(type,props,key)=>({factory:'jsxs',type,props,key});",
+        ),
+        (
+            "node_modules/broken-esm/package.json",
+            r#"{"name":"broken-esm","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/broken-esm/index.mjs",
+            "import{jsxDEV as h,Fragment as F}from'react/jsx-dev-runtime';\n\
+             export const single=h('span',{ref:'single-ref'},'single-key',false);\n\
+             export const multiple=h(F,{children:['a','b']},'multi-key',true);",
+        ),
+        (
+            "node_modules/broken-cjs/package.json",
+            r#"{"name":"broken-cjs","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/broken-cjs/index.js",
+            "const h=require('react/jsx-dev-runtime').jsxDEV;exports.value=h('i',{children:'cjs'},'cjs-key',false);",
+        ),
+        (
+            "src/index.js",
+            "import{single,multiple}from'broken-esm';import{value}from'broken-cjs';export{single,multiple,value};",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(!out.bundle.contains("jsxDEV=undefined"), "{}", out.bundle);
+    assert!(!out.bundle.contains("};,,;function __wake_interop_default"));
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_production_jsxdev_compat_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bundle.cjs");
+    std::fs::write(&path, &out.bundle).unwrap();
+    let script = format!(
+        "const r=require({:?});if(r.single.factory!=='jsx'||r.single.key!=='single-key'||r.single.props.ref!=='single-ref'||r.multiple.factory!=='jsxs'||r.multiple.type!=='fragment'||r.value.factory!=='jsx'||r.value.key!=='cjs-key')process.exit(2);",
+        path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={} bundle={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
 /// TC39 **Stage-3 装饰器**端到端：编译产物在 node 中的**可观察行为**须与 tsc 一致。
 ///
 /// 覆盖：类/方法/静态方法/取值器/设值器/字段/静态字段装饰器、多装饰器倒序应用、
@@ -5771,6 +5948,16 @@ fn public_path_defaults_and_escapes() {
     let out = b.build(Path::new("src/index.js"));
     assert!(
         out.bundle.contains("__wake__.publicPath = \"/\";"),
+        "{}",
+        out.bundle
+    );
+
+    // Electron/file URL 使用显式相对前缀；异步 chunk 不能退回域名或文件系统根目录。
+    let mut b = IncrementalBundler::new(Arc::new(split_fixture()));
+    b.enable_code_splitting().set_public_path("./");
+    let out = b.build(Path::new("src/index.js"));
+    assert!(
+        out.bundle.contains("__wake__.publicPath = \"./\";"),
         "{}",
         out.bundle
     );
