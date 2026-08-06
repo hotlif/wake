@@ -3543,7 +3543,6 @@ fn cyclic_module_ids(modules: &[(u32, String)]) -> FxHashSet<u32> {
 }
 /// 拓扑排序：按依赖顺序排列模块，确保依赖方先于被依赖方执行。
 /// 解析各模块 body 中的 require 调用构建依赖图，忽略对自身和不在集合内的引用。
-
 fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
     let id_set: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
 

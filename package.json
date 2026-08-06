@@ -1,7 +1,7 @@
 {
   "name": "wake-workspace",
   "private": true,
-  "version": "0.1.11",
+  "version": "0.1.12",
   "type": "module",
   "workspaces": [
     "npm/wake"

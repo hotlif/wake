@@ -192,7 +192,7 @@ jobs:
             grep -qx 'package/LICENSE-APACHE' <<<"$list"
             grep -qx 'package/README.md' <<<"$list"
             native_count="$(grep -Ec '\.node$' <<<"$list" || true)"
-            if [[ "$archive" == *crab-dev-wake-0.1.11.tgz ]]; then
+            if [[ "$archive" == *crab-dev-wake-0.1.12.tgz ]]; then
               test "$native_count" -eq 0
               test "$(stat -c%s "$archive")" -le 524288
             else
@@ -200,7 +200,7 @@ jobs:
               test "$(stat -c%s "$archive")" -le 15728640
             fi
             version="$(tar -xOzf "$archive" package/package.json | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).version))")"
-            test "$version" = '0.1.11'
+            test "$version" = '0.1.12'
           done
       - uses: actions/attest-build-provenance@v3
         if: github.event.repository.visibility == 'public'
@@ -233,7 +233,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish root package last
-        run: npm publish ./artifacts/crab-dev-wake-0.1.11.tgz --access public --provenance=${{ github.event.repository.visibility == 'public' }}
+        run: npm publish ./artifacts/crab-dev-wake-0.1.12.tgz --access public --provenance=${{ github.event.repository.visibility == 'public' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -262,7 +262,7 @@ jobs:
           cd smoke
           npm init -y
           for attempt in {1..12}; do
-            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.11; then
+            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.12; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then
@@ -294,7 +294,7 @@ jobs:
           cd smoke
           npm init -y
           for attempt in {1..12}; do
-            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.11; then
+            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.12; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then

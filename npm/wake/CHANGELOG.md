@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.12
+
+- Flattened installed dependencies by npm name, version, and package subpath while preserving distinct versions, peer contexts, Yarn PnP virtual instances, and local workspaces.
+- Preserved CommonJS and cyclic-module factory lifecycles and resolved the React jsxDEV runtime lazily to prevent cycle-captured exports.
+
 ## 0.1.11
 
 - Added production compatibility for dependencies published with React jsxDEV, including Yarn Plug'n'Play package layouts.
