@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.14
+
+- Rebuilt the Components workbench with published Crab UI controls, responsive drawers, compact toolbars, source dialogs, and mobile-first layouts.
+- Changed the default documentation locale to Simplified Chinese while preserving explicit English configuration.
+- Updated the React documentation fixture to consume the published Crab Button package and use Chinese-first content.
+
 ## 0.1.13
 
 - Preserved complete function parameter lists during production minification, preventing undefined bindings in Motion and Framer Motion bundles.
