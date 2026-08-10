@@ -1,7 +1,8 @@
 [docs]
 source_dir = "docs"
-title = "Wake Components"
-description = "Native React component documentation"
+title = "Wake 组件库"
+description = "原生 React 组件文档"
+locale = "zh-CN"
 logo = "/logo.svg"
 repository_url = "https://github.com/hotlif/wake"
 base_path = "/"

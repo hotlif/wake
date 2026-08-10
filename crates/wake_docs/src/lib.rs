@@ -69,7 +69,7 @@ impl Default for DocsOptions {
             source_dir: PathBuf::from("docs"),
             title: "Wake Docs".to_string(),
             description: String::new(),
-            locale: "en-US".to_string(),
+            locale: "zh-CN".to_string(),
             logo: None,
             repository_url: None,
             base_path: "/".to_string(),
@@ -3204,12 +3204,25 @@ const count: number = 2
         let config = fs::read_to_string(generated.generated_dir.join("config.tsx")).unwrap();
         assert!(config.contains(r#""basePath":"/crab/""#));
         assert!(config.contains(r#""logo":"/crab/logo.svg""#));
-        assert!(config.contains(r#""locale":"en-US""#));
+        assert!(config.contains(r#""locale":"zh-CN""#));
         assert_eq!(
             public_asset_url("/crab/", "https://cdn.example/logo.svg"),
             "https://cdn.example/logo.svg"
         );
     }
+
+    #[test]
+    fn docs_options_default_to_chinese_and_allow_explicit_english() {
+        assert_eq!(DocsOptions::default().locale, "zh-CN");
+
+        let options = DocsOptions {
+            locale: "en-US".to_string(),
+            ..DocsOptions::default()
+        };
+        let config = render_config(Path::new("."), &options, DocsMode::Site).unwrap();
+        assert!(config.contains(r#""locale":"en-US""#));
+    }
+
     #[test]
     fn component_mode_builds_a_typed_demo_catalog_without_mdx() {
         let root = fixture();

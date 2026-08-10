@@ -10,6 +10,7 @@
     "components:build": "cargo run -q --manifest-path ../../Cargo.toml -p wake_cli -- docs build . --mode components"
   },
   "dependencies": {
+    "@crab-dev/rc-button": "^0.0.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

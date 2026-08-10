@@ -134,7 +134,7 @@ impl Default for Docs {
             source_dir: "docs".to_string(),
             title: "Wake Docs".to_string(),
             description: String::new(),
-            locale: "en-US".to_string(),
+            locale: "zh-CN".to_string(),
             logo: None,
             repository_url: None,
             base_path: "/".to_string(),
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(default.source_dir, "docs");
         assert_eq!(default.base_path, "/");
         assert_eq!(default.default_theme, "system");
-        assert_eq!(default.locale, "en-US");
+        assert_eq!(default.locale, "zh-CN");
         assert_eq!(default.accent_color, "#8b5cf6");
 
         let config: Config = toml::from_str(
@@ -585,7 +585,7 @@ mod tests {
             [docs]
             source_dir = "website"
             title = "Crab UI"
-            locale = "zh-CN"
+            locale = "en-US"
             base_path = "/crab/"
             preview = "docs/preview.tsx"
             theme_css = "docs/theme.css"
@@ -596,7 +596,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.docs.source_dir, "website");
         assert_eq!(config.docs.title, "Crab UI");
-        assert_eq!(config.docs.locale, "zh-CN");
+        assert_eq!(config.docs.locale, "en-US");
         assert_eq!(config.docs.preview.as_deref(), Some("docs/preview.tsx"));
         assert_eq!(config.docs.default_theme, "dark");
     }

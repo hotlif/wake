@@ -1,6 +1,0 @@
-.fixture-button { border: 0; border-radius: 9px; padding: 10px 16px; color: white; background: #8b5cf6; font: 600 14px system-ui; cursor: pointer; }
-.fixture-button:hover { filter: brightness(1.06); }
-.fixture-button-neutral { color: #27272a; background: #e4e4e7; }
-.fixture-button-danger { background: #e11d48; }
-.fixture-button.is-compact { padding: 6px 10px; font-size: 12px; }
-.fixture-button:disabled { cursor: not-allowed; opacity: .5; }
