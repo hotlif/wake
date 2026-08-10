@@ -44,6 +44,28 @@
   "engines": {
     "node": ">=22.14 <27"
   },
+  "dependencies": {
+    "@crab-dev/rc-alert": "^0.0.2",
+    "@crab-dev/rc-button": "^0.0.2",
+    "@crab-dev/rc-dialog": "^0.0.2",
+    "@crab-dev/rc-drawer": "^0.0.2",
+    "@crab-dev/rc-empty": "^0.0.2",
+    "@crab-dev/rc-line-edit": "^0.0.4",
+    "@crab-dev/rc-number-edit": "^0.0.2",
+    "@crab-dev/rc-segmented": "^0.0.2",
+    "@crab-dev/rc-select": "^0.0.3",
+    "@crab-dev/rc-switch": "^0.0.2",
+    "@crab-dev/rc-tag": "^0.0.2",
+    "@crab-dev/rc-text-edit": "^0.0.1",
+    "@crab-dev/rc-tooltip": "^0.0.2",
+    "@crab-dev/rc-tree": "^0.1.2",
+    "@linaria/core": "^8.1.1",
+    "lucide-react": "^1.23.0"
+  },
+  "peerDependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
   "optionalDependencies": {
     "@crab-dev/wake-darwin-arm64": "0.1.13",
     "@crab-dev/wake-darwin-x64": "0.1.13",

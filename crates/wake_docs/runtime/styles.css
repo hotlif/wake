@@ -1,6 +1,12 @@
 :root {
   color-scheme: light dark;
   --wake-accent: #8b5cf6;
+  /* Components mode follows Crab UI's neutral brand palette. Keep this
+     separate from a documentation site's configurable accent color. */
+  --workbench-accent: oklch(.220 .005 286);
+  --workbench-accent-hover: oklch(.320 .008 286);
+  --workbench-accent-active: oklch(.140 .004 286);
+  --workbench-on-accent: oklch(.980 .002 286);
   --bg: #fafafa;
   --surface: #ffffff;
   --surface-raised: #ffffff;
@@ -11,13 +17,52 @@
   --border: #e5e5e7;
   --border-strong: #d4d4d8;
   --shadow: 0 18px 48px rgba(24, 24, 27, .10), 0 2px 8px rgba(24, 24, 27, .06);
+  /* Crab UI semantic token bridge. Keep component packages theme-aware without
+     coupling Wake to generated Linaria class names. */
+  --token-semantic-color-background-surface: var(--surface);
+  --token-semantic-color-background-elevated: var(--surface-raised);
+  --token-semantic-color-background-overlay: rgba(9, 9, 11, .54);
+  --token-semantic-color-background-hover-subtle: var(--surface-muted);
+  --token-semantic-color-background-active-subtle: oklch(.900 .004 286);
+  --token-semantic-color-background-disabled: color-mix(in srgb, var(--surface-muted) 88%, var(--surface));
+  --token-semantic-color-border-default: var(--border);
+  --token-semantic-color-border-hover: var(--border-strong);
+  --token-semantic-color-border-focus: var(--workbench-accent-active);
+  --token-semantic-color-brand-primary: var(--workbench-accent);
+  --token-semantic-color-brand-primary-hover: var(--workbench-accent-hover);
+  --token-semantic-color-brand-primary-active: var(--workbench-accent-active);
+  --token-semantic-color-text-primary: var(--text);
+  --token-semantic-color-text-secondary: var(--text-soft);
+  --token-semantic-color-text-tertiary: var(--text-faint);
+  --token-semantic-color-text-disabled: var(--text-faint);
+  --token-semantic-color-text-on-brand: var(--workbench-on-accent);
+  --token-semantic-color-text-link: var(--workbench-accent);
+  --token-semantic-color-text-link-hover: var(--workbench-accent-hover);
+  --token-semantic-color-feedback-error: #dc2626;
+  --token-semantic-color-feedback-error-background: color-mix(in srgb, #dc2626 9%, var(--surface-raised));
+  --token-semantic-color-feedback-warning: #d97706;
+  --token-semantic-color-feedback-warning-background: color-mix(in srgb, #d97706 9%, var(--surface-raised));
+  --token-semantic-color-feedback-success: #16a34a;
+  --token-semantic-color-feedback-success-background: color-mix(in srgb, #16a34a 9%, var(--surface-raised));
+  --token-semantic-color-feedback-info: #2563eb;
+  --token-semantic-color-feedback-info-background: color-mix(in srgb, #2563eb 9%, var(--surface-raised));
+  --token-semantic-color-border-error: var(--token-semantic-color-feedback-error);
+  --token-semantic-color-fill-inactive: var(--border-strong);
+  --token-semantic-shadow-focus-ring: 0 0 0 3px color-mix(in srgb, var(--workbench-accent) 28%, transparent);
+  --token-semantic-shadow-overlay: var(--shadow);
+  --dropdown-container-background-color: var(--surface-raised);
+  --dropdown-container-box-shadow: var(--shadow);
+  --switch-handle-background-color: var(--surface-raised);
+  --switch-disabled-handle-background-color: var(--border-strong);
   --topbar: 64px;
   --sidebar: 260px;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
+:root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0c0c0e;
   --surface: #111114;
   --surface-raised: #17171b;
@@ -28,14 +73,34 @@
   --border: #29292f;
   --border-strong: #3b3b44;
   --shadow: 0 20px 60px rgba(0, 0, 0, .48);
+  --workbench-accent: oklch(.950 .003 286);
+  --workbench-accent-hover: oklch(.900 .004 286);
+  --workbench-accent-active: oklch(.980 .002 286);
+  --workbench-on-accent: oklch(.140 .004 286);
+  --token-semantic-color-background-active-subtle: oklch(.320 .008 286);
+  --token-semantic-color-feedback-error: #fb7185;
+  --token-semantic-color-feedback-error-background: color-mix(in srgb, #fb7185 14%, var(--surface-raised));
+  --token-semantic-color-feedback-warning: #fbbf24;
+  --token-semantic-color-feedback-warning-background: color-mix(in srgb, #fbbf24 14%, var(--surface-raised));
+  --token-semantic-color-feedback-success: #4ade80;
+  --token-semantic-color-feedback-success-background: color-mix(in srgb, #4ade80 14%, var(--surface-raised));
+  --token-semantic-color-feedback-info: #60a5fa;
+  --token-semantic-color-feedback-info-background: color-mix(in srgb, #60a5fa 14%, var(--surface-raised));
+  --switch-disabled-handle-background-color: color-mix(in srgb, #fff 42%, var(--surface));
 }
+.workbench-shell,
+.demo-frame-root { --wake-accent: var(--workbench-accent); }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; background: var(--bg); }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.7; }
 button, input { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 a { color: inherit; }
-button:focus-visible, a:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--wake-accent); outline-offset: 2px; }
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+.api-heading input:focus-visible,
+.search-input input:focus-visible { outline: 2px solid var(--wake-accent); outline-offset: 2px; }
 ::selection { color: #fff; background: var(--wake-accent); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 

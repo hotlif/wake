@@ -40,6 +40,16 @@ test('reports platform details when the optional native package is missing', () 
   const env = { ...process.env }
   delete env.WAKE_NATIVE_PATH
   const script = `
+    const Module = require('node:module')
+    const load = Module._load
+    Module._load = function (request) {
+      if (/^@crab-dev\\/wake-(?:win32|linux|darwin)-/.test(request)) {
+        const error = new Error('Simulated missing Wake native package')
+        error.code = 'MODULE_NOT_FOUND'
+        throw error
+      }
+      return load.apply(this, arguments)
+    }
     try { require('./npm/wake/index.cjs') }
     catch (error) { console.log(error.code); console.log(error.message) }
   `
@@ -259,7 +269,7 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   })
   assert.equal(workbench.mode, 'components')
   assert.deepEqual(workbench.routes, [])
-  assert.ok(workbench.demos.some((demo) => demo.component === 'Button' && demo.controlCount > 0))
+  assert.ok(workbench.demos.some((demo) => demo.component === '按钮' && demo.controlCount > 0))
   await Promise.all([
     access(join(componentsOutdir, 'index.html')),
     access(join(componentsOutdir, '404.html')),
