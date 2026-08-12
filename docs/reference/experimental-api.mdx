@@ -1,0 +1,156 @@
++++
+title = "实验 API"
+description = "使用 @crab-dev/wake/experimental 的词法、解析、转换和语义分析原语"
+group = "参考"
+group_order = 30
+order = 30
+slug = "/reference/experimental-api"
+status = "experimental"
++++
+
+# 实验 API
+
+`@crab-dev/wake/experimental` 暴露 Wake 编译器的低层原语。它与主包一起发布，但可能在 `0.x` 版本中调整类型、输出结构和行为，不应作为长期持久化格式。
+
+```js
+import {
+  analyze,
+  parse,
+  tokenize,
+  transform,
+} from "@crab-dev/wake/experimental";
+```
+
+CommonJS 使用：
+
+```js
+const { parse, transform } = require("@crab-dev/wake/experimental");
+```
+
+## ParseOptions
+
+所有入口都接受源码字符串；需要指定模块语义时传入：
+
+```ts
+interface ParseOptions {
+  sourceType?: "module" | "script" | "commonjs";
+}
+```
+
+`sourceType` 默认为 `module`。需要顶层脚本语义时选择 `script`；当前 `commonjs` 使用相同的脚本语法模式，不会执行 Node.js 包装器。该接口不根据文件扩展名推断 TypeScript/JSX 模式。当前 experimental parser 面向 JavaScript 语法，项目级 TypeScript/JSX 编译使用稳定的 build API。
+
+## tokenize
+
+```ts
+function tokenize(source: string, options?: ParseOptions): TokenizeResult
+```
+
+```js
+const result = tokenize("export const answer = 42", {
+  sourceType: "module",
+});
+
+for (const token of result.tokens) {
+  console.log(token.kind, token.start, token.end);
+}
+```
+
+每个 token 包含 `kind`、字节区间、原始文本和 `newlineBefore`。结果同时返回词法诊断。字节区间不是 UTF-16 字符索引，编辑器集成应根据源码编码换算。
+
+## parse 与 ParsedModule
+
+```ts
+function parse(source: string, options?: ParseOptions): ParsedModule
+```
+
+`parse()` 返回持有原生 arena AST 的不透明句柄，而不是可序列化 JavaScript AST：
+
+```js
+using parsed = parse(source, { sourceType: "module" });
+console.log(parsed.summary);
+```
+
+```ts
+class ParsedModule {
+  readonly disposed: boolean;
+  readonly summary: ParseSummary;
+  dispose(): void;
+  [Symbol.dispose](): void;
+}
+```
+
+生命周期规则：
+
+- 使用 `using` 或在 `finally` 中调用 `dispose()`；
+- `dispose()` 可重复调用；
+- 释放后读取 `summary`、调用 `transform()` 或 `analyze()` 会抛出错误；
+- 句柄不能克隆、写入磁盘或传给 Worker；
+- 不要依赖进程退出或垃圾回收代替显式释放。
+
+```js
+const parsed = parse(source, { sourceType: "module" });
+try {
+  console.log(parsed.summary);
+} finally {
+  parsed.dispose();
+}
+```
+
+`ParseSummary` 包含源码字节数、语句数、依赖数量、顶层 await 标志和诊断，用于工具展示与快速检查，不承诺完整 AST 结构。
+
+## transform
+
+```ts
+function transform(
+  sourceOrModule: string | ParsedModule,
+  options?: ParseOptions,
+): TransformResult
+```
+
+```js
+using parsed = parse("const value = 1");
+const output = transform(parsed);
+console.log(output.code, output.diagnostics);
+```
+
+`TransformResult` 包含生成代码和诊断。`transform()` 也可直接接收源码字符串；此时它会创建并自动释放临时句柄。操作现有 `ParsedModule` 时，同一个句柄的并发调用不受支持。
+
+## analyze
+
+```ts
+function analyze(
+  sourceOrModule: string | ParsedModule,
+  options?: ParseOptions,
+): SemanticResult
+```
+
+语义结果包含 scope、symbol 和 reference 的扁平记录：
+
+```js
+using parsed = parse("const value = 1; console.log(value)");
+
+const semantic = analyze(parsed);
+console.log(semantic.scopes, semantic.symbols, semantic.references);
+```
+
+ID 只在本次结果中有意义。不要跨解析结果拼接 ID，也不要把当前数组布局作为稳定数据库 schema。
+
+## 错误处理
+
+实验 API 是同步函数。无效参数、已关闭句柄或原生 panic 会直接抛出 `WakeError`。解析器可以在返回结果的同时携带可恢复诊断；调用方应检查 `diagnostics`，不能只依赖是否抛错。
+
+## 什么时候使用
+
+适合：
+
+- 编辑器、代码检查器和构建工具原型；
+- 调查 lexer/parser/transform 的具体行为；
+- 与 Wake 版本一起锁定并测试的内部工具。
+
+不适合：
+
+- 需要稳定 AST schema 的公共插件协议；
+- 跨进程、Worker 或持久化缓存传递解析句柄；
+- 只需要构建应用或文档的普通项目。此时使用稳定的[Node.js API](./node-api)或 CLI。
+
+升级 Wake 前，应运行覆盖 token kind、summary、语义记录和生成代码的回归测试；实验子路径不会承诺主 API 同等级别的 0.x 兼容性。

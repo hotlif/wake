@@ -17,7 +17,7 @@
 9. [生产构建](guide/production.mdx)：配置部署路径、缓存、静态路由和 CI。
 10. [排错手册](reference/troubleshooting.mdx)：按构建阶段定位常见问题。
 
-需要查命令时阅读 [CLI 参考](reference/cli.mdx)，不理解术语时阅读 [术语表](reference/glossary.mdx)。Crab UI 的安装、导入、样式与版本升级见 [Crab UI 组件指南](guide/crab-components.mdx)。
+需要查命令时阅读 [CLI 参考](reference/cli.mdx)，从 JavaScript 调用 Wake 时阅读 [Node.js API](reference/node-api.mdx)，低层编译器原语见[实验 API](reference/experimental-api.mdx)。不理解术语时阅读 [术语表](reference/glossary.mdx)。Crab UI 的安装、导入、样式与版本升级见 [Crab UI 组件指南](guide/crab-components.mdx)。
 
 ## 本地运行文档站
 
@@ -59,11 +59,11 @@ docs/
 ├─ getting-started/          # 入门路线和零基础教程
 ├─ guide/                    # 开发、配置、生产和组件使用
 ├─ docs-system/              # MDX、Demo、API 和完整实战
-├─ reference/                # CLI、排错和术语表
+├─ reference/                # CLI、Node API、排错和术语表
 ├─ examples/                 # Demo 与 Props 提取使用的真实源码
 └─ site/                     # 文档站 React 组件、Preview 与主题样式
 ```
 
 新增页面时必须提供 Frontmatter，并确保 `slug` 唯一。代码示例应能够运行；涉及组件 Props 时优先使用 JSDoc 说明、`@default` 和 `@deprecated`，以便 `<API>` 自动生成准确内容。
 
-只把面向 Wake 使用者、会参与文档站构建的内容放进本目录。编译器设计、基准数据、测试策略和阶段性结论应写入 `engineering/`，避免站点源码再次混入内部记录。
+只把面向 Wake 使用者、会参与文档站构建的内容放进本目录。编译器设计、基准数据、测试策略和阶段性结论写入 [`engineering/`](../engineering/README.md)，避免站点源码再次混入内部记录。

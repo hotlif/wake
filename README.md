@@ -144,6 +144,8 @@ await server.waitUntilClosed();
 - `buildDocs()` 和 `startDocsDevServer()`：构建或开发文档站；
 - `WakeError`：提供稳定错误码、路径和结构化诊断。
 
+完整的选项、返回值、资源生命周期、服务器事件和取消语义见 [Node.js API 参考](docs/reference/node-api.mdx)。词法分析、解析、转换和语义分析接口见[实验 API](docs/reference/experimental-api.mdx)。
+
 词法分析、解析、转换和语义分析 API 位于 `@crab-dev/wake/experimental`。其中 `ParsedModule` 是需要显式释放的原生句柄，不能克隆、持久化或传入 Worker。
 
 ## Wake Docs
@@ -224,6 +226,7 @@ docs/                # 中文使用文档与示例
 fixtures/            # 应用、文档和压力测试项目
 npm/                 # npm 主包与各平台原生包
 scripts/             # 版本、打包和启动时间检查
+engineering/         # 架构、设计、测试、性能、审计与路线图
 ```
 
 编译核心与 CLI / 服务器边缘层保持分离；`wake_app` 负责让 CLI 和 Node.js API 共享同一套构建、配置和诊断行为。
@@ -250,6 +253,8 @@ npm run npm:pack:check
 ```
 
 CI 还会在 Linux 和 Windows 上测试 workspace，并使用 Miri 验证手写 `unsafe`、使用 Loom 验证并发 single-flight 协议，以及编译全部 benchmark。
+
+当前系统边界、依赖方向和质量门禁见[工程文档](engineering/README.md)。
 
 ## 已知边界
 

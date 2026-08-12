@@ -22,6 +22,17 @@ Compiler primitives are intentionally isolated under
 `@crab-dev/wake/experimental`. A `ParsedModule` is an opaque, disposable
 native handle and cannot be cloned, persisted, or transferred to a Worker.
 
+The stable API also includes in-memory `bundle()`, incremental
+`createBuildContext()`, documentation builds and development servers. Build
+and server operations accept `AbortSignal`; long-lived contexts and servers
+support explicit close methods and JavaScript disposal protocols.
+
+Full documentation:
+
+- [Node.js API](https://github.com/hotlif/wake/blob/canary/docs/reference/node-api.mdx)
+- [Experimental API](https://github.com/hotlif/wake/blob/canary/docs/reference/experimental-api.mdx)
+- [CLI reference](https://github.com/hotlif/wake/blob/canary/docs/reference/cli.mdx)
+
 Wake supports Node.js 22.14 through 26 on Windows x64, Linux glibc x64/arm64,
 and macOS x64/arm64. Installing the package never compiles Rust code and does
 not run a postinstall script.
