@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.15
+
+- Preserved explicitly unset component Props, non-default Args, selected demos, and viewport state across copied URLs, refreshes, and browser navigation.
+- Recovered component previews after control changes or resets and reported React render errors and unhandled promise rejections in the workbench.
+- Prevented the Windows CLI and Node-API library from racing to write the same debug PDB during workspace builds.
+- Added complete stable and experimental Node.js API references, restored versioned engineering documentation, and enforced documentation routes and links in CI.
+
 ## 0.1.14
 
 - Rebuilt the Components workbench with published Crab UI controls, responsive drawers, compact toolbars, source dialogs, and mobile-first layouts.
