@@ -92,6 +92,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # 只确认 bench 骨架可编译可跑（--no-run）。回归门禁待基线历史后用 critcmp 接入。
       - run: cargo bench --workspace --no-run
+
+  docs:
+    name: documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      - run: npm ci --ignore-scripts
+      - run: npm run docs:check
+      - run: npm run docs:build
+
   node:
     name: node ${{ matrix.node }} / win32-x64
     runs-on: windows-latest
