@@ -2,15 +2,16 @@
 //!
 //! DESIGN §10：记忆化并发任务图 = Salsa 红绿失效算法 × turbo-tasks 全并发执行 × 自研工作窃取执行器。
 //!
-//! **当前进度（Phase 2.5，进行中）**：
+//! **当前能力（历史阶段索引见 PLAN §2.5）**：
 //! - [`spike`]：单线程红绿 + 早期截断的正确性证明（PLAN §0.6，历史留存）。
 //! - [`engine`] + [`vc`]：正式引擎核心——`TaskId` / `Vc<T>` 句柄 / 类型擦除 slot 表 /
-//!   thread-local 依赖收集 / 红绿失效 + 早期截断（PLAN §2.5.1–§2.5.3，**单线程**）。
+//!   thread-local 依赖收集 / 红绿失效 + 早期截断 / 分片并发 slot / single-flight。
 //! - [`task`]：`#[wake::task]` 过程宏，把纯函数登记为增量任务。
 //! - [`executor`]：自研工作窃取执行器（PLAN §2.5.5 / DESIGN §10.5），并行执行独立任务扇出。
+//! - 并发协议由 Loom 验证，循环依赖检测与无增量纯并行降级由 Gate-2 测试覆盖。
 //!
-//! 尚未落地：执行器与引擎的并发整合（分片 slot 表 + single-flight 并发红绿）、
-//! generation 取消（§2.5.4）、loom 并发正确性（§2.5.6）。
+//! 产品层取消由 `wake_app::CancellationToken` / Node `AbortSignal` 在安全点协作完成；引擎本体
+//! 尚未提供抢占任意正在执行任务的通用 generation 取消。
 //!
 //! ## 用法速览
 //!

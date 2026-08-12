@@ -21,8 +21,9 @@
 //! 依赖记录纪律（同 spike）：只记直接读（[`record_dependency`]）；深校验路径不登记调用者依赖。
 //! 任务体内的子任务调用与 `Vc::read` 经 thread-local「当前引擎」定位，须在 [`Engine::enter`] 内。
 //!
-//! **未完（§2.5.6/§2.5.4）**：循环依赖检测（环会死锁）、generation 取消。single-flight 协议的
-//! 并发正确性由 loom 独立验证（`tests/loom_single_flight.rs`），端到端语义由并发对拍压测覆盖。
+//! 同线程任务栈上的循环依赖会被检测并拒绝；single-flight 协议的并发正确性由 loom 独立验证
+//! （`tests/loom_single_flight.rs`），端到端语义由并发对拍压测覆盖。引擎本体不提供抢占任意
+//! 正在执行任务的通用 generation 取消，产品层在构建安全点协作取消。
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};

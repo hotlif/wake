@@ -1,7 +1,7 @@
 //! Atom interner 吞吐微基准（criterion）。
 //!
 //! 运行：`cargo bench -p wake_common`
-//! 真正的性能门禁（回归 >5% 红灯，PLAN §1）在 CI 接入。
+//! 当前 CI 只执行 benchmark 编译冒烟；历史回归基线建立后再接入自动阈值。
 //!
 //! 单线程 `intern_1000_fresh`/`_hit` 之外，`intern_contended_*` 用多线程度量分片锁竞争——
 //! 这是评估 tier-3 interner 改动（`Mutex`→`RwLock` 读快路径 / miss 路径单分配 + 单哈希）的

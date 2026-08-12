@@ -13,13 +13,14 @@ fixtures/
     └── assert.mjs            # 产物在 node/浏览器执行后的运行结果断言
 ```
 
-## 用法（P3 起）
+## 用法
 
 每个 fixture 是一次完整的 `wake build fixtures/<case>/input/<entry>`：
 1. 打包产物落到临时目录；
 2. 校验产物结构（chunk/manifest）；
-3. **实际执行产物**（node 加载或 headless 浏览器）并断言运行结果——这是「真的能打包一个
-   React 应用」的硬验收，不是只比字符串（DESIGN §11）。
+3. **实际执行产物**（Node.js 加载或浏览器验证）并断言运行结果，而不只比较生成字符串。
+
+哪些变更必须补 fixture，以及本地与 CI 的验证组合，见[工程测试规范](../engineering/TESTING.md)。
 
 ## 现有 fixture
 

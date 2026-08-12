@@ -1,7 +1,7 @@
-//! 词法吞吐基准（criterion，MB/s）——PLAN §1.6 / Gate-1a 底线 ≥150MB/s（SWAR 层）。
+//! 词法吞吐基准（criterion，MB/s）——PLAN §1.6。
 //!
 //! 运行：`cargo bench -p wake_ecma_lexer`
-//! 双值口径（PLAN §1）：底线 150MB/s（本层）/ 目标 400MB/s（P7 显式 SIMD 回补）。
+//! 数值必须结合提交、工具链和测试机器记录；当前 CI 只执行 benchmark 编译冒烟。
 
 use std::hint::black_box;
 

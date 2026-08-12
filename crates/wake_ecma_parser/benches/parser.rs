@@ -1,4 +1,4 @@
-//! 解析吞吐基准（criterion，MB/s）——PLAN §4 Gate-1 底线 ≥80MB/s（目标 ≥150MB/s）。
+//! 解析吞吐基准（criterion，MB/s）——PLAN §4；当前 CI 只执行 benchmark 编译冒烟。
 //!
 //! 运行：`cargo bench -p wake_ecma_parser`
 

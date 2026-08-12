@@ -1,4 +1,4 @@
-//! 工作窃取执行器加速比 demo（PLAN §2.5.5 DoD：8 核加速比 >6x）。
+//! 工作窃取执行器并行扇出 demo（PLAN §2.5.5）；实际加速比必须连同机器与负载测量。
 //!
 //! 运行：`cargo run --release -p wake_turbo --example work_stealing`
 //!

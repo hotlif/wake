@@ -1,4 +1,4 @@
-//! 合成项目打包基准（PLAN §3 Gate-3：1k 模块 <1.5s）。
+//! 合成项目打包基准（PLAN §3）；结果需连同机器、工具链和缓存状态记录。
 //!
 //! 运行：`cargo bench -p wake_bundler --bench bundle`
 //!
