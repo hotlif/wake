@@ -16,12 +16,14 @@ import Tree, { LoadStateType, NodeType, type Node as TreeNode } from "@crab-dev/
 import { Check, Code2, Copy, Menu, Monitor, Moon, RotateCcw, SlidersHorizontal, Sun } from "lucide-react";
 import { demos } from "@wake/docs/registry.ts";
 import { siteConfig } from "@wake/docs/config.tsx";
+import { applyLocationArgs, equalValue, locationHash, readLocationHash } from "./components-state.mjs";
 
 type DemoRecord = (typeof demos)[number];
 type Viewport = "responsive" | "tablet" | "mobile";
 type Theme = "light" | "dark" | "system";
 type Args = Record<string, unknown>;
 type WorkbenchTreeNode = TreeNode & { demoId?: string; searchText: string };
+type LocationState = { id?: string; args: Args; unset: string[]; viewport: Viewport };
 
 const isChinese = siteConfig.locale.toLowerCase().startsWith("zh");
 const text = (english: string, chinese: string) => isChinese ? chinese : english;
@@ -170,15 +172,6 @@ function controlDefaults(demo: DemoRecord): Args {
   );
 }
 
-function equalValue(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true;
-  try {
-    return JSON.stringify(left) === JSON.stringify(right);
-  } catch {
-    return false;
-  }
-}
-
 function copyText(value: string): Promise<void> {
   if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
   const textarea = document.createElement("textarea");
@@ -199,37 +192,8 @@ function copyText(value: string): Promise<void> {
   }
 }
 
-function changedArgs(args: Args, defaults: Args): Args {
-  return Object.fromEntries(
-    Object.entries(args).filter(([name, value]) => !equalValue(value, defaults[name])),
-  );
-}
-
-function readLocation(): { id?: string; args: Args; viewport: Viewport } {
-  const match = window.location.hash.match(/^#\/components\/([^?]*)(?:\?(.*))?$/);
-  if (!match) return { args: {}, viewport: "responsive" };
-  let args: Args = {};
-  const params = new URLSearchParams(match[2] || "");
-  try {
-    const parsed = JSON.parse(params.get("args") || "{}");
-    if (isPlainObject(parsed)) args = parsed;
-  } catch {
-    args = {};
-  }
-  const rawViewport = params.get("viewport");
-  const viewport = rawViewport === "tablet" || rawViewport === "mobile"
-    ? rawViewport
-    : "responsive";
-  return { id: decodeURIComponent(match[1]), args, viewport };
-}
-
-function locationHash(id: string, args: Args, defaults: Args, viewport: Viewport): string {
-  const params = new URLSearchParams();
-  const changed = changedArgs(args, defaults);
-  if (Object.keys(changed).length) params.set("args", JSON.stringify(changed));
-  if (viewport !== "responsive") params.set("viewport", viewport);
-  const query = params.toString();
-  return "#/components/" + encodeURIComponent(id) + (query ? "?" + query : "");
+function readLocation(): LocationState {
+  return readLocationHash(window.location.hash) as LocationState;
 }
 
 function useTheme() {
@@ -579,24 +543,36 @@ export function ComponentsApp() {
     const syncLocation = () => {
       const next = readLocation();
       if (next.id && demos.some((demo) => demo.id === next.id)) {
+        if (next.id === selectedId && loadedId === next.id) {
+          setArgs(applyLocationArgs(defaults, next));
+        } else {
+          setSourceOpen(false);
+        }
         setSelectedId(next.id);
         setViewport(next.viewport);
       }
     };
     window.addEventListener("hashchange", syncLocation);
-    return () => window.removeEventListener("hashchange", syncLocation);
-  }, []);
+    window.addEventListener("popstate", syncLocation);
+    return () => {
+      window.removeEventListener("hashchange", syncLocation);
+      window.removeEventListener("popstate", syncLocation);
+    };
+  }, [defaults, loadedId, selectedId]);
   useEffect(() => {
     if (!selected) return;
     setLoadedId("");
     setError("");
+    setSource("");
     let active = true;
     Promise.all([selected.load(), selected.loadSource()]).then(([module, sourceModule]) => {
       if (!active) return;
       const metaArgs = serializableArgs(module.meta?.args);
       const nextDefaults = { ...controlDefaults(selected), ...metaArgs.args };
       const currentLocation = readLocation();
-      const nextArgs = { ...nextDefaults, ...(currentLocation.id === selected.id ? currentLocation.args : {}) };
+      const nextArgs = currentLocation.id === selected.id
+        ? applyLocationArgs(nextDefaults, currentLocation)
+        : nextDefaults;
       setDefaults(nextDefaults);
       setArgs(nextArgs);
       setViewport(currentLocation.id === selected.id ? currentLocation.viewport : "responsive");
@@ -620,6 +596,7 @@ export function ComponentsApp() {
     const receive = (event: MessageEvent) => {
       if (event.source !== frameRef.current?.contentWindow || !event.data) return;
       if (event.data.type === "wake:ready") {
+        setError("");
         frameRef.current?.contentWindow?.postMessage({ type: "wake:theme", theme: resolved }, "*");
         frameRef.current?.contentWindow?.postMessage({ type: "wake:args", id: selected?.id, args }, "*");
       }
@@ -644,6 +621,7 @@ export function ComponentsApp() {
     history.pushState(null, "", locationHash(demo.id, {}, {}, "responsive"));
   };
   const updateArg = (name: string, value: unknown) => {
+    setError("");
     setArgs((current) => {
       const next = { ...current };
       if (value === undefined) delete next[name];
@@ -785,7 +763,10 @@ export function ComponentsApp() {
                 type="button"
                 icon={<RotateCcw size={16} aria-hidden="true" />}
                 aria-label={resetActionLabel}
-                onClick={() => setArgs(defaults)}
+                onClick={() => {
+                  setError("");
+                  setArgs(defaults);
+                }}
               />
             </Tooltip>
             <Tooltip title={themeTooltip} placement="bottom">

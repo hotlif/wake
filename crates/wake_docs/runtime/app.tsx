@@ -488,10 +488,41 @@ function NotFound() {
   return <div className="not-found"><span>404</span><h1>{text("Page not found", "页面不存在")}</h1><p>{text("The document may have moved or is still being written.", "文档可能已移动，或仍在编写中。")}</p><a href={siteConfig.basePath}>{text("Back to documentation", "返回文档首页")}</a></div>;
 }
 
+type DemoErrorBoundaryProps = {
+  resetKey: number;
+  onError: (reason: unknown) => void;
+  children: React.ReactNode;
+};
+
+class DemoErrorBoundary extends React.Component<DemoErrorBoundaryProps, { error: string }> {
+  state = { error: "" };
+
+  static getDerivedStateFromError(reason: unknown) {
+    return { error: String((reason as any)?.stack || reason) };
+  }
+
+  componentDidCatch(reason: unknown) {
+    this.props.onError(reason);
+  }
+
+  componentDidUpdate(previous: Readonly<DemoErrorBoundaryProps>) {
+    if (previous.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: "" });
+    }
+  }
+
+  render() {
+    return this.state.error
+      ? <div className="frame-error">{this.state.error}</div>
+      : this.props.children;
+  }
+}
+
 function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
   const demo = demos.find((item) => item.id === id);
   const [module, setModule] = useState<any>(null);
   const [args, setArgs] = useState<Record<string, unknown>>({});
+  const [argsRevision, setArgsRevision] = useState(0);
   const [error, setError] = useState("");
   useEffect(() => {
     if (!demo) return;
@@ -517,14 +548,24 @@ function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
       if (event.data.type === "wake:theme") document.documentElement.dataset.theme = event.data.theme;
       if (event.data.type === "wake:args" && (!event.data.id || event.data.id === id)) {
         const nextArgs = event.data.args;
-        if (nextArgs && typeof nextArgs === "object" && !Array.isArray(nextArgs)) setArgs(nextArgs);
+        if (nextArgs && typeof nextArgs === "object" && !Array.isArray(nextArgs)) {
+          setArgs(nextArgs);
+          setArgsRevision((current) => current + 1);
+        }
       }
     };
     const onError = (event: ErrorEvent) => send({ type: "wake:error", error: event.error?.stack || event.message });
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => send({ type: "wake:error", error: event.reason?.stack || String(event.reason) });
     window.addEventListener("message", receive);
     window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
     document.documentElement.dataset.theme = resolved;
-    return () => { resize.disconnect(); window.removeEventListener("message", receive); window.removeEventListener("error", onError); };
+    return () => {
+      resize.disconnect();
+      window.removeEventListener("message", receive);
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+    };
   }, [id, resolved]);
   useEffect(() => {
     if (module) window.parent.postMessage({ type: "wake:ready", id }, "*");
@@ -533,7 +574,13 @@ function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
   if (error) { window.parent.postMessage({ type: "wake:error", error }, "*"); return <div className="frame-error">{error}</div>; }
   if (!module) return <div className="frame-loading">{text("Loading preview…", "正在加载预览…")}</div>;
   const Component = module.default;
-  return <div className="demo-frame-root"><Preview><Component {...args} /></Preview></div>;
+  const reportError = (reason: unknown) => window.parent.postMessage({
+    type: "wake:error",
+    error: String((reason as any)?.stack || reason),
+  }, "*");
+  return <DemoErrorBoundary resetKey={argsRevision} onError={reportError}>
+    <div className="demo-frame-root"><Preview><Component {...args} /></Preview></div>
+  </DemoErrorBoundary>;
 }
 
 export function App() {

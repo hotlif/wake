@@ -19,6 +19,7 @@ use std::sync::{
 
 const RUNTIME_APP: &str = include_str!("../runtime/app.tsx");
 const RUNTIME_COMPONENTS: &str = include_str!("../runtime/components.tsx");
+const RUNTIME_COMPONENT_STATE: &str = include_str!("../runtime/components-state.mjs");
 const RUNTIME_ENTRY: &str = include_str!("../runtime/entry.tsx");
 const RUNTIME_STYLE: &str = include_str!("../runtime/styles.css");
 const RUNTIME_COMPONENT_STYLE: &str = include_str!("../runtime/components.css");
@@ -378,6 +379,7 @@ pub fn generate_with_mode(
         ("config.tsx", config.as_str()),
         ("runtime/app.tsx", RUNTIME_APP),
         ("runtime/components.tsx", RUNTIME_COMPONENTS),
+        ("runtime/components-state.mjs", RUNTIME_COMPONENT_STATE),
         ("runtime/entry.tsx", RUNTIME_ENTRY),
         ("runtime/styles.css", RUNTIME_STYLE),
         ("runtime/components.css", RUNTIME_COMPONENT_STYLE),
@@ -3272,6 +3274,12 @@ const count: number = 2
             generated
                 .generated_dir
                 .join("runtime/components.tsx")
+                .is_file()
+        );
+        assert!(
+            generated
+                .generated_dir
+                .join("runtime/components-state.mjs")
                 .is_file()
         );
     }
