@@ -10,7 +10,7 @@ description = "Node-API bindings for Wake"
 workspace = true
 
 [lib]
-name = "wake"
+name = "wake_node"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
