@@ -24,6 +24,9 @@ npm run npm:pack:check
 npm run pnp:components:check
 ```
 
+PnP 门禁通过根工作区精确锁定的 `corepack@0.34.6` 启动 Yarn，避免依赖或覆盖 CI
+镜像中的全局 `yarn` shim。
+
 文档修改：
 
 ```bash

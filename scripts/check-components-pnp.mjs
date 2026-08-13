@@ -93,6 +93,8 @@ function escapeRegExp(value) {
 }
 
 const fixtureManifest = JSON.parse(await readFile(join(fixture, 'package.json'), 'utf8'))
+const corepackVersion = runCorepack(['--version'], { capture: true }).stdout.trim()
+assert.equal(corepackVersion, '0.34.6', 'The PnP gate must run with Corepack 0.34.6')
 assert.equal(fixtureManifest.packageManager, 'yarn@4.16.0')
 assert.deepEqual(
   Object.keys(fixtureManifest.dependencies).sort(),
@@ -223,6 +225,7 @@ try {
 
   completed = true
   console.log(JSON.stringify({
+    corepack: corepackVersion,
     yarn: yarnVersion,
     packages: [...packed.values()].map((metadata) => metadata.filename).sort(),
     css: cssFile,

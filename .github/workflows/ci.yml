@@ -141,9 +141,6 @@ jobs:
       - run: npm run npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/wake,npm/wake-win32-x64-msvc
-      - name: Install Corepack for the Yarn PnP gate
-        if: matrix.node == 24
-        run: npm install --global corepack@0.34.6
       - name: Verify Components under Yarn PnP
         if: matrix.node == 24
         run: npm run pnp:components:check
