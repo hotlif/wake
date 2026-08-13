@@ -31,7 +31,9 @@ jobs:
       - name: Read package version
         id: package-version
         shell: bash
-        run: echo "version=$(node -p \"require('./npm/wake/package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(node -p 'require("./npm/wake/package.json").version')"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - run: npm run versions:check
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
