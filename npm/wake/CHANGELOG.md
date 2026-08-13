@@ -7,6 +7,7 @@
 - Preserved configured Demo accent colors independently from the neutral workbench theme.
 - Added a Yarn 4.16 Plug'n'Play release gate that packs all six local npm packages and verifies the Components runtime, hashed CSS link, and direct and transitive component styles.
 - Preserved ESM default and re-exported bindings in minified code-split builds while retaining correct CommonJS default and namespace interop.
+- Made dev-server startup wait for file-watcher registration, eliminating missed immediate edits and surfacing watcher initialization failures to API callers.
 
 ## 0.1.15
 

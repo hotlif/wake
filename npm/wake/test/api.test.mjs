@@ -173,12 +173,7 @@ test('emits rebuild events and releases the port on idempotent close', async () 
   server.on('closed', () => closedEvents += 1)
   try {
     assert.equal(server.url, `http://127.0.0.1:${port}/`)
-    const [initial] = await once(server, 'rebuilt', { signal: AbortSignal.timeout(10_000) })
-    assert.equal(initial.initial, true)
-    assert.ok(initial.modules > 0)
-    assert.equal(initial.updatedModules + initial.cachedModules, initial.modules)
-    assert.ok(initial.chunks > 0)
-    hmrSocket = await openHmrSocket(port)
+    const initialBuild = once(server, 'rebuilt', { signal: AbortSignal.timeout(10_000) })
     const rebuilding = once(server, 'rebuildStart', { signal: AbortSignal.timeout(10_000) })
     // Windows can emit more than one watcher notification for one append. Ignore an
     // intermediate no-op rebuild, but still time out if no substantive rebuild follows.
@@ -187,11 +182,20 @@ test('emits rebuild events and releases the port on idempotent close', async () 
       'rebuilt',
       (event) => !event.initial && event.updatedModules > 0,
     )
-    await appendFile(join(cwd, 'src/index.js'), '\nexport const changed = true;\n')
-    const [start] = await rebuilding
+    // `startDevServer()` returning is the readiness contract: an immediate write must
+    // already be covered by the native watcher, without a sleep or retry in user code.
+    const [[initial], [start], event] = await Promise.all([
+      initialBuild,
+      rebuilding,
+      rebuilt,
+      appendFile(join(cwd, 'src/index.js'), '\nexport const changed = true;\n'),
+    ])
+    assert.equal(initial.initial, true)
+    assert.ok(initial.modules > 0)
+    assert.equal(initial.updatedModules + initial.cachedModules, initial.modules)
+    assert.ok(initial.chunks > 0)
     assert.equal(start.type, 'rebuildStart')
     assert.equal(start.changedPaths.length, 1)
-    const event = await rebuilt
     assert.equal(event.type, 'rebuilt')
     assert.equal(event.initial, false)
     assert.ok(event.modules > 0)
@@ -199,6 +203,7 @@ test('emits rebuild events and releases the port on idempotent close', async () 
     assert.equal(event.cachedModules, event.modules - 1)
     assert.equal(event.updatedModules + event.cachedModules, event.modules)
     assert.ok(event.durationMs >= 0)
+    hmrSocket = await openHmrSocket(port)
   } finally {
     const closingAt = performance.now()
     try {

@@ -2845,12 +2845,14 @@ mod tests {
         assert!(
             RUNTIME_STYLE.contains(".workbench-shell { --wake-accent: var(--workbench-accent); }")
         );
-        assert!(RUNTIME_STYLE.contains(":root:has(.demo-frame-root),\n.demo-frame-root {"));
         let demo_scope = RUNTIME_STYLE
-            .split_once(":root:has(.demo-frame-root),\n.demo-frame-root {")
+            .split_once(":root:has(.demo-frame-root),")
+            .expect("Demo token scope selector")
+            .1
+            .split_once(".demo-frame-root {")
             .expect("Demo token scope")
             .1
-            .split_once("\n}")
+            .split_once('}')
             .expect("Demo token scope end")
             .0;
         assert!(

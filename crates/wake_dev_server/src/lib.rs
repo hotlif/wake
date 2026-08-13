@@ -277,7 +277,7 @@ fn run_server(
     }
 
     // —— 监听线程：独占 bundler，负责首次构建 + 增量重建 + 广播 ——
-    let (ready_tx, ready_rx) = mpsc::channel::<Option<BuildSummary>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<Option<BuildSummary>, String>>();
     let watcher_stop = Arc::clone(&stop);
     let watcher_join = {
         let bundle = bundle.clone();
@@ -309,8 +309,23 @@ fn run_server(
             })
             .expect("spawn watcher thread")
     };
-    // 等首次构建完成再开始服务（保证第一屏有产物）。
-    let summary = ready_rx.recv().ok().flatten();
+    // 等首次构建及所有监听目标注册完成再开始服务。这样 `start()` 返回即表示后续文件
+    // 变化不会落入 watcher 尚未就绪的窗口。
+    let summary = match ready_rx.recv() {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => {
+            stop.store(true, Ordering::Release);
+            let _ = watcher_join.join();
+            return Err(std::io::Error::other(error));
+        }
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            let _ = watcher_join.join();
+            return Err(std::io::Error::other(format!(
+                "Wake file watcher exited during startup: {error}"
+            )));
+        }
+    };
 
     // 浏览器展示地址：0.0.0.0 时用 localhost。
     let display_host = if host == "0.0.0.0" {
@@ -485,7 +500,7 @@ fn watch_and_rebuild(
     bundle: Arc<RwLock<BundleState>>,
     html: Arc<RwLock<String>>,
     tx: broadcast::Sender<String>,
-    ready_tx: mpsc::Sender<Option<BuildSummary>>,
+    ready_tx: mpsc::Sender<Result<Option<BuildSummary>, String>>,
     sty: Sty,
     resolve_options: ResolveOptions,
     define: Vec<(String, String)>,
@@ -514,18 +529,6 @@ fn watch_and_rebuild(
     // 该口径已混入 `content_key`，与 prod 的模块摘要缓存互不干扰。
     bundler.set_jsx_runtime(true, Box::leak(jsx_import_source.into_boxed_str()));
     let mut session = BuildSession::from_incremental(bundler);
-    // 首次构建。
-    let summary = rebuild(
-        &mut session,
-        &entry,
-        &bundle,
-        &tx,
-        true,
-        sty,
-        event_handler.as_ref(),
-    );
-    let _ = ready_tx.send(summary);
-
     // 普通应用默认监听 src；文档模式可提供 docs/src 等多个根目录。
     let default_watch_dir = {
         let src = root.join("src");
@@ -563,7 +566,9 @@ fn watch_and_rebuild(
         }) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("  {} 无法创建文件监听器：{e}", sty.err("✗"));
+                let error = format!("无法创建文件监听器：{e}");
+                eprintln!("  {} {error}", sty.err("✗"));
+                let _ = ready_tx.send(Err(error));
                 return;
             }
         };
@@ -576,13 +581,25 @@ fn watch_and_rebuild(
     watch_targets.dedup_by(|left, right| left.0 == right.0);
     for (watch_dir, mode) in watch_targets {
         if let Err(error) = watcher.watch(&watch_dir, mode) {
-            eprintln!(
-                "  {} 无法监听 {}：{error}",
-                sty.err("✗"),
-                watch_dir.display()
-            );
+            let error = format!("无法监听 {}：{error}", watch_dir.display());
+            eprintln!("  {} {error}", sty.err("✗"));
+            let _ = ready_tx.send(Err(error));
             return;
         }
+    }
+    // 先完成 watcher 注册再进行首次构建。构建期间到达的变更会进入 evt_rx，避免
+    // “已读取模块、尚未开始监听”之间的启动盲区。
+    let summary = rebuild(
+        &mut session,
+        &entry,
+        &bundle,
+        &tx,
+        true,
+        sty,
+        event_handler.as_ref(),
+    );
+    if ready_tx.send(Ok(summary)).is_err() {
+        return;
     }
     while !stop.load(Ordering::Acquire) {
         let (mut changed, mut structural) = match evt_rx.recv_timeout(Duration::from_millis(25)) {
