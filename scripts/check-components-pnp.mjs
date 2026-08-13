@@ -178,7 +178,12 @@ try {
     capture: true,
   }).stdout.trim()
   assert.equal(yarnVersion, '4.16.0', 'The PnP gate must run with Yarn 4.16.0')
-  runCorepack(['yarn', 'install'], { cwd: temporaryProject, env: environment })
+  // This is a freshly materialized fixture whose local tarball checksums vary per build, so its
+  // first install must create a temporary lockfile even when GitHub Actions defaults to immutable.
+  runCorepack(['yarn', 'install', '--no-immutable'], {
+    cwd: temporaryProject,
+    env: environment,
+  })
   assert.ok(existsSync(join(temporaryProject, '.pnp.cjs')), 'Yarn must use Plug\'n\'Play')
   runCorepack(['yarn', 'run', 'components:build'], {
     cwd: temporaryProject,
