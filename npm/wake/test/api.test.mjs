@@ -140,14 +140,20 @@ async function openHmrSocket(port) {
 
 function onceMatching(emitter, eventName, predicate, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
+    const unmatched = []
     const timeout = setTimeout(() => {
       cleanup()
-      reject(new Error(`Timed out waiting for matching ${eventName} event`))
+      reject(new Error(
+        `Timed out waiting for matching ${eventName} event; observed ${JSON.stringify(unmatched)}`,
+      ))
     }, timeoutMs)
     timeout.unref()
 
     const onEvent = (event) => {
-      if (!predicate(event)) return
+      if (!predicate(event)) {
+        unmatched.push(event)
+        return
+      }
       cleanup()
       resolve(event)
     }
@@ -167,7 +173,10 @@ test('emits rebuild events and releases the port on idempotent close', async () 
   const port = await listen(reservation)
   await new Promise((resolve) => reservation.close(resolve))
 
-  const server = await startDevServer({ cwd, port })
+  // Windows path identity is case-insensitive, while bundler cache keys are lexical. Start from
+  // an alternate spelling so this test also locks canonical project roots against notify paths.
+  const serverCwd = process.platform === 'win32' ? cwd.toUpperCase() : cwd
+  const server = await startDevServer({ cwd: serverCwd, port })
   let hmrSocket
   let closedEvents = 0
   server.on('closed', () => closedEvents += 1)

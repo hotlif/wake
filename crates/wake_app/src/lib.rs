@@ -243,14 +243,18 @@ fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
     let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
     let config = wake_config::load(&config_dir)
         .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
-    let root = normalize_path(&config.resolved_root(&config_dir));
-    if !root.is_dir() {
+    let configured_root = normalize_path(&config.resolved_root(&config_dir));
+    if !configured_root.is_dir() {
         return Err(WakeError::new(
             "WAKE_CONFIG",
-            format!("configured project root does not exist: {}", root.display()),
+            format!(
+                "configured project root does not exist: {}",
+                configured_root.display()
+            ),
         )
-        .at(&root));
+        .at(&configured_root));
     }
+    let root = canonical_project_root(&configured_root)?;
     let aliases = prepare_aliases_and_scans(&config, &root)?;
     let entry = match &options.entry {
         Some(entry) => absolute_from(&root, entry),
@@ -263,6 +267,10 @@ fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
         )
         .at(&entry));
     }
+    let entry = entry
+        .canonicalize()
+        .map(|entry| wake_common::fs::normalize(&entry))
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&entry))?;
     let outdir = absolute_from(
         &root,
         options
@@ -611,6 +619,15 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     output
+}
+
+/// Resolve one stable physical identity for project-local paths before aliases, entries, caches,
+/// and file watchers are created. On Windows this expands 8.3 paths such as `RUNNER~1`; without
+/// it, notify can report a long path that does not match the bundler's short-path cache key.
+fn canonical_project_root(path: &Path) -> Result<PathBuf, WakeError> {
+    path.canonicalize()
+        .map(|path| wake_common::fs::normalize(&path))
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(path))
 }
 
 fn sanitize_namespace(namespace: &str) -> String {
@@ -1235,7 +1252,18 @@ fn prepare_docs(
     let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
     let config = wake_config::load(&config_dir)
         .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
-    let root = normalize_path(&config.resolved_root(&config_dir));
+    let configured_root = normalize_path(&config.resolved_root(&config_dir));
+    if !configured_root.is_dir() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "configured project root does not exist: {}",
+                configured_root.display()
+            ),
+        )
+        .at(&configured_root));
+    }
+    let root = canonical_project_root(&configured_root)?;
     let mut aliases = prepare_aliases_and_scans(&config, &root)?;
     let docs = docs_options(&config, options.base_path.as_deref());
     let generated = wake_docs::generate_with_mode(&root, &docs, mode, docs_mode)
