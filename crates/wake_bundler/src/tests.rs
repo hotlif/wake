@@ -3436,7 +3436,7 @@ fn crab_component_styles_auto_import_in_dependency_order() {
         ),
         (
             "node_modules/@crab-dev/rc-card/package.json",
-            r#"{"module":"esm/index.mjs","main":"cjs/index.cjs"}"#,
+            r#"{"name":"@crab-dev/rc-card","module":"esm/index.mjs","main":"cjs/index.cjs"}"#,
         ),
         (
             "node_modules/@crab-dev/rc-card/esm/index.mjs",
@@ -3448,7 +3448,7 @@ fn crab_component_styles_auto_import_in_dependency_order() {
         ),
         (
             "node_modules/@crab-dev/rc-skeleton/package.json",
-            r#"{"module":"esm/index.mjs","main":"cjs/index.cjs"}"#,
+            r#"{"name":"@crab-dev/rc-skeleton","module":"esm/index.mjs","main":"cjs/index.cjs"}"#,
         ),
         (
             "node_modules/@crab-dev/rc-skeleton/esm/index.mjs",
@@ -3866,6 +3866,125 @@ fn code_splitting_lazy_loads_in_node() {
     );
 }
 
+#[test]
+fn minified_code_splitting_uses_esm_marker_for_complete_cjs_interop() {
+    if !node_available() {
+        eprintln!("node 不可用，跳过 minified code-splitting interop e2e");
+        return;
+    }
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import staticDefault from './static-default.js';\n\
+             import * as namespace from './namespace-default.js';\n\
+             import cjsDefault from './legacy.cjs';\n\
+             import * as cjsNamespace from './legacy.cjs';\n\
+             import cjsWithDefaultField from './default-field.cjs';\n\
+             export const eager = staticDefault() + namespace.default() + cjsDefault() + cjsNamespace.default() + cjsWithDefaultField.default();\n\
+             export const cjsNamed = cjsNamespace.named + ':' + cjsWithDefaultField.named;\n\
+             export const cjsDefaultStayedObject = typeof cjsWithDefaultField === 'object';\n\
+             export async function load() { const esm = await import('./dynamic-default.js'); const cjs = await import('./dynamic-legacy.cjs'); return [esm.default(), cjs.default(), cjs.named]; }",
+        ),
+        (
+            "src/static-default.js",
+            "export default function staticDefault() { return 1; }",
+        ),
+        (
+            "src/namespace-default.js",
+            "export default function namespaceDefault() { return 2; } export const named = 'kept';",
+        ),
+        (
+            "src/legacy.cjs",
+            "module.exports = function legacyDefault() { return 3; }; module.exports.named = 'legacy';",
+        ),
+        (
+            "src/default-field.cjs",
+            "module.exports = { default: function nestedDefault() { return 5; }, named: 'field' };",
+        ),
+        (
+            "src/dynamic-default.js",
+            "export default function dynamicDefault() { return 4; } export const named = 'dynamic';",
+        ),
+        (
+            "src/dynamic-legacy.cjs",
+            "module.exports = function dynamicLegacy() { return 6; }; module.exports.named = 'dynamic-cjs';",
+        ),
+    ]);
+    let fs = Arc::new(fs);
+    let unique = format!(
+        "wake_split_interop_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+    let _ = std::fs::remove_file(&cache_path);
+
+    // 先写入单包 minify（无 ESM marker）的模块体缓存。随后分割构建必须因 marker 模式不同
+    // 重新 codegen，不能把静态依赖的无 marker body 从跨进程缓存中复用。
+    let mut seed = IncrementalBundler::new(fs.clone());
+    seed.enable_minify()
+        .enable_mangle()
+        .enable_tree_shaking()
+        .enable_persistent_cache(cache_path.clone());
+    let seed_out = seed.build(Path::new("src/index.js"));
+    assert!(!seed_out.has_errors(), "{:?}", seed_out.diagnostics);
+
+    let mut bundler = IncrementalBundler::new(fs);
+    bundler
+        .enable_minify()
+        .enable_mangle()
+        .enable_tree_shaking()
+        .enable_code_splitting()
+        .enable_persistent_cache(cache_path.clone());
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.chunks.len(), 3, "entry + ESM/CJS dynamic chunks");
+    assert!(
+        out.bundle.contains("m&&m.__esModule?m.default:m"),
+        "分割 runtime 必须按 ESM marker 解析 default import:\n{}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("'default' in m?m.default:m"),
+        "分割 runtime 不得按 default 自有键猜测模块形态:\n{}",
+        out.bundle
+    );
+    assert!(
+        out.chunks
+            .iter()
+            .any(|chunk| chunk.code.contains("__esModule")),
+        "minified 分割构建必须为 ESM 模块保留 marker"
+    );
+
+    let dir = cache_path.with_extension("chunks");
+    let _ = std::fs::remove_dir_all(&dir);
+    let entry = write_chunks(&out, &dir);
+    let script = format!(
+        "const api = require({:?});\n\
+         if (api.eager !== 14 || api.cjsNamed !== 'legacy:field' || !api.cjsDefaultStayedObject) {{ console.error('eager=', api); process.exit(2); }}\n\
+         api.load().then(function(value) {{ if (JSON.stringify(value) !== '[4,6,\"dynamic-cjs\"]') {{ console.error('dynamic=', value); process.exit(3); }} process.stdout.write('OK'); }})\n\
+                   .catch(function(error) {{ console.error(error); process.exit(4); }});",
+        entry.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "minified code-splitting interop 执行失败 status={:?} stderr={}\n--- entry ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(cache_path);
+}
+
 /// Fixture B：入口动态 import a、b；a、b 都静态依赖 shared。
 fn shared_fixture() -> MemoryFileSystem {
     MemoryFileSystem::from_files([
@@ -4131,6 +4250,97 @@ fn persistent_path_index_skips_unchanged_os_source_reads() {
     assert!(!out3.has_errors(), "{:?}", out3.diagnostics);
     assert_eq!(b3.load_exec_count(), 1, "只有变化的依赖需要重新读取");
     assert!(out3.bundle.contains("4300"), "产物必须反映源码变化");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn crab_component_style_add_and_delete_bypass_cross_process_source_snapshot() {
+    let unique = format!(
+        "wake_crab_style_cache_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 Unix epoch")
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(unique);
+    let src_dir = root.join("src");
+    // 目录名刻意不含 `rc-*`：身份必须来自 package.json，而不是物理路径启发式。
+    let package_dir = root.join("packages").join("button-implementation");
+    let component_entry = package_dir.join("esm").join("index.mjs");
+    let style_dir = package_dir.join("css");
+    let style_path = style_dir.join("index.css");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(component_entry.parent().unwrap()).unwrap();
+    std::fs::write(
+        src_dir.join("index.js"),
+        "import { Button } from '../packages/button-implementation/esm/index.mjs'; export default Button;",
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"@crab-dev/rc-button"}"#,
+    )
+    .unwrap();
+    std::fs::write(&component_entry, "export const Button = 'button';").unwrap();
+    let entry = src_dir.join("index.js");
+    let cache_path = root.join("cache.bin");
+
+    // 第一进程：CSS 尚不存在。组件入口也不能进入路径源码快照。
+    let mut without_css = IncrementalBundler::new(Arc::new(OsFileSystem));
+    without_css
+        .enable_persistent_cache(cache_path.clone())
+        .enable_css_extraction();
+    let first = without_css.build(&entry);
+    assert!(!first.has_errors(), "{:?}", first.diagnostics);
+    assert!(!first.assets.iter().any(|asset| asset.is_css));
+    assert_eq!(without_css.load_exec_count(), 2);
+
+    // 第二进程：仅新增相邻 CSS。即使 JS 文件和持久缓存未变，loader 仍须重新运行组件
+    // 入口并把新样式加入依赖图。
+    std::fs::create_dir_all(&style_dir).unwrap();
+    std::fs::write(
+        &style_path,
+        ".rc-button-cache-added { display: inline-flex; }",
+    )
+    .unwrap();
+    let mut with_css = IncrementalBundler::new(Arc::new(OsFileSystem));
+    with_css
+        .enable_persistent_cache(cache_path.clone())
+        .enable_css_extraction();
+    let second = with_css.build(&entry);
+    assert!(!second.has_errors(), "{:?}", second.diagnostics);
+    let css = second
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8_lossy(&asset.bytes))
+        .expect("新增 css/index.css 后必须生成 CSS 产物");
+    assert!(css.contains(".rc-button-cache-added"), "{css}");
+    assert_eq!(
+        with_css.load_exec_count(),
+        2,
+        "热缓存只可恢复项目入口；组件入口与新 CSS 必须真实加载"
+    );
+
+    // 第三进程：删除 CSS。组件入口必须再次真实加载，不能恢复带旧 import 的派生源码。
+    std::fs::remove_file(&style_path).unwrap();
+    let mut deleted_css = IncrementalBundler::new(Arc::new(OsFileSystem));
+    deleted_css
+        .enable_persistent_cache(cache_path)
+        .enable_css_extraction();
+    let third = deleted_css.build(&entry);
+    assert!(!third.has_errors(), "{:?}", third.diagnostics);
+    assert!(
+        !third.assets.iter().any(|asset| asset.is_css),
+        "删除 css/index.css 后不得保留陈旧 CSS 产物"
+    );
+    assert_eq!(
+        deleted_css.load_exec_count(),
+        1,
+        "删除 CSS 后应只真实加载组件入口"
+    );
+
     let _ = std::fs::remove_dir_all(root);
 }
 

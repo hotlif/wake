@@ -387,11 +387,11 @@ pub(crate) fn source_type_for(path: &Path) -> SourceType {
 ///
 /// CSS/JSON/资源会产生派生产物，不能只恢复源码；Crab 组件入口还依赖相邻样式文件是否存在，
 /// 因而也保守回退到真实 loader。
-pub(crate) fn cached_source_type(path: &Path) -> Option<SourceType> {
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "@crab-dev")
-    {
+pub(crate) fn cached_source_type(fs: &dyn FileSystem, path: &Path) -> Option<SourceType> {
+    // 这里必须与 `crab_component_style_specifier` 使用完全相同的包身份/入口判定，且不能把
+    // `css/index.css` 当前是否存在算进条件。否则跨进程热缓存会把「没有自动 import 的旧源码」
+    // 直接恢复出来，新增 CSS 不会进入模块图；反向删除 CSS 时也可能保留陈旧 import。
+    if crab_component_package_dir(fs, path).is_some() {
         return None;
     }
     match path.extension().and_then(|extension| extension.to_str()) {
@@ -403,49 +403,54 @@ pub(crate) fn cached_source_type(path: &Path) -> Option<SourceType> {
     }
 }
 
-/// 为 `@crab-dev/rc-*` 的真实 npm 入口补上同包 `css/index.css`。
-///
-/// 这是 Wake 对 `babel-plugin-auto-import-style` 的原生等价实现：样式仍作为普通 CSS
-/// 模块进入依赖图，因而天然复用 dev 注入、prod 抽取、去重、资源改写和 HMR。导入追加在
-/// 组件入口已有依赖之后，使子组件样式先求值、本组件样式后求值，保持正确的级联顺序。
-fn crab_component_style_specifier(fs: &dyn FileSystem, path: &Path) -> Option<String> {
-    let package_dir = path.ancestors().find(|candidate| {
-        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        let Some(component) = name.strip_prefix("rc-") else {
-            return false;
-        };
+fn is_crab_component_package_name(name: &str) -> bool {
+    name.strip_prefix("@crab-dev/rc-").is_some_and(|component| {
         !component.is_empty()
             && component
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-            && candidate
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|scope| scope.to_str())
-                == Some("@crab-dev")
-            && candidate
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(|dir| dir.to_str())
-                == Some("node_modules")
-    })?;
-    let relative = path.strip_prefix(package_dir).ok()?;
-    let entry = path_to_slash(relative);
-    if !matches!(
-        entry.as_str(),
-        "esm/index.mjs"
-            | "esm/index.js"
-            | "cjs/index.cjs"
-            | "cjs/index.js"
-            | "index.mjs"
-            | "index.js"
-            | "index.cjs"
-    ) {
+    })
+}
+
+fn is_crab_component_manifest(fs: &dyn FileSystem, package_dir: &Path) -> bool {
+    let manifest = package_dir.join("package.json");
+    if !fs.is_file(&manifest) {
+        return false;
+    }
+    fs.read_to_string(&manifest)
+        .ok()
+        .and_then(|source| serde_json::from_str::<serde_json::Value>(&source).ok())
+        .and_then(|package| package.get("name")?.as_str().map(str::to_owned))
+        .is_some_and(|name| is_crab_component_package_name(&name))
+}
+
+/// 返回 Crab UI 包的精确公开入口所在包根。
+///
+/// 包身份只认 `package.json#name = @crab-dev/rc-*`，因此物理目录名可以是 workspace 名、
+/// Yarn virtual/unplugged 目录或 zip 内路径；入口只允许包根及 `esm/`、`cjs/` 下的
+/// `index.js|mjs|cjs`，避免给内部实现文件意外追加样式依赖。
+fn crab_component_package_dir<'a>(fs: &dyn FileSystem, path: &'a Path) -> Option<&'a Path> {
+    let entry_file = path.file_name()?.to_str()?;
+    if !matches!(entry_file, "index.js" | "index.mjs" | "index.cjs") {
         return None;
     }
+    let parent = path.parent()?;
+    let package_dir = match parent.file_name().and_then(|name| name.to_str()) {
+        Some("esm" | "cjs") => parent.parent()?,
+        _ => parent,
+    };
+    is_crab_component_manifest(fs, package_dir).then_some(package_dir)
+}
+
+/// 为 `@crab-dev/rc-*` 的真实包入口补上同包 `css/index.css`。
+///
+/// 这是 Wake 对 `babel-plugin-auto-import-style` 的原生等价实现：样式仍作为普通 CSS
+/// 模块进入依赖图，因而天然复用 dev 注入、prod 抽取、去重、资源改写和 HMR。导入追加在
+/// 组件入口已有依赖之后，使子组件样式先求值、本组件样式后求值，保持正确的级联顺序。
+/// 包身份只由 `package.json#name` 判断，以支持普通安装、workspace、Yarn PnP
+/// virtual/unplugged 目录及 zip 内路径，且与持久缓存的排除规则保持一致。
+fn crab_component_style_specifier(fs: &dyn FileSystem, path: &Path) -> Option<String> {
+    let package_dir = crab_component_package_dir(fs, path)?;
     let style = package_dir.join("css").join("index.css");
     if !fs.is_file(&style) {
         return None;
@@ -695,27 +700,47 @@ mod tests {
 
     #[test]
     fn persistent_source_snapshot_only_accepts_pure_source_modules() {
+        let fs = MemoryFileSystem::from_files([
+            (
+                "packages/button/package.json",
+                r#"{"name":"@crab-dev/rc-button"}"#,
+            ),
+            (
+                "packages/not-crab/package.json",
+                r#"{"name":"example-button"}"#,
+            ),
+        ]);
         assert_eq!(
-            cached_source_type(Path::new("a.js")),
+            cached_source_type(&fs, Path::new("a.js")),
             Some(SourceType::Module)
         );
         assert_eq!(
-            cached_source_type(Path::new("a.ts")),
+            cached_source_type(&fs, Path::new("a.ts")),
             Some(SourceType::TypeScript)
         );
         assert_eq!(
-            cached_source_type(Path::new("a.jsx")),
+            cached_source_type(&fs, Path::new("a.jsx")),
             Some(SourceType::Jsx)
         );
         assert_eq!(
-            cached_source_type(Path::new("a.tsx")),
+            cached_source_type(&fs, Path::new("a.tsx")),
             Some(SourceType::Tsx)
         );
-        assert!(cached_source_type(Path::new("a.css")).is_none());
-        assert!(cached_source_type(Path::new("a.json")).is_none());
-        assert!(cached_source_type(Path::new("a.png")).is_none());
-        assert!(cached_source_type(Path::new("a.raw")).is_none());
-        assert!(cached_source_type(Path::new("node_modules/@crab-dev/rc-a/index.js")).is_none());
+        assert!(cached_source_type(&fs, Path::new("a.css")).is_none());
+        assert!(cached_source_type(&fs, Path::new("a.json")).is_none());
+        assert!(cached_source_type(&fs, Path::new("a.png")).is_none());
+        assert!(cached_source_type(&fs, Path::new("a.raw")).is_none());
+        assert!(cached_source_type(&fs, Path::new("packages/button/esm/index.mjs")).is_none());
+        assert_eq!(
+            cached_source_type(&fs, Path::new("packages/button/esm/internal.mjs")),
+            Some(SourceType::Module),
+            "只有公开组件入口需要规避 loader 派生源码快照"
+        );
+        assert_eq!(
+            cached_source_type(&fs, Path::new("packages/not-crab/index.js")),
+            Some(SourceType::Module),
+            "目录名不能代替 package.json 包身份"
+        );
     }
 
     /// 用内存 FS 走**真实** [`load_source`] 路径加载一个 CSS 文件（dev 形态：不抽取、全内联）。
@@ -825,6 +850,10 @@ mod tests {
     fn crab_component_entry_auto_imports_its_style() {
         let fs = MemoryFileSystem::from_files([
             (
+                "node_modules/@crab-dev/rc-alert/package.json",
+                r#"{"name":"@crab-dev/rc-alert"}"#,
+            ),
+            (
                 "node_modules/@crab-dev/rc-alert/esm/index.mjs",
                 "export default function Alert() {}",
             ),
@@ -847,8 +876,140 @@ mod tests {
     }
 
     #[test]
+    fn crab_component_workspace_pnp_virtual_and_zip_entries_auto_import_their_styles() {
+        for root in [
+            "components/alert-implementation",
+            ".yarn/__virtual__/rc-alert/1/components/rc-alert",
+            ".yarn/cache/rc-alert.zip/node_modules/@crab-dev/rc-alert",
+        ] {
+            let fs = MemoryFileSystem::from_files([
+                (
+                    format!("{root}/package.json"),
+                    r#"{"name":"@crab-dev/rc-alert"}"#.to_string(),
+                ),
+                (
+                    format!("{root}/esm/index.mjs"),
+                    "export default function Alert() {}".to_string(),
+                ),
+                (
+                    format!("{root}/css/index.css"),
+                    ".rc-alert { display: flex; }".to_string(),
+                ),
+            ]);
+            let loaded = load_source(
+                &fs,
+                Path::new(&format!("{root}/esm/index.mjs")),
+                &LoadOptions::default(),
+            )
+            .expect("load");
+            assert!(
+                loaded.source.ends_with("import \"../css/index.css\";\n"),
+                "{root}: {}",
+                loaded.source
+            );
+        }
+    }
+
+    #[test]
+    fn crab_component_only_accepts_supported_public_entry_shapes() {
+        for (entry, expected_style) in [
+            ("index.js", "./css/index.css"),
+            ("index.mjs", "./css/index.css"),
+            ("index.cjs", "./css/index.css"),
+            ("esm/index.js", "../css/index.css"),
+            ("esm/index.mjs", "../css/index.css"),
+            ("esm/index.cjs", "../css/index.css"),
+            ("cjs/index.js", "../css/index.css"),
+            ("cjs/index.mjs", "../css/index.css"),
+            ("cjs/index.cjs", "../css/index.css"),
+        ] {
+            let root = "packages/component-source";
+            let fs = MemoryFileSystem::from_files([
+                (
+                    format!("{root}/package.json"),
+                    r#"{"name":"@crab-dev/rc-alert"}"#.to_string(),
+                ),
+                (
+                    format!("{root}/{entry}"),
+                    "export const Alert = 1;".to_string(),
+                ),
+                (format!("{root}/css/index.css"), ".rc-alert {}".to_string()),
+            ]);
+            let loaded = load_source(
+                &fs,
+                Path::new(&format!("{root}/{entry}")),
+                &LoadOptions::default(),
+            )
+            .expect("load");
+            assert!(
+                loaded
+                    .source
+                    .ends_with(&format!("import \"{expected_style}\";\n")),
+                "{entry}: {}",
+                loaded.source
+            );
+        }
+
+        let fs = MemoryFileSystem::from_files([
+            (
+                "packages/component-source/package.json",
+                r#"{"name":"@crab-dev/rc-alert"}"#,
+            ),
+            (
+                "packages/component-source/dist/esm/index.mjs",
+                "export const Alert = 1;",
+            ),
+            ("packages/component-source/css/index.css", ".rc-alert {}"),
+        ]);
+        let loaded = load_source(
+            &fs,
+            Path::new("packages/component-source/dist/esm/index.mjs"),
+            &LoadOptions::default(),
+        )
+        .expect("load");
+        assert!(!loaded.source.contains("css/index.css"));
+    }
+
+    #[test]
+    fn auto_style_rejects_workspace_package_with_non_crab_manifest() {
+        let fs = MemoryFileSystem::from_files([
+            (
+                "components/rc-alert/package.json",
+                r#"{"name":"example-rc-alert"}"#,
+            ),
+            (
+                "components/rc-alert/esm/index.mjs",
+                "export default function Alert() {}",
+            ),
+            (
+                "components/rc-alert/css/index.css",
+                ".rc-alert { display: flex; }",
+            ),
+        ]);
+        let loaded = load_source(
+            &fs,
+            Path::new("components/rc-alert/esm/index.mjs"),
+            &LoadOptions::default(),
+        )
+        .expect("load");
+        assert!(
+            !loaded.source.contains("css/index.css"),
+            "{}",
+            loaded.source
+        );
+    }
+
+    #[test]
     fn auto_style_ignores_non_entry_and_missing_css() {
         let fs = MemoryFileSystem::from_files([
+            (
+                "node_modules/@crab-dev/rc-alert/package.json",
+                r#"{"name":"@crab-dev/rc-alert"}"#,
+            ),
+            (
+                "node_modules/@crab-dev/rc-button/package.json",
+                r#"{"name":"@crab-dev/rc-button"}"#,
+            ),
             (
                 "node_modules/@crab-dev/rc-alert/esm/internal.mjs",
                 "export const value = 1;",

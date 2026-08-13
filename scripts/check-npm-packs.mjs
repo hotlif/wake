@@ -65,6 +65,16 @@ for (const { directory } of manifests) {
   if (isRoot && nativeFiles.length !== 0) {
     throw new Error('The main package must not contain native binaries')
   }
+  if (isRoot) {
+    for (const required of [
+      'internal/components-runtime.mjs',
+      'internal/components-runtime.d.ts',
+    ]) {
+      if (!files.includes(required)) {
+        throw new Error(`The main package is missing ${required}`)
+      }
+    }
+  }
   if (!isRoot && nativeFiles.length !== 1) {
     throw new Error(`${directory} must contain exactly one native binary`)
   }

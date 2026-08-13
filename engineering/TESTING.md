@@ -1,6 +1,6 @@
 # Wake 测试与质量门禁
 
-本文描述 v0.1.15 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定的测试必须先执行 `npm run native:build` 并设置或生成当前平台 binding。
+本文描述 v0.1.16 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定的测试必须先执行 `npm run native:build` 并设置或生成当前平台 binding。
 
 # 1. 本地最小门禁
 
@@ -21,6 +21,7 @@ npm run native:build
 npm run npm:test
 npm run npm:typecheck
 npm run npm:pack:check
+npm run pnp:components:check
 ```
 
 文档修改：
@@ -45,7 +46,7 @@ cargo test -p wake_docs
 | `miri` | Ubuntu / nightly | `wake_ecma_ast` 和 `wake_turbo` 手写 unsafe/内存模型 |
 | `loom` | Ubuntu / Rust 1.95 | single-flight 线程交错 |
 | `bench-smoke` | Ubuntu / Rust 1.95 | 全 benchmark 可编译 |
-| `node` | Windows / Node 24、26 | 原生绑定、API、类型、启动与 npm pack |
+| `node` | Windows / Node 24、26 | 原生绑定、API、类型、启动与 npm pack；Node 24 另跑 Yarn 4.16 PnP Components 门禁 |
 | `docs` | Ubuntu / Rust 1.95 + Node 24 | 文档链接检查和生产构建 |
 
 Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补齐最低版本覆盖列入路线图。
@@ -74,6 +75,7 @@ Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补�
 - `hello-esm`：最小 ESM；
 - `react-ts-app`：React 19 + TypeScript；
 - `react-ts-app-yarn-pnp`：Yarn PnP/zip 包；
+- `react-components-yarn-pnp`：只声明 Wake、React 和 React DOM 的 Components PnP 发布包门禁；
 - `react-docs`：MDX、Demo、Props、主题和组件工作台；
 - `2k-modules`：生成式压力与跨工具测量。
 
@@ -117,7 +119,8 @@ cargo bench --workspace --no-run
 1. 运行 workspace test、clippy 和许可证检查；
 2. 在 Windows、macOS x64/arm64、manylinux glibc 2.28 x64/arm64 构建；
 3. 审计六个不可变 tarball 的版本、许可证、文件和体积；
-4. 先发布平台包，最后发布主包；
-5. 在 Node 24/26 和全部目标平台执行注册表干净安装与构建 smoke。
+4. 在 Windows 原生发布 leg 中把主包和五个平台包打成本地 tarball，以 Yarn 4.16 PnP 构建 Components fixture，并检查 internal runtime、Lucide 运行时导出、hashed CSS link 和 18 个组件前缀；
+5. 先发布平台包，最后发布主包；
+6. 在 Node 24/26 和全部目标平台执行注册表干净安装与构建 smoke。
 
 部分发布失败不能覆盖已有 npm 版本；修复后统一提升六个包和 workspace 版本。

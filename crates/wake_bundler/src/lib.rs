@@ -20,7 +20,7 @@ mod session;
 pub use incremental::IncrementalBundler;
 pub use session::{BuildOptions, BuildRequest, BuildSession};
 // 供 CLI 组装别名而无需直接依赖 wake_resolver。
-pub use wake_resolver::ResolveOptions;
+pub use wake_resolver::{PnpDependencyFallback, ResolveOptions};
 
 /// 把宿主或外来平台路径转换成产物使用的正斜杠形式，并移除 Windows verbatim 前缀。
 ///

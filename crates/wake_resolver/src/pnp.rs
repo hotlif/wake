@@ -65,6 +65,8 @@ pub enum PnpError {
     UnfulfilledPeer,
     /// 目标 locator 在清单中缺失（清单不一致）。
     MissingPackage,
+    /// issuer 的物理位置同时对应多个 locator，且它们将当前依赖解析到不同目标。
+    AmbiguousIssuer,
 }
 
 impl PnpManifest {
@@ -176,7 +178,8 @@ impl PnpManifest {
             }
         }
 
-        // 最长前缀优先：按位置组件数降序，findPackageLocator 取首个匹配。
+        // 最长前缀优先。同一物理位置的 locator 必须保留为候选集，不能在这里
+        // 任意优先 virtual/base；实际取舍取决于当前要解析的依赖。
         locations.sort_by(|a, b| {
             b.0.components()
                 .count()
@@ -193,14 +196,41 @@ impl PnpManifest {
         })
     }
 
-    /// 找 issuer 所属的包 locator：位置为 `issuer_dir` 最长组件前缀者。
-    fn find_package_locator(&self, issuer_dir: &Path) -> Option<&Locator> {
+    /// 找 issuer 所属的所有 locator：只保留最长位置前缀下的同路径候选。
+    ///
+    /// Yarn 的 unplugged 包可能让 base/virtual locator 共用一个 `packageLocation`。
+    /// 候选不能靠清单顺序或 virtual 标记决胜，必须结合当前依赖消歧。
+    fn find_package_locators(&self, issuer_dir: &Path) -> Vec<&Locator> {
         let issuer = normalize(issuer_dir);
-        // locations 已按最长优先排序，取首个前缀命中。
-        self.locations
+        let Some((matched_location, _)) = self
+            .locations
             .iter()
             .find(|(loc, _)| path_has_prefix(&issuer, loc))
-            .map(|(_, l)| l)
+        else {
+            return Vec::new();
+        };
+        self.locations
+            .iter()
+            .filter(|(location, _)| location == matched_location)
+            .map(|(_, locator)| locator)
+            .collect()
+    }
+
+    /// 返回 issuer 候选集一致的包名，供上层做严格限定的依赖 fallback。
+    pub fn issuer_package_name(&self, issuer_dir: &Path) -> Result<Option<&str>, PnpError> {
+        let locators = self.find_package_locators(issuer_dir);
+        let Some(first) = locators.first() else {
+            return Err(PnpError::IssuerNotFound);
+        };
+        let ident = first.ident.as_deref();
+        if locators
+            .iter()
+            .all(|locator| locator.ident.as_deref() == ident)
+        {
+            Ok(ident)
+        } else {
+            Err(PnpError::AmbiguousIssuer)
+        }
     }
 
     /// 解析裸说明符到「未限定」路径（相对 cwd；可能虚拟 / 指向 zip）。
@@ -208,40 +238,97 @@ impl PnpManifest {
     /// 返回的路径需再经 [`crate::Resolver`] 的文件/目录解析补 main/index/扩展名。
     pub fn resolve_bare(&self, specifier: &str, issuer_dir: &Path) -> Result<PathBuf, PnpError> {
         let (ident, subpath) = split_package(specifier);
-        let issuer_locator = self
-            .find_package_locator(issuer_dir)
-            .ok_or(PnpError::IssuerNotFound)?;
+        let issuer_locators = self.find_package_locators(issuer_dir);
+        if issuer_locators.is_empty() {
+            return Err(PnpError::IssuerNotFound);
+        }
+
+        // 先在全部候选中尝试 issuer 自身的直接依赖。只要有直接依赖成功，
+        // 就不应让另一候选的顶层 fallback 改变结果。
+        let mut direct_failures = Vec::new();
+        let mut resolved_target = None;
+        for issuer_locator in &issuer_locators {
+            match self.resolve_direct_dependency_locator(issuer_locator, &ident) {
+                Ok(target_locator) => merge_resolved_target(&mut resolved_target, target_locator)?,
+                Err(error) => direct_failures.push((*issuer_locator, error)),
+            }
+        }
+        if let Some(target_locator) = resolved_target {
+            return self.unqualified_path(&target_locator, &subpath);
+        }
+
+        // 所有直接依赖都失败后，再逐候选尝试 Yarn 顶层 fallback。
+        // `MissingPackage`/`IssuerNotFound` 表示清单损坏而非依赖边界；绝不能用顶层
+        // 同名包掩盖。只有未声明依赖和未满足 peer 符合 Yarn fallback 语义。
+        if direct_failures
+            .iter()
+            .any(|(_, error)| !matches!(error, PnpError::Undeclared | PnpError::UnfulfilledPeer))
+        {
+            return Err(direct_failures
+                .into_iter()
+                .map(|(_, error)| error)
+                .fold(PnpError::Undeclared, preferred_failure));
+        }
+        let mut fallback_target = None;
+        let mut failure = PnpError::Undeclared;
+        for (issuer_locator, direct_error) in direct_failures {
+            let result = self
+                .fallback_lookup(issuer_locator, &ident)
+                .ok_or(direct_error)
+                .and_then(|target| self.locator_for_target(target));
+            match result {
+                Ok(target_locator) => merge_resolved_target(&mut fallback_target, target_locator)?,
+                Err(error) => failure = preferred_failure(failure, error),
+            }
+        }
+        let target_locator = fallback_target.ok_or(failure)?;
+        self.unqualified_path(&target_locator, &subpath)
+    }
+
+    fn unqualified_path(
+        &self,
+        target_locator: &Locator,
+        subpath: &str,
+    ) -> Result<PathBuf, PnpError> {
+        let pkg = self
+            .packages
+            .get(target_locator)
+            .ok_or(PnpError::MissingPackage)?;
+        let unqualified = if subpath.is_empty() {
+            pkg.location.clone()
+        } else {
+            normalize(&pkg.location.join(subpath))
+        };
+        Ok(unqualified)
+    }
+
+    /// 用一个确定 issuer locator 解析它自身声明的依赖。
+    fn resolve_direct_dependency_locator(
+        &self,
+        issuer_locator: &Locator,
+        ident: &str,
+    ) -> Result<Locator, PnpError> {
         let issuer_pkg = self
             .packages
             .get(issuer_locator)
             .ok_or(PnpError::IssuerNotFound)?;
-
-        // 1) issuer 直接依赖；缺失/未满足 peer 时退到顶层 fallback。
-        let target: &DepTarget = match issuer_pkg.dependencies.get(&ident) {
-            Some(Some(t)) => t,
-            Some(None) => self
-                .fallback_lookup(issuer_locator, &ident)
-                .ok_or(PnpError::UnfulfilledPeer)?,
-            None => self
-                .fallback_lookup(issuer_locator, &ident)
-                .ok_or(PnpError::Undeclared)?,
+        let target = match issuer_pkg.dependencies.get(ident) {
+            Some(Some(target)) => target,
+            Some(None) => return Err(PnpError::UnfulfilledPeer),
+            None => return Err(PnpError::Undeclared),
         };
+        self.locator_for_target(target)
+    }
 
-        let target_locator = Locator {
+    fn locator_for_target(&self, target: &DepTarget) -> Result<Locator, PnpError> {
+        let locator = Locator {
             ident: Some(target.ident.clone()),
             reference: Some(target.reference.clone()),
         };
-        let pkg = self
-            .packages
-            .get(&target_locator)
-            .ok_or(PnpError::MissingPackage)?;
-
-        let unqualified = if subpath.is_empty() {
-            pkg.location.clone()
-        } else {
-            normalize(&pkg.location.join(&subpath))
-        };
-        Ok(unqualified)
+        self.packages
+            .contains_key(&locator)
+            .then_some(locator)
+            .ok_or(PnpError::MissingPackage)
     }
 
     /// 顶层 fallback：`enableTopLevelFallback` 且 issuer 未被排除时，
@@ -262,6 +349,38 @@ impl PnpManifest {
             return Some(t);
         }
         None
+    }
+}
+
+fn merge_resolved_target(
+    resolved: &mut Option<Locator>,
+    candidate: Locator,
+) -> Result<(), PnpError> {
+    match resolved {
+        Some(previous) if previous != &candidate => Err(PnpError::AmbiguousIssuer),
+        Some(_) => Ok(()),
+        None => {
+            *resolved = Some(candidate);
+            Ok(())
+        }
+    }
+}
+
+/// 多个同路径 locator 都失败时，保留最能描述清单问题的错误。
+fn preferred_failure(current: PnpError, candidate: PnpError) -> PnpError {
+    fn rank(error: &PnpError) -> u8 {
+        match error {
+            PnpError::IssuerNotFound => 0,
+            PnpError::Undeclared => 1,
+            PnpError::UnfulfilledPeer => 2,
+            PnpError::MissingPackage => 3,
+            PnpError::AmbiguousIssuer => 4,
+        }
+    }
+    if rank(&candidate) > rank(&current) {
+        candidate
+    } else {
+        current
     }
 }
 
@@ -559,6 +678,197 @@ mod tests {
         assert_eq!(
             m.resolve_bare("scheduler", issuer_nonvirtual),
             Err(PnpError::Undeclared)
+        );
+    }
+
+    #[test]
+    fn shared_unplugged_location_uses_the_only_locator_that_resolves_dependency() {
+        let json = r#"{
+            "enableTopLevelFallback": false,
+            "fallbackExclusionList": [],
+            "fallbackPool": [],
+            "packageRegistryData": [
+                [null, [[null, {
+                    "packageLocation": "./",
+                    "packageDependencies": [
+                        ["wake", "virtual:peer-hash#file:../wake"]
+                    ],
+                    "linkType": "SOFT"
+                }]]],
+                ["wake", [
+                    ["file:../wake", {
+                        "packageLocation": "./.yarn/unplugged/wake/node_modules/wake/",
+                        "packageDependencies": [
+                            ["wake", "file:../wake"]
+                        ],
+                        "linkType": "SOFT"
+                    }],
+                    ["virtual:peer-hash#file:../wake", {
+                        "packageLocation": "./.yarn/unplugged/wake/node_modules/wake/",
+                        "packageDependencies": [
+                            ["wake", "virtual:peer-hash#file:../wake"],
+                            ["ui", "npm:1.0.0"]
+                        ],
+                        "linkType": "SOFT"
+                    }]
+                ]],
+                ["ui", [["npm:1.0.0", {
+                    "packageLocation": "../../cache/ui.zip/node_modules/ui/",
+                    "packageDependencies": [["ui", "npm:1.0.0"]],
+                    "linkType": "HARD"
+                }]]]
+            ]
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let manifest = PnpManifest::from_value(&value, Path::new("")).unwrap();
+        let issuer = Path::new(".yarn/unplugged/wake/node_modules/wake/internal");
+
+        assert_eq!(
+            manifest.resolve_bare("ui", issuer).unwrap(),
+            PathBuf::from("../../cache/ui.zip/node_modules/ui")
+        );
+    }
+
+    fn shared_location_manifest(instances: serde_json::Value) -> PnpManifest {
+        shared_location_manifest_with_top_level(instances, None)
+    }
+
+    fn shared_location_manifest_with_top_level(
+        instances: serde_json::Value,
+        top_level_ui: Option<&str>,
+    ) -> PnpManifest {
+        let mut top_dependencies = vec![serde_json::json!(["wake", "file:../wake"])];
+        if let Some(reference) = top_level_ui {
+            top_dependencies.push(serde_json::json!(["ui", reference]));
+        }
+        let value = serde_json::json!({
+            "enableTopLevelFallback": top_level_ui.is_some(),
+            "fallbackExclusionList": [],
+            "fallbackPool": [],
+            "packageRegistryData": [
+                [null, [[null, {
+                    "packageLocation": "./",
+                    "packageDependencies": top_dependencies,
+                    "linkType": "SOFT"
+                }]]],
+                ["wake", instances],
+                ["ui", [
+                    ["npm:1.0.0", {
+                        "packageLocation": "../../cache/ui-v1/node_modules/ui/",
+                        "packageDependencies": [["ui", "npm:1.0.0"]],
+                        "linkType": "HARD"
+                    }],
+                    ["npm:2.0.0", {
+                        "packageLocation": "../../cache/ui-v2/node_modules/ui/",
+                        "packageDependencies": [["ui", "npm:2.0.0"]],
+                        "linkType": "HARD"
+                    }]
+                ]]
+            ]
+        });
+        PnpManifest::from_value(&value, Path::new("")).unwrap()
+    }
+
+    fn wake_instance(reference: &str, ui_reference: Option<&str>) -> serde_json::Value {
+        let mut dependencies = vec![serde_json::json!(["wake", reference])];
+        if let Some(ui_reference) = ui_reference {
+            dependencies.push(serde_json::json!(["ui", ui_reference]));
+        }
+        serde_json::json!([reference, {
+            "packageLocation": "./.yarn/unplugged/wake/node_modules/wake/",
+            "packageDependencies": dependencies,
+            "linkType": "SOFT"
+        }])
+    }
+
+    #[test]
+    fn shared_location_base_locator_resolves_normally() {
+        let manifest = shared_location_manifest(serde_json::json!([wake_instance(
+            "file:../wake",
+            Some("npm:1.0.0")
+        )]));
+
+        assert_eq!(
+            manifest
+                .resolve_bare(
+                    "ui",
+                    Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
+                )
+                .unwrap(),
+            PathBuf::from("../../cache/ui-v1/node_modules/ui")
+        );
+    }
+
+    #[test]
+    fn shared_location_virtual_locators_with_same_target_are_not_ambiguous() {
+        let manifest = shared_location_manifest(serde_json::json!([
+            wake_instance("file:../wake", None),
+            wake_instance("virtual:first#file:../wake", Some("npm:1.0.0")),
+            wake_instance("virtual:second#file:../wake", Some("npm:1.0.0"))
+        ]));
+
+        assert_eq!(
+            manifest
+                .resolve_bare(
+                    "ui",
+                    Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
+                )
+                .unwrap(),
+            PathBuf::from("../../cache/ui-v1/node_modules/ui")
+        );
+    }
+
+    #[test]
+    fn shared_location_virtual_locators_with_different_targets_are_ambiguous() {
+        let manifest = shared_location_manifest(serde_json::json!([
+            wake_instance("file:../wake", None),
+            wake_instance("virtual:first#file:../wake", Some("npm:1.0.0")),
+            wake_instance("virtual:second#file:../wake", Some("npm:2.0.0"))
+        ]));
+
+        assert_eq!(
+            manifest.resolve_bare(
+                "ui",
+                Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
+            ),
+            Err(PnpError::AmbiguousIssuer)
+        );
+    }
+
+    #[test]
+    fn shared_location_direct_dependency_wins_before_top_level_fallback() {
+        let manifest = shared_location_manifest_with_top_level(
+            serde_json::json!([
+                wake_instance("file:../wake", None),
+                wake_instance("virtual:peer#file:../wake", Some("npm:1.0.0"))
+            ]),
+            Some("npm:2.0.0"),
+        );
+
+        assert_eq!(
+            manifest
+                .resolve_bare(
+                    "ui",
+                    Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
+                )
+                .unwrap(),
+            PathBuf::from("../../cache/ui-v1/node_modules/ui")
+        );
+    }
+
+    #[test]
+    fn missing_direct_locator_is_not_hidden_by_top_level_fallback() {
+        let manifest = shared_location_manifest_with_top_level(
+            serde_json::json!([wake_instance("file:../wake", Some("npm:missing"))]),
+            Some("npm:2.0.0"),
+        );
+
+        assert_eq!(
+            manifest.resolve_bare(
+                "ui",
+                Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
+            ),
+            Err(PnpError::MissingPackage)
         );
     }
 

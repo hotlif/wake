@@ -1,0 +1,8 @@
+[docs]
+source_dir = "docs"
+title = "Wake Yarn PnP Components"
+description = "Yarn PnP automatic component style validation"
+locale = "zh-CN"
+default_theme = "system"
+accent_color = "#2563eb"
+theme_css = "docs/theme.css"

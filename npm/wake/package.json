@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/wake",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Wake native web build tools for Node.js",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -22,6 +22,10 @@
       "import": "./experimental.mjs",
       "require": "./experimental.cjs"
     },
+    "./internal/components-runtime": {
+      "types": "./internal/components-runtime.d.ts",
+      "import": "./internal/components-runtime.mjs"
+    },
     "./package.json": "./package.json"
   },
   "bin": {
@@ -32,6 +36,7 @@
   },
   "files": [
     "bin",
+    "internal",
     "*.cjs",
     "*.mjs",
     "index.d.ts",
@@ -67,11 +72,11 @@
     "react-dom": "^19.2.8"
   },
   "optionalDependencies": {
-    "@crab-dev/wake-darwin-arm64": "0.1.15",
-    "@crab-dev/wake-darwin-x64": "0.1.15",
-    "@crab-dev/wake-linux-arm64-gnu": "0.1.15",
-    "@crab-dev/wake-linux-x64-gnu": "0.1.15",
-    "@crab-dev/wake-win32-x64-msvc": "0.1.15"
+    "@crab-dev/wake-darwin-arm64": "0.1.16",
+    "@crab-dev/wake-darwin-x64": "0.1.16",
+    "@crab-dev/wake-linux-arm64-gnu": "0.1.16",
+    "@crab-dev/wake-linux-x64-gnu": "0.1.16",
+    "@crab-dev/wake-win32-x64-msvc": "0.1.16"
   },
   "publishConfig": {
     "access": "public",

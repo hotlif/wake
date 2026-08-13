@@ -14,7 +14,10 @@ use std::thread;
 use std::time::Instant;
 
 use serde::Serialize;
-use wake_bundler::{BuildOutput, BuildRequest, BuildSession, IncrementalBundler, ResolveOptions};
+use wake_bundler::{
+    BuildOutput, BuildRequest, BuildSession, IncrementalBundler, PnpDependencyFallback,
+    ResolveOptions,
+};
 use wake_common::{Diagnostic, OsFileSystem};
 
 pub use wake_docs::DocsMode;
@@ -185,6 +188,7 @@ struct PreparedBuild {
     outdir: PathBuf,
     config: wake_config::Config,
     aliases: Vec<(String, PathBuf)>,
+    pnp_dependency_fallbacks: Vec<PnpDependencyFallback>,
 }
 
 type PreparedDocs = (
@@ -272,6 +276,7 @@ fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
         outdir,
         config,
         aliases,
+        pnp_dependency_fallbacks: Vec::new(),
     })
 }
 
@@ -343,6 +348,7 @@ fn create_bundler(
     let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
     bundler.set_resolve_options(ResolveOptions {
         alias: prepared.aliases.clone(),
+        pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks.clone(),
         ..ResolveOptions::default()
     });
     bundler.set_define(build_defines(&prepared.config, !project_defaults));
@@ -962,6 +968,7 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         entry: prepared.entry,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
+            pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks,
             conditions: ["browser", "development", "import", "module", "default"]
                 .iter()
                 .map(|value| value.to_string())
@@ -1155,6 +1162,7 @@ pub fn start_docs_dev_server_with_mode(
         entry: prepared.entry,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
+            pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks,
             conditions: ["browser", "development", "import", "module", "default"]
                 .iter()
                 .map(|value| value.to_string())
@@ -1234,6 +1242,11 @@ fn prepare_docs(
         .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
     aliases.retain(|(name, _)| name != "@wake/docs" && name != "@wake/docs-project");
     aliases.extend(generated.aliases);
+    let pnp_dependency_fallbacks = if docs_mode == DocsMode::Components {
+        components_pnp_dependency_fallbacks(&root)
+    } else {
+        Vec::new()
+    };
     let routes = generated.routes;
     let demos = generated.demos;
     let warnings = generated.warnings;
@@ -1244,12 +1257,36 @@ fn prepare_docs(
             outdir: root.join("docs-dist"),
             config,
             aliases,
+            pnp_dependency_fallbacks,
         },
         docs,
         routes,
         demos,
         warnings,
     ))
+}
+
+/// Older Crab UI releases use these runtime packages without declaring them. A hoisted
+/// `node_modules` tree hides that boundary, while Yarn PnP correctly rejects it. Components mode
+/// supplies only these two dependencies, only to `@crab-dev/rc-*` issuers, and only after the
+/// issuer's own dependency plus Yarn's top-level fallback have reported a dependency-boundary
+/// error. User aliases and valid package-local dependency versions therefore remain untouched.
+fn components_pnp_dependency_fallbacks(root: &Path) -> Vec<PnpDependencyFallback> {
+    let fs = wake_common::OsFileSystem;
+    let Some(manifest) = wake_resolver::PnpManifest::discover(&fs, root) else {
+        return Vec::new();
+    };
+    let Ok(wake_root) = manifest.resolve_bare("@crab-dev/wake", root) else {
+        return Vec::new();
+    };
+    ["@linaria/core", "lucide-react"]
+        .into_iter()
+        .map(|dependency| PnpDependencyFallback {
+            issuer_package_prefix: "@crab-dev/rc-".to_string(),
+            dependency: dependency.to_string(),
+            provider_issuer: wake_root.clone(),
+        })
+        .collect()
 }
 
 fn docs_options(config: &wake_config::Config, base_path: Option<&str>) -> wake_docs::DocsOptions {

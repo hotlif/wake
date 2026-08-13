@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.16
+
+- Automatically loaded Crab UI component CSS from package identity across `node_modules`, workspaces, and Yarn PnP virtual, unplugged, and zip layouts without runtime CSS imports.
+- Added issuer-scoped Yarn PnP dependency fallbacks for Components workbenches while preserving aliases, package-owned dependency versions, exports errors, and ambiguous virtual-locator rejection.
+- Preserved configured Demo accent colors independently from the neutral workbench theme.
+- Added a Yarn 4.16 Plug'n'Play release gate that packs all six local npm packages and verifies the Components runtime, hashed CSS link, and direct and transitive component styles.
+- Preserved ESM default and re-exported bindings in minified code-split builds while retaining correct CommonJS default and namespace interop.
+
 ## 0.1.15
 
 - Preserved explicitly unset component Props, non-default Args, selected demos, and viewport state across copied URLs, refreshes, and browser navigation.

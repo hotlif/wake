@@ -16,6 +16,8 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.package-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -26,6 +28,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Read package version
+        id: package-version
+        shell: bash
+        run: echo "version=$(node -p \"require('./npm/wake/package.json').version\")" >> "$GITHUB_OUTPUT"
       - run: npm run versions:check
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -77,6 +83,15 @@ jobs:
           node -e "require('node:fs').copyFileSync(
           'npm/wake/wake.${{ matrix.suffix }}.node',
           'npm/${{ matrix.package_dir }}/wake.${{ matrix.suffix }}.node')"
+      - name: Install Corepack for the Yarn PnP gate
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: npm install --global corepack@0.34.6
+      - name: Verify Components under Yarn PnP
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $env:WAKE_NATIVE_PATH = (Resolve-Path npm/wake/wake.win32-x64-msvc.node).Path
+          npm run pnp:components:check
       - run: node -e "require('node:fs').mkdirSync('artifacts', {recursive:true})"
       - run: npm run npm:pack:check
         env:
@@ -167,7 +182,7 @@ jobs:
           if-no-files-found: error
 
   audit-tarballs:
-    needs: [build-native, build-linux, pack-root]
+    needs: [verify, build-native, build-linux, pack-root]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -182,6 +197,7 @@ jobs:
       - name: Verify all immutable tarballs
         shell: bash
         run: |
+          expected_version='${{ needs.verify.outputs.version }}'
           shopt -s nullglob
           archives=(artifacts/*.tgz)
           test "${#archives[@]}" -eq 6
@@ -192,7 +208,7 @@ jobs:
             grep -qx 'package/LICENSE-APACHE' <<<"$list"
             grep -qx 'package/README.md' <<<"$list"
             native_count="$(grep -Ec '\.node$' <<<"$list" || true)"
-            if [[ "$archive" == *crab-dev-wake-0.1.15.tgz ]]; then
+            if [[ "$archive" == *"crab-dev-wake-${expected_version}.tgz" ]]; then
               test "$native_count" -eq 0
               test "$(stat -c%s "$archive")" -le 524288
             else
@@ -200,7 +216,7 @@ jobs:
               test "$(stat -c%s "$archive")" -le 15728640
             fi
             version="$(tar -xOzf "$archive" package/package.json | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).version))")"
-            test "$version" = '0.1.15'
+            test "$version" = "$expected_version"
           done
       - uses: actions/attest-build-provenance@v3
         if: github.event.repository.visibility == 'public'
@@ -208,8 +224,10 @@ jobs:
           subject-path: artifacts/*.tgz
 
   publish:
-    needs: audit-tarballs
+    needs: [verify, audit-tarballs]
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ needs.verify.outputs.version }}
     environment: npm-release
     permissions:
       id-token: write
@@ -233,7 +251,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish root package last
-        run: npm publish ./artifacts/crab-dev-wake-0.1.15.tgz --access public --provenance=${{ github.event.repository.visibility == 'public' }}
+        run: npm publish "./artifacts/crab-dev-wake-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -257,12 +275,14 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Clean install on the minimum glibc baseline
         shell: bash
+        env:
+          WAKE_VERSION: ${{ needs.publish.outputs.version }}
         run: |
           mkdir smoke
           cd smoke
           npm init -y
           for attempt in {1..12}; do
-            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.15; then
+            if npm install --ignore-scripts --prefer-online "@crab-dev/wake@${WAKE_VERSION}"; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then
@@ -289,12 +309,14 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Clean registry install without build tools
         shell: bash
+        env:
+          WAKE_VERSION: ${{ needs.publish.outputs.version }}
         run: |
           mkdir smoke
           cd smoke
           npm init -y
           for attempt in {1..12}; do
-            if npm install --ignore-scripts --prefer-online @crab-dev/wake@0.1.15; then
+            if npm install --ignore-scripts --prefer-online "@crab-dev/wake@${WAKE_VERSION}"; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then

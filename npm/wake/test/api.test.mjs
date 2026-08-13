@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { access, appendFile, cp, mkdtemp, rm } from 'node:fs/promises'
+import { access, appendFile, cp, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
+import { assertComponentsRuntime } from '../../../scripts/components-runtime-smoke.mjs'
 import {
   WakeError,
   build,
@@ -23,6 +24,9 @@ import { analyze, parse, tokenize, transform } from '../experimental.mjs'
 
 const require = createRequire(import.meta.url)
 const commonjs = require('../index.cjs')
+const packageVersion = JSON.parse(
+  await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+).version
 const contexts = []
 
 after(async () => {
@@ -30,7 +34,7 @@ after(async () => {
 })
 
 test('loads the same API from ESM and CommonJS', () => {
-  assert.equal(version(), '0.1.15')
+  assert.equal(version(), packageVersion)
   assert.equal(commonjs.version(), version())
   assert.equal(typeof commonjs.build, 'function')
 })
@@ -254,6 +258,15 @@ test('addon cleanup releases native resources when a Worker exits', async () => 
 
 test('builds docs and controls the docs dev server lifecycle', async () => {
   const cwd = fileURLToPath(new URL('../../../', import.meta.url))
+  const componentsRuntime = await readFile(
+    fileURLToPath(new URL('../internal/components-runtime.mjs', import.meta.url)),
+    'utf8',
+  )
+  assert.doesNotMatch(
+    componentsRuntime,
+    /["'][^"'\r\n]+\.css(?:\?[^"'\r\n]*)?["']/,
+    'Components runtime must rely on Wake auto-style injection and contain no CSS import',
+  )
   const outdir = fileURLToPath(new URL('../../../target/node-docs-api-test/', import.meta.url))
   const result = await buildDocs({ cwd, outdir })
   assert.equal(result.success, true)
@@ -270,10 +283,59 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   assert.equal(workbench.mode, 'components')
   assert.deepEqual(workbench.routes, [])
   assert.ok(workbench.demos.some((demo) => demo.component === '按钮' && demo.controlCount > 0))
+  const generatedComponentsRuntime = await readFile(
+    join(componentsCwd, '.wake/docs/generated/runtime/components.tsx'),
+    'utf8',
+  )
+  assert.match(
+    generatedComponentsRuntime,
+    /from\s+["']@crab-dev\/wake\/internal\/components-runtime["']/,
+    'Generated workbench code must import only the Wake Components runtime',
+  )
+  assert.doesNotMatch(generatedComponentsRuntime, /from\s+["']@crab-dev\/rc-/)
+  assert.doesNotMatch(
+    generatedComponentsRuntime,
+    /["'][^"'\r\n]+\.css(?:\?[^"'\r\n]*)?["']/,
+  )
   await Promise.all([
     access(join(componentsOutdir, 'index.html')),
     access(join(componentsOutdir, '404.html')),
   ])
+  const componentFiles = await readdir(componentsOutdir)
+  const componentEntryFile = componentFiles.find((file) => /^entry\.[0-9a-f]{8}\.js$/.test(file))
+  assert.ok(componentEntryFile, 'Components build must emit a hashed JavaScript entry')
+  await assertComponentsRuntime(join(componentsOutdir, componentEntryFile))
+  const componentCssFile = componentFiles.find((file) => /^styles\.[0-9a-f]{8}\.css$/.test(file))
+  assert.ok(componentCssFile, 'Components build must emit a CSS asset')
+  const componentHtml = await readFile(join(componentsOutdir, 'index.html'), 'utf8')
+  assert.match(
+    componentHtml,
+    new RegExp(`href=["'][^"']*${componentCssFile.replaceAll('.', '\\.')}["']`),
+    'index.html must link the emitted hashed CSS asset',
+  )
+  const componentCss = await readFile(join(componentsOutdir, componentCssFile), 'utf8')
+  for (const prefix of [
+    'rc-checkbox-',
+    'rc-dropdown-container-',
+    'rc-spin-',
+    'rc-virtual-',
+    'rc-alert-',
+    'rc-button-',
+    'rc-dialog-',
+    'rc-drawer-',
+    'rc-empty-',
+    'rc-line-edit-',
+    'rc-number-edit-',
+    'rc-segmented-',
+    'rc-select-',
+    'rc-switch-',
+    'rc-tag-',
+    'rc-text-edit-',
+    'rc-tooltip-',
+    'rc-tree-',
+  ]) {
+    assert.match(componentCss, new RegExp(prefix), `Components CSS must include ${prefix}`)
+  }
 
   const reservation = createServer()
   const port = await listen(reservation)

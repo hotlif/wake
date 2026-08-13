@@ -1,9 +1,13 @@
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'
 import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
 const cli = resolve(root, 'npm/wake/bin/wake.mjs')
+const expectedVersion = JSON.parse(
+  readFileSync(resolve(root, 'npm/wake/package.json'), 'utf8'),
+).version
 const samples = []
 
 for (let index = 0; index < 5; index += 1) {
@@ -14,7 +18,7 @@ for (let index = 0; index < 5; index += 1) {
     encoding: 'utf8',
   })
   const elapsed = performance.now() - started
-  if (result.status !== 0 || result.stdout.trim() !== '0.1.15') {
+  if (result.status !== 0 || result.stdout.trim() !== expectedVersion) {
     throw new Error(
       `wake --version failed: ${result.stderr || result.stdout || result.status}`,
     )

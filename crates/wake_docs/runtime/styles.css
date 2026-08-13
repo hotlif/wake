@@ -88,8 +88,24 @@
   --token-semantic-color-feedback-info-background: color-mix(in srgb, #60a5fa 14%, var(--surface-raised));
   --switch-disabled-handle-background-color: color-mix(in srgb, #fff 42%, var(--surface));
 }
-.workbench-shell,
-.demo-frame-root { --wake-accent: var(--workbench-accent); }
+.workbench-shell { --wake-accent: var(--workbench-accent); }
+/* Demo previews keep the configured site accent. The `:root:has(...)` arm also
+   reaches Select/Dialog/Drawer portals mounted next to `.demo-frame-root` under
+   `body`; the class arm covers the normal preview subtree without relying on a
+   portal implementation detail. */
+:root:has(.demo-frame-root),
+.demo-frame-root {
+  --token-semantic-color-background-hover-subtle: color-mix(in srgb, var(--wake-accent) 7%, var(--surface));
+  --token-semantic-color-background-active-subtle: color-mix(in srgb, var(--wake-accent) 12%, var(--surface));
+  --token-semantic-color-border-focus: var(--wake-accent);
+  --token-semantic-color-brand-primary: var(--wake-accent);
+  --token-semantic-color-brand-primary-hover: color-mix(in srgb, var(--wake-accent) 84%, var(--text));
+  --token-semantic-color-brand-primary-active: color-mix(in srgb, var(--wake-accent) 72%, var(--text));
+  --token-semantic-color-text-link: var(--wake-accent);
+  --token-semantic-color-text-link-hover: color-mix(in srgb, var(--wake-accent) 78%, var(--text));
+  --token-semantic-color-text-on-brand: #fff;
+  --token-semantic-shadow-focus-ring: 0 0 0 3px color-mix(in srgb, var(--wake-accent) 28%, transparent);
+}
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; background: var(--bg); }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.7; }

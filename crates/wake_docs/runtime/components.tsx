@@ -1,19 +1,32 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import Alert from "@crab-dev/rc-alert";
-import Button from "@crab-dev/rc-button";
-import Dialog from "@crab-dev/rc-dialog";
-import Drawer from "@crab-dev/rc-drawer";
-import Empty from "@crab-dev/rc-empty";
-import LineEdit from "@crab-dev/rc-line-edit";
-import NumberEdit from "@crab-dev/rc-number-edit";
-import Segmented from "@crab-dev/rc-segmented";
-import Select from "@crab-dev/rc-select";
-import Switch from "@crab-dev/rc-switch";
-import Tag from "@crab-dev/rc-tag";
-import TextEdit from "@crab-dev/rc-text-edit";
-import Tooltip from "@crab-dev/rc-tooltip";
-import Tree, { LoadStateType, NodeType, type Node as TreeNode } from "@crab-dev/rc-tree";
-import { Check, Code2, Copy, Menu, Monitor, Moon, RotateCcw, SlidersHorizontal, Sun } from "lucide-react";
+import {
+  Alert,
+  Button,
+  Check,
+  Code2,
+  Copy,
+  Dialog,
+  Drawer,
+  Empty,
+  LineEdit,
+  LoadStateType,
+  Menu,
+  Monitor,
+  Moon,
+  NodeType,
+  NumberEdit,
+  RotateCcw,
+  Segmented,
+  Select,
+  SlidersHorizontal,
+  Sun,
+  Switch,
+  Tag,
+  TextEdit,
+  Tooltip,
+  Tree,
+  type TreeNode,
+} from "@crab-dev/wake/internal/components-runtime";
 import { demos } from "@wake/docs/registry.ts";
 import { siteConfig } from "@wake/docs/config.tsx";
 import { applyLocationArgs, equalValue, locationHash, readLocationHash } from "./components-state.mjs";

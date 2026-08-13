@@ -2841,6 +2841,47 @@ mod tests {
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn component_preview_keeps_configured_accent_while_workbench_stays_neutral() {
+        assert!(
+            RUNTIME_STYLE.contains(".workbench-shell { --wake-accent: var(--workbench-accent); }")
+        );
+        assert!(RUNTIME_STYLE.contains(":root:has(.demo-frame-root),\n.demo-frame-root {"));
+        let demo_scope = RUNTIME_STYLE
+            .split_once(":root:has(.demo-frame-root),\n.demo-frame-root {")
+            .expect("Demo token scope")
+            .1
+            .split_once("\n}")
+            .expect("Demo token scope end")
+            .0;
+        assert!(
+            !demo_scope.contains("--wake-accent:"),
+            "Demo 必须继承配置的 --wake-accent，不能重置为工作台中性色"
+        );
+        for expected in [
+            "--token-semantic-color-background-hover-subtle: color-mix(in srgb, var(--wake-accent)",
+            "--token-semantic-color-background-active-subtle: color-mix(in srgb, var(--wake-accent)",
+            "--token-semantic-color-border-focus: var(--wake-accent);",
+            "--token-semantic-color-brand-primary: var(--wake-accent);",
+            "--token-semantic-color-brand-primary-hover: color-mix(in srgb, var(--wake-accent)",
+            "--token-semantic-color-brand-primary-active: color-mix(in srgb, var(--wake-accent)",
+            "--token-semantic-color-text-link: var(--wake-accent);",
+            "--token-semantic-color-text-link-hover: color-mix(in srgb, var(--wake-accent)",
+            "--token-semantic-shadow-focus-ring: 0 0 0 3px color-mix(in srgb, var(--wake-accent)",
+        ] {
+            assert!(
+                demo_scope.contains(expected),
+                "缺少 Demo 强调色映射: {expected}"
+            );
+        }
+        assert!(
+            RUNTIME_APP.contains(
+                "document.documentElement.style.setProperty(\"--wake-accent\", siteConfig.accentColor)"
+            ),
+            "iframe runtime 必须把配置色写入根节点"
+        );
+    }
+
+    #[test]
     fn slash_paths_strip_windows_verbatim_prefixes() {
         assert_eq!(
             slash_path(Path::new(r"\\?\C:\proj\docs\index.mdx")),
@@ -3276,6 +3317,11 @@ const count: number = 2
                 .join("runtime/components.tsx")
                 .is_file()
         );
+        let components_runtime =
+            fs::read_to_string(generated.generated_dir.join("runtime/components.tsx")).unwrap();
+        assert!(components_runtime.contains("@crab-dev/wake/internal/components-runtime"));
+        assert!(!components_runtime.contains("from \"@crab-dev/rc-"));
+        assert!(!components_runtime.contains("from \"lucide-react\""));
         assert!(
             generated
                 .generated_dir

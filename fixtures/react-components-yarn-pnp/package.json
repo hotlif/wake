@@ -1,0 +1,15 @@
+{
+  "name": "wake-react-components-yarn-pnp-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "yarn@4.16.0",
+  "scripts": {
+    "components:build": "wake docs build . --mode components --outdir dist"
+  },
+  "dependencies": {
+    "@crab-dev/wake": "0.1.16",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  }
+}

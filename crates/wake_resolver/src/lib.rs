@@ -12,7 +12,7 @@ use wake_common::{FileSystem, FxHashMap, fs::normalize};
 pub mod pnp;
 mod pnpfs;
 
-pub use pnp::PnpManifest;
+pub use pnp::{PnpError, PnpManifest};
 pub use pnpfs::PnpFileSystem;
 
 /// 一份 npm 包内容的逻辑身份。普通 registry 包按 `name@version` 扁平去重；
@@ -54,6 +54,18 @@ pub struct ResolvedModule {
 type ResolutionCache = FxHashMap<PathBuf, FxHashMap<String, Option<PathBuf>>>;
 type PackageRootCache = FxHashMap<PathBuf, FxHashMap<String, Arc<[PathBuf]>>>;
 
+/// 一条只在 Yarn PnP 依赖边界错误时生效的定向 fallback。
+///
+/// 当 `issuer_package_prefix` 命中导入方包名、导入的裸包名等于 `dependency`，
+/// 且 issuer 自身及 Yarn 顶层 fallback 都因未声明或未满足 peer 而失败时，
+/// 改从 `provider_issuer` 所属 locator 的依赖图中解析。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PnpDependencyFallback {
+    pub issuer_package_prefix: String,
+    pub dependency: String,
+    pub provider_issuer: PathBuf,
+}
+
 /// 解析选项。
 #[derive(Clone, Debug)]
 pub struct ResolveOptions {
@@ -67,6 +79,9 @@ pub struct ResolveOptions {
     /// 匹配规则：说明符 == 前缀 或以 `前缀/` 开头；命中最长前缀，重写后走文件/目录解析。
     /// 保持既定行为 webpack `resolve.alias`（WAKE-COMPATIBILITY §H）。默认空 → 行为与接入前逐字节一致。
     pub alias: Vec<(String, PathBuf)>,
+    /// 只在 PnP `Undeclared`/`UnfulfilledPeer` 上应用的 issuer-scoped 依赖 fallback。
+    /// 普通 `node_modules` 解析忽略此项。
+    pub pnp_dependency_fallbacks: Vec<PnpDependencyFallback>,
 }
 
 impl Default for ResolveOptions {
@@ -84,6 +99,7 @@ impl Default for ResolveOptions {
                 .map(|value| value.to_string())
                 .collect(),
             alias: Vec::new(),
+            pnp_dependency_fallbacks: Vec::new(),
         }
     }
 }
@@ -288,11 +304,36 @@ impl Resolver {
         } else if let Some(pnp) = &self.pnp {
             // PnP 先定位包根，再由统一包入口逻辑处理 exports 与子路径。
             let (package, subpath) = split_package_ref(specifier);
-            let package_root = pnp.resolve_bare(package, from_dir).ok()?;
+            let package_root = match pnp.resolve_bare(package, from_dir) {
+                Ok(root) => root,
+                Err(pnp::PnpError::Undeclared | pnp::PnpError::UnfulfilledPeer) => {
+                    self.resolve_pnp_dependency_fallback(pnp, package, from_dir)?
+                }
+                Err(_) => return None,
+            };
             self.resolve_package(&package_root, subpath)
         } else {
             self.resolve_node_modules(specifier, from_dir)
         }
+    }
+
+    /// 严格限定的 PnP 依赖 fallback。调用方只会在 issuer 正常解析与
+    /// Yarn 顶层 fallback 都返回依赖边界错误后进入此逻辑。
+    fn resolve_pnp_dependency_fallback(
+        &self,
+        pnp: &PnpManifest,
+        dependency: &str,
+        issuer_dir: &Path,
+    ) -> Option<PathBuf> {
+        let issuer_package = pnp.issuer_package_name(issuer_dir).ok()??;
+        self.options
+            .pnp_dependency_fallbacks
+            .iter()
+            .find(|fallback| {
+                fallback.dependency == dependency
+                    && issuer_package.starts_with(&fallback.issuer_package_prefix)
+            })
+            .and_then(|fallback| pnp.resolve_bare(dependency, &fallback.provider_issuer).ok())
     }
 
     /// 别名匹配：说明符 == 前缀 或以 `前缀/` 开头 → 重写为 `目标 [+ 余下子路径]`（命中最长前缀）。
@@ -892,6 +933,248 @@ mod tests {
                 .resolve("modern", Path::new("project/src"))
                 .unwrap(),
             PathBuf::from("cache/modern/node_modules/modern/esm/index.mjs")
+        );
+    }
+
+    fn pnp_scoped_fallback_resolver(
+        component_dependency: Option<Option<&str>>,
+        provider_has_dependency: bool,
+        enable_top_level_fallback: bool,
+        top_level_dependency: Option<&str>,
+        alias: Vec<(String, PathBuf)>,
+    ) -> Resolver {
+        let mut top_dependencies = vec![
+            serde_json::json!(["@crab-dev/wake", "npm:0.1.16"]),
+            serde_json::json!(["@crab-dev/rc-button", "npm:1.0.0"]),
+        ];
+        if let Some(reference) = top_level_dependency {
+            top_dependencies.push(serde_json::json!(["@linaria/core", reference]));
+        }
+
+        let mut wake_dependencies = vec![serde_json::json!(["@crab-dev/wake", "npm:0.1.16"])];
+        if provider_has_dependency {
+            wake_dependencies.push(serde_json::json!(["@linaria/core", "npm:1.0.0"]));
+        }
+
+        let mut component_dependencies =
+            vec![serde_json::json!(["@crab-dev/rc-button", "npm:1.0.0"])];
+        match component_dependency {
+            Some(Some(reference)) => {
+                component_dependencies.push(serde_json::json!(["@linaria/core", reference]))
+            }
+            Some(None) => component_dependencies.push(serde_json::json!(["@linaria/core", null])),
+            None => {}
+        }
+
+        let manifest_value = serde_json::json!({
+            "enableTopLevelFallback": enable_top_level_fallback,
+            "fallbackExclusionList": [],
+            "fallbackPool": [],
+            "packageRegistryData": [
+                [null, [[null, {
+                    "packageLocation": "./",
+                    "packageDependencies": top_dependencies,
+                    "linkType": "SOFT"
+                }]]],
+                ["@crab-dev/wake", [["npm:0.1.16", {
+                    "packageLocation": "../cache/wake/node_modules/@crab-dev/wake/",
+                    "packageDependencies": wake_dependencies,
+                    "linkType": "HARD"
+                }]]],
+                ["@crab-dev/rc-button", [["npm:1.0.0", {
+                    "packageLocation": "../cache/button/node_modules/@crab-dev/rc-button/",
+                    "packageDependencies": component_dependencies,
+                    "linkType": "HARD"
+                }]]],
+                ["@linaria/core", [
+                    ["npm:1.0.0", {
+                        "packageLocation": "../cache/linaria-v1/node_modules/@linaria/core/",
+                        "packageDependencies": [["@linaria/core", "npm:1.0.0"]],
+                        "linkType": "HARD"
+                    }],
+                    ["npm:2.0.0", {
+                        "packageLocation": "../cache/linaria-v2/node_modules/@linaria/core/",
+                        "packageDependencies": [["@linaria/core", "npm:2.0.0"]],
+                        "linkType": "HARD"
+                    }]
+                ]]
+            ]
+        });
+
+        let fs = MemoryFileSystem::new();
+        fs.insert(
+            "project/.pnp.data.json",
+            manifest_value.to_string().as_str(),
+        );
+        fs.insert("project/src/index.js", "// project");
+        fs.insert(
+            "cache/wake/node_modules/@crab-dev/wake/package.json",
+            r#"{"name":"@crab-dev/wake","main":"index.js"}"#,
+        );
+        fs.insert("cache/wake/node_modules/@crab-dev/wake/index.js", "// wake");
+        fs.insert(
+            "cache/button/node_modules/@crab-dev/rc-button/package.json",
+            r#"{"name":"@crab-dev/rc-button","main":"index.js"}"#,
+        );
+        fs.insert(
+            "cache/button/node_modules/@crab-dev/rc-button/index.js",
+            "// button",
+        );
+        fs.insert(
+            "cache/linaria-v1/node_modules/@linaria/core/package.json",
+            r#"{"name":"@linaria/core","exports":{".":"./index.js","./private":"./private.js"}}"#,
+        );
+        fs.insert(
+            "cache/linaria-v1/node_modules/@linaria/core/index.js",
+            "// provider v1",
+        );
+        fs.insert(
+            "cache/linaria-v1/node_modules/@linaria/core/private.js",
+            "// provider private",
+        );
+        fs.insert(
+            "cache/linaria-v2/node_modules/@linaria/core/package.json",
+            r#"{"name":"@linaria/core","exports":{".":"./index.js"}}"#,
+        );
+        fs.insert(
+            "cache/linaria-v2/node_modules/@linaria/core/index.js",
+            "// component v2",
+        );
+        fs.insert("alias/linaria.js", "// alias");
+
+        let manifest = PnpManifest::load(&fs, Path::new("project")).unwrap();
+        Resolver::with_pnp_options(
+            Arc::new(fs),
+            Arc::new(manifest),
+            ResolveOptions {
+                alias,
+                pnp_dependency_fallbacks: vec![PnpDependencyFallback {
+                    issuer_package_prefix: "@crab-dev/rc-".to_string(),
+                    dependency: "@linaria/core".to_string(),
+                    provider_issuer: PathBuf::from(
+                        "cache/wake/node_modules/@crab-dev/wake/internal",
+                    ),
+                }],
+                ..ResolveOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pnp_scoped_fallback_resolves_undeclared_dependency_from_provider() {
+        let resolver = pnp_scoped_fallback_resolver(None, true, false, None, Vec::new());
+        assert_eq!(
+            resolver
+                .resolve(
+                    "@linaria/core",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .unwrap(),
+            PathBuf::from("cache/linaria-v1/node_modules/@linaria/core/index.js")
+        );
+    }
+
+    #[test]
+    fn pnp_scoped_fallback_resolves_unfulfilled_peer_from_provider() {
+        let resolver = pnp_scoped_fallback_resolver(Some(None), true, false, None, Vec::new());
+        assert_eq!(
+            resolver
+                .resolve(
+                    "@linaria/core",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .unwrap(),
+            PathBuf::from("cache/linaria-v1/node_modules/@linaria/core/index.js")
+        );
+    }
+
+    #[test]
+    fn pnp_issuer_dependency_wins_over_scoped_fallback() {
+        let resolver =
+            pnp_scoped_fallback_resolver(Some(Some("npm:2.0.0")), true, false, None, Vec::new());
+        assert_eq!(
+            resolver
+                .resolve(
+                    "@linaria/core",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .unwrap(),
+            PathBuf::from("cache/linaria-v2/node_modules/@linaria/core/index.js")
+        );
+    }
+
+    #[test]
+    fn pnp_top_level_fallback_wins_over_scoped_fallback() {
+        let resolver =
+            pnp_scoped_fallback_resolver(None, true, true, Some("npm:2.0.0"), Vec::new());
+        assert_eq!(
+            resolver
+                .resolve(
+                    "@linaria/core",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .unwrap(),
+            PathBuf::from("cache/linaria-v2/node_modules/@linaria/core/index.js")
+        );
+    }
+
+    #[test]
+    fn pnp_scoped_fallback_does_not_apply_to_project_sources() {
+        let resolver = pnp_scoped_fallback_resolver(None, true, false, None, Vec::new());
+        assert!(
+            resolver
+                .resolve("@linaria/core", Path::new("project/src"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pnp_scoped_fallback_fails_when_provider_does_not_declare_dependency() {
+        let resolver = pnp_scoped_fallback_resolver(None, false, false, None, Vec::new());
+        assert!(
+            resolver
+                .resolve(
+                    "@linaria/core",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pnp_alias_wins_over_normal_and_scoped_dependency_resolution() {
+        let resolver = pnp_scoped_fallback_resolver(
+            Some(Some("npm:2.0.0")),
+            true,
+            false,
+            None,
+            vec![(
+                "@linaria/core".to_string(),
+                PathBuf::from("alias/linaria.js"),
+            )],
+        );
+        assert_eq!(
+            resolver
+                .resolve(
+                    "@linaria/core",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .unwrap(),
+            PathBuf::from("alias/linaria.js")
+        );
+    }
+
+    #[test]
+    fn pnp_invalid_export_does_not_retry_scoped_fallback() {
+        let resolver =
+            pnp_scoped_fallback_resolver(Some(Some("npm:2.0.0")), true, false, None, Vec::new());
+        assert!(
+            resolver
+                .resolve(
+                    "@linaria/core/private",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
+                )
+                .is_err()
         );
     }
 

@@ -618,10 +618,26 @@ pub fn compute_live_keep(
             Ev::Live(m, local) => {
                 if live.entry(m).or_default().insert(local)
                     && let Some(mi) = idx.get(&m)
-                    && let Some(refs) = mi.decl_refs.get(&local)
                 {
-                    for r in refs.iter() {
-                        wl.push(Ev::Ref(m, *r));
+                    if let Some(refs) = mi.decl_refs.get(&local) {
+                        for r in refs.iter() {
+                            wl.push(Ev::Ref(m, *r));
+                        }
+                    }
+                    // A local export may directly expose an imported binding:
+                    // `import { x } from "dep"; export { x };`. In that case
+                    // there is no local declaration whose references can carry
+                    // liveness to the dependency, so propagate the live binding
+                    // through the import itself.
+                    if let Some((spec, imported)) = mi.named.get(&local).copied()
+                        && let Some(t) = resolve(m, spec)
+                    {
+                        wl.push(Ev::Export(t, imported));
+                    }
+                    if let Some(spec) = mi.namespace.get(&local).copied()
+                        && let Some(t) = resolve(m, spec)
+                    {
+                        wl.push(Ev::All(t));
                     }
                 }
             }
@@ -849,6 +865,99 @@ mod tests {
         if let LiveResult::Names(s) = &keep[&1] {
             assert!(s.contains(&create), "createElement 应活(useState 传递引用)")
         }
+    }
+
+    #[test]
+    fn liveness_local_reexport_of_named_import_propagates_to_source() {
+        // runtime(1): import { Icon } from "barrel"; export { Icon };
+        // barrel(2):  export { default as Icon } from "icon";
+        // icon(3):    const IconImpl = createIcon(); export { IconImpl as default };
+        // entry(0):   import { Icon } from "runtime"; use(Icon);
+        //
+        // The local export in runtime makes an imported binding live. That must
+        // request the named export from barrel and ultimately keep icon's default.
+        let it = Interner::new();
+        let icon = it.intern("Icon");
+        let icon_impl = it.intern("IconImpl");
+        let default = it.intern("default");
+
+        let source = ModuleLiveness {
+            decls: vec![(icon_impl, FxHashSet::default())],
+            exports: vec![(default, Some(icon_impl))],
+            ..Default::default()
+        };
+        let barrel = ModuleLiveness {
+            reexport_named: vec![(icon, "icon".to_string(), default)],
+            ..Default::default()
+        };
+        let mut runtime = ModuleLiveness {
+            exports: vec![(icon, Some(icon))],
+            ..Default::default()
+        };
+        runtime.named_imports.push(named(icon, "barrel", icon));
+
+        let mut entry = ModuleLiveness::default();
+        entry.named_imports.push(named(icon, "runtime", icon));
+        entry.root_refs.insert(icon);
+
+        let mut mods: FxHashMap<u32, &ModuleLiveness> = FxHashMap::default();
+        mods.insert(0u32, &entry);
+        mods.insert(1u32, &runtime);
+        mods.insert(2u32, &barrel);
+        mods.insert(3u32, &source);
+        let resolve = |m: u32, spec: &str| match (m, spec) {
+            (0, "runtime") => Some(1u32),
+            (1, "barrel") => Some(2u32),
+            (2, "icon") => Some(3u32),
+            _ => None,
+        };
+        let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
+
+        match &keep[&3] {
+            LiveResult::Names(names) => {
+                assert!(
+                    names.contains(&default),
+                    "icon default export should be live"
+                )
+            }
+            LiveResult::All => {}
+        }
+    }
+
+    #[test]
+    fn liveness_local_reexport_of_namespace_import_keeps_source_all() {
+        // runtime(1): import * as icons from "icons"; export { icons };
+        // entry(0):   import { icons } from "runtime"; use(icons);
+        let it = Interner::new();
+        let icons = it.intern("icons");
+        let value = it.intern("value");
+
+        let source = ModuleLiveness {
+            decls: vec![(value, FxHashSet::default())],
+            exports: vec![(value, Some(value))],
+            ..Default::default()
+        };
+        let runtime = ModuleLiveness {
+            namespace_imports: vec![(icons, "icons".to_string())],
+            exports: vec![(icons, Some(icons))],
+            ..Default::default()
+        };
+        let mut entry = ModuleLiveness::default();
+        entry.named_imports.push(named(icons, "runtime", icons));
+        entry.root_refs.insert(icons);
+
+        let mut mods: FxHashMap<u32, &ModuleLiveness> = FxHashMap::default();
+        mods.insert(0u32, &entry);
+        mods.insert(1u32, &runtime);
+        mods.insert(2u32, &source);
+        let resolve = |m: u32, spec: &str| match (m, spec) {
+            (0, "runtime") => Some(1u32),
+            (1, "icons") => Some(2u32),
+            _ => None,
+        };
+        let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
+
+        assert_eq!(keep[&2], LiveResult::All);
     }
 
     #[test]

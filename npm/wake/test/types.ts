@@ -16,6 +16,11 @@ import {
   tokenize,
   transform,
 } from '@crab-dev/wake/experimental'
+import {
+  Button,
+  Tree,
+  type TreeNode,
+} from '@crab-dev/wake/internal/components-runtime'
 
 async function api() {
   const result = await build({ cwd: '.', signal: new AbortController().signal })
@@ -46,3 +51,7 @@ async function api() {
 
 void api()
 void WakeError
+void Button
+void Tree
+const treeNode: TreeNode | undefined = undefined
+void treeNode

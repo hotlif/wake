@@ -1,6 +1,6 @@
 # Wake 设计文档
 
-本文保留源码现有 `DESIGN §…` 引用所需的编号，但描述的是 v0.1.15 已实现设计。未来意向统一写入 [ROADMAP.md](ROADMAP.md)。
+本文保留源码现有 `DESIGN §…` 引用所需的编号，但描述的是 v0.1.16 已实现设计。未来意向统一写入 [ROADMAP.md](ROADMAP.md)。
 
 # 1. 目标与原则
 
@@ -56,7 +56,7 @@ Codegen 直接写字符串并根据优先级补括号。Source Map 记录生成�
 
 ## 5.1 Resolver
 
-Resolver 支持相对路径、node_modules、package exports、alias、workspace 和 Yarn PnP zip。缓存按解析上下文隔离；结构性文件变化需要清理相关命中与 miss。
+Resolver 支持相对路径、node_modules、package exports、alias、workspace 和 Yarn PnP zip。Components 模式可配置按 issuer 包名、目标依赖和 provider issuer 限定的 PnP fallback；它只处理未声明依赖或未满足 peer，不绕过 alias、正常依赖、顶层 fallback 或 exports 错误。同一物理路径对应多个 PnP locator 时，依赖目标必须唯一或等价，否则报告歧义。缓存按解析上下文隔离；结构性文件变化需要清理相关命中与 miss。
 
 ## 5.2 Scan
 
@@ -94,7 +94,7 @@ Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map
 
 ## 8.1 CSS
 
-开发模式可注入样式，生产模式抽取 CSS；CSS Modules 生成局部类名。CSS-in-JS 位于独立 crate，保持编译核心依赖边界。
+开发模式可注入样式，生产模式抽取 CSS；CSS Modules 生成局部类名。CSS-in-JS 位于独立 crate，保持编译核心依赖边界。Crab UI 包由 `package.json#name = @crab-dev/rc-*` 与受支持入口共同识别，存在 `css/index.css` 时由 loader 自动加入模块图；业务源码与 Components runtime 均不显式导入这些样式。该身份也参与持久缓存判定，使 CSS 的新增、删除及跨进程热缓存保持冷构建等价。
 
 ## 8.2 静态资源
 
@@ -150,7 +150,7 @@ AST 持有者放入 `Arc` 管理的任务值，下游只在受控闭包中借用
 
 # 12. 发布
 
-主包与五个平台包使用同一版本。发布先验证源码和许可证，再在目标平台构建、审计不可变 tarball，先发平台包、最后发主包，并执行注册表干净安装。
+主包与五个平台包使用同一版本。发布先验证源码和许可证，再在目标平台构建、审计不可变 tarball，Windows 原生构建还用 Yarn 4.16 PnP fixture 验证 Components 样式；之后先发平台包、最后发主包，并执行注册表干净安装。版本与 tarball 名从清单和 tag 动态取得。
 
 # 13. 风险与降级
 

@@ -223,7 +223,7 @@ struct ParsedLayerResult {
 ///
 /// `keep_exports`：`None` = 不 shake（入口 / 被整体使用）；`Some(已排序名单)` = 只保留这些导出。
 /// `dyn_chunks`：本模块每个跨 chunk 动态 import 的 (说明符, 目标 chunk id)（排序去重）。
-/// 三者都进 cell 指纹——任一变化精确触发 codegen 重跑；chunk **归属/文件名**不进指纹（纯 emit 期）。
+/// 各字段都进 cell 指纹——任一变化精确触发 codegen 重跑；chunk **归属/文件名**不进指纹（纯 emit 期）。
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 struct LinkerData {
     deps: DepIds,
@@ -232,6 +232,9 @@ struct LinkerData {
     /// 本模块依赖里属于 **async 子图**（顶层 await 传染）的模块 id（升序去重）。
     /// codegen 据此把静态导入点写成 `(await __wake_require__(id))`。进指纹 → async 归属变化精确重跑。
     async_deps: Vec<u32>,
+    /// 单包 minify 可省略 ESM marker；代码分割 runtime 必须保留 marker，才能可靠区分
+    /// 转译 ESM 与含 `default` 自有字段的纯 CJS。字段进入 linker/body 缓存身份。
+    no_esmodule: bool,
 }
 
 /// `parse` 任务的输出：AST 持有者 + 源文本 + 依赖（说明符已解为 `String`）+ 诊断。
@@ -1143,7 +1146,7 @@ impl IncrementalBundler {
                             slots[index] = Some((id, path, Ok(loaded), None, None));
                         } else {
                             let persistent = self.cache.as_ref().and_then(|persistent_cache| {
-                                cached_source_type(&path).map(|source_type| {
+                                cached_source_type(self.fs.as_ref(), &path).map(|source_type| {
                                     let cached =
                                         persistent_cache.cached_source(&path, persistent_variant);
                                     (source_type, cached)
@@ -1649,6 +1652,9 @@ impl IncrementalBundler {
         } else {
             None
         };
+        // 单包 minify 仍可使用现有的无 marker 紧凑路径；代码分割必须让各 chunk 的 runtime
+        // 通过 `__esModule` 可靠区分 ESM 与 CJS（`default` 键本身不是可靠信号）。
+        let no_esmodule = self.minify && chunk_graph.is_none();
 
         // —— Link 阶段：顶层 await——算 async 子图（含 TLA 的模块 + 静态导入它们的模块）——
         let async_ids = async_module_ids(&modules);
@@ -1695,9 +1701,11 @@ impl IncrementalBundler {
                 keep_exports: keep.get(&id).cloned().flatten(),
                 dyn_chunks,
                 async_deps,
+                no_esmodule,
             };
             // body_key 与查缓存仅在启用缓存时做——`hash_linker`（SipHash 全依赖）无缓存时纯浪费。
-            // define + minify 指纹混入低 64 位：dev↔prod / minify 开关变化 → 缓存精确失效。
+            // linker（含 ESM marker 模式）+ define/minify/mangle 指纹混入低 64 位，配置变化
+            // 会精确失效缓存，尤其禁止分割构建复用单包 minify 的无 marker 模块体。
             let (body_key, cached_body) = if self.cache.is_some() {
                 let minify_salt = if self.minify { MINIFY_SALT } else { 0 };
                 let mangle_salt = if self.mangle { MANGLE_SALT } else { 0 };
@@ -1784,7 +1792,6 @@ impl IncrementalBundler {
                 let define = self.define.clone();
                 let minify = self.minify;
                 let mangle = self.mangle;
-                let no_esmodule = self.minify;
                 let minify_names = self.minify;
                 let drop_console = self.drop_console;
                 let drop_debugger = self.drop_debugger;
@@ -1806,7 +1813,6 @@ impl IncrementalBundler {
                         define,
                         minify,
                         mangle,
-                        no_esmodule,
                         minify_names,
                         drop_console,
                         drop_debugger,
@@ -1887,7 +1893,7 @@ impl IncrementalBundler {
                     &bodies,
                     entry_id,
                     self.minify,
-                    self.minify,
+                    no_esmodule,
                     &block_infos,
                     &async_ids,
                     &self.exec,
@@ -2270,7 +2276,8 @@ impl JsxRuntimeOptions {
     }
 }
 
-/// linker 键：对 `LinkerData`（依赖 id 映射 + keep + dyn_chunks）取稳定 hash（固定种子 SipHash，跨进程稳定）。
+/// linker 键：对 `LinkerData`（依赖 id 映射 + keep + dyn_chunks + marker 模式）取稳定 hash
+///（固定种子 SipHash，跨进程稳定）。
 fn hash_linker(data: &LinkerData) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
@@ -2558,7 +2565,6 @@ fn codegen_request(
     define: Arc<[(String, String)]>,
     minify: bool,
     mangle: bool,
-    no_esmodule: bool,
     minify_names: bool,
     drop_console: bool,
     drop_debugger: bool,
@@ -2586,6 +2592,7 @@ fn codegen_request(
         let mangle = mangle && !compatibility_mode;
         let minify_names = minify_names && !compatibility_mode;
         let data = linker_vc.read();
+        let no_esmodule = data.no_esmodule;
         let linker = Linker {
             map: SpecifierLookup::new(&data.deps),
             dyn_chunk: SpecifierLookup::new(&data.dyn_chunks),
@@ -3595,6 +3602,30 @@ fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
     result
 }
 
+/// 生成 default import interop helper。minify 下 codegen 省略 `__esModule`，
+/// 因此须改用转译 ESM 必然具有的 `default` 导出键判定。
+fn interop_default_helper(name: &str, no_esmodule: bool) -> String {
+    if no_esmodule {
+        format!(
+            "function {name}(m){{return m&&(typeof m==='object'||typeof m==='function')&&'default' in m?m.default:m}}"
+        )
+    } else {
+        format!("function {name}(m){{return m&&m.__esModule?m.default:m}}")
+    }
+}
+
+/// 生成 namespace import interop helper。在无 `__esModule` 标记的模式下，
+/// codegen 已把 ESM 导出写入同一 exports 对象，直接返回即可保留 `.default`。
+fn interop_star_helper(name: &str, no_esmodule: bool) -> String {
+    if no_esmodule {
+        format!("function {name}(m){{return m}}")
+    } else {
+        format!(
+            "function {name}(m){{if(m&&m.__esModule)return m;var ns={{}};if(m!=null){{for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}}ns.default=m;return ns}}"
+        )
+    }
+}
+
 /// 拼接各模块（已 codegen 的）函数体 + mini runtime。
 ///
 /// `async_ids`：async 子图（顶层 await）。非空时包装器改 `async function`、runtime 换 Promise 感知版、
@@ -3858,16 +3889,8 @@ fn emit(
         // 不能简化为恒取 `m.default`：真 CJS 模块（如 `module.exports = api`）没有 `default`，
         // 取之得 `undefined`。这类模块现在会作为独立注册模块存在（见 `reassigns_module_exports`），
         // 简化版会让 `import pkg from 'cjs-pkg'` 直接拿到 undefined。
-        let interop_default = if no_esmodule {
-            "function __wake_interop_default(m){return m&&(typeof m==='object'||typeof m==='function')&&'default' in m?m.default:m}"
-        } else {
-            "function __wake_interop_default(m){return m&&m.__esModule?m.default:m}"
-        };
-        let interop_star = if no_esmodule {
-            "function __wake_interop_star(m){return m}"
-        } else {
-            "function __wake_interop_star(m){if(m&&m.__esModule)return m;var ns={};if(m!=null){for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}return ns}"
-        };
+        let interop_default = interop_default_helper("__wake_interop_default", no_esmodule);
+        let interop_star = interop_star_helper("__wake_interop_star", no_esmodule);
         // async 变体：async 模块的包装器返回 Promise → 缓存并返回它，导入方 `await` 得到最终 exports。
         out.push_str(if async_ids.is_empty() {
             "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
@@ -3878,10 +3901,10 @@ fn emit(
         append_inline_regs(&mut out, &inline_regs);
 
         if needs_interop_default {
-            out.push_str(interop_default);
+            out.push_str(&interop_default);
         }
         if needs_interop_star {
-            out.push_str(interop_star);
+            out.push_str(&interop_star);
         }
         out.push_str("var t={");
         for (id, body) in &final_modules {
@@ -4289,7 +4312,14 @@ fn render_entry_chunk(
     d_map: &str,
     entries: &str,
 ) -> String {
-    let mut out = RUNTIME_ENTRY_PRELUDE.replace("__WAKE_NS__", token);
+    // 分割 runtime 跨 chunk 处理未知模块形态，必须使用 codegen 保留的 ESM marker；不能用
+    // `default` 自有键猜测，因为合法 CJS 也可能导出 `{ default: value }`。
+    let interop_default = interop_default_helper("interopDefault", false);
+    let interop_star = interop_star_helper("interopStar", false);
+    let mut out = RUNTIME_ENTRY_PRELUDE
+        .replace("__WAKE_NS__", token)
+        .replace("__WAKE_INTEROP_DEFAULT__", &interop_default)
+        .replace("__WAKE_INTEROP_STAR__", &interop_star);
     // 配置的 `publicPath` 注入运行时（`loadFile` 用它拼 chunk URL）：子路径部署下动态 import()
     // 才不会按当前页面 URL 相对解析而 404。写在 prelude 之后而非其对象字面量里——registry 可能
     // 已由同 token 的先前加载建好（`g.__WAKE_NS__ || (...)`），字面量那次不会再跑。
@@ -4403,15 +4433,8 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
     }
     return module.exports;
   }
-  function interopDefault(m) { return m && m.__esModule ? m.default : m; }
-  function interopStar(m) {
-    if (m && m.__esModule) return m;
-    var ns = {};
-    if (m != null) for (var k in m)
-      if (Object.prototype.hasOwnProperty.call(m, k) && k !== "default") ns[k] = m[k];
-    ns.default = m;
-    return ns;
-  }
+  __WAKE_INTEROP_DEFAULT__
+  __WAKE_INTEROP_STAR__
   function register(mods) { for (var k in mods) if (!modules[k]) modules[k] = mods[k]; }
   function markLoaded(cid) { if (!chunkPromises[cid]) chunkPromises[cid] = Promise.resolve(); }
   function loadFile(file) {

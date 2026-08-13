@@ -15,6 +15,7 @@ wake_config.workspace = true
 wake_scan.workspace = true
 wake_html.workspace = true
 wake_bundler.workspace = true
+wake_resolver.workspace = true
 wake_dev_server.workspace = true
 wake_docs.workspace = true
 wake_ecma_transform.workspace = true
