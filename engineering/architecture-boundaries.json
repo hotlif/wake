@@ -10,6 +10,8 @@
     "wake_config",
     "wake_css",
     "wake_css_in_js",
+    "wake_css_language",
+    "wake_css_lsp",
     "wake_dev_server",
     "wake_docs",
     "wake_ecma_ast",
@@ -39,12 +41,12 @@
       "wake_ecma_semantic",
       "wake_ecma_transform"
     ],
-    "cssLayers": ["wake_css", "wake_css_in_js"],
-    "productEdges": ["wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+    "cssLayers": ["wake_css", "wake_css_in_js", "wake_css_language"],
+    "productEdges": ["wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
     "shells": ["wake_cli", "wake_node"],
     "nonShells": [
       "wake_app", "wake_bundler", "wake_cache", "wake_common", "wake_config",
-      "wake_css", "wake_css_in_js", "wake_dev_server", "wake_docs", "wake_ecma_ast",
+      "wake_css", "wake_css_in_js", "wake_css_language", "wake_css_lsp", "wake_dev_server", "wake_docs", "wake_ecma_ast",
       "wake_ecma_codegen", "wake_ecma_lexer", "wake_ecma_minify", "wake_ecma_parser",
       "wake_ecma_semantic", "wake_ecma_transform", "wake_graph", "wake_html",
       "wake_resolver", "wake_scan", "wake_tsdoc", "wake_turbo", "wake_turbo_macros"
@@ -55,7 +57,7 @@
       "id": "compiler-core-no-orchestration",
       "description": "compiler core cannot depend on orchestration or product edges",
       "fromGroups": ["compilerCore"],
-      "deny": ["wake_bundler", "wake_cache", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+      "deny": ["wake_bundler", "wake_cache", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
       "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
       "suggestion": "Move the contract to a lower stable model or keep orchestration in the caller."
     },
@@ -111,7 +113,7 @@
       "id": "cache-stores-stable-data",
       "description": "wake_cache cannot depend on arena, resolver, bundler, or product edges",
       "from": ["wake_cache"],
-      "deny": ["wake_ecma_ast", "wake_resolver", "wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+      "deny": ["wake_ecma_ast", "wake_resolver", "wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
       "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
       "suggestion": "Persist a stable DTO owned below the consumer instead of a process-local object."
     },
@@ -119,9 +121,17 @@
       "id": "css-does-not-own-products",
       "description": "CSS layers cannot depend on bundler or product edges",
       "fromGroups": ["cssLayers"],
-      "deny": ["wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+      "deny": ["wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
       "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
       "suggestion": "Expose a stable CSS artifact and let the bundler integrate it."
+    },
+    {
+      "id": "css-language-is-product-neutral",
+      "description": "CSS language analysis cannot own resolution, bundling, protocol or editor products",
+      "from": ["wake_css_language"],
+      "allowOnly": ["wake_common", "wake_ecma_ast", "wake_ecma_parser", "wake_ecma_semantic", "wake_css_in_js"],
+      "decision": "engineering/decisions/0007-css-language-intelligence.md",
+      "suggestion": "Keep files, dependency traversal, LSP transport and editor adaptation in wake_css_lsp or the editor client."
     },
     {
       "id": "bundler-does-not-depend-on-products",

@@ -94,6 +94,8 @@ wake_graph = { path = "crates/wake_graph" }
 wake_bundler = { path = "crates/wake_bundler" }
 wake_css = { path = "crates/wake_css" }
 wake_css_in_js = { path = "crates/wake_css_in_js" }
+wake_css_language = { path = "crates/wake_css_language" }
+wake_css_lsp = { path = "crates/wake_css_lsp" }
 wake_cache = { path = "crates/wake_cache" }
 wake_dev_server = { path = "crates/wake_dev_server" }
 wake_docs = { path = "crates/wake_docs" }

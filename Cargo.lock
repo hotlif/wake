@@ -2801,6 +2801,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wake_css_language"
+version = "0.1.16"
+dependencies = [
+ "wake_common",
+ "wake_css_in_js",
+ "wake_ecma_ast",
+ "wake_ecma_parser",
+ "wake_ecma_semantic",
+]
+
+[[package]]
+name = "wake_css_lsp"
+version = "0.1.16"
+dependencies = [
+ "wake_common",
+ "wake_css_language",
+ "wake_resolver",
+]
+
+[[package]]
 name = "wake_dev_server"
 version = "0.1.16"
 dependencies = [

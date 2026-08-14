@@ -1,0 +1,19 @@
+[package]
+name = "wake_css_lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wake-css-language-server"
+path = "src/main.rs"
+
+[dependencies]
+wake_common.workspace = true
+wake_css_language.workspace = true
+wake_resolver.workspace = true
+
+[lints]
+workspace = true
