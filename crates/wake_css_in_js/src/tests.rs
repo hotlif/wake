@@ -5,7 +5,10 @@ use wake_ecma_ast::SourceType;
 use wake_ecma_parser::parse;
 
 use crate::value::{Scope, StaticValue, collect_imports, collect_static_exports};
-use crate::{CSS_IN_JS_SOURCES, TransformResult, compiler_consumed_imports, transform};
+use crate::{
+    CSS_IN_JS_SOURCES, CssTemplateKind, TransformResult, compiler_consumed_imports,
+    discover_css_templates, transform,
+};
 
 fn run(src: &str) -> TransformResult {
     run_with(src, &Scope::default())
@@ -928,4 +931,48 @@ fn non_finite_arithmetic_is_rejected_instead_of_emitting_invalid_css() {
     assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
     assert!(r.diagnostics[0].is_error());
     assert!(!r.css.contains("inf"), "{}", r.css);
+}
+
+#[test]
+fn language_discovery_uses_alias_binding_identity() {
+    let source = "import { css as c, keyframes, globalStyle as global } from '@crab-dev/css';\n\
+        const box = c`color: red;`;\n\
+        const animation = keyframes`from { opacity: 0; }`;\n\
+        global`:root { color-scheme: dark; }`;";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Tsx);
+    let templates = parsed
+        .module
+        .with_ast(|program| discover_css_templates(program, &interner));
+    assert_eq!(
+        templates
+            .iter()
+            .map(|template| template.kind)
+            .collect::<Vec<_>>(),
+        [
+            CssTemplateKind::Css,
+            CssTemplateKind::Keyframes,
+            CssTemplateKind::GlobalStyle,
+        ]
+    );
+    assert_eq!(templates[0].literal_spans[0].slice(source), "color: red;");
+}
+
+#[test]
+fn language_discovery_ignores_shadowed_and_unrelated_tags() {
+    let source = "import { css as c } from '@crab-dev/css';\n\
+        function render(c) { return c`color: red;`; }\n\
+        const css = value => value;\n\
+        const local = css`display: block;`;\n\
+        const real = c`display: grid;`;";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Tsx);
+    let templates = parsed
+        .module
+        .with_ast(|program| discover_css_templates(program, &interner));
+    assert_eq!(templates.len(), 1);
+    assert_eq!(
+        templates[0].literal_spans[0].slice(source),
+        "display: grid;"
+    );
 }

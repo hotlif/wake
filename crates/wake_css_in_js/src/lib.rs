@@ -37,6 +37,45 @@ enum BindingKind {
     AssignVars,
 }
 
+/// A build-time tagged-template API recognized from `@crab-dev/css`.
+///
+/// This is also the editor language service's source of truth: callers must not infer a template
+/// kind from the tag's spelling because aliases and lexical shadowing are semantically significant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CssTemplateKind {
+    Css,
+    Keyframes,
+    GlobalStyle,
+}
+
+/// Stable source ranges for a recognized Crab CSS tagged template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CssTemplate {
+    pub kind: CssTemplateKind,
+    /// The complete tagged expression, including the tag.
+    pub span: Span,
+    /// The template literal, including its backticks when present.
+    pub template_span: Span,
+    /// Editable raw literal ranges in source order, excluding template delimiters.
+    pub literal_spans: Vec<Span>,
+    /// JavaScript expression ranges in source order, excluding `${` and `}` delimiters.
+    pub interpolations: Vec<Span>,
+}
+
+/// Return the source range containing editable literal text for a template token.
+///
+/// `index` is the token's position in the template and `tail` says whether it is the final token.
+/// The parser token spans include `` ` ``, `${` or `}` delimiters; this helper removes them without
+/// decoding the raw template text.
+pub fn css_template_literal_span(token: Span, _index: usize, tail: bool) -> Span {
+    let lo = token.lo.saturating_add(1);
+    let trailing = if tail { 1 } else { 2 };
+    Span::new(
+        lo.min(token.hi),
+        token.hi.saturating_sub(trailing).max(lo.min(token.hi)),
+    )
+}
+
 impl BindingKind {
     fn from_import(name: &str) -> Option<Self> {
         match name {
@@ -56,6 +95,15 @@ impl BindingKind {
             Self::Keyframes => "keyframes",
             Self::CreateVar => "variable",
             Self::Cx | Self::GlobalStyle | Self::AssignVars => "runtime",
+        }
+    }
+
+    fn template_kind(self) -> Option<CssTemplateKind> {
+        match self {
+            Self::Css => Some(CssTemplateKind::Css),
+            Self::Keyframes => Some(CssTemplateKind::Keyframes),
+            Self::GlobalStyle => Some(CssTemplateKind::GlobalStyle),
+            Self::Cx | Self::CreateVar | Self::AssignVars => None,
         }
     }
 }
@@ -437,6 +485,55 @@ pub fn compiler_consumed_imports(program: &Program, interner: &Interner) -> FxHa
         .filter(|binding| usage.safe.get(&binding.symbol).copied().unwrap_or(false))
         .map(|binding| binding.local)
         .collect()
+}
+
+/// Discover tagged templates governed by the Crab CSS compiler contract.
+///
+/// Results are in source traversal order and use the same binding registry as [`transform`].
+pub fn discover_css_templates(program: &Program, interner: &Interner) -> Vec<CssTemplate> {
+    struct TemplateCollector<'a> {
+        bindings: &'a BindingRegistry,
+        templates: Vec<CssTemplate>,
+    }
+
+    impl<'ast> Visit<'ast> for TemplateCollector<'_> {
+        fn visit_expression(&mut self, expression: &Expression<'ast>) {
+            if let Expression::TaggedTemplate(template) = expression
+                && let Some(binding) = self.bindings.binding_for_expression(&template.tag)
+                && let Some(kind) = binding.kind.template_kind()
+            {
+                self.templates.push(CssTemplate {
+                    kind,
+                    span: template.span,
+                    template_span: template.quasi.span,
+                    literal_spans: template
+                        .quasi
+                        .quasis
+                        .iter()
+                        .enumerate()
+                        .map(|(index, quasi)| {
+                            css_template_literal_span(quasi.span, index, quasi.tail)
+                        })
+                        .collect(),
+                    interpolations: template
+                        .quasi
+                        .expressions
+                        .iter()
+                        .map(Expression::span)
+                        .collect(),
+                });
+            }
+            walk_expression(self, expression);
+        }
+    }
+
+    let bindings = BindingRegistry::collect(program, interner);
+    let mut collector = TemplateCollector {
+        bindings: &bindings,
+        templates: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.templates
 }
 
 struct CompilerImportUsage<'a> {

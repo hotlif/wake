@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cssparser.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 wake_common.workspace = true
 wake_ecma_ast.workspace = true
 wake_ecma_parser.workspace = true
