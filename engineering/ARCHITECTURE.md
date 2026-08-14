@@ -28,6 +28,7 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 - `wake_resolver`：Node 风格包解析、alias、package exports、Yarn PnP 与 zip 文件系统。
 - `wake_graph`：模块和绑定活跃性、Tree Shaking 所需图分析。
 - `wake_css`、`wake_css_in_js`、`wake_html`：非 JavaScript 内容和 HTML 外壳。
+- `wake_css_language`：`@crab-dev/css` 模板发现、虚拟 CSS、宿主映射和无文件系统编辑分析；构建诊断仍由 `wake_css_in_js` 拥有。
 - `wake_scan`、`wake_tsdoc`：组件扫描、Demo/Props 类型和 JSDoc 提取。
 
 ### 2.3 执行与编排层
@@ -43,6 +44,7 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 - `wake_docs`：MDX、Demo、API 表、组件工作台和静态路由生成。
 - `wake_app`：配置、构建会话、文档构建、错误和取消的统一应用层。
 - `wake_cli`、`wake_node`：面向用户的 Rust CLI 与 JavaScript 绑定。
+- `wake_css_lsp`：增量 LSP 文档、受限依赖缓存和保存时静态分析；`editors/vscode-css` 是启动该服务的薄 VS Code 客户端。
 
 ## 3. 依赖方向
 

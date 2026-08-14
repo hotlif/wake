@@ -113,7 +113,9 @@
     "clean": "node scripts/clean.mjs",
     "compile": "node scripts/clean.mjs && tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
     "check": "npm run compile && node --test --test-isolation=none test/*.test.mjs",
-    "package:vsix": "npm run compile && node scripts/package-vsix.mjs"
+    "package:vsix": "npm run compile && node scripts/package-vsix.mjs",
+    "test:extension": "npm run compile && node test/run-extension-host.mjs",
+    "update:css-data": "node scripts/update-css-data.mjs"
   },
   "dependencies": {
     "vscode-languageclient": "10.1.0"
@@ -121,8 +123,10 @@
   "devDependencies": {
     "@types/node": "24.10.1",
     "@types/vscode": "1.96.0",
+    "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "3.9.2",
     "esbuild": "0.28.2",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vscode-css-languageservice": "6.3.10"
   }
 }

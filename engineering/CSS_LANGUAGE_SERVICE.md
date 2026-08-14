@@ -64,3 +64,18 @@ The extension is `crab-dev.crab-css`, display name `Crab CSS`, versioned indepen
 Each VSIX contains one server for Windows x64, Linux x64, Linux arm64, macOS x64 or macOS arm64.
 The extension runs as a workspace extension so remote workspaces use a server built for the remote
 host.
+
+## Validation commands
+
+From the repository root:
+
+```bash
+cargo test -p wake_css_language -p wake_css_lsp
+cargo clippy -p wake_css_language -p wake_css_lsp --all-targets -- -D warnings
+npm ci --ignore-scripts --prefix editors/vscode-css
+npm run vscode:css:check
+```
+
+`editors/vscode-css/scripts/update-css-data.mjs` deterministically regenerates the embedded fact
+snapshot from the pinned `vscode-css-languageservice@6.3.10` package. CI regenerates the file and
+requires a clean diff.

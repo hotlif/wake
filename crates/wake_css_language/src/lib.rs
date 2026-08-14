@@ -486,7 +486,18 @@ fn unknown_property_diagnostics(source: &str, span: Span) -> Vec<LanguageDiagnos
             continue;
         }
         let name = &text[start..index];
-        if name.starts_with("--") || facts::property(name).is_some() {
+        if name.starts_with("--") {
+            continue;
+        }
+        if let Some(property) = facts::property(name) {
+            if property.name != name {
+                diagnostics.push(LanguageDiagnostic {
+                    span: Span::new(span.lo + start as u32, span.lo + index as u32),
+                    severity: LanguageSeverity::Warning,
+                    code: "CSS_PROPERTY_CASE".to_string(),
+                    message: format!("CSS property should be written as `{}`", property.name),
+                });
+            }
             continue;
         }
         diagnostics.push(LanguageDiagnostic {
@@ -611,27 +622,157 @@ fn colors_in_segment(source: &str, span: Span) -> Vec<DocumentColor> {
     let mut colors = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] != b'#' {
+        if bytes[index] == b'#' {
+            let start = index;
             index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_hexdigit() && index - start <= 8 {
+                index += 1;
+            }
+            let digits = &text[start + 1..index];
+            if let Some((red, green, blue, alpha)) = parse_hex_color(digits) {
+                colors.push(document_color(span, start, index, red, green, blue, alpha));
+            }
             continue;
         }
-        let start = index;
-        index += 1;
-        while index < bytes.len() && bytes[index].is_ascii_hexdigit() && index - start <= 8 {
+        let remaining = &text[index..];
+        let function = ["rgba(", "rgb(", "hsla(", "hsl("].into_iter().find(|name| {
+            remaining.len() >= name.len() && remaining[..name.len()].eq_ignore_ascii_case(name)
+        });
+        if let Some(function) = function
+            && let Some(close) = remaining[function.len()..].find(')')
+        {
+            let end = index + function.len() + close + 1;
+            let arguments = &text[index + function.len()..end - 1];
+            let parsed = if function.starts_with("rgb") {
+                parse_rgb_color(arguments)
+            } else {
+                parse_hsl_color(arguments)
+            };
+            if let Some((red, green, blue, alpha)) = parsed {
+                colors.push(document_color(span, index, end, red, green, blue, alpha));
+            }
+            index = end;
+        } else {
             index += 1;
-        }
-        let digits = &text[start + 1..index];
-        if let Some((red, green, blue, alpha)) = parse_hex_color(digits) {
-            colors.push(DocumentColor {
-                span: Span::new(span.lo + start as u32, span.lo + index as u32),
-                red,
-                green,
-                blue,
-                alpha,
-            });
         }
     }
     colors
+}
+
+fn document_color(
+    span: Span,
+    start: usize,
+    end: usize,
+    red: f32,
+    green: f32,
+    blue: f32,
+    alpha: f32,
+) -> DocumentColor {
+    DocumentColor {
+        span: Span::new(span.lo + start as u32, span.lo + end as u32),
+        red,
+        green,
+        blue,
+        alpha,
+    }
+}
+
+fn color_arguments(value: &str) -> Vec<&str> {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '/'))
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn parse_rgb_color(value: &str) -> Option<(f32, f32, f32, f32)> {
+    let values = color_arguments(value);
+    if !(3..=4).contains(&values.len()) {
+        return None;
+    }
+    let channel = |part: &str| {
+        if let Some(percent) = part.strip_suffix('%') {
+            Some(percent.parse::<f32>().ok()?.clamp(0.0, 100.0) / 100.0)
+        } else {
+            Some(part.parse::<f32>().ok()?.clamp(0.0, 255.0) / 255.0)
+        }
+    };
+    Some((
+        channel(values[0])?,
+        channel(values[1])?,
+        channel(values[2])?,
+        values
+            .get(3)
+            .map_or(Some(1.0), |value| parse_alpha(value))?,
+    ))
+}
+
+fn parse_hsl_color(value: &str) -> Option<(f32, f32, f32, f32)> {
+    let values = color_arguments(value);
+    if !(3..=4).contains(&values.len()) {
+        return None;
+    }
+    let hue = values[0]
+        .strip_suffix("deg")
+        .unwrap_or(values[0])
+        .parse::<f32>()
+        .ok()?
+        .rem_euclid(360.0)
+        / 360.0;
+    let saturation = values[1]
+        .strip_suffix('%')?
+        .parse::<f32>()
+        .ok()?
+        .clamp(0.0, 100.0)
+        / 100.0;
+    let lightness = values[2]
+        .strip_suffix('%')?
+        .parse::<f32>()
+        .ok()?
+        .clamp(0.0, 100.0)
+        / 100.0;
+    let alpha = values
+        .get(3)
+        .map_or(Some(1.0), |value| parse_alpha(value))?;
+    if saturation == 0.0 {
+        return Some((lightness, lightness, lightness, alpha));
+    }
+    let q = if lightness < 0.5 {
+        lightness * (1.0 + saturation)
+    } else {
+        lightness + saturation - lightness * saturation
+    };
+    let p = 2.0 * lightness - q;
+    let channel = |mut value: f32| {
+        if value < 0.0 {
+            value += 1.0;
+        }
+        if value > 1.0 {
+            value -= 1.0;
+        }
+        if value < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * value
+        } else if value < 0.5 {
+            q
+        } else if value < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - value) * 6.0
+        } else {
+            p
+        }
+    };
+    Some((
+        channel(hue + 1.0 / 3.0),
+        channel(hue),
+        channel(hue - 1.0 / 3.0),
+        alpha,
+    ))
+}
+
+fn parse_alpha(value: &str) -> Option<f32> {
+    if let Some(percent) = value.strip_suffix('%') {
+        Some(percent.parse::<f32>().ok()?.clamp(0.0, 100.0) / 100.0)
+    } else {
+        Some(value.parse::<f32>().ok()?.clamp(0.0, 1.0))
+    }
 }
 
 fn parse_hex_color(value: &str) -> Option<(f32, f32, f32, f32)> {

@@ -44,6 +44,17 @@ cargo test -p wake_docs
 
 `docs:check` 校验 Frontmatter、slug、站内路由和仓库文档链接；`docs:build` 验证真实 MDX/React 打包，而不只检查 Markdown 文本。
 
+Crab CSS 编辑器修改：
+
+```bash
+npm ci --ignore-scripts --prefix editors/vscode-css
+npm run vscode:css:check
+cargo test -p wake_css_language -p wake_css_lsp
+```
+
+本平台先构建 `wake_css_lsp` release 二进制，再用 `editors/vscode-css` 的 `package:vsix`
+脚本生成 VSIX。脚本会检查归档只包含一个目标二进制、无开发目录且不超过 15 MiB。
+
 # 2. CI 矩阵
 
 `.github/workflows/ci.yml` 当前包含：
@@ -58,6 +69,7 @@ cargo test -p wake_docs
 | `bench-smoke` | Ubuntu / Rust 1.95 | 全 benchmark 可编译 |
 | `node` | Windows / Node 24、26 | 原生绑定、API、类型、启动与 npm pack；Node 24 另跑 Yarn 4.16 PnP Components 门禁 |
 | `docs` | Ubuntu / Rust 1.95 + Node 24 | 文档链接检查和生产构建 |
+| `vscode-css` | Windows、macOS x64/arm64、manylinux glibc 2.28 x64/arm64 | 语言核心、Extension Host、五个平台 VSIX 和归档白名单 |
 
 Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补齐最低版本覆盖列入路线图。
 

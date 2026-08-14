@@ -1,4 +1,6 @@
 /artifacts/
+/.test-dist/
+/.vscode-test/
 /dist/
 /node_modules/
 /server/wake-css-language-server

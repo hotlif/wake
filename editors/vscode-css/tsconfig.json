@@ -10,7 +10,7 @@
       "node",
       "vscode"
     ],
-    "rootDir": "src",
+    "rootDir": ".",
     "outDir": "dist",
     "strict": true,
     "esModuleInterop": true,
@@ -19,6 +19,7 @@
     "sourceMap": true
   },
   "include": [
-    "src/**/*.ts"
+    "src/**/*.ts",
+    "test/suite/**/*.ts"
   ]
 }

@@ -94,7 +94,8 @@ fn reports_unknown_properties_and_exposes_hover_and_tokens() {
     );
     let display = source.find("display").unwrap() as u32;
     let hover = document.hover(display + 2).unwrap();
-    assert!(hover.markdown.contains("inner and outer display"));
+    assert!(hover.markdown.starts_with("**display**\n\n"));
+    assert!(hover.markdown.len() > "**display**\n\n".len());
     assert!(document.semantic_tokens().iter().any(|token| {
         token.kind == SemanticKind::Property && token.span.slice(source) == "display"
     }));
@@ -102,11 +103,26 @@ fn reports_unknown_properties_and_exposes_hover_and_tokens() {
 
 #[test]
 fn finds_hex_colors() {
-    let source = "import { css } from '@crab-dev/css'; const box = css`color: #336699cc;`;";
+    let source = "import { css } from '@crab-dev/css'; const box = css`\n\
+        color: #336699cc; background: rgb(255 0 0 / 50%); border-color: hsl(120 100% 25%);`;";
     let colors = analyze(source).colors();
-    assert_eq!(colors.len(), 1);
+    assert_eq!(colors.len(), 3);
     assert!((colors[0].red - 0.2).abs() < 0.001);
     assert!((colors[0].alpha - 0.8).abs() < 0.001);
+    assert!((colors[1].red - 1.0).abs() < 0.001);
+    assert!((colors[1].alpha - 0.5).abs() < 0.001);
+    assert!((colors[2].green - 0.5).abs() < 0.001);
+}
+
+#[test]
+fn reports_non_canonical_property_case() {
+    let source = "import { css } from '@crab-dev/css'; const box = css`Display: grid;`;";
+    assert!(
+        analyze(source)
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CSS_PROPERTY_CASE")
+    );
 }
 
 #[test]

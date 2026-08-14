@@ -1,6 +1,6 @@
 # ADR 0007: Own CSS language intelligence below editor products
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-14
 
 ## Context
@@ -45,6 +45,10 @@ definition, reference and rename behavior.
 - `engineering/CRAB_CSS.md`
 - `engineering/CSS_LANGUAGE_SERVICE.md`
 - `engineering/architecture-boundaries.json`
+- `crates/wake_css_language/src/tests.rs`
+- `crates/wake_css_lsp/src/lib.rs`
+- `editors/vscode-css/test/`
+- `.github/workflows/vscode-css.yml`
 
 ## Consequences
 

@@ -13,3 +13,14 @@ await build({
   target: 'node20',
   logLevel: 'info',
 })
+
+await build({
+  entryPoints: [fileURLToPath(new URL('../test/suite/index.ts', import.meta.url))],
+  outfile: fileURLToPath(new URL('../.test-dist/suite/index.js', import.meta.url)),
+  bundle: true,
+  external: ['vscode'],
+  format: 'cjs',
+  platform: 'node',
+  target: 'node20',
+  logLevel: 'info',
+})

@@ -36,6 +36,24 @@ import { CompareCard, CompareCards, PageActions, TaskCard, TaskGrid } from "../s
   <TaskCard kicker="构建诊断" href="/styles/static-boundary" title="理解静态边界" description="识别不能在构建期安全求值的表达式。" />
 </TaskGrid>
 
+## VS Code 编辑体验
+
+仓库同时构建 `Crab CSS` VSIX。安装与当前平台匹配的包后，JavaScript、TypeScript、JSX 和 TSX 中的
+模板会获得 CSS 高亮、补全、悬停、颜色预览、诊断和显式格式化。服务按 import binding 识别 API，
+因此别名可用，局部遮蔽不会被误判：
+
+```tsx
+import { css as style } from "@crab-dev/css";
+
+const card = style`
+  display: grid;
+  &:hover { color: rebeccapurple; }
+`;
+```
+
+输入期间执行容错 CSS 检查，保存时再运行与 Wake 构建相同的静态求值诊断。TypeScript 的定义、引用
+与重命名仍由 VS Code 内置服务负责；插件不会执行项目 JavaScript，也不会默认开启 format-on-save。
+
 ## 可运行示例
 
 下面的示例直接经过 `@crab-dev/css` 编译；打开源码可以对照局部样式、组合、动态变量、动画、全局规则和静态求值边界。

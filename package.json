@@ -22,6 +22,7 @@
     "npm:typecheck:css": "npm run typecheck --workspace @crab-dev/css",
     "npm:pack:check": "node scripts/check-npm-packs.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
+    "vscode:css:check": "npm run check --prefix editors/vscode-css",
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {

@@ -777,6 +777,16 @@ impl LanguageServer for Backend {
                         new_text: String::new(),
                     },
                 ),
+                "CSS_PROPERTY_CASE" => {
+                    let span = range_to_span(document.source(), diagnostic.range);
+                    (
+                        "Normalize CSS property casing",
+                        TextEdit {
+                            range: diagnostic.range,
+                            new_text: span.slice(document.source().src()).to_ascii_lowercase(),
+                        },
+                    )
+                }
                 "CSS_UNCLOSED_BLOCK" => {
                     let offset = range_to_span(document.source(), diagnostic.range).hi;
                     let Some(template) = document

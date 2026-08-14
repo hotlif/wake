@@ -1,0 +1,166 @@
+name: Crab CSS VS Code
+
+on:
+  pull_request:
+    paths:
+      - 'crates/wake_common/**'
+      - 'crates/wake_css_in_js/**'
+      - 'crates/wake_css_language/**'
+      - 'crates/wake_css_lsp/**'
+      - 'editors/vscode-css/**'
+      - 'engineering/architecture-boundaries.json'
+      - '.github/workflows/vscode-css.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    branches: [canary]
+    paths:
+      - 'crates/wake_common/**'
+      - 'crates/wake_css_in_js/**'
+      - 'crates/wake_css_language/**'
+      - 'crates/wake_css_lsp/**'
+      - 'editors/vscode-css/**'
+      - 'engineering/architecture-boundaries.json'
+      - '.github/workflows/vscode-css.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: editors/vscode-css/package-lock.json
+      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: npm run vscode:css:check
+      - run: npm run update:css-data --prefix editors/vscode-css
+      - run: git diff --exit-code -- crates/wake_css_language/data/css-facts.json
+      - run: cargo test -p wake_css_language -p wake_css_lsp -p wake_css_in_js
+      - run: cargo clippy -p wake_css_language -p wake_css_lsp --all-targets -- -D warnings
+      - run: npm run architecture:check
+
+  extension-host:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: editors/vscode-css/package-lock.json
+      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: cargo build --release -p wake_css_lsp
+      - run: mkdir -p editors/vscode-css/server
+      - run: cp target/release/wake-css-language-server editors/vscode-css/server/wake-css-language-server
+      - run: xvfb-run -a npm run test:extension --prefix editors/vscode-css
+        env:
+          VSCODE_TEST_VERSION: 1.96.4
+
+  package-native:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            vsce_target: win32-x64
+            binary: target/x86_64-pc-windows-msvc/release/wake-css-language-server.exe
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            vsce_target: darwin-x64
+            binary: target/x86_64-apple-darwin/release/wake-css-language-server
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            vsce_target: darwin-arm64
+            binary: target/aarch64-apple-darwin/release/wake-css-language-server
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: editors/vscode-css/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vscode-css-${{ matrix.rust_target }}
+      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: cargo build --release -p wake_css_lsp --target ${{ matrix.rust_target }}
+      - run: >-
+          npm run package:vsix --prefix editors/vscode-css --
+          --target ${{ matrix.vsce_target }}
+          --binary ${{ github.workspace }}/${{ matrix.binary }}
+          --out ${{ github.workspace }}/artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crab-css-${{ matrix.vsce_target }}-0.1.0
+          path: artifacts/*.vsix
+          if-no-files-found: error
+
+  package-linux:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            vsce_target: linux-x64
+            binary: target/x86_64-unknown-linux-gnu/release/wake-css-language-server
+          - runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+            rust_target: aarch64-unknown-linux-gnu
+            vsce_target: linux-arm64
+            binary: target/aarch64-unknown-linux-gnu/release/wake-css-language-server
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: editors/vscode-css/package-lock.json
+      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: cargo build --release -p wake_css_lsp --target ${{ matrix.rust_target }}
+      - name: Verify glibc baseline
+        shell: bash
+        run: |
+          highest="$(readelf --version-info '${{ matrix.binary }}' | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          test "$(printf '%s\n' "$highest" 'GLIBC_2.28' | sort -V | tail -1)" = 'GLIBC_2.28'
+      - run: >-
+          npm run package:vsix --prefix editors/vscode-css --
+          --target ${{ matrix.vsce_target }}
+          --binary ${{ github.workspace }}/${{ matrix.binary }}
+          --out ${{ github.workspace }}/artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crab-css-${{ matrix.vsce_target }}-0.1.0
+          path: artifacts/*.vsix
+          if-no-files-found: error

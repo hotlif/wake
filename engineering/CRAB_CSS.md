@@ -49,6 +49,7 @@ v0.1 聚焦六个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`�
 | `wake_css_in_js` | 按 import 来源和语义符号识别 API，安全静态求值，生成名称，展开受支持的嵌套，产出 JS 替换、CSS 和诊断 | 启动 Node/VM、读取网络、执行被编译模块 |
 | `wake_bundler` | 扫描依赖、传播静态导出、按模块调用转换、删除已完全消解的 marker import、聚合 CSS | 重复实现 API 语义 |
 | Wake dev/build | 开发时服务重建产物，生产时输出带内容 hash 的 CSS 资源 | 让服务端执行依赖 DOM 的样式逻辑 |
+| `wake_css_language` / `wake_css_lsp` | 编辑器模板发现、虚拟 CSS、提示和诊断协议 | 复制静态求值规则、执行用户模块、接管 TypeScript 符号导航 |
 
 编译器以 import 绑定的语义身份识别 marker，而不是搜索字符串 `css`。因此 import alias 可用，
 局部参数或块变量对同名 API 的遮蔽不得被误编译。只有来自 `@crab-dev/css` 的六个名字具有

@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "@crab-dev/css": "0.1.16"
+  }
+}
