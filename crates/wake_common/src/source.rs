@@ -95,6 +95,31 @@ impl SourceFile {
         (line_idx as u32, column as u32)
     }
 
+    /// Zero-based UTF-16 line/column to a byte offset, clamped to the selected line.
+    ///
+    /// This is the inverse needed by LSP incremental edits. A column that falls in the middle of a
+    /// surrogate pair is clamped to the start of that scalar value rather than splitting UTF-8.
+    pub fn offset0_utf16(&self, line: u32, column: u32) -> u32 {
+        let line_index = (line as usize).min(self.line_starts.len().saturating_sub(1));
+        let line_start = self.line_starts[line_index] as usize;
+        let line_end = if line_index + 1 < self.line_starts.len() {
+            self.line_starts[line_index + 1] as usize
+        } else {
+            self.src.len()
+        };
+        let mut units = 0_u32;
+        let mut offset = line_start;
+        for ch in self.src[line_start..line_end].chars() {
+            let next = units + ch.len_utf16() as u32;
+            if next > column {
+                break;
+            }
+            units = next;
+            offset += ch.len_utf8();
+        }
+        offset.min(line_end) as u32
+    }
+
     /// 取某一行（0 基）的文本，不含行尾换行符。
     pub fn line_text(&self, line_index: usize) -> &str {
         let start = self.line_starts[line_index] as usize;
@@ -193,6 +218,17 @@ mod tests {
         let sf2 = SourceFile::new("a.js", "𝒳x");
         assert_eq!(sf2.location(4).column, 2); // 1 基字符列
         assert_eq!(sf2.location0_utf16(4), (0, 2)); // 0 基 UTF-16 列
+        assert_eq!(sf2.offset0_utf16(0, 2), 4);
+        assert_eq!(sf2.offset0_utf16(0, 1), 0);
+    }
+
+    #[test]
+    fn offset0_utf16_clamps_lines_and_columns() {
+        let sf = SourceFile::new("a.js", "ab\r\n中文");
+        assert_eq!(sf.offset0_utf16(0, 1), 1);
+        assert_eq!(sf.offset0_utf16(0, 99), 4);
+        assert_eq!(sf.offset0_utf16(1, 1), 7);
+        assert_eq!(sf.offset0_utf16(99, 99), sf.len());
     }
 
     #[test]

@@ -54,6 +54,7 @@ browserslist-rs = "0.20.0"
 # —— dev server / 网络（仅 wake_dev_server）——
 # 仅直接启用 broadcast/select 所需能力；运行时、网络与计时能力由 Actix 依赖统一提供。
 tokio = { version = "1.53.1", default-features = false, features = ["sync", "macros"] }
+tower-lsp-server = "0.23.0"
 # 开发服务器不使用响应压缩、Cookie、HTTP/2 或路由宏，关闭默认功能避免编译其 C/过程宏依赖。
 actix-web = { version = "4.14.0", default-features = false }
 actix-ws = "0.4.0"
