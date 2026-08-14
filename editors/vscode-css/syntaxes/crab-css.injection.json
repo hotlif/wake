@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "scopeName": "crab-css.injection",
+  "injectionSelector": "L:source.js -comment -string, L:source.js.jsx -comment -string, L:source.ts -comment -string, L:source.tsx -comment -string",
+  "patterns": [
+    {
+      "name": "meta.embedded.block.crab-css",
+      "begin": "\\b(css|keyframes|globalStyle)\\s*(`)",
+      "beginCaptures": {
+        "1": {
+          "name": "support.function.crab-css"
+        },
+        "2": {
+          "name": "punctuation.definition.string.template.begin.crab-css"
+        }
+      },
+      "end": "(`)",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.string.template.end.crab-css"
+        }
+      },
+      "patterns": [
+        {
+          "name": "meta.interpolation.crab-css",
+          "begin": "(\\$\\{)",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.section.embedded.begin.js"
+            }
+          },
+          "end": "(\\})",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.section.embedded.end.js"
+            }
+          }
+        },
+        {
+          "include": "source.css"
+        }
+      ]
+    }
+  ]
+}

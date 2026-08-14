@@ -1,0 +1,128 @@
+{
+  "name": "crab-css",
+  "displayName": "Crab CSS",
+  "description": "CSS language intelligence for @crab-dev/css tagged templates.",
+  "version": "0.1.0",
+  "publisher": "crab-dev",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hotlif/wake.git",
+    "directory": "editors/vscode-css"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "css",
+    "css-in-js",
+    "wake",
+    "crab"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist/**",
+    "server/**",
+    "syntaxes/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onCommand:crabCss.restartLanguageServer",
+    "onCommand:crabCss.showOutput"
+  ],
+  "contributes": {
+    "grammars": [
+      {
+        "scopeName": "crab-css.injection",
+        "path": "./syntaxes/crab-css.injection.json",
+        "injectTo": [
+          "source.js",
+          "source.js.jsx",
+          "source.ts",
+          "source.tsx"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.crab-css": "css"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "crabCss.restartLanguageServer",
+        "title": "Crab CSS: Restart Language Server"
+      },
+      {
+        "command": "crabCss.showOutput",
+        "title": "Crab CSS: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "Crab CSS",
+      "properties": {
+        "crabCss.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Crab CSS language intelligence."
+        },
+        "crabCss.validation.mode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "onType",
+            "onSave"
+          ],
+          "default": "onType",
+          "description": "Validate while typing and on save, only on save, or not at all."
+        },
+        "crabCss.format.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable explicit document and range formatting for Crab CSS templates."
+        },
+        "crabCss.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace communication with the Crab CSS language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "compile": "node scripts/clean.mjs && tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
+    "check": "npm run compile && node --test --test-isolation=none test/*.test.mjs",
+    "package:vsix": "npm run compile && node scripts/package-vsix.mjs"
+  },
+  "dependencies": {
+    "vscode-languageclient": "10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/vscode": "1.96.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}

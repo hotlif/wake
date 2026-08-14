@@ -1,0 +1,5 @@
+/artifacts/
+/dist/
+/node_modules/
+/server/wake-css-language-server
+/server/wake-css-language-server.exe
