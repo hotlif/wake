@@ -1,6 +1,6 @@
 # Wake
 
-Wake 是一套 Rust 原生的 Web 构建工具，将 JavaScript / TypeScript 编译、打包、开发服务器和 React 组件文档整合到同一条工具链中。它既可以通过 `wake` CLI 使用，也提供 ESM、CommonJS 和 TypeScript 类型完备的 Node.js API。
+Wake 是一套 Rust 原生的 Web 构建工具，将 JavaScript / TypeScript 编译、打包、开发服务器和技术文档构建整合到同一条工具链中。它既可以通过 `wake` CLI 使用，也提供 ESM、CommonJS 和 TypeScript 类型完备的 Node.js API。
 
 > [!IMPORTANT]
 > Wake 当前处于 `0.1.x` Beta 阶段。用于团队或生产项目时，请锁定具体版本、在 CI 中同时验证应用与文档构建，并保留可回退的构建方案。
@@ -13,7 +13,7 @@ Wake 是一套 Rust 原生的 Web 构建工具，将 JavaScript / TypeScript 编
 | 生产构建 | Tree Shaking、无效模块消除、压缩、动态导入分包、CSS 抽取及内容哈希 |
 | 开发服务器 | 常驻增量构建、文件监听、HMR 和 API 代理 |
 | 资源管线 | 小资源内联、大资源独立输出，并生成 HTML 与 `manifest.json` |
-| Wake Docs | 从 MDX、React Demo、Props 类型和 JSDoc 构建静态组件文档站 |
+| Wake Docs | 从 MDX、React Demo、Props 类型和 JSDoc 构建静态技术文档站 |
 | 多种入口 | 原生 CLI、Node.js API，以及隔离在 `experimental` 子路径下的编译器原语 |
 
 ## 快速开始
@@ -93,7 +93,7 @@ npx wake build --outdir dist
 }
 ```
 
-完整入门教程见[快速开始](docs/getting-started/quick-start.mdx)，所有配置项见[配置参考](docs/guide/configuration.mdx)。
+完整入门教程见[创建 React 应用](docs/start/create-react-app.mdx)，所有配置项见[项目配置参考](docs/reference/configuration/project.mdx)。
 
 ## CLI
 
@@ -112,7 +112,7 @@ wake [--no-color] [--ui auto|tui|plain] <COMMAND>
 
 交互式终端中的 `dev`、`docs dev` 和 `build --watch` 默认使用品牌化全屏控制台；重定向或 CI 环境自动降级为普通日志。使用全局 `--ui plain` 可显式关闭全屏模式，`--no-color` 或 `NO_COLOR` 只关闭颜色。`parse` 与 `tokenize` 支持 `--format auto|human|json`，并将机器数据与界面输出分别写入 stdout 和 stderr。
 
-使用 `wake <COMMAND> --help` 查看当前版本支持的参数。更详细的组合、默认值和退出行为见 [CLI 参考](docs/reference/cli.mdx)。
+使用 `wake <COMMAND> --help` 查看当前版本支持的参数。更详细的组合、默认值和退出行为见 [CLI 参考](docs/reference/cli/build.mdx)。
 
 ## Node.js API
 
@@ -144,7 +144,7 @@ await server.waitUntilClosed();
 - `buildDocs()` 和 `startDocsDevServer()`：构建或开发文档站；
 - `WakeError`：提供稳定错误码、路径和结构化诊断。
 
-完整的选项、返回值、资源生命周期、服务器事件和取消语义见 [Node.js API 参考](docs/reference/node-api.mdx)。词法分析、解析、转换和语义分析接口见[实验 API](docs/reference/experimental-api.mdx)。
+完整的选项、返回值、资源生命周期、服务器事件和取消语义见 [Node.js API 参考](docs/reference/node-api/build.mdx)。词法分析、解析、转换和语义分析接口见[实验能力](docs/reference/experimental.mdx)。
 
 词法分析、解析、转换和语义分析 API 位于 `@crab-dev/wake/experimental`。其中 `ParsedModule` 是需要显式释放的原生句柄，不能克隆、持久化或传入 Worker。
 
@@ -174,7 +174,7 @@ npx wake docs dev .
 npx wake docs build . --outdir docs-dist
 ```
 
-从零搭建文档站请阅读[第一个文档站](docs/getting-started/first-docs-site.mdx)，MDX、Demo 和 Props API 的详细说明位于 [`docs/docs-system`](docs/docs-system/overview.mdx)。 组件模式只扫描 `[docs].source_dir` 下的 `.demo.tsx`，复用 Preview、主题和 `base_path`；选择项、非默认 Props 与视口保存在 hash URL 中，可直接部署到普通静态托管。
+从零搭建文档站请阅读[创建文档站](docs/wake-docs/create-site.mdx)，MDX、Demo 和 Props API 分别见 [MDX](docs/wake-docs/mdx.mdx)、[Demo](docs/wake-docs/demos.mdx)和 [Props API](docs/wake-docs/props-api.mdx)。组件模式只扫描 `[docs].source_dir` 下的 `.demo.tsx`，复用 Preview、主题和 `base_path`；选择项、非默认 Props 与视口保存在 hash URL 中，可直接部署到普通静态托管。
 
 ## 安装包与平台
 
@@ -263,7 +263,7 @@ CI 还会在 Linux 和 Windows 上测试 workspace，并使用 Miri 验证手写
 - Wake Docs 要求项目直接声明 React 19 和 `react-dom` 19；
 - 配置文件、入口或监听根发生结构变化后，建议重启开发服务器。
 
-遇到问题时先查看[故障排查](docs/reference/troubleshooting.mdx)。从 Crustify 迁移的项目请参考[迁移指南](docs/migrations/crustify-to-wake.md)。
+遇到问题时先查看[故障排查](docs/reference/troubleshooting.mdx)。旧工具与平台边界见[兼容性参考](docs/reference/compatibility.mdx)。
 
 ## 许可证
 

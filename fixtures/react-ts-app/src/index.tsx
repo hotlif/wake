@@ -1,7 +1,7 @@
 import { StrictMode, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { css, cx } from '@linaria/core';
+import { css, cx } from '@crab-dev/css';
 
 // ============================================================
 // 枚举（值语义 → IIFE 降级 + 纯数字 / 字符串成员 → 编译期常量）
@@ -232,7 +232,7 @@ const initialTodos: TodoItem[] = [
 ];
 
 // ============================================================
-// 样式：@linaria/core 零运行时 CSS-in-JS
+// 样式：@crab-dev/css 零运行时 CSS-in-JS
 // css`` 在构建期被抽取为静态 CSS，表达式本身替换为类名字符串
 // ============================================================
 

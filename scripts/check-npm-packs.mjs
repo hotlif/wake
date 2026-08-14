@@ -3,8 +3,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
+const wakePackageDir = 'npm/wake'
+const cssPackageDir = 'npm/css'
 const allPackageDirs = [
-  'npm/wake',
+  cssPackageDir,
+  wakePackageDir,
   'npm/wake-win32-x64-msvc',
   'npm/wake-linux-x64-gnu',
   'npm/wake-linux-arm64-gnu',
@@ -15,7 +18,7 @@ const packageDirs = process.env.WAKE_PACK_TARGETS
   ? process.env.WAKE_PACK_TARGETS.split(',').map((value) => value.trim())
   : allPackageDirs
 const rootManifest = JSON.parse(
-  readFileSync(resolve(root, 'npm/wake/package.json'), 'utf8'),
+  readFileSync(resolve(root, wakePackageDir, 'package.json'), 'utf8'),
 )
 
 const manifests = packageDirs.map((directory) => {
@@ -61,11 +64,13 @@ for (const { directory } of manifests) {
   const [pack] = JSON.parse(output)
   const files = pack.files.map((file) => file.path)
   const nativeFiles = files.filter((file) => file.endsWith('.node'))
-  const isRoot = directory === 'npm/wake'
-  if (isRoot && nativeFiles.length !== 0) {
-    throw new Error('The main package must not contain native binaries')
+  const isWake = directory === wakePackageDir
+  const isCss = directory === cssPackageDir
+  const isJavaScript = isWake || isCss
+  if (isJavaScript && nativeFiles.length !== 0) {
+    throw new Error(`${directory} must not contain native binaries`)
   }
-  if (isRoot) {
+  if (isWake) {
     for (const required of [
       'internal/components-runtime.mjs',
       'internal/components-runtime.d.ts',
@@ -75,10 +80,28 @@ for (const { directory } of manifests) {
       }
     }
   }
-  if (!isRoot && nativeFiles.length !== 1) {
+  if (isCss) {
+    const expected = [
+      'LICENSE-APACHE',
+      'LICENSE-MIT',
+      'README.md',
+      'index.cjs',
+      'index.d.ts',
+      'index.mjs',
+      'package.json',
+    ]
+    if (JSON.stringify(files.slice().sort()) !== JSON.stringify(expected)) {
+      throw new Error(`${directory} must contain exactly: ${expected.join(', ')}`)
+    }
+  }
+  if (!isJavaScript && nativeFiles.length !== 1) {
     throw new Error(`${directory} must contain exactly one native binary`)
   }
-  const limit = isRoot ? 500 * 1024 : 15 * 1024 * 1024
+  const limit = isCss
+    ? 128 * 1024
+    : isWake
+      ? 500 * 1024
+      : 15 * 1024 * 1024
   if (pack.size > limit) {
     throw new Error(`${directory} packed size ${pack.size} exceeds ${limit}`)
   }

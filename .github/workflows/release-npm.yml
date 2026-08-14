@@ -35,6 +35,11 @@ jobs:
           version="$(node -p 'require("./npm/wake/package.json").version')"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - run: npm run versions:check
+      - run: npm run npm:test:css
+      - run: npm run npm:typecheck:css
+      - run: npm run npm:pack:check
+        env:
+          WAKE_PACK_TARGETS: npm/css
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -172,11 +177,12 @@ jobs:
       - run: mkdir -p artifacts
       - run: npm run npm:pack:check
         env:
-          WAKE_PACK_TARGETS: npm/wake
+          WAKE_PACK_TARGETS: npm/css,npm/wake
       - run: npm pack ./npm/wake --ignore-scripts --pack-destination artifacts
+      - run: npm pack ./npm/css --ignore-scripts --pack-destination artifacts
       - uses: actions/upload-artifact@v4
         with:
-          name: npm-root
+          name: npm-javascript
           path: artifacts/*.tgz
           if-no-files-found: error
 
@@ -197,25 +203,55 @@ jobs:
         shell: bash
         run: |
           expected_version='${{ needs.verify.outputs.version }}'
+          expected_names=(
+            '@crab-dev/css'
+            '@crab-dev/wake'
+            '@crab-dev/wake-win32-x64-msvc'
+            '@crab-dev/wake-linux-x64-gnu'
+            '@crab-dev/wake-linux-arm64-gnu'
+            '@crab-dev/wake-darwin-x64'
+            '@crab-dev/wake-darwin-arm64'
+          )
+          declare -A seen=()
           shopt -s nullglob
           archives=(artifacts/*.tgz)
-          test "${#archives[@]}" -eq 6
+          test "${#archives[@]}" -eq "${#expected_names[@]}"
           for archive in "${archives[@]}"; do
             list="$(tar -tzf "$archive")"
             grep -qx 'package/package.json' <<<"$list"
             grep -qx 'package/LICENSE-MIT' <<<"$list"
             grep -qx 'package/LICENSE-APACHE' <<<"$list"
             grep -qx 'package/README.md' <<<"$list"
-            native_count="$(grep -Ec '\.node$' <<<"$list" || true)"
-            if [[ "$archive" == *"crab-dev-wake-${expected_version}.tgz" ]]; then
-              test "$native_count" -eq 0
-              test "$(stat -c%s "$archive")" -le 524288
-            else
-              test "$native_count" -eq 1
-              test "$(stat -c%s "$archive")" -le 15728640
-            fi
+            name="$(tar -xOzf "$archive" package/package.json | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).name))")"
             version="$(tar -xOzf "$archive" package/package.json | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).version))")"
             test "$version" = "$expected_version"
+            test -z "${seen[$name]:-}"
+            seen["$name"]=1
+            native_count="$(grep -Ec '\.node$' <<<"$list" || true)"
+            case "$name" in
+              '@crab-dev/css')
+                test "$native_count" -eq 0
+                test "$(stat -c%s "$archive")" -le 131072
+                grep -qx 'package/index.cjs' <<<"$list"
+                grep -qx 'package/index.mjs' <<<"$list"
+                grep -qx 'package/index.d.ts' <<<"$list"
+                ;;
+              '@crab-dev/wake')
+                test "$native_count" -eq 0
+                test "$(stat -c%s "$archive")" -le 524288
+                ;;
+              '@crab-dev/wake-'*)
+                test "$native_count" -eq 1
+                test "$(stat -c%s "$archive")" -le 15728640
+                ;;
+              *)
+                echo "Unexpected npm package: $name" >&2
+                exit 1
+                ;;
+            esac
+          done
+          for expected_name in "${expected_names[@]}"; do
+            test "${seen[$expected_name]:-}" = 1
           done
       - uses: actions/attest-build-provenance@v3
         if: github.event.repository.visibility == 'public'
@@ -247,6 +283,10 @@ jobs:
           for package in artifacts/*wake-{win32,linux,darwin}-*.tgz; do
             npm publish "./$package" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
           done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish CSS package
+        run: npm publish "./artifacts/crab-dev-css-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish root package last
@@ -281,7 +321,7 @@ jobs:
           cd smoke
           npm init -y
           for attempt in {1..12}; do
-            if npm install --ignore-scripts --prefer-online "@crab-dev/wake@${WAKE_VERSION}"; then
+            if npm install --ignore-scripts --prefer-online "@crab-dev/wake@${WAKE_VERSION}" "@crab-dev/css@${WAKE_VERSION}"; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then
@@ -315,7 +355,7 @@ jobs:
           cd smoke
           npm init -y
           for attempt in {1..12}; do
-            if npm install --ignore-scripts --prefer-online "@crab-dev/wake@${WAKE_VERSION}"; then
+            if npm install --ignore-scripts --prefer-online "@crab-dev/wake@${WAKE_VERSION}" "@crab-dev/css@${WAKE_VERSION}"; then
               break
             fi
             if [[ "$attempt" -eq 12 ]]; then
@@ -327,5 +367,6 @@ jobs:
           node -e "let p=require('./package.json');p.scripts={'wake-smoke':'wake build'};require('node:fs').writeFileSync('package.json',JSON.stringify(p));require('node:fs').mkdirSync('src');require('node:fs').writeFileSync('wake.config.toml','[html]\nentry = \"src/index.js\"\n');require('node:fs').writeFileSync('src/index.js','export const value = 42\n')"
           npx @crab-dev/wake --version
           npx wake --version
+          node -e "const css=require('@crab-dev/css');if(css.cx('wake',{css:true})!=='wake css')process.exit(1)"
           npm run wake-smoke
           node -e "require('@crab-dev/wake').build({cwd:process.cwd()}).then(r=>{if(!r.success)process.exitCode=1})"
