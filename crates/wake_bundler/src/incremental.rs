@@ -18,6 +18,7 @@
 //! linker cell 稳定 → 缓存命中不受并行影响。
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,14 +42,15 @@ use wake_ecma_minify::{
     MinifyCtx, SimplifyAction, analyze_dce, analyze_vars_with_model, collect_init_map, has_hazard,
     is_undefined_shadowed, plan_mangle_with_model_and_protected, plan_simplifications,
 };
-use wake_ecma_parser::{analyze, parse_with};
+use wake_ecma_parser::parse_with;
+use wake_ecma_semantic::analyze;
 use wake_ecma_transform::{FeatureSet, TargetEnv};
 use wake_graph::{
     ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
     collect_static_uses, compute_live_keep,
 };
 use wake_resolver::{ModuleIdentity, ResolveOptions, ResolvedModule, Resolver};
-use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, query};
+use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, global_executor, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
@@ -77,6 +79,7 @@ type CodegenExecCounts = Arc<[CachePadded<AtomicU64>]>;
 /// `Job`、逐个经 channel 回传。最终顺序仍由调用方的索引槽位恢复。
 const IO_BATCHES_PER_WORKER: usize = 4;
 const CODEGEN_COUNTER_SHARDS: usize = 64;
+
 fn file_stamp(path: &Path) -> Option<FileStamp> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified_ns = metadata
@@ -198,6 +201,14 @@ struct StableModuleGraph {
     modules: FxHashMap<u32, ModuleRec>,
 }
 
+#[derive(Clone)]
+struct LinkPlan {
+    fingerprint: u64,
+    keep: FxHashMap<u32, Option<Vec<String>>>,
+    chunk_graph: Option<ChunkGraph>,
+    async_ids: FxHashSet<u32>,
+}
+
 /// scan 阶段单模块的解析结果：(依赖, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
 /// 摘要命中时后两者为 `None`（不 parse）；未命中时携带新 parse 的 AST 与句柄。
 type ScanParsed = (
@@ -235,6 +246,48 @@ struct LinkerData {
     /// 单包 minify 可省略 ESM marker；代码分割 runtime 必须保留 marker，才能可靠区分
     /// 转译 ESM 与含 `default` 自有字段的纯 CJS。字段进入 linker/body 缓存身份。
     no_esmodule: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CssCodegenInput {
+    /// Imported static values in stable key order. Empty with `seed=None` means that this
+    /// module has no compiler marker and should skip the CSS transform entirely.
+    scope: Vec<(String, wake_css_in_js::StaticValue)>,
+    seed: Option<String>,
+    inject_style: bool,
+}
+
+impl PartialEq for CssCodegenInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.seed == other.seed
+            && self.inject_style == other.inject_style
+    }
+}
+
+impl Eq for CssCodegenInput {}
+
+impl std::hash::Hash for CssCodegenInput {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.scope.hash(state);
+        self.seed.hash(state);
+        self.inject_style.hash(state);
+    }
+}
+
+/// Every non-Vc option captured by codegen. These values are mutable through the public builder
+/// API, so they must participate in the Turbo task identity just like source/linker/CSS inputs.
+/// Otherwise a long-lived bundler can reuse a development module body after switching to a
+/// production define/minify configuration.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CodegenOptionsInput {
+    define: Vec<(String, String)>,
+    minify: bool,
+    mangle: bool,
+    minify_names: bool,
+    drop_console: bool,
+    drop_debugger: bool,
+    want_map: bool,
 }
 
 /// `parse` 任务的输出：AST 持有者 + 源文本 + 依赖（说明符已解为 `String`）+ 诊断。
@@ -278,7 +331,7 @@ pub struct IncrementalBundler {
     fs: Arc<dyn FileSystem>,
     interner: Arc<Interner>,
     engine: Arc<Engine>,
-    exec: Executor,
+    exec: Arc<Executor>,
     /// `Arc` 包裹：每层依赖 resolve 经工作窃取执行器**并行**（`Resolver` 现为 `Sync`，见其 `cache` 注释）。
     resolver: Arc<Resolver>,
     /// 解析选项（含别名）。跨构建保留——PnP 检测切换解析器时用它重建，避免丢别名。
@@ -287,6 +340,12 @@ pub struct IncrementalBundler {
     content_cells: FxHashMap<PathBuf, Vc<Content>>,
     /// 规范化路径 → linker 输入 cell（跨构建保留）。
     linker_cells: FxHashMap<PathBuf, Vc<LinkerData>>,
+    /// 规范化路径 → CSS codegen 输入。跨模块 token、名称 seed 或 dev/prod 注入模式变化时，
+    /// 即使本模块源码/linker 数据不变，也必须让 codegen 任务失效。
+    css_codegen_cells: FxHashMap<PathBuf, Vc<CssCodegenInput>>,
+    /// 规范化路径 → define/minify/DCE/sourcemap codegen 输入。配置 setter 可在同一实例的两次
+    /// build 之间调用；cell 让配置改变精确推进 codegen revision，避免闭包捕获旧值。
+    codegen_options_cells: FxHashMap<PathBuf, Vc<CodegenOptionsInput>>,
     /// codegen 任务体真正执行的累计次数。按构建前后差值形成准确的更新模块数。
     /// 计数器由已注册的重算闭包长期持有，因此跨 generation 仍能正确归属到同一 bundler。
     codegen_exec_counts: CodegenExecCounts,
@@ -300,6 +359,11 @@ pub struct IncrementalBundler {
     memory_parse_vcs: FxHashMap<u64, Vc<ParsedModule>>,
     /// 上一成功 generation 的完整模块图。普通内容编辑在依赖形状不变时直接复用稳定 id/边。
     stable_graph: Option<StableModuleGraph>,
+    /// Link/chunk planning is a pure function of semantic scan summaries and bundler options. Keep
+    /// the previous value so implementation-only edits can skip whole-graph liveness propagation
+    /// and static-closure planning even though emit still materializes the public output string.
+    link_plan: Option<LinkPlan>,
+    link_plan_reuse_count: AtomicU64,
     topology_invalidated: AtomicBool,
     topology_reuse_count: AtomicU64,
     last_module_count: usize,
@@ -307,6 +371,9 @@ pub struct IncrementalBundler {
     tree_shaking: bool,
     /// 是否启用代码分割（默认关闭；prod build 开启）。DESIGN §6.3 / PLAN §6.5。
     code_splitting: bool,
+    /// 单 chunk 路径是否使用 `entry.<content-hash>.js`（默认关闭，保留历史 `bundle.js`）。
+    /// 供主动关闭代码分割、但仍需生产缓存失效语义的宿主使用。
+    hash_single_chunk_entry: bool,
     /// 产物文件名是否带内容 hash（默认开；dev 关以稳定 URL）。
     content_hash: bool,
     /// 共享 chunk 抽取阈值（模块被 ≥N 个 async root 共享则抽取，默认 2）。
@@ -348,9 +415,12 @@ pub struct IncrementalBundler {
     /// minify 路径会 scope-hoist + 改写模块体文本，映射会错位，故 [`IncrementalBundler::build`]
     /// 在 minify 时不产 map（见 emit 处的守卫）。
     sourcemap: bool,
-    /// 零运行时 CSS-in-JS（Linaria 子集）：构建期把 `` css`...` `` 抽取为静态 CSS
+    /// `@crab-dev/css` 零运行时编译：构建期把 `` css`...` `` 抽取为静态 CSS
     /// （WAKE-COMPATIBILITY §M5）。见 [`IncrementalBundler::enable_css_in_js`]。
     css_in_js: bool,
+    /// CSS 生成名使用的项目根。设置后模块 identity 取 project-relative 路径，避免 checkout
+    /// 绝对路径、Windows 盘符与路径分隔符进入产物身份。
+    project_root: Option<PathBuf>,
     /// JSX 运行时口径（dev runtime / jsxImportSource）。见 [`IncrementalBundler::set_jsx_runtime`]。
     jsx: JsxRuntimeOptions,
     /// 目标环境指纹。即使 pass 尚未覆盖某语法，目标变化也不能复用旧转换缓存。
@@ -434,11 +504,13 @@ impl IncrementalBundler {
             fs,
             interner: Arc::new(Interner::new()),
             engine: Arc::new(Engine::new()),
-            exec: Executor::with_default_threads(),
+            exec: global_executor(),
             define: default_define,
             define_hash,
             content_cells: FxHashMap::default(),
             linker_cells: FxHashMap::default(),
+            css_codegen_cells: FxHashMap::default(),
+            codegen_options_cells: FxHashMap::default(),
             codegen_exec_counts: new_codegen_exec_counts(),
             load_cache: Arc::new(Mutex::new(FxHashMap::default())),
             load_exec_count: Arc::new(AtomicU64::new(0)),
@@ -447,11 +519,14 @@ impl IncrementalBundler {
             memory_summaries: FxHashMap::default(),
             memory_parse_vcs: FxHashMap::default(),
             stable_graph: None,
+            link_plan: None,
+            link_plan_reuse_count: AtomicU64::new(0),
             topology_invalidated: AtomicBool::new(true),
             topology_reuse_count: AtomicU64::new(0),
             last_module_count: 0,
             tree_shaking: false,
             code_splitting: false,
+            hash_single_chunk_entry: false,
             content_hash: true,
             share_threshold: 2,
             cache: None,
@@ -467,6 +542,7 @@ impl IncrementalBundler {
             drop_debugger: false,
             sourcemap: false,
             css_in_js: false,
+            project_root: None,
             jsx: JsxRuntimeOptions::default(),
             target_fingerprint: default_target.fingerprint(),
             transform_features: default_target.required_features(),
@@ -492,9 +568,12 @@ impl IncrementalBundler {
         self.engine = Arc::new(Engine::new());
         self.content_cells.clear();
         self.linker_cells.clear();
+        self.css_codegen_cells.clear();
+        self.codegen_options_cells.clear();
         self.memory_summaries.clear();
         self.memory_parse_vcs.clear();
         self.stable_graph = None;
+        self.link_plan = None;
         self.topology_invalidated.store(true, Ordering::Release);
     }
 
@@ -565,6 +644,17 @@ impl IncrementalBundler {
         self
     }
 
+    /// 设置 CSS 编译产物的路径身份根。应用层应传已规范化的项目根；测试或虚拟文件系统使用
+    /// 相对模块路径时可省略。
+    pub fn set_project_root(&mut self, root: impl Into<PathBuf>) -> &mut Self {
+        self.project_root = Some(root.into());
+        self
+    }
+
+    fn css_module_seed(&self, path: &Path) -> String {
+        map_source_name(path, self.project_root.as_deref())
+    }
+
     /// 启用紧凑 codegen（省换行/缩进，WAKE-COMPATIBILITY §M4a）。prod build 用；影响产物缓存键。
     pub fn enable_minify(&mut self) -> &mut Self {
         self.minify = true;
@@ -612,7 +702,7 @@ impl IncrementalBundler {
         modules: &FxHashMap<u32, ModuleRec>,
         ordered: &[u32],
     ) -> FxHashMap<u32, Arc<wake_css_in_js::value::Scope>> {
-        use wake_css_in_js::value::{Scope, collect_imports};
+        use wake_css_in_js::value::{Scope, collect_imports, collect_static_reexports};
 
         // 依赖后序：保证每个模块被处理时，其依赖（若非环）已处理完。
         let mut order: Vec<u32> = Vec::with_capacity(ordered.len());
@@ -682,20 +772,69 @@ impl IncrementalBundler {
 
             // ② 带着该作用域算本模块的导出，供下游模块引用（多层传播的关键）。
             // seed 须与 codegen 期 `transform` 用的完全一致，否则跨模块引用到的类名会对不上。
-            let seed = path_to_slash(&rec.path);
-            let ex = parsed.ast.with_ast(|p| {
+            let seed = self.css_module_seed(&rec.path);
+            let mut ex = parsed.ast.with_ast(|p| {
                 wake_css_in_js::collect_static_exports_with(p, &self.interner, &seed, &scope)
             });
+            let reexports = parsed
+                .ast
+                .with_ast(|p| collect_static_reexports(p, &self.interner));
+            for reexport in reexports {
+                let Some(dep_id) = rec
+                    .dep_ids
+                    .iter()
+                    .find(|(specifier, _)| *specifier == reexport.specifier)
+                    .map(|(_, dep_id)| *dep_id)
+                else {
+                    continue;
+                };
+                let Some(dependency_exports) = exports_of.get(&dep_id) else {
+                    continue;
+                };
+                match (reexport.imported, reexport.exported) {
+                    (Some(imported), Some(exported)) => {
+                        if let Some(value) = dependency_exports.get(&imported) {
+                            ex.insert(exported, value.clone());
+                        }
+                    }
+                    (None, Some(exported)) => {
+                        let mut namespace: Vec<_> = dependency_exports
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect();
+                        namespace.sort_by(|left, right| left.0.cmp(&right.0));
+                        ex.insert(exported, wake_css_in_js::StaticValue::Obj(namespace));
+                    }
+                    (None, None) => {
+                        for (name, value) in dependency_exports {
+                            if name != "default" {
+                                ex.entry(name.clone()).or_insert_with(|| value.clone());
+                            }
+                        }
+                    }
+                    (Some(_), None) => unreachable!("named re-export always has an export name"),
+                }
+            }
             if !ex.is_empty() {
                 exports_of.insert(id, ex);
             }
             scopes.insert(id, scope);
         }
 
-        // 没有可用 import 的模块也要有空作用域：其自身顶层 const 仍可求值。
+        // 只有直接 import 编译期 marker 的模块需要进入 transform/codegen 侧表。依赖模块的
+        // 静态导出已经在上面的后序遍历中求值；把所有模块都放进侧表会让一个 CSS import
+        // 导致整张图走 CSS codegen 分支，并在 dev bundle 中产生无意义的空 registry 脚本。
         ordered
             .iter()
-            .map(|&id| (id, Arc::new(scopes.remove(&id).unwrap_or_default())))
+            .filter_map(|&id| {
+                let direct_marker_import = modules.get(&id).is_some_and(|module| {
+                    module
+                        .deps
+                        .iter()
+                        .any(|dep| wake_css_in_js::is_css_in_js_source(&dep.specifier))
+                });
+                direct_marker_import.then(|| (id, Arc::new(scopes.remove(&id).unwrap_or_default())))
+            })
             .collect()
     }
 
@@ -719,9 +858,9 @@ impl IncrementalBundler {
         self
     }
 
-    /// 启用**零运行时 CSS-in-JS**（Linaria / wyw-in-js 子集，WAKE-COMPATIBILITY §M5）。
+    /// 启用 `@crab-dev/css` 的**零运行时 CSS-in-JS** 编译（WAKE-COMPATIBILITY §M5）。
     ///
-    /// 从 `@linaria/core` 等 import 的 `` css`...` `` 标签模板在构建期求值并抽取为静态 CSS，
+    /// 从 `@crab-dev/css` import 的 `` css`...` `` 标签模板在构建期求值并抽取为静态 CSS，
     /// 表达式替换为类名字符串——运行时零样式计算。插值支持字面量/模板/对象/数组/成员访问，
     /// 以及它们引用的顶层 `const`（含跨模块 import 的静态导出）；无法求值者报警并跳过该条声明。
     ///
@@ -763,9 +902,24 @@ impl IncrementalBundler {
         self
     }
 
-    /// 启用代码分割（动态 import 切 async chunk，PLAN §6.5）。prod build 用；dev 保持单包利于 HMR。
+    /// 启用代码分割（动态 import 切 async chunk，PLAN §6.5）。
     pub fn enable_code_splitting(&mut self) -> &mut Self {
         self.code_splitting = true;
+        self
+    }
+
+    /// Force a single production chunk when a caller explicitly prefers one JavaScript artifact.
+    pub fn disable_code_splitting(&mut self) -> &mut Self {
+        self.code_splitting = false;
+        self
+    }
+
+    /// 让未分割的生产入口使用 `entry.<content-hash>.js`。
+    ///
+    /// 默认关闭，因此普通单包构建仍输出历史文件名 `bundle.js`。该选项仍服从
+    /// [`set_content_hash`](Self::set_content_hash)：全局关闭内容 hash 时输出 `entry.js`。
+    pub fn enable_single_chunk_content_hash(&mut self) -> &mut Self {
+        self.hash_single_chunk_entry = true;
         self
     }
 
@@ -791,6 +945,11 @@ impl IncrementalBundler {
 
     pub fn topology_reuse_count(&self) -> u64 {
         self.topology_reuse_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of generations that reused the previous semantic link/chunk plan.
+    pub fn link_plan_reuse_count(&self) -> u64 {
+        self.link_plan_reuse_count.load(Ordering::Relaxed)
     }
 
     /// 由 generation-aware `BuildSession` 启用。直接打包器保持每次读取文件的兼容语义。
@@ -933,6 +1092,7 @@ impl IncrementalBundler {
                 loaded.source_type,
                 self.jsx,
                 self.target_fingerprint,
+                self.css_in_js,
                 &path,
             );
             let content_vc = self.content_cell(&path, &loaded.source);
@@ -981,11 +1141,9 @@ impl IncrementalBundler {
             };
             let liveness = (self.cache.is_some() || self.load_cache_enabled || self.tree_shaking)
                 .then(|| {
-                    Arc::new(
-                        parsed
-                            .ast
-                            .with_ast(|p| collect_module_liveness(p, self.interner.as_ref())),
-                    )
+                    Arc::new(parsed.ast.with_ast(|p| {
+                        collect_module_liveness_with_css(p, self.interner.as_ref(), self.css_in_js)
+                    }))
                 });
             let block_info = (self.cache.is_some() || self.load_cache_enabled || self.minify)
                 .then(|| parsed.ast.with_ast(concat_block_info));
@@ -1145,7 +1303,7 @@ impl IncrementalBundler {
                         {
                             slots[index] = Some((id, path, Ok(loaded), None, None));
                         } else {
-                            let persistent = self.cache.as_ref().and_then(|persistent_cache| {
+                            let persistent = self.cache.as_mut().and_then(|persistent_cache| {
                                 cached_source_type(self.fs.as_ref(), &path).map(|source_type| {
                                     let cached =
                                         persistent_cache.cached_source(&path, persistent_variant);
@@ -1245,7 +1403,14 @@ impl IncrementalBundler {
                         // content_key 仅缓存启用时需要（缓存主键）；否则跳过 xxh3。
                         let content_key = cached_content_key.unwrap_or_else(|| {
                             if self.cache.is_some() || self.load_cache_enabled {
-                                content_key_of(src, st, self.jsx, self.target_fingerprint, &path)
+                                content_key_of(
+                                    src,
+                                    st,
+                                    self.jsx,
+                                    self.target_fingerprint,
+                                    self.css_in_js,
+                                    &path,
+                                )
                             } else {
                                 0
                             }
@@ -1315,6 +1480,7 @@ impl IncrementalBundler {
                     let st = layer[i].source_type;
                     let interner = self.interner.clone();
                     let jsx = self.jsx;
+                    let css_in_js = self.css_in_js;
                     let transform_features = self.transform_features;
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
                     let file_name = jsx
@@ -1337,7 +1503,11 @@ impl IncrementalBundler {
                                 Vec::new()
                             };
                             let liveness = analyze_liveness.then(|| {
-                                Arc::new(collect_module_liveness(program, interner.as_ref()))
+                                Arc::new(collect_module_liveness_with_css(
+                                    program,
+                                    interner.as_ref(),
+                                    css_in_js,
+                                ))
                             });
                             let block_info = analyze_block_info.then(|| concat_block_info(program));
                             (uses, liveness, block_info)
@@ -1495,7 +1665,11 @@ impl IncrementalBundler {
                     if self.tree_shaking {
                         parsed_opt.as_ref().map(|p| {
                             Arc::new(p.ast.with_ast(|prog| {
-                                collect_module_liveness(prog, self.interner.as_ref())
+                                collect_module_liveness_with_css(
+                                    prog,
+                                    self.interner.as_ref(),
+                                    self.css_in_js,
+                                )
                             }))
                         })
                     } else {
@@ -1642,22 +1816,39 @@ impl IncrementalBundler {
         let t_scan = t0.elapsed();
         let t_link_start = timing.then(std::time::Instant::now);
 
-        // —— Link 阶段：Tree Shaking——算每个模块的「保留导出名」（DESIGN §5.3 / PLAN §6.6）——
-        let keep = self.compute_keep_exports(&modules, entry_id, next_id);
-
-        // —— Link 阶段：代码分割——算 chunk 图（DESIGN §6.3 / PLAN §6.5）。None = 单包路径 ——
-        let chunk_graph = if self.code_splitting {
-            let edges = build_module_edges(&modules);
-            compute_chunk_graph(&edges, entry_id, self.share_threshold)
+        let link_fingerprint = self.link_plan_fingerprint(&modules, entry_id, next_id);
+        let (keep, chunk_graph, async_ids) = if let Some(plan) = self
+            .link_plan
+            .as_ref()
+            .filter(|plan| plan.fingerprint == link_fingerprint)
+        {
+            self.link_plan_reuse_count.fetch_add(1, Ordering::Relaxed);
+            (
+                plan.keep.clone(),
+                plan.chunk_graph.clone(),
+                plan.async_ids.clone(),
+            )
         } else {
-            None
+            // —— Link：Tree Shaking + chunk closures + top-level-await propagation. ——
+            let keep = self.compute_keep_exports(&modules, entry_id, next_id);
+            let chunk_graph = if self.code_splitting {
+                let edges = build_module_edges(&modules);
+                compute_chunk_graph(&edges, entry_id, self.share_threshold)
+            } else {
+                None
+            };
+            let async_ids = async_module_ids(&modules);
+            self.link_plan = Some(LinkPlan {
+                fingerprint: link_fingerprint,
+                keep: keep.clone(),
+                chunk_graph: chunk_graph.clone(),
+                async_ids: async_ids.clone(),
+            });
+            (keep, chunk_graph, async_ids)
         };
         // 单包 minify 仍可使用现有的无 marker 紧凑路径；代码分割必须让各 chunk 的 runtime
         // 通过 `__esModule` 可靠区分 ESM 与 CJS（`default` 键本身不是可靠信号）。
         let no_esmodule = self.minify && chunk_graph.is_none();
-
-        // —— Link 阶段：顶层 await——算 async 子图（含 TLA 的模块 + 静态导入它们的模块）——
-        let async_ids = async_module_ids(&modules);
         let link_time = t_link_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let t_codegen_start = timing.then(std::time::Instant::now);
 
@@ -1665,9 +1856,9 @@ impl IncrementalBundler {
         let ordered: Vec<u32> = (0..next_id).filter(|id| modules.contains_key(id)).collect();
         self.last_module_count = ordered.len();
 
-        // CSS-in-JS 是否真的用得上：全项目无人 import `@linaria/core` 时整体跳过——
+        // CSS-in-JS 是否真的用得上：全项目无人 import `@crab-dev/css` 时整体跳过——
         // 既省掉静态导出求值，也让产物磁盘缓存照常命中（见下方缓存守卫），
-        // 从而使本功能对非 Linaria 项目零开销、可安全默认开启。
+        // 从而使本功能对未使用 Crab CSS 的项目零开销、可安全默认开启。
         let cij_active = self.css_in_js
             && modules.values().any(|r| {
                 r.deps
@@ -1781,51 +1972,61 @@ impl IncrementalBundler {
             .filter(|(_, p)| p.cached_body.is_none())
             .map(|(i, _)| i)
             .collect();
-        let requests: Vec<_> = miss
-            .iter()
-            .map(|&i| {
-                let parse_vc = modules[&plans[i].id]
-                    .parse_vc
-                    .expect("未命中模块此时必已 parse");
-                let linker_vc = plans[i].linker_vc;
-                let interner = self.interner.clone();
-                let define = self.define.clone();
-                let minify = self.minify;
-                let mangle = self.mangle;
-                let minify_names = self.minify;
-                let drop_console = self.drop_console;
-                let drop_debugger = self.drop_debugger;
-                let want_map = self.sourcemap;
-                let id = plans[i].id;
-                let codegen_exec_counts = self.codegen_exec_counts.clone();
-                let codegen_counter_shard = id as usize & (CODEGEN_COUNTER_SHARDS - 1);
-                let cij = cij_scopes.get(&id).cloned();
-                let cij_seed = cij
+        let mut requests = Vec::with_capacity(miss.len());
+        for &i in &miss {
+            let parse_vc = modules[&plans[i].id]
+                .parse_vc
+                .expect("未命中模块此时必已 parse");
+            let linker_vc = plans[i].linker_vc;
+            let interner = self.interner.clone();
+            let id = plans[i].id;
+            let codegen_exec_counts = self.codegen_exec_counts.clone();
+            let codegen_counter_shard = id as usize & (CODEGEN_COUNTER_SHARDS - 1);
+            let cij = cij_scopes.get(&id).cloned();
+            // dev（未开抽取）时把 CSS 以 `<style>` 注入模块体；prod 带出聚合。
+            let inject_style = !self.extract_css;
+            let css_input = CssCodegenInput {
+                scope: cij
+                    .as_deref()
+                    .map(|scope| {
+                        let mut entries: Vec<_> = scope
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect();
+                        entries.sort_by(|left, right| left.0.cmp(&right.0));
+                        entries
+                    })
+                    .unwrap_or_default(),
+                seed: cij
                     .as_ref()
-                    .map(|_| Arc::<str>::from(path_to_slash(&modules[&id].path)));
-                // dev（未开抽取）时把 CSS 以 `<style>` 注入模块体；prod 带出聚合。
-                let inject_style = !self.extract_css;
-                move || {
-                    codegen_request(
-                        parse_vc,
-                        linker_vc,
-                        interner,
-                        define,
-                        minify,
-                        mangle,
-                        minify_names,
-                        drop_console,
-                        drop_debugger,
-                        want_map,
-                        codegen_exec_counts,
-                        codegen_counter_shard,
-                        cij,
-                        cij_seed,
-                        inject_style,
-                    )
-                }
-            })
-            .collect();
+                    .map(|_| self.css_module_seed(&modules[&id].path)),
+                inject_style,
+            };
+            let css_input_vc = self.css_codegen_cell(&plans[i].path, css_input);
+            let options_input_vc = self.codegen_options_cell(
+                &plans[i].path,
+                CodegenOptionsInput {
+                    define: self.define.iter().cloned().collect(),
+                    minify: self.minify,
+                    mangle: self.mangle,
+                    minify_names: self.minify,
+                    drop_console: self.drop_console,
+                    drop_debugger: self.drop_debugger,
+                    want_map: self.sourcemap,
+                },
+            );
+            requests.push(move || {
+                codegen_request(
+                    parse_vc,
+                    linker_vc,
+                    css_input_vc,
+                    options_input_vc,
+                    interner,
+                    codegen_exec_counts,
+                    codegen_counter_shard,
+                )
+            });
+        }
         let engine = Arc::clone(&self.engine);
         let miss_bodies = par_request_batched(&engine, &self.exec, requests);
 
@@ -1871,6 +2072,21 @@ impl IncrementalBundler {
         };
         // 存活模块 id（升序，= 过滤后的 `ordered`）——供 module_count 与单包 module_ids。
         let live_ids: Vec<u32> = bodies.iter().map(|(id, _)| *id).collect();
+        let live_id_set: FxHashSet<u32> = live_ids.iter().copied().collect();
+        if self.extract_css && !collected_css.is_empty() {
+            collected_css.retain(|(id, _)| live_id_set.contains(id));
+        }
+        let (style_assets, style_files) = if self.extract_css {
+            build_style_artifacts(
+                &modules,
+                entry_id,
+                chunk_graph.as_ref(),
+                &mut collected_css,
+                self.minify,
+            )
+        } else {
+            (Vec::new(), BTreeMap::new())
+        };
         let codegen_time = t_codegen_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let t_emit_start = timing.then(std::time::Instant::now);
 
@@ -1901,6 +2117,11 @@ impl IncrementalBundler {
                 );
                 let mut o =
                     crate::single_chunk(bundle, live_ids.len(), diagnostics, live_ids.clone());
+                if self.hash_single_chunk_entry {
+                    let entry = &mut o.chunks[o.entry_chunk];
+                    entry.name = "entry".to_string();
+                    entry.file_name = chunk_filename("entry", &entry.code, self.content_hash);
+                }
                 if want_map {
                     // 源文件名 + 源文本：文本取自 parse 结果；缓存命中未 parse 的模块只带路径
                     // （sourcesContent 为 null，浏览器按路径自取）。
@@ -1931,6 +2152,7 @@ impl IncrementalBundler {
                     &self.public_path,
                     self.content_hash,
                     &async_ids,
+                    &style_files,
                 );
                 let bundle = chunks[entry_chunk].code.clone();
                 BuildOutput {
@@ -1945,13 +2167,19 @@ impl IncrementalBundler {
                 }
             }
         };
+        for chunk in &mut output.chunks {
+            chunk.styles = style_files
+                .get(&chunk.chunk_id)
+                .cloned()
+                .unwrap_or_default();
+        }
 
         output.updated_module_count = codegen_exec_count(&self.codegen_exec_counts)
             .saturating_sub(codegen_exec_before) as usize;
         output.cached_module_count = plans.len().saturating_sub(output.updated_module_count);
 
         // —— 带外产物：超阈值资源（按文件名去重）+ prod 聚合 CSS（模块 id 升序 = BFS 发现序）——
-        let mut assets: Vec<OutputAsset> = Vec::new();
+        let mut assets: Vec<OutputAsset> = style_assets;
         let mut seen: FxHashSet<String> = FxHashSet::default();
         for (name, bytes) in collected_assets {
             if seen.insert(name.clone()) {
@@ -1962,42 +2190,13 @@ impl IncrementalBundler {
                 });
             }
         }
-        if self.extract_css && !collected_css.is_empty() {
-            // **按依赖后序聚合**，不是按模块 id。CSS 的层叠靠顺序定胜负，而模块 id 是 BFS
-            // 发现序：`index → styles.css --@import--> base.css` 会得到 id 0/1/2，于是
-            // `base.css` 被排在 `styles.css` **之后**，覆盖关系整个反过来——与 dev 下
-            // `<style>` 注入（= 模块求值序，依赖先行）恰好相反。后序遍历即 ESM 求值序，
-            // 使 prod 与 dev 的层叠结果一致。
-            let order = css_emission_order(&modules, entry_id);
-            let fallback = u32::MAX;
-            collected_css.sort_by_key(|(id, _)| (*order.get(id).unwrap_or(&fallback), *id));
-            let mut css = String::new();
-            for (_, text) in &collected_css {
-                css.push_str(text);
-                if !text.ends_with('\n') {
-                    css.push('\n');
-                }
-            }
-            // prod 压缩 CSS（安全子集：空白折叠 / 去注释 / 删 `}` 前 `;`）。§M4c
-            let css = if self.minify {
-                wake_css::minify(&css)
-            } else {
-                css
-            };
-            let name = format!("styles.{}.css", hash8(&css));
-            assets.push(OutputAsset {
-                file_name: name,
-                bytes: css.into_bytes(),
-                is_css: true,
-            });
-        }
         output.assets = assets;
 
         // 持久化缓存落盘（opt-in）：仅在无错误 **且本次新增过条目**（dirty）时写。
         // 全命中（未变）时缓存内容没变，跳过落盘——缓存文件常和 bundle 一样大，
         // 每次白写会让 `--cache` 的 I/O 反超它省下的 parse（实测小项目会更慢）。
         if !output.has_errors()
-            && let (Some(cache), Some(path)) = (&self.cache, &self.cache_path)
+            && let (Some(cache), Some(path)) = (&mut self.cache, &self.cache_path)
             && cache.is_dirty()
         {
             let _ = cache.store(path);
@@ -2017,6 +2216,15 @@ impl IncrementalBundler {
                 emit_time,
                 total,
             );
+        }
+
+        if !output.has_errors() {
+            let live_content: FxHashSet<u64> =
+                modules.values().map(|module| module.content_key).collect();
+            self.memory_summaries
+                .retain(|content_key, _| live_content.contains(content_key));
+            self.memory_parse_vcs
+                .retain(|content_key, _| live_content.contains(content_key));
         }
 
         if output.has_errors() || !self.load_cache_enabled {
@@ -2055,6 +2263,32 @@ impl IncrementalBundler {
         } else {
             let cell = self.engine.new_input(data);
             self.linker_cells.insert(path.to_path_buf(), cell);
+            cell
+        }
+    }
+
+    fn css_codegen_cell(&mut self, path: &Path, data: CssCodegenInput) -> Vc<CssCodegenInput> {
+        if let Some(&cell) = self.css_codegen_cells.get(path) {
+            self.engine.set_input(cell, data);
+            cell
+        } else {
+            let cell = self.engine.new_input(data);
+            self.css_codegen_cells.insert(path.to_path_buf(), cell);
+            cell
+        }
+    }
+
+    fn codegen_options_cell(
+        &mut self,
+        path: &Path,
+        data: CodegenOptionsInput,
+    ) -> Vc<CodegenOptionsInput> {
+        if let Some(&cell) = self.codegen_options_cells.get(path) {
+            self.engine.set_input(cell, data);
+            cell
+        } else {
+            let cell = self.engine.new_input(data);
+            self.codegen_options_cells.insert(path.to_path_buf(), cell);
             cell
         }
     }
@@ -2145,6 +2379,44 @@ impl IncrementalBundler {
         }
         keep
     }
+
+    fn link_plan_fingerprint(
+        &self,
+        modules: &FxHashMap<u32, ModuleRec>,
+        entry_id: u32,
+        next_id: u32,
+    ) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entry_id.hash(&mut hasher);
+        next_id.hash(&mut hasher);
+        self.tree_shaking.hash(&mut hasher);
+        self.code_splitting.hash(&mut hasher);
+        self.share_threshold.hash(&mut hasher);
+        self.minify.hash(&mut hasher);
+
+        let mut ids = modules.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        for id in ids {
+            let module = &modules[&id];
+            id.hash(&mut hasher);
+            path_to_slash(&module.path).hash(&mut hasher);
+            module.dep_ids.hash(&mut hasher);
+            module.has_top_level_await.hash(&mut hasher);
+            // The owned summary contains dependency kinds and binding liveness without retaining
+            // AST/arena state. Equal semantic summaries deliberately reuse the plan even when a
+            // string literal changed and therefore produced a different source content key.
+            if let Some(summary) = self.memory_summaries.get(&module.content_key) {
+                summary.persisted.hash(&mut hasher);
+            } else {
+                module.content_key.hash(&mut hasher);
+                for dependency in &module.deps {
+                    dependency.specifier.hash(&mut hasher);
+                    dependency.kind.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
 }
 
 /// 是否为 Node.js 内置模块（含 `node:` 前缀与 `fs/promises`、`stream/web` 等子路径）。
@@ -2216,7 +2488,7 @@ fn extend_module_diagnostics(
     diagnostics: &[Diagnostic],
     path: &Path,
 ) {
-    let path = path.to_string_lossy().into_owned();
+    let path = path_to_slash(path);
     target.extend(
         diagnostics
             .iter()
@@ -2232,6 +2504,7 @@ fn content_key_of(
     st: SourceType,
     jsx: JsxRuntimeOptions,
     target_fingerprint: u64,
+    css_in_js: bool,
     path: &Path,
 ) -> u64 {
     let mut seed = match st {
@@ -2244,10 +2517,30 @@ fn content_key_of(
     // JSX 口径改变解析产出的依赖（`react/jsx-runtime` ↔ `react/jsx-dev-runtime`），
     // 必须参与主键，否则跨 dev/prod 复用摘要会带错依赖。
     seed ^= jsx.salt() ^ target_fingerprint;
+    if css_in_js {
+        // CSS marker imports change the liveness summary even though they do not change parsing.
+        // Keep persistent summaries from CSS-enabled and CSS-disabled builds isolated.
+        seed ^= 0x6372_6162_2d63_7373;
+    }
     if jsx.dev {
         seed ^= xxh3_64_with_seed(path_to_slash(path).as_bytes(), 0x6a73_782d_6669_6c65);
     }
     xxh3_64_with_seed(src.as_bytes(), seed)
+}
+
+fn collect_module_liveness_with_css(
+    program: &Program,
+    interner: &Interner,
+    css_in_js: bool,
+) -> ModuleLiveness {
+    let mut liveness = collect_module_liveness(program, interner);
+    if css_in_js {
+        let consumed = wake_css_in_js::compiler_consumed_imports(program, interner);
+        liveness
+            .named_imports
+            .retain(|import| !consumed.contains(&import.local));
+    }
+    liveness
 }
 
 /// JSX 运行时口径（随 bundler 恒定，传入 parse 任务）。
@@ -2549,11 +2842,23 @@ pub(crate) struct CodegenBody {
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
-// 指纹只取产物代码：map / css 都是同一次 codegen 对同一 AST 的纯函数产物，代码相同则二者
-// 必然相同（同 `ParsedModule` 只取 AST+deps 的做法）。
+// CSS 内容必须参与指纹：类名身份刻意与声明内容解耦，因此 token `red → blue` 时 JS 可以逐字
+// 不变而 CSS 已变化。若只 hash code，Turbo 的 changed-at 截断会把真实样式更新误判为绿色。
 impl std::hash::Hash for CodegenBody {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.code.hash(state);
+        self.css.hash(state);
+        if let Some(map) = &self.map {
+            for mapping in &map.mappings {
+                mapping.gen_line.hash(state);
+                mapping.gen_col.hash(state);
+                mapping.src_index.hash(state);
+                mapping.src_offset.hash(state);
+            }
+        }
+        for diagnostic in &self.diagnostics {
+            format!("{diagnostic:?}").hash(state);
+        }
     }
 }
 
@@ -2561,30 +2866,34 @@ impl std::hash::Hash for CodegenBody {
 fn codegen_request(
     parse_vc: Vc<ParsedModule>,
     linker_vc: Vc<LinkerData>,
+    css_input_vc: Vc<CssCodegenInput>,
+    options_input_vc: Vc<CodegenOptionsInput>,
     interner: Arc<Interner>,
-    define: Arc<[(String, String)]>,
-    minify: bool,
-    mangle: bool,
-    minify_names: bool,
-    drop_console: bool,
-    drop_debugger: bool,
-    want_map: bool,
     codegen_exec_counts: CodegenExecCounts,
     codegen_counter_shard: usize,
-    // CSS-in-JS：`css_in_js` = 本模块 import 绑定已解析出的静态值（None = 未启用）；
-    // `cij_seed` = 类名 hash 种子（模块路径）；`inject_style` = dev 路径改为 `<style>` 注入。
-    css_in_js: Option<Arc<wake_css_in_js::value::Scope>>,
-    cij_seed: Option<Arc<str>>,
-    inject_style: bool,
 ) -> Arc<CodegenBody> {
     let id = TaskId::of(
         "wake_bundler",
         "codegen",
-        &[parse_vc.arg_ref(), linker_vc.arg_ref()],
+        &[
+            parse_vc.arg_ref(),
+            linker_vc.arg_ref(),
+            css_input_vc.arg_ref(),
+            options_input_vc.arg_ref(),
+        ],
     );
     let vc = query(id, move || {
         codegen_exec_counts[codegen_counter_shard].fetch_add(1, Ordering::Relaxed);
         let parsed = parse_vc.read();
+        let css_input = css_input_vc.read();
+        let options = options_input_vc.read();
+        let define = &options.define;
+        let minify = options.minify;
+        let mangle = options.mangle;
+        let minify_names = options.minify_names;
+        let drop_console = options.drop_console;
+        let drop_debugger = options.drop_debugger;
+        let want_map = options.want_map;
         // Large generated modules expose span-keyed rename/liveness divergence between source
         // declarations and linker-generated reads. Keep their names/exports stable until the
         // optimizer is keyed end-to-end by SymbolId; small modules retain the normal fast path.
@@ -2606,21 +2915,19 @@ fn codegen_request(
         } else {
             data.keep_exports.as_deref()
         };
-        // define / minify / mangle 是每个 bundler 的常量（TaskId 未纳入——同一引擎内不变；
-        // 跨引擎无共享内存缓存）。产物磁盘缓存键则由 body_key 混入 define/minify/mangle 指纹区分。
+        // 所有 codegen 配置都来自 Vc input；同一 bundler 实例在 build 之间切换 dev/prod 时会
+        // 精确失效模块体，持久缓存仍由 body_key 的对应盐隔离。
         let dv: Vec<(&str, &str)> = define
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         parsed.ast.with_ast(|program| {
-            // —— CSS-in-JS（Linaria 子集）：与 mangle/minify 无关，先跑 ——
+            // —— `@crab-dev/css` 静态编译：与 mangle/minify 无关，先跑 ——
             // 产出「标签模板 span → 类名字面量」替换 + 本模块抽取的 CSS。
-            let cij = css_in_js
-                .as_ref()
-                .zip(cij_seed.as_deref())
-                .map(|(imported, seed)| {
-                    wake_css_in_js::transform(program, &interner, &parsed.source, seed, imported)
-                });
+            let imported: wake_css_in_js::value::Scope = css_input.scope.iter().cloned().collect();
+            let cij = css_input.seed.as_deref().map(|seed| {
+                wake_css_in_js::transform(program, &interner, &parsed.source, seed, &imported)
+            });
 
             // emit 把每个模块包成 `function(m,$,_r){…}`（`m`=module、`$`=exports、`_r`=require 的
             // 压缩名）。声明为保留名，mangler 不会把局部压成它们而与包装器参数撞车（曾致 React
@@ -2779,6 +3086,9 @@ fn codegen_request(
                     minify_ctx
                         .remove_spans
                         .extend(c.removable_import_spans.iter().copied());
+                    minify_ctx
+                        .unused_var_spans
+                        .extend(c.removable_import_binding_spans.iter().copied());
                 }
 
                 let rename = plan.as_ref().map(|p| p.table());
@@ -2821,18 +3131,25 @@ fn codegen_request(
                 // dev（不抽取 CSS）时把样式随模块体注入 `<style>`，与 `.css` 模块的 dev 行为一致；
                 // prod 则把 CSS 带出，由 driver 聚合进 `styles.<hash>.css`。
                 let css = cij.as_ref().filter(|c| !c.css.is_empty()).map(|c| &c.css);
-                let code = match css {
-                    Some(css) if inject_style => {
-                        let mut s = code;
-                        append_style_injection(&mut s, css);
-                        s
+                let code = if css_input.inject_style {
+                    if let Some(result) = &cij {
+                        let mut output = code;
+                        append_style_injection(
+                            &mut output,
+                            &result.css,
+                            css_input.seed.as_deref().unwrap_or("module"),
+                        );
+                        output
+                    } else {
+                        code
                     }
-                    _ => code,
+                } else {
+                    code
                 };
                 CodegenBody {
                     code: Arc::new(code),
                     map,
-                    css: if inject_style {
+                    css: if css_input.inject_style {
                         None
                     } else {
                         css.map(|c| Arc::new(c.clone()))
@@ -2845,15 +3162,38 @@ fn codegen_request(
     vc.read()
 }
 
-/// 给模块体追加运行时 `<style>` 注入（dev 路径；对齐 `loader.rs` 的 CSS dev 行为）。
+/// 给模块体追加带稳定 module id 的 `<style>` upsert/remove（dev 路径）。每个 bundle runtime
+/// 以其 `__wake_require__` 函数对象作为 WeakMap owner：生成代码保持确定，独立 bundle 即使包含
+/// 相同模块路径也不会互相覆盖，动态 chunk 则自然复用入口 runtime 的 owner。
 ///
 /// `typeof document` 守卫使 SSR / node 下静默跳过。
-fn append_style_injection(js: &mut String, css: &str) {
+fn append_style_injection(js: &mut String, css: &str, module_id: &str) {
+    let style_id = format!("crab-css-{:016x}", stable_text_hash(module_id));
     js.push_str("\nif (typeof document !== \"undefined\") {\n");
-    js.push_str("  var __wake_cij__ = document.createElement(\"style\");\n");
-    js.push_str("  __wake_cij__.textContent = ");
-    crate::loader::push_js_string(js, css);
-    js.push_str(";\n  document.head.appendChild(__wake_cij__);\n}\n");
+    js.push_str("  var __wake_cij_owners__ = document.__wake_css_styles__ || (document.__wake_css_styles__ = new WeakMap());\n");
+    js.push_str("  var __wake_cij_registry__ = __wake_cij_owners__.get(__wake_require__);\n");
+    js.push_str("  if (!__wake_cij_registry__) { __wake_cij_registry__ = {}; __wake_cij_owners__.set(__wake_require__, __wake_cij_registry__); }\n");
+    js.push_str("  var __wake_cij_id__ = ");
+    crate::loader::push_js_string(js, &style_id);
+    js.push_str(";\n  var __wake_cij__ = __wake_cij_registry__[__wake_cij_id__];\n");
+    if css.is_empty() {
+        js.push_str("  if (__wake_cij__) { if (__wake_cij__.remove) __wake_cij__.remove(); delete __wake_cij_registry__[__wake_cij_id__]; }\n");
+    } else {
+        js.push_str("  if (!__wake_cij__) { __wake_cij__ = document.createElement(\"style\"); __wake_cij_registry__[__wake_cij_id__] = __wake_cij__; document.head.appendChild(__wake_cij__); }\n");
+        js.push_str("  __wake_cij__.textContent = ");
+        crate::loader::push_js_string(js, css);
+        js.push_str(";\n");
+    }
+    js.push_str("}\n");
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// parse 任务体：读内容 cell（登记依赖）→ 解析（TS 模式跳过类型）→ 依赖句柄解为字符串。
@@ -3017,7 +3357,7 @@ fn for_each_require<F: FnMut(usize, u32, usize)>(body: &str, mut f: F) {
 /// 全为**局部**（有界回看/前看）检测，故整趟 strip 保持 O(body)。逐字节复刻原逐-id 版的判定。
 fn try_barrel(body: &str, bytes: &[u8], abs: usize, call_end: usize) -> Option<(usize, usize)> {
     // require 前必须是 ` = `（空格=空格）。
-    if abs < 3 || &body[abs - 3..abs] != " = " {
+    if abs < 3 || bytes.get(abs - 3..abs) != Some(b" = ") {
         return None;
     }
     // ` = ` 之前是 VAR 数字。
@@ -3030,11 +3370,11 @@ fn try_barrel(body: &str, bytes: &[u8], abs: usize, call_end: usize) -> Option<(
         return None; // 无数字
     }
     // VAR 数字前应是 `_wm`，再前 `const `。
-    if ds < 3 || &body[ds - 3..ds] != "_wm" {
+    if ds < 3 || bytes.get(ds - 3..ds) != Some(b"_wm") {
         return None;
     }
     let wm_start = ds - 3;
-    if wm_start < 6 || &body[wm_start - 6..wm_start] != "const " {
+    if wm_start < 6 || bytes.get(wm_start - 6..wm_start) != Some(b"const ") {
         return None;
     }
     let const_start = wm_start - 6;
@@ -3176,7 +3516,11 @@ fn append_inline_regs(out: &mut String, inline_regs: &[String]) {
 
 #[cfg(test)]
 mod inline_reg_tests {
-    use super::append_inline_regs;
+    use super::{
+        append_inline_regs, exported_names, strip_hoisted_requires_and_barrels,
+        strip_standalone_requires,
+    };
+    use wake_common::FxHashSet;
 
     #[test]
     fn skips_empty_registry_bodies_without_leaving_commas() {
@@ -3204,6 +3548,25 @@ mod inline_reg_tests {
         append_inline_regs(&mut out, &[String::new(), " ; ".to_string()]);
         assert_eq!(out, "runtime");
     }
+
+    #[test]
+    fn compact_body_scanners_preserve_utf8_and_never_slice_inside_a_character() {
+        let names = exported_names("const label=\"中文件exports\";exports[\"ok\"] = 1;");
+        assert!(names.contains("ok"));
+
+        assert_eq!(
+            strip_standalone_requires("const label=\"中文\";_r(1);exports.value = label;"),
+            "const label=\"中文\";exports.value = label;"
+        );
+
+        let mut hoisted = FxHashSet::default();
+        hoisted.insert(1);
+        let embedded = "const label=\"😀__wake_require__(1)\";";
+        assert_eq!(
+            strip_hoisted_requires_and_barrels(embedded, &hoisted),
+            embedded
+        );
+    }
 }
 
 #[test]
@@ -3221,13 +3584,35 @@ fn detects_only_modules_inside_dependency_cycles() {
     assert!(cyclic.contains(&4));
 }
 
+#[test]
+fn detects_cycles_created_only_by_collapsing_distant_modules_into_concat() {
+    // 原图无环：barrel -> icon -> create -> helper。icon/create 已因其它安全约束独立；若
+    // barrel/helper 被折叠为同一个 concat，就会凭空形成 concat -> icon -> create -> concat。
+    let modules = vec![
+        (0, "const barrel = __wake_require__(1);".to_string()),
+        (1, "const icon = __wake_require__(2);".to_string()),
+        (2, "const create = __wake_require__(3);".to_string()),
+        (3, "const helper = __wake_require__(4);".to_string()),
+        (4, "exports.helper = 1;".to_string()),
+        (5, "exports.unrelated = 1;".to_string()),
+    ];
+    assert!(cyclic_module_ids(&modules).is_empty());
+
+    let standalone = FxHashSet::from_iter([2, 3]);
+    let demoted = concat_cycle_source_ids(&modules, 0, &standalone);
+
+    assert_eq!(demoted, FxHashSet::from_iter([1]));
+    assert!(!demoted.contains(&4), "下游 helper 仍可安全留在 concat");
+    assert!(!demoted.contains(&5), "无关模块不应被降级");
+}
+
 /// 紧凑模块 body 中的运行时引用：`__wake_require__`→`_r`，自由变量 `exports`→`$`。
 ///
 /// **`module.exports` 必须改写成 `m.exports`，不能是 `m.$`**：包装器
 /// `function(m,$,_r)` 由 `.call(module.exports, module, module.exports, __wake_require__)`
 /// 调用，`$` 是 exports 对象的**值**、`m` 才是 module 本身。写成 `m.$` 只是在 module 上挂了个
 /// 名为 `$` 的无关属性，`module.exports` 从未被重新赋值 → 该模块导出恒为空对象
-/// （曾致任何 `module.exports = X` 形态的 CJS 包整包失效，如 `@linaria/core` 的 `cx`）。
+/// （曾致任何 `module.exports = X` 形态的 CJS 包整包失效）。
 ///
 /// 用占位符隔离，避免后一步的 `exports`→`$` 把刚写好的 `m.exports` 又改回 `m.$`。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3297,40 +3682,112 @@ fn compact_body_names(body: &str, names: &RuntimeNames) -> String {
 /// 同一模块的多个依赖按源码中的出现顺序。
 ///
 /// 供 prod CSS 聚合排序用——层叠顺序必须与 dev 的 `<style>` 注入顺序（模块求值序）一致。
-/// 深度优先按 `deps` 原序展开；不区分静态/动态依赖，保证每个可达模块都拿到序号。
+/// 深度优先按静态 `deps` 原序展开。动态 import 并不参与入口求值；把它先遍历会让 lazy
+/// 子图提前占据 shared module 的 `seen` 槽位，从而颠倒 entry CSS 的 cascade 顺序。
 fn css_emission_order(modules: &FxHashMap<u32, ModuleRec>, entry_id: u32) -> FxHashMap<u32, u32> {
+    fn visit_static_postorder(
+        root: u32,
+        modules: &FxHashMap<u32, ModuleRec>,
+        seen: &mut FxHashSet<u32>,
+        order: &mut FxHashMap<u32, u32>,
+        next: &mut u32,
+    ) {
+        if !seen.insert(root) {
+            return;
+        }
+        let mut stack: Vec<(u32, usize)> = vec![(root, 0)];
+        while let Some((id, dependency_index)) = stack.pop() {
+            let Some(module) = modules.get(&id) else {
+                order.insert(id, *next);
+                *next += 1;
+                continue;
+            };
+            if dependency_index < module.deps.len() {
+                stack.push((id, dependency_index + 1));
+                let dependency = &module.deps[dependency_index];
+                if dependency.kind == DependencyKind::DynamicImport {
+                    continue;
+                }
+                if let Some(&(_, child)) = module
+                    .dep_ids
+                    .iter()
+                    .find(|(specifier, _)| specifier == &dependency.specifier)
+                    && seen.insert(child)
+                {
+                    stack.push((child, 0));
+                }
+            } else {
+                order.insert(id, *next);
+                *next += 1;
+            }
+        }
+    }
+
     let mut order: FxHashMap<u32, u32> = FxHashMap::default();
     let mut seen: FxHashSet<u32> = FxHashSet::default();
     let mut next = 0u32;
-    if !modules.contains_key(&entry_id) {
-        return order;
+    if modules.contains_key(&entry_id) {
+        visit_static_postorder(entry_id, modules, &mut seen, &mut order, &mut next);
     }
-    seen.insert(entry_id);
-    // 显式栈的后序 DFS：`(模块 id, 下一个待展开的依赖下标)`。
-    let mut stack: Vec<(u32, usize)> = vec![(entry_id, 0)];
-    while let Some((id, ci)) = stack.pop() {
-        let Some(rec) = modules.get(&id) else {
-            order.entry(id).or_insert_with(|| {
-                let n = next;
-                next += 1;
-                n
-            });
-            continue;
-        };
-        if ci < rec.deps.len() {
-            stack.push((id, ci + 1));
-            let spec = rec.deps[ci].specifier.as_str();
-            if let Some(&(_, child)) = rec.dep_ids.iter().find(|(s, _)| s == spec)
-                && seen.insert(child)
-            {
-                stack.push((child, 0));
-            }
-        } else {
-            order.insert(id, next);
-            next += 1;
+
+    // Lazy roots are not part of entry evaluation, but their own static dependency order matters
+    // once activated. Visit every remaining component in deterministic module-id order.
+    let mut remaining = modules.keys().copied().collect::<Vec<_>>();
+    remaining.sort_unstable();
+    for id in remaining {
+        if !seen.contains(&id) {
+            visit_static_postorder(id, modules, &mut seen, &mut order, &mut next);
         }
     }
     order
+}
+
+/// Turn extracted module styles into chunk-owned artifacts. The global dependency postorder is
+/// preserved inside every chunk; cross-chunk order follows the JavaScript chunk dependency DAG,
+/// which the runtime resolves before loading the dependent chunk's own styles.
+fn build_style_artifacts(
+    modules: &FxHashMap<u32, ModuleRec>,
+    entry_id: u32,
+    chunk_graph: Option<&ChunkGraph>,
+    collected_css: &mut [(u32, String)],
+    minify: bool,
+) -> (Vec<OutputAsset>, BTreeMap<u32, Vec<String>>) {
+    if collected_css.is_empty() {
+        return (Vec::new(), BTreeMap::new());
+    }
+    let order = css_emission_order(modules, entry_id);
+    let fallback = u32::MAX;
+    collected_css.sort_by_key(|(id, _)| (*order.get(id).unwrap_or(&fallback), *id));
+
+    let mut css_by_chunk: BTreeMap<u32, String> = BTreeMap::new();
+    for (module_id, text) in collected_css.iter() {
+        let chunk_id = chunk_graph
+            .and_then(|graph| graph.module_chunk.get(module_id).copied())
+            .unwrap_or(0);
+        let output = css_by_chunk.entry(chunk_id).or_default();
+        output.push_str(text);
+        if !text.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    let mut assets = Vec::with_capacity(css_by_chunk.len());
+    let mut files = BTreeMap::new();
+    for (chunk_id, css) in css_by_chunk {
+        let css = if minify { wake_css::minify(&css) } else { css };
+        let chunk_name = chunk_graph
+            .and_then(|graph| graph.chunks.iter().find(|chunk| chunk.id == chunk_id))
+            .map(|chunk| chunk.name.as_str())
+            .unwrap_or("styles");
+        let file_name = format!("{chunk_name}.{}.css", hash8(&css));
+        files.insert(chunk_id, vec![file_name.clone()]);
+        assets.push(OutputAsset {
+            file_name,
+            bytes: css.into_bytes(),
+            is_css: true,
+        });
+    }
+    (assets, files)
 }
 
 /// 模块体写入 exports 对象的**导出名**集合。
@@ -3353,7 +3810,7 @@ fn exported_names(body: &str) -> FxHashSet<String> {
         let after = at + "exports".len();
         i = after;
         // `module.exports` 不是这里的目标。
-        if at >= "module.".len() && &body[at - "module.".len()..at] == "module." {
+        if at >= "module.".len() && bytes.get(at - "module.".len()..at) == Some(b"module.") {
             continue;
         }
         // `exports` 必须是完整词（前一个字符不能是标识符字符）。
@@ -3411,7 +3868,7 @@ fn exported_names(body: &str) -> FxHashSet<String> {
 /// 这类 CJS 模块**不能**并入 scope-hoist 的 concat：concat 让所有被合并模块共享同一个
 /// exports 对象 `$`，而整体赋值会把 `module.exports` 换成**另一个**对象——此后
 /// 该模块的导出与其它模块写入的 `$` 分属两个对象，必丢其一
-/// （曾致 `@linaria/core` 并入后 `cx` 与同组 ESM 模块的导出互相覆盖丢失）。
+/// （曾致 CJS 与同组 ESM 模块的导出互相覆盖丢失）。
 fn reassigns_module_exports(body: &str) -> bool {
     let mut rest = body;
     while let Some(pos) = rest.find("module.exports") {
@@ -3462,8 +3919,12 @@ fn strip_standalone_requires(body: &str) -> String {
                 }
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch = body[i..]
+            .chars()
+            .next()
+            .expect("i remains on a UTF-8 character boundary");
+        result.push(ch);
+        i += ch.len_utf8();
     }
     result
 }
@@ -3547,6 +4008,94 @@ fn cyclic_module_ids(modules: &[(u32, String)]) -> FxHashSet<u32> {
         }
     }
     cyclic
+}
+
+/// 返回会因「把所有可合并模块折叠成同一个 concat factory」而**新造出运行时环**的
+/// concat 成员。
+///
+/// 原始模块图可以是无环的，例如：
+///
+/// ```text
+/// barrel (merge) -> icon (standalone) -> create (standalone) -> helper (merge)
+/// ```
+///
+/// 若把 `barrel` 与 `helper` 合为一个 concat factory，图就变成
+/// `concat -> icon -> create -> concat`。从 `create` 开始求值时，它先 require concat；concat
+/// 又会急切初始化 barrel/icon，并在 `create` 尚未写出导出时拿到缓存里的空 exports。
+///
+/// 这里精确降级这类路径中位于 standalone **上游**的 merge 成员（例中的 barrel），保留下游
+/// helper 的合并收益。设边方向为「模块 → 依赖」：
+/// 1. 反向遍历所有 merge 成员，找出仍能走到 merge 的 standalone 边界；
+/// 2. 再反向遍历这些边界，其上游 merge 成员就是折叠后闭环的来源。
+fn concat_cycle_source_ids(
+    modules: &[(u32, String)],
+    entry_id: u32,
+    standalone: &FxHashSet<u32>,
+) -> FxHashSet<u32> {
+    let ids: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
+    let merged: FxHashSet<u32> = ids
+        .iter()
+        .copied()
+        .filter(|id| *id != entry_id && !standalone.contains(id))
+        .collect();
+    if merged.is_empty() {
+        return FxHashSet::default();
+    }
+
+    // 反向边：dependency -> importers。
+    let mut reverse: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (id, body) in modules {
+        for_each_require(body, |_, target, _| {
+            if ids.contains(&target) && target != *id {
+                reverse.entry(target).or_default().push(*id);
+            }
+        });
+    }
+    for importers in reverse.values_mut() {
+        importers.sort_unstable();
+        importers.dedup();
+    }
+
+    fn reverse_reachable(
+        seeds: impl IntoIterator<Item = u32>,
+        reverse: &FxHashMap<u32, Vec<u32>>,
+    ) -> FxHashSet<u32> {
+        let mut seen = FxHashSet::default();
+        let mut stack = Vec::new();
+        for seed in seeds {
+            if seen.insert(seed) {
+                stack.push(seed);
+            }
+        }
+        while let Some(id) = stack.pop() {
+            if let Some(importers) = reverse.get(&id) {
+                for importer in importers {
+                    if seen.insert(*importer) {
+                        stack.push(*importer);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    // standalone（入口也永远是独立 factory）必须同时满足「它能到达某个 merge 成员」，
+    // 才可能成为 concat 折叠环的中间边界。
+    let can_reach_merge = reverse_reachable(merged.iter().copied(), &reverse);
+    let bridge_standalones = ids
+        .iter()
+        .copied()
+        .filter(|id| (*id == entry_id || standalone.contains(id)) && can_reach_merge.contains(id))
+        .collect::<Vec<_>>();
+    if bridge_standalones.is_empty() {
+        return FxHashSet::default();
+    }
+
+    let can_reach_bridge = reverse_reachable(bridge_standalones, &reverse);
+    merged
+        .into_iter()
+        .filter(|id| can_reach_bridge.contains(id))
+        .collect()
 }
 /// 拓扑排序：按依赖顺序排列模块，确保依赖方先于被依赖方执行。
 /// 解析各模块 body 中的 require 调用构建依赖图，忽略对自身和不在集合内的引用。
@@ -3775,6 +4324,13 @@ fn emit(
                     }
                 }
             }
+
+            // 把任意 merge 成员全部折叠到一个 eager concat factory，可能在**原本无环**的图上
+            // 新造出 `concat -> standalone -> concat`。典型例子是 Lucide：barrel（可合并）初始化
+            // icon（因重复 default 导出而独立），icon 再依赖 createLucideIcon（独立），后者又依赖
+            // concat 内的 helpers。从 createLucideIcon 开始 require 时，循环缓存会暴露尚未初始化的
+            // 空 exports。只把 standalone 上游、会闭合该路径的 concat 成员降级即可保留其余合并。
+            standalone.extend(concat_cycle_source_ids(&filtered, entry_id, &standalone));
 
             // 真正并入 concat 的模块 id（供 `_r` 垫片判定）。
             let concat_member_ids: Vec<u32> = filtered
@@ -4240,6 +4796,7 @@ fn emit_chunks(
     public_path: &str,
     hashed: bool,
     async_ids: &FxHashSet<u32>,
+    style_files: &BTreeMap<u32, Vec<String>>,
 ) -> (Vec<OutputChunk>, usize) {
     let body_of: FxHashMap<u32, &Arc<String>> = bodies.iter().map(|(id, b)| (*id, b)).collect();
 
@@ -4263,7 +4820,8 @@ fn emit_chunks(
             chunk_id: plan.id,
             module_ids: plan.modules.clone(),
             imports: Vec::new(), // 回填于下
-            source_map: None,    // 代码分割路径暂不产 map（M4d 首期只覆盖单包）
+            styles: style_files.get(&plan.id).cloned().unwrap_or_default(),
+            source_map: None, // 代码分割路径暂不产 map（M4d 首期只覆盖单包）
         });
     }
     // 回填非 entry chunk 的静态依赖文件名。
@@ -4281,7 +4839,16 @@ fn emit_chunks(
     let entries = render_module_entries(&entry_plan.modules, &body_of, async_ids);
     let f_map = json_file_map(&file_of);
     let d_map = json_deps_map(&g.chunk_deps);
-    let code = render_entry_chunk(token, entry_id, public_path, &f_map, &d_map, &entries);
+    let s_map = json_styles_map(style_files);
+    let code = render_entry_chunk(
+        token,
+        entry_id,
+        public_path,
+        &f_map,
+        &d_map,
+        &s_map,
+        &entries,
+    );
     let file = chunk_filename(&entry_plan.name, &code, hashed);
     let entry = OutputChunk {
         name: entry_plan.name.clone(),
@@ -4292,6 +4859,7 @@ fn emit_chunks(
         chunk_id: 0,
         module_ids: entry_plan.modules.clone(),
         imports: Vec::new(),
+        styles: style_files.get(&0).cloned().unwrap_or_default(),
         source_map: None, // 同上：代码分割路径暂不产 map
     };
 
@@ -4310,6 +4878,7 @@ fn render_entry_chunk(
     public_path: &str,
     f_map: &str,
     d_map: &str,
+    s_map: &str,
     entries: &str,
 ) -> String {
     // 分割 runtime 跨 chunk 处理未知模块形态，必须使用 codegen 保留的 ESM marker；不能用
@@ -4328,6 +4897,7 @@ fn render_entry_chunk(
     out.push_str(";\n");
     out.push_str(&format!("__wake__.f = {f_map};\n"));
     out.push_str(&format!("Object.assign(__wake__.d, {d_map});\n"));
+    out.push_str(&format!("Object.assign(__wake__.s, {s_map});\n"));
     out.push_str("__wake__.markLoaded(0);\n");
     out.push_str("__wake__.register({\n");
     out.push_str(entries);
@@ -4386,6 +4956,26 @@ fn json_deps_map(chunk_deps: &FxHashMap<u32, Vec<u32>>) -> String {
     s
 }
 
+/// `{ 1: ["lazy.abcd.css"] }` (chunk id ascending; entry CSS is loaded by HTML).
+fn json_styles_map(style_files: &BTreeMap<u32, Vec<String>>) -> String {
+    let mut output = String::from("{");
+    let mut first = true;
+    for (chunk_id, files) in style_files.iter().filter(|(chunk_id, _)| **chunk_id != 0) {
+        if !first {
+            output.push(',');
+        }
+        first = false;
+        let files = files
+            .iter()
+            .map(|file| format!("{file:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(" {chunk_id}: [{files}]"));
+    }
+    output.push_str(" }");
+    output
+}
+
 /// 内容 hash 文件名 `[name].[hash8].js`（关闭 hash 则 `[name].js`）。
 fn chunk_filename(name: &str, code: &str, hashed: bool) -> String {
     if hashed {
@@ -4415,8 +5005,8 @@ var g = typeof globalThis !== "undefined" ? globalThis
       : typeof self !== "undefined" ? self
       : typeof window !== "undefined" ? window : this;
 var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
-  var modules = {}, cache = {}, chunkPromises = {};
-  var W = { m: modules, c: cache, p: chunkPromises, f: {}, d: {},
+  var modules = {}, cache = {}, chunkPromises = {}, stylePromises = {};
+  var W = { m: modules, c: cache, p: chunkPromises, f: {}, d: {}, s: {},
             publicPath: "", nreq: null, ndir: ".", npath: null };
   function require(id) {
     var hit = cache[id];
@@ -4451,10 +5041,26 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
       (document.head || document.getElementsByTagName("head")[0] || document.documentElement).appendChild(s);
     });
   }
+  function loadStyle(file) {
+    if (stylePromises[file]) return stylePromises[file];
+    if (W.nreq || typeof document === "undefined") return Promise.resolve();
+    var p = new Promise(function (res, rej) {
+      var link = document.createElement("link");
+      link.rel = "stylesheet"; link.href = W.publicPath + file;
+      link.onload = function () { res(); };
+      link.onerror = function () { rej(new Error("wake: failed to load style " + file)); };
+      (document.head || document.getElementsByTagName("head")[0] || document.documentElement).appendChild(link);
+    });
+    stylePromises[file] = p;
+    p.catch(function () { if (stylePromises[file] === p) delete stylePromises[file]; });
+    return p;
+  }
   function ensure(cid) {
     if (chunkPromises[cid]) return chunkPromises[cid];
     var deps = W.d[cid] || [];
     var p = Promise.all(deps.map(ensure)).then(function () {
+      return Promise.all((W.s[cid] || []).map(loadStyle));
+    }).then(function () {
       var file = W.f[cid];
       if (file == null) throw new Error("wake: unknown chunk " + cid);
       return loadFile(file);

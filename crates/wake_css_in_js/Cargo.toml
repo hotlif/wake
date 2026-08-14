@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "零运行时 CSS-in-JS（Linaria / wyw-in-js 子集）：构建期抽取 css`` 为静态 CSS。WAKE-COMPATIBILITY §M5"
+description = "@crab-dev/css 的安全零运行时编译器：构建期抽取静态 CSS。WAKE-COMPATIBILITY §M5"
 
 [lints]
 workspace = true
@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 wake_common.workspace = true
 wake_ecma_ast.workspace = true
+wake_ecma_semantic.workspace = true
 
 [dev-dependencies]
 wake_ecma_parser.workspace = true

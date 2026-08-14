@@ -12,3 +12,6 @@ workspace = true
 [dependencies]
 wake_common.workspace = true
 wake_ecma_ast.workspace = true
+
+[dev-dependencies]
+wake_ecma_parser.workspace = true

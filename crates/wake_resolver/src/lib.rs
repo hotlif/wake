@@ -948,21 +948,21 @@ mod tests {
             serde_json::json!(["@crab-dev/rc-button", "npm:1.0.0"]),
         ];
         if let Some(reference) = top_level_dependency {
-            top_dependencies.push(serde_json::json!(["@linaria/core", reference]));
+            top_dependencies.push(serde_json::json!(["@crab-dev/css", reference]));
         }
 
         let mut wake_dependencies = vec![serde_json::json!(["@crab-dev/wake", "npm:0.1.16"])];
         if provider_has_dependency {
-            wake_dependencies.push(serde_json::json!(["@linaria/core", "npm:1.0.0"]));
+            wake_dependencies.push(serde_json::json!(["@crab-dev/css", "npm:1.0.0"]));
         }
 
         let mut component_dependencies =
             vec![serde_json::json!(["@crab-dev/rc-button", "npm:1.0.0"])];
         match component_dependency {
             Some(Some(reference)) => {
-                component_dependencies.push(serde_json::json!(["@linaria/core", reference]))
+                component_dependencies.push(serde_json::json!(["@crab-dev/css", reference]))
             }
-            Some(None) => component_dependencies.push(serde_json::json!(["@linaria/core", null])),
+            Some(None) => component_dependencies.push(serde_json::json!(["@crab-dev/css", null])),
             None => {}
         }
 
@@ -986,15 +986,15 @@ mod tests {
                     "packageDependencies": component_dependencies,
                     "linkType": "HARD"
                 }]]],
-                ["@linaria/core", [
+                ["@crab-dev/css", [
                     ["npm:1.0.0", {
-                        "packageLocation": "../cache/linaria-v1/node_modules/@linaria/core/",
-                        "packageDependencies": [["@linaria/core", "npm:1.0.0"]],
+                        "packageLocation": "../cache/crab-css-v1/node_modules/@crab-dev/css/",
+                        "packageDependencies": [["@crab-dev/css", "npm:1.0.0"]],
                         "linkType": "HARD"
                     }],
                     ["npm:2.0.0", {
-                        "packageLocation": "../cache/linaria-v2/node_modules/@linaria/core/",
-                        "packageDependencies": [["@linaria/core", "npm:2.0.0"]],
+                        "packageLocation": "../cache/crab-css-v2/node_modules/@crab-dev/css/",
+                        "packageDependencies": [["@crab-dev/css", "npm:2.0.0"]],
                         "linkType": "HARD"
                     }]
                 ]]
@@ -1021,26 +1021,26 @@ mod tests {
             "// button",
         );
         fs.insert(
-            "cache/linaria-v1/node_modules/@linaria/core/package.json",
-            r#"{"name":"@linaria/core","exports":{".":"./index.js","./private":"./private.js"}}"#,
+            "cache/crab-css-v1/node_modules/@crab-dev/css/package.json",
+            r#"{"name":"@crab-dev/css","exports":{".":"./index.js","./private":"./private.js"}}"#,
         );
         fs.insert(
-            "cache/linaria-v1/node_modules/@linaria/core/index.js",
+            "cache/crab-css-v1/node_modules/@crab-dev/css/index.js",
             "// provider v1",
         );
         fs.insert(
-            "cache/linaria-v1/node_modules/@linaria/core/private.js",
+            "cache/crab-css-v1/node_modules/@crab-dev/css/private.js",
             "// provider private",
         );
         fs.insert(
-            "cache/linaria-v2/node_modules/@linaria/core/package.json",
-            r#"{"name":"@linaria/core","exports":{".":"./index.js"}}"#,
+            "cache/crab-css-v2/node_modules/@crab-dev/css/package.json",
+            r#"{"name":"@crab-dev/css","exports":{".":"./index.js"}}"#,
         );
         fs.insert(
-            "cache/linaria-v2/node_modules/@linaria/core/index.js",
+            "cache/crab-css-v2/node_modules/@crab-dev/css/index.js",
             "// component v2",
         );
-        fs.insert("alias/linaria.js", "// alias");
+        fs.insert("alias/crab-css.js", "// alias");
 
         let manifest = PnpManifest::load(&fs, Path::new("project")).unwrap();
         Resolver::with_pnp_options(
@@ -1050,7 +1050,7 @@ mod tests {
                 alias,
                 pnp_dependency_fallbacks: vec![PnpDependencyFallback {
                     issuer_package_prefix: "@crab-dev/rc-".to_string(),
-                    dependency: "@linaria/core".to_string(),
+                    dependency: "@crab-dev/css".to_string(),
                     provider_issuer: PathBuf::from(
                         "cache/wake/node_modules/@crab-dev/wake/internal",
                     ),
@@ -1066,11 +1066,11 @@ mod tests {
         assert_eq!(
             resolver
                 .resolve(
-                    "@linaria/core",
+                    "@crab-dev/css",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .unwrap(),
-            PathBuf::from("cache/linaria-v1/node_modules/@linaria/core/index.js")
+            PathBuf::from("cache/crab-css-v1/node_modules/@crab-dev/css/index.js")
         );
     }
 
@@ -1080,11 +1080,11 @@ mod tests {
         assert_eq!(
             resolver
                 .resolve(
-                    "@linaria/core",
+                    "@crab-dev/css",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .unwrap(),
-            PathBuf::from("cache/linaria-v1/node_modules/@linaria/core/index.js")
+            PathBuf::from("cache/crab-css-v1/node_modules/@crab-dev/css/index.js")
         );
     }
 
@@ -1095,11 +1095,11 @@ mod tests {
         assert_eq!(
             resolver
                 .resolve(
-                    "@linaria/core",
+                    "@crab-dev/css",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .unwrap(),
-            PathBuf::from("cache/linaria-v2/node_modules/@linaria/core/index.js")
+            PathBuf::from("cache/crab-css-v2/node_modules/@crab-dev/css/index.js")
         );
     }
 
@@ -1110,11 +1110,11 @@ mod tests {
         assert_eq!(
             resolver
                 .resolve(
-                    "@linaria/core",
+                    "@crab-dev/css",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .unwrap(),
-            PathBuf::from("cache/linaria-v2/node_modules/@linaria/core/index.js")
+            PathBuf::from("cache/crab-css-v2/node_modules/@crab-dev/css/index.js")
         );
     }
 
@@ -1123,7 +1123,7 @@ mod tests {
         let resolver = pnp_scoped_fallback_resolver(None, true, false, None, Vec::new());
         assert!(
             resolver
-                .resolve("@linaria/core", Path::new("project/src"))
+                .resolve("@crab-dev/css", Path::new("project/src"))
                 .is_err()
         );
     }
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(
             resolver
                 .resolve(
-                    "@linaria/core",
+                    "@crab-dev/css",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .is_err()
@@ -1149,18 +1149,18 @@ mod tests {
             false,
             None,
             vec![(
-                "@linaria/core".to_string(),
-                PathBuf::from("alias/linaria.js"),
+                "@crab-dev/css".to_string(),
+                PathBuf::from("alias/crab-css.js"),
             )],
         );
         assert_eq!(
             resolver
                 .resolve(
-                    "@linaria/core",
+                    "@crab-dev/css",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .unwrap(),
-            PathBuf::from("alias/linaria.js")
+            PathBuf::from("alias/crab-css.js")
         );
     }
 
@@ -1171,7 +1171,7 @@ mod tests {
         assert!(
             resolver
                 .resolve(
-                    "@linaria/core/private",
+                    "@crab-dev/css/private",
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .is_err()

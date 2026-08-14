@@ -19,6 +19,7 @@ wake_common.workspace = true
 wake_ecma_lexer.workspace = true
 wake_ecma_ast.workspace = true
 wake_ecma_parser.workspace = true
+wake_ecma_semantic.workspace = true
 clap.workspace = true
 notify.workspace = true
 ctrlc.workspace = true

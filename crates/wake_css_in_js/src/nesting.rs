@@ -19,7 +19,7 @@
 //! - `@media`/`@supports` 等条件 at-rule → 保留外壳，内部按同规则递归
 //! - `@font-face` 等 → 原样提升到顶层（其内部不是选择器上下文）
 //!
-//! 另实现两项 Linaria 语义（对齐 `@wyw-in-js/transform` 的 stylis 中间件）：
+//! 另实现两项 Crab CSS 选择器语义：
 //! - **`:global()` 逃逸**：`:global() { … }` 块内的选择器**不加**父类前缀，整体全局生效；
 //!   `:global(sel)` 形式则以 `sel` 原样参与（见 [`expand_selector`]）。
 //! - **`@keyframes` 名作用域化**：关键帧名加 `-<父选择器去非字母数字>` 后缀，并同步改写
@@ -28,7 +28,7 @@
 /// 把 `body`（声明块体）按 `parent` 选择器展开为平铺 CSS。
 pub fn flatten(parent: &str, body: &str) -> String {
     // 关键帧作用域化需要先知道本块**定义了哪些**关键帧：只有被定义的名字才在
-    // `animation` 值里改写（对齐 Linaria：未定义的名字可能来自全局，不能乱改）。
+    // `animation` 值里改写（未定义的名字可能来自全局，不能乱改）。
     let defined = collect_keyframe_names(body);
     let suffix = keyframe_suffix(parent);
     let ctx = KeyframeCtx {
@@ -48,7 +48,7 @@ struct KeyframeCtx<'a> {
     suffix: &'a str,
 }
 
-/// 父选择器 → 关键帧后缀（对齐 Linaria `elementToKeyframeSuffix`）。
+/// 父选择器 → 关键帧后缀。
 fn keyframe_suffix(parent: &str) -> String {
     parent
         .chars()
@@ -59,21 +59,46 @@ fn keyframe_suffix(parent: &str) -> String {
 /// 扫描块体（含嵌套）收集 `@keyframes <name>` 定义的名字；`:global(name)` 不收（保持全局）。
 fn collect_keyframe_names(body: &str) -> Vec<String> {
     let mut names = Vec::new();
-    let mut rest = body;
-    while let Some(pos) = rest.find("@keyframes") {
-        let after = &rest[pos + "@keyframes".len()..];
-        let name_part = after.trim_start();
-        // `:global(spin)` → 全局关键帧，不作用域化
-        if !name_part.starts_with(":global(") {
-            let name: String = name_part
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .collect();
-            if !name.is_empty() && !names.contains(&name) {
-                names.push(name);
+    let bytes = body.as_bytes();
+    let marker = b"@keyframes";
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
             }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'@' if bytes[i..].starts_with(marker) => {
+                let after = &body[i + marker.len()..];
+                let name_part = after.trim_start();
+                // `:global(spin)` → 全局关键帧，不作用域化
+                if !name_part.starts_with(":global(") {
+                    let name: String = name_part
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                        .collect();
+                    if !name.is_empty() && !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                i += marker.len();
+            }
+            _ => {}
         }
-        rest = after;
+        i += 1;
     }
     names
 }
@@ -178,11 +203,6 @@ fn flush_ident(out: &mut String, buf: &mut String, ctx: &KeyframeCtx) {
 
 fn flatten_into(parent: &str, body: &str, ctx: &KeyframeCtx, out: &mut String) {
     let mut decls = String::new();
-    // 先收本层裸声明，遇到嵌套块则递归；本层声明统一在最后成规则输出前置，
-    // 保证 `.box{...}` 出现在其嵌套规则之前（源码顺序直觉）。
-    let mut nested: Vec<(String, String)> = Vec::new();
-    let mut at_blocks: Vec<(String, String)> = Vec::new();
-    let mut verbatim: Vec<String> = Vec::new();
 
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -213,8 +233,14 @@ fn flatten_into(parent: &str, body: &str, ctx: &KeyframeCtx, out: &mut String) {
             b';' => {
                 let decl = body[seg_start..i].trim();
                 if !decl.is_empty() {
-                    decls.push_str(&scope_animation_decl(decl, ctx));
-                    decls.push(';');
+                    if parent.is_empty() && decl.starts_with('@') {
+                        flush_declarations(parent, &mut decls, out);
+                        out.push_str(decl);
+                        out.push(';');
+                    } else {
+                        decls.push_str(&scope_animation_decl(decl, ctx));
+                        decls.push(';');
+                    }
                 }
                 i += 1;
                 seg_start = i;
@@ -225,20 +251,45 @@ fn flatten_into(parent: &str, body: &str, ctx: &KeyframeCtx, out: &mut String) {
                 i = next;
                 seg_start = i;
 
+                // A nested rule splits the surrounding declaration sequence. Flush before
+                // emitting the block so declarations written after it remain after it in the
+                // generated CSS; grouping all declarations/nested/at-rules by kind changes the
+                // cascade for equal-specificity rules.
+                flush_declarations(parent, &mut decls, out);
+
                 if prelude.starts_with('@') {
                     let name = at_rule_name(&prelude);
                     if is_conditional_at_rule(name) {
-                        at_blocks.push((prelude, block));
+                        let mut inner = String::new();
+                        flatten_into(parent, &block, ctx, &mut inner);
+                        if !inner.is_empty() {
+                            out.push_str(&prelude);
+                            out.push('{');
+                            out.push_str(&inner);
+                            out.push('}');
+                        }
                     } else if name == "keyframes" {
                         // 关键帧：名字作用域化后原样提升（内部是 `from/to/%`，非选择器上下文）。
                         let scoped = scope_keyframes_prelude(&prelude, ctx);
-                        verbatim.push(format!("{scoped}{{{block}}}"));
+                        out.push_str(&scoped);
+                        out.push('{');
+                        out.push_str(&block);
+                        out.push('}');
                     } else {
                         // @font-face 等：原样提升。
-                        verbatim.push(format!("{prelude}{{{block}}}"));
+                        out.push_str(&prelude);
+                        out.push('{');
+                        out.push_str(&block);
+                        out.push('}');
                     }
                 } else if !prelude.is_empty() {
-                    nested.push((prelude, block));
+                    // `:global()`（空括号）块：其内容整体逃逸出类作用域，以**空父选择器**递归。
+                    if is_bare_global(&prelude) {
+                        flatten_into("", &block, ctx, out);
+                    } else {
+                        let expanded = expand_selector(parent, &prelude);
+                        flatten_into(&expanded, &block, ctx, out);
+                    }
                 }
             }
             _ => i += 1,
@@ -250,38 +301,18 @@ fn flatten_into(parent: &str, body: &str, ctx: &KeyframeCtx, out: &mut String) {
         decls.push_str(&scope_animation_decl(tail, ctx));
         decls.push(';');
     }
+    flush_declarations(parent, &mut decls, out);
+}
 
+fn flush_declarations(parent: &str, declarations: &mut String, out: &mut String) {
     // 全局作用域（`:global()` 块内）没有选择器可挂，裸声明只能丢弃——写出来是非法 CSS。
-    if !decls.is_empty() && !parent.is_empty() {
+    if !declarations.is_empty() && !parent.is_empty() {
         out.push_str(parent);
         out.push('{');
-        out.push_str(&decls);
+        out.push_str(declarations);
         out.push('}');
     }
-    for (sel, block) in nested {
-        // `:global()`（空括号）块：其内容整体逃逸出类作用域，以**空父选择器**递归——
-        // 于是块内的 `html, body` 原样输出，不会被加上 `.box ` 前缀。
-        if is_bare_global(&sel) {
-            flatten_into("", &block, ctx, out);
-            continue;
-        }
-        let expanded = expand_selector(parent, &sel);
-        flatten_into(&expanded, &block, ctx, out);
-    }
-    for (prelude, block) in at_blocks {
-        // 条件 at-rule：外壳保留，内部以同一父选择器递归展开。
-        let mut inner = String::new();
-        flatten_into(parent, &block, ctx, &mut inner);
-        if !inner.is_empty() {
-            out.push_str(&prelude);
-            out.push('{');
-            out.push_str(&inner);
-            out.push('}');
-        }
-    }
-    for v in verbatim {
-        out.push_str(&v);
-    }
+    declarations.clear();
 }
 
 /// 从 `body[open]` 处的 `{` 读到配对的 `}`，返回（块内文本, `}` 之后的下标）。
@@ -335,23 +366,86 @@ fn is_bare_global(sel: &str) -> bool {
 /// `:global(sel)` 的部分**原样取出 sel 且不加父前缀**（全局逃逸）；父选择器为空
 /// （处于 `:global()` 块内）时同样不加前缀。
 fn expand_selector(parent: &str, sel: &str) -> String {
-    sel.split(',')
-        .map(|part| {
-            let p = part.trim();
-            // `:global(x)` → `x`，且该项不受父作用域约束
-            if let Some(inner) = extract_global(p) {
-                return inner;
-            }
-            if p.contains('&') {
-                p.replace('&', parent)
-            } else if parent.is_empty() {
-                p.to_string()
+    let parents = split_selector_list(parent);
+    let mut expanded = Vec::new();
+
+    for part in split_selector_list(sel) {
+        let child = part.trim();
+        // `:global(x)` → `x`，且该项不受父作用域约束。它不与父选择器做笛卡尔积，
+        // 否则同一条全局选择器会被重复输出一次/父分支。
+        if let Some(inner) = extract_global(child) {
+            expanded.push(inner);
+            continue;
+        }
+
+        if parent.is_empty() {
+            expanded.push(child.replace('&', ""));
+            continue;
+        }
+
+        // `parent` 本身可能是上一层嵌套展开得到的 selector list。每个 child 必须分别与
+        // 每个 parent 组合；直接把整个 `parent` 字符串替换进 `&` 会让 `:hover` / `.child`
+        // 等后缀只落到逗号列表的最后一支。
+        for parent in &parents {
+            let parent = parent.trim();
+            if child.contains('&') {
+                expanded.push(child.replace('&', parent));
             } else {
-                format!("{parent} {p}")
+                expanded.push(format!("{parent} {child}"));
             }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+        }
+    }
+
+    expanded.join(",")
+}
+
+/// Split only selector-list commas. Commas inside functional pseudos (`:is()`, `:not()`),
+/// attribute selectors, strings, or comments belong to one selector and must remain untouched.
+fn split_selector_list(selector: &str) -> Vec<&str> {
+    let bytes = selector.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += usize::from(i < bytes.len());
+            }
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b',' if paren_depth == 0 && bracket_depth == 0 => {
+                parts.push(&selector[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&selector[start..]);
+    parts
 }
 
 /// 取出 `:global(sel)` 里的 `sel`（并拼回其前后的其余部分）；非 `:global` 形式返回 `None`。
@@ -404,6 +498,17 @@ mod tests {
     }
 
     #[test]
+    fn global_statement_at_rules_are_preserved_in_source_order() {
+        assert_eq!(
+            flatten(
+                "",
+                "@layer reset, theme; @layer reset { body { margin: 0; } }"
+            ),
+            "@layer reset, theme;@layer reset{body{margin: 0;}}"
+        );
+    }
+
+    #[test]
     fn declaration_without_trailing_semicolon() {
         let css = flatten(".box", "color: red");
         assert_eq!(css, ".box{color: red;}");
@@ -413,6 +518,18 @@ mod tests {
     fn ampersand_pseudo_class() {
         let css = flatten(".box", "color: red; &:hover { color: blue; }");
         assert_eq!(css, ".box{color: red;}.box:hover{color: blue;}");
+    }
+
+    #[test]
+    fn declarations_and_nested_rules_keep_source_order() {
+        let css = flatten(
+            ".box",
+            "color: red; & { color: blue; } color: rebeccapurple;",
+        );
+        assert_eq!(
+            css,
+            ".box{color: red;}.box{color: blue;}.box{color: rebeccapurple;}"
+        );
     }
 
     #[test]
@@ -431,6 +548,41 @@ mod tests {
     fn comma_group_expands_each() {
         let css = flatten(".box", "&:hover, &:focus { outline: none; }");
         assert_eq!(css, ".box:hover,.box:focus{outline: none;}");
+    }
+
+    #[test]
+    fn commas_inside_functional_pseudos_do_not_split_the_selector_list() {
+        assert_eq!(
+            flatten(".box", "&:is(:hover, :focus) { color: red; }"),
+            ".box:is(:hover, :focus){color: red;}"
+        );
+        assert_eq!(
+            flatten(".box", "&[data-label='a,b'], &:not(.x, .y) { color: red; }"),
+            ".box[data-label='a,b'],.box:not(.x, .y){color: red;}"
+        );
+    }
+
+    #[test]
+    fn nested_selector_lists_expand_as_a_cartesian_product() {
+        assert_eq!(
+            flatten(
+                ".box",
+                "& .a, & .b { &:hover { color: red; } .child { color: blue; } }"
+            ),
+            ".box .a:hover,.box .b:hover{color: red;}\
+.box .a .child,.box .b .child{color: blue;}"
+        );
+
+        // Functional-pseudo commas remain inside one selector while top-level child selectors
+        // still combine with every parent branch.
+        assert_eq!(
+            flatten(
+                ".box",
+                "& .a, & .b { &:is(:hover, :focus), &[aria-current] { color: red; } }"
+            ),
+            ".box .a:is(:hover, :focus),.box .b:is(:hover, :focus),\
+.box .a[aria-current],.box .b[aria-current]{color: red;}"
+        );
     }
 
     #[test]
@@ -488,6 +640,16 @@ mod tests {
         // 本块没定义 `spin` → 可能来自全局，不得改写
         let css = flatten(".b", "animation: spin 1s linear infinite;");
         assert!(css.contains("animation: spin 1s linear infinite;"), "{css}");
+    }
+
+    #[test]
+    fn keyframe_markers_inside_strings_and_comments_are_ignored() {
+        let css = flatten(
+            ".b",
+            r#"content: "@keyframes fake"; /* @keyframes also-fake */ animation: fake 1s;"#,
+        );
+        assert!(css.contains("animation: fake 1s;"), "{css}");
+        assert!(!css.contains("fake-b"), "{css}");
     }
 
     #[test]

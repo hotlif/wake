@@ -512,6 +512,7 @@ fn watch_and_rebuild(
     event_handler: Option<EventHandler>,
 ) {
     let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
+    bundler.set_project_root(root.clone());
     // 别名（@/@@）+ define（dev 口径）须在首次 build 前设置，dev 与 build 一致。
     bundler.set_resolve_options(resolve_options);
     bundler.set_define(define);
@@ -519,7 +520,7 @@ fn watch_and_rebuild(
     // dev 走非 minify 单包路径 → 可产出精确 sourcemap（WAKE-COMPATIBILITY §M4d）。
     bundler.enable_sourcemap();
     // 零运行时 CSS-in-JS（§M5）：dev 不抽取 `.css`，抽出的样式随模块体 `<style>` 注入，
-    // 与 `.css` 模块的 dev 行为一致。项目未用 Linaria 时零开销。
+    // 与 `.css` 模块的 dev 行为一致。项目未用 Crab CSS 时零开销。
     bundler.enable_css_in_js();
     // 代码分割：与 prod 行为一致——动态 `import()` 切出 async chunk。此前 dev 不开分割，
     // 懒加载模块被内联进单包（能跑但不懒加载），与生产产物结构不一致、掩盖分割相关问题。

@@ -13,6 +13,7 @@ workspace = true
 wake_common.workspace = true
 wake_ecma_ast.workspace = true
 wake_ecma_parser.workspace = true
+wake_ecma_semantic.workspace = true
 wake_ecma_codegen.workspace = true
 wake_ecma_minify.workspace = true
 wake_ecma_transform.workspace = true

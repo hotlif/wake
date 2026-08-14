@@ -7,15 +7,9 @@
 
 mod expr;
 mod jsx;
-/// 兼容导出：语义分析已拆到独立 crate，parser 调用方无需立即迁移路径。
-pub mod semantic {
-    pub use wake_ecma_semantic::*;
-}
 mod stmt;
 mod ts;
 mod ts_value;
-
-pub use wake_ecma_semantic::{SemanticModel, analyze};
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -682,7 +676,5 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 }
 
-#[cfg(test)]
-mod semantic_tests;
 #[cfg(test)]
 mod tests;

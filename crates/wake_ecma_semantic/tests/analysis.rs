@@ -1,8 +1,7 @@
 use wake_common::Interner;
 use wake_ecma_ast::SourceType;
+use wake_ecma_parser::parse;
 use wake_ecma_semantic::{DeclKind, ScopeKind, SemanticModel, analyze};
-
-use crate::parse;
 
 fn analyze_src(src: &str) -> (SemanticModel, Interner) {
     let interner = Interner::new();

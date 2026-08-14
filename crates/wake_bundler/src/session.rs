@@ -10,6 +10,8 @@ use crate::{BuildOutput, IncrementalBundler, ResolveOptions};
 /// 改变任务语义。
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
+    /// 项目根，用于生成跨 checkout/跨平台稳定的 CSS module identity。
+    pub project_root: Option<PathBuf>,
     pub resolve: ResolveOptions,
     pub define: Vec<(String, String)>,
     pub extract_css: bool,
@@ -33,6 +35,7 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
+            project_root: None,
             resolve: ResolveOptions::default(),
             define: vec![
                 (
@@ -180,9 +183,16 @@ impl BuildSession {
     pub fn topology_reuse_count(&self) -> u64 {
         self.bundler.topology_reuse_count()
     }
+
+    pub fn link_plan_reuse_count(&self) -> u64 {
+        self.bundler.link_plan_reuse_count()
+    }
 }
 
 fn apply_options(bundler: &mut IncrementalBundler, options: BuildOptions) {
+    if let Some(root) = options.project_root {
+        bundler.set_project_root(root);
+    }
     bundler
         .set_resolve_options(options.resolve)
         .set_define(options.define)
@@ -311,6 +321,7 @@ mod tests {
         let loads = session.load_exec_count();
         let tasks = session.task_exec_count();
         let resolves = session.resolve_exec_count();
+        let link_reuses = session.link_plan_reuse_count();
         assert_eq!(loads, 2);
         assert_eq!(resolves, 1);
 
@@ -333,6 +344,11 @@ mod tests {
             1,
             "依赖形状未变时应复用持久模块图"
         );
+        assert_eq!(
+            session.link_plan_reuse_count() - link_reuses,
+            1,
+            "绑定活跃性与依赖图未变时应复用 link/chunk 规划"
+        );
         assert!(rebuilt.bundle.contains("2"));
     }
 
@@ -352,6 +368,7 @@ mod tests {
         assert!(!first.has_errors());
         let resolves = session.resolve_exec_count();
         let topology_reuses = session.topology_reuse_count();
+        let link_reuses = session.link_plan_reuse_count();
 
         fs.insert(
             "src/index.js",
@@ -367,6 +384,11 @@ mod tests {
             session.topology_reuse_count(),
             topology_reuses,
             "specifier 改变必须回退全图扫描"
+        );
+        assert_eq!(
+            session.link_plan_reuse_count(),
+            link_reuses,
+            "依赖图改变必须重算 link/chunk 规划"
         );
         assert!(rebuilt.bundle.contains("2"));
     }

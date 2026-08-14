@@ -5,7 +5,7 @@ use wake_ecma_ast::SourceType;
 use wake_ecma_parser::parse;
 
 use crate::value::{Scope, StaticValue, collect_imports, collect_static_exports};
-use crate::{TransformResult, transform};
+use crate::{CSS_IN_JS_SOURCES, TransformResult, compiler_consumed_imports, transform};
 
 fn run(src: &str) -> TransformResult {
     run_with(src, &Scope::default())
@@ -19,7 +19,12 @@ fn run_with(src: &str, imported: &Scope) -> TransformResult {
         .with_ast(|p| transform(p, &it, src, "src/a.tsx", imported))
 }
 
-const IMPORT: &str = "import { css } from '@linaria/core';\n";
+const IMPORT: &str = "import { css } from '@crab-dev/css';\n";
+
+#[test]
+fn crab_css_is_the_only_compiler_source() {
+    assert_eq!(CSS_IN_JS_SOURCES, ["@crab-dev/css"]);
+}
 
 #[test]
 fn extracts_plain_declarations_and_replaces_with_class() {
@@ -40,23 +45,27 @@ fn extracts_plain_declarations_and_replaces_with_class() {
 }
 
 #[test]
-fn only_transforms_css_imported_from_linaria() {
-    // 未从 linaria import → 不认，保持原样
+fn only_transforms_css_imported_from_crab_package() {
+    // 未从 @crab-dev/css import → 不认，保持原样
     let r = run("const css = (x) => x;\nconst box = css`color: red;`;");
-    assert!(r.replacements.is_empty(), "非 linaria 的 css 不应被转换");
+    assert!(r.replacements.is_empty(), "非 Crab CSS 的 css 不应被转换");
+    assert!(r.css.is_empty());
+
+    let r = run("import { css } from '@other/css';\nconst box = css`color: red;`;");
+    assert!(r.replacements.is_empty(), "其他包的 css 不应被转换");
     assert!(r.css.is_empty());
 }
 
 #[test]
 fn supports_import_alias() {
-    let r = run("import { css as c } from '@linaria/core';\nconst box = c`color: red;`;");
+    let r = run("import { css as c } from '@crab-dev/css';\nconst box = c`color: red;`;");
     assert_eq!(r.replacements.len(), 1, "应支持 import 别名");
     assert!(r.css.contains("color: red"));
 }
 
 #[test]
 fn lowers_safe_cx_calls_and_removes_fully_consumed_import() {
-    let src = "import { css, cx as merge } from '@linaria/core';\n\
+    let src = "import { css, cx as merge } from '@crab-dev/css';\n\
                const base = css`color:red;`;\n\
                const active = css`font-weight:bold;`;\n\
                const value = merge(base, enabled && active);";
@@ -75,8 +84,8 @@ fn lowers_safe_cx_calls_and_removes_fully_consumed_import() {
 #[test]
 fn keeps_cx_runtime_when_atomic_or_unknown_classes_are_possible() {
     for src in [
-        "import { cx } from '@linaria/core'; const value = cx('atm_color_a', 'atm_color_b');",
-        "import { cx } from '@linaria/core'; const value = cx(props.className);",
+        "import { cx } from '@crab-dev/css'; const value = cx('atm_color_a', 'atm_color_b');",
+        "import { cx } from '@crab-dev/css'; const value = cx(props.className);",
     ] {
         let r = run(src);
         assert!(r.replacements.is_empty(), "{:?}", r.replacements);
@@ -112,18 +121,12 @@ fn evaluates_nested_object_member_access() {
 }
 
 #[test]
-fn evaluates_cross_module_imported_value() {
-    // 模拟 `import token from './token.js'`：调用方已解析出静态值
+fn evaluates_cross_module_imported_primitive() {
+    // 模拟 `import { pad } from './token.js'`：调用方已解析出可安全复制的静态值。
     let mut imported = Scope::default();
-    imported.insert(
-        "token".to_string(),
-        StaticValue::Obj(vec![(
-            "pad".to_string(),
-            StaticValue::Str("12px".to_string()),
-        )]),
-    );
+    imported.insert("pad".to_string(), StaticValue::Str("12px".to_string()));
     let src = format!(
-        "{IMPORT}import token from './token.js';\nconst box = css`padding: ${{token.pad}};`;"
+        "{IMPORT}import {{ pad }} from './token.js';\nconst box = css`padding: ${{pad}};`;"
     );
     let r = run_with(&src, &imported);
     assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
@@ -131,13 +134,18 @@ fn evaluates_cross_module_imported_value() {
 }
 
 #[test]
-fn unevaluatable_interpolation_warns_and_drops_that_declaration() {
+fn unevaluatable_interpolation_errors_and_drops_that_declaration() {
     let src = format!(
         "{IMPORT}const box = css`\n  color: red;\n  width: ${{compute()}};\n  height: 10px;\n`;"
     );
     let r = run(&src);
-    assert_eq!(r.diagnostics.len(), 1, "应有一条警告");
-    assert!(r.diagnostics[0].message.contains("无法在构建期求值"));
+    assert_eq!(r.diagnostics.len(), 1, "应有一条错误");
+    assert!(r.diagnostics[0].is_error(), "{:?}", r.diagnostics);
+    assert_eq!(
+        r.diagnostics[0].code.as_deref(),
+        Some("CRAB_CSS_STATIC_VALUE")
+    );
+    assert!(r.diagnostics[0].message.contains("无法安全地在构建期求值"));
     // 该条声明被丢弃，其余声明保留 → 仍是合法 CSS
     assert!(!r.css.contains("compute"), "不得残留原表达式: {}", r.css);
     assert!(!r.css.contains("width"), "该声明应被丢弃: {}", r.css);
@@ -255,6 +263,19 @@ fn numbers_format_like_js() {
 }
 
 #[test]
+fn large_integer_does_not_saturate_to_i64_max() {
+    let r = run(&format!(
+        "{IMPORT}const N = 100000000000000000000;\nconst box = css`z-index: ${{N}};`;"
+    ));
+    assert!(
+        r.css.contains("z-index: 100000000000000000000"),
+        "{}",
+        r.css
+    );
+    assert!(!r.css.contains("9223372036854775807"), "{}", r.css);
+}
+
+#[test]
 fn string_interpolation_has_no_quotes() {
     // 关键差异：ConstVal::to_source 会给字符串加引号，CSS 场景必须裸值
     let r = run(&format!(
@@ -275,13 +296,12 @@ fn no_css_import_means_no_work() {
 }
 
 // ======================================================================
-// 对齐 @linaria/core 的完整插值语义（templateProcessor + toCSS）
+// Crab CSS 的完整静态插值语义
 // ======================================================================
 
 #[test]
 fn css_reference_interpolates_bare_class_name() {
-    // Linaria 语义：css`` 的求值结果是**裸类名字符串**（不带点），
-    // 要当选择器用须自己写 `.${x}`（带点只用于 styled 组件的 __wyw_meta）。
+    // css`` 的求值结果是**裸类名字符串**（不带点），作为选择器使用时需显式写 `.${x}`。
     let src = format!(
         "{IMPORT}const base = css`color: red;`;\n\
          const wrap = css`.${{base}} {{ margin: 4px; }}`;"
@@ -308,8 +328,7 @@ fn css_reference_interpolates_bare_class_name() {
 
 #[test]
 fn class_name_is_independent_of_css_content() {
-    // 类名只由 路径+序号 决定 → 改样式不改类名（对齐 Linaria slug 规则，
-    // 也是 css 互相引用得以在求值前确定类名的前提）。
+    // 类名只由路径和声明身份决定：改样式不改类名，也是互相引用能预分配名称的前提。
     let a = run(&format!("{IMPORT}const box = css`color: red;`;"));
     let b = run(&format!(
         "{IMPORT}const box = css`color: blue; padding: 9px;`;"
@@ -411,7 +430,7 @@ fn array_interpolation_joins_items() {
 
 #[test]
 fn undefined_and_empty_string_interpolations_are_skipped_silently() {
-    // Linaria：undefined 与 "" 直接跳过，不报错、不留痕
+    // undefined 与 "" 直接跳过，不报错、不留痕。
     let src = format!(
         "{IMPORT}const E = '';\nconst box = css`color: red;${{E}}${{undefined}} padding: 1px;`;"
     );
@@ -423,6 +442,25 @@ fn undefined_and_empty_string_interpolations_are_skipped_silently() {
     );
     assert!(r.css.contains("color: red"), "{}", r.css);
     assert!(r.css.contains("padding: 1px"), "{}", r.css);
+}
+
+#[test]
+fn a_bound_identifier_named_undefined_uses_its_static_value() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const undefined = 'rebeccapurple';\n\
+         const box = css`color: ${undefined};`;");
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(r.css.contains("color: rebeccapurple"), "{}", r.css);
+}
+
+#[test]
+fn false_interpolation_is_skipped_silently() {
+    let r = run(&format!(
+        "{CRAB_IMPORT}const disabled = false;\nconst box = css`color: red; ${{disabled}}`;"
+    ));
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(r.css.contains("color: red"), "{}", r.css);
+    assert!(!r.css.contains("false"), "{}", r.css);
 }
 
 #[test]
@@ -464,4 +502,430 @@ fn unsupported_operators_still_fail_safely() {
     assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
     assert!(r.css.contains("color: red"), "{}", r.css);
     assert!(!r.css.contains("z-index"), "该声明应被跳过: {}", r.css);
+}
+
+const CRAB_IMPORT: &str = "import { css } from '@crab-dev/css';\n";
+
+#[test]
+fn crab_css_is_a_first_class_source_and_fails_closed() {
+    let r = run(&format!(
+        "{CRAB_IMPORT}const box = css`color: red; width: ${{compute()}};`;"
+    ));
+    assert_eq!(r.replacements.len(), 1);
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert!(r.diagnostics[0].is_error(), "{:?}", r.diagnostics);
+    assert_eq!(
+        r.diagnostics[0].code.as_deref(),
+        Some("CRAB_CSS_STATIC_VALUE")
+    );
+    assert!(
+        r.diagnostics[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("createVar")),
+        "{:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn semantic_binding_identity_prevents_shadowed_tag_transforms() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const outer = css`color: red;`;\n\
+         function local(css) { return css`color: blue;`; }");
+    assert_eq!(r.replacements.len(), 1, "{:?}", r.replacements);
+    assert!(r.css.contains("color: red"), "{}", r.css);
+    assert!(!r.css.contains("color: blue"), "{}", r.css);
+    // 因为 import binding 还有一次正确消费，局部参数的同名引用不应把它判成逃逸使用。
+    assert_eq!(r.removable_import_spans.len(), 1);
+}
+
+#[test]
+fn complete_ast_visitor_finds_styles_in_control_flow() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         function choose() { while (ready) { return css`color: teal;`; } }");
+    assert_eq!(r.replacements.len(), 1);
+    assert!(r.css.contains("color: teal"), "{}", r.css);
+}
+
+fn selector_for(css: &str, declaration: &str) -> String {
+    let declaration_at = css.find(declaration).expect("declaration exists");
+    let rule_start = css[..declaration_at].rfind('.').expect("class selector");
+    let rule_end = css[rule_start..]
+        .find('{')
+        .map(|offset| rule_start + offset)
+        .expect("rule opening brace");
+    css[rule_start..rule_end].to_string()
+}
+
+#[test]
+fn unrelated_style_insertion_does_not_churn_existing_binding_name() {
+    let before = run(&format!(
+        "{CRAB_IMPORT}const target = css`color: royalblue;`;"
+    ));
+    let after = run(&format!(
+        "{CRAB_IMPORT}const unrelated = css`color: tomato;`;\n\
+         const target = css`color: royalblue;`;"
+    ));
+    assert_eq!(
+        selector_for(&before.css, "color: royalblue"),
+        selector_for(&after.css, "color: royalblue")
+    );
+}
+
+#[test]
+fn module_seed_is_stable_across_windows_path_spellings() {
+    let it = Interner::new();
+    let src = format!("{CRAB_IMPORT}const box = css`color: red;`;");
+    let parsed = parse(&src, &it, SourceType::Tsx);
+    let windows = parsed.module.with_ast(|program| {
+        transform(
+            program,
+            &it,
+            &src,
+            r"C:\project\src\button.tsx",
+            &Scope::default(),
+        )
+    });
+    let portable = parsed.module.with_ast(|program| {
+        transform(
+            program,
+            &it,
+            &src,
+            "c:/project/src/button.tsx",
+            &Scope::default(),
+        )
+    });
+    assert_eq!(windows.replacements, portable.replacements);
+    assert_eq!(windows.css, portable.css);
+}
+
+#[test]
+fn compiles_keyframes_global_style_and_dynamic_variable_contract() {
+    let r = run(
+        "import { css, keyframes, globalStyle, createVar } from '@crab-dev/css';\n\
+         const accent = createVar('accent');\n\
+         const spin = keyframes`from { opacity: 0; } to { opacity: 1; }`;\n\
+         globalStyle`:root { color-scheme: light dark; }`;\n\
+         const box = css`color: ${accent}; animation: ${spin} 1s linear;`;",
+    );
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(r.css.contains("@keyframes spin_"), "{}", r.css);
+    assert!(
+        r.css.contains(":root{color-scheme: light dark;}"),
+        "{}",
+        r.css
+    );
+    assert!(r.css.contains("color: var(--crab-css-accent_"), "{}", r.css);
+    assert!(r.css.contains("animation: spin_"), "{}", r.css);
+    assert!(r.replacements.values().any(|value| value == "void 0"));
+    assert_eq!(r.removable_import_spans.len(), 1);
+}
+
+#[test]
+fn assign_vars_keeps_only_the_needed_runtime_import() {
+    let r = run(
+        "import { css, createVar, assignVars } from '@crab-dev/css';\n\
+         const accent = createVar('accent');\n\
+         const box = css`color: ${accent};`;\n\
+         export const style = assignVars({ [accent]: 'tomato' });",
+    );
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(r.css.contains("var(--crab-css-accent_"), "{}", r.css);
+    // 一条 mixed import 无法部分删除；assignVars 是明确且必要的小 runtime。
+    assert!(r.removable_import_spans.is_empty());
+}
+
+#[test]
+fn reexported_marker_import_is_kept_for_runtime_semantics() {
+    let it = Interner::new();
+    let source = "import { css } from '@crab-dev/css';\nexport { css };";
+    let parsed = parse(source, &it, SourceType::TypeScript);
+    let result = parsed
+        .module
+        .with_ast(|program| transform(program, &it, source, "src/reexport.ts", &Scope::default()));
+    assert!(result.removable_import_spans.is_empty());
+    assert!(result.removable_import_binding_spans.is_empty());
+    let consumed = parsed
+        .module
+        .with_ast(|program| compiler_consumed_imports(program, &it));
+    assert!(consumed.is_empty());
+}
+
+#[test]
+fn global_style_in_runtime_control_flow_is_rejected() {
+    let r = run("import { globalStyle } from '@crab-dev/css';\n\
+         if (enabled) { globalStyle`body { color: red; }`; }");
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("CRAB_CSS_GLOBAL_SCOPE") && diagnostic.is_error()
+        }),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("body"), "{}", r.css);
+}
+
+#[test]
+fn scoped_crab_styles_cannot_hide_global_side_effects() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const unused = css`:global(body) { color: red; }`; ");
+    assert!(r.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("CRAB_CSS_GLOBAL_ESCAPE") && diagnostic.is_error()
+    }));
+    assert!(!r.css.contains("body"), "{}", r.css);
+}
+
+#[test]
+fn scoped_crab_styles_reject_global_at_rules_but_global_style_keeps_layer_statements() {
+    let scoped = run("import { css } from '@crab-dev/css';\n\
+         const unused = css`@font-face { font-family: X; src: url('data:x/y,z'); }`; ");
+    assert!(scoped.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("CRAB_CSS_GLOBAL_AT_RULE") && diagnostic.is_error()
+    }));
+    assert!(scoped.css.is_empty(), "{}", scoped.css);
+
+    let future_global = run("import { css } from '@crab-dev/css';\n\
+         const unused = css`@view-transition { navigation: auto; }`; ");
+    assert!(future_global.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("CRAB_CSS_GLOBAL_AT_RULE") && diagnostic.is_error()
+    }));
+
+    let global = run("import { globalStyle } from '@crab-dev/css';\n\
+         globalStyle`@layer reset, theme; @layer reset { body { margin: 0; } }`; ");
+    assert!(global.diagnostics.is_empty(), "{:?}", global.diagnostics);
+    assert!(
+        global.css.starts_with("@layer reset, theme;"),
+        "{}",
+        global.css
+    );
+}
+
+#[test]
+fn relative_template_urls_fail_instead_of_resolving_against_the_output_directory() {
+    let relative = run("import { css } from '@crab-dev/css';\n\
+         const card = css`background: url('./pixel.png');`; ");
+    assert!(relative.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("CRAB_CSS_RELATIVE_URL") && diagnostic.is_error()
+    }));
+    assert!(relative.css.is_empty(), "{}", relative.css);
+
+    let absolute = run("import { css } from '@crab-dev/css';\n\
+         const card = css`background: url('data:image/gif;base64,R0lGODlhAQABAAAAACw=');`; ");
+    assert!(
+        absolute.diagnostics.is_empty(),
+        "{:?}",
+        absolute.diagnostics
+    );
+    assert!(absolute.css.contains("data:image/gif"), "{}", absolute.css);
+}
+
+#[test]
+fn nested_same_name_style_cannot_replace_a_top_level_static_export() {
+    let it = Interner::new();
+    let source = "import { css } from '@crab-dev/css';\n\
+        export const box = css`color: red;`;\n\
+        function local() { const box = css`color: blue;`; return box; }";
+    let parsed = parse(source, &it, SourceType::TypeScript);
+    let exports = parsed
+        .module
+        .with_ast(|program| crate::collect_static_exports(program, &it, "src/shadow.ts"));
+    let exported = exports
+        .get("box")
+        .and_then(StaticValue::to_css_text)
+        .expect("top-level style export");
+    let result = parsed
+        .module
+        .with_ast(|program| transform(program, &it, source, "src/shadow.ts", &Scope::default()));
+    let red_selector = selector_for(&result.css, "color: red");
+    assert_eq!(exported, red_selector.trim_start_matches('.'));
+}
+
+#[test]
+fn every_alias_of_a_static_css_value_is_exported() {
+    let it = Interner::new();
+    let source = "import { css, createVar } from '@crab-dev/css';\n\
+        const box = css`color: red;`;\n\
+        const accent = createVar('accent');\n\
+        export { box as first, box as second, accent as a, accent as b };";
+    let parsed = parse(source, &it, SourceType::TypeScript);
+    let exports = parsed
+        .module
+        .with_ast(|program| crate::collect_static_exports(program, &it, "src/aliases.ts"));
+    assert_eq!(exports.get("first"), exports.get("second"));
+    assert_eq!(exports.get("a"), exports.get("b"));
+    assert!(exports.contains_key("first"));
+    assert!(exports.contains_key("a"));
+}
+
+#[test]
+fn a_direct_default_style_export_can_be_referenced_cross_module() {
+    let it = Interner::new();
+    let source = "import { css } from '@crab-dev/css'; export default css`color: red;`;";
+    let parsed = parse(source, &it, SourceType::TypeScript);
+    let exports = parsed
+        .module
+        .with_ast(|program| crate::collect_static_exports(program, &it, "src/default.ts"));
+    let value = exports
+        .get("default")
+        .and_then(StaticValue::to_css_text)
+        .expect("direct default style export");
+    assert!(value.starts_with("default_"), "{value}");
+}
+
+#[test]
+fn mutable_bindings_are_never_frozen_during_static_evaluation() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         let color = 'red'; color = 'blue';\n\
+         const box = css`color: ${color};`;");
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert!(r.diagnostics[0].is_error());
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn mutated_const_objects_are_never_frozen_during_static_evaluation() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const tokens = { color: 'red' };\n\
+         tokens.color = 'blue';\n\
+         const box = css`color: ${tokens.color};`;");
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn object_alias_mutation_cannot_freeze_the_original_value() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const tokens = { color: 'red' };\n\
+         const alias = tokens; alias.color = 'blue';\n\
+         const box = css`color: ${tokens.color};`;");
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn nested_object_alias_mutation_cannot_freeze_the_root_value() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const tokens = { nested: { color: 'red' } };\n\
+         const nested = tokens.nested; nested.color = 'blue';\n\
+         const box = css`color: ${tokens.nested.color};`;");
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn method_and_delete_mutations_cannot_freeze_structured_values() {
+    for source in [
+        "const xs = ['red']; xs.splice(0, 1, 'blue');\n\
+         const box = css`color: ${xs[0]};`;",
+        "const tokens = { color: 'red' }; delete tokens.color;\n\
+         const box = css`color: ${tokens.color};`;",
+    ] {
+        let r = run(&format!("import {{ css }} from '@crab-dev/css';\n{source}"));
+        assert!(
+            r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+            "{:?}",
+            r.diagnostics
+        );
+        assert!(!r.css.contains("color: red"), "{}", r.css);
+    }
+}
+
+#[test]
+fn user_tagged_templates_cannot_mutate_a_frozen_object() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const tokens = { color: 'red' };\n\
+         mutate`${tokens}`;\n\
+         const box = css`color: ${tokens.color};`;");
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn mutating_an_imported_object_prevents_static_interpolation() {
+    let mut imported = Scope::default();
+    imported.insert(
+        "tokens".to_string(),
+        StaticValue::Obj(vec![(
+            "color".to_string(),
+            StaticValue::Str("red".to_string()),
+        )]),
+    );
+    let r = run_with(
+        "import { css } from '@crab-dev/css';\n\
+         import { tokens } from './tokens.js';\n\
+         tokens.color = 'blue';\n\
+         const box = css`color: ${tokens.color};`;",
+        &imported,
+    );
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn strict_crab_never_freezes_shared_objects_from_another_module() {
+    let mut imported = Scope::default();
+    imported.insert(
+        "tokens".to_string(),
+        StaticValue::Obj(vec![(
+            "color".to_string(),
+            StaticValue::Str("red".to_string()),
+        )]),
+    );
+    let r = run_with(
+        "import { css } from '@crab-dev/css';\n\
+         import { tokens } from './tokens.js';\n\
+         const box = css`color: ${tokens.color};`;",
+        &imported,
+    );
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn shadowing_local_values_are_never_replaced_by_same_named_module_constants() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const color = 'red';\n\
+         function render(color) { return css`color: ${color};`; }");
+    assert!(
+        r.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("CRAB_CSS_STATIC_VALUE") && diagnostic.is_error()
+        }),
+        "{:?}",
+        r.diagnostics
+    );
+    assert!(!r.css.contains("color: red"), "{}", r.css);
+}
+
+#[test]
+fn non_finite_arithmetic_is_rejected_instead_of_emitting_invalid_css() {
+    let r = run("import { css } from '@crab-dev/css';\n\
+         const box = css`width: ${1 / 0}px;`;");
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert!(r.diagnostics[0].is_error());
+    assert!(!r.css.contains("inf"), "{}", r.css);
 }

@@ -354,6 +354,7 @@ fn create_bundler(
     project_defaults: bool,
 ) -> Result<IncrementalBundler, WakeError> {
     let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
+    bundler.set_project_root(prepared.root.clone());
     bundler.set_resolve_options(ResolveOptions {
         alias: prepared.aliases.clone(),
         pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks.clone(),
@@ -493,6 +494,10 @@ fn write_build_output(output: &BuildOutput, outdir: &Path) -> Result<(), WakeErr
     let manifest = serde_json::json!({
         "entry": output.entry().file_name,
         "chunks": output.chunks.iter().map(|chunk| &chunk.file_name).collect::<Vec<_>>(),
+        "chunkStyles": output.chunks.iter().map(|chunk| serde_json::json!({
+            "chunk": &chunk.file_name,
+            "styles": &chunk.styles,
+        })).collect::<Vec<_>>(),
         "assets": output.assets.iter().map(|asset| &asset.file_name).collect::<Vec<_>>(),
     });
     let path = outdir.join("manifest.json");
@@ -511,12 +516,7 @@ fn emit_html(output: &BuildOutput, config: &wake_config::Config) -> String {
         .filter(|chunk| chunk.is_entry)
         .map(|chunk| chunk.file_name.clone())
         .collect::<Vec<_>>();
-    let styles = output
-        .assets
-        .iter()
-        .filter(|asset| asset.is_css)
-        .map(|asset| asset.file_name.clone())
-        .collect::<Vec<_>>();
+    let styles = output.entry().styles.clone();
     wake_html::generate(
         None,
         &wake_html::HtmlInputs {
@@ -1073,12 +1073,7 @@ pub fn build_docs_with_mode(
         .filter(|chunk| chunk.is_entry)
         .map(|chunk| chunk.file_name.clone())
         .collect::<Vec<_>>();
-    let styles = output
-        .assets
-        .iter()
-        .filter(|asset| asset.is_css)
-        .map(|asset| asset.file_name.clone())
-        .collect::<Vec<_>>();
+    let styles = output.entry().styles.clone();
     let html = wake_html::generate(
         None,
         &wake_html::HtmlInputs {
@@ -1294,9 +1289,9 @@ fn prepare_docs(
     ))
 }
 
-/// Older Crab UI releases use these runtime packages without declaring them. A hoisted
-/// `node_modules` tree hides that boundary, while Yarn PnP correctly rejects it. Components mode
-/// supplies only these two dependencies, only to `@crab-dev/rc-*` issuers, and only after the
+/// Older Crab UI releases use the Crab CSS runtime and icon package without declaring them. A
+/// hoisted `node_modules` tree hides that boundary, while Yarn PnP correctly rejects it. Components
+/// mode supplies only these two dependencies, only to `@crab-dev/rc-*` issuers, and only after the
 /// issuer's own dependency plus Yarn's top-level fallback have reported a dependency-boundary
 /// error. User aliases and valid package-local dependency versions therefore remain untouched.
 fn components_pnp_dependency_fallbacks(root: &Path) -> Vec<PnpDependencyFallback> {
@@ -1307,7 +1302,7 @@ fn components_pnp_dependency_fallbacks(root: &Path) -> Vec<PnpDependencyFallback
     let Ok(wake_root) = manifest.resolve_bare("@crab-dev/wake", root) else {
         return Vec::new();
     };
-    ["@linaria/core", "lucide-react"]
+    ["@crab-dev/css", "lucide-react"]
         .into_iter()
         .map(|dependency| PnpDependencyFallback {
             issuer_package_prefix: "@crab-dev/rc-".to_string(),
@@ -1366,6 +1361,39 @@ mod tests {
                 .any(|(key, value)| key == "import.meta.url"
                     && value == "__wake_require__.metaUrl()")
         );
+    }
+
+    #[test]
+    fn docs_production_chunks_own_their_extracted_styles() {
+        let fs = wake_common::MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "export const lazy = () => import('./route.js');",
+            ),
+            (
+                "src/route.js",
+                "import './route.css'; export const page = 'route';",
+            ),
+            ("src/route.css", ".route { color: red; }"),
+        ]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        bundler.enable_code_splitting().enable_css_extraction();
+
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert!(
+            output.chunks.len() > 1,
+            "Docs production must retain route splitting"
+        );
+        assert!(output.entry().styles.is_empty());
+        let route = output
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_entry && chunk.name == "route")
+            .expect("route chunk");
+        assert_eq!(route.styles.len(), 1);
+        assert!(route.styles[0].ends_with(".css"));
+        assert!(output.bundle.contains("__wake__.s"));
     }
 
     struct Fixture(PathBuf);

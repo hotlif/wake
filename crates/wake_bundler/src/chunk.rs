@@ -38,6 +38,7 @@ pub(crate) struct ModuleEdges {
 }
 
 /// 一个 chunk 的规划。
+#[derive(Clone)]
 pub(crate) struct ChunkPlan {
     pub id: u32,
     pub kind: ChunkKind,
@@ -47,6 +48,7 @@ pub(crate) struct ChunkPlan {
 }
 
 /// chunk 图结果。
+#[derive(Clone)]
 pub(crate) struct ChunkGraph {
     /// 模块 id → chunk id。
     pub module_chunk: FxHashMap<u32, u32>,

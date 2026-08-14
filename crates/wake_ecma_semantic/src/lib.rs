@@ -1,8 +1,8 @@
-//! 作用域 / 符号 / 引用分析（PLAN §2.5，DESIGN §4.4）。
+//! 作用域 / 符号 / 引用分析（PLAN §2.5，DESIGN §4.5）。
 //!
 //! Phase 2 先做 **后置遍历** 版（一遍 Visit 建 scope 树 + symbol 表 + 解析引用）。DESIGN 目标是
-//! 把它内联进 parser 的同一遍以省一次遍历；那是 P2.5/优化期的事，此处先保证语义正确、供
-//! tree-shaking（P6）与 minifier（P7）复用。
+//! 保持独立语义所有权，供 tree-shaking（P6）与 minifier（P7）复用。是否融合遍历属于未来
+//! 性能实验，不能重新引入 parser façade 或反向依赖。
 //!
 //! 独立 crate 边界避免 parser 改动触发 minifier 与 codegen 的级联重编译。
 //!

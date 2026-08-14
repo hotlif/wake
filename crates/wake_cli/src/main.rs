@@ -975,7 +975,7 @@ fn cmd_parse(
                 interner.resolve(dependency.specifier)
             );
         }
-        let model = output.module.with_ast(wake_ecma_parser::analyze);
+        let model = output.module.with_ast(wake_ecma_semantic::analyze);
         println!(
             "  Scopes {:<12} Symbols {:<10} Unresolved {}",
             model.scopes.len(),

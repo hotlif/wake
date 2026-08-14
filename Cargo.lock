@@ -2729,6 +2729,7 @@ dependencies = [
  "wake_ecma_codegen",
  "wake_ecma_minify",
  "wake_ecma_parser",
+ "wake_ecma_semantic",
  "wake_ecma_transform",
  "wake_graph",
  "wake_resolver",
@@ -2760,6 +2761,7 @@ dependencies = [
  "wake_ecma_ast",
  "wake_ecma_lexer",
  "wake_ecma_parser",
+ "wake_ecma_semantic",
 ]
 
 [[package]]
@@ -2795,6 +2797,7 @@ dependencies = [
  "wake_common",
  "wake_ecma_ast",
  "wake_ecma_parser",
+ "wake_ecma_semantic",
 ]
 
 [[package]]
@@ -2876,7 +2879,6 @@ dependencies = [
  "wake_common",
  "wake_ecma_ast",
  "wake_ecma_lexer",
- "wake_ecma_semantic",
  "wake_ecma_transform",
  "xxhash-rust",
 ]
@@ -2887,6 +2889,7 @@ version = "0.1.16"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
+ "wake_ecma_parser",
 ]
 
 [[package]]

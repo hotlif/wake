@@ -1,10 +1,10 @@
-//! # wake_css_in_js — 零运行时 CSS-in-JS（Linaria / wyw-in-js 子集）
+//! # wake_css_in_js — `@crab-dev/css` 的安全零运行时编译器
 //!
 //! WAKE-COMPATIBILITY §M5。把源码里的 `` css`...` `` 标签模板在**构建期**求值并抽取为静态 CSS，
 //! 表达式本身替换为类名字符串字面量——运行时不含任何样式计算。
 //!
 //! ```js
-//! import { css } from '@linaria/core';
+//! import { css } from '@crab-dev/css';
 //! const box = css`
 //!   padding: ${token.space};
 //!   &:hover { color: red; }
@@ -13,18 +13,229 @@
 //! 编译为 `const box = "box_a1b2c3";`，并产出
 //! `.box_a1b2c3{padding:8px}.box_a1b2c3:hover{color:red}`。
 //!
-//! ## 与真 Linaria 的差异
-//! Linaria 在 Node VM 里**真实执行**模块来求值插值；wake 无 JS 运行时，改为对纯数据子集做
-//! 静态求值（[`value`]）。函数调用/条件表达式等求值失败时**报警并跳过该条声明**，不猜语义。
-//! `styled` 组件工厂需要 React 运行时，不在本实现范围（目标项目零使用）。
+//! Wake 只解释一个无副作用、可证明的纯数据子集（[`value`]），绝不启动 JavaScript VM。
+//! `@crab-dev/css` 的插值无法静态证明时会产生阻断构建的错误。
 
-use wake_common::{Diagnostic, FxHashMap, Interner, Span};
+use wake_common::{Atom, Diagnostic, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
+use wake_ecma_semantic::{DeclKind, SymbolId, analyze};
 
 pub mod nesting;
 pub mod value;
 
 pub use value::{StaticExports, StaticValue};
+
+const CRAB_CSS_SOURCE: &str = "@crab-dev/css";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingKind {
+    Css,
+    Cx,
+    Keyframes,
+    GlobalStyle,
+    CreateVar,
+    AssignVars,
+}
+
+impl BindingKind {
+    fn from_import(name: &str) -> Option<Self> {
+        match name {
+            "css" => Some(Self::Css),
+            "cx" => Some(Self::Cx),
+            "keyframes" => Some(Self::Keyframes),
+            "globalStyle" => Some(Self::GlobalStyle),
+            "createVar" => Some(Self::CreateVar),
+            "assignVars" => Some(Self::AssignVars),
+            _ => None,
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Css => "class",
+            Self::Keyframes => "keyframes",
+            Self::CreateVar => "variable",
+            Self::Cx | Self::GlobalStyle | Self::AssignVars => "runtime",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StyleBinding {
+    kind: BindingKind,
+    local: Atom,
+    symbol: SymbolId,
+    declaration: Span,
+}
+
+/// Import bindings plus semantic references. Binding identity is a `SymbolId`, not a spelling,
+/// so a parameter or block-local variable named `css` cannot be mistaken for the imported marker.
+struct BindingRegistry {
+    bindings: Vec<StyleBinding>,
+    references: FxHashMap<Span, SymbolId>,
+    /// Whether an identifier reference is backed by an immutable module binding that the
+    /// allow-listed evaluator can safely read. Keeping this beside marker binding identity lets
+    /// Crab templates reject a shadowing parameter/block binding instead of accidentally
+    /// looking up a same-spelled top-level value in [`value::Scope`].
+    static_references: FxHashMap<Span, bool>,
+}
+
+impl BindingRegistry {
+    fn collect(program: &Program, interner: &Interner) -> Self {
+        let semantic = analyze(program);
+        let mut imported_symbols = FxHashMap::default();
+        for (id, symbol) in semantic.symbols.iter().enumerate() {
+            if symbol.decl_kind == DeclKind::Import {
+                imported_symbols.insert(symbol.span, id as SymbolId);
+            }
+        }
+        let references = semantic
+            .references
+            .iter()
+            .filter_map(|reference| reference.resolved.map(|id| (reference.span, id)))
+            .collect();
+        let static_references = semantic
+            .references
+            .iter()
+            .map(|reference| {
+                let safe = match reference.resolved {
+                    Some(symbol) => {
+                        let symbol = &semantic.symbols[symbol as usize];
+                        symbol.scope == 0
+                            && matches!(symbol.decl_kind, DeclKind::Const | DeclKind::Import)
+                    }
+                    // `undefined` is the only unresolved identifier intentionally understood by
+                    // the evaluator. Every other global would require executing host JavaScript.
+                    None => interner.resolve(reference.name) == "undefined",
+                };
+                (reference.span, safe)
+            })
+            .collect();
+        let mut bindings = Vec::new();
+        for statement in program.body.iter() {
+            let Statement::Import(import) = statement else {
+                continue;
+            };
+            let source = interner.resolve(import.source);
+            if !is_css_in_js_source(&source) {
+                continue;
+            }
+            for specifier in import.specifiers.iter() {
+                let ImportSpecifier::Named {
+                    local, imported, ..
+                } = specifier
+                else {
+                    continue;
+                };
+                let imported_name = match imported {
+                    ModuleExportName::Ident(id) => interner.resolve(id.name),
+                    ModuleExportName::String(atom) => interner.resolve(*atom),
+                };
+                let Some(kind) = BindingKind::from_import(&imported_name) else {
+                    continue;
+                };
+                let Some(&symbol) = imported_symbols.get(&local.span) else {
+                    continue;
+                };
+                bindings.push(StyleBinding {
+                    kind,
+                    local: local.name,
+                    symbol,
+                    declaration: local.span,
+                });
+            }
+        }
+        Self {
+            bindings,
+            references,
+            static_references,
+        }
+    }
+
+    fn binding_for_expression(&self, expression: &Expression) -> Option<&StyleBinding> {
+        let Expression::Identifier(identifier) = expression else {
+            return None;
+        };
+        let symbol = self.references.get(&identifier.span)?;
+        self.bindings
+            .iter()
+            .find(|binding| binding.symbol == *symbol)
+    }
+
+    fn binding_for_declaration(&self, span: Span) -> Option<&StyleBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.declaration == span)
+    }
+
+    fn expression_is_module_static(&self, expression: &Expression) -> bool {
+        struct StaticReferenceCheck<'a> {
+            references: &'a FxHashMap<Span, bool>,
+            safe: bool,
+        }
+
+        impl<'ast> Visit<'ast> for StaticReferenceCheck<'_> {
+            fn visit_expression(&mut self, expression: &Expression<'ast>) {
+                if let Expression::Identifier(identifier) = expression {
+                    if !self
+                        .references
+                        .get(&identifier.span)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        self.safe = false;
+                    }
+                    return;
+                }
+                walk_expression(self, expression);
+            }
+        }
+
+        let mut check = StaticReferenceCheck {
+            references: &self.static_references,
+            safe: true,
+        };
+        check.visit_expression(expression);
+        check.safe
+    }
+
+    fn structured_values_may_escape_through_user_tags(&self, program: &Program) -> bool {
+        struct UserTagCheck<'a> {
+            bindings: &'a BindingRegistry,
+            found: bool,
+        }
+
+        impl<'ast> Visit<'ast> for UserTagCheck<'_> {
+            fn visit_expression(&mut self, expression: &Expression<'ast>) {
+                if let Expression::TaggedTemplate(template) = expression {
+                    let compiler_tag = self
+                        .bindings
+                        .binding_for_expression(&template.tag)
+                        .is_some_and(|binding| {
+                            matches!(
+                                binding.kind,
+                                BindingKind::Css
+                                    | BindingKind::Keyframes
+                                    | BindingKind::GlobalStyle
+                            )
+                        });
+                    if !compiler_tag && !template.quasi.expressions.is_empty() {
+                        self.found = true;
+                        return;
+                    }
+                }
+                walk_expression(self, expression);
+            }
+        }
+
+        let mut check = UserTagCheck {
+            bindings: self,
+            found: false,
+        };
+        check.visit_program(program);
+        check.found
+    }
+}
 
 /// 收集模块可被其它模块静态引用的导出常量，**并把 `css` 绑定的类名一并导出**。
 ///
@@ -45,23 +256,37 @@ pub fn collect_static_exports_with(
     imported: &value::Scope,
 ) -> StaticExports {
     let mut out = value::collect_static_exports_with(program, interner, imported);
-    let tags = collect_css_tags(program, interner);
-    if tags.is_empty() {
+    let bindings = BindingRegistry::collect(program, interner);
+    if bindings.bindings.is_empty() {
         return out;
     }
-    // 只有被 `export` 出去的 css 绑定才需要登记（其余对外不可见）。
+    // 只有被 export 的编译期值才需登记，供下游模块安全静态求值。
     let exported = exported_names(program, interner);
-    for (name, class) in assign_class_names(program, interner, &tags, seed) {
-        if let Some(export_as) = exported.get(&name) {
-            out.insert(export_as.clone(), StaticValue::Str(class));
+    for style in assign_style_names(program, interner, &bindings, seed) {
+        if let Some(exported_as) = style
+            .export_as
+            .as_ref()
+            .map(std::slice::from_ref)
+            .or_else(|| exported.get(&style.declaration).map(Vec::as_slice))
+        {
+            for export_as in exported_as {
+                out.insert(export_as.clone(), StaticValue::Str(style.value.clone()));
+            }
+        }
+    }
+    for variable in assign_create_vars(program, interner, &bindings, seed) {
+        if let Some(exported_as) = exported.get(&variable.declaration) {
+            for export_as in exported_as {
+                out.insert(export_as.clone(), StaticValue::Str(variable.value.clone()));
+            }
         }
     }
     out
 }
 
 /// 本地名 → 导出名（`export const x`、`export { x as y }`、`export default x`）。
-fn exported_names(program: &Program, interner: &Interner) -> FxHashMap<String, String> {
-    let mut m = FxHashMap::default();
+fn exported_names(program: &Program, interner: &Interner) -> FxHashMap<Span, Vec<String>> {
+    let mut m: FxHashMap<Span, Vec<String>> = FxHashMap::default();
     for stmt in program.body.iter() {
         match stmt {
             Statement::ExportNamed(e) => {
@@ -69,33 +294,67 @@ fn exported_names(program: &Program, interner: &Interner) -> FxHashMap<String, S
                     for decl in d.declarations.iter() {
                         if let Pattern::Ident(id) = &decl.id {
                             let n = interner.resolve(id.name);
-                            m.insert(n.clone(), n);
+                            m.entry(id.span).or_default().push(n);
                         }
                     }
                 }
                 if e.source.is_none() {
                     for spec in e.specifiers.iter() {
                         let local = match &spec.local {
-                            ModuleExportName::Ident(id) => interner.resolve(id.name),
-                            ModuleExportName::String(a) => interner.resolve(*a),
+                            ModuleExportName::Ident(id) => id,
+                            ModuleExportName::String(_) => continue,
                         };
                         let exported = match &spec.exported {
                             ModuleExportName::Ident(id) => interner.resolve(id.name),
                             ModuleExportName::String(a) => interner.resolve(*a),
                         };
-                        m.insert(local, exported);
+                        // Resolve the local export back to its declaration span, so a nested
+                        // binding with the same spelling cannot overwrite the exported style.
+                        if let Some(declaration) = top_level_declaration(program, local.name) {
+                            m.entry(declaration).or_default().push(exported);
+                        }
                     }
                 }
             }
             Statement::ExportDefault(d) => {
-                if let ExportDefaultKind::Expression(Expression::Identifier(id)) = &d.declaration {
-                    m.insert(interner.resolve(id.name), "default".to_string());
+                if let ExportDefaultKind::Expression(Expression::Identifier(id)) = &d.declaration
+                    && let Some(declaration) = top_level_declaration(program, id.name)
+                {
+                    m.entry(declaration)
+                        .or_default()
+                        .push("default".to_string());
                 }
             }
             _ => {}
         }
     }
     m
+}
+
+fn top_level_declaration(program: &Program, name: Atom) -> Option<Span> {
+    for statement in program.body.iter() {
+        let Some(declaration) = (match statement {
+            Statement::VariableDeclaration(declaration) => Some(*declaration),
+            Statement::ExportNamed(export) => export.declaration.and_then(|statement| {
+                if let Statement::VariableDeclaration(declaration) = statement {
+                    Some(declaration)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        }) else {
+            continue;
+        };
+        for declarator in declaration.declarations.iter() {
+            if let Pattern::Ident(identifier) = &declarator.id
+                && identifier.name == name
+            {
+                return Some(identifier.span);
+            }
+        }
+    }
+    None
 }
 
 /// 一次模块转换的产出。
@@ -108,9 +367,11 @@ pub struct TransformResult {
     pub verbatim_replacement_spans: Vec<Span>,
     /// 已被完整静态消解、可从 codegen 删除的 CSS-in-JS import 语句。
     pub removable_import_spans: Vec<Span>,
+    /// mixed import 中已静态消解、可不生成局部读取的 import binding span。
+    pub removable_import_binding_spans: Vec<Span>,
     /// 本模块抽取出的 CSS（已按声明序拼接）。
     pub css: String,
-    /// 求值失败等诊断（警告级，不中断构建）。
+    /// 静态求值与 API 使用诊断；不安全插值为 error。
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -120,17 +381,125 @@ impl TransformResult {
     }
 }
 
-/// Linaria 包名：从这些模块 import 的 `css` 才被识别为 CSS-in-JS 标签。
+/// 唯一受支持的 CSS-in-JS 包。
 ///
 /// 限定来源可避免误伤同名的普通函数（如自定义的 `css()` 工具）。
-pub const CSS_IN_JS_SOURCES: &[&str] = &["@linaria/core", "@wyw-in-js/core", "@wake/css"];
+pub const CSS_IN_JS_SOURCES: &[&str] = &[CRAB_CSS_SOURCE];
 
 /// 该模块说明符是否是 CSS-in-JS 的来源包。
 ///
 /// 供打包器**在扫描后、codegen 前**廉价判断「本次构建是否用得上 CSS-in-JS」：全项目无人
-/// import 时可整体跳过静态导出求值，使未用 Linaria 的项目零开销（故本功能可默认开启）。
+/// import 时可整体跳过静态导出求值，使未用 Crab CSS 的项目零开销（故本功能可默认开启）。
 pub fn is_css_in_js_source(specifier: &str) -> bool {
     CSS_IN_JS_SOURCES.contains(&specifier)
+}
+
+/// Return imported locals that the CSS compiler consumes completely.
+///
+/// The bundler uses this before graph liveness is computed. Without this hand-off, an import such
+/// as `import { css, createVar, assignVars } from '@crab-dev/css'` would keep the runtime exports for
+/// `css` and `createVar` alive even though codegen replaces every reference. This analysis uses the
+/// same semantic binding identity and conservative rules as [`transform`]: any non-marker reference
+/// makes the import runtime-live.
+pub fn compiler_consumed_imports(program: &Program, interner: &Interner) -> FxHashSet<Atom> {
+    let bindings = BindingRegistry::collect(program, interner);
+    if bindings.bindings.is_empty() {
+        return FxHashSet::default();
+    }
+    let consumed_create_var_calls: Vec<Span> = assign_create_vars(program, interner, &bindings, "")
+        .into_iter()
+        .map(|variable| variable.span)
+        .collect();
+    let mut usage = CompilerImportUsage {
+        bindings: &bindings,
+        safe: bindings
+            .bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.symbol,
+                    matches!(
+                        binding.kind,
+                        BindingKind::Css
+                            | BindingKind::Keyframes
+                            | BindingKind::GlobalStyle
+                            | BindingKind::CreateVar
+                    ),
+                )
+            })
+            .collect(),
+        consumed_create_var_calls: &consumed_create_var_calls,
+    };
+    usage.visit_program(program);
+    bindings
+        .bindings
+        .iter()
+        .filter(|binding| usage.safe.get(&binding.symbol).copied().unwrap_or(false))
+        .map(|binding| binding.local)
+        .collect()
+}
+
+struct CompilerImportUsage<'a> {
+    bindings: &'a BindingRegistry,
+    safe: FxHashMap<SymbolId, bool>,
+    consumed_create_var_calls: &'a [Span],
+}
+
+impl<'ast> Visit<'ast> for CompilerImportUsage<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'ast>) {
+        if let Statement::ExportNamed(export) = statement
+            && export.source.is_none()
+        {
+            for specifier in export.specifiers.iter() {
+                if let ModuleExportName::Ident(identifier) = &specifier.local
+                    && let Some(binding) = self
+                        .bindings
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.local == identifier.name)
+                {
+                    self.safe.insert(binding.symbol, false);
+                }
+            }
+        }
+        walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'ast>) {
+        if let Expression::TaggedTemplate(template) = expression
+            && self
+                .bindings
+                .binding_for_expression(&template.tag)
+                .is_some_and(|binding| {
+                    matches!(
+                        binding.kind,
+                        BindingKind::Css | BindingKind::Keyframes | BindingKind::GlobalStyle
+                    )
+                })
+        {
+            for interpolation in template.quasi.expressions.iter() {
+                self.visit_expression(interpolation);
+            }
+            return;
+        }
+        if let Expression::Call(call) = expression
+            && let Some(binding) = self.bindings.binding_for_expression(&call.callee)
+            && binding.kind == BindingKind::CreateVar
+            && self.consumed_create_var_calls.contains(&call.span)
+        {
+            for argument in call.arguments.iter() {
+                self.visit_expression(argument);
+            }
+            return;
+        }
+        if let Expression::Identifier(identifier) = expression
+            && let Some(symbol) = self.bindings.references.get(&identifier.span)
+            && self.safe.contains_key(symbol)
+        {
+            self.safe.insert(*symbol, false);
+        }
+        walk_expression(self, expression);
+    }
 }
 
 /// 转换一个模块。
@@ -147,40 +516,59 @@ pub fn transform(
 ) -> TransformResult {
     let mut out = TransformResult::default();
 
-    // 1) 找出本模块把 `css` / `cx` 绑定成了哪些本地名（支持别名）。
-    let tags = collect_css_tags(program, interner);
-    let cx_bindings = collect_named_bindings(program, interner, "cx");
-    if tags.is_empty() && cx_bindings.is_empty() {
+    // 1) 以语义符号而非名字登记编译期 marker，支持 import alias 且正确处理局部遮蔽。
+    let bindings = BindingRegistry::collect(program, interner);
+    if bindings.bindings.is_empty() {
         return out;
     }
 
     // 2) 模块顶层常量（可引用 import 进来的值）。
-    let mut scope = value::collect_module_scope(program, interner, imported);
+    let mut imported = value::safe_imported_scope(program, interner, imported);
+    // An exporting module cannot prove that a different importer did not mutate a shared object
+    // before this module executes. Until graph-wide provenance/mutation analysis is available,
+    // propagate only copy-safe primitive/class/variable values across ESM.
+    imported.retain(|_, value| !matches!(value, StaticValue::Obj(_) | StaticValue::Arr(_)));
+    let mut scope = value::collect_module_scope(program, interner, &imported);
+    if bindings.structured_values_may_escape_through_user_tags(program) {
+        scope.retain(|_, value| !matches!(value, StaticValue::Obj(_) | StaticValue::Arr(_)));
+    }
 
-    // 2′) **css 互相引用**：预先算出本模块每个 `const X = css\`…\`` 的类名并注入作用域。
-    // 类名只由「模块路径 + 序号」决定、不依赖 CSS 内容（对齐 Linaria 的 slug 规则），
-    // 因此可在求值**之前**确定，从而打破「求值需要类名、类名需要求值」的循环。
-    // 之后 `${X}` 求值即得裸类名字符串——与 Linaria 一致（要当选择器须自己写 `.${X}`）。
-    for (name, class) in assign_class_names(program, interner, &tags, seed) {
-        scope.insert(name, value::StaticValue::Str(class));
+    // 2′) 预分配 css/keyframes 名称，打破样式互相引用时的求值循环。
+    for style in assign_style_names(program, interner, &bindings, seed) {
+        scope.insert(style.local, value::StaticValue::Str(style.value));
+    }
+
+    // 2″) `createVar()` 是编译器内建 marker：静态替换成可直接插值的 `var(--…)`，动态值
+    // 只通过 `assignVars` 进入 inline style，绝不需要执行用户模块。
+    let create_vars = assign_create_vars(program, interner, &bindings, seed);
+    let mut consumed_create_var_calls = Vec::with_capacity(create_vars.len());
+    for variable in create_vars {
+        scope.insert(
+            variable.local,
+            value::StaticValue::Str(variable.value.clone()),
+        );
+        out.replacements
+            .insert(variable.span, js_string_literal(&variable.value));
+        consumed_create_var_calls.push(variable.span);
     }
 
     let ctx = value::EvalCtx {
         interner,
         scope: &scope,
-        imported,
+        imported: &imported,
     };
 
-    // 3) 遍历 AST，处理每个 `css` 标签模板。
-    if !tags.is_empty() {
+    // 3) 抽取 css/keyframes/globalStyle，并写入 span replacement。
+    {
         let mut collector = Collector {
             interner,
-            tags: &tags,
+            bindings: &bindings,
             ctx: &ctx,
             seed,
             out: &mut out,
             name_hint: None,
-            counter: 0,
+            counters: FxHashMap::default(),
+            allow_global_style: false,
         };
         collector.visit_program(program);
     }
@@ -188,19 +576,21 @@ pub fn transform(
     // 4) `cx` 的 atomic-class 冲突语义不能盲目降级成 join。只有能证明每个可能出现的
     // class 都是单个非 atomic token 时才替换；未知调用保留原包依赖。
     let mut usage = CssInJsUsage {
-        interner,
         source,
-        tags: &tags,
-        cx_bindings: &cx_bindings,
+        bindings: &bindings,
         ctx: &ctx,
         out: &mut out,
-        css_safe: true,
-        cx_safe: true,
+        safe: bindings
+            .bindings
+            .iter()
+            .map(|binding| (binding.symbol, true))
+            .collect(),
+        consumed_create_var_calls: &consumed_create_var_calls,
     };
     usage.visit_program(program);
 
     // import 的全部 specifier 都已消解时删整条语句，codegen 不再发出 require，
-    // 随后的 dead-module elimination 就能把 @linaria/core 从模块图中移除。
+    // 随后的 dead-module elimination 就能把 @crab-dev/css 从模块图中移除。
     for stmt in program.body.iter() {
         let Statement::Import(imp) = stmt else {
             continue;
@@ -208,82 +598,71 @@ pub fn transform(
         if !is_css_in_js_source(&interner.resolve(imp.source)) || imp.specifiers.is_empty() {
             continue;
         }
-        let removable = imp.specifiers.iter().all(|spec| match spec {
-            ImportSpecifier::Named { imported, .. } => {
-                let name = match imported {
-                    ModuleExportName::Ident(id) => interner.resolve(id.name),
-                    ModuleExportName::String(a) => interner.resolve(*a),
+        let consumed: Vec<Span> = imp
+            .specifiers
+            .iter()
+            .filter_map(|specifier| {
+                let ImportSpecifier::Named { local, .. } = specifier else {
+                    return None;
                 };
-                (name == "css" && usage.css_safe) || (name == "cx" && usage.cx_safe)
-            }
-            _ => false,
-        });
-        if removable {
+                usage
+                    .bindings
+                    .binding_for_declaration(local.span)
+                    .and_then(|binding| usage.safe.get(&binding.symbol))
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(local.span)
+            })
+            .collect();
+        if consumed.len() == imp.specifiers.len() {
             usage.out.removable_import_spans.push(imp.span);
+        } else {
+            usage.out.removable_import_binding_spans.extend(consumed);
         }
     }
     out
 }
 
-/// 收集 `import { css } from '@linaria/core'` 绑定的本地名。
-fn collect_css_tags(program: &Program, interner: &Interner) -> Vec<String> {
-    collect_named_bindings(program, interner, "css")
+struct CssInJsUsage<'a, 'b> {
+    source: &'a str,
+    bindings: &'a BindingRegistry,
+    ctx: &'a value::EvalCtx<'a>,
+    out: &'b mut TransformResult,
+    safe: FxHashMap<SymbolId, bool>,
+    consumed_create_var_calls: &'a [Span],
 }
 
-fn collect_named_bindings(program: &Program, interner: &Interner, wanted: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    for stmt in program.body.iter() {
-        let Statement::Import(imp) = stmt else {
-            continue;
-        };
-        let source = interner.resolve(imp.source);
-        if !CSS_IN_JS_SOURCES.iter().any(|s| *s == source) {
-            continue;
-        }
-        for s in imp.specifiers.iter() {
-            if let ImportSpecifier::Named {
-                local, imported, ..
-            } = s
-            {
-                let imported_name = match imported {
-                    ModuleExportName::Ident(id) => interner.resolve(id.name),
-                    ModuleExportName::String(a) => interner.resolve(*a),
-                };
-                if imported_name == wanted {
-                    tags.push(interner.resolve(local.name));
+impl<'ast> Visit<'ast> for CssInJsUsage<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'ast>) {
+        if let Statement::ExportNamed(export) = statement
+            && export.source.is_none()
+        {
+            for specifier in export.specifiers.iter() {
+                if let ModuleExportName::Ident(identifier) = &specifier.local
+                    && let Some(binding) = self
+                        .bindings
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.local == identifier.name)
+                {
+                    self.safe.insert(binding.symbol, false);
                 }
             }
         }
+        walk_statement(self, statement);
     }
-    tags
-}
 
-struct CssInJsUsage<'a, 'b> {
-    interner: &'a Interner,
-    source: &'a str,
-    tags: &'a [String],
-    cx_bindings: &'a [String],
-    ctx: &'a value::EvalCtx<'a>,
-    out: &'b mut TransformResult,
-    css_safe: bool,
-    cx_safe: bool,
-}
-
-impl CssWalk for CssInJsUsage<'_, '_> {
-    fn interner(&self) -> &Interner {
-        self.interner
-    }
-    fn tags(&self) -> &[String] {
-        self.tags
-    }
-    fn swap_hint(&mut self, _hint: Option<String>) -> Option<String> {
-        None
-    }
-    fn on_css(&mut self, _tt: &TaggedTemplateExpression) {}
-
-    fn visit_expression(&mut self, expr: &Expression) {
+    fn visit_expression(&mut self, expr: &Expression<'ast>) {
         if let Expression::TaggedTemplate(tt) = expr
-            && is_css_tag(self.interner, self.tags, &tt.tag)
+            && self
+                .bindings
+                .binding_for_expression(&tt.tag)
+                .is_some_and(|binding| {
+                    matches!(
+                        binding.kind,
+                        BindingKind::Css | BindingKind::Keyframes | BindingKind::GlobalStyle
+                    )
+                })
         {
             for expression in tt.quasi.expressions.iter() {
                 self.visit_expression(expression);
@@ -291,7 +670,8 @@ impl CssWalk for CssInJsUsage<'_, '_> {
             return;
         }
         if let Expression::Call(call) = expr
-            && is_named_binding(self.interner, self.cx_bindings, &call.callee)
+            && let Some(binding) = self.bindings.binding_for_expression(&call.callee)
+            && binding.kind == BindingKind::Cx
         {
             if call.optional
                 || !call
@@ -299,33 +679,36 @@ impl CssWalk for CssInJsUsage<'_, '_> {
                     .iter()
                     .all(|arg| known_non_atomic_class(arg, self.ctx))
             {
-                self.cx_safe = false;
+                self.safe.insert(binding.symbol, false);
             } else if let Some(replacement) = cx_replacement(call, self.source) {
                 self.out.replacements.insert(call.span, replacement);
                 self.out.verbatim_replacement_spans.push(call.span);
             } else {
-                self.cx_safe = false;
+                self.safe.insert(binding.symbol, false);
             }
             for argument in call.arguments.iter() {
                 self.visit_expression(argument);
             }
             return;
         }
-        if let Expression::Identifier(id) = expr {
-            let name = self.interner.resolve(id.name);
-            if self.tags.contains(&name) {
-                self.css_safe = false;
+        if let Expression::Call(call) = expr
+            && let Some(binding) = self.bindings.binding_for_expression(&call.callee)
+            && binding.kind == BindingKind::CreateVar
+            && self.consumed_create_var_calls.contains(&call.span)
+        {
+            for argument in call.arguments.iter() {
+                self.visit_expression(argument);
             }
-            if self.cx_bindings.contains(&name) {
-                self.cx_safe = false;
-            }
+            return;
         }
-        walk_expression_children(self, expr);
+        if let Expression::Identifier(id) = expr
+            && let Some(symbol) = self.bindings.references.get(&id.span)
+            && self.safe.contains_key(symbol)
+        {
+            self.safe.insert(*symbol, false);
+        }
+        walk_expression(self, expr);
     }
-}
-
-fn is_named_binding(interner: &Interner, bindings: &[String], expr: &Expression) -> bool {
-    matches!(expr, Expression::Identifier(id) if bindings.contains(&interner.resolve(id.name)))
 }
 
 fn known_non_atomic_class(expr: &Expression, ctx: &value::EvalCtx) -> bool {
@@ -362,177 +745,543 @@ fn cx_replacement(call: &CallExpression, source: &str) -> Option<String> {
     Some(out)
 }
 
-/// 类名生成：`变量名_hash8`，hash 只由「模块路径 + 模块内序号」决定。
-///
-/// **刻意不混入 CSS 内容**——对齐 Linaria（slug 取自 `相对路径:序号`）。这既让类名在改样式时
-/// 保持稳定（利于调试与缓存），也使类名可在求值前算出，从而支持 css 之间互相引用。
-fn class_name_for(hint: &str, seed: &str, index: u32) -> String {
-    let key = format!("{seed}\u{0}{index}");
-    format!("{}_{:08x}", sanitize_ident(hint), fnv1a(&key))
+/// 名称身份由「schema + 规范化模块 id + API 种类 + binding 名 + 同名 ordinal」组成，刻意
+/// 不混入 CSS 内容。向文件前方插入另一个不同 binding 的样式不会让已有名称 churn。
+fn generated_name(kind: BindingKind, hint: &str, seed: &str, ordinal: u32) -> String {
+    const SCHEMA: &str = "crab-css-v1";
+    let seed = normalize_style_seed(seed);
+    let key = format!("{SCHEMA}\0{seed}\0{}\0{hint}\0{ordinal}", kind.slug());
+    format!(
+        "{}_{:012x}",
+        sanitize_ident(hint),
+        fnv1a64(&key) & 0x0000_ffff_ffff_ffff
+    )
 }
 
-/// 前序遍历，给每个 `const X = css\`…\`` 预分配类名，返回 `(变量名, 类名)`。
-///
-/// 遍历顺序与计数必须与 [`Collector`] 完全一致（同一份 `visit_*` 逻辑，见 `NameAssigner`）。
-fn assign_class_names(
+fn normalize_style_seed(seed: &str) -> String {
+    let mut normalized = seed.replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/") {
+        normalized = rest.to_string();
+    }
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        normalized.replace_range(0..1, &normalized[..1].to_ascii_lowercase());
+    }
+    normalized
+}
+
+fn next_ordinal(counters: &mut FxHashMap<String, u32>, kind: BindingKind, hint: &str) -> u32 {
+    let key = format!("{}\0{hint}", kind.slug());
+    let slot = counters.entry(key).or_default();
+    let ordinal = *slot;
+    *slot += 1;
+    ordinal
+}
+
+/// 前序遍历，为 `css` 与 `keyframes` 预分配名称。
+struct AssignedStyle {
+    local: String,
+    declaration: Span,
+    export_as: Option<String>,
+    value: String,
+}
+
+fn assign_style_names(
     program: &Program,
     interner: &Interner,
-    tags: &[String],
+    bindings: &BindingRegistry,
     seed: &str,
-) -> Vec<(String, String)> {
-    let mut a = NameAssigner {
+) -> Vec<AssignedStyle> {
+    let mut assigner = NameAssigner {
         interner,
-        tags,
+        bindings,
         seed,
         out: Vec::new(),
         name_hint: None,
-        counter: 0,
+        counters: FxHashMap::default(),
     };
-    a.visit_program(program);
-    a.out
+    assigner.visit_program(program);
+    assigner.out
 }
 
-/// 与 [`Collector`] 同构的轻量遍历：只分配类名、不渲染 CSS。
 struct NameAssigner<'a> {
     interner: &'a Interner,
-    tags: &'a [String],
+    bindings: &'a BindingRegistry,
     seed: &'a str,
-    out: Vec<(String, String)>,
-    name_hint: Option<String>,
-    counter: u32,
+    out: Vec<AssignedStyle>,
+    name_hint: Option<(String, Span)>,
+    counters: FxHashMap<String, u32>,
 }
 
-/// 两趟遍历（预分配类名 / 真正抽取）共用的遍历骨架。
-///
-/// 两者**必须**走完全相同的顺序与计数，否则预注入作用域的类名会与产出的类名错位。
-/// 用同一份 `visit_*` 默认实现保证这一点，杜绝两份逻辑各自漂移。
-trait CssWalk {
-    fn interner(&self) -> &Interner;
-    fn tags(&self) -> &[String];
-    /// 换入新的类名提示（变量名），返回旧值以便恢复。
-    fn swap_hint(&mut self, hint: Option<String>) -> Option<String>;
-    /// 命中一个 `css` 标签模板。
-    fn on_css(&mut self, tt: &TaggedTemplateExpression);
-
-    fn visit_program(&mut self, program: &Program) {
-        for stmt in program.body.iter() {
-            self.visit_statement(stmt);
-        }
-    }
-
-    fn visit_statement(&mut self, stmt: &Statement) {
-        // 变量声明：记录名字作为类名提示，再递归其初始化器。
-        if let Statement::VariableDeclaration(d) = stmt {
-            for decl in d.declarations.iter() {
-                let hint = match &decl.id {
-                    Pattern::Ident(id) => Some(self.interner().resolve(id.name)),
+impl<'ast> Visit<'ast> for NameAssigner<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'ast>) {
+        if let Statement::VariableDeclaration(declaration) = statement {
+            for declarator in declaration.declarations.iter() {
+                let hint = match &declarator.id {
+                    Pattern::Ident(identifier) => {
+                        Some((self.interner.resolve(identifier.name), identifier.span))
+                    }
                     _ => None,
                 };
-                if let Some(init) = &decl.init {
-                    let saved = self.swap_hint(hint);
-                    self.visit_expression(init);
-                    self.swap_hint(saved);
+                if let Some(initializer) = &declarator.init {
+                    let saved = std::mem::replace(&mut self.name_hint, hint);
+                    self.visit_expression(initializer);
+                    self.name_hint = saved;
                 }
             }
             return;
         }
-        walk_statement_children(self, stmt);
-    }
-
-    fn visit_expression(&mut self, expr: &Expression) {
-        if let Expression::TaggedTemplate(tt) = expr
-            && is_css_tag(self.interner(), self.tags(), &tt.tag)
+        if let Statement::ExportDefault(export) = statement
+            && let ExportDefaultKind::Expression(expression) = &export.declaration
         {
-            self.on_css(tt);
+            let saved = self.name_hint.replace(("default".to_string(), export.span));
+            let before = self.out.len();
+            self.visit_expression(expression);
+            if let Some(style) = self.out.get_mut(before) {
+                style.export_as = Some("default".to_string());
+            }
+            self.name_hint = saved;
             return;
         }
-        walk_expression_children(self, expr);
+        walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'ast>) {
+        if let Expression::TaggedTemplate(template) = expression
+            && let Some(binding) = self.bindings.binding_for_expression(&template.tag)
+            && matches!(binding.kind, BindingKind::Css | BindingKind::Keyframes)
+        {
+            let fallback = if binding.kind == BindingKind::Css {
+                "css"
+            } else {
+                "keyframes"
+            };
+            let hint = self
+                .name_hint
+                .as_ref()
+                .map(|(name, _)| name.as_str())
+                .unwrap_or(fallback);
+            let ordinal = next_ordinal(&mut self.counters, binding.kind, hint);
+            let generated = generated_name(binding.kind, hint, self.seed, ordinal);
+            if let Some((local, declaration)) = self.name_hint.clone() {
+                self.out.push(AssignedStyle {
+                    local,
+                    declaration,
+                    export_as: None,
+                    value: generated,
+                });
+            }
+            return;
+        }
+        walk_expression(self, expression);
     }
 }
 
-/// 标签是否是本模块绑定的 `css`。
-fn is_css_tag(interner: &Interner, tags: &[String], tag: &Expression) -> bool {
-    match tag {
-        Expression::Identifier(id) => tags.contains(&interner.resolve(id.name)),
-        _ => false,
-    }
+struct AssignedVariable {
+    local: String,
+    declaration: Span,
+    value: String,
+    span: Span,
 }
 
-impl CssWalk for NameAssigner<'_> {
-    fn interner(&self) -> &Interner {
-        self.interner
-    }
-    fn tags(&self) -> &[String] {
-        self.tags
-    }
-    fn swap_hint(&mut self, hint: Option<String>) -> Option<String> {
-        std::mem::replace(&mut self.name_hint, hint)
-    }
-    fn on_css(&mut self, _tt: &TaggedTemplateExpression) {
-        let hint = self.name_hint.as_deref().unwrap_or("css");
-        let class = class_name_for(hint, self.seed, self.counter);
-        self.counter += 1;
-        // 只有绑定到变量的 css 才可被引用（匿名的没有名字可引用）。
-        if let Some(name) = self.name_hint.clone() {
-            self.out.push((name, class));
+/// `createVar` 只在模块顶层 immutable binding 上静态消解；其它位置保留小型 runtime。
+fn assign_create_vars(
+    program: &Program,
+    interner: &Interner,
+    bindings: &BindingRegistry,
+    seed: &str,
+) -> Vec<AssignedVariable> {
+    let mut out = Vec::new();
+    for statement in program.body.iter() {
+        let declaration = match statement {
+            Statement::VariableDeclaration(declaration) => Some(*declaration),
+            Statement::ExportNamed(export) => export.declaration.and_then(|declaration| {
+                if let Statement::VariableDeclaration(declaration) = declaration {
+                    Some(declaration)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
+        let Some(declaration) = declaration else {
+            continue;
+        };
+        if declaration.kind != VarKind::Const {
+            continue;
+        }
+        for declarator in declaration.declarations.iter() {
+            let (Pattern::Ident(identifier), Some(Expression::Call(call))) =
+                (&declarator.id, &declarator.init)
+            else {
+                continue;
+            };
+            let Some(binding) = bindings.binding_for_expression(&call.callee) else {
+                continue;
+            };
+            if binding.kind != BindingKind::CreateVar
+                || call.optional
+                || call.arguments.len() > 1
+                || call
+                    .arguments
+                    .first()
+                    .is_some_and(|argument| !matches!(argument, Expression::StringLiteral(_)))
+            {
+                continue;
+            }
+            let local = interner.resolve(identifier.name);
+            let slug = generated_name(BindingKind::CreateVar, &local, seed, 0);
+            out.push(AssignedVariable {
+                local,
+                declaration: identifier.span,
+                value: format!("var(--crab-css-{slug})"),
+                span: call.span,
+            });
         }
     }
-}
-
-impl CssWalk for Collector<'_, '_> {
-    fn interner(&self) -> &Interner {
-        self.interner
-    }
-    fn tags(&self) -> &[String] {
-        self.tags
-    }
-    fn swap_hint(&mut self, hint: Option<String>) -> Option<String> {
-        std::mem::replace(&mut self.name_hint, hint)
-    }
-    fn on_css(&mut self, tt: &TaggedTemplateExpression) {
-        self.handle_css_template(tt);
-    }
+    out
 }
 
 struct Collector<'a, 'b> {
     interner: &'a Interner,
-    tags: &'a [String],
+    bindings: &'a BindingRegistry,
     ctx: &'a value::EvalCtx<'a>,
     seed: &'a str,
     out: &'b mut TransformResult,
-    /// 当前所在变量声明的名字，用作类名前缀（`const box = css\`\`` → `box_xxxx`）。
     name_hint: Option<String>,
-    /// 同模块内的序号，保证匿名/同名场景类名唯一。
-    counter: u32,
+    counters: FxHashMap<String, u32>,
+    allow_global_style: bool,
+}
+
+impl<'ast> Visit<'ast> for Collector<'_, '_> {
+    fn visit_program(&mut self, program: &Program<'ast>) {
+        for statement in program.body.iter() {
+            if let Statement::Expression(expression_statement) = statement
+                && let Expression::TaggedTemplate(template) = &expression_statement.expression
+                && self
+                    .bindings
+                    .binding_for_expression(&template.tag)
+                    .is_some_and(|binding| binding.kind == BindingKind::GlobalStyle)
+            {
+                let saved = std::mem::replace(&mut self.allow_global_style, true);
+                self.visit_expression(&expression_statement.expression);
+                self.allow_global_style = saved;
+            } else {
+                self.visit_statement(statement);
+            }
+        }
+    }
+
+    fn visit_statement(&mut self, statement: &Statement<'ast>) {
+        if let Statement::VariableDeclaration(declaration) = statement {
+            for declarator in declaration.declarations.iter() {
+                let hint = match &declarator.id {
+                    Pattern::Ident(identifier) => Some(self.interner.resolve(identifier.name)),
+                    _ => None,
+                };
+                if let Some(initializer) = &declarator.init {
+                    let saved = std::mem::replace(&mut self.name_hint, hint);
+                    self.visit_expression(initializer);
+                    self.name_hint = saved;
+                }
+            }
+            return;
+        }
+        if let Statement::ExportDefault(export) = statement
+            && let ExportDefaultKind::Expression(expression) = &export.declaration
+        {
+            let saved = self.name_hint.replace("default".to_string());
+            self.visit_expression(expression);
+            self.name_hint = saved;
+            return;
+        }
+        walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'ast>) {
+        if let Expression::TaggedTemplate(template) = expression
+            && let Some(binding) = self.bindings.binding_for_expression(&template.tag)
+            && matches!(
+                binding.kind,
+                BindingKind::Css | BindingKind::Keyframes | BindingKind::GlobalStyle
+            )
+        {
+            self.handle_template(template, binding);
+            return;
+        }
+        walk_expression(self, expression);
+    }
 }
 
 impl Collector<'_, '_> {
-    fn handle_css_template(&mut self, tt: &TaggedTemplateExpression) {
-        let (body, mut diags) = render_template(tt.quasi, self.ctx, self.interner);
-        self.out.diagnostics.append(&mut diags);
+    fn handle_template(&mut self, template: &TaggedTemplateExpression, binding: &StyleBinding) {
+        let label = match binding.kind {
+            BindingKind::Css => "css",
+            BindingKind::Keyframes => "keyframes",
+            BindingKind::GlobalStyle => "globalStyle",
+            _ => return,
+        };
+        let (body, mut diagnostics) = render_template(
+            template.quasi,
+            self.ctx,
+            self.interner,
+            self.bindings,
+            label,
+        );
+        self.out.diagnostics.append(&mut diagnostics);
 
-        // 类名与 `assign_class_names` 必须**同规则同序**（同一次前序遍历、同一计数器），
-        // 否则预注入作用域的类名与真正产出的类名会对不上。
-        let hint = self.name_hint.as_deref().unwrap_or("css");
-        let class = class_name_for(hint, self.seed, self.counter);
-        self.counter += 1;
+        if binding.kind == BindingKind::Css && contains_css_token(&body, ":global") {
+            self.out.diagnostics.push(
+                Diagnostic::error(
+                    "css`` 中的 :global 逃逸无法跟随局部 binding 做可靠的样式存活分析",
+                )
+                .with_code("CRAB_CSS_GLOBAL_ESCAPE")
+                .with_primary(template.span, "请把全局规则改为模块顶层的 globalStyle``"),
+            );
+            return;
+        }
+        if binding.kind == BindingKind::Css
+            && let Some(at_rule) = unsupported_scoped_at_rule(&body)
+        {
+            self.out.diagnostics.push(
+                Diagnostic::error(format!(
+                    "css`` 中的 @{at_rule} 会产生无法跟随局部 binding 摇树的全局副作用"
+                ))
+                .with_code("CRAB_CSS_GLOBAL_AT_RULE")
+                .with_primary(template.span, "请把该规则移到模块顶层的 globalStyle``"),
+            );
+            return;
+        }
+        if contains_relative_css_url(&body) {
+            self.out.diagnostics.push(
+                Diagnostic::error(
+                    "@crab-dev/css 暂不支持模板中的相对 url() 资源重写",
+                )
+                .with_code("CRAB_CSS_RELATIVE_URL")
+                .with_primary(template.span, "相对资源在聚合 CSS 中会改变解析基准")
+                .with_note(
+                    "请暂时把含相对 url() 的规则放入普通 .css 文件；绝对 URL、根路径、data: 和片段引用仍可用",
+                ),
+            );
+            return;
+        }
 
-        let css = nesting::flatten(&format!(".{class}"), &body);
-        self.out.css.push_str(&css);
-        self.out
-            .replacements
-            .insert(tt.span, js_string_literal(&class));
+        match binding.kind {
+            BindingKind::Css | BindingKind::Keyframes => {
+                let fallback = if binding.kind == BindingKind::Css {
+                    "css"
+                } else {
+                    "keyframes"
+                };
+                let hint = self.name_hint.as_deref().unwrap_or(fallback);
+                let ordinal = next_ordinal(&mut self.counters, binding.kind, hint);
+                let generated = generated_name(binding.kind, hint, self.seed, ordinal);
+                if binding.kind == BindingKind::Css {
+                    self.out
+                        .css
+                        .push_str(&nesting::flatten(&format!(".{generated}"), &body));
+                } else {
+                    self.out.css.push_str("@keyframes ");
+                    self.out.css.push_str(&generated);
+                    self.out.css.push('{');
+                    self.out.css.push_str(&body);
+                    self.out.css.push('}');
+                }
+                self.out
+                    .replacements
+                    .insert(template.span, js_string_literal(&generated));
+            }
+            BindingKind::GlobalStyle => {
+                if !self.allow_global_style {
+                    self.out.diagnostics.push(
+                        Diagnostic::error(
+                            "globalStyle`` 必须是模块顶层的直接表达式语句，不能位于函数或控制流中",
+                        )
+                        .with_code("CRAB_CSS_GLOBAL_SCOPE")
+                        .with_primary(template.span, "把 globalStyle`` 移到模块顶层"),
+                    );
+                    return;
+                }
+                self.out.css.push_str(&nesting::flatten("", &body));
+                self.out
+                    .replacements
+                    .insert(template.span, "void 0".to_string());
+            }
+            _ => {}
+        }
     }
+}
+
+fn contains_css_token(css: &str, needle: &str) -> bool {
+    let bytes = css.as_bytes();
+    let needle = needle.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => skip_css_string(bytes, &mut i),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => skip_css_comment(bytes, &mut i),
+            _ if bytes[i..].starts_with(needle) => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+fn contains_relative_css_url(css: &str) -> bool {
+    let bytes = css.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                skip_css_string(bytes, &mut i);
+                continue;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                skip_css_comment(bytes, &mut i);
+                continue;
+            }
+            _ => {}
+        }
+        if i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"url") {
+            let mut open = i + 3;
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if open < bytes.len() && bytes[open] == b'(' {
+                let mut end = open + 1;
+                let mut quote = None;
+                while end < bytes.len() {
+                    if let Some(expected) = quote {
+                        if bytes[end] == b'\\' {
+                            end += 2;
+                            continue;
+                        }
+                        if bytes[end] == expected {
+                            quote = None;
+                        }
+                    } else if matches!(bytes[end], b'"' | b'\'') {
+                        quote = Some(bytes[end]);
+                    } else if bytes[end] == b')' {
+                        break;
+                    }
+                    end += 1;
+                }
+                let raw = css[open + 1..end.min(bytes.len())].trim();
+                let value = raw
+                    .strip_prefix(['"', '\''])
+                    .and_then(|value| value.strip_suffix(['"', '\'']))
+                    .unwrap_or(raw)
+                    .trim();
+                if !is_absolute_css_url(value) {
+                    return true;
+                }
+                i = end.saturating_add(1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_absolute_css_url(value: &str) -> bool {
+    if value.starts_with(['/', '#']) {
+        return true;
+    }
+    let Some(colon) = value.find(':') else {
+        return false;
+    };
+    let scheme = &value[..colon];
+    !scheme.is_empty()
+        && scheme.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic()
+                || (index > 0 && (byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')))
+        })
+}
+
+fn unsupported_scoped_at_rule(css: &str) -> Option<String> {
+    let bytes = css.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                skip_css_string(bytes, &mut i);
+                continue;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                skip_css_comment(bytes, &mut i);
+                continue;
+            }
+            b'@' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-')
+                {
+                    end += 1;
+                }
+                if end == start {
+                    i += 1;
+                    continue;
+                }
+                let name = css[start..end].to_ascii_lowercase();
+                // Allow-list only rules whose body is safely scoped by nesting::flatten, plus
+                // keyframes whose name is localized. New/unknown at-rules fail closed because
+                // many of them are global statement or descriptor rules.
+                if !matches!(
+                    name.as_str(),
+                    "media" | "supports" | "container" | "scope" | "document" | "keyframes"
+                ) && name != "layer"
+                {
+                    return Some(name);
+                }
+                if name == "layer" {
+                    let rest = &css[end..];
+                    if rest.find(';').unwrap_or(usize::MAX) < rest.find('{').unwrap_or(usize::MAX) {
+                        return Some(name);
+                    }
+                }
+                i = end;
+                continue;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_css_string(bytes: &[u8], i: &mut usize) {
+    let quote = bytes[*i];
+    *i += 1;
+    while *i < bytes.len() {
+        if bytes[*i] == b'\\' {
+            *i += 2;
+            continue;
+        }
+        let done = bytes[*i] == quote;
+        *i += 1;
+        if done {
+            return;
+        }
+    }
+}
+
+fn skip_css_comment(bytes: &[u8], i: &mut usize) {
+    *i += 2;
+    while *i + 1 < bytes.len() && !(bytes[*i] == b'*' && bytes[*i + 1] == b'/') {
+        *i += 1;
+    }
+    *i = (*i + 2).min(bytes.len());
 }
 
 /// 渲染标签模板为 CSS 文本：静态片段原样，插值求值后替换。
 ///
-/// 无法求值的插值 → 记一条警告，并**丢弃其所在的那条声明**（从上一个 `;`/`{`/`}` 到下一个 `;`），
-/// 使产出仍是合法 CSS。
+/// 无法安全求值的插值会产生错误；为避免产出非法 CSS，同时丢弃其所在的那条声明。
 fn render_template(
     quasi: &TemplateLiteral,
     ctx: &value::EvalCtx,
     interner: &Interner,
+    bindings: &BindingRegistry,
+    tag_name: &str,
 ) -> (String, Vec<Diagnostic>) {
     let mut out = String::new();
     let mut diags = Vec::new();
@@ -546,14 +1295,20 @@ fn render_template(
         let Some(expr) = quasi.expressions.get(i) else {
             continue;
         };
-        // 插值分派，对齐 Linaria `templateProcessor`：
+        // 插值分派：
         //   undefined / "" → 静默跳过（不追加任何文本，也不报警）
         //   可 CSS 化的值（字符串/数字/数组/对象）→ toCSS 后折行为空格
-        //   其余（含函数、无法静态求值）→ 报警并回删该条声明
-        let evaluated = value::eval(expr, ctx);
+        //   其余（含函数、无法静态求值）→ 报错并回删该条声明
+        let evaluated = if bindings.expression_is_module_static(expr) {
+            value::eval(expr, ctx)
+        } else {
+            None
+        };
         if matches!(
             evaluated,
-            Some(value::StaticValue::Undefined) | Some(value::StaticValue::Null)
+            Some(value::StaticValue::Undefined)
+                | Some(value::StaticValue::Null)
+                | Some(value::StaticValue::Bool(false))
         ) {
             continue;
         }
@@ -567,11 +1322,17 @@ fn render_template(
             None => {
                 bad_spots.push(out.len());
                 diags.push(
-                    Diagnostic::warning("css`` 插值无法在构建期求值，已跳过该条声明")
-                        .with_primary(expr.span(), "此插值不是可静态求值的表达式")
-                        .with_note(
-                            "支持：字面量、模板字符串、对象/数组字面量、成员访问、以及它们引用的顶层 const（含跨模块 import）",
-                        ),
+                    Diagnostic::error(format!(
+                        "{tag_name}`` 插值无法安全地在构建期求值"
+                    ))
+                    .with_code("CRAB_CSS_STATIC_VALUE")
+                    .with_primary(expr.span(), "此插值不是可静态求值的纯表达式")
+                    .with_note(
+                        "支持：字面量、模板字符串、对象/数组字面量、成员访问、顶层 const 与它们的静态 ESM import",
+                    )
+                    .with_note(
+                        "动态值请使用 createVar() 声明 CSS 变量，并通过 assignVars() 显式赋值；Wake 不执行用户模块或函数",
+                    ),
                 );
             }
         }
@@ -625,7 +1386,7 @@ fn drop_declarations_at(src: &str, spots: &[usize]) -> String {
     out
 }
 
-/// 折叠插值结果中的换行为空格并 trim（对齐 Linaria `stripLines`）。
+/// 折叠插值结果中的换行为空格并 trim。
 ///
 /// CSS 字符串字面量内不允许裸换行，插值来的多行文本（如对象展开）必须压成一行。
 fn strip_lines(text: &str) -> String {
@@ -667,12 +1428,12 @@ fn sanitize_ident(s: &str) -> String {
     out
 }
 
-/// FNV-1a 32 位——与 `wake_css` 的 CSS Modules 作用域化同族算法，保证产物确定性。
-fn fnv1a(s: &str) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
+/// FNV-1a 64 位；名称展示 48 位，碰撞面显著大于旧实现的 32 位且无需引入运行时依赖。
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
-        h ^= *b as u32;
-        h = h.wrapping_mul(0x0100_0193);
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
 }
@@ -695,137 +1456,6 @@ fn js_string_literal(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-// ======================================================================
-// 极简 AST 递归（只需覆盖「表达式可能出现的位置」，不依赖 visit crate 的可变借用）
-// ======================================================================
-
-fn walk_statement_children<W: CssWalk + ?Sized>(c: &mut W, stmt: &Statement) {
-    match stmt {
-        Statement::Expression(e) => c.visit_expression(&e.expression),
-        Statement::Return(r) => {
-            if let Some(a) = &r.argument {
-                c.visit_expression(a);
-            }
-        }
-        Statement::Block(b) => {
-            for s in b.body.iter() {
-                c.visit_statement(s);
-            }
-        }
-        Statement::If(i) => {
-            c.visit_expression(&i.test);
-            c.visit_statement(&i.consequent);
-            if let Some(a) = &i.alternate {
-                c.visit_statement(a);
-            }
-        }
-        Statement::FunctionDeclaration(f) => {
-            if let Some(body) = &f.body {
-                for s in body.statements.iter() {
-                    c.visit_statement(s);
-                }
-            }
-        }
-        Statement::ExportNamed(e) => {
-            if let Some(d) = &e.declaration {
-                c.visit_statement(d);
-            }
-        }
-        Statement::ExportDefault(d) => {
-            if let ExportDefaultKind::Expression(e) = &d.declaration {
-                c.visit_expression(e);
-            }
-        }
-        Statement::VariableDeclaration(d) => {
-            for decl in d.declarations.iter() {
-                if let Some(init) = &decl.init {
-                    c.visit_expression(init);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn walk_expression_children<W: CssWalk + ?Sized>(c: &mut W, expr: &Expression) {
-    match expr {
-        Expression::Call(call) => {
-            c.visit_expression(&call.callee);
-            for a in call.arguments.iter() {
-                c.visit_expression(a);
-            }
-        }
-        Expression::New(n) => {
-            c.visit_expression(&n.callee);
-            for a in n.arguments.iter() {
-                c.visit_expression(a);
-            }
-        }
-        Expression::Member(m) => c.visit_expression(&m.object),
-        Expression::Binary(b) => {
-            c.visit_expression(&b.left);
-            c.visit_expression(&b.right);
-        }
-        Expression::Logical(l) => {
-            c.visit_expression(&l.left);
-            c.visit_expression(&l.right);
-        }
-        Expression::Conditional(cond) => {
-            c.visit_expression(&cond.test);
-            c.visit_expression(&cond.consequent);
-            c.visit_expression(&cond.alternate);
-        }
-        Expression::Assignment(a) => c.visit_expression(&a.right),
-        Expression::Array(a) => {
-            for el in a.elements.iter().flatten() {
-                c.visit_expression(el);
-            }
-        }
-        Expression::Object(o) => {
-            for m in o.properties.iter() {
-                match m {
-                    ObjectMember::Property(p) => c.visit_expression(&p.value),
-                    ObjectMember::Spread(s) => c.visit_expression(&s.argument),
-                }
-            }
-        }
-        Expression::Arrow(a) => match &a.body {
-            ArrowBody::Expression(e) => c.visit_expression(e),
-            ArrowBody::Block(b) => {
-                for s in b.statements.iter() {
-                    c.visit_statement(s);
-                }
-            }
-        },
-        Expression::Function(f) => {
-            if let Some(body) = &f.body {
-                for s in body.statements.iter() {
-                    c.visit_statement(s);
-                }
-            }
-        }
-        Expression::TemplateLiteral(t) => {
-            for e in t.expressions.iter() {
-                c.visit_expression(e);
-            }
-        }
-        Expression::TaggedTemplate(t) => {
-            for e in t.quasi.expressions.iter() {
-                c.visit_expression(e);
-            }
-        }
-        Expression::Sequence(s) => {
-            for e in s.expressions.iter() {
-                c.visit_expression(e);
-            }
-        }
-        Expression::Unary(u) => c.visit_expression(&u.argument),
-        Expression::Await(a) => c.visit_expression(&a.argument),
-        Expression::Spread(s) => c.visit_expression(&s.argument),
-        _ => {}
-    }
 }
 
 #[cfg(test)]

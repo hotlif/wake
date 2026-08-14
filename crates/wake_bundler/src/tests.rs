@@ -175,6 +175,54 @@ fn set_define_dev_replaces_node_env() {
 }
 
 #[test]
+fn codegen_configuration_changes_invalidate_a_long_lived_bundler() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export const mode = process.env.NODE_ENV; console.log('keep');",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.set_define(vec![(
+        "process.env.NODE_ENV".to_string(),
+        "\"development\"".to_string(),
+    )]);
+    let development = bundler.build(Path::new("src/index.js"));
+    assert!(
+        development.bundle.contains("development"),
+        "{}",
+        development.bundle
+    );
+    assert!(
+        development.bundle.contains("console.log"),
+        "{}",
+        development.bundle
+    );
+
+    bundler
+        .set_define(vec![(
+            "process.env.NODE_ENV".to_string(),
+            "\"production\"".to_string(),
+        )])
+        .enable_minify()
+        .enable_drop_console();
+    let production = bundler.build(Path::new("src/index.js"));
+    assert!(
+        production.bundle.contains("production"),
+        "{}",
+        production.bundle
+    );
+    assert!(
+        !production.bundle.contains("development"),
+        "{}",
+        production.bundle
+    );
+    assert!(
+        !production.bundle.contains("console.log"),
+        "{}",
+        production.bundle
+    );
+}
+
+#[test]
 fn default_bundle_lowers_import_meta_for_classic_script_chunks() {
     let fs = MemoryFileSystem::from_files([(
         "src/index.js",
@@ -4161,6 +4209,27 @@ fn no_dynamic_import_single_chunk() {
     );
 }
 
+#[test]
+fn single_chunk_content_hash_is_opt_in_and_derived_from_entry_code() {
+    let mut plain = IncrementalBundler::new(Arc::new(fixture()));
+    let plain_output = plain.build(Path::new("src/index.js"));
+    assert_eq!(plain_output.entry().file_name, "bundle.js");
+
+    let mut hashed = IncrementalBundler::new(Arc::new(fixture()));
+    hashed.enable_single_chunk_content_hash();
+    let hashed_output = hashed.build(Path::new("src/index.js"));
+    let expected = format!(
+        "entry.{:08x}.js",
+        xxhash_rust::xxh3::xxh3_64(hashed_output.bundle.as_bytes()) as u32
+    );
+    assert_eq!(hashed_output.entry().file_name, expected);
+    assert_eq!(hashed_output.entry().name, "entry");
+
+    hashed.set_content_hash(false);
+    let unhashed_output = hashed.build(Path::new("src/index.js"));
+    assert_eq!(unhashed_output.entry().file_name, "entry.js");
+}
+
 // ============================================================
 // 持久化构建缓存（PLAN §7.1）——全新进程冷构建跳过未变模块的 parse + codegen
 // ============================================================
@@ -4935,43 +5004,50 @@ fn sourcemap_source_names_are_normalized() {
 }
 
 // ======================================================================
-// M5 — 零运行时 CSS-in-JS（Linaria 子集）
+// M5 — `@crab-dev/css` 零运行时编译
 // ======================================================================
 
-/// `@linaria/core` 桩包：真实项目里这是已安装的依赖。`css` 会被构建期完全消解，
-/// 但同包的 `cx`（类名拼接）仍是运行时函数，故不能整体外部化——保留正常解析。
-const LINARIA_PKG_JSON: &str = r#"{"name":"@linaria/core","version":"6.0.0","main":"index.js"}"#;
-const LINARIA_INDEX: &str = "export const css = () => { throw new Error('css should be compiled away'); };\n\
+const CRAB_CSS_PKG_JSON: &str = r#"{"name":"@crab-dev/css","version":"0.1.16","main":"index.js"}"#;
+const CRAB_CSS_INDEX: &str = "export const css = () => { throw new Error('css should be compiled away'); };\n\
+     export const keyframes = css; export const globalStyle = css;\n\
+     export const createVar = () => 'runtime-var';\n\
+     export const assignVars = (values) => values;\n\
      export const cx = (...a) => a.filter(Boolean).join(' ');\n";
 
-/// crab-dev 的真实形态：token 模块导出嵌套对象，组件模块用 `${token.a.b}` 插值。
-fn linaria_fixture() -> MemoryFileSystem {
+fn crab_css_fixture(source: &'static str) -> MemoryFileSystem {
     MemoryFileSystem::from_files([
-        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
-        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        ("src/index.tsx", source),
+    ])
+}
+
+/// 跨模块传递可安全复制的 design token，并由组件模块做静态插值。
+fn crab_css_token_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
         (
             "src/index.tsx",
-            "import { css } from '@linaria/core';\n\
-             import token from './token.js';\n\
+            "import { css } from '@crab-dev/css';\n\
+             import { padding } from './token.js';\n\
              const box = css`\n\
              \x20 display: flex;\n\
-             \x20 padding: ${token.container.padding};\n\
+             \x20 padding: ${padding};\n\
              \x20 &:hover { color: red; }\n\
              `;\n\
              export default box;",
         ),
         (
             "src/token.js",
-            "const vars = { 'container.padding': '--c-pad' };\n\
-             const token = { container: { padding: `var(${vars['container.padding']}, 24px)` } };\n\
-             export default token;",
+            "export const padding = 'var(--c-pad, 24px)';",
         ),
     ])
 }
 
 #[test]
 fn css_in_js_extracts_styles_and_replaces_with_class() {
-    let mut b = IncrementalBundler::new(Arc::new(linaria_fixture()));
+    let mut b = IncrementalBundler::new(Arc::new(crab_css_token_fixture()));
     b.enable_css_in_js();
     b.enable_css_extraction();
     let out = b.build(Path::new("src/index.tsx"));
@@ -5016,13 +5092,13 @@ fn css_in_js_extracts_styles_and_replaces_with_class() {
 }
 
 #[test]
-fn css_in_js_lowers_safe_cx_and_eliminates_linaria_runtime_module() {
+fn crab_css_lowers_safe_cx_and_eliminates_runtime_module() {
     let fs = MemoryFileSystem::from_files([
-        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
-        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
         (
             "src/index.tsx",
-            "import { css, cx as merge } from '@linaria/core';\n\
+            "import { css, cx as merge } from '@crab-dev/css';\n\
              const base = css`color:red;`;\n\
              const active = css`font-weight:bold;`;\n\
              const enabled = false;\n\
@@ -5039,18 +5115,18 @@ fn css_in_js_lowers_safe_cx_and_eliminates_linaria_runtime_module() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(
         !out.bundle.contains("css should be compiled away"),
-        "已完全消解的 @linaria/core 不应进入产物: {}",
+        "已完全消解的 @crab-dev/css 不应进入产物: {}",
         out.bundle
     );
-    assert!(!out.bundle.contains("@linaria/core"), "{}", out.bundle);
+    assert!(!out.bundle.contains("@crab-dev/css"), "{}", out.bundle);
     assert!(out.bundle.contains("filter(Boolean).join(\" \")"));
-    assert_eq!(out.module_count, 1, "Linaria 模块应被 DME 删除");
+    assert_eq!(out.module_count, 1, "Crab CSS 运行时模块应被 DME 删除");
 }
 
 #[test]
 fn css_in_js_dev_injects_style_tag() {
     // dev（不开抽取）：CSS 随模块体以 <style> 注入，不产 .css 资源
-    let mut b = IncrementalBundler::new(Arc::new(linaria_fixture()));
+    let mut b = IncrementalBundler::new(Arc::new(crab_css_token_fixture()));
     b.enable_css_in_js();
     let out = b.build(Path::new("src/index.tsx"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
@@ -5071,8 +5147,8 @@ fn css_in_js_dev_injects_style_tag() {
 
 #[test]
 fn css_in_js_disabled_leaves_source_untouched() {
-    let out =
-        IncrementalBundler::new(Arc::new(linaria_fixture())).build(Path::new("src/index.tsx"));
+    let out = IncrementalBundler::new(Arc::new(crab_css_token_fixture()))
+        .build(Path::new("src/index.tsx"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(out.assets.iter().all(|a| !a.is_css));
     // 未启用时不应有类名替换发生
@@ -5083,41 +5159,404 @@ fn css_in_js_disabled_leaves_source_untouched() {
 }
 
 #[test]
-fn css_in_js_warns_on_unevaluatable_interpolation() {
-    let fs = MemoryFileSystem::from_files([
-        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
-        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
-        (
-            "src/index.tsx",
-            "import { css } from '@linaria/core';\n\
-             const box = css`color: red; width: ${compute()}; height: 1px;`;\n\
-             export default box;",
-        ),
-    ]);
-    let mut b = IncrementalBundler::new(Arc::new(fs));
-    b.enable_css_in_js();
-    b.enable_css_extraction();
-    let out = b.build(Path::new("src/index.tsx"));
-
-    // 警告但不失败
-    assert!(!out.has_errors(), "求值失败应是警告而非错误");
-    assert!(
-        out.diagnostics
-            .iter()
-            .any(|d| d.message.contains("无法在构建期求值")),
-        "应报出求值失败警告: {:?}",
-        out.diagnostics
-    );
+fn crab_css_extracts_extended_api_and_eliminates_static_runtime() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { css, cx, keyframes, globalStyle, createVar } from '@crab-dev/css';\n\
+         const accent = createVar('accent');\n\
+         const spin = keyframes`from { opacity: 0; } to { opacity: 1; }`;\n\
+         globalStyle`:root { color-scheme: light dark; }`;\n\
+         const box = css`color: ${accent}; animation: ${spin} 1s;`;\n\
+         export default cx(box);",
+    )));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    bundler.enable_dead_module_elimination();
+    bundler.enable_minify();
+    let out = bundler.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
     let css = out
         .assets
         .iter()
-        .find(|a| a.is_css)
-        .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
-        .unwrap_or_default();
-    // 其余声明保留，产物是合法 CSS
-    assert!(css.contains("color: red"), "{css}");
-    assert!(css.contains("height: 1px"), "{css}");
-    assert!(!css.contains("compute"), "不得残留原表达式: {css}");
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8(asset.bytes.clone()).unwrap())
+        .expect("Crab CSS should be extracted");
+    assert!(css.contains("@keyframes spin_"), "{css}");
+    assert!(css.contains(":root{color-scheme: light dark"), "{css}");
+    assert!(css.contains("var(--crab-css-accent_"), "{css}");
+    assert!(!out.bundle.contains("css should be compiled away"));
+    assert!(!out.bundle.contains("runtime-var"));
+    assert_eq!(out.module_count, 1, "static runtime should be removed");
+}
+
+#[test]
+fn crab_css_unsafe_interpolation_is_a_build_error() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { css } from '@crab-dev/css';\n\
+         export const box = css`color: red; width: ${compute()};`;",
+    )));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    bundler.enable_tree_shaking();
+    let out = bundler.build(Path::new("src/index.tsx"));
+    assert!(out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("CRAB_CSS_STATIC_VALUE")
+                && diagnostic.path.as_deref() == Some("src/index.tsx")
+        }),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn crab_css_dev_is_deterministic_and_runtime_scopes_style_registry_slots() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { css } from '@crab-dev/css';\n\
+         export const box = css`color: rebeccapurple;`;",
+    )));
+    bundler.enable_css_in_js();
+    let out = bundler.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("document.__wake_css_styles__"));
+    assert!(out.bundle.contains("crab-css-"));
+    assert!(out.bundle.contains("if (!__wake_cij__)"));
+    assert_eq!(out.bundle.matches("createElement(\"style\")").count(), 1);
+    assert_eq!(
+        out.bundle.matches("var __wake_cij_registry__").count(),
+        1,
+        "only the module that imports Crab CSS should carry the dev registry code"
+    );
+
+    let style_id = |bundle: &str| {
+        let start = bundle.find("\"crab-css-").expect("style registry id") + 1;
+        let tail = &bundle[start..];
+        tail[..tail.find('"').expect("closing style registry id quote")].to_string()
+    };
+    let first_id = style_id(&out.bundle);
+    let rebuilt = bundler.build(Path::new("src/index.tsx"));
+    assert_eq!(
+        style_id(&rebuilt.bundle),
+        first_id,
+        "one bundler must retain its HMR registry slot"
+    );
+
+    let mut same_input = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { css } from '@crab-dev/css';\n\
+         export const box = css`color: rebeccapurple;`;",
+    )));
+    same_input.enable_css_in_js();
+    let same_input = same_input.build(Path::new("src/index.tsx"));
+    assert_eq!(
+        same_input.bundle, out.bundle,
+        "fresh development builds with identical inputs must be byte-for-byte deterministic"
+    );
+
+    let mut independent = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { css } from '@crab-dev/css';\n\
+         export const box = css`color: tomato;`;",
+    )));
+    independent.enable_css_in_js();
+    let independent = independent.build(Path::new("src/index.tsx"));
+    assert_eq!(
+        style_id(&independent.bundle),
+        first_id,
+        "stable module identity, rather than a build nonce, must own the emitted style id"
+    );
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node unavailable; skipping Crab CSS runtime-owner execution");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "wake_crab_css_runtime_owner_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let first_path = dir.join("first.cjs");
+    let second_path = dir.join("second.cjs");
+    std::fs::write(&first_path, &out.bundle).unwrap();
+    std::fs::write(&second_path, &independent.bundle).unwrap();
+    let script = format!(
+        "const styles = [];\n\
+         global.document = {{\n\
+           head: {{ appendChild(el) {{ styles.push(el); }} }},\n\
+           createElement() {{ return {{ textContent: '', remove() {{}} }}; }}\n\
+         }};\n\
+         require({:?});\n\
+         require({:?});\n\
+         if (styles.length !== 2) {{ console.error('count=', styles.length); process.exit(2); }}\n\
+         if (!styles[0].textContent.includes('rebeccapurple')) process.exit(3);\n\
+         if (!styles[1].textContent.includes('tomato')) process.exit(4);\n\
+         process.stdout.write('OK');",
+        first_path.to_string_lossy(),
+        second_path.to_string_lossy()
+    );
+    let executed = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success() && executed.stdout == b"OK",
+        "independent bundle runtimes must not share a style registry slot: {}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+}
+
+#[test]
+fn crab_css_assign_vars_keeps_the_small_runtime() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { css, createVar, assignVars } from '@crab-dev/css';\n\
+         const accent = createVar('accent');\n\
+         export const box = css`color: ${accent};`;\n\
+         export const style = assignVars({ [accent]: 'tomato' });",
+    )));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    bundler.enable_tree_shaking();
+    let out = bundler.build(Path::new("src/index.tsx"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("assignVars"), "{}", out.bundle);
+    assert!(!out.bundle.contains("runtime-var"), "{}", out.bundle);
+}
+
+#[test]
+fn crab_css_drops_styles_owned_by_an_unreachable_module() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        (
+            "src/styles.js",
+            "import { css } from '@crab-dev/css';\n\
+             export const unused = css`color: royalblue;`;",
+        ),
+        (
+            "src/index.js",
+            "if (false) require('./styles.js');\nexport const answer = 42;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    bundler.enable_tree_shaking();
+    bundler.enable_dead_module_elimination();
+    bundler.enable_minify();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.module_count, 1, "{}", out.bundle);
+    assert!(
+        out.assets.iter().all(|asset| !asset.is_css),
+        "unreachable CSS must not be emitted: {:?}",
+        out.assets
+            .iter()
+            .map(|asset| &asset.file_name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn crab_css_token_edit_invalidates_the_consumer_css_artifact() {
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        ("src/tokens.js", "export const color = 'red';"),
+        (
+            "src/index.js",
+            "import { css } from '@crab-dev/css';\n\
+             import { color } from './tokens.js';\n\
+             export const box = css`color: ${color};`;",
+        ),
+    ]));
+    let mut bundler = IncrementalBundler::new(fs.clone());
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+
+    let first = bundler.build(Path::new("src/index.js"));
+    let first_css = first
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8(asset.bytes.clone()).unwrap())
+        .expect("first CSS asset");
+    assert!(first_css.contains("color: red"), "{first_css}");
+
+    fs.insert("src/tokens.js", "export const color = 'blue';");
+    let second = bundler.build(Path::new("src/index.js"));
+    let second_css = second
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8(asset.bytes.clone()).unwrap())
+        .expect("updated CSS asset");
+    assert!(second_css.contains("color: blue"), "{second_css}");
+    assert!(!second_css.contains("color: red"), "{second_css}");
+}
+
+#[test]
+fn crab_css_static_tokens_propagate_through_esm_barrels() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        (
+            "src/tokens.js",
+            "export const tone = 'rebeccapurple'; export const gap = 8;",
+        ),
+        (
+            "src/barrel.js",
+            "export { tone as color } from './tokens.js'; export * from './tokens.js';",
+        ),
+        (
+            "src/index.js",
+            "import { css } from '@crab-dev/css';\n\
+             import { color, gap } from './barrel.js';\n\
+             export const box = css`color: ${color}; gap: ${gap}px;`;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let css = out
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8_lossy(&asset.bytes))
+        .expect("CSS asset");
+    assert!(css.contains("color: rebeccapurple"), "{css}");
+    assert!(css.contains("gap: 8px"), "{css}");
+}
+
+#[test]
+fn crab_css_dynamic_chunk_loads_style_before_javascript() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        (
+            "src/lazy.js",
+            "import { css } from '@crab-dev/css';\n\
+             export const box = css`color: hotpink;`;",
+        ),
+        (
+            "src/index.js",
+            "export const load = () => import('./lazy.js');",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    bundler.enable_code_splitting();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.entry().styles.is_empty());
+    let lazy = out
+        .chunks
+        .iter()
+        .find(|chunk| chunk.name == "lazy")
+        .expect("lazy chunk");
+    assert_eq!(lazy.styles.len(), 1);
+    assert!(out.bundle.contains(&lazy.styles[0]));
+
+    if !node_available() {
+        eprintln!("node 不可用，跳过 chunk CSS 浏览器形态 e2e");
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_chunk_css_order_e2e");
+    let _ = std::fs::remove_dir_all(&dir);
+    let entry = write_chunks(&out, &dir);
+    let entry_file = entry.file_name().unwrap().to_string_lossy().into_owned();
+    let runner = dir.join("run-css-order.js");
+    std::fs::write(
+        &runner,
+        r#"const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+const events = [];
+function local(url) { return url.replace(/^\//, ""); }
+function run(ctx, file) { vm.runInContext(fs.readFileSync(path.join(__dirname, file), "utf8"), ctx, { filename: file }); }
+const document = {
+  createElement: function () { return {}; },
+  head: { appendChild: function (element) {
+    if (element.rel === "stylesheet") { events.push("css:" + element.href); element.onload(); return; }
+    events.push("js:" + element.src);
+    try { run(ctx, local(element.src)); element.onload(); } catch (error) { console.error(error); element.onerror(); }
+  } },
+};
+const ctx = vm.createContext({ console, document });
+run(ctx, process.argv[2]);
+ctx.__wake_entry__.load().then(function () {
+  if (events.length !== 2 || !events[0].startsWith("css:") || !events[1].startsWith("js:")) {
+    console.error(events); process.exit(2);
+  }
+  process.stdout.write(events.join("|"));
+}).catch(function (error) { console.error(error); process.exit(3); });
+"#,
+    )
+    .unwrap();
+    let result = std::process::Command::new("node")
+        .arg(&runner)
+        .arg(&entry_file)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "chunk CSS e2e failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let events = String::from_utf8_lossy(&result.stdout);
+    assert!(events.contains(&lazy.styles[0]), "{events}");
+    assert!(events.contains(&lazy.file_name), "{events}");
+}
+
+#[test]
+fn dynamic_imports_cannot_reorder_entry_owned_shared_css() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        (
+            "src/shared.js",
+            "import { globalStyle } from '@crab-dev/css'; globalStyle`body { color: red; }`;",
+        ),
+        (
+            "src/lazy.js",
+            "import './shared.js'; export const lazy = true;",
+        ),
+        (
+            "src/other.js",
+            "import { globalStyle } from '@crab-dev/css'; globalStyle`body { color: blue; }`;",
+        ),
+        (
+            "src/b.js",
+            "import './other.js'; import './shared.js'; export const b = true;",
+        ),
+        (
+            "src/index.js",
+            "import('./lazy.js'); import './b.js'; export const entry = true;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    bundler.enable_code_splitting();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let css = out
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8_lossy(&asset.bytes))
+        .expect("entry CSS asset");
+    let blue = css.find("color: blue").expect("blue global style");
+    let red = css.find("color: red").expect("red shared style");
+    assert!(
+        blue < red,
+        "static evaluation order must be other -> shared: {css}"
+    );
 }
 
 #[test]
@@ -5130,7 +5569,7 @@ fn css_in_js_runs_in_node_with_correct_class_name() {
         eprintln!("node 不可用，跳过 CSS-in-JS e2e");
         return;
     }
-    let mut b = IncrementalBundler::new(Arc::new(linaria_fixture()));
+    let mut b = IncrementalBundler::new(Arc::new(crab_css_token_fixture()));
     b.enable_css_in_js();
     b.enable_css_extraction();
     let out = b.build(Path::new("src/index.tsx"));
@@ -5165,16 +5604,16 @@ fn css_in_js_runs_in_node_with_correct_class_name() {
 fn css_in_js_cross_module_class_reference() {
     // 跨模块 css 互相引用：base 模块导出一个 css 类，wrap 模块用 `.${base}` 当选择器
     let fs = MemoryFileSystem::from_files([
-        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
-        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
         (
             "src/base.tsx",
-            "import { css } from '@linaria/core';\n\
+            "import { css } from '@crab-dev/css';\n\
              export const base = css`color: red;`;",
         ),
         (
             "src/index.tsx",
-            "import { css } from '@linaria/core';\n\
+            "import { css } from '@crab-dev/css';\n\
              import { base } from './base.js';\n\
              const wrap = css`.${base} { margin: 4px; }`;\n\
              export default { base, wrap };",
@@ -5334,7 +5773,7 @@ fn destructured_export_uses_the_mangled_binding_name() {
 ///
 /// 曾因 `compact_body_names` 把 `module.exports` 改写成 `m.$`（`$` 是 exports 的**值**，
 /// `m` 才是 module）导致赋值落到无关属性上，模块导出恒为空对象——任何
-/// `module.exports = X` 的 CJS 包（如 `@linaria/core` 的 `cx`）整包失效。
+/// `module.exports = X` 形态的 CJS 包整包失效。
 #[test]
 fn cjs_module_exports_assignment_survives_minify() {
     let fs = MemoryFileSystem::from_files([
@@ -5396,7 +5835,7 @@ fn cjs_module_exports_assignment_survives_minify() {
 ///
 /// concat 让被合并模块共享同一个 exports 对象 `$`；而 `module.exports = X` 会把导出**换成
 /// 另一个对象**，此后该模块的导出与其它模块写入的 `$` 分属两处，必丢其一。曾致
-/// `@linaria/core` 与同组 ESM 模块的导出互相覆盖（`cx` 或 ESM 导出二者只能活一个）。
+/// CJS 与同组 ESM 模块的导出互相覆盖（二者只能活一个）。
 #[test]
 fn cjs_module_exports_module_not_merged_into_concat() {
     let fs = MemoryFileSystem::from_files([
@@ -5454,12 +5893,83 @@ fn cjs_module_exports_module_not_merged_into_concat() {
     );
 }
 
+/// 回归：把依赖链两端的 ESM 模块折叠成同一个 eager concat factory，不得凭空制造
+/// `concat -> standalone -> concat` 初始化环。
+///
+/// 真实触发来自 Lucide：barrel 与 helpers 可合并，icon/createLucideIcon 因导出冲突等原因
+/// 独立。直接求值 createLucideIcon 时，它 require concat；concat 又急切求值 barrel/icon，
+/// icon 在 createLucideIcon 写出 default 前拿到循环缓存里的空 exports，最终报
+/// `createLucideIcon is not a function`。
+#[test]
+fn concat_collapse_does_not_create_runtime_initialization_cycle() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/helper.js",
+            "export function decorate(value) { return `<${value}>`; }",
+        ),
+        (
+            "src/create.cjs",
+            "const { decorate } = require('./helper.js');\n\
+             module.exports = function create(name) { return decorate(name); };",
+        ),
+        (
+            "src/icon.cjs",
+            "const create = require('./create.cjs');\nmodule.exports = create('icon');",
+        ),
+        (
+            "src/barrel.js",
+            "import icon from './icon.cjs';\nexport const Icon = icon;",
+        ),
+        (
+            "src/index.js",
+            "import create from './create.cjs';\n\
+             import { Icon } from './barrel.js';\n\
+             export default create('direct') + ',' + Icon;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_mangle();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node 不可用，跳过 concat 初始化环 e2e");
+        return;
+    }
+    let dir = std::env::temp_dir().join("wake_concat_runtime_cycle_regression");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle_path = dir.join("bundle.cjs");
+    std::fs::write(&bundle_path, &out.bundle).unwrap();
+    let script = format!(
+        "const r = require({:?}); const v = r.default ?? r; \
+         if (v !== '<direct>,<icon>') {{ console.error('got', v); process.exit(2); }} \
+         process.stdout.write('OK');",
+        bundle_path.to_string_lossy()
+    );
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stdout == b"OK",
+        "node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        out.bundle
+    );
+}
+
 /// 跨模块**多层**常量传播：`base → mid → leaf` 三层链，css 插值须能取到最深处的值。
 #[test]
 fn css_in_js_multi_level_constant_propagation() {
     let fs = MemoryFileSystem::from_files([
-        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
-        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
         // 第 3 层：最底层的原始常量
         (
             "src/base.js",
@@ -5469,15 +5979,15 @@ fn css_in_js_multi_level_constant_propagation() {
         (
             "src/mid.js",
             "import { UNIT, HUE } from './base.js';\n\
-             export const space = { sm: `${UNIT}px`, lg: `${UNIT * 3}px` };\n\
-             export const theme = { color: HUE, pad: space.sm };",
+             export const color = HUE;\n\
+             export const pad = `${UNIT}px`;",
         ),
         // 第 1 层：css 插值引用第 2 层（其值又来自第 3 层）
         (
             "src/index.tsx",
-            "import { css } from '@linaria/core';\n\
-             import { theme } from './mid.js';\n\
-             const box = css`color: ${theme.color}; padding: ${theme.pad};`;\n\
+            "import { css } from '@crab-dev/css';\n\
+             import { color, pad } from './mid.js';\n\
+             const box = css`color: ${color}; padding: ${pad};`;\n\
              export default box;",
         ),
     ]);
@@ -5503,24 +6013,22 @@ fn css_in_js_multi_level_constant_propagation() {
         css.contains("color: oklch(0.7 0.1 250)"),
         "第 3 层常量未传播: {css}"
     );
-    // pad 穿过 2 层且经过模块内二次引用（space.sm ← UNIT）
+    // pad 穿过 2 层且在中间模块经过模板字符串计算。
     assert!(css.contains("padding: 4px"), "模板内算式未传播: {css}");
 }
 
-/// `@keyframes` 作用域化 + `:global()` 逃逸的端到端。
+/// 一等 `keyframes` 与 `globalStyle` API 的端到端抽取。
 #[test]
-fn css_in_js_keyframes_scoped_and_global_escapes() {
+fn crab_css_keyframes_and_global_style_are_extracted() {
     let fs = MemoryFileSystem::from_files([
-        ("node_modules/@linaria/core/package.json", LINARIA_PKG_JSON),
-        ("node_modules/@linaria/core/index.js", LINARIA_INDEX),
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
         (
             "src/index.tsx",
-            "import { css } from '@linaria/core';\n\
-             const spinner = css`\n\
-             \x20 animation: spin 1s linear infinite;\n\
-             \x20 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }\n\
-             \x20 :global() { html, body { margin: 0; } }\n\
-             `;\n\
+            "import { css, keyframes, globalStyle } from '@crab-dev/css';\n\
+             const spin = keyframes`from { transform: rotate(0deg); } to { transform: rotate(360deg); }`;\n\
+             globalStyle`html, body { margin: 0; }`;\n\
+             const spinner = css`animation: ${spin} 1s linear infinite;`;\n\
              export default spinner;",
         ),
     ]);
@@ -5537,30 +6045,17 @@ fn css_in_js_keyframes_scoped_and_global_escapes() {
         .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
         .expect("应产出 CSS");
 
-    // 类名后缀 = 类名去掉 `.`
-    let cls = css
-        .split('{')
-        .next()
-        .unwrap()
-        .trim_start_matches('.')
-        .to_string();
-    assert!(cls.starts_with("spinner_"), "{cls} / {css}");
-
-    // 关键帧被作用域化，且 animation 引用同步改写
+    let animation = css
+        .split("@keyframes ")
+        .nth(1)
+        .and_then(|rest| rest.split('{').next())
+        .expect("应产出 keyframes 名称");
+    assert!(animation.starts_with("spin_"), "{animation} / {css}");
     assert!(
-        css.contains(&format!("@keyframes spin-{cls}")),
-        "关键帧未作用域化: {css}"
+        css.contains(&format!("animation: {animation} 1s linear infinite")),
+        "animation 应引用同一个静态名称: {css}"
     );
-    assert!(
-        css.contains(&format!("animation: spin-{cls} 1s linear infinite")),
-        "animation 引用未改写: {css}"
-    );
-    // :global() 内容逃逸出类作用域
     assert!(css.contains("html,body{margin: 0;}"), "{css}");
-    assert!(
-        !css.contains(&format!(".{cls} html")),
-        ":global() 内容不应带类前缀: {css}"
-    );
 }
 
 /// TS `namespace` 的点分名 / 声明合并 / 嵌套，以及 `enum` 合并——须在 **prod 压缩路径**下正确。

@@ -1,7 +1,7 @@
 //! 构建期静态求值：把 AST 表达式求成 [`StaticValue`]。
 //!
-//! Linaria 用真实 JS 虚拟机求值模块，wake 无 JS 运行时，改为对一个**刻意受限的纯数据子集**
-//! 做递归求值：字面量 / 模板字符串 / 对象 / 数组 / 标识符引用 / 成员访问 / 数字算术与字符串拼接。
+//! Crab CSS 不执行 JavaScript，而是对一个**刻意受限的纯数据子集**做递归求值：字面量 /
+//! 模板字符串 / 对象 / 数组 / 标识符引用 / 成员访问 / 数字算术与字符串拼接。
 //! 函数调用、条件表达式、比较与位运算一律求值失败（返回 `None`）——宁可报警跳过，也不猜测语义。
 //!
 //! 该子集足以覆盖 design token 模式：
@@ -39,7 +39,8 @@ impl StaticValue {
     pub fn to_css_text(&self) -> Option<String> {
         match self {
             StaticValue::Str(s) => Some(s.clone()),
-            StaticValue::Num(n) => Some(format_number(*n)),
+            StaticValue::Num(n) if n.is_finite() => Some(format_number(*n)),
+            StaticValue::Num(_) => None,
             StaticValue::Bool(b) => Some(b.to_string()),
             // null/undefined/对象/数组插进 CSS 只会产生垃圾文本（JS 会得到 "[object Object]"），
             // 视为求值失败，由调用方报警跳过该声明。
@@ -47,7 +48,7 @@ impl StaticValue {
         }
     }
 
-    /// 按 Linaria `toCSS` 语义把值渲染为 CSS 文本（`@wyw-in-js/processor-utils/utils/toCSS`）。
+    /// 按 Crab CSS 的对象插值契约把值渲染为 CSS 文本。
     ///
     /// - 数组 → 逐项渲染后以换行连接
     /// - 原始值 → 直接字符串化
@@ -58,7 +59,8 @@ impl StaticValue {
     pub fn to_css(&self) -> Option<String> {
         match self {
             StaticValue::Str(s) => Some(s.clone()),
-            StaticValue::Num(n) => Some(format_number(*n)),
+            StaticValue::Num(n) if n.is_finite() => Some(format_number(*n)),
+            StaticValue::Num(_) => None,
             StaticValue::Bool(b) => Some(b.to_string()),
             StaticValue::Arr(items) => {
                 let mut parts = Vec::with_capacity(items.len());
@@ -70,7 +72,6 @@ impl StaticValue {
             StaticValue::Obj(entries) => {
                 let mut parts: Vec<String> = Vec::new();
                 for (k, v) in entries {
-                    // Linaria: `.filter(([, value]) => typeof value === 'number' || value)`
                     // —— 数字全留（含 0），其余 falsy（null/undefined/false/""）丢弃。
                     match v {
                         StaticValue::Num(_) => {}
@@ -86,7 +87,7 @@ impl StaticValue {
                         }
                         _ => {
                             let val = match v {
-                                StaticValue::Num(n) => format_css_number(k, *n),
+                                StaticValue::Num(n) => format_css_number(k, *n)?,
                                 other => other.to_css()?,
                             };
                             parts.push(format!("{}: {};", hyphenate(k), val));
@@ -112,23 +113,46 @@ impl StaticValue {
 /// 按 JS `String(n)` 语义格式化数字（整数不带小数点）。
 fn format_number(n: f64) -> String {
     if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e21 {
-        format!("{}", n as i64)
+        // A float-to-i64 cast saturates above i64::MAX. Zero-decimal formatting preserves the
+        // represented integer throughout JavaScript's non-exponential range instead.
+        format!("{n:.0}")
     } else {
         format!("{n}")
     }
 }
 
-/// 对象属性里的数字值：非 0 且属性不在 [`UNITLESS`] 表中时补 `px`（对齐 Linaria/React 行为）。
-fn format_css_number(key: &str, n: f64) -> String {
+/// 对象属性里的数字值：非 0 且属性不在 [`UNITLESS`] 表中时补 `px`。
+fn format_css_number(key: &str, n: f64) -> Option<String> {
+    if !n.is_finite() {
+        return None;
+    }
     let s = format_number(n);
     if n != 0.0 && !is_unitless(key) {
-        format!("{s}px")
+        Some(format!("{s}px"))
     } else {
-        s
+        Some(s)
     }
 }
 
-/// 驼峰属性名 → 连字符。`--custom` 原样；`ms` 前缀特判为 `-ms-`（对齐 Linaria `hyphenate`）。
+impl std::hash::Hash for StaticValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            StaticValue::Str(value) => value.hash(state),
+            StaticValue::Num(value) => {
+                // Derived `PartialEq` treats -0 and +0 as equal, so their hashes must agree too.
+                let normalized = if *value == 0.0 { 0.0 } else { *value };
+                normalized.to_bits().hash(state);
+            }
+            StaticValue::Bool(value) => value.hash(state),
+            StaticValue::Obj(entries) => entries.hash(state),
+            StaticValue::Arr(items) => items.hash(state),
+            StaticValue::Null | StaticValue::Undefined => {}
+        }
+    }
+}
+
+/// 驼峰属性名 → 连字符。`--custom` 原样；`ms` 前缀特判为 `-ms-`。
 fn hyphenate(s: &str) -> String {
     if s.starts_with("--") {
         return s.to_string();
@@ -149,7 +173,7 @@ fn hyphenate(s: &str) -> String {
     out
 }
 
-/// 取值为纯数字时**不**补 `px` 的属性（源自 Linaria `units.ts` 的 `unitless` 表）。
+/// 取值为纯数字时**不**补 `px` 的属性。
 const UNITLESS: &[&str] = &[
     "animationIterationCount",
     "borderImageOutset",
@@ -205,7 +229,7 @@ fn is_unitless(key: &str) -> bool {
 }
 
 /// 剥掉 `Webkit`/`Moz`/`O`/`ms` 厂商前缀并把其后首字母小写：
-/// `WebkitBoxFlex` → `boxFlex`（对齐 Linaria 的 `/^(Webkit|Moz|O|ms)([A-Z])(.+)$/` 替换）。
+/// `WebkitBoxFlex` → `boxFlex`。
 fn strip_vendor_prefix(key: &str) -> String {
     for p in ["Webkit", "Moz", "ms", "O"] {
         if let Some(rest) = key.strip_prefix(p)
@@ -245,24 +269,23 @@ impl EvalCtx<'_> {
 pub fn eval(expr: &Expression, ctx: &EvalCtx) -> Option<StaticValue> {
     match expr {
         Expression::StringLiteral(s) => Some(StaticValue::Str(ctx.interner.resolve(s.value))),
-        Expression::NumberLiteral(n) => Some(StaticValue::Num(n.value)),
+        Expression::NumberLiteral(n) => finite_number(n.value),
         Expression::BooleanLiteral(b) => Some(StaticValue::Bool(b.value)),
         Expression::NullLiteral(_) => Some(StaticValue::Null),
 
         Expression::Identifier(id) => {
             let name = ctx.interner.resolve(id.name);
-            if name == "undefined" {
-                return Some(StaticValue::Undefined);
-            }
-            ctx.lookup(&name).cloned()
+            ctx.lookup(&name)
+                .cloned()
+                .or_else(|| (name == "undefined").then_some(StaticValue::Undefined))
         }
 
         // `-8` 在 AST 里是一元负号包数字字面量。
         Expression::Unary(u) => {
             let v = eval(&u.argument, ctx)?;
             match (u.operator, v) {
-                (UnaryOperator::Minus, StaticValue::Num(n)) => Some(StaticValue::Num(-n)),
-                (UnaryOperator::Plus, StaticValue::Num(n)) => Some(StaticValue::Num(n)),
+                (UnaryOperator::Minus, StaticValue::Num(n)) => finite_number(-n),
+                (UnaryOperator::Plus, StaticValue::Num(n)) => finite_number(n),
                 _ => None,
             }
         }
@@ -274,22 +297,22 @@ pub fn eval(expr: &Expression, ctx: &EvalCtx) -> Option<StaticValue> {
             let r = eval(&b.right, ctx)?;
             match (b.operator, &l, &r) {
                 (BinaryOperator::Add, StaticValue::Num(x), StaticValue::Num(y)) => {
-                    Some(StaticValue::Num(x + y))
+                    finite_number(x + y)
                 }
                 (BinaryOperator::Sub, StaticValue::Num(x), StaticValue::Num(y)) => {
-                    Some(StaticValue::Num(x - y))
+                    finite_number(x - y)
                 }
                 (BinaryOperator::Mul, StaticValue::Num(x), StaticValue::Num(y)) => {
-                    Some(StaticValue::Num(x * y))
+                    finite_number(x * y)
                 }
                 (BinaryOperator::Div, StaticValue::Num(x), StaticValue::Num(y)) => {
-                    Some(StaticValue::Num(x / y))
+                    finite_number(x / y)
                 }
                 (BinaryOperator::Rem, StaticValue::Num(x), StaticValue::Num(y)) => {
-                    Some(StaticValue::Num(x % y))
+                    finite_number(x % y)
                 }
                 (BinaryOperator::Exp, StaticValue::Num(x), StaticValue::Num(y)) => {
-                    Some(StaticValue::Num(x.powf(*y)))
+                    finite_number(x.powf(*y))
                 }
                 // JS `+`：任一侧为字符串即字符串拼接。
                 (BinaryOperator::Add, StaticValue::Str(_), _)
@@ -376,6 +399,10 @@ pub fn eval(expr: &Expression, ctx: &EvalCtx) -> Option<StaticValue> {
     }
 }
 
+fn finite_number(number: f64) -> Option<StaticValue> {
+    number.is_finite().then_some(StaticValue::Num(number))
+}
+
 /// 求值模板字符串（无标签），拼接为一个字符串。
 ///
 /// 与 `wake_ecma_minify::const_eval` 的模板求值不同：这里插值用 [`StaticValue::to_css_text`]，
@@ -396,11 +423,12 @@ pub fn cooked_text(q: &TemplateElement, interner: &Interner) -> Option<String> {
     q.cooked.map(|a| interner.resolve(a))
 }
 
-/// 收集模块顶层 `const`/`let`/`var` 的可静态求值绑定（按声明序逐条累积，后者可引用前者）。
+/// 收集模块顶层 immutable `const` 的可静态求值绑定（按声明序逐条累积，后者可引用前者）。
 ///
 /// 只走**顶层**声明：函数体/块内的同名变量不参与，避免作用域误命中。
 pub fn collect_module_scope(program: &Program, interner: &Interner, imported: &Scope) -> Scope {
     let mut scope = Scope::default();
+    let unsafe_bindings = mutated_top_level_bindings(program, interner);
     for stmt in program.body.iter() {
         // `export const x = ...` 的声明藏在 ExportNamed 里。
         let decl = match stmt {
@@ -412,25 +440,363 @@ pub fn collect_module_scope(program: &Program, interner: &Interner, imported: &S
             _ => None,
         };
         let Some(decl) = decl else { continue };
+        // `let`/`var` 后续可能被赋值；在没有完整 mutation proof 前绝不能把它们冻结成旧值。
+        if decl.kind != VarKind::Const {
+            continue;
+        }
         for d in decl.declarations.iter() {
             let (Pattern::Ident(id), Some(init)) = (&d.id, &d.init) else {
                 continue;
             };
+            let name = interner.resolve(id.name);
             let ctx = EvalCtx {
                 interner,
                 scope: &scope,
                 imported,
             };
             if let Some(v) = eval(init, &ctx) {
-                scope.insert(interner.resolve(id.name), v);
+                if unsafe_bindings.contains(&name)
+                    && matches!(v, StaticValue::Obj(_) | StaticValue::Arr(_))
+                {
+                    continue;
+                }
+                scope.insert(name, v);
             }
         }
     }
     scope
 }
 
+/// Top-level `const` prevents rebinding, not mutation of referenced arrays/objects. Structured
+/// values are only frozen while every use is a direct member read. A bare reference aliases or
+/// escapes the object (assignment, call argument, return, spread, etc.) and is rejected
+/// conservatively; assignment/update roots are always rejected. Primitive constants are still
+/// safe because copying them cannot create a mutable alias.
+fn mutated_top_level_bindings(
+    program: &Program,
+    interner: &Interner,
+) -> wake_common::FxHashSet<String> {
+    struct Mutations<'a> {
+        interner: &'a Interner,
+        names: wake_common::FxHashSet<String>,
+        /// `(alias, source root)` edges. Only propagate when the alias itself later mutates or
+        /// escapes; a scalar projection such as `const pad = tokens.space` remains safe.
+        aliases: Vec<(String, String)>,
+    }
+
+    impl<'ast> Visit<'ast> for Mutations<'_> {
+        fn visit_statement(&mut self, statement: &Statement<'ast>) {
+            match statement {
+                Statement::VariableDeclaration(declaration) => {
+                    for declarator in declaration.declarations.iter() {
+                        if let (Pattern::Ident(alias), Some(initializer)) =
+                            (&declarator.id, &declarator.init)
+                        {
+                            let alias = self.interner.resolve(alias.name);
+                            for root in escape_roots(initializer, self.interner) {
+                                if root != alias {
+                                    self.aliases.push((alias.clone(), root));
+                                }
+                            }
+                        }
+                    }
+                }
+                Statement::Return(return_statement) => {
+                    if let Some(argument) = &return_statement.argument {
+                        mark_escape_roots(argument, self);
+                    }
+                }
+                Statement::ExportDefault(export) => {
+                    if let ExportDefaultKind::Expression(expression) = &export.declaration
+                        && assignment_target_root(expression, self.interner).is_some()
+                    {
+                        // Exporting a static object does not mutate it. Any importing consumer
+                        // that writes/aliases it is filtered independently by safe_imported_scope.
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            walk_statement(self, statement);
+        }
+
+        fn visit_expression(&mut self, expression: &Expression<'ast>) {
+            match expression {
+                Expression::Assignment(assignment) => {
+                    if let Some(name) = assignment_target_root(&assignment.left, self.interner) {
+                        self.names.insert(name);
+                    }
+                    mark_escape_roots(&assignment.right, self);
+                }
+                Expression::Update(update) => {
+                    if let Some(name) = assignment_target_root(&update.argument, self.interner) {
+                        self.names.insert(name);
+                    }
+                }
+                Expression::Unary(unary) if unary.operator == UnaryOperator::Delete => {
+                    if let Some(name) = assignment_target_root(&unary.argument, self.interner) {
+                        self.names.insert(name);
+                    }
+                }
+                Expression::Identifier(identifier) => {
+                    // This visitor suppresses identifiers that are the root of a read-only member
+                    // chain below. Any identifier reaching here is a bare alias/escape.
+                    self.names.insert(self.interner.resolve(identifier.name));
+                    return;
+                }
+                Expression::Member(member) => {
+                    visit_member_read(self, &member.object);
+                    if let MemberProperty::Computed(property) = &member.property {
+                        self.visit_expression(property);
+                    }
+                    return;
+                }
+                Expression::TaggedTemplate(_) => {
+                    // Compiler templates are pure read sites. User tagged templates are screened
+                    // separately by the transform's semantic marker registry before strict Crab
+                    // interpolation uses this scope.
+                    return;
+                }
+                Expression::Call(call) => {
+                    if let Expression::Member(member) = &call.callee
+                        && let Some(name) = assignment_target_root(&member.object, self.interner)
+                    {
+                        // No purity metadata exists for user methods. Treat every method call as
+                        // potentially mutating its receiver (`splice`, `set`, custom methods...).
+                        self.names.insert(name);
+                    }
+                    for argument in call.arguments.iter() {
+                        mark_escape_roots(argument, self);
+                    }
+                }
+                Expression::New(new_expression) => {
+                    for argument in new_expression.arguments.iter() {
+                        mark_escape_roots(argument, self);
+                    }
+                }
+                _ => {}
+            }
+            walk_expression(self, expression);
+        }
+    }
+
+    fn escape_roots(expression: &Expression, interner: &Interner) -> Vec<String> {
+        let mut roots = wake_common::FxHashSet::default();
+        fn collect(
+            expression: &Expression,
+            interner: &Interner,
+            roots: &mut wake_common::FxHashSet<String>,
+        ) {
+            if let Some(name) = assignment_target_root(expression, interner) {
+                roots.insert(name);
+                return;
+            }
+            match expression {
+                Expression::Array(array) => {
+                    for element in array.elements.iter().flatten() {
+                        collect(element, interner, roots);
+                    }
+                }
+                Expression::Object(object) => {
+                    for member in object.properties.iter() {
+                        match member {
+                            ObjectMember::Property(property) => {
+                                collect(&property.value, interner, roots)
+                            }
+                            ObjectMember::Spread(spread) => {
+                                collect(&spread.argument, interner, roots)
+                            }
+                        }
+                    }
+                }
+                Expression::Conditional(conditional) => {
+                    collect(&conditional.consequent, interner, roots);
+                    collect(&conditional.alternate, interner, roots);
+                }
+                Expression::Logical(logical) => {
+                    collect(&logical.left, interner, roots);
+                    collect(&logical.right, interner, roots);
+                }
+                Expression::Sequence(sequence) => {
+                    if let Some(last) = sequence.expressions.last() {
+                        collect(last, interner, roots);
+                    }
+                }
+                Expression::Spread(spread) => collect(&spread.argument, interner, roots),
+                Expression::Await(await_expression) => {
+                    collect(&await_expression.argument, interner, roots)
+                }
+                Expression::Yield(yield_expression) => {
+                    if let Some(argument) = &yield_expression.argument {
+                        collect(argument, interner, roots);
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect(expression, interner, &mut roots);
+        roots.into_iter().collect()
+    }
+
+    fn mark_escape_roots(expression: &Expression, visitor: &mut Mutations<'_>) {
+        if let Some(name) = assignment_target_root(expression, visitor.interner) {
+            visitor.names.insert(name);
+            return;
+        }
+        match expression {
+            Expression::Array(array) => {
+                for element in array.elements.iter().flatten() {
+                    mark_escape_roots(element, visitor);
+                }
+            }
+            Expression::Object(object) => {
+                for member in object.properties.iter() {
+                    match member {
+                        ObjectMember::Property(property) => {
+                            mark_escape_roots(&property.value, visitor)
+                        }
+                        ObjectMember::Spread(spread) => {
+                            mark_escape_roots(&spread.argument, visitor)
+                        }
+                    }
+                }
+            }
+            Expression::Conditional(conditional) => {
+                mark_escape_roots(&conditional.consequent, visitor);
+                mark_escape_roots(&conditional.alternate, visitor);
+            }
+            Expression::Logical(logical) => {
+                mark_escape_roots(&logical.left, visitor);
+                mark_escape_roots(&logical.right, visitor);
+            }
+            Expression::Sequence(sequence) => {
+                if let Some(last) = sequence.expressions.last() {
+                    mark_escape_roots(last, visitor);
+                }
+            }
+            Expression::Spread(spread) => mark_escape_roots(&spread.argument, visitor),
+            Expression::Await(await_expression) => {
+                mark_escape_roots(&await_expression.argument, visitor)
+            }
+            Expression::Yield(yield_expression) => {
+                if let Some(argument) = &yield_expression.argument {
+                    mark_escape_roots(argument, visitor);
+                }
+            }
+            // Templates produce strings rather than object aliases. In particular, a compiler
+            // tagged template is the intended read site for structured design tokens.
+            _ => {}
+        }
+    }
+
+    fn visit_member_read<'ast>(visitor: &mut Mutations<'_>, mut object: &Expression<'ast>) {
+        loop {
+            match object {
+                Expression::Identifier(_) => return,
+                Expression::Member(member) => {
+                    if let MemberProperty::Computed(property) = &member.property {
+                        visitor.visit_expression(property);
+                    }
+                    object = &member.object;
+                }
+                other => {
+                    visitor.visit_expression(other);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn assignment_target_root(expression: &Expression, interner: &Interner) -> Option<String> {
+        match expression {
+            Expression::Identifier(identifier) => Some(interner.resolve(identifier.name)),
+            Expression::Member(member) => assignment_target_root(&member.object, interner),
+            _ => None,
+        }
+    }
+
+    let mut mutations = Mutations {
+        interner,
+        names: wake_common::FxHashSet::default(),
+        aliases: Vec::new(),
+    };
+    mutations.visit_program(program);
+    loop {
+        let mut changed = false;
+        for (alias, source) in &mutations.aliases {
+            if mutations.names.contains(alias) {
+                changed |= mutations.names.insert(source.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    mutations.names
+}
+
+/// Drop imported structured values that this module mutates, aliases, or passes to unknown code.
+/// The bundler may have proven their exporting module immutable, but a consumer can still mutate
+/// the shared JavaScript object before a style expression reads it.
+pub(crate) fn safe_imported_scope(
+    program: &Program,
+    interner: &Interner,
+    imported: &Scope,
+) -> Scope {
+    let unsafe_bindings = mutated_top_level_bindings(program, interner);
+    imported
+        .iter()
+        .filter(|(name, value)| {
+            !unsafe_bindings.contains(*name)
+                || !matches!(value, StaticValue::Obj(_) | StaticValue::Arr(_))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 /// 模块的静态导出：导出名 → 值（`"default"` 表示默认导出）。
 pub type StaticExports = FxHashMap<String, StaticValue>;
+
+/// A side-effect-free ESM forwarding edge used by the bundler's static token propagation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticReexport {
+    pub specifier: String,
+    /// `Some(name)` for `export { name }`; `None` for `export *` / namespace forwarding.
+    pub imported: Option<String>,
+    /// `Some(alias)` for named/namespace exports; `None` for a plain `export *`.
+    pub exported: Option<String>,
+}
+
+pub fn collect_static_reexports(program: &Program, interner: &Interner) -> Vec<StaticReexport> {
+    let mut out = Vec::new();
+    for statement in program.body.iter() {
+        match statement {
+            Statement::ExportNamed(export) => {
+                let Some(source) = export.source else {
+                    continue;
+                };
+                let specifier = interner.resolve(source);
+                for item in export.specifiers.iter() {
+                    out.push(StaticReexport {
+                        specifier: specifier.clone(),
+                        imported: Some(export_name(&item.local, interner)),
+                        exported: Some(export_name(&item.exported, interner)),
+                    });
+                }
+            }
+            Statement::ExportAll(export) => out.push(StaticReexport {
+                specifier: interner.resolve(export.source),
+                imported: None,
+                exported: export
+                    .exported
+                    .as_ref()
+                    .map(|name| export_name(name, interner)),
+            }),
+            _ => {}
+        }
+    }
+    out
+}
 
 /// 收集一个模块可被其它模块静态引用的导出常量。
 ///
@@ -448,8 +814,9 @@ pub fn collect_static_exports_with(
     interner: &Interner,
     imported: &Scope,
 ) -> StaticExports {
-    let empty = imported;
-    let scope = collect_module_scope(program, interner, imported);
+    let imported = safe_imported_scope(program, interner, imported);
+    let empty = &imported;
+    let scope = collect_module_scope(program, interner, &imported);
     let mut out = StaticExports::default();
 
     for stmt in program.body.iter() {

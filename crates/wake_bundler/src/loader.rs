@@ -162,6 +162,9 @@ pub(crate) fn load_source(
             })
         } else {
             let mut source = text;
+            if crab_component_package_dir(fs, path).is_some() {
+                source = migrate_crab_component_css_runtime(source);
+            }
             if let Some(style_specifier) = crab_component_style_specifier(fs, path) {
                 source.push_str("\nimport ");
                 push_js_string(&mut source, &style_specifier);
@@ -175,6 +178,17 @@ pub(crate) fn load_source(
             })
         }
     }
+}
+
+/// Early published Crab UI entrypoints imported their class-name helper from the predecessor
+/// package without declaring it as a runtime dependency. Restrict the migration to verified
+/// `@crab-dev/rc-*` public entrypoints: application source, other third-party packages, and
+/// component internals receive no legacy CSS compatibility. Once those packages are republished,
+/// this source migration can be removed without changing the public Crab CSS contract.
+fn migrate_crab_component_css_runtime(source: String) -> String {
+    source
+        .replace("\"@linaria/core\"", "\"@crab-dev/css\"")
+        .replace("'@linaria/core'", "'@crab-dev/css'")
 }
 
 /// React 的 production `jsx-dev-runtime` 会按设计导出 `jsxDEV = undefined`。某些已经发布的
@@ -873,6 +887,54 @@ mod tests {
             "{}",
             loaded.source
         );
+    }
+
+    #[test]
+    fn crab_component_public_entry_migrates_legacy_cx_runtime_to_crab_css() {
+        let fs = MemoryFileSystem::from_files([
+            (
+                "node_modules/@crab-dev/rc-alert/package.json",
+                r#"{"name":"@crab-dev/rc-alert"}"#,
+            ),
+            (
+                "node_modules/@crab-dev/rc-alert/esm/index.mjs",
+                "import { cx } from '@linaria/core'; export default cx('alert');",
+            ),
+            (
+                "node_modules/@crab-dev/rc-alert/cjs/index.cjs",
+                "const { cx } = require(\"@linaria/core\"); module.exports = cx('alert');",
+            ),
+        ]);
+
+        for path in [
+            "node_modules/@crab-dev/rc-alert/esm/index.mjs",
+            "node_modules/@crab-dev/rc-alert/cjs/index.cjs",
+        ] {
+            let loaded = load_source(&fs, Path::new(path), &LoadOptions::default()).expect("load");
+            assert!(
+                loaded.source.contains("@crab-dev/css"),
+                "{path}: {}",
+                loaded.source
+            );
+            assert!(
+                !loaded.source.contains("@linaria/core"),
+                "{path}: {}",
+                loaded.source
+            );
+        }
+
+        let ordinary = MemoryFileSystem::from_files([(
+            "src/index.js",
+            "import { cx } from '@linaria/core'; export default cx('app');",
+        )]);
+        let loaded = load_source(
+            &ordinary,
+            Path::new("src/index.js"),
+            &LoadOptions::default(),
+        )
+        .expect("ordinary source load");
+        assert!(loaded.source.contains("@linaria/core"));
+        assert!(!loaded.source.contains("@crab-dev/css"));
     }
 
     #[test]

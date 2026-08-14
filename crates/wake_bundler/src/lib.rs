@@ -94,6 +94,9 @@ pub struct OutputChunk {
     pub module_ids: Vec<u32>,
     /// 依赖的其它 chunk 文件名（须先加载；供 manifest）。
     pub imports: Vec<String>,
+    /// 在该 JavaScript chunk 执行前必须激活的抽取 CSS 文件。入口由 HTML 加载，异步
+    /// chunk 由 Wake runtime 的 chunk manifest 加载。
+    pub styles: Vec<String>,
     /// Source Map V3 JSON（`None` = 未启用或该路径不支持）。WAKE-COMPATIBILITY §M4d。
     /// 由 CLI 写为 `<file_name>.map` 或经 dev server 提供；`code` 末尾对应追加 `sourceMappingURL`。
     pub source_map: Option<String>,
@@ -144,6 +147,7 @@ pub(crate) fn single_chunk(
         chunk_id: 0,
         module_ids,
         imports: Vec::new(),
+        styles: Vec::new(),
         source_map: None, // 由调用方（IncrementalBundler）在启用 sourcemap 时回填
     };
     BuildOutput {
