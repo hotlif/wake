@@ -1,0 +1,66 @@
++++
+title = "创建文档站"
+description = "创建最小 Wake Docs 项目并生成第一篇静态页面"
+kind = "tutorial"
+status = "stable"
++++
+
+import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+
+# 创建文档站
+
+<ResultPanel title="完成后">
+  一个包含导航、首页和 404 的最小静态文档站可以本地预览并生产构建。
+</ResultPanel>
+
+## 创建三个入口
+
+```toml title="wake.config.toml"
+[docs]
+source_dir = "docs"
+title = "My Docs"
+description = "团队技术文档"
+locale = "zh-CN"
+```
+
+```toml title="docs/navigation.toml"
+[[group]]
+id = "start"
+title = "开始"
+pages = ["index"]
+```
+
+```mdx title="docs/index.mdx"
++++
+title = "My Docs"
+description = "从这里开始"
+kind = "overview"
+status = "stable"
++++
+
+# My Docs
+
+这是第一篇页面。
+```
+
+## 运行并验证
+
+<StepFlow>
+  <Step number="01" title="预览">运行 npx wake docs dev .。</Step>
+  <Step number="02" title="检查">侧栏应出现“开始”，首页标题与描述正确。</Step>
+  <Step number="03" title="构建">运行 npx wake docs build . --outdir docs-dist。</Step>
+</StepFlow>
+
+生产目录应包含首页、404 页面和带哈希资源；直接打开首页即可阅读。
+
+## 常见错误
+
+- 页面未列入 navigation.toml：构建会失败，而不是静默隐藏。
+- Frontmatter 保留旧排序字段：删除 group、order 和 slug。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/wake-docs/pages-and-navigation" title="扩展导航" description="添加页面并组织三级目录。" />
+  <NextLink href="/wake-docs/mdx" title="编写 MDX" description="使用统一页面结构和受控 JSX。" />
+</NextActions>

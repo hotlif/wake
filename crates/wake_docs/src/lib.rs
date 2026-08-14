@@ -20,7 +20,8 @@ use std::sync::{
 const RUNTIME_APP: &str = include_str!("../runtime/app.tsx");
 const RUNTIME_COMPONENTS: &str = include_str!("../runtime/components.tsx");
 const RUNTIME_COMPONENT_STATE: &str = include_str!("../runtime/components-state.mjs");
-const RUNTIME_ENTRY: &str = include_str!("../runtime/entry.tsx");
+const RUNTIME_SITE_ENTRY: &str = include_str!("../runtime/site-entry.tsx");
+const RUNTIME_COMPONENTS_ENTRY: &str = include_str!("../runtime/components-entry.tsx");
 const RUNTIME_STYLE: &str = include_str!("../runtime/styles.css");
 const RUNTIME_COMPONENT_STYLE: &str = include_str!("../runtime/components.css");
 const MINIMUM_REACT_MAJOR: u64 = 19;
@@ -102,12 +103,15 @@ pub struct RouteInfo {
     pub file: String,
     pub title: String,
     pub description: String,
+    pub kind: String,
     pub group: String,
-    pub group_order: i32,
-    pub order: i32,
+    pub group_id: String,
+    pub section: String,
+    pub section_id: String,
     pub slug: String,
     pub status: String,
     pub draft: bool,
+    pub hidden: bool,
     pub headings: Vec<HeadingInfo>,
 }
 
@@ -123,6 +127,7 @@ pub enum DocsError {
     Io(PathBuf, String),
     Mdx(PathBuf, String),
     Frontmatter(PathBuf, String),
+    Navigation(PathBuf, String),
     InvalidMacro {
         path: PathBuf,
         line: usize,
@@ -147,6 +152,11 @@ impl fmt::Display for DocsError {
             Self::Frontmatter(path, error) => write!(
                 f,
                 "invalid TOML frontmatter in `{}`: {error}",
+                path.display()
+            ),
+            Self::Navigation(path, error) => write!(
+                f,
+                "invalid documentation navigation `{}`: {error}",
                 path.display()
             ),
             Self::InvalidMacro {
@@ -181,16 +191,40 @@ impl fmt::Display for DocsError {
 impl std::error::Error for DocsError {}
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct Frontmatter {
     title: Option<String>,
     description: String,
-    group: Option<String>,
-    group_order: i32,
-    order: i32,
-    slug: Option<String>,
+    kind: Option<String>,
     status: Option<String>,
     draft: bool,
+    hidden: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavigationConfig {
+    #[serde(rename = "group")]
+    groups: Vec<NavigationGroup>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavigationGroup {
+    id: String,
+    title: String,
+    #[serde(default)]
+    pages: Vec<String>,
+    #[serde(default, rename = "section")]
+    sections: Vec<NavigationSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavigationSection {
+    id: String,
+    title: String,
+    pages: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -309,18 +343,17 @@ pub fn generate_with_mode(
     let mut pages = Vec::new();
     for path in &mdx_files {
         let page = compile_page(&root, &source_dir, path)?;
-        if mode != BuildMode::Production || !page.route.draft {
-            pages.push((path.clone(), page));
+        pages.push((path.clone(), page));
+    }
+    if docs_mode == DocsMode::Site {
+        apply_navigation(&source_dir, &mut pages)?;
+        for (_, page) in &mut pages {
+            sync_page_metadata(page);
         }
     }
-    pages.sort_by(|(_, left), (_, right)| {
-        left.route
-            .group_order
-            .cmp(&right.route.group_order)
-            .then_with(|| left.route.group.cmp(&right.route.group))
-            .then_with(|| left.route.order.cmp(&right.route.order))
-            .then_with(|| left.route.title.cmp(&right.route.title))
-    });
+    if mode == BuildMode::Production {
+        pages.retain(|(_, page)| !page.route.draft);
+    }
     ensure_unique_routes(&pages)?;
 
     let demos = compile_demos(&root, &source_dir, &demo_files, docs_mode)?;
@@ -374,16 +407,27 @@ pub fn generate_with_mode(
         .collect();
     let registry = render_registry(&source_dir, &pages, &demos, &api_entries)?;
     let config = render_config(&root, options, docs_mode)?;
-    let fixed = [
+    let mut fixed = vec![
         ("registry.ts", registry.as_str()),
         ("config.tsx", config.as_str()),
         ("runtime/app.tsx", RUNTIME_APP),
-        ("runtime/components.tsx", RUNTIME_COMPONENTS),
-        ("runtime/components-state.mjs", RUNTIME_COMPONENT_STATE),
-        ("runtime/entry.tsx", RUNTIME_ENTRY),
         ("runtime/styles.css", RUNTIME_STYLE),
-        ("runtime/components.css", RUNTIME_COMPONENT_STYLE),
     ];
+    let entry_relative = match docs_mode {
+        DocsMode::Site => {
+            fixed.push(("runtime/site-entry.tsx", RUNTIME_SITE_ENTRY));
+            "runtime/site-entry.tsx"
+        }
+        DocsMode::Components => {
+            fixed.extend([
+                ("runtime/components.tsx", RUNTIME_COMPONENTS),
+                ("runtime/components-state.mjs", RUNTIME_COMPONENT_STATE),
+                ("runtime/components-entry.tsx", RUNTIME_COMPONENTS_ENTRY),
+                ("runtime/components.css", RUNTIME_COMPONENT_STYLE),
+            ]);
+            "runtime/components-entry.tsx"
+        }
+    };
     for (relative, content) in fixed {
         let path = generated_dir.join(relative);
         if atomic_write_if_changed(&path, content.as_bytes())? {
@@ -424,7 +468,7 @@ pub fn generate_with_mode(
     Ok(GeneratedProject {
         root: root.clone(),
         generated_dir: generated_dir.clone(),
-        entry: generated_dir.join("runtime/entry.tsx"),
+        entry: generated_dir.join(entry_relative),
         aliases: vec![
             ("@wake/docs".to_string(), generated_dir),
             ("@wake/docs-project".to_string(), root),
@@ -436,6 +480,20 @@ pub fn generate_with_mode(
         warnings,
         changed_files,
     })
+}
+
+fn sync_page_metadata(page: &mut CompiledPage) {
+    const PREFIX: &str = "export const __wakeMeta = ";
+    let Some(start) = page.module.find(PREFIX) else {
+        return;
+    };
+    let value_start = start + PREFIX.len();
+    let Some(value_end) = page.module[value_start..].find(";\n") else {
+        return;
+    };
+    let value_end = value_start + value_end;
+    let metadata = serde_json::to_string(&page.route).expect("serializable route");
+    page.module.replace_range(value_start..value_end, &metadata);
 }
 
 fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledPage, DocsError> {
@@ -479,12 +537,17 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
                     .unwrap_or("Page"),
             )
         });
-    let group = frontmatter
-        .group
-        .clone()
-        .unwrap_or_else(|| derive_group(relative));
-    let derived_slug = derive_slug(relative);
-    let slug = normalize_slug(frontmatter.slug.as_deref().unwrap_or(&derived_slug));
+    let kind = frontmatter.kind.unwrap_or_else(|| "guide".to_string());
+    if !matches!(
+        kind.as_str(),
+        "overview" | "tutorial" | "guide" | "reference" | "component"
+    ) {
+        return Err(DocsError::Frontmatter(
+            path.to_path_buf(),
+            format!("kind `{kind}` must be overview, tutorial, guide, reference, or component"),
+        ));
+    }
+    let slug = normalize_slug(&derive_slug(relative));
     let status = frontmatter.status.unwrap_or_else(|| "stable".to_string());
     if !matches!(
         status.as_str(),
@@ -501,12 +564,15 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
         file,
         title,
         description: frontmatter.description,
-        group,
-        group_order: frontmatter.group_order,
-        order: frontmatter.order,
+        kind,
+        group: String::new(),
+        group_id: String::new(),
+        section: String::new(),
+        section_id: String::new(),
         slug,
         status,
         draft: frontmatter.draft,
+        hidden: frontmatter.hidden,
         headings,
     };
 
@@ -542,6 +608,155 @@ fn find_frontmatter(path: &Path, ast: &Node) -> Result<Frontmatter, DocsError> {
         }
     }
     Ok(Frontmatter::default())
+}
+
+fn apply_navigation(
+    source_dir: &Path,
+    pages: &mut [(PathBuf, CompiledPage)],
+) -> Result<(), DocsError> {
+    let path = source_dir.join("navigation.toml");
+    let source = fs::read_to_string(&path)
+        .map_err(|error| DocsError::Navigation(path.clone(), error.to_string()))?;
+    let navigation: NavigationConfig = toml::from_str(&source)
+        .map_err(|error| DocsError::Navigation(path.clone(), error.to_string()))?;
+    if navigation.groups.is_empty() {
+        return Err(DocsError::Navigation(
+            path,
+            "at least one [[group]] is required".to_string(),
+        ));
+    }
+
+    let mut group_ids = BTreeSet::new();
+    let mut placements = BTreeMap::<String, (usize, String, String, String, String)>::new();
+    let mut order = 0usize;
+    for group in &navigation.groups {
+        validate_navigation_id(&path, "group", &group.id)?;
+        if group.title.trim().is_empty() {
+            return Err(DocsError::Navigation(
+                path.clone(),
+                format!("group `{}` must have a title", group.id),
+            ));
+        }
+        if !group_ids.insert(group.id.clone()) {
+            return Err(DocsError::Navigation(
+                path.clone(),
+                format!("duplicate group id `{}`", group.id),
+            ));
+        }
+        for page in &group.pages {
+            insert_navigation_page(&path, &mut placements, page, order, group, None)?;
+            order += 1;
+        }
+        let mut section_ids = BTreeSet::new();
+        for section in &group.sections {
+            validate_navigation_id(&path, "section", &section.id)?;
+            if section.title.trim().is_empty() || section.pages.is_empty() {
+                return Err(DocsError::Navigation(
+                    path.clone(),
+                    format!(
+                        "section `{}/{}` must have a title and at least one page",
+                        group.id, section.id
+                    ),
+                ));
+            }
+            if !section_ids.insert(section.id.clone()) {
+                return Err(DocsError::Navigation(
+                    path.clone(),
+                    format!("duplicate section id `{}/{}`", group.id, section.id),
+                ));
+            }
+            for page in &section.pages {
+                insert_navigation_page(&path, &mut placements, page, order, group, Some(section))?;
+                order += 1;
+            }
+        }
+    }
+
+    let known = pages
+        .iter()
+        .map(|(_, page)| page.route.id.clone())
+        .collect::<BTreeSet<_>>();
+    for id in placements.keys() {
+        if !known.contains(id) {
+            return Err(DocsError::Navigation(
+                path.clone(),
+                format!("navigation references missing page `{id}`"),
+            ));
+        }
+    }
+    for (_, page) in pages.iter_mut() {
+        if let Some((_, group_id, group, section_id, section)) = placements.get(&page.route.id) {
+            page.route.group_id.clone_from(group_id);
+            page.route.group.clone_from(group);
+            page.route.section_id.clone_from(section_id);
+            page.route.section.clone_from(section);
+        } else if !page.route.hidden {
+            return Err(DocsError::Navigation(
+                path.clone(),
+                format!(
+                    "page `{}` is not listed in navigation.toml; list it or set hidden = true",
+                    page.route.id
+                ),
+            ));
+        }
+    }
+    pages.sort_by_key(|(_, page)| {
+        placements
+            .get(&page.route.id)
+            .map_or(usize::MAX, |placement| placement.0)
+    });
+    Ok(())
+}
+
+fn validate_navigation_id(path: &Path, kind: &str, id: &str) -> Result<(), DocsError> {
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(DocsError::Navigation(
+            path.to_path_buf(),
+            format!("{kind} id `{id}` must use lowercase ASCII letters, digits, and hyphens"),
+        ))
+    }
+}
+
+fn normalized_page_id(value: &str) -> String {
+    let value = value.trim().trim_matches('/').replace('\\', "/");
+    value.strip_suffix(".mdx").unwrap_or(&value).to_string()
+}
+
+fn insert_navigation_page(
+    path: &Path,
+    placements: &mut BTreeMap<String, (usize, String, String, String, String)>,
+    page: &str,
+    order: usize,
+    group: &NavigationGroup,
+    section: Option<&NavigationSection>,
+) -> Result<(), DocsError> {
+    let id = normalized_page_id(page);
+    if id.is_empty() {
+        return Err(DocsError::Navigation(
+            path.to_path_buf(),
+            format!("group `{}` contains an empty page id", group.id),
+        ));
+    }
+    let placement = (
+        order,
+        group.id.clone(),
+        group.title.clone(),
+        section.map_or_else(String::new, |section| section.id.clone()),
+        section.map_or_else(String::new, |section| section.title.clone()),
+    );
+    if placements.insert(id.clone(), placement).is_some() {
+        return Err(DocsError::Navigation(
+            path.to_path_buf(),
+            format!("page `{id}` appears more than once"),
+        ));
+    }
+    Ok(())
 }
 
 fn collect_headings(ast: &Node) -> Vec<HeadingInfo> {
@@ -2709,19 +2924,6 @@ fn is_static_value(value: Option<&AttributeValue>) -> bool {
     }
 }
 
-fn derive_group(relative: &Path) -> String {
-    let many = relative.components().count() > 1;
-    relative
-        .components()
-        .next()
-        .and_then(|component| match component {
-            Component::Normal(value) if many => value.to_str(),
-            _ => None,
-        })
-        .map(title_case)
-        .unwrap_or_else(|| "Guide".to_string())
-}
-
 fn derive_slug(relative: &Path) -> String {
     let mut path = relative.with_extension("");
     if path.file_name().and_then(|value| value.to_str()) == Some("index") {
@@ -2951,6 +3153,43 @@ mod tests {
         root
     }
 
+    fn write_fixture_navigation(root: &Path) {
+        let docs = root.join("docs");
+        let mut mdx_files = Vec::new();
+        let mut demo_files = Vec::new();
+        scan_files(&docs, &mut mdx_files, &mut demo_files).expect("scan fixture pages");
+        let mut pages = mdx_files
+            .into_iter()
+            .map(|path| {
+                slash_path(
+                    path.strip_prefix(&docs)
+                        .expect("fixture page beneath docs")
+                        .with_extension(""),
+                )
+            })
+            .collect::<Vec<_>>();
+        pages.sort();
+        let pages = pages
+            .iter()
+            .map(|page| format!("\"{page}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            docs.join("navigation.toml"),
+            format!("[[group]]\nid = \"test\"\ntitle = \"Test\"\npages = [{pages}]\n"),
+        )
+        .expect("fixture navigation");
+    }
+
+    fn generate_fixture(
+        root: &Path,
+        options: &DocsOptions,
+        mode: BuildMode,
+    ) -> Result<GeneratedProject, DocsError> {
+        write_fixture_navigation(root);
+        generate(root, options, mode)
+    }
+
     #[test]
     fn leaves_imports_inside_fenced_code_as_documentation_text() {
         let root = fixture();
@@ -2959,7 +3198,8 @@ mod tests {
             "# Home\n\n```tsx\nimport \"./styles.css\";\nexport default function Example() {}\n```\n",
         )
         .unwrap();
-        let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
         assert!(page.contains(r#"import \"./styles.css\";"#));
         assert!(!page.contains("@wake/docs-project/docs/styles.css"));
@@ -2974,7 +3214,8 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
-        let error = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
         assert!(
             matches!(error, DocsError::InvalidConfig(message) if message.contains("react 19+") && message.contains("^18.3.1"))
         );
@@ -2988,8 +3229,7 @@ mod tests {
             r#"+++
 title = "Button"
 description = "Actions"
-group = "General"
-order = 10
+kind = "guide"
 status = "stable"
 +++
 
@@ -3009,7 +3249,8 @@ import Badge from "../src/badge.tsx"
         )
         .expect("mdx");
         fs::write(root.join("src/badge.tsx"), "export default () => null").expect("badge");
-        let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         assert_eq!(generated.routes.len(), 1);
         assert_eq!(generated.routes[0].slug, "/button");
         let page = fs::read_to_string(generated.generated_dir.join("pages/button.tsx")).unwrap();
@@ -3045,7 +3286,8 @@ const count: number = 2
 "####,
         )
         .unwrap();
-        let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
         assert!(page.contains("<CodeBlock"));
         assert!(page.contains("syntax-keyword"));
@@ -3077,7 +3319,8 @@ const count: number = 2
             "# Checklist\n\n- [ ] Pending\n- [x] Complete\n",
         )
         .unwrap();
-        let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
         assert!(page.contains("<ul className=\"task-list\">"));
         assert!(page.contains("<li className=\"task-list-item\">"));
@@ -3093,49 +3336,166 @@ const count: number = 2
             "# Home\n\n<Demo src={chooseDemo()} />\n",
         )
         .expect("mdx");
-        let error = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
         assert!(matches!(error, DocsError::InvalidMacro { line: 3, .. }));
     }
 
     #[test]
-    fn detects_duplicate_routes_and_excludes_production_drafts() {
+    fn derives_routes_from_paths_and_excludes_production_drafts() {
         let root = fixture();
-        fs::write(root.join("docs/a.mdx"), "+++\nslug = \"/same\"\n+++\n# A").unwrap();
-        fs::write(root.join("docs/b.mdx"), "+++\nslug = \"/same\"\n+++\n# B").unwrap();
-        assert!(matches!(
-            generate(&root, &DocsOptions::default(), BuildMode::Development),
-            Err(DocsError::DuplicateRoute { .. })
-        ));
-        fs::write(
-            root.join("docs/b.mdx"),
-            "+++\ndraft = true\nslug = \"/same\"\n+++\n# B",
-        )
-        .unwrap();
-        let generated = generate(&root, &DocsOptions::default(), BuildMode::Production).unwrap();
+        fs::write(root.join("docs/a.mdx"), "# A").unwrap();
+        fs::write(root.join("docs/b.mdx"), "+++\ndraft = true\n+++\n# B").unwrap();
+        let development =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        assert_eq!(
+            development
+                .routes
+                .iter()
+                .map(|route| route.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a", "/b"]
+        );
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Production).unwrap();
         assert_eq!(generated.routes.len(), 1);
+        assert_eq!(generated.routes[0].slug, "/a");
     }
+
     #[test]
-    fn group_order_controls_sidebar_route_order() {
+    fn navigation_manifest_controls_group_section_and_page_order() {
         let root = fixture();
         fs::write(
-            root.join("docs/later.mdx"),
-            "+++\ntitle = \"稍后\"\ngroup = \"A\"\ngroup_order = 20\n+++\n# Later\n",
+            root.join("docs/install.mdx"),
+            "+++\ntitle = \"安装\"\n+++\n# Install\n",
         )
-        .unwrap();
+        .expect("install");
         fs::write(
-            root.join("docs/first.mdx"),
-            "+++\ntitle = \"优先\"\ngroup = \"Z\"\ngroup_order = 10\n+++\n# First\n",
+            root.join("docs/build.mdx"),
+            "+++\ntitle = \"构建\"\n+++\n# Build\n",
         )
-        .unwrap();
+        .expect("build");
+        fs::write(
+            root.join("docs/navigation.toml"),
+            r#"[[group]]
+id = "app"
+title = "应用开发"
+pages = ["install"]
+
+[[group.section]]
+id = "release"
+title = "构建与发布"
+pages = ["build"]
+"#,
+        )
+        .expect("navigation");
         let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         assert_eq!(
             generated
                 .routes
                 .iter()
-                .map(|route| route.title.as_str())
+                .map(|route| (
+                    route.title.as_str(),
+                    route.group.as_str(),
+                    route.section.as_str()
+                ))
                 .collect::<Vec<_>>(),
-            vec!["优先", "稍后"]
+            vec![("安装", "应用开发", ""), ("构建", "应用开发", "构建与发布")]
         );
+        let build_page =
+            fs::read_to_string(generated.generated_dir.join("pages/build.tsx")).unwrap();
+        assert!(build_page.contains(r#""group":"应用开发""#));
+        assert!(build_page.contains(r#""section":"构建与发布""#));
+    }
+
+    #[test]
+    fn rejects_retired_frontmatter_fields() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            "+++\ntitle = \"Home\"\nslug = \"/legacy\"\n+++\n# Home\n",
+        )
+        .unwrap();
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(
+            matches!(error, DocsError::Frontmatter(_, message) if message.contains("unknown field `slug`"))
+        );
+    }
+
+    #[test]
+    fn navigation_rejects_missing_duplicate_and_unlisted_pages() {
+        let root = fixture();
+        fs::write(root.join("docs/a.mdx"), "# A").unwrap();
+        fs::write(root.join("docs/b.mdx"), "# B").unwrap();
+        fs::write(
+            root.join("docs/navigation.toml"),
+            "[[group]]\nid = \"test\"\ntitle = \"Test\"\npages = [\"a\", \"a\", \"missing\"]\n",
+        )
+        .unwrap();
+        let error = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(
+            matches!(error, DocsError::Navigation(_, message) if message.contains("appears more than once"))
+        );
+
+        fs::write(
+            root.join("docs/navigation.toml"),
+            "[[group]]\nid = \"test\"\ntitle = \"Test\"\npages = [\"a\", \"missing\"]\n",
+        )
+        .unwrap();
+        let error = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(
+            matches!(error, DocsError::Navigation(_, message) if message.contains("missing page `missing`"))
+        );
+
+        fs::write(
+            root.join("docs/navigation.toml"),
+            "[[group]]\nid = \"test\"\ntitle = \"Test\"\npages = [\"a\"]\n",
+        )
+        .unwrap();
+        let error = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(
+            matches!(error, DocsError::Navigation(_, message) if message.contains("page `b` is not listed"))
+        );
+    }
+
+    #[test]
+    fn hidden_pages_do_not_need_navigation_entries() {
+        let root = fixture();
+        fs::write(root.join("docs/a.mdx"), "# A").unwrap();
+        fs::write(
+            root.join("docs/hidden.mdx"),
+            "+++\nhidden = true\n+++\n# Hidden\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/navigation.toml"),
+            "[[group]]\nid = \"test\"\ntitle = \"Test\"\npages = [\"a\"]\n",
+        )
+        .unwrap();
+        let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        assert_eq!(generated.routes.len(), 2);
+        assert!(generated.routes.iter().any(|route| route.hidden));
+    }
+
+    #[test]
+    fn sidebar_keeps_status_in_the_page_header_instead_of_navigation_items() {
+        let runtime = include_str!("../runtime/app.tsx");
+        let sidebar_start = runtime.find("function Sidebar").expect("sidebar");
+        let sidebar_end = runtime[sidebar_start..]
+            .find("function TableOfContents")
+            .map(|offset| sidebar_start + offset)
+            .expect("table of contents");
+        let sidebar = &runtime[sidebar_start..sidebar_end];
+
+        assert!(!sidebar.contains("StatusBadge"));
+        assert!(sidebar.contains("aria-current={active ? \"page\" : undefined}"));
+        assert!(runtime.contains("className=\"breadcrumbs\""));
+        assert!(runtime.contains("<StatusBadge status={meta.status} />"));
+        assert!(runtime.contains("sessionStorage"));
+        assert!(runtime.contains("wake-docs-user-expanded-sections"));
+        assert!(!runtime.contains("wake-docs-expanded-sections"));
+        assert!(!runtime.contains("setExpanded((current) => current.has(activeKey)"));
     }
 
     #[test]
@@ -3143,12 +3503,15 @@ const count: number = 2
         let root = fixture();
         let page = root.join("docs/index.mdx");
         fs::write(&page, "# Home\n\nFirst paragraph.\n").unwrap();
-        let first = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
-        let unchanged = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let first =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let unchanged =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         assert!(unchanged.changed_files.is_empty());
 
         fs::write(&page, "# Home\n\nSecond paragraph.\n").unwrap();
-        let changed = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let changed =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         let relative: BTreeSet<_> = changed
             .changed_files
             .iter()
@@ -3168,13 +3531,15 @@ const count: number = 2
     fn demo_edit_only_rewrites_its_lazy_source_module() {
         let root = fixture();
         fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
-        let first = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let first =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         fs::write(
             root.join("docs/demos/basic.demo.tsx"),
             "export default function Demo() { return <button>Changed</button>; }",
         )
         .unwrap();
-        let changed = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let changed =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         let relative: BTreeSet<_> = changed
             .changed_files
             .iter()
@@ -3209,17 +3574,24 @@ const count: number = 2
             file: format!("docs/{}.mdx", slug.trim_matches('/')),
             title: title.to_string(),
             description: description.to_string(),
+            kind: "guide".to_string(),
             group: "指南".to_string(),
-            group_order: 0,
-            order: 0,
+            group_id: "guide".to_string(),
+            section: String::new(),
+            section_id: String::new(),
             slug: slug.to_string(),
             status: "stable".to_string(),
             draft: false,
+            hidden: false,
             headings: Vec::new(),
         };
         let routes = vec![
             route("Wake & Docs", "中文 <首页>", "/"),
-            route("快速开始", "使用 \"Wake\" 构建", "/guide/start"),
+            route(
+                "创建 React 应用",
+                "使用 \"Wake\" 构建",
+                "/start/create-react-app",
+            ),
         ];
 
         write_route_shells(&outdir, &routes, shell, "Wake & Docs", "默认描述", "zh-CN").unwrap();
@@ -3228,8 +3600,9 @@ const count: number = 2
         assert!(root_html.contains("<html lang=\"zh-CN\">"));
         assert!(root_html.contains("<title>Wake &amp; Docs</title>"));
         assert!(root_html.contains("content=\"中文 &lt;首页&gt;\""));
-        let guide_html = fs::read_to_string(outdir.join("guide/start/index.html")).unwrap();
-        assert!(guide_html.contains("<title>快速开始 · Wake &amp; Docs</title>"));
+        let guide_html =
+            fs::read_to_string(outdir.join("start/create-react-app/index.html")).unwrap();
+        assert!(guide_html.contains("<title>创建 React 应用 · Wake &amp; Docs</title>"));
         assert!(guide_html.contains("content=\"使用 &quot;Wake&quot; 构建\""));
         let not_found_html = fs::read_to_string(outdir.join("404.html")).unwrap();
         assert!(not_found_html.contains("<title>404 · Wake &amp; Docs</title>"));
@@ -3245,7 +3618,7 @@ const count: number = 2
             logo: Some("/logo.svg".to_string()),
             ..DocsOptions::default()
         };
-        let generated = generate(&root, &options, BuildMode::Production).unwrap();
+        let generated = generate_fixture(&root, &options, BuildMode::Production).unwrap();
         let config = fs::read_to_string(generated.generated_dir.join("config.tsx")).unwrap();
         assert!(config.contains(r#""basePath":"/crab/""#));
         assert!(config.contains(r#""logo":"/crab/logo.svg""#));
@@ -3329,6 +3702,46 @@ const count: number = 2
                 .generated_dir
                 .join("runtime/components-state.mjs")
                 .is_file()
+        );
+        assert!(generated.entry.ends_with("runtime/components-entry.tsx"));
+        assert!(
+            !generated
+                .generated_dir
+                .join("runtime/site-entry.tsx")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn site_mode_emits_only_the_site_runtime_surface() {
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Production).unwrap();
+
+        assert!(generated.entry.ends_with("runtime/site-entry.tsx"));
+        let entry = fs::read_to_string(&generated.entry).unwrap();
+        assert!(entry.contains("runtime/app.tsx"));
+        assert!(!entry.contains("ComponentsApp"));
+        assert!(!entry.contains("components.css"));
+        assert!(
+            !generated
+                .generated_dir
+                .join("runtime/components.tsx")
+                .exists()
+        );
+        assert!(
+            !generated
+                .generated_dir
+                .join("runtime/components.css")
+                .exists()
+        );
+        assert!(
+            !generated
+                .generated_dir
+                .join("runtime/components-state.mjs")
+                .exists()
         );
     }
 

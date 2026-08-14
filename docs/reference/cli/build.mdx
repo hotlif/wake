@@ -1,0 +1,24 @@
++++
+title = "build 命令"
+description = "查询应用生产构建、输出目录、缓存、监听和 source map 参数"
+kind = "reference"
+status = "stable"
++++
+
+# build 命令
+
+## 用法
+
+```text
+wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap]
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `ENTRY` | 配置入口 | 临时覆盖 `[html].entry` |
+| `--outdir` | `dist` | 输出目录 |
+| `--cache` | 关闭 | 启用持久构建缓存 |
+| `--watch` | 关闭 | 构建后持续监听 |
+| `--sourcemap` | 关闭 | 输出 source map，同时关闭压缩和代码分割 |
+
+全局 `--no-color` 关闭颜色，`--ui auto|plain|dashboard` 控制长任务终端界面。自动化脚本应根据退出码和结构化诊断判断成功，不解析进度文案。

@@ -1,0 +1,31 @@
++++
+title = "兼容性"
+description = "查询 Node.js、React、操作系统、模块格式和浏览器目标边界"
+kind = "reference"
+status = "stable"
++++
+
+# 兼容性
+
+## 运行环境
+
+| 项目 | 支持范围 |
+| --- | --- |
+| Node.js | `>=22.14 <27` |
+| React | 19 |
+| 模块 | ESM、CommonJS、TypeScript、JSX/TSX |
+| 操作系统 | Windows、Linux、macOS 的已发布原生包 |
+
+Wake npm 主包按当前平台加载对应原生包。缺少平台产物时抛出 `WAKE_UNSUPPORTED_PLATFORM`。
+
+## 浏览器目标
+
+默认目标来自 Wake 配置。旧浏览器语法降级取决于声明的 browserslist；Web API polyfill 不由 Wake 自动注入。
+
+## CSS-in-JS
+
+`@crab-dev/css` 只由 Wake 原生编译，不提供 Babel、Vite、webpack、Rollup 或 esbuild 插件。
+
+## Wake Docs
+
+文档运行时使用 React 19，输出纯静态文件。MDX 是可信源码输入，不应编译不可信用户上传内容。

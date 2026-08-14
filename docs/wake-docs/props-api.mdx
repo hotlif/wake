@@ -1,0 +1,52 @@
++++
+title = "Props API"
+description = "从 TypeScript 类型与 JSDoc 生成可筛选的 Props 表格"
+kind = "tutorial"
+status = "stable"
++++
+
+# Props API
+
+## 完成本页后
+
+Props 表直接来自公开 TypeScript 声明；类型、默认值和 JSDoc 不再在 MDX 中重复维护。
+
+## 编写类型说明
+
+```tsx title="src/notice.tsx"
+export interface NoticeProps {
+  /** 提示标题。 */
+  title: string;
+  /** 视觉语气。 @default "info" */
+  tone?: "info" | "warning";
+}
+
+export function Notice({ title, tone = "info" }: NoticeProps) {
+  return <aside data-tone={tone}>{title}</aside>;
+}
+```
+
+## 生成表格
+
+```mdx
+<API source="../../src/notice.tsx" symbol="NoticeProps" component="Notice" />
+```
+
+Wake 提取属性名、类型、必填状态、默认值和 JSDoc。继承的 DOM 属性折叠显示，无法安全展开的类型产生明确 warning。
+
+## 约束
+
+`source` 相对当前 MDX 解析，`symbol` 必须是该文件可找到的类型。不要在 MDX 中手工复制一份 Props 表，否则代码与文档会漂移。
+
+## 验证方式
+
+搜索属性名和联合类型，确认默认值与源码一致；故意写错 symbol 时构建必须失败。
+
+## 常见错误
+
+- `source` 必须能从当前 MDX 文件解析，`symbol` 必须是可提取的公开类型。
+- 上游声明缺少 JSDoc 时修复源码，不要在 MDX 中复制一份说明。
+
+## 下一步
+
+需要 Provider 或全局样式时配置[Preview](/wake-docs/preview)。

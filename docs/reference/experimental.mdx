@@ -1,0 +1,20 @@
++++
+title = "实验 API"
+description = "了解低层编译器原语的稳定性和资源生命周期"
+kind = "reference"
+status = "experimental"
++++
+
+# 实验 API
+
+`@crab-dev/wake/experimental` 暴露词法、解析、转换和语义分析等低层原语。它们用于工具链研究和 Wake 自身集成，不属于稳定应用构建 API。
+
+## 使用原则
+
+- 锁定 Wake 精确版本；
+- 不把返回的原生资源跨进程或跨版本持久化；
+- 使用后显式关闭带生命周期的对象；
+- 为升级准备真实 fixture 和快照测试；
+- 不向业务插件承诺内部 AST 字段稳定。
+
+需要稳定构建能力时使用 CLI 或 `@crab-dev/wake` 主入口。实验 API 的破坏性调整可以出现在 0.1.x 发布中。

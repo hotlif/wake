@@ -1,0 +1,34 @@
++++
+title = "Wake Docs"
+description = "用 MDX 编写页面、运行 React Demo、生成 Props API，并输出可部署的静态文档站"
+kind = "overview"
+status = "stable"
++++
+
+import { PageActions, Step, StepFlow, TaskCard, TaskGrid } from "../site/components.tsx"
+
+# Wake Docs
+
+<PageActions
+  primaryHref="/wake-docs/create-site"
+  primaryLabel="创建文档站"
+  secondaryHref="/wake-docs/demos"
+  secondaryLabel="查看交互 Demo"
+ />
+
+## 从内容到站点
+
+<StepFlow>
+  <Step number="01" title="组织内容">文件路径生成 URL，`navigation.toml` 只管理导航层级和顺序。</Step>
+  <Step number="02" title="加入交互">Demo 运行真实 React 代码，Props 表直接读取 TypeScript 类型。</Step>
+  <Step number="03" title="静态发布">Wake 输出页面、搜索索引和哈希资源，不需要文档服务端。</Step>
+</StepFlow>
+
+## 选择下一项能力
+
+<TaskGrid>
+  <TaskCard kicker="内容模型" href="/wake-docs/pages-and-navigation" title="设计页面与导航" description="分离文件路由与导航清单，建立稳定信息架构。" />
+  <TaskCard kicker="交互示例" href="/wake-docs/demos" title="运行 React Demo" description="在文档中运行可检查、可复制的真实示例。" />
+  <TaskCard kicker="类型文档" href="/wake-docs/props-api" title="生成 Props API" description="从公开 TypeScript 声明生成可搜索属性表。" />
+  <TaskCard kicker="发布路径" href="/wake-docs/deployment" title="构建并部署" description="生成可直接交给静态托管平台的目录。" />
+</TaskGrid>

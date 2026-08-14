@@ -1,0 +1,29 @@
++++
+title = "Node.js Wake Docs API"
+description = "从 JavaScript 构建文档站或启动文档开发服务器"
+kind = "reference"
+status = "stable"
++++
+
+# Node.js Wake Docs API
+
+```ts
+import { buildDocs, startDocsDevServer } from "@crab-dev/wake";
+```
+
+## `buildDocs(options)`
+
+```ts
+const result = await buildDocs({
+  cwd: process.cwd(),
+  outdir: "docs-dist",
+  basePath: "/docs/",
+  mode: "site",
+});
+```
+
+结果在普通 `BuildResult` 基础上增加 `routes`、`mode` 和 `demos`。
+
+## `startDocsDevServer(options)`
+
+返回与应用开发服务器相同的 `DevServer`，额外接受 `mode: "site" | "components"`。服务关闭、事件和取消语义与 `startDevServer` 一致。

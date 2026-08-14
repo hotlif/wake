@@ -1,0 +1,41 @@
++++
+title = "Wake Docs 配置"
+description = "查询文档目录、站点信息、预览、主题和部署路径"
+kind = "reference"
+status = "stable"
++++
+
+# Wake Docs 配置
+
+## 字段
+
+```toml
+[docs]
+source_dir = "docs"
+title = "My Docs"
+description = "团队技术文档"
+locale = "zh-CN"
+logo = "/logo.svg"
+repository_url = "https://github.com/example/project"
+base_path = "/"
+preview = "docs/preview.tsx"
+theme_css = "docs/theme.css"
+default_theme = "system"
+accent_color = "#7c3aed"
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_dir` | MDX、Demo 和 `navigation.toml` 所在目录 |
+| `title` | 站点名称，同时用于页面标题 |
+| `description` | 站点默认描述 |
+| `locale` | 文档语言，例如 `zh-CN` |
+| `logo` | 位于公开资源目录中的 Logo 路径 |
+| `repository_url` | 源码仓库地址，用于页面的仓库入口 |
+| `base_path` | 部署子路径，首尾使用 `/` |
+| `preview` | Demo 公共 React 包装器 |
+| `theme_css` | 文档外壳主题覆盖 |
+| `default_theme` | `light`、`dark` 或 `system` |
+| `accent_color` | 六位十六进制强调色 |
+
+`navigation.toml` 必须位于 `source_dir` 根。页面路由始终由相对文件路径生成。

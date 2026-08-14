@@ -1,0 +1,39 @@
++++
+title = "React 与 TypeScript"
+description = "配置 React 19 JSX 转换和可靠的 TypeScript 类型检查"
+kind = "guide"
+status = "stable"
++++
+
+# React 与 TypeScript
+
+## 配置 JSX
+
+```toml title="wake.config.toml"
+[react]
+enabled = true
+jsx_import_source = "react"
+```
+
+Wake 转换 TypeScript 和 TSX，但构建器不替代完整类型检查。项目应保留独立的 `tsc` 门禁：
+
+```json title="package.json"
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && wake build --outdir dist"
+  }
+}
+```
+
+## 版本约束
+
+Wake 应用和 Wake Docs 使用 React 19。让 `react` 与 `react-dom` 保持相同主版本，并避免在 workspace 中安装多份 React。
+
+## 验证方式
+
+故意传入一个错误 Props：`npm run typecheck` 应失败；修复后 Wake 才进入生产构建。
+
+## 下一步
+
+启动[开发服务器](/app/dev-server)。

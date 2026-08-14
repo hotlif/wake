@@ -1,0 +1,42 @@
++++
+title = "开发服务器配置"
+description = "查询端口、主机、自动打开、代理和路径重写配置"
+kind = "reference"
+status = "stable"
++++
+
+# 开发服务器配置
+
+```toml
+[dev_server]
+server = "http"
+host = "127.0.0.1"
+port = 5173
+open = false
+
+[[dev_server.proxy]]
+context = ["/api"]
+target = "http://127.0.0.1:3000"
+change_origin = true
+ws = false
+
+[dev_server.proxy.path_rewrite]
+"^/api" = ""
+```
+
+## 字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `server` | 预留的协议字段；当前开发服务器仍以 HTTP 启动 |
+| `host` | 监听地址 |
+| `port` | 默认端口 |
+| `open` | 启动后打开浏览器 |
+| `proxy` | 按声明顺序执行的代理规则数组 |
+| `context` | 由当前代理匹配的路径前缀 |
+| `target` | 后端服务地址 |
+| `ws` | 是否代理 WebSocket |
+| `change_origin` | 是否重写请求 Host |
+| `path_rewrite` | 转发前的路径替换表 |
+
+代理仅用于开发，不写入生产产物。生产转发由部署平台配置。

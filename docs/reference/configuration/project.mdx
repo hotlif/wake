@@ -1,0 +1,77 @@
++++
+title = "项目配置"
+description = "查询项目根、入口、别名、React、TypeScript、define 和浏览器目标"
+kind = "reference"
+status = "stable"
++++
+
+# 项目配置
+
+Wake 从命令目标向上寻找 `wake.config.toml`。配置使用静态 TOML，不执行 JavaScript。
+
+## 根级字段
+
+| 字段 | 用途 |
+| --- | --- |
+| `root_dir` | 相对配置文件改变项目根 |
+| `public_path` | 设置生产资源公开前缀 |
+| `browserslist` | 声明输出浏览器目标 |
+| `browserslist_options` | 控制 Browserslist 查询行为 |
+| `define` | 构建时替换全局常量 |
+| `alias` | 把导入前缀映射到项目路径 |
+| `component_scan` | 声明组件源码扫描规则 |
+| `dev_server` | 开发服务器配置，见[开发服务器配置](/reference/configuration/dev-server) |
+| `html` | HTML 模板与应用入口 |
+| `hooks` | 声明式启动文件路径调整 |
+| `typescript` | TypeScript 转换选项 |
+| `react` | React JSX 转换选项 |
+| `docs` | Wake Docs 配置，见[Wake Docs 配置](/reference/configuration/docs) |
+| `transforms` | 显式启用或禁用语法转换 |
+
+## 最小应用配置
+
+```toml
+[html]
+entry = "src/entry.tsx"
+
+[react]
+enabled = true
+jsx_import_source = "react"
+
+[typescript]
+enabled = true
+only_remove_type_imports = false
+```
+
+## HTML、转换与浏览器
+
+| 配置段 | 字段 | 说明 |
+| --- | --- | --- |
+| `html` | `template` | HTML 外壳路径；未设置时使用 `public/index.html` 或内置外壳 |
+| `html` | `entry` | 应用入口；默认 `src/entry.tsx` |
+| `react` | `enabled` | 是否启用 React JSX automatic runtime |
+| `react` | `jsx_import_source` | JSX runtime 的包来源 |
+| `typescript` | `enabled` | 是否转换 `.ts` 和 `.tsx` |
+| `typescript` | `only_remove_type_imports` | 只删除显式类型导入，避免猜测值导入 |
+| `browserslist_options` | `mobile_to_desktop` | 移动浏览器缺少数据时复用桌面数据 |
+| `transforms` | `include` | 强制启用的转换名称 |
+| `transforms` | `exclude` | 强制禁用的转换名称 |
+| `hooks` | `bootstrap_path` | 自定义 bootstrap 文件路径 |
+
+## 组件扫描
+
+每个 `[[component_scan]]` 规则使用以下字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `namespace` | 通过 `@@@/{namespace}` 导入时使用的命名空间 |
+| `cwd` | 相对项目根的扫描目录 |
+| `generate_source` | 是否把源码文本写入生成结果 |
+| `include` | 文件包含正则字符串 |
+| `exclude` | 文件排除正则字符串 |
+
+## 加载与错误
+
+所有相对路径以配置文件所在目录为基准，再应用 `root_dir`。找不到 `wake.config.toml` 时使用默认配置；文件存在但无法读取、TOML 无效或 Browserslist 查询失败时，Wake 终止并报告对应文件，不会静默回退。
+
+开发服务器字段见[开发服务器配置](/reference/configuration/dev-server)，文档字段见[Wake Docs 配置](/reference/configuration/docs)。

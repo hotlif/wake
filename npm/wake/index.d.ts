@@ -64,19 +64,22 @@ export interface BundleResult extends BuildResult {
 
 export type DocsMode = 'site' | 'components'
 
-export interface DocsRoute {
-  id: string
-  file: string
-  title: string
-  description: string
-  group: string
-  groupOrder: number
-  order: number
-  slug: string
-  status: string
-  draft: boolean
-  headings: Array<{ depth: number; title: string; id: string }>
-}
+  export interface DocsRoute {
+    id: string
+    file: string
+    title: string
+    description: string
+    kind: 'overview' | 'tutorial' | 'guide' | 'reference' | 'component'
+    group: string
+    groupId: string
+    section: string
+    sectionId: string
+    slug: string
+    status: string
+    draft: boolean
+    hidden: boolean
+    headings: Array<{ depth: number; title: string; id: string }>
+  }
 export interface DocsDemo {
   id: string
   title: string

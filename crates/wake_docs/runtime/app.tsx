@@ -7,6 +7,8 @@ type ResolvedTheme = "light" | "dark";
 type DemoRecord = (typeof demos)[number];
 type PageRecord = (typeof pages)[number];
 type ViewportPreset = "responsive" | "tablet" | "mobile";
+type NavSection = { id: string; title: string; pages: PageRecord[] };
+type NavGroup = { id: string; title: string; pages: PageRecord[]; sections: NavSection[] };
 
 const isChinese = siteConfig.locale.toLowerCase().startsWith("zh");
 const text = (english: string, chinese: string) => isChinese ? chinese : english;
@@ -195,9 +197,10 @@ export function CodeBlock({ language, code, title, children }: { language: strin
 }
 
 function PagePager({ current }: { current: string }) {
-  const index = pages.findIndex((page) => page.slug === current);
-  const previous = index > 0 ? pages[index - 1] : undefined;
-  const next = index >= 0 && index < pages.length - 1 ? pages[index + 1] : undefined;
+  const visiblePages = pages.filter((page) => !page.hidden);
+  const index = visiblePages.findIndex((page) => page.slug === current);
+  const previous = index > 0 ? visiblePages[index - 1] : undefined;
+  const next = index >= 0 && index < visiblePages.length - 1 ? visiblePages[index + 1] : undefined;
   const link = (page: PageRecord, direction: "previous" | "next") => <a
     className={"page-pager-link page-pager-" + direction}
     href={siteConfig.basePath.replace(/\/$/, "") + page.slug}
@@ -215,9 +218,13 @@ function PagePager({ current }: { current: string }) {
 
 export function MdxPage({ meta, children }: { meta: PageRecord; children: React.ReactNode }) {
   useEffect(() => { updateDocumentMetadata(pageTitle(meta.title), meta.description || siteConfig.description); }, [meta.title, meta.description]);
+  const crumbs = [meta.group, meta.section, meta.title]
+    .filter(Boolean)
+    .filter((crumb, index, values) => values.indexOf(crumb) === index);
   return <article className="mdx-page">
     <header className="page-header">
-      <div className="eyebrow"><span>{meta.group}</span><StatusBadge status={meta.status} />{meta.draft && <span className="status status-draft">{statusText("draft")}</span>}</div>
+      <nav className="breadcrumbs" aria-label={text("Breadcrumb", "面包屑")}>{crumbs.map((crumb, index) => <React.Fragment key={crumb}><span>{crumb}</span>{index < crumbs.length - 1 && <i aria-hidden="true">/</i>}</React.Fragment>)}</nav>
+      {(meta.status !== "stable" || meta.draft) && <div className="eyebrow"><StatusBadge status={meta.status} />{meta.draft && <span className="status status-draft">{statusText("draft")}</span>}</div>}
       <h1>{meta.title}</h1>
       {meta.description && <p className="page-description">{meta.description}</p>}
     </header>
@@ -402,9 +409,10 @@ function Search({ open, close, go }: { open: boolean; close: () => void; go: (sl
   useEffect(() => { if (open) { setQuery(""); setActive(0); } }, [open]);
   const sectionKind = text("Section", "章节");
   const propKind = text("Prop", "属性");
-  const index = useMemo(() => pages.flatMap((page) => {
+  const index = useMemo(() => pages.filter((page) => !page.hidden).flatMap((page) => {
     const apiProps = Object.entries(apiDocs as Record<string, any>).filter(([key]) => key.startsWith(page.file + "|")).flatMap(([, doc]) => doc.props.map((prop: any) => ({ name: prop.name, anchor: "api-" + doc.symbol })));
-    return [{ title: page.title, detail: page.description, slug: page.slug, kind: page.group }, ...page.headings.filter((heading) => heading.depth > 1).map((heading) => ({ title: heading.title, detail: page.title, slug: page.slug + "#" + heading.id, kind: sectionKind })), ...apiProps.map((prop) => ({ title: prop.name, detail: page.title, slug: page.slug + "#" + prop.anchor, kind: propKind }))];
+    const location = [page.group, page.section].filter(Boolean).join(" / ");
+    return [{ title: page.title, detail: page.description, slug: page.slug, kind: location }, ...page.headings.filter((heading) => heading.depth > 1).map((heading) => ({ title: heading.title, detail: page.title + " · " + location, slug: page.slug + "#" + heading.id, kind: sectionKind })), ...apiProps.map((prop) => ({ title: prop.name, detail: page.title, slug: page.slug + "#" + prop.anchor, kind: propKind }))];
   }), []);
   const results = query.trim() ? index.filter((item) => (item.title + " " + item.detail + " " + item.kind).toLowerCase().includes(query.toLowerCase())).slice(0, 12) : index.filter((item) => item.kind !== sectionKind && item.kind !== propKind).slice(0, 8);
   useEffect(() => { if (open) document.getElementById("wake-search-result-" + active)?.scrollIntoView({ block: "nearest" }); }, [active, query, open]);
@@ -449,12 +457,73 @@ function Logo() {
 }
 
 function Sidebar({ current, close }: { current: string; close?: () => void }) {
-  const groups = pages.reduce((result, page) => {
-    (result[page.group] ||= []).push(page);
+  const groups = useMemo(() => pages.filter((page) => !page.hidden).reduce((result, page) => {
+    let group = result.find((item) => item.id === page.group_id);
+    if (!group) {
+      group = { id: page.group_id, title: page.group, pages: [], sections: [] };
+      result.push(group);
+    }
+    if (!page.section_id) group.pages.push(page);
+    else {
+      let section = group.sections.find((item) => item.id === page.section_id);
+      if (!section) {
+        section = { id: page.section_id, title: page.section, pages: [] };
+        group.sections.push(section);
+      }
+      section.pages.push(page);
+    }
     return result;
-  }, {} as Record<string, PageRecord[]>);
+  }, [] as NavGroup[]), []);
+  const activeSection = groups.flatMap((group) => group.sections.map((section) => ({ group, section }))).find(({ section }) => section.pages.some((page) => page.slug === current));
+  const activeKey = activeSection ? activeSection.group.id + "/" + activeSection.section.id : "";
+  const [expandedByUser, setExpandedByUser] = useState<Set<string>>(() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("wake-docs-user-expanded-sections") || "[]");
+      return new Set(Array.isArray(saved) ? saved.filter((value) => typeof value === "string") : []);
+    } catch {
+      return new Set();
+    }
+  });
+  useEffect(() => {
+    sessionStorage.setItem("wake-docs-user-expanded-sections", JSON.stringify([...expandedByUser]));
+  }, [expandedByUser]);
+  useEffect(() => {
+    document.querySelector('.sidebar-nav a[aria-current="page"]')?.scrollIntoView({ block: "nearest" });
+  }, [current]);
+  const link = (page: PageRecord, nested = false) => {
+    const active = page.slug === current;
+    return <a
+      key={page.slug}
+      className={(active ? "active" : "") + (nested ? " nested" : "")}
+      aria-current={active ? "page" : undefined}
+      href={siteConfig.basePath.replace(/\/$/, "") + page.slug}
+      onClick={(event) => { navigate(event, page.slug); close?.(); }}
+    >
+      <span>{page.title}</span>
+    </a>;
+  };
   return <nav className="sidebar-nav" aria-label={text("Documentation", "文档导航")}>
-    {Object.entries(groups).map(([group, items]) => <div className="nav-group" key={group}><h2>{group}</h2>{items.map((page) => <a key={page.slug} className={page.slug === current ? "active" : ""} href={siteConfig.basePath.replace(/\/$/, "") + page.slug} onClick={(event) => { navigate(event, page.slug); close?.(); }}><span>{page.title}</span><StatusBadge status={page.status} /></a>)}</div>)}
+    {groups.map((group) => <div className="nav-group" key={group.id}>
+      <h2>{group.title}</h2>
+      {group.pages.map((page) => link(page))}
+      {group.sections.map((section) => {
+        const key = group.id + "/" + section.id;
+        const open = expandedByUser.has(key) || key === activeKey;
+        const controls = "wake-nav-" + group.id + "-" + section.id;
+        return <div className="nav-section" key={key}>
+          <button type="button" className="nav-section-toggle" aria-expanded={open} aria-controls={controls} onClick={() => setExpandedByUser((current) => {
+            const next = new Set(current);
+            if (next.has(key)) next.delete(key); else next.add(key);
+            return next;
+          })}>
+            <span>{section.title}</span><i aria-hidden="true">›</i>
+          </button>
+          <div className="nav-section-pages" id={controls} hidden={!open}>
+            {section.pages.map((page) => link(page, true))}
+          </div>
+        </div>;
+      })}
+    </div>)}
   </nav>;
 }
 

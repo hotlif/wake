@@ -1,0 +1,46 @@
++++
+title = "构建与部署 Wake Docs"
+description = "生成静态文档站、验证直接路由并设置缓存策略"
+kind = "tutorial"
+status = "stable"
++++
+
+# 构建与部署 Wake Docs
+
+## 完成本页后
+
+`docs-dist` 可以独立部署；深层 URL、搜索、Demo 和哈希资源均通过生产环境验收。
+
+## 生产构建
+
+```bash
+npx wake docs build . --outdir docs-dist
+```
+
+构建会验证导航、Frontmatter、MDX、Demo 静态路径和 Props API，并为每个页面写入可直接访问的 HTML shell。
+
+## 部署
+
+发布整个 `docs-dist`。HTML 使用短缓存，带哈希的 JS/CSS 使用长缓存。部署到子路径时在 `[docs]` 中设置一致的 `base_path`。
+
+## CI 门禁
+
+```bash
+npm ci
+npm run docs:check
+npm run docs:build
+```
+
+## 验收
+
+从地址栏直接打开三个深层页面，测试搜索、侧栏折叠、Demo、源码查看、明暗主题和手机抽屉。不要只从首页点击进入。
+
+## 常见错误
+
+- 页面未列入导航：加入 `navigation.toml` 或显式隐藏；
+- 直接路由 404：部署目录不完整或静态平台规则错误；
+- Demo 空白：先查看当前 Demo 的错误层，再检查 Preview 依赖。
+
+## 下一步
+
+精确配置见[Wake Docs 配置](/reference/configuration/docs)，命令见[Docs CLI](/reference/cli/docs)。

@@ -1,0 +1,42 @@
++++
+title = "页面与导航"
+description = "使用文件路径生成路由，并通过 navigation.toml 维护三级导航"
+kind = "guide"
+status = "stable"
++++
+
+# 页面与导航
+
+## 路由来自文件路径
+
+`docs/app/hmr.mdx` 对应 `/app/hmr`，`docs/index.mdx` 对应 `/`。Frontmatter 不允许自定义 slug，避免文件位置、路由和导航出现三套事实来源。
+
+## 导航来自单一清单
+
+```toml title="docs/navigation.toml"
+[[group]]
+id = "app"
+title = "应用开发"
+
+[[group.section]]
+id = "development"
+title = "开发"
+pages = ["app/dev-server", "app/hmr"]
+```
+
+一级 group 始终可见，section 在侧栏中可折叠，pages 的顺序就是阅读顺序。
+
+## 构建约束
+
+- 导航引用不存在页面时失败；
+- 页面出现两次时失败；
+- 未列入导航的页面必须声明 `hidden = true`；
+- group 和 section ID 只允许小写字母、数字与连字符。
+
+## 验证方式
+
+运行文档检查后，分别从桌面侧栏、移动抽屉和搜索打开当前页面；三处必须显示同一层级路径。
+
+## 下一步
+
+开始[编写 MDX](/wake-docs/mdx)。

@@ -1,0 +1,47 @@
++++
+title = "安装 Wake"
+description = "安装运行时与构建工具，并确认本机可以执行 Wake"
+kind = "tutorial"
+status = "stable"
++++
+
+# 安装 Wake
+
+## 完成本页后
+
+你会得到可执行的 Wake CLI、React 19 和 TypeScript 开发环境。
+
+## 前置条件
+
+- Node.js `>=22.14 <27`；
+- npm；
+- 一个包含 `package.json` 的项目目录。
+
+Rust 只用于参与 Wake 自身开发，业务项目无需安装 Rust。
+
+## 安装依赖
+
+```bash
+npm install react react-dom
+npm install --save-dev @crab-dev/wake typescript @types/react @types/react-dom
+```
+
+为团队项目提交 `package-lock.json`，并让 CI 使用 `npm ci`。
+
+## 验证安装
+
+```bash
+npx wake --version
+```
+
+命令应输出与 `package.json` 中 `@crab-dev/wake` 一致的版本。
+
+## 常见错误
+
+- 找不到 `wake`：使用 `npx wake` 或 npm script，不依赖全局安装。
+- React 18 被拒绝：将 `react` 和 `react-dom` 一起升级到 19。
+- 原生包缺失：删除不完整的安装目录后重新运行 `npm ci`。
+
+## 下一步
+
+继续[创建 React 应用](/start/create-react-app)，或把 Wake [接入现有项目](/start/existing-project)。

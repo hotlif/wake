@@ -1,0 +1,57 @@
++++
+title = "接入现有项目"
+description = "在不重写业务代码的前提下把 React 项目迁入 Wake"
+kind = "tutorial"
+status = "stable"
++++
+
+import { CompareCard, CompareCards, NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+
+# 接入现有项目
+
+<ResultPanel title="完成后">
+  旧构建链与 Wake 可以并行运行，并在独立目录中比较开发与生产结果。
+</ResultPanel>
+
+## 添加最小配置
+
+```toml title="wake.config.toml"
+[html]
+entry = "src/main.tsx"
+
+[react]
+enabled = true
+jsx_import_source = "react"
+```
+
+入口不同时使用真实路径。先不要复制旧 bundler 的全部选项。
+
+## 分阶段切换
+
+<StepFlow>
+  <Step number="01" title="跑通入口">执行 npx wake dev .，验证 React 和裸包导入。</Step>
+  <Step number="02" title="补齐行为">按需配置别名、代理、CSS 与资源。</Step>
+  <Step number="03" title="比较产物">构建到 dist-wake，确认路由和交互后再切 scripts。</Step>
+</StepFlow>
+
+<CompareCards>
+  <CompareCard title="迁移前记录" tone="neutral">开发命令、生产文件、环境变量、别名、代理和动态导入。</CompareCard>
+  <CompareCard title="切换前验证" tone="positive">开发和生产都测试子路由、刷新、动态导入与静态资源。</CompareCard>
+</CompareCards>
+
+## 验证方式
+
+关键路由、请求和交互结果一致，Wake 产物位于独立目录后，再替换 npm scripts。
+
+## 常见错误
+
+- 浏览器入口依赖 Node 内置模块：换成 Web API 或服务端接口。
+- 旧环境变量由插件注入：迁移到 Wake `define`。
+- 别名只写在 tsconfig：Wake 仍需要自己的 alias 配置。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/app/react-typescript" title="校准类型环境" description="固定 React JSX 与 TypeScript 行为。" />
+  <NextLink href="/app/aliases-and-proxy" title="迁移别名与代理" description="补齐源码路径和开发 API 请求。" />
+</NextActions>

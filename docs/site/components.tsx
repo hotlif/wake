@@ -1,115 +1,277 @@
 import React from "react";
-import Alert from "@crab-dev/rc-alert";
-import Button from "@crab-dev/rc-button";
-import Card from "@crab-dev/rc-card";
-import Prose from "@crab-dev/rc-prose";
-import Tag from "@crab-dev/rc-tag";
 
+export type VisualName = "home" | "hmr" | "build" | "dynamic-css";
+export type FeatureIconName =
+  | "app"
+  | "style"
+  | "docs"
+  | "search"
+  | "page"
+  | "navigation"
+  | "demo"
+  | "api"
+  | "preview"
+  | "deploy"
+  | "scope"
+  | "compose"
+  | "variable"
+  | "animation"
+  | "global"
+  | "boundary";
 
-export function HomeHero() {
-  return <section className="wake-home-hero">
-    <div className="wake-hero-orb wake-hero-orb-one" />
-    <div className="wake-hero-orb wake-hero-orb-two" />
+type Children = { children: React.ReactNode };
+
+function unwrapMdxParagraphs(children: React.ReactNode) {
+  return React.Children.toArray(children).flatMap((child) => {
+    if (!React.isValidElement<{ children?: React.ReactNode }>(child) || child.type !== "p") return [child];
+    return React.Children.toArray(child.props.children);
+  });
+}
+
+function Arrow({ d }: { d: string }) {
+  return <path className="diagram-arrow" d={d} />;
+}
+
+function Node({ x, y, width, label, accent = false }: { x: number; y: number; width: number; label: string; accent?: boolean }) {
+  return <g className={accent ? "diagram-node diagram-node-accent" : "diagram-node"}>
+    <rect x={x} y={y} width={width} height="38" rx="4" />
+    <text x={x + width / 2} y={y + 24} textAnchor="middle">{label}</text>
+  </g>;
+}
+
+function TechnicalVisual({ name, alt, decorative = false }: { name: VisualName; alt?: string; decorative?: boolean }) {
+  let content: React.ReactNode;
+
+  switch (name) {
+    case "home":
+      content = <>
+        <Arrow d="M138 57H236" /><Arrow d="M138 143H236" /><Arrow d="M404 57H502" /><Arrow d="M404 143H502" />
+        <Node x={34} y={38} width={104} label="React" />
+        <Node x={34} y={124} width={104} label="TypeScript" />
+        <Node x={236} y={76} width={168} label="Wake" accent />
+        <Node x={502} y={38} width={104} label="CSS" />
+        <Node x={502} y={124} width={104} label="Assets" />
+      </>;
+      break;
+    case "hmr":
+      content = <>
+        <Node x={28} y={76} width={136} label="File change" />
+        <Node x={252} y={76} width={136} label="Module update" accent />
+        <Node x={476} y={76} width={136} label="Browser state" />
+        <Arrow d="M164 95H252" /><Arrow d="M388 95H476" /><Arrow d="M544 122C544 171 96 171 96 122" />
+      </>;
+      break;
+    case "build":
+      content = <>
+        <Node x={24} y={76} width={124} label="Module graph" />
+        <Node x={258} y={76} width={124} label="Optimize" accent />
+        <Node x={492} y={18} width={124} label="JavaScript" />
+        <Node x={492} y={66} width={124} label="CSS" />
+        <Node x={492} y={114} width={124} label="Assets" />
+        <Node x={492} y={162} width={124} label="Manifest" />
+        <Arrow d="M148 95H258" /><Arrow d="M382 95H440V37H492" /><Arrow d="M440 95H492" /><Arrow d="M440 95V133H492" /><Arrow d="M440 95V181H492" />
+      </>;
+      break;
+    case "dynamic-css":
+      content = <>
+        <Node x={24} y={76} width={136} label="React value" />
+        <Node x={252} y={76} width={136} label="CSS variable" accent />
+        <Node x={480} y={76} width={136} label="Static rule" />
+        <Arrow d="M160 95H252" /><Arrow d="M388 95H480" />
+      </>;
+      break;
+  }
+
+  return <svg
+    className={`technical-visual technical-visual-${name}`}
+    viewBox="0 0 640 200"
+    role={!decorative && alt ? "img" : undefined}
+    aria-hidden={decorative || !alt ? true : undefined}
+    aria-label={!decorative ? alt : undefined}
+  >
+    {!decorative && alt && <title>{alt}</title>}
+    {content}
+  </svg>;
+}
+
+function Actions({ primaryHref, primaryLabel, secondaryHref, secondaryLabel }: {
+  primaryHref: string;
+  primaryLabel: string;
+  secondaryHref?: string;
+  secondaryLabel?: string;
+}) {
+  return <div className="wake-actions">
+    <a className="wake-button wake-button-primary" href={primaryHref}>{primaryLabel}<span aria-hidden="true">→</span></a>
+    {secondaryHref && secondaryLabel && <a className="wake-button" href={secondaryHref}>{secondaryLabel}</a>}
+  </div>;
+}
+
+function FeatureIcon({ name }: { name: FeatureIconName }) {
+  let paths: React.ReactNode;
+  switch (name) {
+    case "app": paths = <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M8 9v11" /></>; break;
+    case "style": paths = <><path d="M12 3c4 4 7 7 7 11a7 7 0 0 1-14 0c0-4 3-7 7-11Z" /><path d="M9 17c1.4.8 3.3.8 5 0" /></>; break;
+    case "docs": paths = <><path d="M5 3h10l4 4v14H5z" /><path d="M15 3v5h4M8 12h8M8 16h6" /></>; break;
+    case "search": paths = <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 5 5" /></>; break;
+    case "page": paths = <><path d="M5 3h10l4 4v14H5z" /><path d="M15 3v5h4M8 12h8M8 16h8" /></>; break;
+    case "navigation": paths = <><path d="M5 5h14M5 12h9M5 19h14" /><circle cx="18" cy="12" r="2" /></>; break;
+    case "demo": paths = <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m10 9 5 3-5 3z" /></>; break;
+    case "api": paths = <><path d="M8 5 3 12l5 7M16 5l5 7-5 7M14 3l-4 18" /></>; break;
+    case "preview": paths = <><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></>; break;
+    case "deploy": paths = <><path d="M12 3v12M7 8l5-5 5 5" /><path d="M4 14v6h16v-6" /></>; break;
+    case "scope": paths = <><rect x="4" y="4" width="16" height="16" rx="3" /><path d="M8 9h8M8 13h5" /></>; break;
+    case "compose": paths = <><rect x="3" y="5" width="10" height="10" rx="2" /><rect x="11" y="9" width="10" height="10" rx="2" /></>; break;
+    case "variable": paths = <><path d="M4 7h16M4 17h16" /><circle cx="9" cy="7" r="2" /><circle cx="15" cy="17" r="2" /></>; break;
+    case "animation": paths = <><path d="M20 11a8 8 0 1 1-3-6.2" /><path d="M17 2v4h4" /><path d="M12 8v5l3 2" /></>; break;
+    case "global": paths = <><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18" /></>; break;
+    case "boundary": paths = <><path d="M12 3 5 6v5c0 5 2.8 8.2 7 10 4.2-1.8 7-5 7-10V6z" /><path d="m9 12 2 2 4-5" /></>; break;
+  }
+  return <svg className="wake-feature-icon" viewBox="0 0 24 24" aria-hidden="true">{paths}</svg>;
+}
+
+export function PageActions(props: {
+  primaryHref: string;
+  primaryLabel: string;
+  secondaryHref?: string;
+  secondaryLabel?: string;
+}) {
+  return <div className="wake-page-actions"><Actions {...props} /></div>;
+}
+
+export function FeatureGrid({ children }: Children) {
+  return <div className="wake-feature-grid">{unwrapMdxParagraphs(children)}</div>;
+}
+
+export function FeatureCard({ icon, href, title, description, label }: {
+  icon: FeatureIconName;
+  href: string;
+  title: string;
+  description: string;
+  label?: string;
+}) {
+  return <a className="wake-feature-card" href={href}>
+    <span className="wake-feature-icon-wrap"><FeatureIcon name={icon} /></span>
+    <span className="wake-feature-copy">
+      {label && <small>{label}</small>}
+      <strong>{title}</strong>
+      <p>{description}</p>
+    </span>
+    <i aria-hidden="true">↗</i>
+  </a>;
+}
+
+export function HomeLead({
+  title,
+  description,
+  status,
+  primaryHref,
+  primaryLabel,
+  secondaryHref,
+  secondaryLabel,
+  children,
+}: Children & {
+  title: string;
+  description: string;
+  status?: string;
+  primaryHref: string;
+  primaryLabel: string;
+  secondaryHref?: string;
+  secondaryLabel?: string;
+}) {
+  return <section className="wake-home-lead">
     <div className="wake-home-copy">
-      <Tag className="wake-kicker" color="primary" bordered={false}>
-        <i /> React 19 · 应用构建 · 组件文档
-      </Tag>
-      <h1>构建 React 应用，<br /><em>也构建组件文档</em></h1>
-      <p>Wake 把开发服务器、生产打包与完整 MDX 文档放进同一套 Rust 工具链。第一次使用时，从学习路线开始，亲手完成一个可运行的应用和文档站。</p>
-      <div className="wake-home-actions">
-        <Button className="wake-action-primary" href="./getting-started/learning-path" appearance="primary" size="large" iconAfter={<span aria-hidden="true">→</span>}>
-          按学习路线开始
-        </Button>
-        <Button className="wake-action-secondary" href="./getting-started/first-docs-site" appearance="subtle" size="large">
-          创建第一个文档站
-        </Button>
-      </div>
-      <div className="wake-home-meta" aria-label="Wake 关键能力"><span>React 19+</span><span>完整 MDX</span><span>隔离 Demo</span><span>Props API</span></div>
+      {status && <small className="wake-home-status">{status}</small>}
+      <h1>{title}</h1>
+      <p className="wake-home-description">{description}</p>
+      <div className="wake-home-message">{children}</div>
+      <Actions primaryHref={primaryHref} primaryLabel={primaryLabel} secondaryHref={secondaryHref} secondaryLabel={secondaryLabel} />
     </div>
-    <div className="wake-terminal" aria-label="Wake 文档构建输出示例">
-      <div className="wake-terminal-bar"><span /><span /><span /><small>wake docs build .</small></div>
-      <pre><code><b>⚡ wake v0.1.0</b><br /><br />  ✓ 文档构建成功  ·  15 routes<br />    → docs-dist/index.html<br />    → docs-dist/404.html</code></pre>
-    </div>
+    <div className="wake-home-diagram"><TechnicalVisual name="home" decorative /></div>
   </section>;
 }
 
-export function HomeFeatures() {
-  const features = [
-    ["保存即可看到结果", "开发服务器监听源码、样式和文档变化，只重新处理受到影响的模块。", "01", "primary"],
-    ["以 React 19 为基线", "直接使用项目中的 React、React DOM 和 automatic JSX runtime，不附带另一套运行时。", "02", "success"],
-    ["开发完成即可生产构建", "代码分割、Tree Shaking、CSS 抽取、资源哈希和静态 HTML 使用同一套模块图。", "03", "warning"],
-    ["组件文档不是附属品", "MDX、交互 Demo、Props API、搜索和静态路由都由 Wake 编译并持续更新。", "04", "default"],
-  ];
-  return <section className="wake-home-section" aria-labelledby="wake-features-title">
-    <header className="wake-home-section-heading"><Tag color="primary" bordered={false}>核心能力</Tag><h2 id="wake-features-title">从第一次保存，到可部署产物</h2><p>学习时只需要掌握两组命令；Wake 负责让应用代码、文档示例和生产输出保持一致。</p></header>
-    <div className="wake-feature-grid">
-      {features.map(([title, body, number, color]) => <Card key={number} className="wake-feature-card" variant="outlined" size="large">
-        <Tag className="wake-feature-index" color={color} size="small" bordered={false}>{number}</Tag>
-        <h3>{title}</h3><p>{body}</p>
-      </Card>)}
-    </div>
+export function OverviewLead({
+  primaryHref,
+  primaryLabel,
+  secondaryHref,
+  secondaryLabel,
+  children,
+}: Children & {
+  primaryHref: string;
+  primaryLabel: string;
+  secondaryHref?: string;
+  secondaryLabel?: string;
+}) {
+  return <section className="wake-overview-lead">
+    <div>{children}</div>
+    <Actions primaryHref={primaryHref} primaryLabel={primaryLabel} secondaryHref={secondaryHref} secondaryLabel={secondaryLabel} />
   </section>;
 }
 
-export function HomePaths() {
-  const paths = [
-    {
-      tag: "路线 A",
-      title: "先构建一个 React 19 应用",
-      body: "适合第一次使用 Wake，或准备把现有 React 项目迁移到 Wake 的开发者。",
-      points: ["创建入口、样式和最小配置", "启动开发服务器并验证更新", "生成带资源哈希的 dist"],
-      href: "./getting-started/quick-start",
-      action: "进入快速开始",
-    },
-    {
-      tag: "路线 B",
-      title: "先创建一个组件文档站",
-      body: "适合维护设计系统、组件库或内部 UI 平台，希望直接体验 MDX、Demo 和 Props API 的开发者。",
-      points: ["创建中文 MDX 页面和导航", "运行隔离的 React 19 Demo", "生成可搜索的 Props 文档"],
-      href: "./getting-started/first-docs-site",
-      action: "创建第一个文档站",
-    },
-  ];
-  return <section className="wake-home-section wake-home-paths" aria-labelledby="wake-paths-title">
-    <header className="wake-home-section-heading"><Tag color="success" bordered={false}>从这里开始</Tag><h2 id="wake-paths-title">选择与你当前目标一致的路线</h2><p>不需要先读完全部参考资料。完成一条路线后，再回到学习路线补齐开发、生产和排错知识。</p></header>
-    <div className="wake-path-grid">
-      {paths.map((path) => <Card key={path.tag} className="wake-path-card" variant="outlined" size="large">
-        <Tag color="primary" size="small" bordered={false}>{path.tag}</Tag>
-        <h3>{path.title}</h3>
-        <p>{path.body}</p>
-        <ul>{path.points.map((point) => <li key={point}>{point}</li>)}</ul>
-        <Button className="wake-path-action" href={path.href} appearance="primary" size="middle" iconAfter={<span aria-hidden="true">→</span>}>{path.action}</Button>
-      </Card>)}
-    </div>
-    <nav className="wake-home-shortcuts" aria-label="熟练用户快捷入口"><strong>已经开始使用 Wake？</strong><a href="./guide/development">开发与 HMR</a><a href="./guide/production">生产构建</a><a href="./reference/cli">CLI 参考</a><a href="./reference/troubleshooting">故障排查</a></nav>
-  </section>;
+export function TaskGrid({ children }: Children) {
+  return <div className="wake-task-grid">{unwrapMdxParagraphs(children)}</div>;
 }
 
-export function Callout({ title, tone = "info", children }: { title: string; tone?: "info" | "warning" | "success"; children: React.ReactNode }) {
-  return <Alert className={`wake-callout wake-callout-${tone}`} type={tone} title={title} showIcon>
-    <Prose className="wake-callout-prose" size="sm">{children}</Prose>
-  </Alert>;
+export function TaskCard({ href, title, description, kicker }: { href: string; title: string; description: string; kicker?: string }) {
+  return <a className="wake-task-card" href={href}>
+    <span className="wake-task-copy">{kicker && <small>{kicker}</small>}<strong>{title}</strong><p>{description}</p></span>
+    <i aria-hidden="true">→</i>
+  </a>;
 }
 
-export function CrabComponentShowcase() {
-  return <section className="wake-component-showcase" aria-label="Crab UI 组件示例">
-    <Card
-      className="wake-component-card"
-      variant="outlined"
-      size="large"
-      title={<span className="wake-component-title">项目级组件 <Tag color="success" size="small">npm</Tag></span>}
-      extra={<Tag color="primary" bordered={false}>React 19</Tag>}
-      actions={[
-        <Button key="guide" href="../getting-started/quick-start" appearance="subtle" size="small">阅读快速开始</Button>,
-        <Button key="cli" href="../reference/cli" appearance="primary" size="small">查看 CLI</Button>,
-      ]}
-    >
-      <Prose size="sm">
-        <p>这块内容由已发布的 <code>@crab-dev/rc-card</code>、<code>rc-tag</code>、<code>rc-button</code> 与 <code>rc-prose</code> 共同渲染。</p>
-      </Prose>
-    </Card>
-    <Alert type="success" title="边界清晰" showIcon>
-      Wake Docs 负责 MDX、路由和构建，Crab UI 只属于当前文档项目的展示层。
-    </Alert>
-  </section>;
+export function StepFlow({ children }: Children) {
+  return <ol className="wake-step-flow">{unwrapMdxParagraphs(children)}</ol>;
+}
+
+export function Step({ number, title, children }: Children & { number: string; title: string }) {
+  return <li><span>{number}</span><div><strong>{title}</strong><div>{children}</div></div></li>;
+}
+
+export function ResultPanel({ title, label = "EXPECTED", children }: Children & { title: string; label?: string }) {
+  return <aside className="wake-result-panel" aria-label={`${label}: ${title}`}>
+    <div><small>{label}</small><strong>{title}</strong></div>
+    <div>{children}</div>
+  </aside>;
+}
+
+export function VisualFigure({ visual, alt, caption }: { visual: Exclude<VisualName, "home">; alt: string; caption?: string }) {
+  return <figure className="wake-visual-figure"><TechnicalVisual name={visual} alt={alt} />{caption && <figcaption>{caption}</figcaption>}</figure>;
+}
+
+export function CompareCards({ children }: Children) {
+  return <div className="wake-compare-cards">{unwrapMdxParagraphs(children)}</div>;
+}
+
+export function CompareCard({ title, tone = "neutral", children }: Children & { title: string; tone?: "neutral" | "positive" | "warning" }) {
+  return <section className={`wake-compare-card wake-compare-${tone}`}><strong>{title}</strong><div>{children}</div></section>;
+}
+
+export function NextActions({ children }: Children) {
+  return <nav className="wake-next-actions" aria-label="下一步">{unwrapMdxParagraphs(children)}</nav>;
+}
+
+export function NextLink({ href, title, description }: { href: string; title: string; description: string }) {
+  return <a className="wake-next-link" href={href}><span><strong>{title}</strong><small>{description}</small></span><i aria-hidden="true">→</i></a>;
+}
+
+export function MetricStrip({ children }: Children) {
+  return <dl className="wake-metric-strip">{unwrapMdxParagraphs(children)}</dl>;
+}
+
+export function Metric({ value, label }: { value: string; label: string }) {
+  return <div><dt>{value}</dt><dd>{label}</dd></div>;
+}
+
+export function Callout({
+  title,
+  tone = "info",
+  children,
+}: Children & {
+  title: string;
+  tone?: "info" | "warning" | "success";
+}) {
+  return <aside className={`wake-callout wake-callout-${tone}`} role={tone === "warning" ? "alert" : "note"}>
+    <strong>{title}</strong>
+    <div className="wake-callout-prose">{children}</div>
+  </aside>;
 }

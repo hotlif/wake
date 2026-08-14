@@ -1,0 +1,49 @@
++++
+title = "组合类名"
+description = "使用 cx 组合字符串、条件、数组和对象"
+kind = "tutorial"
+status = "experimental"
++++
+
+# 组合类名
+
+## 完成本页后
+
+一个组件可以按状态组合局部类名，同时保持确定的类名顺序。
+
+`cx` 保留输入顺序并忽略 `false`、`null` 和 `undefined`。
+
+```tsx
+import { css, cx } from "@crab-dev/css";
+
+const base = css`padding: 8px 12px;`;
+const selected = css`outline: 2px solid #7c3aed;`;
+const compact = css`padding: 4px 8px;`;
+
+export function Item({ active, small }: { active: boolean; small: boolean }) {
+  return <div className={cx(base, active && selected, [small && compact])}>项目</div>;
+}
+```
+
+<Demo src="../examples/styles/composition.demo.tsx" />
+
+条件对象适合外部普通类名：
+
+```ts
+const className = cx(base, { "is-dragging": dragging });
+```
+
+`cx` 不生成 atomic class，也不负责解决两个类对同一属性的冲突。冲突结果仍由 CSS cascade 决定。
+
+## 验证方式
+
+切换每个布尔条件，检查 DOM 类名没有 `false` 或空字符串，并确认顺序稳定。
+
+## 常见错误
+
+- `cx` 不解决 CSS 属性冲突；仍需通过 cascade 或样式职责消除冲突。
+- 对象键适合普通类名，不要把运行时未知字符串当作局部样式声明。
+
+## 下一步
+
+需要把 React 状态传入 CSS 时使用[动态值](/styles/dynamic-values)。

@@ -1,0 +1,52 @@
++++
+title = "编写 MDX"
+description = "用统一 Frontmatter、Markdown 和受控 JSX 编写清晰页面"
+kind = "tutorial"
+status = "stable"
++++
+
+# 编写 MDX
+
+## 完成本页后
+
+一个页面同时具有可搜索元数据、唯一标题、清晰章节和可验证的下一步。
+
+## 页面模板
+
+```mdx
++++
+title = "热更新"
+description = "定位 HMR 更新边界"
+kind = "guide"
+status = "stable"
++++
+
+# 热更新
+
+## 什么时候使用
+
+正文从这里开始。
+```
+
+`kind` 支持 `overview`、`tutorial`、`guide`、`reference` 和 `component`。Frontmatter 只描述页面自身，导航位置由 `navigation.toml` 决定。
+
+## 可用内容
+
+普通段落、列表、表格、任务列表、代码围栏、链接和静态 JSX 都会编译成 React。导入语句必须位于 Frontmatter 后、正文前。
+
+## 编译期组件
+
+`<Demo>`、`<Demos>` 和 `<API>` 的路径、glob、symbol 等属性必须是静态字面量。Wake 在构建前收集它们，动态表达式会得到带行列的诊断。
+
+## 验证方式
+
+运行 `wake docs dev`，检查标题、面包屑、右侧目录和搜索结果。再运行生产构建验证直接路由。
+
+## 常见错误
+
+- 不要用 Frontmatter 控制路由或导航顺序；这些职责分别属于文件路径和 `navigation.toml`。
+- 不要在编译期组件属性中使用动态表达式。
+
+## 下一步
+
+添加[交互 Demo](/wake-docs/demos)。

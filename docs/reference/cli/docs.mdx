@@ -1,0 +1,24 @@
++++
+title = "docs 命令"
+description = "查询 Wake Docs 开发、静态构建、部署路径和工作台模式"
+kind = "reference"
+status = "stable"
++++
+
+# docs 命令
+
+## 开发
+
+```text
+wake docs dev [ROOT] [--port PORT] [--mode site|components]
+```
+
+## 构建
+
+```text
+wake docs build [ROOT] [--outdir DIR] [--base PATH] [--mode site|components]
+```
+
+`--base` 临时覆盖 `[docs].base_path`。`site` 构建 MDX 文档站；`components` 启动或构建 Demo 工作台，不扫描 MDX 页面。
+
+构建命令会验证导航、页面、Demo 和 API，然后为每个公开路由生成 HTML shell。输出目录默认来自 Wake Docs 配置或 `docs-dist`。

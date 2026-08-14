@@ -1,0 +1,31 @@
++++
+title = "Node.js 构建 API"
+description = "在脚本中执行单次构建、内存 bundle 和可复用增量上下文"
+kind = "reference"
+status = "stable"
++++
+
+# Node.js 构建 API
+
+```ts
+import { build, bundle, createBuildContext } from "@crab-dev/wake";
+```
+
+## `build(options)`
+
+写入生产文件并返回模块数、缓存命中、耗时、诊断和输出文件清单。
+
+```ts
+const result = await build({ cwd: process.cwd(), outdir: "dist", cache: true });
+console.log(result.files);
+```
+
+## `bundle(options)`
+
+返回包含 `code` 的内存结果，不设置 `outputDir`。适合工具集成，不用于部署完整 HTML/CSS/资源目录。
+
+## `createBuildContext(options)`
+
+返回可重复 `rebuild()` 的 `BuildContext`。结束时必须 `close()`，也可使用 `await using` 调用异步释放。
+
+所有操作都接受 `AbortSignal`。失败抛出 `WakeError`，调用方应根据 `code` 分支并展示 `diagnostics`。

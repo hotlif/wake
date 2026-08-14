@@ -1,0 +1,52 @@
++++
+title = "部署"
+description = "把生产目录发布到静态托管，并正确处理缓存和子路由"
+kind = "tutorial"
+status = "stable"
++++
+
+import { CompareCard, CompareCards, NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+
+# 部署
+
+<ResultPanel title="完成后">
+  静态托管只接收一次生产构建生成的完整目录，路由与缓存策略经过验证。
+</ResultPanel>
+
+## 构建可发布目录
+
+```bash
+npm ci
+npm run typecheck
+npm run build
+```
+
+不要发布源码、node_modules 或 Wake 缓存。
+
+## 配置静态托管
+
+<CompareCards>
+  <CompareCard title="短缓存" tone="neutral">HTML 使用短缓存或重新验证，确保及时指向新资源。</CompareCard>
+  <CompareCard title="长缓存" tone="positive">带内容哈希的 JS、CSS、图片和字体可以长期缓存。</CompareCard>
+</CompareCards>
+
+<StepFlow>
+  <Step number="01" title="路由">未命中真实文件的应用路径回退到 index.html。</Step>
+  <Step number="02" title="路径">部署子目录时保持 public_path 一致。</Step>
+  <Step number="03" title="原子发布">HTML 与它引用的资源必须来自同一次构建。</Step>
+</StepFlow>
+
+## 验证方式
+
+首页、直接子路由、刷新和动态 import 均应成功；网络面板没有资源 404，新版本 HTML 指向同一批新资源。
+
+## 常见错误
+
+不要只测试客户端跳转。直接访问子路由才能验证静态服务器的回退规则。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/reference/configuration/project" title="查询部署字段" description="核对 public_path 与浏览器目标。" />
+  <NextLink href="/reference/troubleshooting" title="定位生产失败" description="按路由、资源和构建阶段排查。" />
+</NextActions>

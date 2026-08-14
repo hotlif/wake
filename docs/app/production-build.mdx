@@ -1,0 +1,49 @@
++++
+title = "生产构建"
+description = "生成可部署产物，并理解 HTML、chunk、CSS 与 manifest"
+kind = "tutorial"
+status = "stable"
++++
+
+import { Metric, MetricStrip, NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from "../site/components.tsx"
+
+# 生产构建
+
+<ResultPanel title="完成后">
+  `dist` 中包含互相匹配的 HTML、JavaScript、CSS、资源和 manifest，可直接交给静态服务器验证。
+</ResultPanel>
+
+<VisualFigure visual="build" alt="源码模块经过分析、分割与压缩打包成生产资源" caption="生产构建生成互相匹配的一组 HTML、JavaScript、CSS 和资源。" />
+
+## 执行构建
+
+```bash
+npx wake build --outdir dist
+```
+
+<StepFlow>
+  <Step number="01" title="分析">从入口建立生产模块图并删除无用代码。</Step>
+  <Step number="02" title="优化">压缩代码、分割 chunk、抽取 CSS 和重写资源。</Step>
+  <Step number="03" title="命名">为可缓存资源加入内容哈希并写入 manifest。</Step>
+</StepFlow>
+
+<MetricStrip>
+  <Metric value="HTML" label="应用入口" />
+  <Metric value="JS + CSS" label="按模块图生成" />
+  <Metric value="manifest" label="逻辑入口映射" />
+</MetricStrip>
+
+## 验证方式
+
+用静态服务器测试首页、直接子路由、动态导入和强制刷新；浏览器不应请求开发 WebSocket。
+
+## 常见错误
+
+不要依赖具体哈希文件名，也不要把旧 dist 与新构建混合部署。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/app/performance" title="设置缓存策略" description="理解代码分割与内容哈希。" />
+  <NextLink href="/app/deployment" title="部署生产目录" description="配置静态托管和路由回退。" />
+</NextActions>

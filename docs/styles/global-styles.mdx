@@ -1,0 +1,47 @@
++++
+title = "全局样式"
+description = "用 globalStyle 显式声明 reset、字体和根级主题"
+kind = "tutorial"
+status = "experimental"
++++
+
+# 全局样式
+
+## 完成本页后
+
+Reset、字体和根主题集中在一个入口可达模块中，开发更新不会重复追加规则。
+
+```ts title="src/global-styles.ts"
+import { globalStyle } from "@crab-dev/css";
+
+globalStyle`
+  :root { color-scheme: light dark; }
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; }
+`;
+```
+
+在应用入口执行一次静态导入：
+
+```ts
+import "./global-styles";
+```
+
+<Demo src="../examples/styles/global-styles.demo.tsx" />
+
+## 边界
+
+`globalStyle` 必须位于入口可达模块的顶层。不要在组件渲染、事件处理器或条件分支中调用。局部 `css` 不允许通过 `:global` 隐藏全局副作用。
+
+## 验证方式
+
+开发更新时页面只保留一个对应 style slot；生产 CSS 中全局规则顺序与静态依赖顺序一致。
+
+## 常见错误
+
+- 不要在组件、回调或条件分支中调用 `globalStyle`。
+- 不要从动态 import 引入全局规则；其加载时机无法与首屏样式保持一致。
+
+## 下一步
+
+遇到无法求值的插值时查看[静态边界](/styles/static-boundary)。

@@ -1,0 +1,38 @@
++++
+title = "别名与代理"
+description = "统一源码导入路径，并在开发时把 API 请求转发到后端"
+kind = "guide"
+status = "stable"
++++
+
+# 别名与代理
+
+## 路径别名
+
+别名让深层模块使用稳定的逻辑路径。别名必须同时被 Wake 和 TypeScript 识别；不要只修改 `tsconfig.json`。
+
+```toml title="wake.config.toml"
+[alias]
+"@app" = "./src"
+```
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@app/*": ["src/*"] }
+  }
+}
+```
+
+## API 代理
+
+开发代理只解决本地跨域和地址差异，不会被写入生产产物。生产环境仍需由部署平台把 `/api` 转发到真实服务。
+
+## 验证方式
+
+从两层以上的目录导入 `@app/...`，再请求一个代理接口。类型检查、开发构建和生产构建都必须成功。
+
+## 下一步
+
+了解[资源与 public](/app/assets)。

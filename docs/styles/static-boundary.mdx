@@ -1,0 +1,37 @@
++++
+title = "静态边界"
+description = "判断哪些 CSS 插值可以构建，以及如何处理动态或有副作用的值"
+kind = "reference"
+status = "experimental"
++++
+
+# 静态边界
+
+## 可以求值
+
+Wake 接受能够证明无副作用的字面量、模板、数字运算、字符串拼接、模块顶层不可变常量，以及 ESM 传递的叶子字符串和数字。
+
+```ts
+const unit = 4;
+const gap = `${unit * 2}px`;
+const box = css`padding: ${gap};`;
+```
+
+<Demo src="../examples/styles/static-boundary.demo.tsx" />
+
+## 会被拒绝
+
+- 用户函数调用和 tagged template；
+- getter、可变对象和逃逸引用；
+- `window`、`process`、文件系统、网络和随机值；
+- 相对 `url()`。
+
+Wake 不会执行用户代码来“猜”结果。无法证明安全时构建失败，而不是删除声明后继续。
+
+## 解决方法
+
+固定值整理成模块顶层纯常量；运行时变化值使用 `createVar` / `assignVars`；资源 URL 使用普通 CSS 或显式 import。
+
+## 错误码
+
+常见诊断包括 `CRAB_CSS_STATIC_VALUE`、`CRAB_CSS_RELATIVE_URL` 和 `ERR_WAKE_CSS_NOT_COMPILED`。异步 chunk 的静态样式会作为 chunk-owned CSS artifact，在对应 JavaScript 执行前加载。完整 API 见[CSS API](/reference/css-api)。

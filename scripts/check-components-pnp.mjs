@@ -8,7 +8,9 @@ import { assertComponentsRuntime } from './components-runtime-smoke.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const fixture = resolve(root, 'fixtures/react-components-yarn-pnp')
+const cssPackageName = '@crab-dev/css'
 const packageDirectories = [
+  'npm/css',
   'npm/wake',
   'npm/wake-win32-x64-msvc',
   'npm/wake-linux-x64-gnu',
@@ -134,10 +136,22 @@ try {
 
   assert.deepEqual(
     [...packed.keys()].sort(),
-    ['@crab-dev/wake', ...platformPackageNames].sort(),
-    'The PnP gate must pack the main package and all five platform packages',
+    [cssPackageName, '@crab-dev/wake', ...platformPackageNames].sort(),
+    'The PnP gate must pack CSS, Wake, and all five platform packages',
   )
+  const cssPack = packed.get(cssPackageName)
   const mainPack = packed.get('@crab-dev/wake')
+  assert.ok(
+    ['index.cjs', 'index.mjs', 'index.d.ts'].every((file) =>
+      cssPack.files.some((entry) => entry.path === file),
+    ),
+    'The CSS tarball must include ESM, CommonJS, and declarations',
+  )
+  assert.equal(
+    cssPack.files.some((file) => file.path.endsWith('.node')),
+    false,
+    'The CSS package must not contain a native module',
+  )
   assert.ok(
     mainPack.files.some((file) => file.path === 'internal/components-runtime.mjs'),
     'Wake tarball must include the Components runtime module',
@@ -166,9 +180,10 @@ try {
   const projectManifest = JSON.parse(await readFile(projectManifestPath, 'utf8'))
   const localReference = (metadata) => `file:./.wake-packs/${basename(metadata.filename)}`
   projectManifest.dependencies['@crab-dev/wake'] = localReference(mainPack)
-  projectManifest.resolutions = Object.fromEntries(
-    platformPackageNames.map((name) => [name, localReference(packed.get(name))]),
-  )
+  projectManifest.resolutions = Object.fromEntries([
+    [cssPackageName, localReference(cssPack)],
+    ...platformPackageNames.map((name) => [name, localReference(packed.get(name))]),
+  ])
   await writeFile(projectManifestPath, `${JSON.stringify(projectManifest, null, 2)}\n`)
 
   const environment = { ...process.env, WAKE_NATIVE_PATH: nativePath }
@@ -212,12 +227,23 @@ try {
 
   const outputDirectory = join(temporaryProject, 'dist')
   const outputFiles = await readdir(outputDirectory)
-  const entryFile = outputFiles.find((file) => /^entry\.[0-9a-f]{8}\.js$/.test(file))
-  assert.ok(entryFile, 'Components build must emit a hashed JavaScript entry')
+  const manifest = JSON.parse(await readFile(join(outputDirectory, 'manifest.json'), 'utf8'))
+  const entryFile = manifest.entry
+  assert.match(
+    entryFile,
+    /^entry\.[0-9a-f]{8}\.js$/,
+    'Components build must emit a content-hashed JavaScript entry',
+  )
+  assert.ok(outputFiles.includes(entryFile), 'Components build must emit its manifest entry')
   await assertComponentsRuntime(join(outputDirectory, entryFile))
   const cssFile = outputFiles.find((file) => /^styles\.[0-9a-f]{8}\.css$/.test(file))
   assert.ok(cssFile, 'Components build must emit a hashed CSS asset')
   const html = await readFile(join(outputDirectory, 'index.html'), 'utf8')
+  assert.match(
+    html,
+    new RegExp(`src=["'][^"']*${escapeRegExp(entryFile)}["']`),
+    'index.html must load the emitted JavaScript entry',
+  )
   assert.match(
     html,
     new RegExp(`href=["'][^"']*${escapeRegExp(cssFile)}["']`),

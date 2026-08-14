@@ -316,8 +316,19 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
     access(join(componentsOutdir, '404.html')),
   ])
   const componentFiles = await readdir(componentsOutdir)
-  const componentEntryFile = componentFiles.find((file) => /^entry\.[0-9a-f]{8}\.js$/.test(file))
-  assert.ok(componentEntryFile, 'Components build must emit a hashed JavaScript entry')
+  const componentManifest = JSON.parse(
+    await readFile(join(componentsOutdir, 'manifest.json'), 'utf8'),
+  )
+  const componentEntryFile = componentManifest.entry
+  assert.match(
+    componentEntryFile,
+    /^entry\.[0-9a-f]{8}\.js$/,
+    'Components build must emit a content-hashed JavaScript entry',
+  )
+  assert.ok(
+    componentFiles.includes(componentEntryFile),
+    'Components build must emit the JavaScript entry named by its manifest',
+  )
   await assertComponentsRuntime(join(componentsOutdir, componentEntryFile))
   const componentCssFile = componentFiles.find((file) => /^styles\.[0-9a-f]{8}\.css$/.test(file))
   assert.ok(componentCssFile, 'Components build must emit a CSS asset')

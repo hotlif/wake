@@ -1,0 +1,9 @@
+[[group]]
+id = "start"
+title = "快速开始"
+pages = ["index"]
+
+[[group]]
+id = "components"
+title = "基础组件"
+pages = ["components/button"]

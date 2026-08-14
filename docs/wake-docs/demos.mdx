@@ -1,0 +1,67 @@
++++
+title = "交互 Demo"
+description = "创建隔离运行、可查看源码并支持多视口预览的 React 示例"
+kind = "tutorial"
+status = "stable"
++++
+
+import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+
+# 交互 Demo
+
+<ResultPanel title="完成后">
+  页面内出现可运行预览、源码切换和多视口工具，示例错误不会拖垮整页。
+</ResultPanel>
+
+## 创建一个示例
+
+```tsx title="docs/examples/counter.demo.tsx"
+import { useState } from "react";
+
+export const meta = {
+  title: "计数器",
+  description: "验证本地状态与交互",
+  viewport: "responsive",
+};
+
+export default function CounterDemo() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>
+    已点击 {count} 次
+  </button>;
+}
+```
+
+在 MDX 页面引用它：
+
+```mdx
+<Demo src="./examples/counter.demo.tsx" />
+```
+
+下面就是仓库中的真实 Demo；它使用 `@crab-dev/css`，因此同时经过 Demo 模块编译、样式抽取和 iframe 运行边界。
+
+<Demo src="../examples/demos/basic.demo.tsx" />
+
+<StepFlow>
+  <Step number="01" title="聚焦行为">一个 Demo 只证明一个行为，初始状态可以直接理解。</Step>
+  <Step number="02" title="保持独立">不依赖外部网络、不稳定时间或页面外状态。</Step>
+  <Step number="03" title="完整验证">检查交互、源码、复制、视口和全屏模式。</Step>
+</StepFlow>
+
+## 验证方式
+
+点击按钮后数字应增加；切换源码与视口不会丢失整个文档页面。运行时错误只显示在当前 Demo。
+
+多个示例可使用 `<Demos glob="./examples/*.demo.tsx" columns={2} />`；glob 和列数必须是静态值。
+
+## 常见错误
+
+- Demo 不应依赖外部网络、当前时间或页面外的可变全局状态。
+- `src` 和 `glob` 必须是静态字面量，构建器才能建立依赖。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/wake-docs/props-api" title="生成 Props API" description="让类型与示例相互补充。" />
+  <NextLink href="/wake-docs/preview" title="配置 Preview" description="为 Demo 注入 Provider 与全局样式。" />
+</NextActions>

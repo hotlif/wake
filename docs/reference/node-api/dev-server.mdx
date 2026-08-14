@@ -1,0 +1,26 @@
++++
+title = "Node.js 开发服务器 API"
+description = "从 JavaScript 启动、监听并关闭 Wake 开发服务器"
+kind = "reference"
+status = "stable"
++++
+
+# Node.js 开发服务器 API
+
+## 启动与关闭
+
+```ts
+import { startDevServer } from "@crab-dev/wake";
+
+const server = await startDevServer({ cwd: process.cwd(), port: 5173 });
+console.log(server.url);
+
+server.on("rebuilt", (event) => console.log(event.durationMs));
+server.on("diagnostic", (diagnostic) => console.error(diagnostic));
+
+await server.waitUntilClosed();
+```
+
+`DevServer` 事件包括 `rebuildStart`、`rebuilt`、`diagnostic` 和 `closed`。`unref()` 允许 Node 在没有其他任务时退出；`close()` 返回服务真正关闭后的 Promise。
+
+测试必须在 `finally` 中关闭服务器，避免端口和文件监听泄漏。

@@ -1,0 +1,55 @@
++++
+title = "项目结构"
+description = "明确入口、源码、公开资源、配置与产物目录的职责"
+kind = "guide"
+status = "stable"
++++
+
+import { NextActions, NextLink, OverviewLead, Step, StepFlow } from "../site/components.tsx"
+
+# 项目结构
+
+<OverviewLead
+  primaryHref="/app/dev-server"
+  primaryLabel="启动开发服务器"
+  secondaryHref="/app/react-typescript"
+  secondaryLabel="配置 React"
+>
+  <strong>让入口保持小，让业务模块保持独立。</strong>
+  Wake 分析 src 中的依赖，复制 public 中的固定资源，并把结果写入 dist。
+</OverviewLead>
+
+## 推荐目录
+
+```text
+my-app/
+├─ public/              # 固定路径资源
+├─ src/
+│  ├─ entry.tsx         # 创建 React root
+│  ├─ app.tsx           # 应用根组件
+│  └─ styles.css
+├─ package.json
+├─ tsconfig.json
+└─ wake.config.toml
+```
+
+<StepFlow>
+  <Step number="SRC" title="参与构建">可分析导入、删除无用代码并重写资源 URL。</Step>
+  <Step number="PUB" title="原样复制">适合 favicon、robots.txt 等固定路径文件。</Step>
+  <Step number="OUT" title="随时重建">dist 不提交源码分支，也不混入旧构建。</Step>
+</StepFlow>
+
+## 入口原则
+
+入口只加载全局样式、创建 React root 并挂载应用。路由、状态和业务页面放入独立模块。
+
+## 验证方式
+
+删除 `dist` 后重新构建；产物必须能完全重建，`public` 资源保持固定路径，源码资源由模块图生成。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/app/react-typescript" title="配置 React 与 TypeScript" description="建立可靠 JSX 转换和类型检查。" />
+  <NextLink href="/app/dev-server" title="进入日常开发" description="启动本地服务并验证增量更新。" />
+</NextActions>

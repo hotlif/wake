@@ -1,0 +1,31 @@
++++
+title = "文档主题"
+description = "使用稳定 CSS 变量定制品牌、明暗主题和内容排版"
+kind = "guide"
+status = "stable"
++++
+
+# 文档主题
+
+## 配置主题文件
+
+```toml title="wake.config.toml"
+[docs]
+theme_css = "docs/theme.css"
+default_theme = "system"
+accent_color = "#7c3aed"
+```
+
+主题文件通过 CSS 变量覆盖页面表面、文字、边框和强调色。优先改变语义变量，不依赖生成类名或深层 DOM 结构。
+
+## 明暗主题
+
+使用 `html[data-theme="light"]` 和 `html[data-theme="dark"]` 覆盖变量。两套主题都要检查正文、代码块、表格、焦点环和 Demo 背景。
+
+## 验证方式
+
+在 1440px、1024px 和 390px 下切换主题，确认没有横向溢出、不可见焦点或只有颜色才能识别的状态。
+
+## 下一步
+
+完成[构建与部署](/wake-docs/deployment)。

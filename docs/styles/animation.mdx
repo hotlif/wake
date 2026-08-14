@@ -1,0 +1,50 @@
++++
+title = "动画"
+description = "用 keyframes 声明局部动画并在静态样式中引用"
+kind = "tutorial"
+status = "experimental"
++++
+
+# 动画
+
+## 完成本页后
+
+组件拥有局部动画名称；用户开启减少动态效果时，内容仍可直接阅读和操作。
+
+```tsx
+import { css, keyframes } from "@crab-dev/css";
+
+const enter = keyframes`
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+`;
+
+const panel = css`
+  animation: ${enter} 160ms ease-out;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+```
+
+<Demo src="../examples/styles/animation.demo.tsx" />
+
+`keyframes` 模板只包含步骤，Wake 负责生成名称和完整 `@keyframes`。名称可以跨模块静态引用。
+
+## 无障碍要求
+
+非必要动画应尊重 `prefers-reduced-motion`。不要用动画作为唯一状态反馈，也不要让闪烁影响可读性。
+
+## 验证方式
+
+在浏览器模拟减少动态效果，确认动画关闭且内容仍然可理解。
+
+## 常见错误
+
+- 不要把完整 `@keyframes` 再包进 `keyframes` 模板。
+- 不要用持续闪烁或位移作为唯一状态提示。
+
+## 下一步
+
+只有 reset、字体和根主题才使用[全局样式](/styles/global-styles)。

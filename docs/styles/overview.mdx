@@ -1,0 +1,43 @@
++++
+title = "CSS-in-JS"
+description = "使用 @crab-dev/css 编写局部、组合、动态、动画与全局样式，并由 Wake 在构建时抽取 CSS"
+kind = "overview"
+status = "experimental"
++++
+
+import { CompareCard, CompareCards, PageActions, TaskCard, TaskGrid } from "../site/components.tsx"
+
+# CSS-in-JS
+
+<PageActions
+  primaryHref="/styles/local-styles"
+  primaryLabel="编写第一个样式"
+  secondaryHref="/reference/css-api"
+  secondaryLabel="查看 CSS API"
+ />
+
+## 两条样式路径
+
+<CompareCards>
+  <CompareCard title="构建时">
+    用 `css`、`keyframes` 和 `globalStyle` 声明规则。Wake 生成稳定名称，并把规则抽取到 CSS 产物。
+  </CompareCard>
+  <CompareCard title="运行时">
+    用 `cx` 组合类名；必须随状态变化的值通过 `createVar` 和 `assignVars` 写入 CSS 自定义属性。
+  </CompareCard>
+</CompareCards>
+
+## 按任务开始
+
+<TaskGrid>
+  <TaskCard kicker="推荐起点" href="/styles/local-styles" title="编写局部样式" description="完成一个包含伪类和嵌套规则的静态样式。" />
+  <TaskCard kicker="交互状态" href="/styles/dynamic-values" title="连接动态值" description="把 React 状态安全地传给静态 CSS。" />
+  <TaskCard kicker="站点基础" href="/styles/global-styles" title="声明全局样式" description="集中管理 reset、字体和根级主题。" />
+  <TaskCard kicker="构建诊断" href="/styles/static-boundary" title="理解静态边界" description="识别不能在构建期安全求值的表达式。" />
+</TaskGrid>
+
+## 可运行示例
+
+下面的示例直接经过 `@crab-dev/css` 编译；打开源码可以对照局部样式、组合、动态变量、动画、全局规则和静态求值边界。
+
+<Demos glob="../examples/styles/*.demo.tsx" columns={2} />

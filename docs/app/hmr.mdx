@@ -1,0 +1,44 @@
++++
+title = "热更新"
+description = "理解 HMR 的更新边界，并按稳定顺序定位未更新问题"
+kind = "guide"
+status = "stable"
++++
+
+import { CompareCard, CompareCards, NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from "../site/components.tsx"
+
+# 热更新
+
+<ResultPanel title="完成后">
+  修改组件文本时页面状态保持；入口或不安全边界变化时明确回退为整页刷新。
+</ResultPanel>
+
+<VisualFigure visual="hmr" alt="变更模块在浏览器与开发服务器之间循环更新" caption="安全边界内替换模块；边界不安全时回退为整页刷新。" />
+
+HMR（热模块替换）无需刷新整页即可替换变化模块。React 组件通常保留本地状态，入口或副作用模块可能触发完整刷新。
+
+## 写出稳定边界
+
+<CompareCards>
+  <CompareCard title="适合热替换" tone="positive">组件模块只导出 React 组件和稳定常量；监听与计时器都有清理函数。</CompareCard>
+  <CompareCard title="容易完整刷新" tone="warning">入口发生变化，或模块顶层启动了无法停止的请求、计时器和全局副作用。</CompareCard>
+</CompareCards>
+
+## 没有更新时
+
+<StepFlow>
+  <Step number="01" title="文件">终端是否观察到目标文件并重新构建。</Step>
+  <Step number="02" title="连接">浏览器 WebSocket 是否在线，是否出现诊断。</Step>
+  <Step number="03" title="边界">模块是否被入口引用，是否回退为整页刷新。</Step>
+</StepFlow>
+
+## 验证方式
+
+在包含本地 state 的组件里修改静态文本：文本应变化，state 应保留。修改入口时允许完整刷新。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/app/aliases-and-proxy" title="配置别名与代理" description="让日常导入和 API 请求更稳定。" />
+  <NextLink href="/reference/troubleshooting" title="继续排错" description="按症状查找权威诊断路径。" />
+</NextActions>

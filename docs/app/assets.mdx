@@ -1,0 +1,36 @@
++++
+title = "资源与 public"
+description = "正确处理图片、字体、CSS URL 和无需编译的公开文件"
+kind = "guide"
+status = "stable"
++++
+
+# 资源与 public
+
+## 进入模块图的资源
+
+从 TypeScript 或 CSS 相对导入的图片、字体和其他文件属于模块图。Wake 会计算内容哈希、决定内联或独立输出，并把引用重写到最终地址。
+
+```tsx
+import logoUrl from "./logo.svg";
+
+export function Logo() {
+  return <img src={logoUrl} alt="Wake" />;
+}
+```
+
+## public 文件
+
+robots.txt、固定站点图标或必须保持文件名的资源放在 `public`。代码使用从站点根开始的 URL 引用它们。
+
+## 选择原则
+
+需要版本化和依赖追踪时使用 import；需要固定公开路径时使用 public。不要把同一资源同时放入两条管线。
+
+## 验证方式
+
+生产构建后检查资源请求没有 404，并确认部署子路径下的 `public_path` 与 HTML 引用一致。
+
+## 下一步
+
+生成[生产构建](/app/production-build)。

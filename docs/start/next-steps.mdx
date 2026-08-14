@@ -1,0 +1,37 @@
++++
+title = "选择下一步"
+description = "根据当前任务进入 Wake 的应用、样式、文档或参考路径"
+kind = "overview"
+status = "stable"
++++
+
+import { OverviewLead, Step, StepFlow, TaskCard, TaskGrid } from "../site/components.tsx"
+
+# 选择下一步
+
+<OverviewLead
+  primaryHref="/app/project-structure"
+  primaryLabel="继续应用开发"
+  secondaryHref="/reference/troubleshooting"
+  secondaryLabel="遇到问题"
+>
+  <strong>基础项目已经运行，接下来只学当前任务。</strong>
+  选择应用、样式或文档路径；需要精确字段时再进入参考区。
+</OverviewLead>
+
+## 按目标继续
+
+<TaskGrid>
+  <TaskCard kicker="APP" href="/app/project-structure" title="开发业务应用" description="掌握项目结构、开发服务器、资源与生产部署。" />
+  <TaskCard kicker="CSS" href="/styles/local-styles" title="编写局部样式" description="把样式放进组件模块，并获得普通 CSS 产物。" />
+  <TaskCard kicker="DOCS" href="/wake-docs/create-site" title="建立文档站" description="创建 MDX 页面、导航和可交互 Demo。" />
+  <TaskCard kicker="LOOKUP" href="/reference/cli/build" title="查询接口" description="直接查看 CLI、配置、Node.js API 和错误码。" />
+</TaskGrid>
+
+## 推荐顺序
+
+<StepFlow>
+  <Step number="01" title="开发">先让日常编辑和 HMR 稳定。</Step>
+  <Step number="02" title="构建">再验证资源、chunk 与生产路由。</Step>
+  <Step number="03" title="扩展">按需接入 CSS-in-JS 或 Wake Docs。</Step>
+</StepFlow>

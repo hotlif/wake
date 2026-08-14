@@ -1,0 +1,37 @@
++++
+title = "CSS API"
+description = "查询 @crab-dev/css 的六个公开 API 与运行时边界"
+kind = "reference"
+status = "experimental"
++++
+
+# CSS API
+
+| API | 返回值 | 用途 |
+| --- | --- | --- |
+| `css` | `ClassName` | 抽取局部规则 |
+| `cx` | `ClassName` | 组合条件类名 |
+| `keyframes` | `KeyframesName` | 抽取局部关键帧 |
+| `globalStyle` | `void` | 抽取显式全局规则 |
+| `createVar` | `CSSVar` | 创建 CSS 自定义属性引用 |
+| `assignVars` | `Record<string, string \| number>` | 生成 inline style 变量对象 |
+
+## 模板 API
+
+```ts
+css(strings: TemplateStringsArray, ...values: CSSInterpolation[]): ClassName
+keyframes(strings: TemplateStringsArray, ...values: CSSInterpolation[]): KeyframesName
+globalStyle(strings: TemplateStringsArray, ...values: CSSInterpolation[]): void
+```
+
+这些 tag 必须经过 Wake 编译。直接在其他运行器执行会抛出 `ERR_WAKE_CSS_NOT_COMPILED`。
+
+## 运行时 API
+
+```ts
+cx(...values: ClassValue[]): ClassName
+createVar(debugName?: string): CSSVar
+assignVars(variables: Readonly<Record<CSSVar, string | number>>): CSSVariableStyles
+```
+
+静态 `cx` 可被内联；动态组合与 `assignVars` 保留小型运行时。完整用法从[CSS-in-JS 概览](/styles/overview)开始。

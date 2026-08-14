@@ -1,0 +1,77 @@
+[[group]]
+id = "start"
+title = "开始"
+pages = ["index", "start/install", "start/create-react-app", "start/existing-project", "start/next-steps"]
+
+[[group]]
+id = "app"
+title = "应用开发"
+
+[[group.section]]
+id = "foundation"
+title = "基础"
+pages = ["app/project-structure", "app/react-typescript"]
+
+[[group.section]]
+id = "development"
+title = "开发"
+pages = ["app/dev-server", "app/hmr", "app/aliases-and-proxy"]
+
+[[group.section]]
+id = "build"
+title = "构建与发布"
+pages = ["app/assets", "app/production-build", "app/performance", "app/deployment"]
+
+[[group]]
+id = "styles"
+title = "样式"
+pages = ["styles/overview"]
+
+[[group.section]]
+id = "css-in-js"
+title = "教程"
+pages = ["styles/local-styles", "styles/composition", "styles/dynamic-values", "styles/animation", "styles/global-styles", "styles/static-boundary"]
+
+[[group]]
+id = "wake-docs"
+title = "Wake Docs"
+pages = ["wake-docs/overview"]
+
+[[group.section]]
+id = "foundation"
+title = "建立文档站"
+pages = ["wake-docs/create-site", "wake-docs/pages-and-navigation", "wake-docs/mdx"]
+
+[[group.section]]
+id = "interactive"
+title = "交互内容"
+pages = ["wake-docs/demos", "wake-docs/props-api", "wake-docs/preview", "wake-docs/theming"]
+
+[[group.section]]
+id = "release"
+title = "发布"
+pages = ["wake-docs/deployment"]
+
+[[group]]
+id = "reference"
+title = "参考"
+
+[[group.section]]
+id = "configuration"
+title = "配置"
+pages = ["reference/configuration/project", "reference/configuration/dev-server", "reference/configuration/docs"]
+
+[[group.section]]
+id = "cli"
+title = "CLI"
+pages = ["reference/cli/build", "reference/cli/dev", "reference/cli/docs"]
+
+[[group.section]]
+id = "node-api"
+title = "Node.js API"
+pages = ["reference/node-api/build", "reference/node-api/dev-server", "reference/node-api/docs"]
+
+[[group.section]]
+id = "language"
+title = "API 与诊断"
+pages = ["reference/css-api", "reference/compatibility", "reference/errors", "reference/troubleshooting", "reference/experimental", "reference/glossary"]

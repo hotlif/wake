@@ -1,0 +1,63 @@
++++
+title = "创建 React 应用"
+description = "从空目录创建一个可以开发和生产构建的 React 19 应用"
+kind = "tutorial"
+status = "stable"
++++
+
+import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+
+# 创建 React 应用
+
+<ResultPanel title="完成后">
+  浏览器显示 React 页面，修改组件会立即更新，并能生成可部署的 `dist`。
+</ResultPanel>
+
+## 创建三个文件
+
+```toml title="wake.config.toml"
+[html]
+entry = "src/entry.tsx"
+
+[react]
+enabled = true
+jsx_import_source = "react"
+```
+
+```tsx title="src/entry.tsx"
+import { createRoot } from "react-dom/client";
+import "./style.css";
+
+function App() {
+  return <main><h1>Wake 已就绪</h1></main>;
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+```
+
+```css title="src/style.css"
+:root { font-family: system-ui, sans-serif; }
+body { margin: 0; padding: 3rem; }
+```
+
+## 运行并验证
+
+<StepFlow>
+  <Step number="01" title="启动">运行 npx wake dev .，打开终端给出的地址。</Step>
+  <Step number="02" title="编辑">修改标题，页面应在不刷新时更新。</Step>
+  <Step number="03" title="构建">运行 npx wake build --outdir dist。</Step>
+</StepFlow>
+
+`dist` 应包含 HTML，以及带内容哈希的 JavaScript 和 CSS。用静态服务器打开它，页面应与开发环境一致。
+
+## 常见错误
+
+- 页面空白：确认 HTML 中存在 `id="root"` 的元素。
+- 找不到 React：先安装 `react`、`react-dom` 和对应类型包。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/app/project-structure" title="整理项目结构" description="分清入口、业务模块、公开资源与产物。" />
+  <NextLink href="/app/dev-server" title="进入日常开发" description="配置端口并理解开发请求。" />
+</NextActions>

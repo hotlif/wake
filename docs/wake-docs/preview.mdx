@@ -1,0 +1,38 @@
++++
+title = "Preview 环境"
+description = "为全部 Demo 注入 Provider、全局样式和稳定运行边界"
+kind = "guide"
+status = "stable"
++++
+
+# Preview 环境
+
+## 创建包装器
+
+```tsx title="docs/preview.tsx"
+import type { ReactNode } from "react";
+import "./preview.css";
+
+export default function Preview({ children }: { children: ReactNode }) {
+  return <div className="preview-root">{children}</div>;
+}
+```
+
+```toml title="wake.config.toml"
+[docs]
+preview = "docs/preview.tsx"
+```
+
+Preview 适合注入路由、主题、国际化和数据客户端。它不应替 Demo 隐藏真实依赖，也不应启动共享的不可清理副作用。
+
+## 隔离原则
+
+Demo 默认在 iframe 中运行，错误、样式和尺寸不会污染文档外壳。Preview 本身也进入每个 iframe，因此应保持轻量和确定性。
+
+## 验证方式
+
+打开两个不同 Demo，确认状态互不共享；切换文档主题时两个 iframe 都能收到主题更新。
+
+## 下一步
+
+调整[文档主题](/wake-docs/theming)。

@@ -1,0 +1,62 @@
++++
+title = "动态样式"
+description = "使用 CSS 自定义属性连接 React 状态与静态 CSS"
+kind = "tutorial"
+status = "experimental"
++++
+
+import { NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from "../site/components.tsx"
+
+# 动态样式
+
+<ResultPanel title="完成后">
+  React 只更新元素上的自定义属性；生成类名与抽取样式表保持稳定。
+</ResultPanel>
+
+<VisualFigure visual="dynamic-css" alt="React 运行时数值通过 CSS 自定义属性进入静态样式" caption="类名和样式表保持稳定，只有元素上的自定义属性变化。" />
+
+## 完整示例
+
+```tsx title="meter.tsx"
+import { assignVars, createVar, css } from "@crab-dev/css";
+
+const accent = createVar("accent");
+const progress = createVar("progress");
+
+const meter = css`
+  color: ${accent};
+  transform: scaleX(${progress});
+  transform-origin: left;
+`;
+
+export function Meter({ color, value }: { color: string; value: number }) {
+  return <div className={meter} style={assignVars({
+    [accent]: color,
+    [progress]: value,
+  })} />;
+}
+```
+
+<Demo src="../examples/styles/dynamic-values.demo.tsx" />
+
+<StepFlow>
+  <Step number="01" title="声明变量">在模块顶层调用 createVar，获得 var(--...) 引用。</Step>
+  <Step number="02" title="写入模板">直接插值变量，不再额外包一层 var()。</Step>
+  <Step number="03" title="赋运行时值">用 assignVars 把 props 写入元素 style。</Step>
+</StepFlow>
+
+## 验证方式
+
+修改 `color` 或 `value` 后，元素上的 `--crab-css-*` 值应变化；类名和抽取样式表保持不变。
+
+## 常见错误
+
+- 不要在渲染函数里创建变量，否则名称取决于调用顺序。
+- 构建时未知的 props 不能直接插入 `css` 模板。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/styles/animation" title="添加动画" description="声明并引用局部 keyframes。" />
+  <NextLink href="/styles/static-boundary" title="理解静态边界" description="判断表达式能否安全求值。" />
+</NextActions>

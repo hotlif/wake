@@ -18,6 +18,46 @@ function factorySource(factory) {
   return Function.prototype.toString.call(factory)
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function factoryBindings(factory) {
+  const match = factorySource(factory).match(
+    /^function(?:\s+[$\w]+)?\s*\(\s*([$\w]+)\s*,\s*([$\w]+)\s*,\s*([$\w]+)\s*\)/,
+  )
+  return match ? { exportsName: match[2], requireName: match[3] } : undefined
+}
+
+function exposeRuntime(source) {
+  const legacyMarker = 'var __wake_entry__ = __wake__.require(0);'
+  if (source.includes(legacyMarker)) {
+    assert.equal(
+      source.split(legacyMarker).length - 1,
+      1,
+      'Components entry must contain exactly one Wake entry bootstrap',
+    )
+    return source.replace(
+      legacyMarker,
+      'g.__wake_runtime_smoke__ = __wake__; var __wake_entry__ = {};',
+    )
+  }
+
+  const compactBootstrap = /([$\w]+)\.m=([$\w]+);\1\.c=([$\w]+);var ([$\w]+)=\1\(0\);/g
+  const matches = [...source.matchAll(compactBootstrap)]
+  assert.equal(
+    matches.length,
+    1,
+    'Components entry must contain exactly one Wake entry bootstrap',
+  )
+  const [marker, requireName, modulesName, cacheName, entryName] = matches[0]
+  return source.replace(
+    marker,
+    `${requireName}.m=${modulesName};${requireName}.c=${cacheName};` +
+      `g.__wake_runtime_smoke__={m:${modulesName},require:${requireName}};var ${entryName}={};`,
+  )
+}
+
 function findSingleModule(runtime, predicate, label) {
   const matches = Object.entries(runtime.m).filter(([, factory]) =>
     predicate(factorySource(factory)),
@@ -36,18 +76,14 @@ function isComponent(value) {
 
 export async function assertComponentsRuntime(entryPath) {
   const source = await readFile(entryPath, 'utf8')
-  const bootMarker = 'var __wake_entry__ = __wake__.require(0);'
-  assert.equal(
-    source.split(bootMarker).length - 1,
-    1,
-    'Components entry must contain exactly one Wake entry bootstrap',
-  )
-
-  const smokeSource = source.replace(
-    bootMarker,
-    'g.__wake_runtime_smoke__ = __wake__; var __wake_entry__ = {};',
-  )
-  const context = {}
+  const smokeSource = exposeRuntime(source)
+  // Some component dependencies probe browser globals while their module factory initializes.
+  // The smoke only inspects exports, so a minimal self-referential window/document is sufficient
+  // and keeps the check independent from a full DOM implementation.
+  const document = {}
+  const window = { document }
+  window.window = window
+  const context = { document, window, queueMicrotask() {} }
   runInNewContext(smokeSource, context, {
     filename: entryPath,
     timeout: 10_000,
@@ -67,10 +103,17 @@ export async function assertComponentsRuntime(entryPath) {
     'SlidersHorizontal module must preserve its default React component export',
   )
 
-  const requiredIcon = `__wake_require__(${iconModuleId})`
   const barrelCandidates = Object.entries(runtime.m).filter(([, factory]) => {
     const source = factorySource(factory)
-    return source.includes(requiredIcon) && source.includes('exports.SlidersHorizontal=')
+    const bindings = factoryBindings(factory)
+    if (!bindings) return false
+    const requiredIcon = new RegExp(
+      `${escapeRegExp(bindings.requireName)}\\(\\s*${iconModuleId}\\s*\\)`,
+    )
+    const exportedIcon = new RegExp(
+      `${escapeRegExp(bindings.exportsName)}\\.SlidersHorizontal\\s*=`,
+    )
+    return requiredIcon.test(source) && exportedIcon.test(source)
   })
   assert.ok(barrelCandidates.length > 0, 'Components runtime smoke found no Lucide barrel')
   const matchingBarrels = barrelCandidates

@@ -1,27 +1,43 @@
 +++
 title = "Wake"
-description = "用同一套 Rust 工具链开发 React 19 应用并构建组件文档"
-group = "开始"
-group_order = 0
-order = 0
-slug = "/"
+description = "用一套 Rust 原生工具链开发、构建和发布 React 应用"
+kind = "overview"
 status = "beta"
 +++
 
-import { HomeHero, HomeFeatures, HomePaths, Callout } from "./site/components.tsx"
+import { Callout, FeatureCard, FeatureGrid, HomeLead, Step, StepFlow } from "./site/components.tsx"
 
 # Wake
 
-<div className="wake-home">
+<HomeLead
+  title="Wake"
+  description="用一套 Rust 原生工具链开发、构建和发布 React 应用。"
+  status="Beta"
+  primaryHref="/start/create-react-app"
+  primaryLabel="创建 React 应用"
+  secondaryHref="/start/install"
+  secondaryLabel="安装 Wake"
+>
+  TypeScript、React、CSS、静态资源、开发服务器与生产构建共享同一份配置。
+</HomeLead>
 
-<HomeHero />
+## 你想完成什么
 
-<HomeFeatures />
+<FeatureGrid>
+  <FeatureCard icon="app" href="/start/create-react-app" title="React 应用开发" description="获得开发服务器、HMR、资源处理与生产构建。" />
+  <FeatureCard icon="style" href="/styles/overview" title="构建期 CSS-in-JS" description="让样式靠近组件，向浏览器交付普通 CSS。" />
+  <FeatureCard icon="docs" href="/wake-docs/overview" title="Wake Docs" description="用 MDX、交互 Demo 和类型信息建设文档站。" />
+  <FeatureCard icon="search" href="/reference/troubleshooting" title="配置、API 与诊断" description="查询命令、配置、Node.js API 与错误码。" />
+</FeatureGrid>
 
-<HomePaths />
+## 三步启动
 
-<Callout title="Beta 阶段如何使用" tone="info">
-Wake 已覆盖解析、转换、打包、开发服务器和组件文档的完整链路。项目仍处于 <code>0.1.x</code>：用于团队项目时请固定 Wake 版本，把 <code>wake build</code> 和 <code>wake docs build</code> 加入 CI，并为重要生产项目保留可回退的构建方案。
+<StepFlow>
+  <Step number="01" title="安装">安装 React 与 @crab-dev/wake。</Step>
+  <Step number="02" title="配置">声明浏览器入口和 React 转换。</Step>
+  <Step number="03" title="运行">执行 wake dev，修改即更新。</Step>
+</StepFlow>
+
+<Callout title="Beta 状态" tone="info">
+Wake 当前为 0.1.x Beta。团队项目请锁定版本，并在 CI 中运行类型检查与生产构建。
 </Callout>
-
-</div>

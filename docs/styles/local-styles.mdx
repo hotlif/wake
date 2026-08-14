@@ -1,0 +1,61 @@
++++
+title = "局部样式"
+description = "编写声明、伪类、嵌套选择器和条件 at-rule"
+kind = "tutorial"
+status = "experimental"
++++
+
+import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+
+# 局部样式
+
+<ResultPanel title="完成后">
+  一个模板生成一个稳定类名，局部规则被抽取到 CSS，嵌套顺序保持不变。
+</ResultPanel>
+
+## 编写完整样式
+
+```tsx title="card.tsx"
+import { css } from "@crab-dev/css";
+
+const card = css`
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+
+  &:hover { border-color: #7c3aed; }
+  & > h2 { margin: 0; }
+
+  @media (width < 640px) {
+    padding: 12px;
+  }
+`;
+
+export function Card() {
+  return <article className={card}><h2>标题</h2></article>;
+}
+```
+
+<Demo src="../examples/styles/local-styles.demo.tsx" />
+
+<StepFlow>
+  <Step number="01" title="声明">模板直接写声明，不再包自定义类选择器。</Step>
+  <Step number="02" title="嵌套">& 指向当前类；子选择器和媒体查询保持就近。</Step>
+  <Step number="03" title="抽取">生产构建把规则放入 CSS，模板不进入浏览器。</Step>
+</StepFlow>
+
+## 验证方式
+
+在 hover 和窄屏状态下检查边框与间距；CSS 中只应出现生成类名，不应包含运行时模板。
+
+## 常见错误
+
+- 全局副作用使用 `globalStyle`，不要藏在局部 `css` 中。
+- `css` 模板暂不接收相对 `url()`；需要资源重写时，把这条规则移到普通 CSS 文件。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/styles/composition" title="组合多个类名" description="使用 cx 处理条件与状态。" />
+  <NextLink href="/styles/dynamic-values" title="连接动态值" description="用 CSS 自定义属性传递运行时状态。" />
+</NextActions>
