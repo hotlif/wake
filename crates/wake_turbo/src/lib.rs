@@ -38,7 +38,7 @@ pub mod vc;
 
 pub use engine::{Engine, query, read};
 #[cfg(not(loom))]
-pub use executor::Executor;
+pub use executor::{Executor, global_executor};
 pub use vc::{RawVc, Revision, TaskArg, TaskId, TaskOutput, Vc};
 
 // 重导出过程宏，上层以 `#[wake_turbo::task]` 或 `use wake_turbo::task;` 使用。

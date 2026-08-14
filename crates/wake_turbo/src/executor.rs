@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -95,6 +95,14 @@ fn worker_loop(shared: Arc<Shared>, local: Worker<Job>) {
 pub struct Executor {
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
+}
+
+/// Process-wide execution capacity used by production bundlers. A Wake process may host multiple
+/// build contexts; sharing this pool keeps total worker ownership bounded by machine parallelism
+/// instead of multiplying it by the number of contexts.
+pub fn global_executor() -> Arc<Executor> {
+    static GLOBAL: OnceLock<Arc<Executor>> = OnceLock::new();
+    Arc::clone(GLOBAL.get_or_init(|| Arc::new(Executor::with_default_threads())))
 }
 
 impl Executor {
@@ -186,6 +194,34 @@ impl Drop for Executor {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn global_executor_has_one_process_owner() {
+        let first = global_executor();
+        let second = global_executor();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.num_threads() >= 1);
+    }
+
+    #[test]
+    fn global_executor_supports_concurrent_submitters() {
+        let submitters = (0..4)
+            .map(|owner| {
+                let executor = global_executor();
+                std::thread::spawn(move || {
+                    let jobs = (0..128)
+                        .map(|value| move || owner * 1_000 + value)
+                        .collect::<Vec<_>>();
+                    executor.parallel(jobs)
+                })
+            })
+            .collect::<Vec<_>>();
+        for (owner, submitter) in submitters.into_iter().enumerate() {
+            let output = submitter.join().expect("submitter");
+            assert_eq!(output[0], owner * 1_000);
+            assert_eq!(output[127], owner * 1_000 + 127);
+        }
+    }
 
     #[test]
     #[cfg_attr(

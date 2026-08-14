@@ -27,9 +27,31 @@ const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
 const SCHEMA: u32 = 4;
 
+/// Persistent caches are an optimization, so bounded retention is preferable to allowing edited
+/// content versions to grow without limit for the lifetime of a project. The limits are deliberately
+/// generous enough for large applications while preventing a forgotten cache from consuming an
+/// unbounded amount of memory and disk.
+const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 200_000;
+
+#[derive(Clone, Copy)]
+struct CacheLimits {
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl Default for CacheLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_CACHE_BYTES,
+            max_entries: MAX_CACHE_ENTRIES,
+        }
+    }
+}
+
 /// 一条依赖（说明符 + 种类判别值 + 源码位置）。`kind` 用 `u8`（由调用方与 `DependencyKind` 互转），
 /// 使本 crate 不依赖 AST 类型。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct CachedDep {
     pub specifier: String,
     pub kind: u8,
@@ -39,7 +61,7 @@ pub struct CachedDep {
 
 /// 一条静态使用记录（Tree Shaking 用）。`all=true` 表示整体使用（namespace/export*），
 /// `reexport=true` 且 `all=true` 表示 `export *`（仅当下游消费本模块导出时才传播）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct CachedUse {
     pub specifier: String,
     pub all: bool,
@@ -47,7 +69,7 @@ pub struct CachedUse {
     pub names: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct CachedNamedImport {
     pub local: String,
     pub spec: String,
@@ -55,7 +77,7 @@ pub struct CachedNamedImport {
 }
 
 /// 链接阶段需要的绑定活跃性。跨持久化边界只存字符串，不存进程内 `Atom`。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct CachedLiveness {
     pub decls: Vec<(String, Vec<String>)>,
     pub root_refs: Vec<String>,
@@ -68,7 +90,7 @@ pub struct CachedLiveness {
 }
 
 /// 一个模块的摘要：依赖、静态使用及链接分析。足以建图、tree shaking 和 concat，无需重建 AST。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct ModuleSummary {
     pub deps: Vec<CachedDep>,
     pub uses: Vec<CachedUse>,
@@ -112,6 +134,13 @@ pub struct BuildCache {
     /// 命中计数（诊断/测试用）。
     pub summary_hits: u64,
     pub body_hits: u64,
+    /// Session-local recency. These maps are intentionally not serialized: every entry used by a
+    /// fresh build is touched before the next store, while untouched entries are precisely the best
+    /// eviction candidates from the previous process.
+    access_clock: u64,
+    path_access: HashMap<PathBuf, u64>,
+    summary_access: HashMap<u64, u64>,
+    body_access: HashMap<u128, u64>,
     /// 本次构建是否往缓存写过新条目。全命中（未变）时为 `false` → 跳过落盘，
     /// 免掉「重写 = 缓存体量」大小的磁盘 I/O（缓存文件常和 bundle 一样大）。
     dirty: bool,
@@ -126,29 +155,51 @@ impl BuildCache {
     /// 从磁盘加载。文件不存在 / 损坏 / schema 不符 → 返回空缓存（缓存永远可重建，容错优先）。
     pub fn load(path: &Path) -> BuildCache {
         match std::fs::read(path) {
-            Ok(bytes) => Self::decode(&bytes).unwrap_or_default(),
+            Ok(bytes) => {
+                let mut cache = Self::decode(&bytes).unwrap_or_default();
+                // Older Wake versions could leave an arbitrarily large monolithic file. Compact
+                // immediately so the next successful build commits it back under the current
+                // budget; cache misses remain a correctness-neutral fallback.
+                cache.compact(CacheLimits::default());
+                cache
+            }
             Err(_) => BuildCache::default(),
         }
     }
 
     /// 原子落盘（临时文件 + rename，避开 Windows Defender 扫描锁；同 CLI 写产物的手法）。
-    pub fn store(&self, path: &Path) -> std::io::Result<()> {
+    pub fn store(&mut self, path: &Path) -> std::io::Result<()> {
+        self.compact(CacheLimits::default());
         let bytes = self.encode();
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &bytes)?;
-        match std::fs::rename(&tmp, path) {
+        let result = match std::fs::rename(&tmp, path) {
             Ok(()) => Ok(()),
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 std::fs::write(path, &bytes).map_err(|_| e)
             }
+        };
+        if result.is_ok() {
+            // `dirty` describes mutations since the last durable commit. Keeping it set after a
+            // successful store makes every later cache-hit build rewrite the complete cache file.
+            self.dirty = false;
         }
+        result
     }
 
     /// 查询路径源码快照；配置变体不一致时视为 miss。
-    pub fn cached_source(&self, path: &Path, variant: u64) -> Option<CachedSource> {
-        let entry = self.paths.get(path)?;
-        (entry.variant == variant).then(|| entry.cached.clone())
+    pub fn cached_source(&mut self, path: &Path, variant: u64) -> Option<CachedSource> {
+        let cached = self
+            .paths
+            .get(path)
+            .filter(|entry| entry.variant == variant)
+            .map(|entry| entry.cached.clone());
+        if cached.is_some() {
+            let access = self.next_access();
+            self.path_access.insert(path.to_path_buf(), access);
+        }
+        cached
     }
 
     /// 更新路径索引。内容完全相同时不置 dirty，避免全命中构建重写缓存文件。
@@ -160,6 +211,8 @@ impl BuildCache {
         content_key: u64,
         source: &str,
     ) {
+        let access = self.next_access();
+        self.path_access.insert(path.to_path_buf(), access);
         let unchanged = self.paths.get(path).is_some_and(|entry| {
             entry.variant == variant
                 && entry.cached.stamp == stamp
@@ -188,13 +241,19 @@ impl BuildCache {
         let s = self.summaries.get(&content_key).cloned();
         if s.is_some() {
             self.summary_hits += 1;
+            let access = self.next_access();
+            self.summary_access.insert(content_key, access);
         }
         s
     }
 
     pub fn put_summary(&mut self, content_key: u64, summary: ModuleSummary) {
-        self.summaries.insert(content_key, summary);
-        self.dirty = true;
+        let access = self.next_access();
+        self.summary_access.insert(content_key, access);
+        if self.summaries.get(&content_key) != Some(&summary) {
+            self.summaries.insert(content_key, summary);
+            self.dirty = true;
+        }
     }
 
     /// 本次是否新增过条目——否则（全命中）无需落盘。
@@ -207,17 +266,120 @@ impl BuildCache {
         let b = self.bodies.get(&key).cloned();
         if b.is_some() {
             self.body_hits += 1;
+            let access = self.next_access();
+            self.body_access.insert(key, access);
         }
         b
     }
 
     pub fn put_body(&mut self, key: u128, body: Arc<String>) {
-        self.bodies.insert(key, body);
-        self.dirty = true;
+        let access = self.next_access();
+        self.body_access.insert(key, access);
+        if self
+            .bodies
+            .get(&key)
+            .is_none_or(|current| current.as_str() != body.as_str())
+        {
+            self.bodies.insert(key, body);
+            self.dirty = true;
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty() && self.summaries.is_empty() && self.bodies.is_empty()
+    }
+
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn estimated_size(&self) -> usize {
+        let paths = self
+            .paths
+            .iter()
+            .map(|(path, entry)| path.to_string_lossy().len() + entry.cached.source.len() + 64);
+        let summaries = self.summaries.values().map(summary_estimated_size);
+        let bodies = self.bodies.values().map(|body| body.len() + 32);
+        paths.chain(summaries).chain(bodies).sum::<usize>() + 64
+    }
+
+    /// Retain the most recently used entries under a combined entry and byte budget. Eviction only
+    /// changes future cache hit rates; it never changes build semantics because every value is
+    /// reproducible from source.
+    fn compact(&mut self, limits: CacheLimits) {
+        #[derive(Clone)]
+        enum Key {
+            Path(PathBuf),
+            Summary(u64),
+            Body(u128),
+        }
+
+        let mut candidates =
+            Vec::with_capacity(self.paths.len() + self.summaries.len() + self.bodies.len());
+        candidates.extend(self.paths.keys().map(|key| {
+            (
+                self.path_access.get(key).copied().unwrap_or(0),
+                Key::Path(key.clone()),
+            )
+        }));
+        candidates.extend(self.summaries.keys().map(|&key| {
+            (
+                self.summary_access.get(&key).copied().unwrap_or(0),
+                Key::Summary(key),
+            )
+        }));
+        candidates.extend(self.bodies.keys().map(|&key| {
+            (
+                self.body_access.get(&key).copied().unwrap_or(0),
+                Key::Body(key),
+            )
+        }));
+        // Oldest first. Tie-breakers do not affect correctness; stable key ordering makes retained
+        // contents deterministic for a fixed cache state.
+        candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| match (&left.1, &right.1) {
+                    (Key::Path(a), Key::Path(b)) => a.cmp(b),
+                    (Key::Summary(a), Key::Summary(b)) => a.cmp(b),
+                    (Key::Body(a), Key::Body(b)) => a.cmp(b),
+                    (Key::Path(_), _) => std::cmp::Ordering::Less,
+                    (Key::Summary(_), Key::Body(_)) => std::cmp::Ordering::Less,
+                    _ => std::cmp::Ordering::Greater,
+                })
+        });
+
+        let mut entries = candidates.len();
+        let mut bytes = self.estimated_size();
+        for (_, key) in candidates {
+            if entries <= limits.max_entries && bytes <= limits.max_bytes {
+                break;
+            }
+            let removed = match key {
+                Key::Path(key) => {
+                    self.path_access.remove(&key);
+                    self.paths
+                        .remove(&key)
+                        .map(|entry| key.to_string_lossy().len() + entry.cached.source.len() + 64)
+                }
+                Key::Summary(key) => {
+                    self.summary_access.remove(&key);
+                    self.summaries
+                        .remove(&key)
+                        .map(|entry| summary_estimated_size(&entry))
+                }
+                Key::Body(key) => {
+                    self.body_access.remove(&key);
+                    self.bodies.remove(&key).map(|entry| entry.len() + 32)
+                }
+            };
+            if let Some(removed) = removed {
+                entries -= 1;
+                bytes = bytes.saturating_sub(removed);
+                self.dirty = true;
+            }
+        }
     }
 
     // —— 编解码（手写小端二进制）——
@@ -361,6 +523,62 @@ impl BuildCache {
         }
         Some(cache)
     }
+}
+
+fn summary_estimated_size(summary: &ModuleSummary) -> usize {
+    let deps = summary
+        .deps
+        .iter()
+        .map(|dep| dep.specifier.len() + 16)
+        .sum::<usize>();
+    let uses = summary
+        .uses
+        .iter()
+        .map(|usage| {
+            usage.specifier.len()
+                + usage.names.iter().map(String::len).sum::<usize>()
+                + usage.names.len() * 4
+                + 16
+        })
+        .sum::<usize>();
+    let liveness = &summary.liveness;
+    let liveness_strings = liveness
+        .decls
+        .iter()
+        .map(|(name, refs)| name.len() + refs.iter().map(String::len).sum::<usize>())
+        .sum::<usize>()
+        + liveness.root_refs.iter().map(String::len).sum::<usize>()
+        + liveness
+            .named_imports
+            .iter()
+            .map(|import| import.local.len() + import.spec.len() + import.imported.len())
+            .sum::<usize>()
+        + liveness
+            .namespace_imports
+            .iter()
+            .map(|(local, spec)| local.len() + spec.len())
+            .sum::<usize>()
+        + liveness
+            .reexport_star
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+        + liveness
+            .ns_reexports
+            .iter()
+            .map(|(name, spec)| name.len() + spec.len())
+            .sum::<usize>()
+        + liveness
+            .reexport_named
+            .iter()
+            .map(|(name, spec, imported)| name.len() + spec.len() + imported.len())
+            .sum::<usize>()
+        + liveness
+            .exports
+            .iter()
+            .map(|(name, local)| name.len() + local.as_ref().map_or(0, String::len))
+            .sum::<usize>();
+    deps + uses + liveness_strings + 128
 }
 
 // —— 写原语 ——
@@ -604,10 +822,71 @@ mod tests {
     fn store_load_file() {
         let dir = std::env::temp_dir();
         let path = dir.join("wake_cache_roundtrip_test.bin");
-        sample().store(&path).unwrap();
+        let mut cache = sample();
+        cache.store(&path).unwrap();
         let mut loaded = BuildCache::load(&path);
         assert_eq!(loaded.summary(0xDEAD_BEEF).unwrap().deps[0].kind, 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn successful_store_commits_dirty_state() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "wake_cache_commit_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cache = sample();
+
+        assert!(cache.is_dirty());
+        cache.store(&path).unwrap();
+        assert!(!cache.is_dirty());
+
+        cache.put_body(99, Arc::new("changed".to_string()));
+        assert!(cache.is_dirty());
+        cache.store(&path).unwrap();
+        assert!(!cache.is_dirty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_store_preserves_dirty_state_for_retry() {
+        let dir = std::env::temp_dir().join(format!(
+            "wake_cache_store_failure_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = sample();
+
+        assert!(cache.store(&dir).is_err());
+        assert!(cache.is_dirty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_keeps_recent_entries_within_budget() {
+        let mut cache = BuildCache::new();
+        for key in 0..6u128 {
+            cache.put_body(key, Arc::new(format!("body-{key}")));
+        }
+        // Refresh an old key so recency, not insertion order, owns retention.
+        assert!(cache.body(0).is_some());
+        cache.compact(CacheLimits {
+            max_bytes: usize::MAX,
+            max_entries: 2,
+        });
+
+        assert_eq!(cache.bodies.len(), 2);
+        assert!(cache.bodies.contains_key(&0));
+        assert!(cache.bodies.contains_key(&5));
     }
 
     #[test]
