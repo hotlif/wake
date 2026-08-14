@@ -12,6 +12,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+架构或 crate 依赖修改：
+
+```bash
+npm run architecture:test
+npm run architecture:check
+```
+
 Node/npm 修改：
 
 ```bash
@@ -110,10 +117,11 @@ Loom 使用 `RUSTFLAGS="--cfg loom"` 只编译引擎核心，穷举 single-fligh
 CI 当前执行：
 
 ```bash
+cargo test -p wake_bundler --test performance_invariants --release
 cargo bench --workspace --no-run
 ```
 
-它只保证 benchmark 可编译，不判断性能回归。提交性能数字或优化声明前按 [PERFORMANCE.md](PERFORMANCE.md) 运行实际测量并保存环境信息。
+第一条用稳定 work-count 检查 edit-one 的 loader、resolver、link/chunk 与 codegen 工作局部性；第二条保证 benchmark 可编译。两者都不判断机器相关的耗时回归。提交性能数字或优化声明前按 [PERFORMANCE.md](PERFORMANCE.md) 运行实际测量并保存环境信息。
 
 # 6. 发布门禁
 

@@ -1,6 +1,6 @@
 # Wake 性能测量
 
-本文件记录可复现方法和现有测量面，不给出脱离机器、提交和工具链的目标数字。CI 当前只编译 benchmark，尚未启用“回归超过固定百分比即失败”的历史基线门禁。
+本文件记录可复现方法和现有测量面，不给出脱离机器、提交和工具链的目标数字。CI 对增量路径执行确定性的 work-count 门禁并编译 benchmark；尚未启用“回归超过固定百分比即失败”的历史耗时基线。
 
 # 1. 测量纪律
 
@@ -39,6 +39,14 @@ sample size / warmup:
 ```bash
 cargo bench --workspace --no-run
 ```
+
+增量架构门禁：
+
+```bash
+cargo test -p wake_bundler --test performance_invariants --release
+```
+
+该门禁固定检查 edit-one 只读取并 codegen 一个模块、复用 resolver 拓扑和 link/chunk 规划。它不使用共享 runner 上不稳定的绝对毫秒数。
 
 运行单项：
 
@@ -95,4 +103,4 @@ node scripts/check-startup.mjs
 4. 允许人工复跑并保存原始 Criterion 输出；
 5. 将性能红灯与正确性门禁分开，避免重试掩盖功能失败。
 
-在这些条件满足前，CI 保持 `--no-run` 编译门禁，性能 PR 在说明中附可复现结果。
+在这些条件满足前，CI 保持 work-count + `--no-run` 门禁，性能 PR 在说明中附可复现耗时结果。

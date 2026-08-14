@@ -13,6 +13,18 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  architecture:
+    name: architecture boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: npm run architecture:test
+      - run: npm run architecture:check
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -84,13 +96,15 @@ jobs:
           RUSTFLAGS: --cfg loom
 
   bench-smoke:
-    name: benches compile
+    name: performance invariants + benches compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      # 只确认 bench 骨架可编译可跑（--no-run）。回归门禁待基线历史后用 critcmp 接入。
+      # Shared runners are too noisy for a millisecond SLA. Gate deterministic avoided-work counts,
+      # then compile Criterion benches so measurement surfaces cannot silently rot.
+      - run: cargo test -p wake_bundler --test performance_invariants --release
       - run: cargo bench --workspace --no-run
 
   docs:
@@ -109,6 +123,22 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run docs:check
       - run: npm run docs:build
+
+  css:
+    name: css package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run npm:test:css
+      - run: npm run npm:typecheck:css
+      - run: npm run npm:pack:check
+        env:
+          WAKE_PACK_TARGETS: npm/css
 
   node:
     name: node ${{ matrix.node }} / win32-x64
@@ -135,12 +165,12 @@ jobs:
         run: |
           "WAKE_NATIVE_PATH=$((Resolve-Path npm/wake/wake.win32-x64-msvc.node).Path)" >> $env:GITHUB_ENV
           Copy-Item npm/wake/wake.win32-x64-msvc.node npm/wake-win32-x64-msvc/wake.win32-x64-msvc.node
-      - run: npm run npm:test
-      - run: npm run npm:typecheck
+      - run: npm run npm:test:wake
+      - run: npm run npm:typecheck:wake
       - run: node scripts/check-startup.mjs
       - run: npm run npm:pack:check
         env:
-          WAKE_PACK_TARGETS: npm/wake,npm/wake-win32-x64-msvc
+          WAKE_PACK_TARGETS: npm/css,npm/wake,npm/wake-win32-x64-msvc
       - name: Verify Components under Yarn PnP
         if: matrix.node == 24
         run: npm run pnp:components:check

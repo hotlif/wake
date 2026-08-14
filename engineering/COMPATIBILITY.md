@@ -1,6 +1,6 @@
 # Wake 兼容性决策
 
-本文为源码中的 `WAKE-COMPATIBILITY` 与 M1–M8 引用提供当前解释。它记录从 Crustify 迁移时形成的产品决策；用户迁移步骤见 [`docs/migrations/crustify-to-wake.md`](../docs/migrations/crustify-to-wake.md)。
+本文为源码中的 `WAKE-COMPATIBILITY` 与 M1–M8 引用提供当前解释，并记录从 Crustify 迁移时形成的历史产品决策。公共文档不再维护旧工具迁移教程。
 
 # 0. 决策基线
 

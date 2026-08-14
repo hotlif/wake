@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+  "crates": [
+    "wake_app",
+    "wake_bundler",
+    "wake_cache",
+    "wake_cli",
+    "wake_common",
+    "wake_config",
+    "wake_css",
+    "wake_css_in_js",
+    "wake_dev_server",
+    "wake_docs",
+    "wake_ecma_ast",
+    "wake_ecma_codegen",
+    "wake_ecma_lexer",
+    "wake_ecma_minify",
+    "wake_ecma_parser",
+    "wake_ecma_semantic",
+    "wake_ecma_transform",
+    "wake_graph",
+    "wake_html",
+    "wake_node",
+    "wake_resolver",
+    "wake_scan",
+    "wake_tsdoc",
+    "wake_turbo",
+    "wake_turbo_macros"
+  ],
+  "groups": {
+    "compilerCore": [
+      "wake_common",
+      "wake_ecma_ast",
+      "wake_ecma_codegen",
+      "wake_ecma_lexer",
+      "wake_ecma_minify",
+      "wake_ecma_parser",
+      "wake_ecma_semantic",
+      "wake_ecma_transform"
+    ],
+    "cssLayers": ["wake_css", "wake_css_in_js"],
+    "productEdges": ["wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+    "shells": ["wake_cli", "wake_node"],
+    "nonShells": [
+      "wake_app", "wake_bundler", "wake_cache", "wake_common", "wake_config",
+      "wake_css", "wake_css_in_js", "wake_dev_server", "wake_docs", "wake_ecma_ast",
+      "wake_ecma_codegen", "wake_ecma_lexer", "wake_ecma_minify", "wake_ecma_parser",
+      "wake_ecma_semantic", "wake_ecma_transform", "wake_graph", "wake_html",
+      "wake_resolver", "wake_scan", "wake_tsdoc", "wake_turbo", "wake_turbo_macros"
+    ]
+  },
+  "rules": [
+    {
+      "id": "compiler-core-no-orchestration",
+      "description": "compiler core cannot depend on orchestration or product edges",
+      "fromGroups": ["compilerCore"],
+      "deny": ["wake_bundler", "wake_cache", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Move the contract to a lower stable model or keep orchestration in the caller."
+    },
+    {
+      "id": "common-is-workspace-foundation",
+      "description": "wake_common cannot depend on another workspace crate",
+      "from": ["wake_common"],
+      "allowOnly": [],
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
+      "suggestion": "Move the dependency above wake_common or extract a dependency-free model."
+    },
+    {
+      "id": "ast-and-lexer-use-common-only",
+      "description": "AST and lexer consume only the workspace foundation",
+      "from": ["wake_ecma_ast", "wake_ecma_lexer"],
+      "allowOnly": ["wake_common"],
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
+      "suggestion": "Keep higher compiler phases out of AST and lexer ownership."
+    },
+    {
+      "id": "semantic-and-transform-use-stable-ast",
+      "description": "semantic analysis and transform helpers consume only common AST models",
+      "from": ["wake_ecma_semantic", "wake_ecma_transform"],
+      "allowOnly": ["wake_common", "wake_ecma_ast"],
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
+      "suggestion": "Move parser context or orchestration into the caller."
+    },
+    {
+      "id": "parser-does-not-own-semantic",
+      "description": "parser owns syntax context and may use lowering helpers but not semantic analysis",
+      "from": ["wake_ecma_parser"],
+      "allowOnly": ["wake_common", "wake_ecma_ast", "wake_ecma_lexer", "wake_ecma_transform"],
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
+      "suggestion": "Depend on wake_ecma_semantic directly from the analysis consumer."
+    },
+    {
+      "id": "graph-is-pure-analysis",
+      "description": "wake_graph only consumes common and AST models",
+      "from": ["wake_graph"],
+      "allowOnly": ["wake_common", "wake_ecma_ast"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Move file, resolver, or product behavior out of wake_graph."
+    },
+    {
+      "id": "turbo-is-domain-neutral",
+      "description": "wake_turbo only knows common infrastructure and its macros",
+      "from": ["wake_turbo"],
+      "allowOnly": ["wake_common", "wake_turbo_macros"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Keep Web build domain objects in the bundler or application layer."
+    },
+    {
+      "id": "cache-stores-stable-data",
+      "description": "wake_cache cannot depend on arena, resolver, bundler, or product edges",
+      "from": ["wake_cache"],
+      "deny": ["wake_ecma_ast", "wake_resolver", "wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Persist a stable DTO owned below the consumer instead of a process-local object."
+    },
+    {
+      "id": "css-does-not-own-products",
+      "description": "CSS layers cannot depend on bundler or product edges",
+      "fromGroups": ["cssLayers"],
+      "deny": ["wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Expose a stable CSS artifact and let the bundler integrate it."
+    },
+    {
+      "id": "bundler-does-not-depend-on-products",
+      "description": "wake_bundler cannot depend on product edges",
+      "from": ["wake_bundler"],
+      "denyGroups": ["productEdges"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Move HTTP, Docs, lifecycle, CLI, or Node adaptation above the bundler."
+    },
+    {
+      "id": "app-does-not-depend-on-shells",
+      "description": "wake_app is shared beneath CLI and Node shells",
+      "from": ["wake_app"],
+      "denyGroups": ["shells"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Move the shared behavior into wake_app and keep shell adaptation outside it."
+    },
+    {
+      "id": "shells-are-terminal-edges",
+      "description": "internal crates cannot depend on CLI or Node shells",
+      "fromGroups": ["nonShells"],
+      "denyGroups": ["shells"],
+      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "suggestion": "Invert the dependency through wake_app or a lower stable contract."
+    },
+    {
+      "id": "shells-use-app-or-compiler",
+      "description": "shells reach build and lifecycle behavior through wake_app and only compiler APIs directly",
+      "fromGroups": ["shells"],
+      "allowOnly": ["wake_app"],
+      "allowOnlyGroups": ["compilerCore"],
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
+      "suggestion": "Move build behavior into wake_app or keep the shell dependency compiler-only."
+    }
+  ]
+}

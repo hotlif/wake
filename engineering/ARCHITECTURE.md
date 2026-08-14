@@ -17,8 +17,9 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 
 - `wake_common`：Span、源码、诊断、文件系统抽象、字符串驻留和压缩包读取。
 - `wake_ecma_ast`：arena AST、自引用持有者、访问器和结构指纹。
-- `wake_ecma_lexer`、`wake_ecma_parser`、`wake_ecma_semantic`：词法、语法、依赖与符号分析。
-- `wake_ecma_transform`、`wake_ecma_codegen`、`wake_ecma_minify`：转换、生成、Source Map 和生产压缩。
+- `wake_ecma_lexer`、`wake_ecma_parser`：词法、语法、依赖提取，以及必须借助 cover grammar/作用域上下文完成的 lowering 编排。
+- `wake_ecma_semantic`：独立的符号、作用域与引用分析；不通过 parser façade 暴露。
+- `wake_ecma_transform`、`wake_ecma_codegen`、`wake_ecma_minify`：可复用 lowering 规则、生成、Source Map 和生产压缩。
 
 编译核心只依赖 workspace 白名单中的少量通用库，不依赖网络、CLI 或 Node-API。
 
@@ -46,8 +47,12 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 ## 3. 依赖方向
 
 ```text
-common
-  └─ ecma_ast ─ lexer/parser ─ semantic/transform ─ codegen/minify
+common ─ ecma_ast
+   ├─ lexer
+   ├─ semantic
+   └─ transform ─ parser（消费 lexer + lowering helpers）
+
+parser + semantic + transform ─ codegen/minify
 
 common ─ resolver
 common + ecma_ast ─ graph
@@ -65,11 +70,11 @@ config + bundler + dev_server + docs
 
 必须维持的约束：
 
-1. 编译核心不得依赖 CLI、Node、dev server 或 bundler。
+1. 编译核心不得依赖 CLI、Node、dev server 或 bundler；基础、AST、lexer、semantic、transform 与 parser 的允许出边由机器规则逐层限定。
 2. `wake_graph` 不读取文件、不解析路径、不写产物。
 3. `wake_cache` 只保存跨进程稳定数据，不保存 arena/Atom 句柄。
 4. `wake_turbo` 不认识 Web 构建领域对象。
-5. CLI 和 Node API 经 `wake_app` 共享配置、错误和构建行为。
+5. CLI 和 Node 的配置、错误、构建、Docs 与服务生命周期经 `wake_app` 共享；显式 compiler/experimental API 可直达 compiler crates，但不得直达 bundler 或其他产品层。
 
 ## 4. 应用构建数据流
 

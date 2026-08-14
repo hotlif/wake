@@ -42,11 +42,11 @@ Lexer 按字节扫描，token 只保存类型、Span 和 ASI 换行状态。pars
 
 ## 4.4 Parser 与依赖
 
-语句使用递归下降，表达式使用 Pratt 优先级解析。解析时同步提取静态/动态依赖和顶层 await 标志，并根据 SourceType 选择 JS、TS、JSX、TSX 或 CommonJS 语义。
+语句使用递归下降，表达式使用 Pratt 优先级解析。解析时同步提取静态/动态依赖和顶层 await 标志，并根据 SourceType 选择 JS、TS、JSX、TSX 或 CommonJS 语义。需要 cover grammar、词法作用域或临时变量所有权的浏览器 lowering 由 parser 编排，但规则与 AST 构造归 `wake_ecma_transform`；因此目标特性属于前端任务身份。
 
 ## 4.5 Transform
 
-TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上下文中运行。转换复用原 Span，避免丢失诊断与 Source Map 来源。
+TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上下文中运行。`wake_ecma_transform` 不依赖 parser，只提供稳定的 lowering 规则与 AST helper；parser 可在仍掌握 cover grammar/作用域上下文时调用它们。转换复用原 Span，避免丢失诊断与 Source Map 来源。
 
 ## 4.6 Codegen 与 Source Map
 
@@ -84,7 +84,7 @@ Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map
 
 ## 6.3 Chunk 与动态导入
 
-生产构建为动态 import 创建 async chunk，并通过 `public_path` 生成加载 URL。相对 `./` 用于 file URL/Electron；文档站独立使用 `base_path`。
+生产构建为动态 import 创建 async chunk，并通过 `public_path` 生成加载 URL。抽取 CSS 归属到具体 chunk：入口样式由 HTML 激活，异步样式由 runtime 在对应 JavaScript 执行前加载；书面 manifest 保留同一 chunk/style 关系。相对 `./` 用于 file URL/Electron；文档站独立使用 `base_path`。
 
 # 7. Dev Server 与 HMR
 
@@ -108,11 +108,11 @@ Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map
 
 ## 10.1 工作规避
 
-Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要和生成体缓存减少重复解析与 codegen。
+Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要和生成体缓存减少重复解析与 codegen。依赖形状和绑定活跃性不变时复用上一 generation 的 link/chunk 规划；旧的内存摘要在成功 generation 后回收。持久缓存成功落盘即恢复 clean，并按访问新近度限制为 512 MiB/20 万条。
 
 ## 10.2 并发模型
 
-一次 revision 的变更写入是串行的，查询可并行；Web 构建依赖图仍由领域层组织，不把每个对象建模为 Actor。
+一次 revision 的变更写入是串行的，查询可并行；Web 构建依赖图仍由领域层组织，不把每个对象建模为 Actor。生产 bundler 共享进程级工作窃取执行器，使多 BuildContext 的总 worker 数受机器并行度约束；显式执行器仅用于测试和隔离实验。
 
 ## 10.3 wake_turbo
 
