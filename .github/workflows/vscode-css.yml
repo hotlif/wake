@@ -223,6 +223,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Check out release source for provenance
+        uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: crab-css-*-${{ needs.verify.outputs.version }}

@@ -87,6 +87,7 @@ for (const required of [
   "- 'vscode-css-v*'",
   'github-release:',
   'contents: write',
+  'Check out release source for provenance',
   'actions/attest-build-provenance@v3',
   'gh release',
   'needs.verify.outputs.version',
