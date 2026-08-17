@@ -78,15 +78,13 @@ export function assignVars(variables) {
   const styles = {}
 
   for (const [variable, value] of Object.entries(variables)) {
-    const match = /^var\((--[^()\s]+)\)$/.exec(variable)
+    const property = customPropertyFromReference(variable)
 
-    if (!match) {
+    if (property === undefined) {
       throw new TypeError(
         `@crab-dev/css: assignVars key ${JSON.stringify(variable)} is not a CSS variable reference.`,
       )
     }
-
-    const property = match[1]
 
     if (
       (typeof value !== 'string' && typeof value !== 'number') ||
@@ -103,14 +101,41 @@ export function assignVars(variables) {
   return styles
 }
 
+function customPropertyFromReference(variable) {
+  if (!variable.startsWith('var(--') || !variable.endsWith(')')) return undefined
+
+  const property = variable.slice(4, -1)
+  if (property.length <= 2) return undefined
+  for (const character of property) {
+    if (character === '(' || character === ')' || character.trim() === '') return undefined
+  }
+  return property
+}
+
 function normalizeDebugName(debugName) {
   if (!debugName) return 'var'
 
-  const normalized = debugName
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48)
+  let normalized = ''
+  let invalidRun = false
+  for (const character of debugName.trim()) {
+    const code = character.codePointAt(0)
+    const valid =
+      (code >= 48 && code <= 57) ||
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      character === '_' ||
+      character === '-'
+    if (valid) {
+      if (invalidRun) normalized += '-'
+      normalized += character
+      invalidRun = false
+    } else {
+      invalidRun = true
+    }
+  }
+  while (normalized.startsWith('-')) normalized = normalized.slice(1)
+  while (normalized.endsWith('-')) normalized = normalized.slice(0, -1)
+  normalized = normalized.slice(0, 48)
 
   return normalized || 'var'
 }

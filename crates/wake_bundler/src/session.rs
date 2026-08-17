@@ -4,7 +4,7 @@ use std::sync::Arc;
 use wake_common::FileSystem;
 use wake_ecma_transform::TargetEnv;
 
-use crate::{BuildOutput, IncrementalBundler, ResolveOptions};
+use crate::{BuildOutput, BuildPlatform, IncrementalBundler, ModuleFormat, ResolveOptions};
 
 /// 一次构建使用的稳定配置。配置在 session 创建时归一化，避免构建过程中通过 setter
 /// 改变任务语义。
@@ -13,6 +13,9 @@ pub struct BuildOptions {
     /// 项目根，用于生成跨 checkout/跨平台稳定的 CSS module identity。
     pub project_root: Option<PathBuf>,
     pub resolve: ResolveOptions,
+    pub platform: BuildPlatform,
+    pub module_format: ModuleFormat,
+    pub external_packages: Vec<String>,
     pub define: Vec<(String, String)>,
     pub extract_css: bool,
     pub asset_inline_limit: usize,
@@ -37,6 +40,9 @@ impl Default for BuildOptions {
         Self {
             project_root: None,
             resolve: ResolveOptions::default(),
+            platform: BuildPlatform::Browser,
+            module_format: ModuleFormat::Iife,
+            external_packages: Vec::new(),
             define: vec![
                 (
                     "process.env.NODE_ENV".to_string(),
@@ -195,6 +201,9 @@ fn apply_options(bundler: &mut IncrementalBundler, options: BuildOptions) {
     }
     bundler
         .set_resolve_options(options.resolve)
+        .set_platform(options.platform)
+        .set_module_format(options.module_format)
+        .set_external_packages(options.external_packages)
         .set_define(options.define)
         .set_asset_inline_limit(options.asset_inline_limit)
         .set_public_path(options.public_path)

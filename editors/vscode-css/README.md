@@ -4,8 +4,12 @@ Crab CSS adds CSS highlighting, completion, hover, diagnostics, colors, symbols,
 ranges and explicit formatting to `css`, `keyframes` and `globalStyle` templates imported from
 `@crab-dev/css`.
 
-The extension uses a native Rust language server. Canonical tag names receive immediate TextMate
-highlighting; semantic analysis recognizes import aliases and ignores shadowed local bindings.
+The extension uses a native Rust language server. Highlighting is driven exclusively by AST and
+semantic binding analysis, so import aliases work while shadowed bindings and same-named tags from
+other packages are ignored. The client does not inspect source text or dependency manifests to
+guess whether a document contains Crab CSS. Discovered templates are parsed once into the CSS
+concrete syntax tree owned by `wake_css`, shared with compiler and bundler syntax consumers and
+reused by highlighting, diagnostics, hover, colors, folding and formatting.
 
 ## Compatibility
 

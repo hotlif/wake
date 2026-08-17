@@ -4,8 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use wake_common::{MemoryFileSystem, OsFileSystem};
+use wake_ecma_transform::TargetEnv;
 
-use crate::{Bundler, IncrementalBundler};
+use crate::{BuildPlatform, Bundler, IncrementalBundler, ModuleFormat};
 
 /// 一个多模块 ESM fixture：index 依赖 math + msg。
 fn fixture() -> MemoryFileSystem {
@@ -345,6 +346,7 @@ fn node_builtin_is_externalized() {
         ),
     ]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.set_platform(BuildPlatform::Node);
     let out = bundler.build(Path::new("src/index.js"));
     assert!(
         !out.has_errors(),
@@ -360,6 +362,203 @@ fn node_builtin_is_externalized() {
     );
     // 只有 index + lib 两个模块（fs / node:path 未进图）。
     assert_eq!(out.module_count, 2);
+}
+
+#[test]
+fn node_commonjs_bundle_keeps_explicit_external_and_strict_entry_export() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.ts",
+        "import * as vscode from 'vscode'; export const kind = typeof vscode;",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs)
+        .set_external_packages(vec!["vscode".to_string()])
+        .set_target_env(TargetEnv::new(vec![
+            wake_ecma_transform::BrowserTarget::new("node", "20"),
+        ]));
+    let out = bundler.build(Path::new("src/index.ts"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("require(\"vscode\")"), "{}", out.bundle);
+    assert!(out.bundle.contains("module.exports = __wake_entry__"));
+    assert!(!out.bundle.contains("root.__wake_entry__"));
+}
+
+#[test]
+fn external_package_matches_subpaths_but_not_similar_package_names() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.ts",
+            "import api from 'vscode/languages'; import value from 'vscode-test'; \
+             export default [typeof api, value];",
+        ),
+        (
+            "node_modules/vscode-test/package.json",
+            r#"{"main":"./index.js"}"#,
+        ),
+        (
+            "node_modules/vscode-test/index.js",
+            "export default 'INTERNAL_SIMILAR_PACKAGE';",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs)
+        .set_external_packages(vec!["vscode".to_string()]);
+
+    let out = bundler.build(Path::new("src/index.ts"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(
+        out.bundle.contains("require(\"vscode/languages\")"),
+        "{}",
+        out.bundle
+    );
+    assert!(out.bundle.contains("INTERNAL_SIMILAR_PACKAGE"));
+    assert_eq!(out.module_count, 2);
+}
+
+#[test]
+fn platform_format_and_external_changes_invalidate_a_long_lived_bundler() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import value from 'host-api'; export default value;",
+        ),
+        (
+            "node_modules/host-api/package.json",
+            r#"{"main":"./index.js"}"#,
+        ),
+        (
+            "node_modules/host-api/index.js",
+            "export default 'INTERNAL_HOST_API';",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    let browser = bundler.build(Path::new("src/index.js"));
+    assert!(!browser.has_errors(), "{:?}", browser.diagnostics);
+    assert!(browser.bundle.contains("INTERNAL_HOST_API"));
+    assert!(browser.bundle.contains("root.__wake_entry__"));
+
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs)
+        .set_external_packages(vec!["host-api".to_string()]);
+    let node = bundler.build(Path::new("src/index.js"));
+    assert!(!node.has_errors(), "{:?}", node.diagnostics);
+    assert!(!node.bundle.contains("INTERNAL_HOST_API"));
+    assert!(node.bundle.contains("require(\"host-api\")"));
+    assert!(node.bundle.contains("module.exports = __wake_entry__"));
+    assert!(!node.bundle.contains("root.__wake_entry__"));
+}
+
+#[test]
+fn node_bundle_rejects_browser_resources_with_the_resource_path() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.ts",
+            "import './theme.css'; export const ok = true;",
+        ),
+        ("src/theme.css", "body { color: rebeccapurple; }"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs);
+
+    let out = bundler.build(Path::new("src/index.ts"));
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0303"))
+        .unwrap_or_else(|| panic!("应有 Node 资源诊断: {:?}", out.diagnostics));
+    assert!(out.has_errors());
+    assert!(
+        diagnostic
+            .path
+            .as_deref()
+            .is_some_and(|path| path.replace('\\', "/") == "src/index.ts"),
+        "{:?}",
+        diagnostic.path
+    );
+    assert!(!diagnostic.labels.is_empty(), "{diagnostic:?}");
+}
+
+#[test]
+fn commonjs_bundle_allows_top_level_await_behind_dynamic_import() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.ts",
+            "export const load = () => import('./async.js');",
+        ),
+        (
+            "src/async.js",
+            "const value = await Promise.resolve(42); export default value;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs);
+
+    let out = bundler.build(Path::new("src/index.ts"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+}
+
+#[test]
+fn commonjs_bundle_rejects_top_level_await_in_static_graph() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.ts",
+            "import value from './async.js'; export default value;",
+        ),
+        (
+            "src/async.js",
+            "const value = await Promise.resolve(42); export default value;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs);
+
+    let out = bundler.build(Path::new("src/index.ts"));
+    assert!(out.has_errors());
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0304")),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn commonjs_bundle_rejects_require_of_top_level_await_module() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "const value = require('./async.js'); module.exports = value;",
+        ),
+        (
+            "src/async.js",
+            "const value = await Promise.resolve(42); export default value;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs);
+
+    let out = bundler.build(Path::new("src/index.js"));
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0304"))
+        .unwrap_or_else(|| panic!("expected require/TLA diagnostic: {:?}", out.diagnostics));
+    assert!(out.has_errors());
+    assert!(!diagnostic.labels.is_empty(), "{diagnostic:?}");
 }
 
 #[test]
@@ -720,7 +919,7 @@ fn browserslist_target_lowers_exponentiation() {
         "src/index.js",
         "const base = 2; console.log(base ** 3);",
     )]));
-    let mut old = IncrementalBundler::new(fs.clone());
+    let mut old = IncrementalBundler::new(fs);
     old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
         wake_ecma_transform::BrowserTarget::new("chrome", "49"),
     ]));
@@ -733,11 +932,10 @@ fn browserslist_target_lowers_exponentiation() {
     );
     assert!(!lowered.bundle.contains("base**3"), "{}", lowered.bundle);
 
-    let mut modern = IncrementalBundler::new(fs);
-    modern.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
+    old.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
         wake_ecma_transform::BrowserTarget::new("chrome", "120"),
     ]));
-    let preserved = modern.build(Path::new("src/index.js"));
+    let preserved = old.build(Path::new("src/index.js"));
     assert!(!preserved.has_errors(), "{:?}", preserved.diagnostics);
     assert!(
         preserved.bundle.contains("base ** 3"),
@@ -4230,6 +4428,31 @@ fn single_chunk_content_hash_is_opt_in_and_derived_from_entry_code() {
     assert_eq!(unhashed_output.entry().file_name, "entry.js");
 }
 
+#[test]
+fn configured_entry_chunk_name_applies_to_code_split_output() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/components-entry.js",
+            "export const load = () => import('./route.js');",
+        ),
+        ("src/route.js", "export const route = 'docs';"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_code_splitting()
+        .set_entry_chunk_name("entry");
+
+    let output = bundler.build(Path::new("src/components-entry.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(output.chunks.len() > 1);
+    assert_eq!(output.entry().name, "entry");
+    assert!(
+        output.entry().file_name.starts_with("entry.") && output.entry().file_name.ends_with(".js"),
+        "{}",
+        output.entry().file_name
+    );
+}
+
 // ============================================================
 // 持久化构建缓存（PLAN §7.1）——全新进程冷构建跳过未变模块的 parse + codegen
 // ============================================================
@@ -5430,6 +5653,28 @@ fn crab_css_static_tokens_propagate_through_esm_barrels() {
         .expect("CSS asset");
     assert!(css.contains("color: rebeccapurple"), "{css}");
     assert!(css.contains("gap: 8px"), "{css}");
+}
+
+#[test]
+fn code_split_entry_css_keeps_the_stable_styles_name() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/components-entry.js",
+            "import './entry.css'; export const load = () => import('./lazy.js');",
+        ),
+        ("src/entry.css", "body { color: rebeccapurple; }"),
+        ("src/lazy.js", "export const value = 42;"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_css_extraction()
+        .enable_code_splitting()
+        .set_entry_chunk_name("entry");
+    let output = bundler.build(Path::new("src/components-entry.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.entry().styles.len(), 1);
+    assert!(output.entry().styles[0].starts_with("styles."));
 }
 
 #[test]

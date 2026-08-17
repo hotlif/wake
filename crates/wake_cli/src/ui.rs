@@ -159,6 +159,41 @@ impl Ui {
         let _ = io::stderr().flush();
     }
 
+    pub fn bundle_result(&self, label: &str, result: &wake_app::BundleResult, extra: Option<&str>) {
+        let bytes = result.files.iter().map(|file| file.bytes).sum::<usize>();
+        eprintln!(
+            "  {}  {} {}",
+            self.ok("✓"),
+            self.bold(label),
+            self.accent(&format!("in {}", human_duration(result.duration_ms))),
+        );
+        eprintln!(
+            "     {} {} {} {} {} {} {}",
+            self.accent(&format!("{} modules", result.module_count)),
+            self.dim("·"),
+            result.files.len(),
+            self.dim("files"),
+            self.dim("·"),
+            self.accent(&human_bytes(bytes)),
+            extra.unwrap_or_default(),
+        );
+        if let Some(output_file) = &result.output_file {
+            eprintln!("     {}  {}", self.dim("Output"), self.accent(output_file));
+        }
+        for diagnostic in &result.diagnostics {
+            eprintln!(
+                "     {}  {}",
+                self.warn(&diagnostic.severity.to_uppercase()),
+                diagnostic.message
+            );
+            if let Some(path) = &diagnostic.path {
+                eprintln!("        {} {}", self.dim("-->"), self.accent(path));
+            }
+        }
+        eprintln!();
+        let _ = io::stderr().flush();
+    }
+
     pub fn app_error(&self, error: &wake_app::WakeError) {
         eprintln!(
             "  {}  {} {}",

@@ -124,3 +124,11 @@ JavaScript 类型以 `npm/wake/index.d.ts` 和 `experimental.d.ts` 为公开事�
 `wake_bundler` 同时公开同步 `Bundler` 与基于 `IncrementalBundler` 的 `BuildSession`。应用层主流程使用会话/增量路径，但同步路径仍被测试和部分内部调用覆盖。
 
 这不是新的功能入口。后续应先建立两条路径的产物等价测试，再决定把同步路径降为薄适配器或内部测试工具；在此之前不得删除其回归用例。验收条件见 [ROADMAP.md](ROADMAP.md)。
+
+## 8. 发布边界
+
+npm registry 包与 Crab CSS VS Code 扩展是两个独立产品边缘：前者只由
+`release-npm.yml` 发布，后者只由 `vscode-css.yml` 发布。各自的 package manifest 是版本事实
+来源，标签必须与 manifest 精确一致；发布 job 只消费已经构建和审计的不可变制品。可执行的
+覆盖规则由 `scripts/check-release-coverage.mjs` 持有，长期决策见
+[ADR 0011](decisions/0011-release-automation.md)。

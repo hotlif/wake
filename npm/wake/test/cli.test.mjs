@@ -42,3 +42,22 @@ test('validates the docs mode before starting a build', () => {
   assert.match(result.stderr, /--mode must be one of: site, components/)
   assert.doesNotMatch(result.stderr, /WAKE \/ DOCS BUILD/)
 })
+
+test('bundle parser errors use the Rust CLI usage exit code', () => {
+  const missingOutfile = run(['bundle', fixture, '--platform', 'node'])
+  assert.equal(missingOutfile.status, 2)
+  assert.match(missingOutfile.stderr, /WAKE_CONFIG/)
+  assert.match(missingOutfile.stderr, /--outfile/)
+
+  const invalidPlatform = run([
+    'bundle',
+    fixture,
+    '--outfile',
+    'ignored.js',
+    '--platform',
+    'server',
+  ])
+  assert.equal(invalidPlatform.status, 2)
+  assert.match(invalidPlatform.stderr, /WAKE_CONFIG/)
+  assert.match(invalidPlatform.stderr, /browser, node/)
+})

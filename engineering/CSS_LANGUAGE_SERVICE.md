@@ -2,15 +2,18 @@
 
 This document defines the protocol and ownership contract for editor intelligence around
 `@crab-dev/css`. The durable architecture decision is
-[ADR 0007](decisions/0007-css-language-intelligence.md).
+[ADR 0010](decisions/0010-shared-css-syntax-tree.md).
 
 ## Components
 
-- `wake_css_language`: host parsing, semantic tag discovery, virtual CSS, source maps and reusable
-  language features.
+- `wake_css`: the shared CSS concrete syntax tree, decoded tokens, declarations, errors and source
+  spans used by compiler, bundler and language consumers.
+- `wake_css_language`: ECMA AST/semantic tag discovery, virtual CSS, source maps and reusable
+  language features built from the shared CSS tree.
 - `wake_css_lsp`: stdio protocol, document lifecycle, workspace resolution, saved dependency
   analysis and bounded caches.
-- `editors/vscode-css`: TextMate injection, configuration, commands and platform server launch.
+- `editors/vscode-css`: configuration, commands and platform server launch; highlighting comes only
+  from semantic tokens and has no TextMate fallback.
 
 The compiler remains authoritative for static evaluation. Language features may add CSS syntax
 diagnostics, but a diagnostic using a `CRAB_CSS_*` code must originate in `wake_css_in_js`.
@@ -18,8 +21,8 @@ diagnostics, but a diagnostic using a `CRAB_CSS_*` code must originate in `wake_
 ## Document model
 
 Every open document is identified by URI and monotonically increasing editor version. A parsed
-snapshot contains discovered templates, virtual CSS text, source segments and local analysis. The
-snapshot is reused by all requests for that version.
+snapshot contains discovered templates, virtual CSS text, source segments and one shared CSS CST.
+The snapshot and tree are reused by all requests for that version.
 
 Virtual contexts are deterministic:
 

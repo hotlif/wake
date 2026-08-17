@@ -1,11 +1,14 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, copyFileSync, mkdirSync, rmSync } from 'node:fs'
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { inspectVsix } from './check-vsix.mjs'
 
 const extensionRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
+const extensionManifest = JSON.parse(
+  readFileSync(join(extensionRoot, 'package.json'), 'utf8'),
+)
 const supportedTargets = new Set([
   'win32-x64',
   'linux-x64',
@@ -37,7 +40,7 @@ copyFileSync(resolve(binary), stagedBinary)
 if (!target.startsWith('win32')) chmodSync(stagedBinary, 0o755)
 mkdirSync(output, { recursive: true })
 
-const archive = join(output, `crab-css-${target}-0.1.0.vsix`)
+const archive = join(output, `crab-css-${target}-${extensionManifest.version}.vsix`)
 execFileSync(process.execPath, [
   join(extensionRoot, 'node_modules', '@vscode', 'vsce', 'vsce'),
   'package',

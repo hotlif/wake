@@ -1,7 +1,7 @@
 {
   "name": "wake-workspace",
   "private": true,
-  "version": "0.1.16",
+  "version": "0.1.17",
   "type": "module",
   "workspaces": [
     "npm/css",
@@ -22,6 +22,7 @@
     "npm:typecheck:css": "npm run typecheck --workspace @crab-dev/css",
     "npm:pack:check": "node scripts/check-npm-packs.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
+    "release:check": "node scripts/check-release-coverage.mjs",
     "vscode:css:check": "npm run check --prefix editors/vscode-css",
     "versions:check": "node scripts/check-versions.mjs"
   },
@@ -42,7 +43,7 @@
     "@crab-dev/rc-text-edit": "^0.0.1",
     "@crab-dev/rc-tooltip": "^0.0.2",
     "@crab-dev/rc-tree": "^0.1.2",
-    "@crab-dev/css": "0.1.16",
+    "@crab-dev/css": "0.1.17",
     "lucide-react": "^1.23.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

@@ -39,9 +39,25 @@ export interface BuildOptions extends ProjectOptions {
   sourceMap?: boolean
 }
 
+export type BundlePlatform = 'browser' | 'node'
+export type BundleFormat = 'iife' | 'cjs'
+export type NodeTarget = `node${number}` | `node${number}.${number}`
+
+export interface BundleOptions extends ProjectOptions {
+  entry?: string
+  outfile?: string
+  platform?: BundlePlatform
+  format?: BundleFormat
+  target?: NodeTarget
+  external?: string[]
+  minify?: boolean
+  sourceMap?: boolean
+  cache?: boolean
+}
+
 export interface OutputFile {
   path: string
-  kind: 'chunk' | 'css' | 'asset' | 'html'
+  kind: 'chunk' | 'css' | 'asset' | 'html' | 'map'
   bytes: number
 }
 
@@ -57,9 +73,18 @@ export interface BuildResult {
   diagnostics: Diagnostic[]
 }
 
-export interface BundleResult extends BuildResult {
+export interface BundleResult {
+  success: true
+  moduleCount: number
+  updatedModuleCount: number
+  cachedModuleCount: number
+  durationMs: number
+  outputFile?: string
   code: string
-  outputDir?: undefined
+  sourceMap?: string
+  sourceMapFile?: string
+  files: OutputFile[]
+  diagnostics: Diagnostic[]
 }
 
 export type DocsMode = 'site' | 'components'
@@ -149,7 +174,7 @@ export class DevServer extends EventEmitter {
 }
 
 export function version(): string
-export function bundle(options: BuildOptions): Promise<BundleResult>
+export function bundle(options: BundleOptions): Promise<BundleResult>
 export function build(options?: BuildOptions): Promise<BuildResult>
 export function createBuildContext(options?: BuildOptions): Promise<BuildContext>
 export function startDevServer(options?: DevServerOptions): Promise<DevServer>

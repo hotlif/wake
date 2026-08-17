@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { access, appendFile, cp, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { access, appendFile, cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
@@ -110,6 +110,43 @@ test('builds, bundles, and serializes context rebuilds', async () => {
   await context.close()
   assert.equal(context.closed, true)
   await context.close()
+})
+
+test('writes an executable Node CommonJS bundle to an exact outfile', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-node-bundle-'))
+  const outfile = join(cwd, 'dist', 'extension.cjs')
+  await writeFile(join(cwd, 'package.json'), '{"name":"fixture"}')
+  await writeFile(
+    join(cwd, 'extension.ts'),
+    "import path from 'node:path'; export const answer: number = path.sep.length + 41; " +
+      'export const runtimeDir = __dirname; export const runtimeFile = __filename;',
+  )
+  const result = await bundle({
+    cwd,
+    entry: 'extension.ts',
+    outfile,
+    platform: 'node',
+    target: 'node20',
+  })
+  assert.equal(result.outputFile, outfile)
+  const loaded = require(outfile)
+  assert.equal(loaded.answer, 42)
+  assert.equal(loaded.runtimeDir, dirname(outfile))
+  assert.equal(loaded.runtimeFile, outfile)
+  const mappedOutfile = join(cwd, 'dist', 'mapped.cjs')
+  const mapped = await bundle({
+    cwd,
+    entry: 'extension.ts',
+    outfile: mappedOutfile,
+    platform: 'node',
+    sourceMap: true,
+  })
+  assert.equal(typeof mapped.sourceMap, 'string')
+  assert.equal(mapped.sourceMapFile, `${mappedOutfile}.map`)
+  assert.equal(await readFile(`${mappedOutfile}.map`, 'utf8'), mapped.sourceMap)
+  assert.match(await readFile(mappedOutfile, 'utf8'), /sourceMappingURL=mapped\.cjs\.map/)
+  assert.equal(await readFile(join(cwd, 'package.json'), 'utf8'), '{"name":"fixture"}')
+  await rm(cwd, { recursive: true, force: true })
 })
 
 async function listen(server, port = 0) {
@@ -389,6 +426,11 @@ test('normalizes cancellation and configuration failures', async () => {
 
   await assert.rejects(
     build({ cwd: 'does-not-exist' }),
+    (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
+  )
+
+  await assert.rejects(
+    bundle({ minify: true, sourceMap: true }),
     (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
   )
 })

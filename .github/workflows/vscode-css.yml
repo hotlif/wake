@@ -3,7 +3,16 @@ name: Crab CSS VS Code
 on:
   pull_request:
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'crates/wake_common/**'
+      - 'crates/wake_resolver/**'
+      - 'crates/wake_bundler/**'
+      - 'crates/wake_app/**'
+      - 'crates/wake_cli/**'
+      - 'crates/wake_node/**'
+      - 'crates/wake_ecma_transform/**'
+      - 'npm/wake/**'
       - 'crates/wake_css_in_js/**'
       - 'crates/wake_css_language/**'
       - 'crates/wake_css_lsp/**'
@@ -14,8 +23,19 @@ on:
       - 'Cargo.lock'
   push:
     branches: [canary]
+    tags:
+      - 'vscode-css-v*'
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'crates/wake_common/**'
+      - 'crates/wake_resolver/**'
+      - 'crates/wake_bundler/**'
+      - 'crates/wake_app/**'
+      - 'crates/wake_cli/**'
+      - 'crates/wake_node/**'
+      - 'crates/wake_ecma_transform/**'
+      - 'npm/wake/**'
       - 'crates/wake_css_in_js/**'
       - 'crates/wake_css_language/**'
       - 'crates/wake_css_lsp/**'
@@ -36,6 +56,8 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.extension-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -46,8 +68,24 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: editors/vscode-css/package-lock.json
+      - name: Verify extension release version
+        id: extension-version
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version="$(node -p 'require("./editors/vscode-css/package.json").version')"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          if [ "$REF_TYPE" = 'tag' ]; then
+            test "$REF_NAME" = "vscode-css-v${version}"
+          fi
       - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: npm run release:check
+      - run: cargo build --release -p wake_cli
       - run: npm run vscode:css:check
+        env:
+          WAKE_BIN: ${{ github.workspace }}/target/release/wake
       - run: npm run update:css-data --prefix editors/vscode-css
       - run: git diff --exit-code -- crates/wake_css_language/data/css-facts.json
       - run: cargo test -p wake_css_language -p wake_css_lsp -p wake_css_in_js
@@ -66,12 +104,13 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode-css/package-lock.json
       - run: npm ci --ignore-scripts --prefix editors/vscode-css
-      - run: cargo build --release -p wake_css_lsp
+      - run: cargo build --release -p wake_css_lsp -p wake_cli
       - run: mkdir -p editors/vscode-css/server
       - run: cp target/release/wake-css-language-server editors/vscode-css/server/wake-css-language-server
       - run: xvfb-run -a npm run test:extension --prefix editors/vscode-css
         env:
           VSCODE_TEST_VERSION: 1.96.4
+          WAKE_BIN: ${{ github.workspace }}/target/release/wake
 
   package-native:
     needs: verify
@@ -83,14 +122,17 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             vsce_target: win32-x64
             binary: target/x86_64-pc-windows-msvc/release/wake-css-language-server.exe
+            wake_binary: target/x86_64-pc-windows-msvc/release/wake.exe
           - runner: macos-15-intel
             rust_target: x86_64-apple-darwin
             vsce_target: darwin-x64
             binary: target/x86_64-apple-darwin/release/wake-css-language-server
+            wake_binary: target/x86_64-apple-darwin/release/wake
           - runner: macos-15
             rust_target: aarch64-apple-darwin
             vsce_target: darwin-arm64
             binary: target/aarch64-apple-darwin/release/wake-css-language-server
+            wake_binary: target/aarch64-apple-darwin/release/wake
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -106,15 +148,17 @@ jobs:
         with:
           key: vscode-css-${{ matrix.rust_target }}
       - run: npm ci --ignore-scripts --prefix editors/vscode-css
-      - run: cargo build --release -p wake_css_lsp --target ${{ matrix.rust_target }}
+      - run: cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }}
       - run: >-
           npm run package:vsix --prefix editors/vscode-css --
           --target ${{ matrix.vsce_target }}
           --binary ${{ github.workspace }}/${{ matrix.binary }}
           --out ${{ github.workspace }}/artifacts
+        env:
+          WAKE_BIN: ${{ github.workspace }}/${{ matrix.wake_binary }}
       - uses: actions/upload-artifact@v4
         with:
-          name: crab-css-${{ matrix.vsce_target }}-0.1.0
+          name: crab-css-${{ matrix.vsce_target }}-${{ needs.verify.outputs.version }}
           path: artifacts/*.vsix
           if-no-files-found: error
 
@@ -129,11 +173,13 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             vsce_target: linux-x64
             binary: target/x86_64-unknown-linux-gnu/release/wake-css-language-server
+            wake_binary: target/x86_64-unknown-linux-gnu/release/wake
           - runner: ubuntu-24.04-arm
             image: quay.io/pypa/manylinux_2_28_aarch64
             rust_target: aarch64-unknown-linux-gnu
             vsce_target: linux-arm64
             binary: target/aarch64-unknown-linux-gnu/release/wake-css-language-server
+            wake_binary: target/aarch64-unknown-linux-gnu/release/wake
     runs-on: ${{ matrix.runner }}
     container:
       image: ${{ matrix.image }}
@@ -148,7 +194,7 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode-css/package-lock.json
       - run: npm ci --ignore-scripts --prefix editors/vscode-css
-      - run: cargo build --release -p wake_css_lsp --target ${{ matrix.rust_target }}
+      - run: cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }}
       - name: Verify glibc baseline
         shell: bash
         run: |
@@ -159,8 +205,55 @@ jobs:
           --target ${{ matrix.vsce_target }}
           --binary ${{ github.workspace }}/${{ matrix.binary }}
           --out ${{ github.workspace }}/artifacts
+        env:
+          WAKE_BIN: ${{ github.workspace }}/${{ matrix.wake_binary }}
       - uses: actions/upload-artifact@v4
         with:
-          name: crab-css-${{ matrix.vsce_target }}-0.1.0
+          name: crab-css-${{ matrix.vsce_target }}-${{ needs.verify.outputs.version }}
           path: artifacts/*.vsix
           if-no-files-found: error
+
+  github-release:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'vscode-css-v')
+    needs: [verify, extension-host, package-native, package-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: crab-css-*-${{ needs.verify.outputs.version }}
+          path: release-artifacts
+          merge-multiple: true
+      - name: Verify immutable VSIX release set
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          expected=(win32-x64 linux-x64 linux-arm64 darwin-x64 darwin-arm64)
+          shopt -s nullglob
+          archives=(release-artifacts/*.vsix)
+          test "${#archives[@]}" -eq "${#expected[@]}"
+          for target in "${expected[@]}"; do
+            test -f "release-artifacts/crab-css-${target}-${VERSION}.vsix"
+          done
+      - uses: actions/attest-build-provenance@v3
+        if: github.event.repository.visibility == 'public'
+        with:
+          subject-path: release-artifacts/*.vsix
+      - name: Attach packages to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-artifacts/*.vsix --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-artifacts/*.vsix \
+              --verify-tag \
+              --generate-notes \
+              --title "Crab CSS VS Code ${VERSION}"
+          fi

@@ -8,6 +8,20 @@ import * as esm from '../index.mjs'
 const require = createRequire(import.meta.url)
 const cjs = require('../index.cjs')
 
+function errorMessageIncludes(fragment) {
+  return (error) => error instanceof Error && error.message.includes(fragment)
+}
+
+function isGeneratedVar(value, label) {
+  const prefix = `var(--crab-css-${label}-`
+  if (!value.startsWith(prefix) || !value.endsWith(')')) return false
+  const id = value.slice(prefix.length, -1)
+  return id.length > 0 && [...id].every((character) => {
+    const code = character.codePointAt(0)
+    return (code >= 48 && code <= 57) || (code >= 97 && code <= 122)
+  })
+}
+
 const publicExports = [
   'assignVars',
   'createVar',
@@ -29,9 +43,9 @@ test('compile-time tags fail clearly when Wake did not transform them', () => {
         () => implementation[name]`color: red;`,
         (error) => {
           assert.equal(error.code, 'ERR_WAKE_CSS_NOT_COMPILED')
-          assert.match(error.message, new RegExp(`@crab-dev/css: ${name}`))
-          assert.match(error.message, /compile-time template tag/)
-          assert.match(error.message, /Build this module with Wake/)
+          assert.ok(error.message.includes(`@crab-dev/css: ${name}`))
+          assert.ok(error.message.includes('compile-time template tag'))
+          assert.ok(error.message.includes('Build this module with Wake'))
           return true
         },
       )
@@ -61,12 +75,12 @@ test('createVar is realm-unique across ESM and CommonJS and sanitizes debug labe
   const second = cjs.createVar('accent color')
   const fallback = esm.createVar('!!!')
 
-  assert.match(first, /^var\(--crab-css-accent-color-[0-9a-z]+\)$/)
-  assert.match(second, /^var\(--crab-css-accent-color-[0-9a-z]+\)$/)
-  assert.match(fallback, /^var\(--crab-css-var-[0-9a-z]+\)$/)
+  assert.ok(isGeneratedVar(first, 'accent-color'))
+  assert.ok(isGeneratedVar(second, 'accent-color'))
+  assert.ok(isGeneratedVar(fallback, 'var'))
   assert.notEqual(first, second)
   assert.notEqual(second, fallback)
-  assert.throws(() => esm.createVar(42), /debugName must be a string/)
+  assert.throws(() => esm.createVar(42), errorMessageIncludes('debugName must be a string'))
 })
 
 test('assignVars creates a fresh custom-property style object', () => {
@@ -80,10 +94,25 @@ test('assignVars creates a fresh custom-property style object', () => {
     [spacing.slice(4, -1)]: 8,
   })
   assert.notEqual(styles, input)
-  assert.throws(() => esm.assignVars(null), /expects a CSS variable map/)
-  assert.throws(() => esm.assignVars({ '--raw': 'red' }), /not a CSS variable reference/)
-  assert.throws(() => esm.assignVars({ 'var(--bad)': Infinity }), /string or finite number/)
-  assert.throws(() => esm.assignVars({ 'var(--bad)': true }), /string or finite number/)
+  assert.throws(() => esm.assignVars(null), errorMessageIncludes('expects a CSS variable map'))
+  assert.throws(
+    () => esm.assignVars({ '--raw': 'red' }),
+    errorMessageIncludes('not a CSS variable reference'),
+  )
+  assert.throws(
+    () => esm.assignVars({ 'var(--bad)': Infinity }),
+    errorMessageIncludes('string or finite number'),
+  )
+  assert.throws(
+    () => esm.assignVars({ 'var(--bad)': true }),
+    errorMessageIncludes('string or finite number'),
+  )
+  for (const invalid of ['var(--bad value)', 'var(--bad())', 'var(--)', 'var( --bad)']) {
+    assert.throws(
+      () => esm.assignVars({ [invalid]: 'red' }),
+      errorMessageIncludes('not a CSS variable reference'),
+    )
+  }
 })
 
 test('package metadata has no runtime dependencies and publishes only artifacts', async () => {
@@ -92,7 +121,7 @@ test('package metadata has no runtime dependencies and publishes only artifacts'
   )
 
   assert.equal(packageJson.name, '@crab-dev/css')
-  assert.equal(packageJson.version, '0.1.16')
+  assert.equal(packageJson.version, '0.1.17')
   assert.equal(packageJson.sideEffects, false)
   assert.equal(packageJson.dependencies, undefined)
   assert.deepEqual(packageJson.files, [

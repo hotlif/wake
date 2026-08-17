@@ -17,6 +17,9 @@
 //! `@crab-dev/css` 的插值无法静态证明时会产生阻断构建的错误。
 
 use wake_common::{Atom, Diagnostic, FxHashMap, FxHashSet, Interner, Span};
+use wake_css::syntax::{
+    CssSyntaxContext, CssSyntaxItem, CssSyntaxItemKind, CssSyntaxKind, CssSyntaxNode, CssSyntaxTree,
+};
 use wake_ecma_ast::*;
 use wake_ecma_semantic::{DeclKind, SymbolId, analyze};
 
@@ -104,6 +107,15 @@ impl BindingKind {
             Self::Keyframes => Some(CssTemplateKind::Keyframes),
             Self::GlobalStyle => Some(CssTemplateKind::GlobalStyle),
             Self::Cx | Self::CreateVar | Self::AssignVars => None,
+        }
+    }
+
+    fn syntax_context(self) -> CssSyntaxContext {
+        match self {
+            Self::Css => CssSyntaxContext::StyleBlock,
+            Self::Keyframes => CssSyntaxContext::Keyframes,
+            Self::GlobalStyle => CssSyntaxContext::Stylesheet,
+            Self::Cx | Self::CreateVar | Self::AssignVars => CssSyntaxContext::ComponentValues,
         }
     }
 }
@@ -1123,10 +1135,17 @@ impl Collector<'_, '_> {
             self.interner,
             self.bindings,
             label,
+            binding.kind.syntax_context(),
         );
         self.out.diagnostics.append(&mut diagnostics);
+        let syntax = CssSyntaxTree::parse_with_context(
+            &body,
+            Span::new(0, body.len() as u32),
+            binding.kind.syntax_context(),
+        );
 
-        if binding.kind == BindingKind::Css && contains_css_token(&body, ":global") {
+        if binding.kind == BindingKind::Css && contains_global_escape(&syntax.nodes, &syntax.items)
+        {
             self.out.diagnostics.push(
                 Diagnostic::error(
                     "css`` 中的 :global 逃逸无法跟随局部 binding 做可靠的样式存活分析",
@@ -1137,7 +1156,7 @@ impl Collector<'_, '_> {
             return;
         }
         if binding.kind == BindingKind::Css
-            && let Some(at_rule) = unsupported_scoped_at_rule(&body)
+            && let Some(at_rule) = unsupported_scoped_at_rule(&syntax.nodes, &syntax.items)
         {
             self.out.diagnostics.push(
                 Diagnostic::error(format!(
@@ -1148,7 +1167,7 @@ impl Collector<'_, '_> {
             );
             return;
         }
-        if contains_relative_css_url(&body) {
+        if contains_relative_css_url(&syntax.nodes) {
             self.out.diagnostics.push(
                 Diagnostic::error(
                     "@crab-dev/css 暂不支持模板中的相对 url() 资源重写",
@@ -1173,9 +1192,11 @@ impl Collector<'_, '_> {
                 let ordinal = next_ordinal(&mut self.counters, binding.kind, hint);
                 let generated = generated_name(binding.kind, hint, self.seed, ordinal);
                 if binding.kind == BindingKind::Css {
-                    self.out
-                        .css
-                        .push_str(&nesting::flatten(&format!(".{generated}"), &body));
+                    self.out.css.push_str(&nesting::flatten_tree(
+                        &format!(".{generated}"),
+                        &body,
+                        &syntax,
+                    ));
                 } else {
                     self.out.css.push_str("@keyframes ");
                     self.out.css.push_str(&generated);
@@ -1198,7 +1219,9 @@ impl Collector<'_, '_> {
                     );
                     return;
                 }
-                self.out.css.push_str(&nesting::flatten("", &body));
+                self.out
+                    .css
+                    .push_str(&nesting::flatten_tree("", &body, &syntax));
                 self.out
                     .replacements
                     .insert(template.span, "void 0".to_string());
@@ -1208,76 +1231,49 @@ impl Collector<'_, '_> {
     }
 }
 
-fn contains_css_token(css: &str, needle: &str) -> bool {
-    let bytes = css.as_bytes();
-    let needle = needle.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' | b'\'' => skip_css_string(bytes, &mut i),
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => skip_css_comment(bytes, &mut i),
-            _ if bytes[i..].starts_with(needle) => return true,
-            _ => i += 1,
+fn contains_global_escape(nodes: &[CssSyntaxNode], items: &[CssSyntaxItem]) -> bool {
+    items.iter().any(|item| {
+        (matches!(item.kind, CssSyntaxItemKind::QualifiedRule)
+            && selector_contains_global_escape(item.nodes(nodes)))
+            || item
+                .block(nodes)
+                .is_some_and(|block| contains_global_escape(&block.children, &item.children))
+    })
+}
+
+fn selector_contains_global_escape(nodes: &[CssSyntaxNode]) -> bool {
+    for (index, node) in nodes.iter().enumerate() {
+        if matches!(node.kind, CssSyntaxKind::Colon)
+            && nodes[index + 1..]
+                .iter()
+                .find(|candidate| !candidate.is_trivia())
+                .is_some_and(|candidate| {
+                matches!(&candidate.kind, CssSyntaxKind::Function(name) if name.eq_ignore_ascii_case("global"))
+            })
+        {
+            return true;
+        }
+        if selector_contains_global_escape(&node.children) {
+            return true;
         }
     }
     false
 }
 
-fn contains_relative_css_url(css: &str) -> bool {
-    let bytes = css.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' | b'\'' => {
-                skip_css_string(bytes, &mut i);
-                continue;
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                skip_css_comment(bytes, &mut i);
-                continue;
-            }
-            _ => {}
-        }
-        if i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"url") {
-            let mut open = i + 3;
-            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
-                open += 1;
-            }
-            if open < bytes.len() && bytes[open] == b'(' {
-                let mut end = open + 1;
-                let mut quote = None;
-                while end < bytes.len() {
-                    if let Some(expected) = quote {
-                        if bytes[end] == b'\\' {
-                            end += 2;
-                            continue;
-                        }
-                        if bytes[end] == expected {
-                            quote = None;
-                        }
-                    } else if matches!(bytes[end], b'"' | b'\'') {
-                        quote = Some(bytes[end]);
-                    } else if bytes[end] == b')' {
-                        break;
-                    }
-                    end += 1;
+fn contains_relative_css_url(nodes: &[CssSyntaxNode]) -> bool {
+    nodes.iter().any(|node| match &node.kind {
+        CssSyntaxKind::Url(value) => !is_absolute_css_url(value.trim()),
+        CssSyntaxKind::Function(name) if name.eq_ignore_ascii_case("url") => {
+            let value = node.children.iter().find(|child| !child.is_trivia());
+            match value.map(|child| &child.kind) {
+                Some(CssSyntaxKind::QuotedString(value) | CssSyntaxKind::Url(value)) => {
+                    !is_absolute_css_url(value.trim())
                 }
-                let raw = css[open + 1..end.min(bytes.len())].trim();
-                let value = raw
-                    .strip_prefix(['"', '\''])
-                    .and_then(|value| value.strip_suffix(['"', '\'']))
-                    .unwrap_or(raw)
-                    .trim();
-                if !is_absolute_css_url(value) {
-                    return true;
-                }
-                i = end.saturating_add(1);
-                continue;
+                _ => true,
             }
         }
-        i += 1;
-    }
-    false
+        _ => contains_relative_css_url(&node.children),
+    })
 }
 
 fn is_absolute_css_url(value: &str) -> bool {
@@ -1295,79 +1291,29 @@ fn is_absolute_css_url(value: &str) -> bool {
         })
 }
 
-fn unsupported_scoped_at_rule(css: &str) -> Option<String> {
-    let bytes = css.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' | b'\'' => {
-                skip_css_string(bytes, &mut i);
-                continue;
+fn unsupported_scoped_at_rule(nodes: &[CssSyntaxNode], items: &[CssSyntaxItem]) -> Option<String> {
+    for item in items {
+        if let CssSyntaxItemKind::AtRule { name } = &item.kind {
+            let normalized = name.to_ascii_lowercase();
+            // Only rules whose block is safely scoped by nesting::flatten_tree are allowed.
+            // Unknown rules fail closed because many are global statements or descriptors.
+            if !matches!(
+                normalized.as_str(),
+                "media" | "supports" | "container" | "scope" | "document" | "keyframes" | "layer"
+            ) {
+                return Some(normalized);
             }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                skip_css_comment(bytes, &mut i);
-                continue;
+            if normalized == "layer" && item.block_index.is_none() {
+                return Some(normalized);
             }
-            b'@' => {
-                let start = i + 1;
-                let mut end = start;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-')
-                {
-                    end += 1;
-                }
-                if end == start {
-                    i += 1;
-                    continue;
-                }
-                let name = css[start..end].to_ascii_lowercase();
-                // Allow-list only rules whose body is safely scoped by nesting::flatten, plus
-                // keyframes whose name is localized. New/unknown at-rules fail closed because
-                // many of them are global statement or descriptor rules.
-                if !matches!(
-                    name.as_str(),
-                    "media" | "supports" | "container" | "scope" | "document" | "keyframes"
-                ) && name != "layer"
-                {
-                    return Some(name);
-                }
-                if name == "layer" {
-                    let rest = &css[end..];
-                    if rest.find(';').unwrap_or(usize::MAX) < rest.find('{').unwrap_or(usize::MAX) {
-                        return Some(name);
-                    }
-                }
-                i = end;
-                continue;
-            }
-            _ => i += 1,
+        }
+        if let Some(block) = item.block(nodes)
+            && let Some(name) = unsupported_scoped_at_rule(&block.children, &item.children)
+        {
+            return Some(name);
         }
     }
     None
-}
-
-fn skip_css_string(bytes: &[u8], i: &mut usize) {
-    let quote = bytes[*i];
-    *i += 1;
-    while *i < bytes.len() {
-        if bytes[*i] == b'\\' {
-            *i += 2;
-            continue;
-        }
-        let done = bytes[*i] == quote;
-        *i += 1;
-        if done {
-            return;
-        }
-    }
-}
-
-fn skip_css_comment(bytes: &[u8], i: &mut usize) {
-    *i += 2;
-    while *i + 1 < bytes.len() && !(bytes[*i] == b'*' && bytes[*i + 1] == b'/') {
-        *i += 1;
-    }
-    *i = (*i + 2).min(bytes.len());
 }
 
 /// 渲染标签模板为 CSS 文本：静态片段原样，插值求值后替换。
@@ -1379,6 +1325,7 @@ fn render_template(
     interner: &Interner,
     bindings: &BindingRegistry,
     tag_name: &str,
+    syntax_context: CssSyntaxContext,
 ) -> (String, Vec<Diagnostic>) {
     let mut out = String::new();
     let mut diags = Vec::new();
@@ -1436,42 +1383,32 @@ fn render_template(
     }
 
     if !bad_spots.is_empty() {
-        out = drop_declarations_at(&out, &bad_spots);
+        out = drop_declarations_at(&out, &bad_spots, syntax_context);
     }
     (out, diags)
 }
 
-/// 删除包含指定位置的那几条声明（按 `;`/`{`/`}` 切分边界）。
-fn drop_declarations_at(src: &str, spots: &[usize]) -> String {
-    let bytes = src.as_bytes();
-    let mut remove: Vec<(usize, usize)> = Vec::new();
-    for &spot in spots {
-        // 向前找声明起点：上一个 `;`、`{` 或 `}` 之后
-        let mut start = 0;
-        for i in (0..spot.min(bytes.len())).rev() {
-            if matches!(bytes[i], b';' | b'{' | b'}') {
-                start = i + 1;
-                break;
-            }
-        }
-        // 向后找声明终点：下一个 `;`（含）；没有则到下一个 `}` 之前
-        let mut end = bytes.len();
-        for (i, &b) in bytes.iter().enumerate().skip(spot.min(bytes.len())) {
-            if b == b';' {
-                end = i + 1;
-                break;
-            }
-            if b == b'}' {
-                end = i;
-                break;
-            }
-        }
-        remove.push((start, end));
-    }
-    remove.sort_unstable();
+/// 删除包含指定位置的声明。声明边界由共享 CSS CST 提供。
+fn drop_declarations_at(src: &str, spots: &[usize], syntax_context: CssSyntaxContext) -> String {
+    let tree =
+        CssSyntaxTree::parse_with_context(src, Span::new(0, src.len() as u32), syntax_context);
+    let mut remove = spots
+        .iter()
+        .filter_map(|spot| {
+            let offset = (*spot).min(src.len()) as u32;
+            tree.declarations
+                .iter()
+                .find(|declaration| declaration.span.lo <= offset && offset <= declaration.span.hi)
+                .map(|declaration| declaration.span)
+        })
+        .collect::<Vec<_>>();
+    remove.sort_by_key(|span| (span.lo, span.hi));
+    remove.dedup();
     let mut out = String::with_capacity(src.len());
     let mut pos = 0;
-    for (s, e) in remove {
+    for span in remove {
+        let s = span.lo as usize;
+        let e = span.hi as usize;
         if s >= pos {
             out.push_str(&src[pos..s]);
             pos = e;

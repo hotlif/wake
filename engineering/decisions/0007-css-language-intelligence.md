@@ -1,7 +1,8 @@
 # ADR 0007: Own CSS language intelligence below editor products
 
-- Status: accepted
+- Status: superseded
 - Date: 2026-08-14
+- Superseded by: [ADR 0009](0009-semantic-css-highlighting.md)
 
 ## Context
 
@@ -74,6 +75,11 @@ compiler diagnostics with an actionable warning.
 ## Supersedes
 
 None.
+
+## Superseded by
+
+[ADR 0009](0009-semantic-css-highlighting.md) replaces spelling-based TextMate highlighting with
+AST and semantic-binding-driven tokens as the only highlighting authority.
 
 ## Removal plan
 

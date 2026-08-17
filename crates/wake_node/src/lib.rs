@@ -160,6 +160,73 @@ impl RawBuildOptions {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawBundleOptions {
+    cwd: Option<String>,
+    config_path: Option<String>,
+    entry: Option<String>,
+    outfile: Option<String>,
+    platform: Option<String>,
+    format: Option<String>,
+    target: Option<String>,
+    external: Vec<String>,
+    minify: bool,
+    source_map: bool,
+    cache: bool,
+}
+
+impl RawBundleOptions {
+    fn parse(value: Option<String>) -> Result<Self, WakeError> {
+        value
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()))
+            })
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    fn into_app(self) -> Result<wake_app::BundleOptions, WakeError> {
+        let platform = match self.platform.as_deref() {
+            None => None,
+            Some("browser") => Some(wake_app::BuildPlatform::Browser),
+            Some("node") => Some(wake_app::BuildPlatform::Node),
+            Some(value) => {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("unsupported bundle platform: {value}"),
+                ));
+            }
+        };
+        let format = match self.format.as_deref() {
+            None => None,
+            Some("iife") => Some(wake_app::ModuleFormat::Iife),
+            Some("cjs") => Some(wake_app::ModuleFormat::CommonJs),
+            Some(value) => {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("unsupported bundle format: {value}"),
+                ));
+            }
+        };
+        Ok(wake_app::BundleOptions {
+            project: wake_app::ProjectOptions {
+                cwd: self.cwd.map(PathBuf::from),
+                config_path: self.config_path.map(PathBuf::from),
+            },
+            entry: self.entry.map(PathBuf::from),
+            outfile: self.outfile.map(PathBuf::from),
+            platform,
+            format,
+            target: self.target,
+            external: self.external,
+            minify: self.minify,
+            source_map: self.source_map,
+            cache: self.cache,
+        })
+    }
+}
+
 #[napi(js_name = "build")]
 pub fn native_build(
     options_json: Option<String>,
@@ -193,7 +260,7 @@ pub fn native_bundle(
     }
     async_json(
         JsonTask::new(move || {
-            let options = RawBuildOptions::parse(options_json)?.into_app(false);
+            let options = RawBundleOptions::parse(options_json)?.into_app()?;
             let result = wake_app::bundle(options, &cancellation)?;
             serde_json::to_value(result)
                 .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))

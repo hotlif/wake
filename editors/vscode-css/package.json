@@ -1,8 +1,9 @@
 {
   "name": "crab-css",
+  "private": true,
   "displayName": "Crab CSS",
   "description": "CSS language intelligence for @crab-dev/css tagged templates.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "crab-dev",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -31,7 +32,6 @@
   "files": [
     "dist/**",
     "server/**",
-    "syntaxes/**",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -48,21 +48,6 @@
     "onCommand:crabCss.showOutput"
   ],
   "contributes": {
-    "grammars": [
-      {
-        "scopeName": "crab-css.injection",
-        "path": "./syntaxes/crab-css.injection.json",
-        "injectTo": [
-          "source.js",
-          "source.js.jsx",
-          "source.ts",
-          "source.tsx"
-        ],
-        "embeddedLanguages": {
-          "meta.embedded.block.crab-css": "css"
-        }
-      }
-    ],
     "commands": [
       {
         "command": "crabCss.restartLanguageServer",
@@ -125,7 +110,6 @@
     "@types/vscode": "1.96.0",
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "3.9.2",
-    "esbuild": "0.28.2",
     "typescript": "7.0.2",
     "vscode-css-languageservice": "6.3.10"
   }

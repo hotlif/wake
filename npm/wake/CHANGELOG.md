@@ -1,7 +1,14 @@
 # Changelog
 
+## 0.1.17
+
+- Added AST-driven CSS parsing shared by compilation, CSS-in-JS nesting, editor diagnostics, and semantic highlighting, removing the legacy TextMate injection grammar.
+- Added Node library bundle APIs and CLI support with incremental rebuild coverage and updated documentation.
+- Added complete CI release coverage for all seven public npm packages and GitHub-only multi-platform VSIX releases.
+
 ## 0.1.16
 
+- Added Node 20 CommonJS single-file bundles with atomic exact-outfile writes, host externals, declaration-ordered Node conditional exports, usable source-map results, and matching Rust/npm CLI support.
 - Automatically loaded Crab UI component CSS from package identity across `node_modules`, workspaces, and Yarn PnP virtual, unplugged, and zip layouts without runtime CSS imports.
 - Added issuer-scoped Yarn PnP dependency fallbacks for Components workbenches while preserving aliases, package-owned dependency versions, exports errors, and ambiguous virtual-locator rejection.
 - Preserved configured Demo accent colors independently from the neutral workbench theme.

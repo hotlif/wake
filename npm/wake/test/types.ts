@@ -25,7 +25,20 @@ import {
 async function api() {
   const result = await build({ cwd: '.', signal: new AbortController().signal })
   result.files.forEach((file) => console.log(file.path))
-  await bundle({ entry: 'src/index.ts' })
+  const memoryBundle = await bundle({ entry: 'src/index.ts', sourceMap: true })
+  memoryBundle.code.toUpperCase()
+  memoryBundle.sourceMap?.toUpperCase()
+  memoryBundle.sourceMapFile?.toUpperCase()
+  const nodeBundle = await bundle({
+    entry: 'src/extension.ts',
+    outfile: 'dist/extension.js',
+    platform: 'node',
+    format: 'cjs',
+    target: 'node20',
+    external: ['vscode'],
+    minify: true,
+  })
+  nodeBundle.outputFile?.toUpperCase()
   await buildDocs({ basePath: '/docs/' })
   const workbench = await buildDocs({ mode: 'components' })
   workbench.demos.forEach((demo) => console.log(demo.component, demo.controlCount))

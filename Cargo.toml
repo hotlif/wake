@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hotlif/wake"
@@ -42,6 +42,7 @@ proc-macro2 = "1.0.107"
 rkyv = "0.8.17"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tempfile = "3.27.0"
 # 声明式项目配置 wake.config.toml（仅 wake_config 使用，CLI 侧，非编译核心）。
 toml = "1.1.4+spec-1.1.0"
 # 组件扫描 include/exclude 正则（仅 wake_scan 使用，CLI 侧，非编译核心）。

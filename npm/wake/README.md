@@ -9,7 +9,7 @@ npx wake build
 ```
 
 ```js
-import { build, startDevServer } from '@crab-dev/wake'
+import { build, bundle, startDevServer } from '@crab-dev/wake'
 
 await build({ cwd: process.cwd() })
 
@@ -26,6 +26,25 @@ The stable API also includes in-memory `bundle()`, incremental
 `createBuildContext()`, documentation builds and development servers. Build
 and server operations accept `AbortSignal`; long-lived contexts and servers
 support explicit close methods and JavaScript disposal protocols.
+
+Node-hosted tools can request an exact CommonJS artifact without Web output:
+
+```js
+await bundle({
+  entry: 'src/extension.ts',
+  outfile: 'dist/extension.js',
+  platform: 'node',
+  format: 'cjs',
+  target: 'node20',
+  external: ['vscode'],
+})
+```
+
+`platform: 'node'` defaults to CommonJS and `node20`, so `format` and `target`
+can be omitted. `bundle()` returns a dedicated result whose `code` is always a
+string. With `sourceMap: true`, `sourceMap` is returned in memory; when
+`outfile` is present Wake also writes `<outfile>.map`, exposes
+`sourceMapFile`, and appends the matching `sourceMappingURL`.
 
 Full documentation:
 

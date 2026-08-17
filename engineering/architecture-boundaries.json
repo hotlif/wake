@@ -70,6 +70,14 @@
       "suggestion": "Move the dependency above wake_common or extract a dependency-free model."
     },
     {
+      "id": "wake-css-owns-shared-css-syntax",
+      "description": "wake_css is the product-neutral CSS syntax foundation",
+      "from": ["wake_css"],
+      "allowOnly": ["wake_common"],
+      "decision": "engineering/decisions/0010-shared-css-syntax-tree.md",
+      "suggestion": "Keep compiler, language-service, bundler and product behavior above the shared CSS syntax owner."
+    },
+    {
       "id": "ast-and-lexer-use-common-only",
       "description": "AST and lexer consume only the workspace foundation",
       "from": ["wake_ecma_ast", "wake_ecma_lexer"],
@@ -129,8 +137,8 @@
       "id": "css-language-is-product-neutral",
       "description": "CSS language analysis cannot own resolution, bundling, protocol or editor products",
       "from": ["wake_css_language"],
-      "allowOnly": ["wake_common", "wake_ecma_ast", "wake_ecma_parser", "wake_ecma_semantic", "wake_css_in_js"],
-      "decision": "engineering/decisions/0007-css-language-intelligence.md",
+      "allowOnly": ["wake_common", "wake_css", "wake_ecma_ast", "wake_ecma_parser", "wake_ecma_semantic", "wake_css_in_js"],
+      "decision": "engineering/decisions/0010-shared-css-syntax-tree.md",
       "suggestion": "Keep files, dependency traversal, LSP transport and editor adaptation in wake_css_lsp or the editor client."
     },
     {

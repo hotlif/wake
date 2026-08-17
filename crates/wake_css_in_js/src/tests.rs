@@ -680,6 +680,37 @@ fn scoped_crab_styles_cannot_hide_global_side_effects() {
 }
 
 #[test]
+fn syntax_lookalikes_inside_strings_and_comments_do_not_trigger_scope_checks() {
+    let result = run("import { css } from '@crab-dev/css';\n\
+         const label = css`content: \":global(body) @font-face url('./fake.png')\";\n\
+           /* :global(html) @page url('./comment.png') */ color: red;`; ");
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert!(result.css.contains(":global(body)"), "{}", result.css);
+    assert!(result.css.contains("color: red"), "{}", result.css);
+}
+
+#[test]
+fn declaration_values_do_not_trigger_selector_or_at_rule_scope_checks() {
+    let result = run("import { css } from '@crab-dev/css';\n\
+         const label = css`--selector-token: :global(red); --at-token: @future; color: red;`; ");
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert!(result.css.contains(":global(red)"), "{}", result.css);
+    assert!(result.css.contains("@future"), "{}", result.css);
+}
+
+#[test]
+fn failed_interpolation_removes_the_ast_declaration_not_string_semicolons() {
+    let result = run("import { css } from '@crab-dev/css';\n\
+         const label = css`content: \"a;b\"; color: ${makeColor()}; display: block;`; ");
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("CRAB_CSS_STATIC_VALUE") && diagnostic.is_error()
+    }));
+    assert!(result.css.contains("content: \"a;b\""), "{}", result.css);
+    assert!(result.css.contains("display: block"), "{}", result.css);
+    assert!(!result.css.contains("color:"), "{}", result.css);
+}
+
+#[test]
 fn scoped_crab_styles_reject_global_at_rules_but_global_style_keeps_layer_statements() {
     let scoped = run("import { css } from '@crab-dev/css';\n\
          const unused = css`@font-face { font-family: X; src: url('data:x/y,z'); }`; ");

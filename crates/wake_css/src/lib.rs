@@ -1,16 +1,22 @@
-//! # wake_css — 极简 CSS「tokenizer」（DESIGN §8.1）
+//! # wake_css — Wake 的共享 CSS 语法层（DESIGN §8.1）
 //!
-//! **不做完整 CSS 引擎**（lightningcss 级别留给远期）。第一版只识别打包必需的两件事：
+//! [`syntax::CssSyntaxTree`] 是编译器、CSS-in-JS 与编辑器语言服务共同使用的 CSS CST。
+//! 打包侧基于这棵树完成两件事：
 //!
 //! - `@import`：依赖提取——进模块图统一去重排序（顶部 @import 语句从产物中**移除**，
 //!   由驱动层转成 JS `import` 让模块图处理顺序与去重）；
 //! - `url()`：资源引用——记录其在**输出** `code` 中的字节区间，供资源改写（6.4）原地替换。
 //!
-//! 其余内容（选择器、声明、注释、字符串）**原样透传**。扫描器正确跳过 `/* */` 注释与
-//! `"..."`/`'...'` 字符串，避免把它们内部的 `@import`/`url(` 误判为规则。
-//!
-//! 设计取「懒 flush」：默认不复制，遇到需要删除（@import）或需要定位（url）的片段时才把
-//! 已扫描区间一次性写入输出——既 UTF-8 安全（永不切多字节字符），又零多余分配。
+//! 其余内容（选择器、声明、注释、字符串）**原样透传**。所有结构判断都来自共享 CST；
+//! 输出阶段只按节点提供的源码区间应用编辑，不再维护第二套字符扫描器。
+
+pub mod syntax;
+
+use cssparser::TokenSerializationType;
+use syntax::{
+    CssBlockKind, CssSyntaxItem, CssSyntaxItemKind, CssSyntaxKind, CssSyntaxNode, CssSyntaxTree,
+};
+use wake_common::Span;
 
 /// 一条 `@import` 依赖。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,300 +75,332 @@ impl CssModule {
 /// 刻意**不**删的（避免破坏语义）：后代组合器空白（`.a .b`）、`calc(1px + 2px)` 等值内空白、
 /// `>`/`+`/`~` 组合器周围空白、`prop: value` 冒号后空白——这些删了会改变含义或非法。
 pub fn minify(src: &str) -> String {
-    let b = src.as_bytes();
-    let n = b.len();
-    let mut out = String::with_capacity(n);
-    let mut i = 0;
-    let mut pending_space = false; // 见到空白，待定是否发单空格
-    let mut suppress = true; // 抑制紧邻结构符/开头 之后的空格（开头 true → 去前导空白）
-    while i < n {
-        let c = b[i];
-        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
-            // 注释：整段丢弃（不发空格；源码真实空白仍触发 pending_space）。
-            i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(n);
-        } else if c == b'"' || c == b'\'' {
-            if pending_space && !suppress {
-                out.push(' ');
-            }
-            pending_space = false;
-            suppress = false;
-            let start = i;
-            i += 1;
-            while i < n && b[i] != c {
-                i += if b[i] == b'\\' { 2 } else { 1 };
-            }
-            i = (i + 1).min(n);
-            out.push_str(&src[start..i.min(n)]);
-        } else if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
-            pending_space = true;
-            i += 1;
-        } else if c == b'{' || c == b',' || c == b';' {
-            pending_space = false;
-            out.push(c as char);
-            suppress = true;
-            i += 1;
-        } else if c == b'}' {
-            pending_space = false;
-            if out.ends_with(';') {
-                out.pop(); // 删 `}` 前多余 `;`
-            }
-            out.push('}');
-            suppress = true;
-            i += 1;
-        } else {
-            // 普通片段：扫到下一个分隔符再整段推入（UTF-8 安全：边界均在 ASCII 分隔符）。
-            if pending_space && !suppress {
-                out.push(' ');
-            }
-            pending_space = false;
-            suppress = false;
-            let start = i;
-            while i < n {
-                let d = b[i];
-                if d == b'/' && i + 1 < n && b[i + 1] == b'*' {
-                    break;
-                }
-                if matches!(
-                    d,
-                    b'"' | b'\'' | b' ' | b'\t' | b'\n' | b'\r' | b'{' | b'}' | b',' | b';'
-                ) {
-                    break;
-                }
-                i += 1;
-            }
-            out.push_str(&src[start..i]);
-        }
-    }
-    out
+    let tree = CssSyntaxTree::parse(src, Span::new(0, src.len() as u32));
+    let mut writer = CssMinifier::new(src);
+    writer.write_nodes(&tree.nodes);
+    writer.finish()
 }
 
-/// 分析一段 CSS：提取 `@import` 依赖、探测 `url()` 引用，其余透传到 `code`。
-pub fn analyze(src: &str) -> CssModule {
-    let b = src.as_bytes();
-    let n = b.len();
-    let mut out = String::with_capacity(n);
-    let mut imports: Vec<CssImport> = Vec::new();
-    let mut urls: Vec<CssUrl> = Vec::new();
+struct CssMinifier<'a> {
+    source: &'a str,
+    output: String,
+    pending_space: bool,
+    suppress_space: bool,
+    previous_token: TokenSerializationType,
+}
 
-    let mut i = 0; // 当前扫描位置
-    let mut mark = 0; // 尚未 flush 到 out 的输入起点
-    let mut depth: i32 = 0; // `{}` 嵌套深度（@import 只在 depth==0 有效）
-
-    while i < n {
-        match b[i] {
-            // —— 注释 /* ... */：整体透传，内部不解析 ——
-            b'/' if i + 1 < n && b[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(n);
-            }
-            // —— 字符串 "..." / '...'：整体透传，内部不解析 ——
-            b'"' | b'\'' => {
-                let q = b[i];
-                i += 1;
-                while i < n && b[i] != q {
-                    i += if b[i] == b'\\' { 2 } else { 1 };
-                }
-                i = (i + 1).min(n);
-            }
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                i += 1;
-            }
-            // —— @import（仅顶层）：提取依赖并从输出移除整条语句 ——
-            b'@' if depth == 0 && keyword_at(b, i + 1, b"import") => {
-                out.push_str(&src[mark..i]); // flush @import 之前的内容
-                let (import, end) = parse_import_rule(src, b, i);
-                imports.push(import);
-                i = end;
-                // 顺带吞掉紧随的一个换行，避免留下空行。
-                while i < n && (b[i] == b' ' || b[i] == b'\t') {
-                    i += 1;
-                }
-                if i < n && b[i] == b'\n' {
-                    i += 1;
-                } else if i + 1 < n && b[i] == b'\r' && b[i + 1] == b'\n' {
-                    i += 2;
-                }
-                mark = i;
-            }
-            // —— url( ... )：记录输出中的引用区间（不含 url( 与引号）——
-            b'u' | b'U' if keyword_at(b, i, b"url") && next_nonspace_is(b, i + 3, b'(') => {
-                if let Some((u_specifier, ref_start_in, ref_end_in, quoted, stmt_end)) =
-                    parse_url(src, b, i)
-                {
-                    // flush 到引用起点，使 out.len() 恰为引用在输出中的起偏移。
-                    out.push_str(&src[mark..ref_start_in]);
-                    let start = out.len();
-                    out.push_str(&src[ref_start_in..ref_end_in]);
-                    let end = out.len();
-                    urls.push(CssUrl {
-                        specifier: u_specifier,
-                        start,
-                        end,
-                        quoted,
-                    });
-                    mark = ref_end_in;
-                    i = stmt_end;
-                } else {
-                    i += 3;
-                }
-            }
-            _ => i += 1,
+impl<'a> CssMinifier<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            output: String::with_capacity(source.len()),
+            pending_space: false,
+            suppress_space: true,
+            previous_token: TokenSerializationType::Nothing,
         }
     }
-    out.push_str(&src[mark..n]);
+
+    fn write_nodes(&mut self, nodes: &[CssSyntaxNode]) {
+        for node in nodes {
+            match node.kind {
+                CssSyntaxKind::Comment => {}
+                CssSyntaxKind::Whitespace => self.pending_space = true,
+                CssSyntaxKind::Comma | CssSyntaxKind::Semicolon => {
+                    self.pending_space = false;
+                    self.push_token(node.span, node.serialization_type);
+                    self.suppress_space = true;
+                }
+                CssSyntaxKind::Block(CssBlockKind::Curly) => self.write_curly_block(node),
+                _ if node.block_kind().is_some() => self.write_inline_block(node),
+                _ => {
+                    self.push_token(node.span, node.serialization_type);
+                    self.suppress_space = false;
+                }
+            }
+        }
+    }
+
+    fn write_curly_block(&mut self, node: &CssSyntaxNode) {
+        self.pending_space = false;
+        self.push_token(node.head_span, node.serialization_type);
+        self.suppress_space = true;
+        self.write_nodes(&node.children);
+        self.pending_space = false;
+        if self.output.ends_with(';') {
+            self.output.pop();
+        }
+        self.push_closing_delimiter(node);
+        self.previous_token = node.serialization_type;
+        self.suppress_space = true;
+    }
+
+    fn write_inline_block(&mut self, node: &CssSyntaxNode) {
+        self.push_token(node.head_span, node.serialization_type);
+        self.suppress_space = false;
+        self.write_nodes(&node.children);
+        self.flush_space();
+        self.push_closing_delimiter(node);
+        self.previous_token = node.serialization_type;
+        self.suppress_space = false;
+    }
+
+    fn flush_space(&mut self) {
+        if self.pending_space && !self.suppress_space {
+            self.output.push(' ');
+            self.previous_token = TokenSerializationType::WhiteSpace;
+        }
+        self.pending_space = false;
+    }
+
+    fn push_token(&mut self, span: Span, token: TokenSerializationType) {
+        self.flush_space();
+        if self.previous_token.needs_separator_when_before(token) {
+            self.output.push_str("/**/");
+        }
+        self.push_span(span);
+        self.previous_token = token;
+    }
+
+    fn push_span(&mut self, span: Span) {
+        if let Some(text) = source_slice(self.source, span) {
+            self.output.push_str(text);
+        }
+    }
+
+    fn push_closing_delimiter(&mut self, node: &CssSyntaxNode) {
+        if node.closed && node.span.hi > node.head_span.hi {
+            self.push_span(Span::new(node.span.hi - 1, node.span.hi));
+        }
+    }
+
+    fn finish(self) -> String {
+        self.output
+    }
+}
+
+#[derive(Clone)]
+struct ImportRecord {
+    import: CssImport,
+    span: Span,
+}
+
+#[derive(Clone)]
+struct SourceEdit {
+    span: Span,
+    replacement: String,
+}
+
+/// 分析一段 CSS：从共享 CST 提取 `@import` 依赖和 `url()` 引用，其余透传到 `code`。
+pub fn analyze(src: &str) -> CssModule {
+    let tree = CssSyntaxTree::parse(src, Span::new(0, src.len() as u32));
+    let import_records = collect_imports(src, &tree.nodes);
+    let removals = import_records
+        .iter()
+        .map(|record| record.span)
+        .collect::<Vec<_>>();
+    let code = apply_edits(
+        src,
+        import_records
+            .iter()
+            .map(|record| SourceEdit {
+                span: record.span,
+                replacement: String::new(),
+            })
+            .collect(),
+    );
+    let mut source_urls = Vec::new();
+    collect_urls(&tree.nodes, &removals, &mut source_urls);
+    let urls = source_urls
+        .into_iter()
+        .map(|url| CssUrl {
+            specifier: url.specifier,
+            start: output_offset(url.span.lo as usize, &removals),
+            end: output_offset(url.span.hi as usize, &removals),
+            quoted: url.quoted,
+        })
+        .collect();
 
     CssModule {
-        imports,
+        imports: import_records
+            .into_iter()
+            .map(|record| record.import)
+            .collect(),
         urls,
-        code: out,
+        code,
     }
 }
 
-/// `b[at..]` 是否以 `kw`（ASCII，大小写不敏感）起头且其后为非标识符字符（词边界）。
-fn keyword_at(b: &[u8], at: usize, kw: &[u8]) -> bool {
-    if at + kw.len() > b.len() {
-        return false;
-    }
-    for (k, &kb) in kw.iter().enumerate() {
-        if !b[at + k].eq_ignore_ascii_case(&kb) {
-            return false;
+fn collect_imports(source: &str, nodes: &[CssSyntaxNode]) -> Vec<ImportRecord> {
+    let mut records = Vec::new();
+    let mut statement_start = true;
+    let mut index = 0usize;
+    while index < nodes.len() {
+        let node = &nodes[index];
+        if node.is_trivia() {
+            index += 1;
+            continue;
         }
-    }
-    // 词边界：kw 后不能紧跟标识符字符（`@imports`、`urlx` 不算）。
-    match b.get(at + kw.len()) {
-        Some(&c) => !is_ident_byte(c),
-        None => true,
-    }
-}
-
-/// CSS 标识符字节（简化：字母/数字/`-`/`_`/非 ASCII）。
-fn is_ident_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80
-}
-
-/// 从 `at` 起跳过空白后，第一个非空白字节是否为 `target`。
-fn next_nonspace_is(b: &[u8], at: usize, target: u8) -> bool {
-    let mut j = at;
-    while j < b.len() && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    b.get(j) == Some(&target)
-}
-
-/// 解析 `@import` 规则（`i` 指向 `@`）。返回 (依赖, 语句结束偏移即 `;` 之后)。
-fn parse_import_rule(src: &str, b: &[u8], i: usize) -> (CssImport, usize) {
-    let n = b.len();
-    let mut j = i + "@import".len();
-    while j < n && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-
-    // 说明符：url(...) 形式或 "..."/'...' 字符串形式。
-    let (specifier, mut j) = if keyword_at(b, j, b"url") && next_nonspace_is(b, j + 3, b'(') {
-        match parse_url(src, b, j) {
-            Some((spec, _, _, _, end)) => (spec, end),
-            None => (String::new(), j + 3),
+        if statement_start
+            && matches!(&node.kind, CssSyntaxKind::AtKeyword(name) if name.eq_ignore_ascii_case("import"))
+        {
+            let end_index = nodes[index + 1..]
+                .iter()
+                .position(|candidate| matches!(candidate.kind, CssSyntaxKind::Semicolon))
+                .map_or(nodes.len() - 1, |offset| index + 1 + offset);
+            let rule_nodes = &nodes[index + 1..=end_index];
+            let value = rule_nodes.iter().find(|candidate| !candidate.is_trivia());
+            let (specifier, value_end) = value
+                .map(|value| import_value(source, value))
+                .unwrap_or_else(|| (String::new(), node.span.hi));
+            let statement_end = nodes[end_index].span.hi;
+            let media_end = if matches!(nodes[end_index].kind, CssSyntaxKind::Semicolon) {
+                nodes[end_index].span.lo
+            } else {
+                statement_end
+            };
+            let media = source_slice(source, Span::new(value_end, media_end))
+                .map(str::trim)
+                .filter(|media| !media.is_empty())
+                .map(str::to_string);
+            let removal_end = nodes
+                .get(end_index + 1)
+                .filter(|next| next.is_trivia() && next.span.lo == statement_end)
+                .map_or(statement_end, |next| {
+                    consume_import_line_break(source, statement_end, next.span.hi)
+                });
+            records.push(ImportRecord {
+                import: CssImport { specifier, media },
+                span: Span::new(node.span.lo, removal_end),
+            });
+            index = end_index + 1;
+            statement_start = true;
+            continue;
         }
-    } else if j < n && (b[j] == b'"' || b[j] == b'\'') {
-        let (spec, end) = read_string(src, b, j);
-        (spec, end)
-    } else {
-        // 兜底：读到分号/空白为止。
-        let start = j;
-        while j < n && b[j] != b';' && !b[j].is_ascii_whitespace() {
-            j += 1;
+        statement_start = matches!(
+            node.kind,
+            CssSyntaxKind::Semicolon | CssSyntaxKind::Block(CssBlockKind::Curly)
+        );
+        index += 1;
+    }
+    records
+}
+
+fn import_value(source: &str, node: &CssSyntaxNode) -> (String, u32) {
+    match &node.kind {
+        CssSyntaxKind::QuotedString(value) | CssSyntaxKind::Url(value) => {
+            (value.clone(), node.span.hi)
         }
-        (src[start..j].to_string(), j)
+        CssSyntaxKind::Function(name) if name.eq_ignore_ascii_case("url") => {
+            let value = node.children.iter().find(|child| !child.is_trivia());
+            let specifier = value
+                .and_then(css_string_value)
+                .unwrap_or_default()
+                .to_string();
+            (specifier, node.span.hi)
+        }
+        _ => (
+            source_slice(source, node.span)
+                .unwrap_or_default()
+                .to_string(),
+            node.span.hi,
+        ),
+    }
+}
+
+fn consume_import_line_break(source: &str, start: u32, whitespace_end: u32) -> u32 {
+    let Some(whitespace) = source_slice(source, Span::new(start, whitespace_end)) else {
+        return start;
     };
-
-    // 媒体查询：剩余到 `;` 的部分。
-    let media_start = j;
-    while j < n && b[j] != b';' {
-        j += 1;
-    }
-    let media_raw = src[media_start..j].trim();
-    let media = if media_raw.is_empty() {
-        None
+    let horizontal = whitespace
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let rest = &whitespace[horizontal..];
+    let line_break = if rest.starts_with("\r\n") {
+        2
+    } else if rest.starts_with(['\r', '\n']) {
+        1
     } else {
-        Some(media_raw.to_string())
+        0
     };
-    if j < n && b[j] == b';' {
-        j += 1; // 吞掉分号
-    }
-    (CssImport { specifier, media }, j)
+    start + (horizontal + line_break) as u32
 }
 
-/// 读一个字符串字面量（`i` 指向引号）。返回 (内容去引号, 结束偏移即闭引号之后)。
-fn read_string(src: &str, b: &[u8], i: usize) -> (String, usize) {
-    let n = b.len();
-    let q = b[i];
-    let start = i + 1;
-    let mut j = start;
-    while j < n && b[j] != q {
-        j += if b[j] == b'\\' { 2 } else { 1 };
-    }
-    let content = src[start..j.min(n)].to_string();
-    ((content), (j + 1).min(n))
+struct SourceUrl {
+    specifier: String,
+    span: Span,
+    quoted: bool,
 }
 
-/// 解析 `url(...)`（`i` 指向 `u`）。
-/// 返回 (引用内容去引号, 引用起始输入偏移, 引用结束输入偏移, 是否带引号, `)` 之后偏移)。
-fn parse_url(src: &str, b: &[u8], i: usize) -> Option<(String, usize, usize, bool, usize)> {
-    let n = b.len();
-    let mut j = i + 3; // 跳过 `url`
-    while j < n && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    if j >= n || b[j] != b'(' {
-        return None;
-    }
-    j += 1; // 跳过 `(`
-    while j < n && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    if j < n && (b[j] == b'"' || b[j] == b'\'') {
-        // 带引号：引用为引号内内容。
-        let q = b[j];
-        let ref_start = j + 1;
-        let mut k = ref_start;
-        while k < n && b[k] != q {
-            k += if b[k] == b'\\' { 2 } else { 1 };
+fn collect_urls(nodes: &[CssSyntaxNode], removals: &[Span], output: &mut Vec<SourceUrl>) {
+    for node in nodes {
+        if removals.iter().any(|span| span.contains(node.span)) {
+            continue;
         }
-        let ref_end = k.min(n);
-        let spec = src[ref_start..ref_end].to_string();
-        k = (k + 1).min(n); // 跳过闭引号
-        while k < n && b[k] != b')' {
-            k += 1;
+        match &node.kind {
+            CssSyntaxKind::Url(value) => {
+                if let Some(span) = node.value_span {
+                    output.push(SourceUrl {
+                        specifier: value.clone(),
+                        span,
+                        quoted: false,
+                    });
+                }
+            }
+            CssSyntaxKind::Function(name) if name.eq_ignore_ascii_case("url") => {
+                if let Some(value) = node.children.iter().find(|child| !child.is_trivia())
+                    && let Some(specifier) = css_string_value(value)
+                    && let Some(span) = value.value_span
+                {
+                    output.push(SourceUrl {
+                        specifier: specifier.to_string(),
+                        span,
+                        quoted: matches!(value.kind, CssSyntaxKind::QuotedString(_)),
+                    });
+                }
+            }
+            _ => collect_urls(&node.children, removals, output),
         }
-        let stmt_end = (k + 1).min(n); // 跳过 `)`
-        Some((spec, ref_start, ref_end, true, stmt_end))
-    } else {
-        // 无引号：引用到 `)` 或空白为止。
-        let ref_start = j;
-        let mut k = j;
-        while k < n && b[k] != b')' && !b[k].is_ascii_whitespace() {
-            k += 1;
-        }
-        let ref_end = k;
-        let spec = src[ref_start..ref_end].to_string();
-        while k < n && b[k] != b')' {
-            k += 1;
-        }
-        let stmt_end = (k + 1).min(n);
-        Some((spec, ref_start, ref_end, false, stmt_end))
     }
+}
+
+fn css_string_value(node: &CssSyntaxNode) -> Option<&str> {
+    match &node.kind {
+        CssSyntaxKind::QuotedString(value) | CssSyntaxKind::Url(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn output_offset(source_offset: usize, removals: &[Span]) -> usize {
+    source_offset
+        - removals
+            .iter()
+            .filter(|span| span.hi as usize <= source_offset)
+            .map(|span| (span.hi - span.lo) as usize)
+            .sum::<usize>()
+}
+
+fn source_slice(source: &str, span: Span) -> Option<&str> {
+    source.get(span.lo as usize..span.hi as usize)
+}
+
+fn apply_edits(source: &str, mut edits: Vec<SourceEdit>) -> String {
+    edits.sort_by_key(|edit| (edit.span.lo, std::cmp::Reverse(edit.span.hi)));
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for edit in edits {
+        let start = edit.span.lo as usize;
+        let end = edit.span.hi as usize;
+        if start < cursor || end < start || end > source.len() {
+            continue;
+        }
+        output.push_str(&source[cursor..start]);
+        output.push_str(&edit.replacement);
+        cursor = end;
+    }
+    output.push_str(&source[cursor..]);
+    output
 }
 
 // ======================================================================
@@ -374,18 +412,12 @@ fn parse_url(src: &str, b: &[u8], i: usize) -> Option<(String, usize, usize, boo
 pub struct CssModulesResult {
     /// `@import` 依赖（与 [`analyze`] 同）。
     pub imports: Vec<CssImport>,
+    /// `url()` 引用，位置已映射到转换后的 [`Self::code`]。
+    pub urls: Vec<CssUrl>,
     /// 局部类名 → 作用域化类名（按首次出现顺序、去重）。
     pub exports: Vec<(String, String)>,
     /// 改写后的 CSS：类选择器 `.foo` → `.foo_<hash>`，`@import` 已移除。
     pub code: String,
-}
-
-/// 当前块类型：`Rule`（含嵌套规则，如 `@media` 体，内部仍是选择器上下文）/
-/// `Decl`（声明块，内部是 `prop: value`，`.` 属值不改）。
-#[derive(PartialEq)]
-enum BlockKind {
-    Rule,
-    Decl,
 }
 
 /// 把一个 `.module.css` 源转换为「类名作用域化」的 CSS + 导出映射。
@@ -394,125 +426,130 @@ enum BlockKind {
 ///   同文件同名稳定、跨文件不撞）；构建 `局部名 → 作用域名` 映射供 JS `import styles` 使用。
 /// - 正确区分**选择器上下文**（顶层 / `@media`·`@supports`·`@container`·`@layer` 体）与
 ///   **声明块**（`.foo { }` 体内、`@keyframes`/`@font-face` 体），只在前者改写 `.`。
-/// - `@import` 依赖提取同 [`analyze`]。（url() 改写在 module 场景暂略，见 6.4。）
+/// - `@import` 与 `url()` 依赖提取同 [`analyze`]，URL span 映射到所有作用域编辑之后。
 ///
-/// 未覆盖（后续）：`#id` 作用域、`composes`、`:global(...)`/`:local(...)`、keyframes 名作用域。
+/// 未覆盖（后续）：`#id` 作用域、`composes`、keyframes 名作用域。
 pub fn transform_modules(src: &str, seed: &str) -> CssModulesResult {
-    let b = src.as_bytes();
-    let n = b.len();
-    let mut out = String::with_capacity(n + 32);
-    let mut imports: Vec<CssImport> = Vec::new();
+    let tree = CssSyntaxTree::parse(src, Span::new(0, src.len() as u32));
+    let import_records = collect_imports(src, &tree.nodes);
     let mut exports: Vec<(String, String)> = Vec::new();
-    let mut stack: Vec<BlockKind> = Vec::new();
-
-    let mut i = 0;
-    let mut mark = 0;
-    let mut prelude_start = 0; // 当前 `{` 之前的 prelude 起点
-
-    while i < n {
-        match b[i] {
-            b'/' if i + 1 < n && b[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(n);
-            }
-            b'"' | b'\'' => {
-                let q = b[i];
-                i += 1;
-                while i < n && b[i] != q {
-                    i += if b[i] == b'\\' { 2 } else { 1 };
-                }
-                i = (i + 1).min(n);
-            }
-            b'@' if stack.is_empty() && keyword_at(b, i + 1, b"import") => {
-                out.push_str(&src[mark..i]);
-                let (imp, end) = parse_import_rule(src, b, i);
-                imports.push(imp);
-                i = end;
-                while i < n && (b[i] == b' ' || b[i] == b'\t') {
-                    i += 1;
-                }
-                if i < n && b[i] == b'\n' {
-                    i += 1;
-                } else if i + 1 < n && b[i] == b'\r' && b[i + 1] == b'\n' {
-                    i += 2;
-                }
-                mark = i;
-                prelude_start = i;
-            }
-            b'{' => {
-                let prelude = src[prelude_start..i].trim_start();
-                let kind = if is_rule_at_rule(prelude) {
-                    BlockKind::Rule
-                } else {
-                    BlockKind::Decl
-                };
-                stack.push(kind);
-                i += 1;
-                prelude_start = i;
-            }
-            b'}' => {
-                stack.pop();
-                i += 1;
-                prelude_start = i;
-            }
-            b';' => {
-                i += 1;
-                prelude_start = i;
-            }
-            // 类选择器：仅在选择器上下文（顶层 / 规则型 at-rule 体内）改写。
-            b'.' if in_selector_ctx(&stack) && i + 1 < n && is_class_start(b[i + 1]) => {
-                let name_start = i + 1;
-                let mut j = name_start;
-                while j < n && is_ident_byte(b[j]) {
-                    j += 1;
-                }
-                let local = &src[name_start..j];
-                let scoped = scoped_name(seed, local);
-                out.push_str(&src[mark..name_start]); // flush 到（含）`.`
-                out.push_str(&scoped);
-                mark = j;
-                if !exports.iter().any(|(l, _)| l == local) {
-                    exports.push((local.to_string(), scoped));
-                }
-                i = j;
-            }
-            _ => i += 1,
-        }
-    }
-    out.push_str(&src[mark..n]);
+    let mut edits = import_records
+        .iter()
+        .map(|record| SourceEdit {
+            span: record.span,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    collect_module_rules(&tree.nodes, &tree.items, seed, &mut exports, &mut edits);
+    let removals = import_records
+        .iter()
+        .map(|record| record.span)
+        .collect::<Vec<_>>();
+    let mut source_urls = Vec::new();
+    collect_urls(&tree.nodes, &removals, &mut source_urls);
+    let urls = source_urls
+        .into_iter()
+        .map(|url| CssUrl {
+            specifier: url.specifier,
+            start: output_offset_after_edits(url.span.lo as usize, &edits),
+            end: output_offset_after_edits(url.span.hi as usize, &edits),
+            quoted: url.quoted,
+        })
+        .collect();
 
     CssModulesResult {
-        imports,
+        imports: import_records
+            .into_iter()
+            .map(|record| record.import)
+            .collect(),
+        urls,
         exports,
-        code: out,
+        code: apply_edits(src, edits),
     }
 }
 
-/// 内层块是否处于选择器上下文（空栈=顶层，或最内层是规则型 at-rule 体）。
-fn in_selector_ctx(stack: &[BlockKind]) -> bool {
-    stack.last().is_none_or(|k| *k == BlockKind::Rule)
+fn output_offset_after_edits(source_offset: usize, edits: &[SourceEdit]) -> usize {
+    let delta = edits
+        .iter()
+        .filter(|edit| edit.span.hi as usize <= source_offset)
+        .map(|edit| edit.replacement.len() as i64 - i64::from(edit.span.hi - edit.span.lo))
+        .sum::<i64>();
+    (source_offset as i64 + delta).max(0) as usize
 }
 
-/// prelude 是否为「含嵌套规则」的 at-rule（其块内仍是选择器上下文）。
-fn is_rule_at_rule(prelude: &str) -> bool {
-    let p = prelude.as_bytes();
-    let kw = |k: &[u8]| keyword_at(p, 0, k);
-    !prelude.is_empty()
-        && p[0] == b'@'
-        && (kw(b"@media")
-            || kw(b"@supports")
-            || kw(b"@container")
-            || kw(b"@layer")
-            || kw(b"@document")
-            || kw(b"@scope"))
+fn collect_module_rules(
+    nodes: &[CssSyntaxNode],
+    items: &[CssSyntaxItem],
+    seed: &str,
+    exports: &mut Vec<(String, String)>,
+    edits: &mut Vec<SourceEdit>,
+) {
+    for item in items {
+        if matches!(item.kind, CssSyntaxItemKind::QualifiedRule) {
+            collect_selector_classes(item.nodes(nodes), true, seed, exports, edits);
+        }
+        if let Some(block) = item.block(nodes) {
+            collect_module_rules(&block.children, &item.children, seed, exports, edits);
+        }
+    }
 }
 
-/// 类名首字符（CSS 标识符起始：字母 / `_` / `-` / 非 ASCII；不含数字）。
-fn is_class_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c == b'-' || c >= 0x80
+fn collect_selector_classes(
+    nodes: &[CssSyntaxNode],
+    local: bool,
+    seed: &str,
+    exports: &mut Vec<(String, String)>,
+    edits: &mut Vec<SourceEdit>,
+) {
+    let mut index = 0usize;
+    while index < nodes.len() {
+        let node = &nodes[index];
+        if matches!(node.kind, CssSyntaxKind::Colon)
+            && let Some((function_index, function)) = nodes
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .find(|(_, candidate)| !candidate.is_trivia())
+            && let CssSyntaxKind::Function(name) = &function.kind
+            && (name.eq_ignore_ascii_case("global") || name.eq_ignore_ascii_case("local"))
+        {
+            edits.push(SourceEdit {
+                span: Span::new(node.span.lo, function.head_span.hi),
+                replacement: String::new(),
+            });
+            if function.closed {
+                edits.push(SourceEdit {
+                    span: Span::new(function.span.hi - 1, function.span.hi),
+                    replacement: String::new(),
+                });
+            }
+            collect_selector_classes(
+                &function.children,
+                name.eq_ignore_ascii_case("local"),
+                seed,
+                exports,
+                edits,
+            );
+            index = function_index + 1;
+            continue;
+        }
+        if local
+            && matches!(node.kind, CssSyntaxKind::Delim('.'))
+            && let Some(identifier) = nodes[index + 1..].iter().find(|node| !node.is_trivia())
+            && let CssSyntaxKind::Ident(local) = &identifier.kind
+        {
+            let scoped = scoped_name(seed, local);
+            edits.push(SourceEdit {
+                span: identifier.span,
+                replacement: scoped.clone(),
+            });
+            if !exports.iter().any(|(name, _)| name == local) {
+                exports.push((local.clone(), scoped));
+            }
+        }
+        collect_selector_classes(&node.children, local, seed, exports, edits);
+        index += 1;
+    }
 }
 
 /// 作用域化类名：`{local}_{hash6}`，hash = FNV-1a(seed ‖ local) 低 24 位。
@@ -570,6 +607,15 @@ mod tests {
             minify(".a { content: \"  hi  \" ; }"),
             ".a{content: \"  hi  \"}"
         );
+    }
+
+    #[test]
+    fn minify_preserves_token_boundaries_when_dropping_comments() {
+        assert_eq!(
+            minify(".a { font-family: red/**/blue; width: 10/**/px; }"),
+            ".a{font-family: red/**/blue;width: 10/**/px}"
+        );
+        assert_eq!(minify("p/**/.class { color: red; }"), "p.class{color: red}");
     }
 
     #[test]
@@ -644,6 +690,16 @@ mod tests {
     }
 
     #[test]
+    fn parser_decodes_escaped_import_keyword() {
+        let m = analyze(
+            r#"@\69mport "reset.css";
+.a {}"#,
+        );
+        assert_eq!(m.imports[0].specifier, "reset.css");
+        assert_eq!(m.code, ".a {}");
+    }
+
+    #[test]
     fn detects_url_quoted() {
         let m = analyze(".a { background: url(\"logo.png\"); }");
         assert_eq!(m.urls.len(), 1);
@@ -662,6 +718,16 @@ mod tests {
         assert!(!m.urls[0].quoted);
         let u = &m.urls[0];
         assert_eq!(&m.code[u.start..u.end], "logo.png");
+    }
+
+    #[test]
+    fn url_detection_uses_function_nodes_and_ignores_text_lookalikes() {
+        let source = r#".a { content: "url(fake.png)"; /* url(comment.png) */ background: u\72l("logo.png"); }"#;
+        let module = analyze(source);
+        assert_eq!(module.urls.len(), 1);
+        assert_eq!(module.urls[0].specifier, "logo.png");
+        let url = &module.urls[0];
+        assert_eq!(&module.code[url.start..url.end], "logo.png");
     }
 
     #[test]
@@ -780,5 +846,63 @@ mod tests {
         let sa = &m.exports.iter().find(|(l, _)| l == "a").unwrap().1;
         let sb = &m.exports.iter().find(|(l, _)| l == "b").unwrap().1;
         assert!(m.code.contains(&format!(".{sa}.{sb}")), "{}", m.code);
+    }
+
+    #[test]
+    fn modules_scope_decoded_escaped_class_identifiers() {
+        let module = transform_modules(r#".t\69 tle { color: red; }"#, "s");
+        assert_eq!(module.exports[0].0, "title");
+        assert!(
+            module.code.contains(&format!(".{}", module.exports[0].1)),
+            "{}",
+            module.code
+        );
+        assert!(!module.code.contains(r#".t\69 tle"#));
+    }
+
+    #[test]
+    fn modules_use_ast_scope_for_global_and_local_selectors() {
+        let module = transform_modules(
+            ":global(.reset) .card, :local(.explicit) { color: red; }",
+            "s",
+        );
+        let map: std::collections::HashMap<_, _> = module.exports.iter().cloned().collect();
+        assert!(!map.contains_key("reset"));
+        assert!(map.contains_key("card"));
+        assert!(map.contains_key("explicit"));
+        assert!(!module.code.contains(":global"), "{}", module.code);
+        assert!(!module.code.contains(":local"), "{}", module.code);
+        assert!(module.code.contains(".reset"), "{}", module.code);
+        assert!(
+            module.code.contains(&format!(".{}", map["card"])),
+            "{}",
+            module.code
+        );
+    }
+
+    #[test]
+    fn modules_do_not_treat_custom_property_blocks_as_nested_rules() {
+        let module =
+            transform_modules(".root { --theme: { .value }; .child { color: red; } }", "s");
+        let names = module
+            .exports
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"root"), "{:?}", module.exports);
+        assert!(names.contains(&"child"), "{:?}", module.exports);
+        assert!(!names.contains(&"value"), "{:?}", module.exports);
+    }
+
+    #[test]
+    fn modules_map_url_spans_through_ast_edits_without_reparsing() {
+        let module = transform_modules(
+            "@import 'base.css';\n:local(.hero) { background: url(\"./hero.png\"); }",
+            "s",
+        );
+        assert_eq!(module.urls.len(), 1);
+        let url = &module.urls[0];
+        assert_eq!(url.specifier, "./hero.png");
+        assert_eq!(&module.code[url.start..url.end], "./hero.png");
     }
 }

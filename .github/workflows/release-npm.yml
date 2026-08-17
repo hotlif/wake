@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+      - '!vscode-css-v*'
   workflow_dispatch:
 
 permissions:
@@ -35,6 +36,7 @@ jobs:
           version="$(node -p 'require("./npm/wake/package.json").version')"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - run: npm run versions:check
+      - run: npm run release:check
       - run: npm run npm:test:css
       - run: npm run npm:typecheck:css
       - run: npm run npm:pack:check
@@ -259,6 +261,7 @@ jobs:
           subject-path: artifacts/*.tgz
 
   publish:
+    if: github.ref_type == 'tag' && github.ref_name == format('v{0}', needs.verify.outputs.version)
     needs: [verify, audit-tarballs]
     runs-on: ubuntu-latest
     outputs:

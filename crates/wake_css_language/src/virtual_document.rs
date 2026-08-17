@@ -112,10 +112,25 @@ impl VirtualCssDocument {
         })
     }
 
+    pub fn virtual_to_host_covering_span(&self, span: Span) -> Option<Span> {
+        let lo = self.virtual_to_host_offset(span.lo)?;
+        let hi = self.virtual_to_host_offset(span.hi)?;
+        Some(Span::new(lo, hi))
+    }
+
     pub fn contains_host_offset(&self, offset: u32) -> bool {
         self.segments
             .iter()
             .any(|segment| segment.host.lo <= offset && offset <= segment.host.hi)
+    }
+
+    pub fn body_virtual_span(&self) -> Span {
+        self.segments
+            .first()
+            .zip(self.segments.last())
+            .map_or(Span::at(0), |(first, last)| {
+                Span::new(first.virtual_css.lo, last.virtual_css.hi)
+            })
     }
 
     pub fn edit_is_safe(&self, span: Span) -> bool {

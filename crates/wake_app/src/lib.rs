@@ -4,6 +4,7 @@
 //! Rust CLI and the Node-API addon are responsible only for argument parsing,
 //! presentation, and process lifecycle.
 
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -18,6 +19,7 @@ use wake_bundler::{
     BuildOutput, BuildRequest, BuildSession, IncrementalBundler, PnpDependencyFallback,
     ResolveOptions,
 };
+pub use wake_bundler::{BuildPlatform, ModuleFormat};
 use wake_common::{Diagnostic, OsFileSystem};
 
 pub use wake_docs::DocsMode;
@@ -137,6 +139,21 @@ impl Default for BuildOptions {
     }
 }
 
+/// 单文件 library bundle 选项。与 Web application build 明确分离。
+#[derive(Debug, Clone, Default)]
+pub struct BundleOptions {
+    pub project: ProjectOptions,
+    pub entry: Option<PathBuf>,
+    pub outfile: Option<PathBuf>,
+    pub platform: Option<BuildPlatform>,
+    pub format: Option<ModuleFormat>,
+    pub target: Option<String>,
+    pub external: Vec<String>,
+    pub minify: bool,
+    pub source_map: bool,
+    pub cache: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputFile {
@@ -159,6 +176,40 @@ pub struct BuildResult {
     pub code: Option<String>,
     pub files: Vec<OutputFile>,
     pub diagnostics: Vec<DiagnosticInfo>,
+}
+
+/// 单文件 bundle 的结果。与 Web build 的目录结果分离，并用类型保证始终返回代码。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleResult {
+    pub success: bool,
+    pub module_count: usize,
+    pub updated_module_count: usize,
+    pub cached_module_count: usize,
+    pub duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<String>,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_map_file: Option<String>,
+    pub files: Vec<OutputFile>,
+    pub diagnostics: Vec<DiagnosticInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedBundleOptions {
+    project: ProjectOptions,
+    entry: Option<PathBuf>,
+    outfile: Option<PathBuf>,
+    platform: BuildPlatform,
+    format: ModuleFormat,
+    target: Option<String>,
+    external: Vec<String>,
+    minify: bool,
+    source_map: bool,
+    cache: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -207,11 +258,10 @@ pub fn build(
 }
 
 pub fn bundle(
-    mut options: BuildOptions,
+    options: BundleOptions,
     cancellation: &CancellationToken,
-) -> Result<BuildResult, WakeError> {
-    options.write = false;
-    execute_build(options, cancellation, false)
+) -> Result<BundleResult, WakeError> {
+    execute_bundle(options, cancellation)
 }
 
 fn execute_build(
@@ -232,6 +282,112 @@ fn execute_build(
         output,
         started.elapsed().as_secs_f64() * 1000.0,
     )
+}
+
+fn execute_bundle(
+    options: BundleOptions,
+    cancellation: &CancellationToken,
+) -> Result<BundleResult, WakeError> {
+    let options = resolve_bundle_options(options)?;
+    cancellation.check()?;
+    let started = Instant::now();
+    let prepared = prepare_build(&BuildOptions {
+        project: options.project.clone(),
+        entry: options.entry.clone(),
+        write: false,
+        ..BuildOptions::default()
+    })?;
+    let mut bundler = create_bundle_bundler(&prepared, &options)?;
+    let output = bundler.build(&prepared.entry);
+    cancellation.check()?;
+    finish_bundle(
+        &prepared,
+        &options,
+        output,
+        started.elapsed().as_secs_f64() * 1000.0,
+    )
+}
+
+fn resolve_bundle_options(options: BundleOptions) -> Result<ResolvedBundleOptions, WakeError> {
+    let platform = options.platform.unwrap_or(BuildPlatform::Browser);
+    let format = options.format.unwrap_or(match platform {
+        BuildPlatform::Browser => ModuleFormat::Iife,
+        BuildPlatform::Node => ModuleFormat::CommonJs,
+    });
+    let valid_pair = matches!(
+        (platform, format),
+        (BuildPlatform::Browser, ModuleFormat::Iife)
+            | (BuildPlatform::Node, ModuleFormat::CommonJs)
+    );
+    if !valid_pair {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "supported bundle combinations are browser+iife and node+cjs",
+        ));
+    }
+    if options.minify && options.source_map {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "bundle minify and sourceMap cannot be enabled together",
+        ));
+    }
+    if platform == BuildPlatform::Browser && options.target.is_some() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "explicit target is currently only supported for Node bundles",
+        ));
+    }
+    for package in &options.external {
+        if !is_bare_package_name(package) {
+            return Err(WakeError::new(
+                "WAKE_CONFIG",
+                format!("external must be a bare package name: {package}"),
+            ));
+        }
+    }
+    Ok(ResolvedBundleOptions {
+        project: options.project,
+        entry: options.entry,
+        outfile: options.outfile,
+        platform,
+        format,
+        target: (platform == BuildPlatform::Node)
+            .then(|| options.target.unwrap_or_else(|| "node20".to_string())),
+        external: options.external,
+        minify: options.minify,
+        source_map: options.source_map,
+        cache: options.cache,
+    })
+}
+
+fn is_bare_package_name(value: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with('.')
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.contains('*')
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || value
+            .chars()
+            .any(|character| matches!(character, ':' | '#' | '?' | '%'))
+    {
+        return false;
+    }
+    if value.starts_with('@') {
+        let mut parts = value.split('/');
+        return parts
+            .next()
+            .is_some_and(|scope| valid_package_part(&scope[1..]))
+            && parts.next().is_some_and(valid_package_part)
+            && parts.next().is_none();
+    }
+    !value.contains('/') && valid_package_part(value)
+}
+
+fn valid_package_part(value: &str) -> bool {
+    !value.is_empty() && value != "." && value != ".." && !value.starts_with('.')
 }
 
 fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
@@ -399,6 +555,95 @@ fn create_bundler(
     Ok(bundler)
 }
 
+fn create_bundle_bundler(
+    prepared: &PreparedBuild,
+    options: &ResolvedBundleOptions,
+) -> Result<IncrementalBundler, WakeError> {
+    let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
+    bundler
+        .set_project_root(prepared.root.clone())
+        .set_resolve_options(ResolveOptions {
+            alias: prepared.aliases.clone(),
+            pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks.clone(),
+            ..ResolveOptions::default()
+        })
+        .set_platform(options.platform)
+        .set_module_format(options.format)
+        .set_external_packages(options.external.clone())
+        .set_define(build_defines(
+            &prepared.config,
+            options.platform == BuildPlatform::Browser,
+        ))
+        .set_jsx_runtime(
+            false,
+            Box::leak(
+                prepared
+                    .config
+                    .react
+                    .jsx_import_source
+                    .clone()
+                    .into_boxed_str(),
+            ),
+        )
+        .set_content_hash(false);
+
+    if options.platform == BuildPlatform::Browser {
+        bundler.enable_css_in_js();
+        bundler.set_public_path(prepared.config.public_path());
+        // 省略 outfile 时保持旧的内存 bundle 资源阈值；精确 outfile 是严格单文件，
+        // 因此必须内联资源，不能在目标目录旁静默生成额外文件。
+        bundler.set_asset_inline_limit(if options.outfile.is_some() {
+            usize::MAX
+        } else {
+            4096
+        });
+    }
+
+    let target = match options.platform {
+        BuildPlatform::Browser => resolve_target_env(&prepared.config, &prepared.root)?,
+        BuildPlatform::Node => node_target_env(
+            options
+                .target
+                .as_deref()
+                .expect("Node bundle target is normalized"),
+        )?,
+    };
+    bundler.set_target_env(target);
+    if options.minify {
+        bundler
+            .enable_minify()
+            .enable_mangle()
+            .enable_tree_shaking()
+            .enable_dead_module_elimination();
+    }
+    if options.source_map {
+        bundler.enable_sourcemap();
+    }
+    if options.cache {
+        let cache_dir = prepared.root.join(".wake");
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&cache_dir))?;
+        bundler.enable_persistent_cache(cache_dir.join("bundle-cache.bin"));
+    }
+    Ok(bundler)
+}
+
+fn node_target_env(target: &str) -> Result<TargetEnv, WakeError> {
+    let version = target.strip_prefix("node").unwrap_or("");
+    let valid = !version.is_empty()
+        && version.split('.').count() <= 2
+        && version.split('.').all(|component| {
+            !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
+        });
+    if !valid {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Node target `{target}`; expected node20 or node20.0"),
+        ));
+    }
+    Ok(TargetEnv::new(vec![BrowserTarget::new("node", version)]))
+}
+
 fn create_session(
     prepared: &PreparedBuild,
     options: &BuildOptions,
@@ -470,6 +715,166 @@ fn finish_output(
         files,
         diagnostics,
     })
+}
+
+fn finish_bundle(
+    prepared: &PreparedBuild,
+    options: &ResolvedBundleOptions,
+    output: BuildOutput,
+    duration_ms: f64,
+) -> Result<BundleResult, WakeError> {
+    let diagnostics = output
+        .diagnostics
+        .iter()
+        .map(DiagnosticInfo::from)
+        .collect::<Vec<_>>();
+    if output.has_errors() {
+        return Err(WakeError::new("WAKE_BUILD", "Wake bundle failed")
+            .with_diagnostics(&output.diagnostics));
+    }
+    if options.platform == BuildPlatform::Node && !output.assets.is_empty() {
+        return Err(WakeError::new(
+            "WAKE_BUILD",
+            "Node bundle cannot emit browser assets",
+        ));
+    }
+    if options.outfile.is_some() && !output.assets.is_empty() {
+        return Err(WakeError::new(
+            "WAKE_BUILD",
+            "single-file bundle cannot emit sibling assets",
+        ));
+    }
+
+    let output_file = options
+        .outfile
+        .as_deref()
+        .map(|outfile| absolute_from(&prepared.root, outfile));
+    let mut source_map = output.entry().source_map.clone();
+    if let (Some(map), Some(output_path)) = (&source_map, &output_file)
+        && let Some(file_name) = output_path.file_name().and_then(|name| name.to_str())
+    {
+        source_map = Some(rewrite_source_map_file(map, file_name)?);
+    }
+    let source_map_file = output_file
+        .as_ref()
+        .filter(|_| source_map.is_some())
+        .map(|path| append_path_suffix(path, ".map"));
+    let mut code = output.bundle.clone();
+    if let Some(map_path) = &source_map_file
+        && let Some(map_name) = map_path.file_name().and_then(|name| name.to_str())
+    {
+        code.push_str("//# sourceMappingURL=");
+        code.push_str(map_name);
+        code.push('\n');
+    }
+    if let Some(path) = &output_file {
+        if let (Some(map), Some(map_path)) = (&source_map, &source_map_file) {
+            atomic_write(map_path, map.as_bytes())?;
+        }
+        atomic_write(path, code.as_bytes())?;
+    }
+    let mut files = vec![OutputFile {
+        path: output_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| output.entry().file_name.clone()),
+        kind: "chunk".to_string(),
+        bytes: code.len(),
+    }];
+    if output_file.is_none() {
+        files.extend(output.assets.iter().map(|asset| OutputFile {
+            path: asset.file_name.clone(),
+            kind: if asset.is_css { "css" } else { "asset" }.to_string(),
+            bytes: asset.bytes.len(),
+        }));
+    }
+    if let Some(map) = &source_map {
+        files.push(OutputFile {
+            path: source_map_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{}.map", output.entry().file_name)),
+            kind: "map".to_string(),
+            bytes: map.len(),
+        });
+    }
+
+    Ok(BundleResult {
+        success: true,
+        module_count: output.module_count,
+        updated_module_count: output.updated_module_count,
+        cached_module_count: output.cached_module_count,
+        duration_ms,
+        output_file: output_file.map(|path| path.to_string_lossy().into_owned()),
+        code,
+        source_map,
+        source_map_file: source_map_file.map(|path| path.to_string_lossy().into_owned()),
+        files,
+        diagnostics,
+    })
+}
+
+fn rewrite_source_map_file(map: &str, file_name: &str) -> Result<String, WakeError> {
+    let mut value = serde_json::from_str::<serde_json::Value>(map).map_err(|error| {
+        WakeError::new(
+            "WAKE_INTERNAL",
+            format!("Wake generated an invalid source map: {error}"),
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        WakeError::new(
+            "WAKE_INTERNAL",
+            "Wake generated a source map whose root is not an object",
+        )
+    })?;
+    object.insert(
+        "file".to_string(),
+        serde_json::Value::String(file_name.to_string()),
+    );
+    serde_json::to_string(&value).map_err(|error| {
+        WakeError::new(
+            "WAKE_INTERNAL",
+            format!("Wake could not serialize its source map: {error}"),
+        )
+    })
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WakeError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(parent))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".wake-bundle-")
+        .tempfile_in(parent)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(parent))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(path))?;
+    for attempt in 0..10_u64 {
+        match temporary.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let retryable = matches!(
+                    error.error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+                );
+                if !retryable || attempt == 9 {
+                    return Err(WakeError::new("WAKE_IO", error.error.to_string()).at(path));
+                }
+                temporary = error.file;
+                thread::sleep(std::time::Duration::from_millis((attempt + 1).min(5)));
+            }
+        }
+    }
+    unreachable!("atomic write retry loop returns on every terminal state")
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn write_build_output(output: &BuildOutput, outdir: &Path) -> Result<(), WakeError> {
@@ -1059,6 +1464,7 @@ pub fn build_docs_with_mode(
         ..BuildOptions::default()
     };
     let mut bundler = create_bundler(&prepared, &build_options, true)?;
+    bundler.set_entry_chunk_name("entry");
     let output = bundler.build(&prepared.entry);
     cancellation.check()?;
     if output.has_errors() {
@@ -1422,6 +1828,14 @@ mod tests {
                 config_path: None,
             }
         }
+
+        fn write(&self, path: &str, contents: impl AsRef<[u8]>) {
+            let path = self.0.join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, contents).unwrap();
+        }
     }
 
     impl Drop for Fixture {
@@ -1442,9 +1856,17 @@ mod tests {
         assert!(result.success);
         assert!(result.files.iter().any(|file| file.kind == "html"));
 
-        let bundled = bundle(options.clone(), &CancellationToken::default()).unwrap();
-        assert!(bundled.code.as_deref().is_some_and(|code| !code.is_empty()));
-        assert!(bundled.output_dir.is_none());
+        let bundled = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(!bundled.code.is_empty());
+        assert!(bundled.output_file.is_none());
 
         let context = BuildContext::create(options).unwrap();
         let first = context.clone();
@@ -1474,6 +1896,220 @@ mod tests {
                 .unwrap_err()
                 .code,
             "WAKE_INTERNAL"
+        );
+    }
+
+    #[test]
+    fn node_bundle_writes_only_the_requested_commonjs_file() {
+        let fixture = Fixture::new("node-bundle");
+        let output_dir = fixture.0.join("artifacts");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let sibling = output_dir.join("keep.txt");
+        std::fs::write(&sibling, "keep").unwrap();
+        std::fs::write(output_dir.join("extension.js"), "stale").unwrap();
+        let result = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                outfile: Some(PathBuf::from("artifacts/extension.js")),
+                platform: Some(BuildPlatform::Node),
+                format: None,
+                target: Some("node20".to_string()),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let outfile = output_dir.join("extension.js");
+        assert_eq!(
+            result.output_file.as_deref(),
+            Some(outfile.to_string_lossy().as_ref())
+        );
+        assert!(
+            std::fs::read_to_string(&outfile)
+                .unwrap()
+                .contains("module.exports = __wake_entry__")
+        );
+        assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "keep");
+        assert!(!output_dir.join("index.html").exists());
+        assert!(!output_dir.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn browser_bundle_defaults_preserve_iife_and_css_runtime_behavior() {
+        let fixture = Fixture::new("browser-bundle");
+        fixture.write(
+            "src/index.js",
+            "import './theme.css'; export const value = 42;\n",
+        );
+        fixture.write("src/theme.css", "body { color: rebeccapurple; }\n");
+
+        let result = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert!(result.code.contains("rebeccapurple"), "{}", result.code);
+        assert!(result.code.contains("__wake_entry__"), "{}", result.code);
+        assert!(result.output_file.is_none());
+    }
+
+    #[test]
+    fn browser_exact_outfile_inlines_assets_instead_of_emitting_siblings() {
+        let fixture = Fixture::new("browser-exact-outfile");
+        fixture.write(
+            "src/index.js",
+            "import image from './large.png'; export default image;\n",
+        );
+        fixture.write("src/large.png", vec![b'X'; 8 * 1024]);
+
+        let result = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                outfile: Some(PathBuf::from("artifacts/browser.js")),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert!(result.code.contains("data:image/png;base64,"));
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(fixture.0.join("artifacts"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn bundle_source_map_is_returned_and_written_next_to_exact_outfile() {
+        let fixture = Fixture::new("bundle-source-map");
+        let memory = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(memory.source_map.is_some());
+        assert!(memory.source_map_file.is_none());
+        assert!(!memory.code.contains("sourceMappingURL="));
+        assert!(memory.files.iter().any(|file| file.kind == "map"));
+
+        let written = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                outfile: Some(PathBuf::from("artifacts/extension.js")),
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let outfile = fixture.0.join("artifacts/extension.js");
+        let mapfile = fixture.0.join("artifacts/extension.js.map");
+        assert_eq!(
+            written.source_map_file.as_deref().map(PathBuf::from),
+            Some(mapfile.clone())
+        );
+        let disk_map = std::fs::read_to_string(&mapfile).unwrap();
+        assert_eq!(written.source_map.as_deref(), Some(disk_map.as_str()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&disk_map).unwrap()["file"],
+            "extension.js"
+        );
+        let code = std::fs::read_to_string(outfile).unwrap();
+        assert_eq!(written.code, code);
+        assert!(code.ends_with("//# sourceMappingURL=extension.js.map\n"));
+    }
+
+    #[test]
+    fn bundle_option_validation_is_owned_by_the_application_layer() {
+        let fixture = Fixture::new("bundle-validation");
+        let invalid_pair = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                platform: Some(BuildPlatform::Node),
+                format: Some(ModuleFormat::Iife),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert_eq!(invalid_pair.code, "WAKE_CONFIG");
+
+        let incompatible = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                minify: true,
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert_eq!(incompatible.code, "WAKE_CONFIG");
+
+        for external in ["./local", "pkg/*", "pkg name", "@scope", "pkg/subpath"] {
+            let error = bundle(
+                BundleOptions {
+                    project: fixture.project(),
+                    external: vec![external.to_string()],
+                    ..BundleOptions::default()
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "WAKE_CONFIG", "{external}");
+        }
+    }
+
+    #[test]
+    fn atomic_write_concurrently_replaces_with_one_complete_payload() {
+        let fixture = Fixture::new("atomic-write");
+        let target = fixture.0.join("artifacts/extension.js");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_target = target.clone();
+        let first = thread::spawn(move || {
+            first_barrier.wait();
+            atomic_write(&first_target, &vec![b'A'; 128 * 1024])
+        });
+        let second_barrier = barrier.clone();
+        let second_target = target.clone();
+        let second = thread::spawn(move || {
+            second_barrier.wait();
+            atomic_write(&second_target, &vec![b'B'; 128 * 1024])
+        });
+        barrier.wait();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let contents = std::fs::read(&target).unwrap();
+        assert!(contents == vec![b'A'; 128 * 1024] || contents == vec![b'B'; 128 * 1024]);
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wake-bundle-"))
+                .count(),
+            0
         );
     }
 

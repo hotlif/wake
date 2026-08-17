@@ -49,15 +49,17 @@ use wake_graph::{
     ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
     collect_static_uses, compute_live_keep,
 };
-use wake_resolver::{ModuleIdentity, ResolveOptions, ResolvedModule, Resolver};
+use wake_resolver::{ModuleIdentity, ResolutionProfile, ResolveOptions, ResolvedModule, Resolver};
 use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, global_executor, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
-use crate::loader::{LoadOptions, Loaded, cached_source_type, load_source, push_js_string};
+use crate::loader::{
+    LoadOptions, Loaded, cached_source_type, is_asset_path, load_source, push_js_string,
+};
 use crate::{
-    BuildOutput, ChunkKind, Linker, OutputAsset, OutputChunk, POSTLUDE, PRELUDE, PRELUDE_ASYNC,
-    SpecifierLookup, path_to_slash,
+    BuildOutput, BuildPlatform, ChunkKind, Linker, ModuleFormat, OutputAsset, OutputChunk,
+    POSTLUDE, POSTLUDE_COMMONJS, PRELUDE, PRELUDE_ASYNC, SpecifierLookup, path_to_slash,
 };
 
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
@@ -72,7 +74,11 @@ type LoadedResult = (
     Option<FileStamp>,
     Option<u64>,
 );
-type ResolveResult = Result<ResolvedModule, wake_resolver::ResolveError>;
+enum ResolveResult {
+    Internal(ResolvedModule),
+    External(String),
+    Error,
+}
 type CodegenExecCounts = Arc<[CachePadded<AtomicU64>]>;
 
 /// I/O 小任务的目标批次数：既给工作窃取留出余量，又避免为数千个小文件逐个分配
@@ -336,6 +342,10 @@ pub struct IncrementalBundler {
     resolver: Arc<Resolver>,
     /// 解析选项（含别名）。跨构建保留——PnP 检测切换解析器时用它重建，避免丢别名。
     resolve_options: ResolveOptions,
+    /// 宿主平台、入口格式与显式 external 都属于稳定构建身份。
+    platform: BuildPlatform,
+    module_format: ModuleFormat,
+    external_packages: Arc<[String]>,
     /// 规范化路径 → 内容输入 cell（跨构建保留）。
     content_cells: FxHashMap<PathBuf, Vc<Content>>,
     /// 规范化路径 → linker 输入 cell（跨构建保留）。
@@ -374,6 +384,8 @@ pub struct IncrementalBundler {
     /// 单 chunk 路径是否使用 `entry.<content-hash>.js`（默认关闭，保留历史 `bundle.js`）。
     /// 供主动关闭代码分割、但仍需生产缓存失效语义的宿主使用。
     hash_single_chunk_entry: bool,
+    /// 宿主指定的入口 chunk 逻辑名。Docs 用它让单包和分包都稳定产出 `entry.<hash>.js`。
+    entry_chunk_name: Option<Arc<str>>,
     /// 产物文件名是否带内容 hash（默认开；dev 关以稳定 URL）。
     content_hash: bool,
     /// 共享 chunk 抽取阈值（模块被 ≥N 个 async root 共享则抽取，默认 2）。
@@ -439,6 +451,8 @@ struct ModuleRec {
     /// 依赖（来自 parse 或缓存摘要）。
     deps: Vec<ParsedDep>,
     dep_ids: DepIds,
+    /// 已明确外置的宿主依赖。它们不进入模块图，但属于 link 与缓存身份。
+    external_deps: Vec<String>,
     /// 绑定级活跃性（Tree Shaking 用；仅 prod + 新 parse 的模块有；缓存摘要命中 → `None` → 保守全保留）。
     liveness: Option<Arc<ModuleLiveness>>,
     /// 单包 concat 块安全信息（`{}` vs IIFE；缓存摘要命中 → `None` → 保守走 IIFE + 不加 strict）。
@@ -501,6 +515,9 @@ impl IncrementalBundler {
         IncrementalBundler {
             resolver: Arc::new(Resolver::new(fs.clone())),
             resolve_options: ResolveOptions::default(),
+            platform: BuildPlatform::Browser,
+            module_format: ModuleFormat::Iife,
+            external_packages: Arc::from(Vec::<String>::new()),
             fs,
             interner: Arc::new(Interner::new()),
             engine: Arc::new(Engine::new()),
@@ -527,6 +544,7 @@ impl IncrementalBundler {
             tree_shaking: false,
             code_splitting: false,
             hash_single_chunk_entry: false,
+            entry_chunk_name: None,
             content_hash: true,
             share_threshold: 2,
             cache: None,
@@ -561,6 +579,35 @@ impl IncrementalBundler {
         }
         self.target_fingerprint = fingerprint;
         self.transform_features = target.required_features();
+        self
+    }
+
+    /// 设置 bundle 宿主平台。平台改变条件导出与 Node builtin 的处理。
+    pub fn set_platform(&mut self, platform: BuildPlatform) -> &mut Self {
+        if self.platform != platform {
+            self.platform = platform;
+            self.reset_parse_graph();
+        }
+        self
+    }
+
+    /// 设置入口模块输出格式。
+    pub fn set_module_format(&mut self, format: ModuleFormat) -> &mut Self {
+        if self.module_format != format {
+            self.module_format = format;
+            self.link_plan = None;
+        }
+        self
+    }
+
+    /// 设置由宿主运行时提供的裸 npm 包。包名同时匹配其子路径。
+    pub fn set_external_packages(&mut self, mut packages: Vec<String>) -> &mut Self {
+        packages.sort();
+        packages.dedup();
+        if self.external_packages.as_ref() != packages.as_slice() {
+            self.external_packages = packages.into();
+            self.reset_parse_graph();
+        }
         self
     }
 
@@ -920,6 +967,16 @@ impl IncrementalBundler {
     /// [`set_content_hash`](Self::set_content_hash)：全局关闭内容 hash 时输出 `entry.js`。
     pub fn enable_single_chunk_content_hash(&mut self) -> &mut Self {
         self.hash_single_chunk_entry = true;
+        self
+    }
+
+    /// 设置入口 chunk 的逻辑文件名（不含扩展名与 hash），同时适用于单包和代码分割。
+    pub fn set_entry_chunk_name(&mut self, name: impl Into<String>) -> &mut Self {
+        let name: Arc<str> = Arc::from(name.into());
+        if self.entry_chunk_name.as_deref() != Some(name.as_ref()) {
+            self.entry_chunk_name = Some(name);
+            self.reset_parse_graph();
+        }
         self
     }
 
@@ -1542,7 +1599,7 @@ impl IncrementalBundler {
 
             // —— Pass 1：串行取预分析结果 + 缓存记账 + 收集 resolve 请求 ——
             let mut pending: Vec<PendingModule> = Vec::with_capacity(layer.len());
-            let mut resolve_reqs: Vec<(String, PathBuf)> = Vec::new();
+            let mut resolve_reqs: Vec<(String, PathBuf, DependencyKind)> = Vec::new();
             for (i, it) in layer.into_iter().enumerate() {
                 let LayerItem {
                     id,
@@ -1658,7 +1715,7 @@ impl IncrementalBundler {
                 let from_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
                 // resolve 请求按依赖序压入（Pass 2 按同序消费）。
                 for dep in deps.iter() {
-                    resolve_reqs.push((dep.specifier.clone(), from_dir.clone()));
+                    resolve_reqs.push((dep.specifier.clone(), from_dir.clone(), dep.kind));
                 }
                 // 绑定级活跃性（仅 tree-shaking 且本模块有新 parse 的 AST 时；缓存摘要命中 → None → 保守全保留）。
                 let liveness = cached_liveness.or_else(|| {
@@ -1715,12 +1772,29 @@ impl IncrementalBundler {
                     .map(|batch| {
                         let resolver = Arc::clone(&self.resolver);
                         let resolve_exec_count = self.resolve_exec_count.clone();
+                        let platform = self.platform;
+                        let external_packages = Arc::clone(&self.external_packages);
                         move || {
                             batch
                                 .into_iter()
-                                .map(|(index, (specifier, from_dir))| {
+                                .map(|(index, (specifier, from_dir, kind))| {
                                     resolve_exec_count.fetch_add(1, Ordering::Relaxed);
-                                    (index, resolver.resolve_module(&specifier, &from_dir))
+                                    let resolved = if is_external_specifier(
+                                        &specifier,
+                                        platform,
+                                        &external_packages,
+                                    ) {
+                                        ResolveResult::External(specifier)
+                                    } else {
+                                        let profile = resolution_profile(platform, kind);
+                                        match resolver.resolve_module_with_profile(
+                                            &specifier, &from_dir, &profile,
+                                        ) {
+                                            Ok(module) => ResolveResult::Internal(module),
+                                            Err(_) => ResolveResult::Error,
+                                        }
+                                    };
+                                    (index, resolved)
                                 })
                                 .collect::<Vec<_>>()
                         }
@@ -1759,11 +1833,27 @@ impl IncrementalBundler {
                     parsed_opt,
                 } = pm;
                 let mut dep_ids: DepIds = Vec::new();
+                let mut external_deps = Vec::new();
                 for dep in deps.iter() {
                     let resolved = &resolved_flat[flat_idx];
                     flat_idx += 1;
                     match resolved {
-                        Ok(resolved) => {
+                        ResolveResult::Internal(resolved) => {
+                            if self.platform == BuildPlatform::Node
+                                && is_node_browser_resource(&resolved.path)
+                            {
+                                diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "Node bundle 不支持浏览器资源模块 `{}`",
+                                        resolved.path.display()
+                                    ))
+                                    .with_code("WAKE0303")
+                                    .with_path(path.to_string_lossy().into_owned())
+                                    .with_primary(dep.span, "此资源导入不适用于 Node bundle")
+                                    .with_note("请移除此导入，或改用 browser+iife 构建"),
+                                );
+                                continue;
+                            }
                             let known = module_to_id.contains_key(&resolved.identity);
                             let did = assign_id(
                                 &mut module_to_id,
@@ -1775,13 +1865,10 @@ impl IncrementalBundler {
                             }
                             dep_ids.push((dep.specifier.clone(), did));
                         }
-                        Err(_) if is_node_builtin(&dep.specifier) => {
-                            // Node 内置模块（fs/stream/util/crypto/...）外部化：不加入模块图，
-                            // codegen 的 require_expr 走 external 回退保留 `require("...")`，
-                            // 在 node 运行时由宿主提供（等价 esbuild --platform=node）。
-                            // 浏览器目标若拉入 Node 内置则天然无法运行，需改用浏览器版依赖。
+                        ResolveResult::External(specifier) => {
+                            external_deps.push(specifier.clone());
                         }
-                        Err(_) => diagnostics.push(
+                        ResolveResult::Error => diagnostics.push(
                             Diagnostic::error(format!(
                                 "无法从 `{}` 解析依赖 `{}`",
                                 path.display(),
@@ -1793,6 +1880,17 @@ impl IncrementalBundler {
                         ),
                     }
                 }
+                if self.platform == BuildPlatform::Node && is_node_browser_resource(&path) {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "Node bundle 不支持浏览器资源模块 `{}`",
+                            path.display()
+                        ))
+                        .with_code("WAKE0303")
+                        .with_path(path.to_string_lossy().into_owned())
+                        .with_note("请从 Node 入口移除此资源导入，或改用 browser+iife 构建"),
+                    );
+                }
                 modules.insert(
                     id,
                     ModuleRec {
@@ -1802,6 +1900,7 @@ impl IncrementalBundler {
                         content_vc,
                         deps,
                         dep_ids,
+                        external_deps,
                         liveness,
                         block_info,
                         has_top_level_await,
@@ -1849,6 +1948,44 @@ impl IncrementalBundler {
         // 单包 minify 仍可使用现有的无 marker 紧凑路径；代码分割必须让各 chunk 的 runtime
         // 通过 `__esModule` 可靠区分 ESM 与 CJS（`default` 键本身不是可靠信号）。
         let no_esmodule = self.minify && chunk_graph.is_none();
+        if self.module_format == ModuleFormat::CommonJs {
+            if async_ids.contains(&entry_id) {
+                let source = modules
+                    .values()
+                    .find(|module| module.has_top_level_await)
+                    .map(|module| path_to_slash(&module.path))
+                    .unwrap_or_else(|| path_to_slash(&entry_norm));
+                diagnostics.push(
+                    Diagnostic::error("CommonJS 入口的同步依赖图不支持顶层 await")
+                        .with_code("WAKE0304")
+                        .with_path(source),
+                );
+            } else {
+                for module in modules.values() {
+                    let targets = module
+                        .dep_ids
+                        .iter()
+                        .map(|(specifier, id)| (specifier.as_str(), *id))
+                        .collect::<FxHashMap<_, _>>();
+                    for dependency in &module.deps {
+                        if dependency.kind == DependencyKind::Require
+                            && targets
+                                .get(dependency.specifier.as_str())
+                                .is_some_and(|target| async_ids.contains(target))
+                        {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "CommonJS require() 不能同步加载包含顶层 await 的模块",
+                                )
+                                .with_code("WAKE0304")
+                                .with_path(path_to_slash(&module.path))
+                                .with_primary(dependency.span, "此 require() 指向异步模块"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let link_time = t_link_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let t_codegen_start = timing.then(std::time::Instant::now);
 
@@ -2113,14 +2250,19 @@ impl IncrementalBundler {
                     &block_infos,
                     &async_ids,
                     &self.exec,
+                    self.module_format,
                     want_map.then_some(&mut body_starts),
                 );
                 let mut o =
                     crate::single_chunk(bundle, live_ids.len(), diagnostics, live_ids.clone());
-                if self.hash_single_chunk_entry {
+                if let Some(name) = self
+                    .entry_chunk_name
+                    .as_deref()
+                    .or(self.hash_single_chunk_entry.then_some("entry"))
+                {
                     let entry = &mut o.chunks[o.entry_chunk];
-                    entry.name = "entry".to_string();
-                    entry.file_name = chunk_filename("entry", &entry.code, self.content_hash);
+                    entry.name = name.to_string();
+                    entry.file_name = chunk_filename(name, &entry.code, self.content_hash);
                 }
                 if want_map {
                     // 源文件名 + 源文本：文本取自 parse 结果；缓存命中未 parse 的模块只带路径
@@ -2144,7 +2286,7 @@ impl IncrementalBundler {
             }
             Some(g) => {
                 let token = build_token(&normalize(entry), live_ids.len());
-                let (chunks, entry_chunk) = emit_chunks(
+                let (mut chunks, entry_chunk) = emit_chunks(
                     &bodies,
                     g,
                     entry_id,
@@ -2154,6 +2296,11 @@ impl IncrementalBundler {
                     &async_ids,
                     &style_files,
                 );
+                if let Some(name) = self.entry_chunk_name.as_deref() {
+                    let entry = &mut chunks[entry_chunk];
+                    entry.name = name.to_string();
+                    entry.file_name = chunk_filename(name, &entry.code, self.content_hash);
+                }
                 let bundle = chunks[entry_chunk].code.clone();
                 BuildOutput {
                     bundle,
@@ -2393,6 +2540,9 @@ impl IncrementalBundler {
         self.code_splitting.hash(&mut hasher);
         self.share_threshold.hash(&mut hasher);
         self.minify.hash(&mut hasher);
+        self.platform.hash(&mut hasher);
+        self.module_format.hash(&mut hasher);
+        self.external_packages.hash(&mut hasher);
 
         let mut ids = modules.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
@@ -2401,6 +2551,7 @@ impl IncrementalBundler {
             id.hash(&mut hasher);
             path_to_slash(&module.path).hash(&mut hasher);
             module.dep_ids.hash(&mut hasher);
+            module.external_deps.hash(&mut hasher);
             module.has_top_level_await.hash(&mut hasher);
             // The owned summary contains dependency kinds and binding liveness without retaining
             // AST/arena state. Equal semantic summaries deliberately reuse the plan even when a
@@ -2419,8 +2570,50 @@ impl IncrementalBundler {
     }
 }
 
+fn resolution_profile(platform: BuildPlatform, kind: DependencyKind) -> ResolutionProfile {
+    let require = matches!(kind, DependencyKind::Require);
+    let conditions = match (platform, require) {
+        (BuildPlatform::Node, true) => vec!["node".into(), "require".into()],
+        (BuildPlatform::Node, false) => vec!["node".into(), "import".into()],
+        (BuildPlatform::Browser, true) => vec!["browser".into(), "require".into()],
+        (BuildPlatform::Browser, false) => {
+            vec!["browser".into(), "import".into(), "module".into()]
+        }
+    };
+    let main_fields = match platform {
+        BuildPlatform::Browser => vec!["module".into(), "main".into()],
+        BuildPlatform::Node => vec!["main".into(), "module".into()],
+    };
+    ResolutionProfile {
+        conditions,
+        main_fields,
+    }
+}
+
+fn is_external_specifier(specifier: &str, platform: BuildPlatform, packages: &[String]) -> bool {
+    (platform == BuildPlatform::Node && is_node_builtin(specifier))
+        || packages.iter().any(|package| {
+            specifier == package
+                || specifier
+                    .strip_prefix(package)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+}
+
+fn is_node_browser_resource(path: &Path) -> bool {
+    is_asset_path(path)
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "css" | "html" | "htm"
+                )
+            })
+}
+
 /// 是否为 Node.js 内置模块（含 `node:` 前缀与 `fs/promises`、`stream/web` 等子路径）。
-/// 这些模块不打进 bundle，保留为运行时 `require(...)`（node 目标）。
 fn is_node_builtin(spec: &str) -> bool {
     if spec.starts_with("node:") {
         return true;
@@ -2429,7 +2622,21 @@ fn is_node_builtin(spec: &str) -> bool {
     let head = spec.split('/').next().unwrap_or(spec);
     matches!(
         head,
-        "assert"
+        "_http_agent"
+            | "_http_client"
+            | "_http_common"
+            | "_http_incoming"
+            | "_http_outgoing"
+            | "_http_server"
+            | "_stream_duplex"
+            | "_stream_passthrough"
+            | "_stream_readable"
+            | "_stream_transform"
+            | "_stream_wrap"
+            | "_stream_writable"
+            | "_tls_common"
+            | "_tls_wrap"
+            | "assert"
             | "async_hooks"
             | "buffer"
             | "child_process"
@@ -3775,10 +3982,16 @@ fn build_style_artifacts(
     let mut files = BTreeMap::new();
     for (chunk_id, css) in css_by_chunk {
         let css = if minify { wake_css::minify(&css) } else { css };
-        let chunk_name = chunk_graph
-            .and_then(|graph| graph.chunks.iter().find(|chunk| chunk.id == chunk_id))
-            .map(|chunk| chunk.name.as_str())
-            .unwrap_or("styles");
+        // Entry CSS keeps the stable `styles.<hash>.css` public contract even when the
+        // JavaScript graph is split and its source entry has a project-specific stem.
+        let chunk_name = if chunk_id == 0 {
+            "styles"
+        } else {
+            chunk_graph
+                .and_then(|graph| graph.chunks.iter().find(|chunk| chunk.id == chunk_id))
+                .map(|chunk| chunk.name.as_str())
+                .unwrap_or("styles")
+        };
         let file_name = format!("{chunk_name}.{}.css", hash8(&css));
         files.insert(chunk_id, vec![file_name.clone()]);
         assets.push(OutputAsset {
@@ -4191,6 +4404,7 @@ fn emit(
     block_infos: &FxHashMap<u32, ConcatBlockInfo>,
     async_ids: &FxHashSet<u32>,
     exec: &Executor,
+    module_format: ModuleFormat,
     body_starts: Option<&mut Vec<(u32, u32)>>,
 ) -> String {
     let mut keep_bodies: Vec<(u32, Arc<String>)> = Vec::new();
@@ -4482,7 +4696,13 @@ fn emit(
         }
         out.push_str("};r.m=t;r.c=c;");
         out.push_str(&format!("var e=r({});", entry_id));
-        out.push_str("if(typeof module!=='undefined'&&module.exports)module.exports=e;else g.__wake_entry__=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);");
+        if module_format == ModuleFormat::CommonJs {
+            out.push_str(
+                "module.exports=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);",
+            );
+        } else {
+            out.push_str("if(typeof module!=='undefined'&&module.exports)module.exports=e;else g.__wake_entry__=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);");
+        }
         out
     } else {
         // 非 minify 模式：不 do scope hoisting（无 tree-shaking，所有模块都有 exports/requires）。
@@ -4529,7 +4749,11 @@ fn emit(
         out.push_str(&format!(
             "var __wake_entry__ = __wake_require__({entry_id});\n"
         ));
-        out.push_str(POSTLUDE);
+        out.push_str(if module_format == ModuleFormat::CommonJs {
+            POSTLUDE_COMMONJS
+        } else {
+            POSTLUDE
+        });
         if let Some(slot) = body_starts {
             *slot = starts;
         }

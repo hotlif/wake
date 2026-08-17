@@ -48,6 +48,38 @@ enum Command {
         #[arg(long)]
         sourcemap: bool,
     },
+    /// Bundle one JavaScript or TypeScript entry into one library file.
+    Bundle {
+        /// Entry source file.
+        entry: PathBuf,
+        /// Exact output file.
+        #[arg(long)]
+        outfile: PathBuf,
+        /// Bundle host platform.
+        #[arg(long, value_enum)]
+        platform: Option<BundlePlatformArg>,
+        /// Entry module format. Defaults from platform when omitted.
+        #[arg(long, value_enum)]
+        format: Option<BundleFormatArg>,
+        /// Runtime syntax target, for example node20.
+        #[arg(long)]
+        target: Option<String>,
+        /// Bare package supplied by the runtime; may be repeated.
+        #[arg(long)]
+        external: Vec<String>,
+        /// Minify the bundle.
+        #[arg(long)]
+        minify: bool,
+        /// Emit a source map next to outfile.
+        #[arg(long)]
+        sourcemap: bool,
+        /// Enable persistent cache.
+        #[arg(long)]
+        cache: bool,
+        /// Explicit wake.config.toml path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Start the application development server and HMR.
     Dev {
         /// Project root.
@@ -122,6 +154,18 @@ enum DocsModeArg {
     Components,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BundlePlatformArg {
+    Browser,
+    Node,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BundleFormatArg {
+    Iife,
+    Cjs,
+}
+
 impl From<DocsModeArg> for wake_app::DocsMode {
     fn from(value: DocsModeArg) -> Self {
         match value {
@@ -155,6 +199,34 @@ fn main() -> ExitCode {
                     .and_then(|()| cmd_build(entry.as_deref(), &outdir, cache, sourcemap, ui))
             }
         }
+        Command::Bundle {
+            entry,
+            outfile,
+            platform,
+            format,
+            target,
+            external,
+            minify,
+            sourcemap,
+            cache,
+            config,
+        } => ensure_static_mode(cli.ui).and_then(|()| {
+            cmd_bundle(
+                BundleCommandOptions {
+                    entry,
+                    outfile,
+                    platform,
+                    format,
+                    target,
+                    external,
+                    minify,
+                    sourcemap,
+                    cache,
+                    config,
+                },
+                ui,
+            )
+        }),
         Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port, ui, cli.ui),
         Command::Docs { command } => match command {
             DocsCommand::Dev { root, port, mode } => cmd_docs_dev(&root, port, mode, ui, cli.ui),
@@ -270,6 +342,59 @@ fn metrics_from_result(result: &wake_app::BuildResult) -> BuildMetrics {
             .filter(|file| file.kind == "asset" || file.kind == "css")
             .count(),
         duration_ms: result.duration_ms,
+    }
+}
+
+struct BundleCommandOptions {
+    entry: PathBuf,
+    outfile: PathBuf,
+    platform: Option<BundlePlatformArg>,
+    format: Option<BundleFormatArg>,
+    target: Option<String>,
+    external: Vec<String>,
+    minify: bool,
+    sourcemap: bool,
+    cache: bool,
+    config: Option<PathBuf>,
+}
+
+fn cmd_bundle(options: BundleCommandOptions, ui: Ui) -> Result<(), ExitCode> {
+    ui.header("bundle");
+    let platform = options.platform.map(|platform| match platform {
+        BundlePlatformArg::Browser => wake_app::BuildPlatform::Browser,
+        BundlePlatformArg::Node => wake_app::BuildPlatform::Node,
+    });
+    let format = options.format.map(|format| match format {
+        BundleFormatArg::Iife => wake_app::ModuleFormat::Iife,
+        BundleFormatArg::Cjs => wake_app::ModuleFormat::CommonJs,
+    });
+    let project = wake_app::ProjectOptions {
+        cwd: std::env::current_dir().ok(),
+        config_path: options.config,
+    };
+    match wake_app::bundle(
+        wake_app::BundleOptions {
+            project,
+            entry: Some(options.entry),
+            outfile: Some(options.outfile),
+            platform,
+            format,
+            target: options.target,
+            external: options.external,
+            minify: options.minify,
+            source_map: options.sourcemap,
+            cache: options.cache,
+        },
+        &wake_app::CancellationToken::default(),
+    ) {
+        Ok(result) => {
+            ui.bundle_result("Bundled", &result, None);
+            Ok(())
+        }
+        Err(error) => {
+            ui.app_error(&error);
+            Err(ExitCode::FAILURE)
+        }
     }
 }
 

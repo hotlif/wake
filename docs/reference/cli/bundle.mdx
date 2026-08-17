@@ -1,0 +1,38 @@
++++
+title = "bundle 命令"
+description = "生成精确的浏览器 IIFE 或 Node CommonJS 单文件产物"
+kind = "reference"
+status = "stable"
++++
+
+# bundle 命令
+
+## 用法
+
+```text
+wake bundle <ENTRY> --outfile <FILE>
+  [--platform browser|node] [--format iife|cjs]
+  [--target node20] [--external PACKAGE]...
+  [--minify] [--sourcemap] [--cache] [--config FILE]
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `ENTRY` | 必填 | TypeScript 或 JavaScript 入口 |
+| `--outfile` | 必填 | 精确输出文件；自动创建父目录且不清理同目录文件 |
+| `--platform` | `browser` | 目标宿主；`node` 自动外置 Node 内置模块 |
+| `--format` | 随平台 | Browser 使用 `iife`，Node 使用 `cjs` |
+| `--target` | Node 为 `node20` | Node 语法转换目标，例如 `node20.0` |
+| `--external` | 无 | 宿主提供的裸 npm 包；可重复，且同时匹配包的子路径 |
+| `--minify` | 关闭 | 压缩单文件产物 |
+| `--sourcemap` | 关闭 | 写入 `<outfile>.map` 并添加 `sourceMappingURL` |
+| `--cache` | 关闭 | 启用持久 bundle 缓存 |
+| `--config` | 自动发现 | 显式指定 `wake.config.toml` |
+
+首版只接受 `browser+iife` 与 `node+cjs`。`--minify` 和 `--sourcemap` 不能同时启用；
+CommonJS 同步入口图包含顶层 `await` 时构建失败，但动态导入后的异步模块可以使用顶层 `await`。
+
+```sh
+wake bundle src/extension.ts --outfile dist/extension.js \
+  --platform node --external vscode --minify
+```

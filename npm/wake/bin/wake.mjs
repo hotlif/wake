@@ -4,9 +4,11 @@ import { readFile } from 'node:fs/promises'
 import {
   build,
   buildDocs,
+  bundle,
   startDevServer,
   startDocsDevServer,
   version,
+  WakeError,
 } from '../index.mjs'
 import { parse, tokenize } from '../experimental.mjs'
 import {
@@ -32,6 +34,9 @@ const HELP = `Wake ${version()}
 Usage:
   wake [--ui auto|tui|plain] [--no-color] <command>
   wake build [entry] [--outdir DIR] [--cache] [--sourcemap]
+  wake bundle <entry> --outfile FILE [--platform browser|node] [--format iife|cjs]
+              [--target node20] [--external PACKAGE] [--minify] [--sourcemap]
+              [--cache] [--config FILE]
   wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open]
   wake docs build [root] [--mode site|components] [--outdir DIR] [--base PATH]
   wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
@@ -45,13 +50,22 @@ Options:
   --format    Human or JSON output for parse/tokenize (default: auto)
 `
 
-function takeOption(args, name) {
+function takeOption(args, name, usage = false) {
   const index = args.indexOf(name)
   if (index === -1) return undefined
-  if (index + 1 >= args.length) throw new Error(`${name} requires a value`)
+  if (index + 1 >= args.length) {
+    const message = `${name} requires a value`
+    throw usage ? usageError(message) : new Error(message)
+  }
   const [value] = args.splice(index + 1, 1)
   args.splice(index, 1)
   return value
+}
+
+function usageError(message) {
+  const error = new WakeError('WAKE_CONFIG', message)
+  error.exitCode = 2
+  return error
 }
 
 function takeFlag(args, name) {
@@ -59,6 +73,15 @@ function takeFlag(args, name) {
   if (index === -1) return false
   args.splice(index, 1)
   return true
+}
+
+function takeOptions(args, name, usage = false) {
+  const values = []
+  for (;;) {
+    const value = takeOption(args, name, usage)
+    if (value === undefined) return values
+    values.push(value)
+  }
 }
 
 function commonOptions(args) {
@@ -74,6 +97,13 @@ function printLines(lines, output = console.error) {
 function validateChoice(value, name, choices) {
   if (!choices.includes(value)) {
     throw new Error(`${name} must be one of: ${choices.join(', ')}`)
+  }
+  return value
+}
+
+function validateBundleChoice(value, name, choices) {
+  if (!choices.includes(value)) {
+    throw usageError(`${name} must be one of: ${choices.join(', ')}`)
   }
   return value
 }
@@ -245,6 +275,33 @@ export async function runCli(argv = process.argv.slice(2)) {
     return 0
   }
 
+  if (command === 'bundle') {
+    ensureStaticMode(uiMode)
+    const options = { configPath: takeOption(args, '--config', true) }
+    options.outfile = takeOption(args, '--outfile', true)
+    const platform = takeOption(args, '--platform', true)
+    if (platform !== undefined) {
+      options.platform = validateBundleChoice(platform, '--platform', ['browser', 'node'])
+    }
+    const format = takeOption(args, '--format', true)
+    if (format !== undefined) {
+      options.format = validateBundleChoice(format, '--format', ['iife', 'cjs'])
+    }
+    options.target = takeOption(args, '--target', true)
+    options.external = takeOptions(args, '--external', true)
+    options.minify = takeFlag(args, '--minify')
+    options.sourceMap = takeFlag(args, '--sourcemap')
+    options.cache = takeFlag(args, '--cache')
+    options.entry = args.shift()
+    if (!options.entry || !options.outfile) {
+      throw usageError('bundle requires one entry and --outfile FILE')
+    }
+    if (args.length) throw usageError(`unknown bundle arguments: ${args.join(' ')}`)
+    printLines(formatBanner(ui, 'bundle', version()))
+    printResult(ui, await bundle(options), 'Bundled')
+    return 0
+  }
+
   if (command === 'dev') {
     const options = commonOptions(args)
     options.entry = takeOption(args, '--entry')
@@ -342,5 +399,5 @@ try {
   const noColor = process.argv.includes('--no-color')
   const ui = createUi(!noColor && supportsColor())
   printLines(formatError(ui, error))
-  process.exitCode = 1
+  process.exitCode = error.exitCode || 1
 }

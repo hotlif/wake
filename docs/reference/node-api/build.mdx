@@ -22,7 +22,30 @@ console.log(result.files);
 
 ## `bundle(options)`
 
-返回包含 `code` 的内存结果，不设置 `outputDir`。适合工具集成，不用于部署完整 HTML/CSS/资源目录。
+返回独立的 `BundleResult`，其中 `code` 始终存在。省略 `outfile` 时只在内存中返回；设置后
+原子写入该文件且不生成 HTML、manifest 或其他 Web 应用产物。`platform: "node"` 会默认
+选择 `format: "cjs"` 和 `target: "node20"`，这些默认值由 Wake 应用层统一决定。
+
+Node/CommonJS bundle 可指定宿主 external：
+
+```ts
+const result = await bundle({
+  entry: "src/extension.ts",
+  outfile: "dist/extension.js",
+  platform: "node",
+  format: "cjs",
+  target: "node20",
+  external: ["vscode"],
+  minify: true,
+});
+console.log(result.outputFile);
+```
+
+Node 平台自动外置 Node 内置模块。显式 external 必须是裸 npm 包名并同时覆盖其子路径。
+首版 Node bundle 只支持 CommonJS 单文件，`minify` 与 `sourceMap` 不能同时启用。
+启用 `sourceMap` 时，内存构建通过 `result.sourceMap` 返回映射；设置 `outfile` 后还会原子写入
+`<outfile>.map`、返回 `result.sourceMapFile`，并在 JavaScript 末尾写入对应的
+`sourceMappingURL`。
 
 ## `createBuildContext(options)`
 

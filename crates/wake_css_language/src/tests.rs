@@ -23,6 +23,15 @@ fn discovers_aliases_and_ignores_shadowing() {
 }
 
 #[test]
+fn ignores_same_named_tags_imported_from_other_packages() {
+    let source = "import { css } from '@linaria/core';\n\
+        const box = css`display: grid;`;";
+    let document = analyze(source);
+    assert!(document.virtual_documents().is_empty());
+    assert!(document.semantic_tokens().is_empty());
+}
+
+#[test]
 fn virtual_document_maps_unicode_crlf_and_interpolation_without_exposing_holes() {
     let source = "// 𝒳 中文\r\nimport { css } from '@crab-dev/css';\r\n\
         const box = css`color: red; width: ${token.size}px;`;";
@@ -99,6 +108,87 @@ fn reports_unknown_properties_and_exposes_hover_and_tokens() {
     assert!(document.semantic_tokens().iter().any(|token| {
         token.kind == SemanticKind::Property && token.span.slice(source) == "display"
     }));
+}
+
+#[test]
+fn global_style_selectors_are_not_classified_as_declarations() {
+    let source = "import { globalStyle } from '@crab-dev/css';\n\
+        globalStyle`a:hover { color: red; } @font-face { font-family: demo; src: url(font.woff2); }`;";
+    let document = analyze(source);
+    assert!(!document.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code == "CSS_UNKNOWN_PROPERTY" && diagnostic.message.contains("`a`")
+    }));
+    assert!(
+        document.semantic_tokens().iter().any(|token| {
+            token.kind == SemanticKind::Keyword && token.span.slice(source) == "a"
+        })
+    );
+    assert!(document.semantic_tokens().iter().any(|token| {
+        token.kind == SemanticKind::Property && token.span.slice(source) == "font-family"
+    }));
+}
+
+#[test]
+fn css_syntax_tree_ignores_comments_and_decodes_escaped_properties() {
+    let source = "import { css } from '@crab-dev/css'; const box = css`\n\
+        /* display: grid; color: #ff0000; */\n\
+        d\\69 splay: grid;\n`;";
+    let document = analyze(source);
+    assert!(!document.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code == "CSS_UNKNOWN_PROPERTY" || diagnostic.code == "CSS_PROPERTY_CASE"
+    }));
+    assert!(document.colors().is_empty());
+    let comment_display = source.find("display").unwrap() as u32;
+    assert!(
+        document
+            .semantic_tokens()
+            .iter()
+            .all(|token| !token.span.contains_offset(comment_display))
+    );
+    let escaped = source.find("d\\69 splay").unwrap() as u32;
+    let hover = document.hover(escaped + 2).expect("escaped property hover");
+    assert!(hover.markdown.starts_with("**display**"));
+    assert!(document.semantic_tokens().iter().any(|token| {
+        token.kind == SemanticKind::Property && token.span.slice(source) == "d\\69 splay"
+    }));
+}
+
+#[test]
+fn css_syntax_tree_owns_numbers_blocks_and_formatting_context() {
+    let source = "import { css } from '@crab-dev/css'; const box = css`\n\
+        content: '{ not a block }';\n\
+        opacity: .5;\n\
+        width: 1e2px;\n\
+        &:hover {\n\
+        color: red;\n\
+        }\n`;";
+    let document = analyze(source);
+    let number_tokens = document
+        .semantic_tokens()
+        .into_iter()
+        .filter(|token| token.kind == SemanticKind::Number)
+        .map(|token| token.span.slice(source).to_string())
+        .collect::<Vec<_>>();
+    assert!(number_tokens.iter().any(|value| value == ".5"));
+    assert!(number_tokens.iter().any(|value| value == "1e2px"));
+    assert_eq!(document.folding_ranges().len(), 1);
+    let edits = document.format(None);
+    assert!(
+        edits
+            .iter()
+            .any(|edit| edit.replacement.contains("  color: red;"))
+    );
+}
+
+#[test]
+fn css_syntax_tree_reports_unclosed_blocks_from_parser_structure() {
+    let source = "import { css } from '@crab-dev/css'; const box = css`&:hover { color: red;`;";
+    assert!(
+        analyze(source)
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CSS_UNCLOSED_BLOCK")
+    );
 }
 
 #[test]

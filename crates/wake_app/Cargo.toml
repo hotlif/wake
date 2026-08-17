@@ -21,3 +21,4 @@ wake_docs.workspace = true
 wake_ecma_transform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

@@ -46,10 +46,11 @@ v0.1 聚焦六个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`�
 | 层 | 当前职责 | 禁止承担的职责 |
 | --- | --- | --- |
 | `npm/css` | ESM/CJS 入口、TypeScript 品牌类型、未经编译保护、`cx`、`createVar` 的保守运行时后备、`assignVars` | 解析 CSS、生成 `<style>`、访问 React |
-| `wake_css_in_js` | 按 import 来源和语义符号识别 API，安全静态求值，生成名称，展开受支持的嵌套，产出 JS 替换、CSS 和诊断 | 启动 Node/VM、读取网络、执行被编译模块 |
+| `wake_css` | 共享 CSS CST、节点/声明/错误与源码 span；普通 CSS 的 import、URL、压缩和 Modules 变换 | CSS-in-JS 静态求值、编辑器协议、产品编排 |
+| `wake_css_in_js` | 按 import 来源和语义符号识别 API，安全静态求值；消费共享 CST 展开嵌套并产出 JS 替换、CSS 和诊断 | 启动 Node/VM、读取网络、执行被编译模块、维护另一套 CSS 扫描器 |
 | `wake_bundler` | 扫描依赖、传播静态导出、按模块调用转换、删除已完全消解的 marker import、聚合 CSS | 重复实现 API 语义 |
 | Wake dev/build | 开发时服务重建产物，生产时输出带内容 hash 的 CSS 资源 | 让服务端执行依赖 DOM 的样式逻辑 |
-| `wake_css_language` / `wake_css_lsp` | 编辑器模板发现、虚拟 CSS、提示和诊断协议 | 复制静态求值规则、执行用户模块、接管 TypeScript 符号导航 |
+| `wake_css_language` / `wake_css_lsp` | 编辑器模板发现、虚拟 CSS、消费共享 CST 提供提示和诊断协议 | 复制静态求值规则、维护私有 CSS 解析器、执行用户模块、接管 TypeScript 符号导航 |
 
 编译器以 import 绑定的语义身份识别 marker，而不是搜索字符串 `css`。因此 import alias 可用，
 局部参数或块变量对同名 API 的遮蔽不得被误编译。只有来自 `@crab-dev/css` 的六个名字具有
@@ -65,7 +66,9 @@ CSS-in-JS 入口。
 4. 名称分配先于模板渲染，使同模块及跨模块样式引用可以求值而不形成“名称依赖 CSS 内容、
    CSS 又依赖名称”的环。
 5. 模板静态片段原样保留，插值经安全求值器转为 CSS 文本；失败在 `@crab-dev/css` 下产生
-   构建错误。
+   构建错误。渲染后的 CSS 由 `wake_css::syntax::CssSyntaxTree` 按 `StyleBlock`、`Keyframes` 或
+   `Stylesheet` 入口解析，作用域检查、URL、嵌套、选择器、关键帧和声明边界都复用同一棵树，
+   不存在 regex/字节扫描回退。
 6. `css` 产出作用域类规则，`keyframes` 产出命名动画，`globalStyle` 产出完整全局规则；
    相应表达式替换成字符串或 `void 0`。
 7. 只有某条 import 的全部绑定都被安全消解时，codegen 才能删除该 import。`cx`、动态位置的

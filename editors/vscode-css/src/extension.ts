@@ -31,14 +31,13 @@ export async function activate(extensionContext: vscode.ExtensionContext): Promi
     output,
     vscode.commands.registerCommand('crabCss.restartLanguageServer', restartLanguageServer),
     vscode.commands.registerCommand('crabCss.showOutput', () => output.show(true)),
-    vscode.workspace.onDidOpenTextDocument(() => void startIfNeeded()),
     vscode.workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('crabCss')) {
         void configurationChanged()
       }
     }),
   )
-  await startIfNeeded()
+  await startLanguageServer()
 }
 
 export async function deactivate(): Promise<void> {
@@ -50,22 +49,16 @@ async function configurationChanged(): Promise<void> {
     await stopLanguageServer()
     return
   }
-  await startIfNeeded()
+  await startLanguageServer()
 }
 
 async function restartLanguageServer(): Promise<void> {
   await stopLanguageServer()
-  await startLanguageServer(true)
+  await startLanguageServer()
 }
 
-async function startIfNeeded(): Promise<void> {
+async function startLanguageServer(): Promise<void> {
   if (client || !configuration().get<boolean>('enable', true)) return
-  if (await workspaceUsesCrabCss()) await startLanguageServer(false)
-}
-
-async function startLanguageServer(force: boolean): Promise<void> {
-  if (client || !configuration().get<boolean>('enable', true)) return
-  if (!force && !(await workspaceUsesCrabCss())) return
 
   const executable = serverExecutable(context)
   if (!existsSync(executable.command)) {
@@ -129,29 +122,4 @@ function settings(): object {
     format: { enable: config.get<boolean>('format.enable', true) },
     trace: { server: config.get<string>('trace.server', 'off') },
   }
-}
-
-async function workspaceUsesCrabCss(): Promise<boolean> {
-  if (vscode.workspace.textDocuments.some(document => document.getText().includes('@crab-dev/css'))) {
-    return true
-  }
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    try {
-      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder.uri, 'package.json'))
-      const manifest = JSON.parse(Buffer.from(bytes).toString('utf8')) as Record<string, unknown>
-      if (manifestSectionHasCrabCss(manifest, 'dependencies')
-        || manifestSectionHasCrabCss(manifest, 'devDependencies')
-        || manifestSectionHasCrabCss(manifest, 'peerDependencies')) {
-        return true
-      }
-    } catch {
-      // A missing or incomplete package.json is normal for untitled and non-Node workspaces.
-    }
-  }
-  return false
-}
-
-function manifestSectionHasCrabCss(manifest: Record<string, unknown>, section: string): boolean {
-  const value = manifest[section]
-  return typeof value === 'object' && value !== null && '@crab-dev/css' in value
 }

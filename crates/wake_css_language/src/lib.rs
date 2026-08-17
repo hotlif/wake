@@ -3,8 +3,10 @@
 mod facts;
 mod virtual_document;
 
-use cssparser::{Parser, ParserInput};
 use wake_common::{Diagnostic, Interner, Severity, SourceFile, Span};
+use wake_css::syntax::{
+    CssBlockKind, CssSyntaxContext, CssSyntaxKind, CssSyntaxNode, CssSyntaxTree,
+};
 use wake_css_in_js::value::{Scope, StaticExports, collect_imports, collect_static_exports_with};
 use wake_css_in_js::{CssTemplateKind, discover_css_templates, transform};
 use wake_ecma_ast::SourceType;
@@ -121,6 +123,7 @@ pub struct LanguageDocument {
     interner: Interner,
     parsed: ParseOutput,
     virtual_documents: Vec<VirtualCssDocument>,
+    syntax_trees: Vec<CssSyntaxTree>,
     diagnostics: Vec<LanguageDiagnostic>,
 }
 
@@ -141,9 +144,24 @@ impl LanguageDocument {
             .iter()
             .map(|template| VirtualCssDocument::from_template(&source, template))
             .collect::<Vec<_>>();
+        let syntax_trees = virtual_documents
+            .iter()
+            .map(|document| {
+                let context = match document.kind {
+                    CssTemplateKind::Css => CssSyntaxContext::StyleBlock,
+                    CssTemplateKind::Keyframes => CssSyntaxContext::Keyframes,
+                    CssTemplateKind::GlobalStyle => CssSyntaxContext::Stylesheet,
+                };
+                CssSyntaxTree::parse_with_context(
+                    &document.text,
+                    document.body_virtual_span(),
+                    context,
+                )
+            })
+            .collect::<Vec<_>>();
         let mut diagnostics = parser_diagnostics(&parsed.diagnostics);
-        for document in &virtual_documents {
-            diagnostics.extend(css_diagnostics(&source, document));
+        for (document, tree) in virtual_documents.iter().zip(&syntax_trees) {
+            diagnostics.extend(css_diagnostics(document, tree));
         }
         diagnostics.sort_by_key(|diagnostic| (diagnostic.span.lo, diagnostic.span.hi));
         Self {
@@ -151,6 +169,7 @@ impl LanguageDocument {
             interner,
             parsed,
             virtual_documents,
+            syntax_trees,
             diagnostics,
         }
     }
@@ -197,22 +216,30 @@ impl LanguageDocument {
     }
 
     pub fn completions(&self, host_offset: u32) -> Vec<Completion> {
-        let Some(document) = self
+        let Some((index, document)) = self
             .virtual_documents
             .iter()
-            .find(|document| document.contains_host_offset(host_offset))
+            .enumerate()
+            .find(|(_, document)| document.contains_host_offset(host_offset))
         else {
             return Vec::new();
         };
-        let source = self.source.src();
-        let segment = document
-            .segments
-            .iter()
-            .find(|segment| segment.host.lo <= host_offset && host_offset <= segment.host.hi)
-            .expect("containing segment exists");
-        let before = &source[segment.host.lo as usize..host_offset as usize];
-        let prefix = identifier_prefix(before);
-        if prefix.starts_with('@') {
+        let Some(virtual_offset) = document.host_to_virtual_offset(host_offset) else {
+            return Vec::new();
+        };
+        let tree = &self.syntax_trees[index];
+        let node = tree.node_at_cursor(virtual_offset);
+        let prefix = node
+            .and_then(|node| {
+                document
+                    .text
+                    .get(node.span.lo as usize..virtual_offset as usize)
+            })
+            .unwrap_or("");
+        if matches!(
+            node.map(|node| &node.kind),
+            Some(CssSyntaxKind::AtKeyword(_))
+        ) {
             return facts::css_facts()
                 .at_rules
                 .iter()
@@ -220,16 +247,23 @@ impl LanguageDocument {
                 .map(|value| completion(value, "CSS at-rule", "", CompletionKind::Keyword))
                 .collect();
         }
-        if prefix.starts_with(':') {
+        if node.is_some_and(|node| {
+            matches!(node.kind, CssSyntaxKind::Ident(_))
+                && tree
+                    .previous_significant(node.span)
+                    .is_some_and(|previous| matches!(previous.kind, CssSyntaxKind::Colon))
+        }) {
+            let prefix = format!(":{prefix}");
             return facts::css_facts()
                 .pseudos
                 .iter()
-                .filter(|value| value.starts_with(prefix))
+                .filter(|value| value.starts_with(&prefix))
                 .map(|value| completion(value, "CSS pseudo selector", "", CompletionKind::Keyword))
                 .collect();
         }
-        if let Some(property_name) = value_context_property(before)
-            && let Some(property) = facts::property(property_name)
+        if let Some(declaration) = tree.declaration_at(virtual_offset)
+            && virtual_offset >= declaration.colon_span.hi
+            && let Some(property) = facts::property(&declaration.name)
         {
             return property
                 .values
@@ -259,48 +293,43 @@ impl LanguageDocument {
     }
 
     pub fn hover(&self, host_offset: u32) -> Option<Hover> {
-        let document = self
+        let (index, document) = self
             .virtual_documents
             .iter()
-            .find(|document| document.contains_host_offset(host_offset))?;
-        let segment = document
-            .segments
-            .iter()
-            .find(|segment| segment.host.lo <= host_offset && host_offset <= segment.host.hi)?;
-        let span = word_span(self.source.src(), host_offset, segment.host)?;
-        let word = span.slice(self.source.src());
-        let property_word = word.trim_end_matches(':');
-        if let Some(property) = facts::property(property_word) {
+            .enumerate()
+            .find(|(_, document)| document.contains_host_offset(host_offset))?;
+        let virtual_offset = document.host_to_virtual_offset(host_offset)?;
+        let tree = &self.syntax_trees[index];
+        let node = tree.node_at(virtual_offset)?;
+        let host_span = document.virtual_to_host_span(node.head_span)?;
+        if let Some(declaration) = tree.declaration_with_name_span(node.span)
+            && let Some(property) = facts::property(&declaration.name)
+        {
             return Some(Hover {
-                span: Span::new(span.lo, span.lo + property_word.len() as u32),
+                span: host_span,
                 markdown: format!("**{}**\n\n{}", property.name, property.description),
             });
         }
-        if facts::css_facts()
-            .at_rules
-            .iter()
-            .any(|value| value == word)
-        {
-            return Some(Hover {
-                span,
-                markdown: format!("**{word}** CSS at-rule"),
-            });
-        }
-        if facts::css_facts().pseudos.iter().any(|value| value == word) {
-            return Some(Hover {
-                span,
-                markdown: format!("**{word}** CSS pseudo selector"),
-            });
+        if let CssSyntaxKind::AtKeyword(name) = &node.kind {
+            let word = format!("@{name}");
+            if facts::css_facts()
+                .at_rules
+                .iter()
+                .any(|value| value == &word)
+            {
+                return Some(Hover {
+                    span: host_span,
+                    markdown: format!("**{word}** CSS at-rule"),
+                });
+            }
         }
         None
     }
 
     pub fn semantic_tokens(&self) -> Vec<SemanticToken> {
         let mut tokens = Vec::new();
-        for document in &self.virtual_documents {
-            for segment in &document.segments {
-                tokens.extend(semantic_tokens_in_segment(self.source.src(), segment.host));
-            }
+        for (document, tree) in self.virtual_documents.iter().zip(&self.syntax_trees) {
+            tokens.extend(semantic_tokens(document, tree));
         }
         tokens.sort_by_key(|token| (token.span.lo, token.span.hi));
         tokens
@@ -308,10 +337,8 @@ impl LanguageDocument {
 
     pub fn colors(&self) -> Vec<DocumentColor> {
         let mut colors = Vec::new();
-        for document in &self.virtual_documents {
-            for segment in &document.segments {
-                colors.extend(colors_in_segment(self.source.src(), segment.host));
-            }
+        for (document, tree) in self.virtual_documents.iter().zip(&self.syntax_trees) {
+            colors.extend(document_colors(document, tree));
         }
         colors
     }
@@ -340,25 +367,17 @@ impl LanguageDocument {
 
     pub fn folding_ranges(&self) -> Vec<Span> {
         let mut ranges = Vec::new();
-        for document in &self.virtual_documents {
-            let mut stack = Vec::new();
-            for segment in &document.segments {
-                for (relative, byte) in segment.host.slice(self.source.src()).bytes().enumerate() {
-                    let offset = segment.host.lo + relative as u32;
-                    match byte {
-                        b'{' => stack.push(offset),
-                        b'}' => {
-                            if let Some(start) = stack.pop()
-                                && self.source.location0_utf16(start).0
-                                    < self.source.location0_utf16(offset).0
-                            {
-                                ranges.push(Span::new(start, offset.saturating_add(1)));
-                            }
-                        }
-                        _ => {}
-                    }
+        for (document, tree) in self.virtual_documents.iter().zip(&self.syntax_trees) {
+            tree.visit(|node| {
+                if matches!(node.kind, CssSyntaxKind::Block(CssBlockKind::Curly))
+                    && node.closed
+                    && let Some(span) = document.virtual_to_host_covering_span(node.span)
+                    && self.source.location0_utf16(span.lo).0
+                        < self.source.location0_utf16(span.hi.saturating_sub(1)).0
+                {
+                    ranges.push(span);
                 }
-            }
+            });
         }
         ranges
     }
@@ -372,17 +391,15 @@ impl LanguageDocument {
 
     pub fn format(&self, requested: Option<Span>) -> Vec<TextEdit> {
         let mut edits = Vec::new();
-        for document in &self.virtual_documents {
-            let mut indent = 0_usize;
+        for (document, tree) in self.virtual_documents.iter().zip(&self.syntax_trees) {
             for segment in &document.segments {
                 if requested
                     .is_some_and(|range| range.hi <= segment.host.lo || segment.host.hi <= range.lo)
                 {
-                    update_indent(segment.host.slice(self.source.src()), &mut indent);
                     continue;
                 }
                 let original = segment.host.slice(self.source.src());
-                let replacement = format_literal(original, &mut indent);
+                let replacement = format_literal(original, segment.host, document, tree);
                 if replacement != original && document.edit_is_safe(segment.host) {
                     edits.push(TextEdit {
                         span: segment.host,
@@ -421,78 +438,27 @@ fn map_compiler_diagnostic(diagnostic: &Diagnostic) -> Option<LanguageDiagnostic
     })
 }
 
-fn css_diagnostics(source: &str, document: &VirtualCssDocument) -> Vec<LanguageDiagnostic> {
+fn css_diagnostics(document: &VirtualCssDocument, tree: &CssSyntaxTree) -> Vec<LanguageDiagnostic> {
     let mut diagnostics = Vec::new();
-    let mut input = ParserInput::new(&document.text);
-    let mut parser = Parser::new(&mut input);
-    while parser.next_including_whitespace_and_comments().is_ok() {}
-
-    let mut braces = Vec::new();
-    for segment in &document.segments {
-        let text = segment.host.slice(source);
-        for (relative, byte) in text.bytes().enumerate() {
-            let offset = segment.host.lo + relative as u32;
-            match byte {
-                b'{' => braces.push(offset),
-                b'}' if braces.pop().is_none() => diagnostics.push(LanguageDiagnostic {
-                    span: Span::new(offset, offset + 1),
-                    severity: LanguageSeverity::Error,
-                    code: "CSS_UNEXPECTED_BRACE".to_string(),
-                    message: "Unexpected closing brace".to_string(),
-                }),
-                b'}' => {}
-                _ => {}
-            }
-        }
-        diagnostics.extend(unknown_property_diagnostics(source, segment.host));
-    }
-    for offset in braces {
-        diagnostics.push(LanguageDiagnostic {
-            span: Span::new(offset, offset + 1),
+    diagnostics.extend(tree.errors.iter().filter_map(|error| {
+        Some(LanguageDiagnostic {
+            span: document.virtual_to_host_span(error.span)?,
             severity: LanguageSeverity::Error,
-            code: "CSS_UNCLOSED_BLOCK".to_string(),
-            message: "CSS block is not closed".to_string(),
-        });
-    }
-    diagnostics
-}
-
-fn unknown_property_diagnostics(source: &str, span: Span) -> Vec<LanguageDiagnostic> {
-    let text = span.slice(source);
-    let bytes = text.as_bytes();
-    let mut diagnostics = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !is_ident_byte(bytes[index]) {
-            index += 1;
+            code: error.code.to_string(),
+            message: error.message.to_string(),
+        })
+    }));
+    for declaration in &tree.declarations {
+        if declaration.name.starts_with("--") {
             continue;
         }
-        let start = index;
-        while index < bytes.len() && is_ident_byte(bytes[index]) {
-            index += 1;
-        }
-        let mut next = index;
-        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
-            next += 1;
-        }
-        if next >= bytes.len() || bytes[next] != b':' {
+        let Some(span) = document.virtual_to_host_span(declaration.name_span) else {
             continue;
-        }
-        let previous = text[..start]
-            .bytes()
-            .rev()
-            .find(|byte| !byte.is_ascii_whitespace());
-        if previous.is_some_and(|byte| !matches!(byte, b'{' | b';')) && start != 0 {
-            continue;
-        }
-        let name = &text[start..index];
-        if name.starts_with("--") {
-            continue;
-        }
-        if let Some(property) = facts::property(name) {
-            if property.name != name {
+        };
+        if let Some(property) = facts::property(&declaration.name) {
+            if property.name != declaration.name {
                 diagnostics.push(LanguageDiagnostic {
-                    span: Span::new(span.lo + start as u32, span.lo + index as u32),
+                    span,
                     severity: LanguageSeverity::Warning,
                     code: "CSS_PROPERTY_CASE".to_string(),
                     message: format!("CSS property should be written as `{}`", property.name),
@@ -501,10 +467,10 @@ fn unknown_property_diagnostics(source: &str, span: Span) -> Vec<LanguageDiagnos
             continue;
         }
         diagnostics.push(LanguageDiagnostic {
-            span: Span::new(span.lo + start as u32, span.lo + index as u32),
+            span,
             severity: LanguageSeverity::Warning,
             code: "CSS_UNKNOWN_PROPERTY".to_string(),
-            message: format!("Unknown CSS property `{name}`"),
+            message: format!("Unknown CSS property `{}`", declaration.name),
         });
     }
     diagnostics
@@ -520,156 +486,70 @@ fn completion(label: &str, detail: &str, documentation: &str, kind: CompletionKi
     }
 }
 
-fn identifier_prefix(value: &str) -> &str {
-    let start = value
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| !is_word_char(*ch) && !matches!(ch, ':' | '@'))
-        .map_or(0, |(index, ch)| index + ch.len_utf8());
-    &value[start..]
-}
-
-fn value_context_property(value: &str) -> Option<&str> {
-    let boundary = value.rfind([';', '{', '}']).map_or(0, |index| index + 1);
-    let declaration = &value[boundary..];
-    let colon = declaration.find(':')?;
-    let property = declaration[..colon].trim();
-    (!property.is_empty() && property.bytes().all(is_ident_byte)).then_some(property)
-}
-
-fn word_span(source: &str, offset: u32, bounds: Span) -> Option<Span> {
-    let mut lo = offset.min(bounds.hi) as usize;
-    let mut hi = lo;
-    let lower = bounds.lo as usize;
-    let upper = bounds.hi as usize;
-    while lo > lower && is_word_char(source[..lo].chars().next_back()?) {
-        lo -= source[..lo].chars().next_back()?.len_utf8();
-    }
-    while hi < upper && is_word_char(source[hi..].chars().next()?) {
-        hi += source[hi..].chars().next()?.len_utf8();
-    }
-    (lo < hi).then_some(Span::new(lo as u32, hi as u32))
-}
-
-fn semantic_tokens_in_segment(source: &str, span: Span) -> Vec<SemanticToken> {
-    let text = span.slice(source);
+fn semantic_tokens(document: &VirtualCssDocument, tree: &CssSyntaxTree) -> Vec<SemanticToken> {
     let mut result = Vec::new();
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let start = index;
-        if matches!(bytes[index], b'\'' | b'"') {
-            let quote = bytes[index];
-            index += 1;
-            while index < bytes.len() && bytes[index] != quote {
-                index += if bytes[index] == b'\\' && index + 1 < bytes.len() {
-                    2
+    tree.visit(|node| {
+        let (virtual_span, kind) = match &node.kind {
+            CssSyntaxKind::QuotedString(_) | CssSyntaxKind::Url(_) => {
+                (node.span, SemanticKind::String)
+            }
+            CssSyntaxKind::Number(_)
+            | CssSyntaxKind::Percentage(_)
+            | CssSyntaxKind::Dimension { .. } => (node.span, SemanticKind::Number),
+            CssSyntaxKind::AtKeyword(_) => (node.span, SemanticKind::Keyword),
+            CssSyntaxKind::Function(_) => (
+                Span::new(node.head_span.lo, node.head_span.hi.saturating_sub(1)),
+                SemanticKind::Function,
+            ),
+            CssSyntaxKind::Ident(_) => {
+                let kind = if tree.declaration_with_name_span(node.span).is_some() {
+                    SemanticKind::Property
                 } else {
-                    1
+                    SemanticKind::Keyword
                 };
+                (node.span, kind)
             }
-            index = (index + 1).min(bytes.len());
-            result.push(token(span, start, index, SemanticKind::String));
-        } else if bytes[index].is_ascii_digit() {
-            index += 1;
-            while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b'.') {
-                index += 1;
-            }
-            result.push(token(span, start, index, SemanticKind::Number));
-        } else if bytes[index] == b'@' {
-            index += 1;
-            while index < bytes.len() && is_ident_byte(bytes[index]) {
-                index += 1;
-            }
-            result.push(token(span, start, index, SemanticKind::Keyword));
-        } else if is_ident_byte(bytes[index]) {
-            index += 1;
-            while index < bytes.len() && is_ident_byte(bytes[index]) {
-                index += 1;
-            }
-            let mut next = index;
-            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
-                next += 1;
-            }
-            let kind = if next < bytes.len() && bytes[next] == b'(' {
-                SemanticKind::Function
-            } else if next < bytes.len()
-                && bytes[next] == b':'
-                && facts::property(&text[start..index]).is_some()
-            {
-                SemanticKind::Property
-            } else {
-                SemanticKind::Keyword
-            };
-            result.push(token(span, start, index, kind));
-        } else {
-            index += 1;
+            _ => return,
+        };
+        if let Some(span) = document.virtual_to_host_span(virtual_span) {
+            result.push(SemanticToken { span, kind });
         }
-    }
+    });
     result
 }
 
-fn token(span: Span, start: usize, end: usize, kind: SemanticKind) -> SemanticToken {
-    SemanticToken {
-        span: Span::new(span.lo + start as u32, span.lo + end as u32),
-        kind,
-    }
-}
-
-fn colors_in_segment(source: &str, span: Span) -> Vec<DocumentColor> {
-    let text = span.slice(source);
-    let bytes = text.as_bytes();
+fn document_colors(document: &VirtualCssDocument, tree: &CssSyntaxTree) -> Vec<DocumentColor> {
     let mut colors = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'#' {
-            let start = index;
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_hexdigit() && index - start <= 8 {
-                index += 1;
+    tree.visit(|node| match &node.kind {
+        CssSyntaxKind::Hash(value) | CssSyntaxKind::IdHash(value) => {
+            if let Some((red, green, blue, alpha)) = parse_hex_color(value)
+                && let Some(span) = document.virtual_to_host_span(node.span)
+            {
+                colors.push(document_color(span, red, green, blue, alpha));
             }
-            let digits = &text[start + 1..index];
-            if let Some((red, green, blue, alpha)) = parse_hex_color(digits) {
-                colors.push(document_color(span, start, index, red, green, blue, alpha));
-            }
-            continue;
         }
-        let remaining = &text[index..];
-        let function = ["rgba(", "rgb(", "hsla(", "hsl("].into_iter().find(|name| {
-            remaining.len() >= name.len() && remaining[..name.len()].eq_ignore_ascii_case(name)
-        });
-        if let Some(function) = function
-            && let Some(close) = remaining[function.len()..].find(')')
+        CssSyntaxKind::Function(name)
+            if node.closed
+                && matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "rgb" | "rgba" | "hsl" | "hsla"
+                ) =>
         {
-            let end = index + function.len() + close + 1;
-            let arguments = &text[index + function.len()..end - 1];
-            let parsed = if function.starts_with("rgb") {
-                parse_rgb_color(arguments)
-            } else {
-                parse_hsl_color(arguments)
-            };
-            if let Some((red, green, blue, alpha)) = parsed {
-                colors.push(document_color(span, index, end, red, green, blue, alpha));
+            let parsed = parse_color_function(name, &node.children);
+            if let Some((red, green, blue, alpha)) = parsed
+                && let Some(span) = document.virtual_to_host_span(node.span)
+            {
+                colors.push(document_color(span, red, green, blue, alpha));
             }
-            index = end;
-        } else {
-            index += 1;
         }
-    }
+        _ => {}
+    });
     colors
 }
 
-fn document_color(
-    span: Span,
-    start: usize,
-    end: usize,
-    red: f32,
-    green: f32,
-    blue: f32,
-    alpha: f32,
-) -> DocumentColor {
+fn document_color(span: Span, red: f32, green: f32, blue: f32, alpha: f32) -> DocumentColor {
     DocumentColor {
-        span: Span::new(span.lo + start as u32, span.lo + end as u32),
+        span,
         red,
         green,
         blue,
@@ -677,24 +557,46 @@ fn document_color(
     }
 }
 
-fn color_arguments(value: &str) -> Vec<&str> {
-    value
-        .split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '/'))
-        .filter(|part| !part.is_empty())
-        .collect()
+#[derive(Clone, Copy)]
+enum ColorComponent<'a> {
+    Number(f32),
+    Percentage(f32),
+    Dimension(f32, &'a str),
 }
 
-fn parse_rgb_color(value: &str) -> Option<(f32, f32, f32, f32)> {
-    let values = color_arguments(value);
+fn parse_color_function(name: &str, children: &[CssSyntaxNode]) -> Option<(f32, f32, f32, f32)> {
+    let mut values = Vec::new();
+    for child in children {
+        match &child.kind {
+            CssSyntaxKind::Number(value) => values.push(ColorComponent::Number(*value)),
+            CssSyntaxKind::Percentage(value) => {
+                values.push(ColorComponent::Percentage(*value));
+            }
+            CssSyntaxKind::Dimension { value, unit } => {
+                values.push(ColorComponent::Dimension(*value, unit));
+            }
+            CssSyntaxKind::Whitespace
+            | CssSyntaxKind::Comment
+            | CssSyntaxKind::Comma
+            | CssSyntaxKind::Delim('/') => {}
+            _ => return None,
+        }
+    }
+    if name.eq_ignore_ascii_case("rgb") || name.eq_ignore_ascii_case("rgba") {
+        parse_rgb_color(&values)
+    } else {
+        parse_hsl_color(&values)
+    }
+}
+
+fn parse_rgb_color(values: &[ColorComponent<'_>]) -> Option<(f32, f32, f32, f32)> {
     if !(3..=4).contains(&values.len()) {
         return None;
     }
-    let channel = |part: &str| {
-        if let Some(percent) = part.strip_suffix('%') {
-            Some(percent.parse::<f32>().ok()?.clamp(0.0, 100.0) / 100.0)
-        } else {
-            Some(part.parse::<f32>().ok()?.clamp(0.0, 255.0) / 255.0)
-        }
+    let channel = |part: ColorComponent<'_>| match part {
+        ColorComponent::Percentage(value) => Some(value.clamp(0.0, 1.0)),
+        ColorComponent::Number(value) => Some(value.clamp(0.0, 255.0) / 255.0),
+        ColorComponent::Dimension(_, _) => None,
     };
     Some((
         channel(values[0])?,
@@ -702,37 +604,32 @@ fn parse_rgb_color(value: &str) -> Option<(f32, f32, f32, f32)> {
         channel(values[2])?,
         values
             .get(3)
-            .map_or(Some(1.0), |value| parse_alpha(value))?,
+            .map_or(Some(1.0), |value| parse_alpha(*value))?,
     ))
 }
 
-fn parse_hsl_color(value: &str) -> Option<(f32, f32, f32, f32)> {
-    let values = color_arguments(value);
+fn parse_hsl_color(values: &[ColorComponent<'_>]) -> Option<(f32, f32, f32, f32)> {
     if !(3..=4).contains(&values.len()) {
         return None;
     }
-    let hue = values[0]
-        .strip_suffix("deg")
-        .unwrap_or(values[0])
-        .parse::<f32>()
-        .ok()?
-        .rem_euclid(360.0)
+    let hue = match values[0] {
+        ColorComponent::Number(value) => value,
+        ColorComponent::Dimension(value, unit) if unit.eq_ignore_ascii_case("deg") => value,
+        _ => return None,
+    }
+    .rem_euclid(360.0)
         / 360.0;
-    let saturation = values[1]
-        .strip_suffix('%')?
-        .parse::<f32>()
-        .ok()?
-        .clamp(0.0, 100.0)
-        / 100.0;
-    let lightness = values[2]
-        .strip_suffix('%')?
-        .parse::<f32>()
-        .ok()?
-        .clamp(0.0, 100.0)
-        / 100.0;
+    let ColorComponent::Percentage(saturation) = values[1] else {
+        return None;
+    };
+    let ColorComponent::Percentage(lightness) = values[2] else {
+        return None;
+    };
+    let saturation = saturation.clamp(0.0, 1.0);
+    let lightness = lightness.clamp(0.0, 1.0);
     let alpha = values
         .get(3)
-        .map_or(Some(1.0), |value| parse_alpha(value))?;
+        .map_or(Some(1.0), |value| parse_alpha(*value))?;
     if saturation == 0.0 {
         return Some((lightness, lightness, lightness, alpha));
     }
@@ -767,11 +664,12 @@ fn parse_hsl_color(value: &str) -> Option<(f32, f32, f32, f32)> {
     ))
 }
 
-fn parse_alpha(value: &str) -> Option<f32> {
-    if let Some(percent) = value.strip_suffix('%') {
-        Some(percent.parse::<f32>().ok()?.clamp(0.0, 100.0) / 100.0)
-    } else {
-        Some(value.parse::<f32>().ok()?.clamp(0.0, 1.0))
+fn parse_alpha(value: ColorComponent<'_>) -> Option<f32> {
+    match value {
+        ColorComponent::Percentage(value) | ColorComponent::Number(value) => {
+            Some(value.clamp(0.0, 1.0))
+        }
+        ColorComponent::Dimension(_, _) => None,
     }
 }
 
@@ -811,8 +709,14 @@ fn parse_hex_color(value: &str) -> Option<(f32, f32, f32, f32)> {
     }
 }
 
-fn format_literal(source: &str, indent: &mut usize) -> String {
+fn format_literal(
+    source: &str,
+    host_span: Span,
+    document: &VirtualCssDocument,
+    tree: &CssSyntaxTree,
+) -> String {
     let mut output = String::with_capacity(source.len());
+    let mut line_offset = 0usize;
     for line in source.split_inclusive('\n') {
         let (content, newline) = line.strip_suffix("\r\n").map_or_else(
             || {
@@ -824,40 +728,20 @@ fn format_literal(source: &str, indent: &mut usize) -> String {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             output.push_str(newline);
+            line_offset += line.len();
             continue;
         }
-        if trimmed.starts_with('}') {
-            *indent = indent.saturating_sub(1);
-        }
-        output.push_str(&"  ".repeat(*indent));
+        let content_offset = content.len().saturating_sub(content.trim_start().len());
+        let host_offset = host_span.lo + (line_offset + content_offset) as u32;
+        let indent = document
+            .host_to_virtual_offset(host_offset)
+            .map_or(0, |offset| tree.curly_depth_at(offset));
+        output.push_str(&"  ".repeat(indent));
         output.push_str(trimmed);
         output.push_str(newline);
-        update_indent_line(trimmed, indent);
+        line_offset += line.len();
     }
     output
-}
-
-fn update_indent(source: &str, indent: &mut usize) {
-    for line in source.lines() {
-        update_indent_line(line.trim(), indent);
-    }
-}
-
-fn update_indent_line(line: &str, indent: &mut usize) {
-    let opens = line.bytes().filter(|byte| *byte == b'{').count();
-    let closes = line.bytes().filter(|byte| *byte == b'}').count();
-    let leading_close = usize::from(line.starts_with('}'));
-    *indent = indent
-        .saturating_add(opens)
-        .saturating_sub(closes.saturating_sub(leading_close));
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-}
-
-fn is_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '@')
 }
 
 #[cfg(test)]

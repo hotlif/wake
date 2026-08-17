@@ -241,18 +241,22 @@ struct Prepared {
 /// `url()` 改写必须在这里、按**模块粒度**做：[`wake_css::CssUrl`] 的偏移是相对单个模块的
 /// `code` 的，一旦进了 `split_css_imports`（前置外部 `@import`）或跨模块聚合/压缩，偏移即失效。
 fn prepare_css(fs: &dyn FileSystem, path: &Path, text: &str, opts: &LoadOptions) -> Prepared {
-    // CSS Modules：先做类名作用域化，再在其**输出**上分析 url。
-    // （`transform_modules` 不记录 url 位置，故对其结果重跑一次 `analyze`——此时 `@import`
-    // 已被移除，`analyze` 对余下文本是恒等的，偏移因而对齐 `code`。）
-    let (imports, base_code, exports) = if is_css_module_path(path) {
+    let (imports, analyzed, exports) = if is_css_module_path(path) {
         let seed = path_to_slash(path);
         let m = wake_css::transform_modules(text, &seed);
-        (m.imports, m.code, Some(m.exports))
+        (
+            m.imports,
+            wake_css::CssModule {
+                imports: Vec::new(),
+                urls: m.urls,
+                code: m.code,
+            },
+            Some(m.exports),
+        )
     } else {
         let m = wake_css::analyze(text);
-        (m.imports, m.code, None)
+        (m.imports.clone(), m, None)
     };
-    let analyzed = wake_css::analyze(&base_code);
     let mut assets = Vec::new();
     let code = analyzed.rewrite_urls(|u| rewrite_one_css_url(fs, path, u, opts, &mut assets));
     Prepared {
@@ -531,7 +535,7 @@ fn raw_to_js_module(text: &str) -> String {
 }
 
 /// 路径是否为二进制静态资源（图片/字体/媒体）。
-fn is_asset_path(path: &Path) -> bool {
+pub(crate) fn is_asset_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some(

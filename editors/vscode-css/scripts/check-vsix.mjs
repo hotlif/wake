@@ -4,7 +4,11 @@ import { pathToFileURL } from 'node:url'
 export function inspectVsix(path, target) {
   const archive = readFileSync(path)
   const entries = centralDirectoryEntries(archive)
-  const serverEntries = entries.filter(entry => /\/server\/wake-css-language-server(?:\.exe)?$/.test(entry))
+  const serverEntries = entries.filter(
+    entry =>
+      entry.endsWith('/server/wake-css-language-server') ||
+      entry.endsWith('/server/wake-css-language-server.exe'),
+  )
   if (serverEntries.length !== 1) {
     throw new Error(`expected exactly one language server, found ${serverEntries.length}`)
   }
@@ -17,10 +21,27 @@ export function inspectVsix(path, target) {
       throw new Error(`VSIX contains forbidden development path ${forbidden}`)
     }
   }
+  const removedBundlerName = 'es' + 'build'
+  for (const forbidden of [removedBundlerName, `@${removedBundlerName}/`]) {
+    if (entries.some(entry => entry.toLowerCase().includes(forbidden))) {
+      throw new Error(`VSIX contains forbidden build dependency ${forbidden}`)
+    }
+  }
+  for (const forbidden of [
+    'extension/wake',
+    'extension/wake.exe',
+    'extension/syntaxes/crab-css.injection.json',
+    'extension/index.html',
+    'extension/dist/index.html',
+    'extension/dist/manifest.json',
+  ]) {
+    if (entries.includes(forbidden)) {
+      throw new Error(`VSIX contains forbidden build artifact ${forbidden}`)
+    }
+  }
   for (const required of [
     'extension/package.json',
     'extension/dist/extension.js',
-    'extension/syntaxes/crab-css.injection.json',
     'extension/THIRD_PARTY_NOTICES.md',
   ]) {
     if (!entries.includes(required)) throw new Error(`VSIX is missing ${required}`)

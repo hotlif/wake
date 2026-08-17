@@ -22,6 +22,22 @@ pub use session::{BuildOptions, BuildRequest, BuildSession};
 // 供 CLI 组装别名而无需直接依赖 wake_resolver。
 pub use wake_resolver::{PnpDependencyFallback, ResolveOptions};
 
+/// Bundle 宿主平台。浏览器保持历史行为；Node 自动外置内置模块并启用 Node 条件导出。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BuildPlatform {
+    #[default]
+    Browser,
+    Node,
+}
+
+/// 入口模块的公开输出格式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ModuleFormat {
+    #[default]
+    Iife,
+    CommonJs,
+}
+
 /// 把宿主或外来平台路径转换成产物使用的正斜杠形式，并移除 Windows verbatim 前缀。
 ///
 /// 不能依赖 Path::components 解析其它平台的路径：Unix 会把 Windows 反斜杠视为普通字符。
@@ -292,6 +308,12 @@ __wake_require__.metaUrl = function () {
 /// mini runtime 后半（入口执行之后，导出到 module.exports 或全局）。
 pub(crate) const POSTLUDE: &str = r#"if (typeof module !== "undefined" && module.exports) module.exports = __wake_entry__;
 else root.__wake_entry__ = __wake_entry__;
+return __wake_entry__;
+})(typeof globalThis !== "undefined" ? globalThis : this);
+"#;
+
+/// 严格 CommonJS 后半：不写浏览器全局 fallback。
+pub(crate) const POSTLUDE_COMMONJS: &str = r#"module.exports = __wake_entry__;
 return __wake_entry__;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 "#;

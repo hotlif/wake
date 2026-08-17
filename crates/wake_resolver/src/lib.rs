@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use wake_common::{FileSystem, FxHashMap, fs::normalize};
 
 pub mod pnp;
@@ -51,7 +52,21 @@ pub struct ResolvedModule {
     pub identity: ModuleIdentity,
 }
 
-type ResolutionCache = FxHashMap<PathBuf, FxHashMap<String, Option<PathBuf>>>;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ResolutionKey {
+    specifier: String,
+    conditions: Vec<String>,
+    main_fields: Vec<String>,
+}
+
+/// 一次解析的完整包入口语义。条件是活动集合；条件对象自身的声明顺序决定优先级。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResolutionProfile {
+    pub conditions: Vec<String>,
+    pub main_fields: Vec<String>,
+}
+
+type ResolutionCache = FxHashMap<PathBuf, FxHashMap<ResolutionKey, Option<PathBuf>>>;
 type PackageRootCache = FxHashMap<PathBuf, FxHashMap<String, Arc<[PathBuf]>>>;
 
 /// 一条只在 Yarn PnP 依赖边界错误时生效的定向 fallback。
@@ -73,7 +88,7 @@ pub struct ResolveOptions {
     pub extensions: Vec<String>,
     /// `package.json` 入口字段优先级（现代优先 `module` 再 `main`）。
     pub main_fields: Vec<String>,
-    /// `package.json#exports` 条件优先级。`default` 始终作为最终回退。
+    /// `package.json#exports` 活动条件。条件对象中的声明顺序决定优先级。
     pub conditions: Vec<String>,
     /// 路径别名 `(前缀, 绝对目标)`（如 `@`→`<root>/src`、`@@`→`<root>`、`@@@/{ns}`→扫描产物）。
     /// 匹配规则：说明符 == 前缀 或以 `前缀/` 开头；命中最长前缀，重写后走文件/目录解析。
@@ -106,11 +121,130 @@ impl Default for ResolveOptions {
 
 #[derive(Clone, Debug, Default)]
 struct PackageConfig {
-    entry: Option<String>,
-    exports: Option<serde_json::Value>,
+    string_fields: FxHashMap<String, String>,
+    exports: Option<OrderedJsonValue>,
     name: Option<String>,
     version: Option<String>,
     has_peer_dependencies: bool,
+}
+
+impl PackageConfig {
+    fn entry(&self, main_fields: &[String]) -> Option<String> {
+        main_fields
+            .iter()
+            .find_map(|field| self.string_fields.get(field).cloned())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum OrderedJsonValue {
+    Null,
+    Bool,
+    Number,
+    String(String),
+    Array(Vec<OrderedJsonValue>),
+    Object(Vec<(String, OrderedJsonValue)>),
+}
+
+impl OrderedJsonValue {
+    fn get(&self, key: &str) -> Option<&Self> {
+        match self {
+            Self::Object(entries) => entries
+                .iter()
+                .find_map(|(candidate, value)| (candidate == key).then_some(value)),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn as_object(&self) -> Option<&[(String, OrderedJsonValue)]> {
+        match self {
+            Self::Object(entries) => Some(entries),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OrderedValueVisitor;
+
+        impl<'de> Visitor<'de> for OrderedValueVisitor {
+            type Value = OrderedJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::Null)
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::Bool)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::Number)
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::Number)
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::Number)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(OrderedJsonValue::String(value))
+            }
+
+            fn visit_seq<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                while let Some(value) = values.next_element()? {
+                    items.push(value);
+                }
+                Ok(OrderedJsonValue::Array(items))
+            }
+
+            fn visit_map<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some((key, value)) = values.next_entry()? {
+                    entries.push((key, value));
+                }
+                Ok(OrderedJsonValue::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(OrderedValueVisitor)
+    }
 }
 
 /// 解析失败。
@@ -196,12 +330,52 @@ impl Resolver {
 
     /// 从 `from_dir` 解析 `specifier` 到一个规范文件路径。
     pub fn resolve(&self, specifier: &str, from_dir: &Path) -> Result<PathBuf, ResolveError> {
+        self.resolve_with_profile(
+            specifier,
+            from_dir,
+            &ResolutionProfile {
+                conditions: self.options.conditions.clone(),
+                main_fields: self.options.main_fields.clone(),
+            },
+        )
+    }
+
+    /// 使用调用方提供的条件集合解析模块。条件属于解析身份的一部分，Node/Browser 与
+    /// import/require 不得共享成功或失败缓存。
+    pub fn resolve_with_conditions(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        conditions: &[String],
+    ) -> Result<PathBuf, ResolveError> {
+        self.resolve_with_profile(
+            specifier,
+            from_dir,
+            &ResolutionProfile {
+                conditions: conditions.to_vec(),
+                main_fields: self.options.main_fields.clone(),
+            },
+        )
+    }
+
+    /// 使用完整的包解析 profile。profile 的全部字段进入成功与失败缓存身份。
+    pub fn resolve_with_profile(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        profile: &ResolutionProfile,
+    ) -> Result<PathBuf, ResolveError> {
+        let key = ResolutionKey {
+            specifier: specifier.to_string(),
+            conditions: profile.conditions.clone(),
+            main_fields: profile.main_fields.clone(),
+        };
         let cached = self
             .cache
             .lock()
             .unwrap()
             .get(from_dir)
-            .and_then(|by_specifier| by_specifier.get(specifier))
+            .and_then(|by_specifier| by_specifier.get(&key))
             .cloned();
         // 先取 cache（锁瞬间释放：`.cloned()` 拷出 Option 后 guard 即析构）——**关键**是别把锁
         // 持到 `resolve_uncached` 的 FS 探测期间，否则并行退化为串行。
@@ -210,13 +384,13 @@ impl Resolver {
         }
         // 未命中：昂贵的 FS 探测在锁外进行（并行的收益全在这里）。两个线程同 key 竞争时都会算一遍
         // 再各自 insert——幂等无害，换取零锁争用。
-        let resolved = self.resolve_uncached(specifier, from_dir);
+        let resolved = self.resolve_uncached(specifier, from_dir, profile);
         self.cache
             .lock()
             .unwrap()
             .entry(from_dir.to_path_buf())
             .or_default()
-            .insert(specifier.to_owned(), resolved.clone());
+            .insert(key, resolved.clone());
         resolved.ok_or_else(|| self.err(specifier, from_dir))
     }
 
@@ -227,6 +401,30 @@ impl Resolver {
         from_dir: &Path,
     ) -> Result<ResolvedModule, ResolveError> {
         let path = self.resolve(specifier, from_dir)?;
+        let identity = self.module_identity(&path);
+        Ok(ResolvedModule { path, identity })
+    }
+
+    /// 条件感知的逻辑模块解析。
+    pub fn resolve_module_with_conditions(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        conditions: &[String],
+    ) -> Result<ResolvedModule, ResolveError> {
+        let path = self.resolve_with_conditions(specifier, from_dir, conditions)?;
+        let identity = self.module_identity(&path);
+        Ok(ResolvedModule { path, identity })
+    }
+
+    /// 完整 profile 感知的逻辑模块解析。
+    pub fn resolve_module_with_profile(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        profile: &ResolutionProfile,
+    ) -> Result<ResolvedModule, ResolveError> {
+        let path = self.resolve_with_profile(specifier, from_dir, profile)?;
         let identity = self.module_identity(&path);
         Ok(ResolvedModule { path, identity })
     }
@@ -288,7 +486,12 @@ impl Resolver {
         }
     }
 
-    fn resolve_uncached(&self, specifier: &str, from_dir: &Path) -> Option<PathBuf> {
+    fn resolve_uncached(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        profile: &ResolutionProfile,
+    ) -> Option<PathBuf> {
         // 别名优先：命中则重写为绝对目标后走文件/目录解析（扩展名补全 / index / package.json）。
         if let Some(aliased) = self.apply_alias(specifier) {
             return self.resolve_as_file_or_dir(&aliased);
@@ -311,9 +514,9 @@ impl Resolver {
                 }
                 Err(_) => return None,
             };
-            self.resolve_package(&package_root, subpath)
+            self.resolve_package(&package_root, subpath, profile)
         } else {
-            self.resolve_node_modules(specifier, from_dir)
+            self.resolve_node_modules(specifier, from_dir, profile)
         }
     }
 
@@ -411,7 +614,12 @@ impl Resolver {
         self.resolve_as_file(&path.join("index"))
     }
 
-    fn resolve_package(&self, package_root: &Path, subpath: &str) -> Option<PathBuf> {
+    fn resolve_package(
+        &self,
+        package_root: &Path,
+        subpath: &str,
+        profile: &ResolutionProfile,
+    ) -> Option<PathBuf> {
         if !self.fs.is_dir(package_root) {
             return None;
         }
@@ -425,12 +633,12 @@ impl Resolver {
                 } else {
                     format!("./{subpath}")
                 };
-                let target = resolve_exports_target(&exports, &key, &self.options.conditions)?;
+                let target = resolve_exports_target(&exports, &key, &profile.conditions)?;
                 let relative = target.strip_prefix("./")?;
                 return self.resolve_as_file_or_dir(&normalize(&package_root.join(relative)));
             }
             if subpath.is_empty()
-                && let Some(entry) = config.entry
+                && let Some(entry) = config.entry(&profile.main_fields)
             {
                 return self.resolve_as_file_or_dir(&normalize(&package_root.join(entry)));
             }
@@ -443,10 +651,15 @@ impl Resolver {
         self.resolve_as_file_or_dir(&target)
     }
 
-    fn resolve_node_modules(&self, specifier: &str, from_dir: &Path) -> Option<PathBuf> {
+    fn resolve_node_modules(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        profile: &ResolutionProfile,
+    ) -> Option<PathBuf> {
         let (pkg_name, subpath) = split_package_ref(specifier);
         for pkg_dir in self.package_roots(pkg_name, from_dir).iter() {
-            if let Some(resolved) = self.resolve_package(pkg_dir, subpath) {
+            if let Some(resolved) = self.resolve_package(pkg_dir, subpath, profile) {
                 return Some(resolved);
             }
         }
@@ -544,7 +757,8 @@ impl Resolver {
 
     /// 读 package.json 的入口字段（按 main_fields 优先级）。
     fn read_pkg_entry(&self, pkg: &Path) -> Option<String> {
-        self.read_package_config(pkg)?.entry
+        self.read_package_config(pkg)?
+            .entry(&self.options.main_fields)
     }
 
     fn read_package_config(&self, pkg: &Path) -> Option<PackageConfig> {
@@ -552,26 +766,28 @@ impl Resolver {
             return config.clone();
         }
         let config = self.fs.read_to_string(pkg).ok().and_then(|text| {
-            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-            let entry = self.options.main_fields.iter().find_map(|field| {
-                json.get(field)
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            });
+            let json: OrderedJsonValue = serde_json::from_str(&text).ok()?;
+            let root = json.as_object()?;
+            let string_fields = root
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect();
             Some(PackageConfig {
-                entry,
+                string_fields,
                 exports: json.get("exports").cloned(),
                 name: json
                     .get("name")
-                    .and_then(|value| value.as_str())
+                    .and_then(OrderedJsonValue::as_str)
                     .map(str::to_owned),
                 version: json
                     .get("version")
-                    .and_then(|value| value.as_str())
+                    .and_then(OrderedJsonValue::as_str)
                     .map(str::to_owned),
                 has_peer_dependencies: json
                     .get("peerDependencies")
-                    .and_then(|value| value.as_object())
+                    .and_then(OrderedJsonValue::as_object)
                     .is_some_and(|peers| !peers.is_empty()),
             })
         });
@@ -584,17 +800,20 @@ impl Resolver {
 }
 
 fn resolve_exports_target(
-    exports: &serde_json::Value,
+    exports: &OrderedJsonValue,
     key: &str,
     conditions: &[String],
 ) -> Option<String> {
     let Some(map) = exports.as_object() else {
         return (key == ".").then(|| resolve_conditional_target(exports, conditions))?;
     };
-    if !map.keys().any(|candidate| candidate.starts_with('.')) {
+    if !map.iter().any(|(candidate, _)| candidate.starts_with('.')) {
         return (key == ".").then(|| resolve_conditional_target(exports, conditions))?;
     }
-    if let Some(value) = map.get(key) {
+    if let Some(value) = map
+        .iter()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value))
+    {
         return resolve_conditional_target(value, conditions);
     }
 
@@ -603,35 +822,31 @@ fn resolve_exports_target(
         .filter_map(|(pattern, value)| {
             let (prefix, suffix) = pattern.split_once('*')?;
             let capture = key.strip_prefix(prefix)?.strip_suffix(suffix)?;
-            Some((prefix.len() + suffix.len(), capture, value))
+            Some((prefix.len(), pattern.len(), capture, value))
         })
         .collect::<Vec<_>>();
-    patterns.sort_by_key(|item| std::cmp::Reverse(item.0));
-    let (_, capture, value) = patterns.into_iter().next()?;
+    // Node's PATTERN_KEY_COMPARE prefers the longer base before the `*`, then the longer key.
+    // Comparing only total literal length can select a broader pattern with a long suffix.
+    patterns.sort_by_key(|item| std::cmp::Reverse((item.0, item.1)));
+    let (_, _, capture, value) = patterns.into_iter().next()?;
     resolve_conditional_target(value, conditions).map(|target| target.replace('*', capture))
 }
 
-fn resolve_conditional_target(value: &serde_json::Value, conditions: &[String]) -> Option<String> {
+fn resolve_conditional_target(value: &OrderedJsonValue, conditions: &[String]) -> Option<String> {
     match value {
-        serde_json::Value::String(target) => Some(target.clone()),
-        serde_json::Value::Array(targets) => targets
+        OrderedJsonValue::String(target) => Some(target.clone()),
+        OrderedJsonValue::Array(targets) => targets
             .iter()
             .find_map(|target| resolve_conditional_target(target, conditions)),
-        serde_json::Value::Object(targets) => {
-            for condition in conditions {
-                if let Some(target) = targets.get(condition)
+        OrderedJsonValue::Object(targets) => {
+            for (condition, target) in targets {
+                if (condition == "default" || conditions.iter().any(|active| active == condition))
                     && let Some(resolved) = resolve_conditional_target(target, conditions)
                 {
                     return Some(resolved);
                 }
             }
-            if !conditions.iter().any(|condition| condition == "default") {
-                targets
-                    .get("default")
-                    .and_then(|target| resolve_conditional_target(target, conditions))
-            } else {
-                None
-            }
+            None
         }
         _ => None,
     }
@@ -756,6 +971,15 @@ mod tests {
             r.resolve("react", Path::new("src")).unwrap(),
             PathBuf::from("node_modules/react/esm/react.js")
         );
+        let node = ResolutionProfile {
+            conditions: vec!["node".into(), "require".into()],
+            main_fields: vec!["main".into(), "module".into()],
+        };
+        assert_eq!(
+            r.resolve_with_profile("react", Path::new("src"), &node)
+                .unwrap(),
+            PathBuf::from("node_modules/react/index.js")
+        );
     }
 
     #[test]
@@ -874,6 +1098,83 @@ mod tests {
         assert_eq!(
             r.resolve("modern/icons/add", Path::new("src")).unwrap(),
             PathBuf::from("node_modules/modern/esm/icons/add.js")
+        );
+    }
+
+    #[test]
+    fn package_export_patterns_prefer_the_longer_base_before_total_key_length() {
+        let r = resolver(&[
+            (
+                "node_modules/patterns/package.json",
+                r#"{"exports":{"./a*def":"./broad/*.js","./abc*":"./specific/*.js"}}"#,
+            ),
+            ("node_modules/patterns/broad/bc.js", "// broad"),
+            ("node_modules/patterns/specific/def.js", "// specific"),
+        ]);
+
+        assert_eq!(
+            r.resolve("patterns/abcdef", Path::new("src")).unwrap(),
+            PathBuf::from("node_modules/patterns/specific/def.js")
+        );
+    }
+
+    #[test]
+    fn conditional_exports_cache_isolated_by_platform_and_edge_kind() {
+        let r = resolver(&[
+            (
+                "node_modules/dual/package.json",
+                r#"{"exports":{".":{"node":{"import":"./node-import.js","require":"./node-require.js"},"browser":{"import":"./browser-import.js","require":"./browser-require.js"},"default":"./default.js"}}}"#,
+            ),
+            ("node_modules/dual/node-import.js", "// node import"),
+            ("node_modules/dual/node-require.js", "// node require"),
+            ("node_modules/dual/browser-import.js", "// browser import"),
+            ("node_modules/dual/browser-require.js", "// browser require"),
+            ("node_modules/dual/default.js", "// default"),
+        ]);
+        let node_import = ["node", "import", "default"].map(str::to_string);
+        let node_require = ["node", "require", "default"].map(str::to_string);
+        let browser_import = ["browser", "import", "module", "default"].map(str::to_string);
+        let browser_require = ["browser", "require", "default"].map(str::to_string);
+        assert_eq!(
+            r.resolve_with_conditions("dual", Path::new("src"), &node_import)
+                .unwrap(),
+            PathBuf::from("node_modules/dual/node-import.js")
+        );
+        assert_eq!(
+            r.resolve_with_conditions("dual", Path::new("src"), &node_require)
+                .unwrap(),
+            PathBuf::from("node_modules/dual/node-require.js")
+        );
+        assert_eq!(
+            r.resolve_with_conditions("dual", Path::new("src"), &browser_import)
+                .unwrap(),
+            PathBuf::from("node_modules/dual/browser-import.js")
+        );
+        assert_eq!(
+            r.resolve_with_conditions("dual", Path::new("src"), &browser_require)
+                .unwrap(),
+            PathBuf::from("node_modules/dual/browser-require.js")
+        );
+    }
+
+    #[test]
+    fn conditional_exports_follow_package_declaration_order() {
+        let r = resolver(&[
+            (
+                "node_modules/ordered/package.json",
+                r#"{"exports":{".":{"default":"./default.js","node":"./node.js"}}}"#,
+            ),
+            ("node_modules/ordered/default.js", "// default first"),
+            ("node_modules/ordered/node.js", "// node second"),
+        ]);
+        let node = ResolutionProfile {
+            conditions: vec!["node".into(), "import".into()],
+            main_fields: vec!["main".into(), "module".into()],
+        };
+        assert_eq!(
+            r.resolve_with_profile("ordered", Path::new("src"), &node)
+                .unwrap(),
+            PathBuf::from("node_modules/ordered/default.js")
         );
     }
 

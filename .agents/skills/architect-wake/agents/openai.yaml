@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wake 架构演进"
+  short_description: "从目标架构出发，持续设计、验证并收敛 Wake 工程系统"
+  default_prompt: "使用 $architect-wake 从目标架构开始，验证假设、持续修订，并完成必要的破坏性重构。"
+
+policy:
+  allow_implicit_invocation: true
