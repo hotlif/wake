@@ -200,13 +200,14 @@ jobs:
         run: |
           highest="$(readelf --version-info '${{ matrix.binary }}' | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
           test "$(printf '%s\n' "$highest" 'GLIBC_2.28' | sort -V | tail -1)" = 'GLIBC_2.28'
-      - run: >-
-          npm run package:vsix --prefix editors/vscode-css --
-          --target ${{ matrix.vsce_target }}
-          --binary ${{ github.workspace }}/${{ matrix.binary }}
-          --out ${{ github.workspace }}/artifacts
-        env:
-          WAKE_BIN: ${{ github.workspace }}/${{ matrix.wake_binary }}
+      - name: Package Linux VSIX from container paths
+        shell: bash
+        run: |
+          export WAKE_BIN="$PWD/${{ matrix.wake_binary }}"
+          npm run package:vsix --prefix editors/vscode-css -- \
+            --target ${{ matrix.vsce_target }} \
+            --binary "$PWD/${{ matrix.binary }}" \
+            --out "$PWD/artifacts"
       - uses: actions/upload-artifact@v4
         with:
           name: crab-css-${{ matrix.vsce_target }}-${{ needs.verify.outputs.version }}

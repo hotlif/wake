@@ -90,6 +90,9 @@ for (const required of [
   'actions/attest-build-provenance@v3',
   'gh release',
   'needs.verify.outputs.version',
+  'export WAKE_BIN="$PWD/${{ matrix.wake_binary }}"',
+  '--binary "$PWD/${{ matrix.binary }}"',
+  '--out "$PWD/artifacts"',
 ]) {
   if (!vscodeWorkflow.includes(required)) {
     throw new Error(`vscode-css.yml is missing release contract marker ${required}`)
