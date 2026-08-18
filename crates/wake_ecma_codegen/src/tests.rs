@@ -1152,6 +1152,37 @@ fn shake_parenthesizes_preserved_object_and_class_initializers() {
 }
 
 #[test]
+fn minified_bigint_suffix_remains_part_of_the_literal_token() {
+    let interner = Interner::new();
+    let parsed = parse(
+        "export const zero = 0n; export const one = 1n;",
+        &interner,
+        SourceType::Module,
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let js = parsed.module.with_ast(|program| {
+        crate::codegen_module_shaken_mangled(
+            program,
+            &interner,
+            &NoLinker,
+            None,
+            &[],
+            true,
+            None,
+            None,
+            false,
+            false,
+        )
+    });
+    assert!(js.contains("0n"), "{js}");
+    assert!(js.contains("1n"), "{js}");
+    assert!(!js.contains("0 n") && !js.contains("1 n"), "{js}");
+
+    let reparsed = parse(&js, &Interner::new(), SourceType::Script);
+    assert!(!reparsed.has_errors(), "{js}: {:?}", reparsed.diagnostics);
+}
+
+#[test]
 fn shake_drops_unused_default() {
     let src = "export default function App() { return 1; }\nexport const keep = 2;";
     let js = shake(src, Some(&["keep"]));

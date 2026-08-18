@@ -3148,7 +3148,13 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
             Expression::NullLiteral(_) => self.push("null"),
             Expression::BigIntLiteral(b) => {
                 self.push_name(b.raw);
-                self.push("n");
+                // `n` is part of the BigInt token, not an adjacent identifier. Going through
+                // `push()` would invoke the minified token-boundary guard and emit invalid
+                // JavaScript such as `0 n`.
+                self.out.push('n');
+                if let Some(sm) = &mut self.smap {
+                    sm.col += 1;
+                }
             }
             Expression::RegExpLiteral(r) => {
                 self.push("/");
