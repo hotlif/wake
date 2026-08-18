@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.18
+
+- Added native component-library ESM, CommonJS, declaration, and extracted CSS builds through `wake library build` and `buildLibrary()` without changing application builds.
+- Added strict Rust-native token and docgen generators through `wake library token`, `wake library docgen`, `generateCssToken()`, and `generateDocgen()`.
+- Added `defineTokens()` to `@crab-dev/css` for deeply immutable design tokens that can be safely evaluated across module boundaries.
+- Added stable package-prefixed CSS class names, PnP-aware static analysis, transactional library outputs, and fail-closed public type diagnostics.
+
 ## 0.1.17
 
 - Added AST-driven CSS parsing shared by compilation, CSS-in-JS nesting, editor diagnostics, and semantic highlighting, removing the legacy TextMate injection grammar.

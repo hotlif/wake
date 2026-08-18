@@ -176,6 +176,90 @@ struct RawBundleOptions {
     cache: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawGenerateCssTokenOptions {
+    cwd: Option<String>,
+    config_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawGenerateDocgenOptions {
+    cwd: Option<String>,
+    entry: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawLibraryBuildOptions {
+    cwd: Option<String>,
+    entry: Option<String>,
+}
+
+impl RawGenerateCssTokenOptions {
+    fn parse(value: Option<String>) -> Result<Self, WakeError> {
+        value
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()))
+            })
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    fn into_app(self) -> wake_app::GenerateCssTokenOptions {
+        wake_app::GenerateCssTokenOptions {
+            project: wake_app::ProjectOptions {
+                cwd: self.cwd.map(PathBuf::from),
+                config_path: None,
+            },
+            config_path: self.config_path.map(PathBuf::from),
+        }
+    }
+}
+
+impl RawGenerateDocgenOptions {
+    fn parse(value: Option<String>) -> Result<Self, WakeError> {
+        value
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()))
+            })
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    fn into_app(self) -> wake_app::GenerateDocgenOptions {
+        wake_app::GenerateDocgenOptions {
+            project: wake_app::ProjectOptions {
+                cwd: self.cwd.map(PathBuf::from),
+                config_path: None,
+            },
+            entry: self.entry.map(PathBuf::from),
+        }
+    }
+}
+
+impl RawLibraryBuildOptions {
+    fn parse(value: Option<String>) -> Result<Self, WakeError> {
+        value
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()))
+            })
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    fn into_app(self) -> wake_app::LibraryBuildOptions {
+        wake_app::LibraryBuildOptions {
+            project: wake_app::ProjectOptions {
+                cwd: self.cwd.map(PathBuf::from),
+                config_path: None,
+            },
+            entry: self.entry.map(PathBuf::from),
+        }
+    }
+}
+
 impl RawBundleOptions {
     fn parse(value: Option<String>) -> Result<Self, WakeError> {
         value
@@ -262,6 +346,69 @@ pub fn native_bundle(
         JsonTask::new(move || {
             let options = RawBundleOptions::parse(options_json)?.into_app()?;
             let result = wake_app::bundle(options, &cancellation)?;
+            serde_json::to_value(result)
+                .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
+        }),
+        signal,
+    )
+}
+
+#[napi(js_name = "generateCssToken")]
+pub fn native_generate_css_token(
+    options_json: Option<String>,
+    signal: Option<AbortSignal>,
+) -> AsyncTask<JsonTask> {
+    let cancellation = CancellationToken::default();
+    if let Some(signal) = &signal {
+        let cancellation = cancellation.clone();
+        signal.on_abort(move || cancellation.cancel());
+    }
+    async_json(
+        JsonTask::new(move || {
+            let options = RawGenerateCssTokenOptions::parse(options_json)?.into_app();
+            let result = wake_app::generate_css_token(options, &cancellation)?;
+            serde_json::to_value(result)
+                .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
+        }),
+        signal,
+    )
+}
+
+#[napi(js_name = "generateDocgen")]
+pub fn native_generate_docgen(
+    options_json: Option<String>,
+    signal: Option<AbortSignal>,
+) -> AsyncTask<JsonTask> {
+    let cancellation = CancellationToken::default();
+    if let Some(signal) = &signal {
+        let cancellation = cancellation.clone();
+        signal.on_abort(move || cancellation.cancel());
+    }
+    async_json(
+        JsonTask::new(move || {
+            let options = RawGenerateDocgenOptions::parse(options_json)?.into_app();
+            let result = wake_app::generate_docgen(options, &cancellation)?;
+            serde_json::to_value(result)
+                .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
+        }),
+        signal,
+    )
+}
+
+#[napi(js_name = "buildLibrary")]
+pub fn native_build_library(
+    options_json: Option<String>,
+    signal: Option<AbortSignal>,
+) -> AsyncTask<JsonTask> {
+    let cancellation = CancellationToken::default();
+    if let Some(signal) = &signal {
+        let cancellation = cancellation.clone();
+        signal.on_abort(move || cancellation.cancel());
+    }
+    async_json(
+        JsonTask::new(move || {
+            let options = RawLibraryBuildOptions::parse(options_json)?.into_app();
+            let result = wake_app::build_library(options, &cancellation)?;
             serde_json::to_value(result)
                 .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
         }),

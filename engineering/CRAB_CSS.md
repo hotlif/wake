@@ -21,8 +21,9 @@
 
 ## 2. v0.1 范围与非目标
 
-v0.1 聚焦六个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`、`createVar` 和
-`assignVars`。它们足以覆盖局部规则、类名组合、动画、全局规则和由组件状态驱动的值。
+v0.1 聚焦七个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`、`createVar`、
+`assignVars` 和 `defineTokens`。它们足以覆盖局部规则、类名组合、动画、全局规则、由组件状态
+驱动的值，以及显式不可变的跨模块 design token。
 
 下列能力不是 v0.1 已实现功能：
 
@@ -45,7 +46,7 @@ v0.1 聚焦六个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`�
 
 | 层 | 当前职责 | 禁止承担的职责 |
 | --- | --- | --- |
-| `npm/css` | ESM/CJS 入口、TypeScript 品牌类型、未经编译保护、`cx`、`createVar` 的保守运行时后备、`assignVars` | 解析 CSS、生成 `<style>`、访问 React |
+| `npm/css` | ESM/CJS 入口、TypeScript 品牌类型、未经编译保护、`cx`、`createVar` 的保守运行时后备、`assignVars`、`defineTokens` 的深冻结 | 解析 CSS、生成 `<style>`、访问 React |
 | `wake_css` | 共享 CSS CST、节点/声明/错误与源码 span；普通 CSS 的 import、URL、压缩和 Modules 变换 | CSS-in-JS 静态求值、编辑器协议、产品编排 |
 | `wake_css_in_js` | 按 import 来源和语义符号识别 API，安全静态求值；消费共享 CST 展开嵌套并产出 JS 替换、CSS 和诊断 | 启动 Node/VM、读取网络、执行被编译模块、维护另一套 CSS 扫描器 |
 | `wake_bundler` | 扫描依赖、传播静态导出、按模块调用转换、删除已完全消解的 marker import、聚合 CSS | 重复实现 API 语义 |
@@ -53,7 +54,7 @@ v0.1 聚焦六个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`�
 | `wake_css_language` / `wake_css_lsp` | 编辑器模板发现、虚拟 CSS、消费共享 CST 提供提示和诊断协议 | 复制静态求值规则、维护私有 CSS 解析器、执行用户模块、接管 TypeScript 符号导航 |
 
 编译器以 import 绑定的语义身份识别 marker，而不是搜索字符串 `css`。因此 import alias 可用，
-局部参数或块变量对同名 API 的遮蔽不得被误编译。只有来自 `@crab-dev/css` 的六个名字具有
+局部参数或块变量对同名 API 的遮蔽不得被误编译。只有来自 `@crab-dev/css` 的七个名字具有
 完整 v0.1 语义；仓库中的 JavaScript、TypeScript、示例、fixture 与发布依赖不得使用其他
 CSS-in-JS 入口。
 
@@ -163,6 +164,17 @@ function assignVars(
 `{ "--crab-...": value }`，可直接传给 React 的 `style` 或写入其他框架的 style 绑定。它只做
 数据转换，不触碰 DOM，不注入规则，也不持有全局主题状态。
 
+### 4.7 `defineTokens`
+
+```ts
+function defineTokens<const T extends TokenValue>(value: T): DeepReadonlyToken<T>
+```
+
+`defineTokens` 为跨模块结构化 token 建立显式不可变身份。只有从 `@crab-dev/css` 语义导入、
+直接初始化模块顶层 `const` 的调用会被编译器识别；参数必须能由 allowlist 静态求值。TypeScript
+返回深只读类型，npm 运行时在不访问 getter、不执行用户函数的前提下深冻结同一个对象图。
+普通对象/数组不获得该身份，跨 ESM 插值仍按不安全共享值拒绝。
+
 ## 5. 安全静态求值
 
 ### 5.1 允许集合
@@ -176,7 +188,7 @@ function assignVars(
 - 数字的一元正负、算术表达式，以及至少一侧为字符串时的 `+` 拼接；
 - 前面已求值的顶层简单绑定；
 - 通过静态 import/export 传播的上述值；
-- 编译器明确登记的内建 marker，例如规范形态的顶层 `createVar()`。
+- 编译器明确登记的内建 marker，例如规范形态的顶层 `createVar()` 和 `defineTokens()`。
 
 对象属性到 CSS 声明的兼容转换属于迁移能力，不扩大 JavaScript 求值范围。所有输出保持输入
 属性顺序；哈希表迭代顺序不得泄漏进 CSS。
@@ -192,9 +204,10 @@ function assignVars(
 4. 任何非 `@crab-dev/css` 入口都不属于产品契约；不得通过 warning、静默丢弃声明或运行时
    降级把不受支持的入口伪装成成功构建。
 
-对象/数组只有在直接成员读取且未逃逸时才可冻结；别名、函数参数、return、spread、写入以及
-消费模块中的修改都会使对应值变为未知。Crab v0.1 只跨 ESM 边界传播 primitive/class/keyframes/
-CSS variable 名，不传播共享对象或数组；这避免兄弟 importer mutation 造成静默旧值。模板内相对 `url()` 也 fail closed，因为当前独立 CSS
+普通对象/数组只有在模块内直接成员读取且未逃逸时才可静态使用；别名、函数参数、return、
+spread、写入以及消费模块中的修改都会使对应值变为未知。跨 ESM 边界只传播 primitive、
+class、keyframes、CSS variable 名，以及由规范 `defineTokens()` 建立的深冻结结构；这避免兄弟
+importer mutation 造成静默旧值。模板内相对 `url()` 也 fail closed，因为当前独立 CSS
 聚合尚未把 URL 依赖交给 asset loader；应暂时移入普通 `.css` 文件。
 
 此模型的安全结论是“构建 CSS 时不执行项目 JavaScript”，不是“任意恶意仓库都可以无限资源
@@ -276,7 +289,7 @@ Linaria，而以下差异可以通过仓库测试复现：
 
 ### M0 — npm 契约（v0.1）
 
-- ESM、CJS 与声明文件导出完全相同的六个 API；
+- ESM、CJS 与声明文件导出完全相同的七个 API；
 - `cx` 对字符串、falsy、对象和至少 32 层嵌套数组保持顺序，ESM/CJS 结果一致；
 - `createVar` 返回合法 `var(--...)`，`assignVars` 正确剥壳并拒绝非法 key/非有限数字；
 - 直接调用 `css`、`keyframes`、`globalStyle` 都抛同一错误码和 Wake 配置指引；
@@ -284,7 +297,7 @@ Linaria，而以下差异可以通过仓库测试复现：
 
 ### M1 — 安全编译核心（v0.1）
 
-- 六个 API 的 import alias、局部遮蔽、ESM 导入删除/保留各有单元测试；
+- 七个 API 的 import alias、局部遮蔽、ESM 导入删除/保留各有单元测试；
 - `css`、`keyframes`、`globalStyle` 在 dev 与 prod fixture 中得到预期 CSS 和 JS 替换；
 - 顶层 `createVar` 在 CSS 插值、跨模块导出和 `assignVars` 中得到同一个引用；
 - 至少覆盖字面量、对象/数组、成员访问、算术、模板与三层静态 import 传播；

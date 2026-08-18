@@ -3,8 +3,11 @@
 import { readFile } from 'node:fs/promises'
 import {
   build,
+  buildLibrary,
   buildDocs,
   bundle,
+  generateCssToken,
+  generateDocgen,
   startDevServer,
   startDocsDevServer,
   version,
@@ -20,6 +23,7 @@ import {
   formatBuildResult,
   formatError,
   formatFinalSummary,
+  formatGeneratorResult,
   formatServerReady,
   observeServer,
   setDashboardEndpoint,
@@ -37,6 +41,7 @@ Usage:
   wake bundle <entry> --outfile FILE [--platform browser|node] [--format iife|cjs]
               [--target node20] [--external PACKAGE] [--minify] [--sourcemap]
               [--cache] [--config FILE]
+  wake library token [project] [--config token.toml]
   wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open]
   wake docs build [root] [--mode site|components] [--outdir DIR] [--base PATH]
   wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
@@ -299,6 +304,27 @@ export async function runCli(argv = process.argv.slice(2)) {
     if (args.length) throw usageError(`unknown bundle arguments: ${args.join(' ')}`)
     printLines(formatBanner(ui, 'bundle', version()))
     printResult(ui, await bundle(options), 'Bundled')
+    return 0
+  }
+
+  if (command === 'library') {
+    ensureStaticMode(uiMode)
+    const action = args.shift()
+    if (action !== 'build' && action !== 'token' && action !== 'docgen') {
+      throw usageError('library requires build, token, or docgen')
+    }
+    const options = action === 'token'
+      ? { configPath: takeOption(args, '--config', true) }
+      : { entry: takeOption(args, '--entry', true) }
+    if (args[0]) options.cwd = args.shift()
+    if (args.length) throw usageError(`unknown library ${action} arguments: ${args.join(' ')}`)
+    printLines(formatBanner(ui, `library ${action}`, version()))
+    if (action === 'build') {
+      printResult(ui, await buildLibrary(options), 'Built library')
+      return 0
+    }
+    const result = action === 'token' ? await generateCssToken(options) : await generateDocgen(options)
+    printLines(formatGeneratorResult(ui, result, action === 'token' ? 'Tokens generated' : 'Docgen generated'))
     return 0
   }
 

@@ -40,6 +40,95 @@ pub struct InheritedGroup {
     pub type_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComponentApiDoc {
+    pub display_name: String,
+    pub description: String,
+    pub api: ApiDoc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationFile {
+    pub source: PathBuf,
+    pub file_name: PathBuf,
+    pub code: String,
+}
+
+/// Emit a dependency-free declaration module set for a library entry.
+///
+/// Type syntax is copied from the source rather than reconstructed from Wake's runtime AST. Local
+/// module specifiers are redirected into the declaration output tree. Public values must carry an
+/// explicit annotation; Wake deliberately fails instead of inventing `any`.
+pub fn emit_library_declarations(
+    project_root: impl AsRef<Path>,
+    entry: impl AsRef<Path>,
+) -> Result<Vec<DeclarationFile>, ApiError> {
+    let root = canonical(project_root.as_ref())?;
+    let entry = if entry.as_ref().is_absolute() {
+        canonical(entry.as_ref())?
+    } else {
+        canonical(&root.join(entry.as_ref()))?
+    };
+    if !entry.starts_with(&root) {
+        return Err(ApiError::InvalidSource(
+            entry,
+            "library declaration entry escapes the project root".to_string(),
+        ));
+    }
+
+    let mut pending = vec![entry.clone()];
+    let mut sources = BTreeMap::new();
+    while let Some(path) = pending.pop() {
+        if sources.contains_key(&path) {
+            continue;
+        }
+        let source = read(&path)?;
+        for specifier in declaration_module_specifiers(&source, path == entry) {
+            if specifier.starts_with('.') {
+                let target = resolve_local_import(&path, &specifier)?;
+                if !target.starts_with(&root) {
+                    return Err(ApiError::InvalidSource(
+                        path.clone(),
+                        format!(
+                            "local declaration dependency `{specifier}` escapes the project root"
+                        ),
+                    ));
+                }
+                pending.push(target);
+            }
+        }
+        sources.insert(path, source);
+    }
+
+    let mut output_paths = BTreeMap::new();
+    for path in sources.keys() {
+        let output = if path == &entry {
+            PathBuf::from("index.d.ts")
+        } else {
+            let relative = path.strip_prefix(&root).map_err(|_| {
+                ApiError::InvalidSource(path.clone(), "source escaped project root".to_string())
+            })?;
+            let mut output = PathBuf::from("_wake").join(relative);
+            output.set_extension("d.ts");
+            output
+        };
+        output_paths.insert(path.clone(), output);
+    }
+
+    let mut files = Vec::with_capacity(sources.len());
+    for (path, source) in sources {
+        let current_output = &output_paths[&path];
+        let code = emit_declaration_module(&path, &source, current_output, &output_paths)?;
+        files.push(DeclarationFile {
+            source: path.clone(),
+            file_name: current_output.clone(),
+            code,
+        });
+    }
+    files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    Ok(files)
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     Io(PathBuf, String),
@@ -153,6 +242,146 @@ pub fn extract_demo_props(source: impl AsRef<Path>) -> Result<Option<ApiDoc>, Ap
         inherited: resolved.inherited,
         warnings: resolved.warnings,
     }))
+}
+
+/// Extract the public props shape of a default-exported React component.
+///
+/// This follows the explicit, fail-closed forms used by Crab components: `FC<Props>`, a typed
+/// function/arrow parameter, or `forwardRef<Ref, Props>`. Missing public annotations are errors;
+/// this function never invents `any`.
+pub fn extract_component_api(source: impl AsRef<Path>) -> Result<ComponentApiDoc, ApiError> {
+    let source_path = canonical(source.as_ref())?;
+    let source_text = read(&source_path)?;
+    let (display_name, declaration_offset) =
+        default_component_name(&source_text).ok_or_else(|| {
+            ApiError::InvalidSource(
+                source_path.clone(),
+                "cannot identify the default-exported component".to_string(),
+            )
+        })?;
+    let expression = component_props_expression(&source_text, &display_name).ok_or_else(|| {
+        ApiError::InvalidSource(
+            source_path.clone(),
+            format!("component `{display_name}` needs an explicit public props annotation"),
+        )
+    })?;
+
+    let imports = parse_imports(&source_text);
+    let mut resolver = Resolver::default();
+    let mut resolved = Resolved::default();
+    resolver.merge_expression(
+        &source_path,
+        &imports,
+        &expression,
+        &mut Vec::new(),
+        &mut resolved,
+    )?;
+    let defaults = infer_defaults(&source_text, &display_name);
+    for prop in &mut resolved.props {
+        if prop.default_value.is_none() {
+            prop.default_value = defaults.get(&prop.name).cloned();
+        }
+    }
+    resolved.props.sort_by(|left, right| {
+        right
+            .required
+            .cmp(&left.required)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    deduplicate(&mut resolved);
+    let description = preceding_jsdoc(&source_text, declaration_offset).description;
+    Ok(ComponentApiDoc {
+        display_name,
+        description: if description.is_empty() {
+            resolved.description.clone()
+        } else {
+            description
+        },
+        api: ApiDoc {
+            symbol: expression,
+            source: source_path.to_string_lossy().into_owned(),
+            description: resolved.description,
+            props: resolved.props,
+            inherited: resolved.inherited,
+            warnings: resolved.warnings,
+        },
+    })
+}
+
+fn default_component_name(source: &str) -> Option<(String, usize)> {
+    let function = Regex::new(
+        r"(?m)^\s*export\s+default\s+(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+    )
+    .expect("valid default function regex");
+    if let Some(captures) = function.captures(source) {
+        let matched = captures.get(0)?;
+        return Some((captures.get(1)?.as_str().to_string(), matched.start()));
+    }
+    let named = Regex::new(r"(?m)^\s*export\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*;?")
+        .expect("valid default component regex");
+    if let Some(captures) = named.captures(source) {
+        let name = captures.get(1)?.as_str().to_string();
+        let declaration = Regex::new(&format!(
+            r"(?m)^\s*(?:export\s+)?(?:const|let|var|function|class)\s+{}\b",
+            regex::escape(&name)
+        ))
+        .expect("valid component declaration regex")
+        .find(source)
+        .map_or_else(|| captures.get(0).unwrap().start(), |found| found.start());
+        return Some((name, declaration));
+    }
+    None
+}
+
+fn component_props_expression(source: &str, component: &str) -> Option<String> {
+    let annotated = Regex::new(&format!(
+        r"(?s)(?:const|let|var)\s+{}\s*:\s*(?:React\.)?(?:FC|FunctionComponent)\s*<",
+        regex::escape(component)
+    ))
+    .expect("valid component annotation regex");
+    if let Some(found) = annotated.find(source) {
+        let open = found.end() - 1;
+        let close = find_matching(source, open, '<', '>')?;
+        return Some(source[open + 1..close].trim().to_string());
+    }
+
+    let forward_ref = Regex::new(&format!(
+        r"(?s)(?:const|let|var)\s+{}(?:\s*:[^=;]+)?\s*=\s*(?:React\.)?forwardRef\s*<",
+        regex::escape(component)
+    ))
+    .expect("valid forwardRef regex");
+    if let Some(found) = forward_ref.find(source) {
+        let open = found.end() - 1;
+        let close = find_matching(source, open, '<', '>')?;
+        let arguments = split_top_level(&source[open + 1..close], ',');
+        if arguments.len() >= 2 {
+            return Some(arguments[1].trim().to_string());
+        }
+    }
+
+    let function = Regex::new(&format!(
+        r"(?s)(?:export\s+)?(?:async\s+)?function\s+{}\s*(?:<[^{{}};]*>)?\s*\(",
+        regex::escape(component)
+    ))
+    .expect("valid named function regex");
+    let parameter = if let Some(found) = function.find(source) {
+        let open = found.end() - 1;
+        let close = find_matching(source, open, '(', ')')?;
+        first_parameter(&source[open + 1..close])
+    } else {
+        let binding = Regex::new(&format!(
+            r"(?s)(?:const|let|var)\s+{}(?:\s*:[^=;]+)?\s*=\s*(?:async\s+)?(?:<[^;{{}}]*>\s*)?\(",
+            regex::escape(component)
+        ))
+        .expect("valid component binding regex");
+        let found = binding.find(source)?;
+        let open = found.end() - 1;
+        let close = find_matching(source, open, '(', ')')?;
+        first_parameter(&source[open + 1..close])
+    }?;
+    let colon = find_top_level(parameter, ':')?;
+    let expression = strip_parameter_initializer(parameter[colon + 1..].trim());
+    (!expression.is_empty()).then(|| expression.to_string())
 }
 
 fn default_export_parameter(source: &str) -> Option<&str> {
@@ -598,7 +827,7 @@ fn apply_utility(name: &str, props: &mut Vec<ApiProp>, keys: &[String]) {
 
 fn infer_defaults(source: &str, component: &str) -> BTreeMap<String, String> {
     let regex = Regex::new(&format!(
-        r"(?s)(?:function\s+{}|const\s+{}\s*=\s*)[^{{=]*\(\s*\{{",
+        r"(?s)(?:function\s+{}|const\s+{}(?:\s*:[^=;]+)?\s*=\s*)[^{{=]*\(\s*\{{",
         regex::escape(component),
         regex::escape(component)
     ))
@@ -692,9 +921,14 @@ fn resolve_local_import(path: &Path, specifier: &str) -> Result<PathBuf, ApiErro
         .unwrap_or_else(|| Path::new("."))
         .join(specifier);
     let mut candidates = vec![base.clone()];
-    if base.extension().is_some() {
-        let stem = base.with_extension("");
-        candidates.extend(["ts", "tsx", "d.ts"].map(|ext| stem.with_extension(ext)));
+    if let Some(extension) = base.extension().and_then(|value| value.to_str()) {
+        let source_base = if matches!(extension, "js" | "jsx" | "mjs" | "cjs") {
+            base.with_extension("")
+        } else {
+            base.clone()
+        };
+        candidates
+            .extend([".ts", ".tsx", ".d.ts"].map(|suffix| append_path_text(&source_base, suffix)));
     } else {
         candidates.extend(["ts", "tsx", "d.ts"].map(|ext| base.with_extension(ext)));
         candidates.extend(["index.ts", "index.tsx", "index.d.ts"].map(|name| base.join(name)));
@@ -704,6 +938,12 @@ fn resolve_local_import(path: &Path, specifier: &str) -> Result<PathBuf, ApiErro
         .find(|candidate| candidate.is_file())
         .map(|candidate| fs::canonicalize(&candidate).unwrap_or(candidate))
         .ok_or_else(|| ApiError::Io(base, format!("cannot resolve local import `{specifier}`")))
+}
+
+fn append_path_text(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn read(path: &Path) -> Result<String, ApiError> {
@@ -868,6 +1108,497 @@ fn strip_parens(mut value: &str) -> &str {
     }
 }
 
+fn declaration_module_specifiers(source: &str, is_entry: bool) -> Vec<String> {
+    let regex = Regex::new(
+        r#"(?m)^\s*(?:import(?:[\s\S]*?\sfrom\s*)?|export(?:[\s\S]*?\sfrom\s*))["']([^"']+)["']\s*;"#,
+    )
+    .expect("valid module specifier regex");
+    regex
+        .captures_iter(source)
+        .filter_map(|captures| {
+            let statement = captures.get(0)?.as_str().trim_start();
+            let declaration_edge = is_entry
+                || statement.starts_with("export")
+                || statement.starts_with("import type")
+                || statement.contains("{ type ")
+                || statement.contains("{type ");
+            declaration_edge.then(|| captures[1].to_string())
+        })
+        .collect()
+}
+
+fn emit_declaration_module(
+    path: &Path,
+    source: &str,
+    current_output: &Path,
+    output_paths: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<String, ApiError> {
+    let default_name = Regex::new(r"(?m)^\s*export\s+default\s+([A-Za-z_$][\w$]*)\s*;")
+        .expect("valid default export regex")
+        .captures(source)
+        .map(|captures| captures[1].to_string());
+    let mut statements = BTreeMap::<usize, (usize, String)>::new();
+
+    let module_statement = Regex::new(
+        r#"(?m)^\s*(?:(?:import(?:[\s\S]*?\sfrom\s*)?)|(?:export(?:[\s\S]*?\sfrom\s*)))["']([^"']+)["']\s*;"#,
+    )
+    .expect("valid module statement regex");
+    for captures in module_statement.captures_iter(source) {
+        let whole = captures.get(0).expect("whole module statement");
+        let specifier = &captures[1];
+        let mut text = whole.as_str().trim().to_string();
+        if specifier.starts_with('.') {
+            let target = resolve_local_import(path, specifier)?;
+            let Some(target_output) = output_paths.get(&target) else {
+                continue;
+            };
+            let rewritten = relative_module_specifier(current_output, target_output);
+            text = text.replacen(specifier, &rewritten, 1);
+        }
+        statements.insert(whole.start(), (whole.end(), text));
+    }
+
+    let declaration = Regex::new(
+        r"(?m)^\s*(?:(?:export|declare)\s+)*(?:abstract\s+)?(interface|type|enum|namespace)\s+[A-Za-z_$][\w$]*",
+    )
+    .expect("valid declaration regex");
+    for found in declaration.find_iter(source) {
+        let text = found.as_str();
+        let end = if text.contains("type ") {
+            find_statement_end(source, found.end())
+        } else {
+            let open = source[found.end()..]
+                .find('{')
+                .map(|offset| found.end() + offset)
+                .ok_or_else(|| {
+                    ApiError::InvalidSource(
+                        path.to_path_buf(),
+                        format!("type declaration at byte {} has no body", found.start()),
+                    )
+                })?;
+            find_matching(source, open, '{', '}')
+                .map(|close| close + 1)
+                .ok_or_else(|| {
+                    ApiError::InvalidSource(
+                        path.to_path_buf(),
+                        format!(
+                            "type declaration at byte {} has no closing brace",
+                            found.start()
+                        ),
+                    )
+                })?
+        };
+        statements.insert(
+            found.start(),
+            (end, source[found.start()..end].trim().to_string()),
+        );
+    }
+
+    let function = Regex::new(
+        r"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*(?:\s*<[^>{}]*>)?\s*\(",
+    )
+    .expect("valid function regex");
+    for found in function.find_iter(source) {
+        let open = source[..found.end()]
+            .rfind('(')
+            .expect("function has opening paren");
+        let close = find_matching(source, open, '(', ')').ok_or_else(|| {
+            ApiError::InvalidSource(
+                path.to_path_buf(),
+                "function parameter list is incomplete".to_string(),
+            )
+        })?;
+        let body = find_function_body(source, close + 1).ok_or_else(|| {
+            ApiError::InvalidSource(
+                path.to_path_buf(),
+                "function declaration has no body".to_string(),
+            )
+        })?;
+        let body_end = find_matching(source, body, '{', '}').ok_or_else(|| {
+            ApiError::InvalidSource(
+                path.to_path_buf(),
+                "function body is incomplete".to_string(),
+            )
+        })?;
+        let between = source[close + 1..body].trim();
+        let mut signature = source[found.start()..=close].trim().to_string();
+        signature = signature
+            .replace("export default async function", "export default function")
+            .replace("export async function", "export function");
+        if signature.starts_with("async function") {
+            signature = signature.replacen("async function", "declare function", 1);
+        } else if signature.starts_with("function") {
+            signature.insert_str(0, "declare ");
+        }
+        if between.starts_with(':') {
+            signature.push(' ');
+            signature.push_str(between);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("tsx") {
+            signature.push_str(": import(\"react\").JSX.Element");
+        } else {
+            return Err(ApiError::InvalidSource(
+                path.to_path_buf(),
+                format!(
+                    "public function at byte {} needs an explicit return type",
+                    found.start()
+                ),
+            ));
+        }
+        signature.push(';');
+        statements.insert(found.start(), (body_end + 1, signature));
+    }
+
+    let variable = Regex::new(
+        r"(?m)^\s*(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*",
+    )
+    .expect("valid variable regex");
+    for captures in variable.captures_iter(source) {
+        let whole = captures.get(0).expect("whole variable declaration");
+        let name = &captures[1];
+        let exported = whole.as_str().contains("export ") || default_name.as_deref() == Some(name);
+        if !exported {
+            continue;
+        }
+        let end = find_statement_end(source, whole.end());
+        let tail = &source[whole.end()..end];
+        let Some(equal) = find_variable_assignment(tail) else {
+            continue;
+        };
+        let before = tail[..equal].trim();
+        let modifier = if whole.as_str().contains("export ") {
+            "export "
+        } else {
+            ""
+        };
+        let declaration_type = if let Some(annotation) = before.strip_prefix(':') {
+            annotation.trim().to_string()
+        } else if path.extension().and_then(|value| value.to_str()) == Some("tsx") {
+            infer_public_value_type(&tail[equal + 1..], true).ok_or_else(|| {
+                ApiError::InvalidSource(
+                    path.to_path_buf(),
+                    format!("public value `{name}` needs an explicit type annotation"),
+                )
+            })?
+        } else if let Some(inferred) = infer_public_value_type(&tail[equal + 1..], false) {
+            inferred
+        } else {
+            return Err(ApiError::InvalidSource(
+                path.to_path_buf(),
+                format!("public value `{name}` needs an explicit type annotation"),
+            ));
+        };
+        statements.insert(
+            whole.start(),
+            (
+                end,
+                format!("{modifier}declare const {name}: {declaration_type};"),
+            ),
+        );
+    }
+
+    let plain_export = Regex::new(
+        r"(?m)^\s*export\s+(?:type\s+)?\{[^}]*\}\s*;|^\s*export\s+default\s+[A-Za-z_$][\w$]*\s*;",
+    )
+    .expect("valid plain export regex");
+    for found in plain_export.find_iter(source) {
+        statements
+            .entry(found.start())
+            .or_insert_with(|| (found.end(), found.as_str().trim().to_string()));
+    }
+
+    let mut code = String::new();
+    for (_, (_, statement)) in statements {
+        code.push_str(&statement);
+        code.push('\n');
+    }
+    if code.is_empty() {
+        code.push_str("export {};\n");
+    }
+    Ok(code)
+}
+
+fn find_function_body(source: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut angle = 0u32;
+    for (offset, ch) in source[start..].char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '<' => angle += 1,
+            '>' => angle = angle.saturating_sub(1),
+            '{' if angle == 0 => return Some(start + offset),
+            ';' if angle == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn infer_arrow_type(initializer: &str, allow_jsx_return: bool) -> Option<String> {
+    let initializer = initializer.trim();
+    let (initializer, is_async) = initializer
+        .strip_prefix("async ")
+        .map_or((initializer, false), |value| (value, true));
+    let arrow = find_top_level_arrow(initializer)?;
+    let left = initializer[..arrow].trim();
+    let open = left.find('(')?;
+    let close = find_matching(left, open, '(', ')')?;
+    let parameters = &left[open..=close];
+    if split_top_level(&parameters[1..parameters.len() - 1], ',')
+        .iter()
+        .any(|parameter| !parameter.trim().is_empty() && find_top_level(parameter, ':').is_none())
+    {
+        return None;
+    }
+    let generics = left[..open].trim();
+    let explicit_return = left[close + 1..].trim().strip_prefix(':').map(str::trim);
+    if explicit_return.is_none() && !allow_jsx_return {
+        return None;
+    }
+    let return_type = explicit_return.map_or_else(
+        || {
+            if is_async {
+                "Promise<import(\"react\").JSX.Element>".to_string()
+            } else {
+                "import(\"react\").JSX.Element".to_string()
+            }
+        },
+        ToString::to_string,
+    );
+    Some(format!("{generics}{parameters} => {return_type}"))
+}
+
+fn infer_public_value_type(initializer: &str, allow_jsx: bool) -> Option<String> {
+    let initializer = initializer.trim().trim_end_matches(';').trim();
+    if let Some(inferred) = infer_arrow_type(initializer, allow_jsx) {
+        return Some(inferred);
+    }
+    if let Some(rest) = initializer.strip_prefix("createContext<") {
+        let close = find_matching(initializer, "createContext".len(), '<', '>')?;
+        let type_text = initializer["createContext<".len()..close].trim();
+        if !type_text.is_empty() && rest.contains('>') {
+            return Some(format!("import(\"react\").Context<{type_text}>"));
+        }
+    }
+    if initializer.starts_with("defineTokens(") && initializer.ends_with(')') {
+        return infer_static_object_type(
+            initializer["defineTokens(".len()..initializer.len() - 1].trim(),
+        );
+    }
+    if let Some(value_type) = infer_static_value_type(initializer) {
+        return Some(value_type);
+    }
+    if let Some(question) = find_top_level(initializer, '?')
+        && let Some(colon_offset) = find_top_level(&initializer[question + 1..], ':')
+    {
+        let truthy = initializer[question + 1..question + 1 + colon_offset].trim();
+        let falsy = initializer[question + 1 + colon_offset + 1..].trim();
+        if [truthy, falsy].iter().all(|branch| {
+            !branch.is_empty()
+                && branch.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '$' | '.')
+                })
+        }) {
+            return Some(format!("typeof {truthy} | typeof {falsy}"));
+        }
+    }
+    if !initializer.is_empty()
+        && initializer.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '$')
+                || (index > 0 && character == '.')
+        })
+    {
+        return Some(format!("typeof {initializer}"));
+    }
+    infer_static_object_type(initializer)
+}
+
+fn infer_static_value_type(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (value, constant) = value
+        .strip_suffix("as const")
+        .map_or((value, false), |value| (value.trim(), true));
+    if (value.starts_with('\'') && value.ends_with('\''))
+        || (value.starts_with('"') && value.ends_with('"'))
+        || value == "true"
+        || value == "false"
+        || value.parse::<f64>().is_ok()
+    {
+        return Some(value.to_string());
+    }
+    if value.starts_with('[') && value.ends_with(']') {
+        let comment = Regex::new(r"(?ms)//[^\r\n]*|/\*.*?\*/").expect("valid comment regex");
+        let body = comment.replace_all(&value[1..value.len() - 1], "");
+        let members = split_top_level(&body, ',')
+            .into_iter()
+            .filter(|member| !member.trim().is_empty())
+            .map(|member| infer_static_value_type(member.trim()))
+            .collect::<Option<Vec<_>>>()?;
+        if constant {
+            return Some(format!("readonly [{}]", members.join(", ")));
+        }
+        let mut unique = BTreeSet::new();
+        for member in members {
+            unique.insert(match member.as_str() {
+                "true" | "false" => "boolean".to_string(),
+                value if value.parse::<f64>().is_ok() => "number".to_string(),
+                value
+                    if (value.starts_with('\'') && value.ends_with('\''))
+                        || (value.starts_with('"') && value.ends_with('"')) =>
+                {
+                    "string".to_string()
+                }
+                value => value.to_string(),
+            });
+        }
+        return Some(format!(
+            "Array<{}>",
+            unique.into_iter().collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    None
+}
+
+fn infer_static_object_type(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.strip_suffix("as const").unwrap_or(value).trim();
+    if !value.starts_with('{') || !value.ends_with('}') {
+        return None;
+    }
+    let body = &value[1..value.len() - 1];
+    let mut members = Vec::new();
+    for item in split_top_level(body, ',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let colon = find_top_level(item, ':')?;
+        let key = item[..colon].trim();
+        if key.is_empty() || key.starts_with("...") {
+            return None;
+        }
+        let value = item[colon + 1..].trim();
+        let value_type = if (value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('`') && value.ends_with('`'))
+        {
+            "string".to_string()
+        } else if value == "true" || value == "false" {
+            "boolean".to_string()
+        } else if value.parse::<f64>().is_ok() {
+            "number".to_string()
+        } else {
+            infer_static_object_type(value)?
+        };
+        members.push(format!("readonly {key}: {value_type}"));
+    }
+    Some(format!("{{ {}; }}", members.join("; ")))
+}
+
+fn find_top_level_arrow(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut depth = Depth::default();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        let ch = bytes[index] as char;
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '=' if bytes[index + 1] == b'>' && depth.is_zero() => return Some(index),
+            _ => depth.update(ch),
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_variable_assignment(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut depth = Depth::default();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        let ch = *byte as char;
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '=' && depth.is_zero() {
+            let previous = index.checked_sub(1).map(|value| bytes[value]);
+            let next = bytes.get(index + 1).copied();
+            if next != Some(b'>')
+                && next != Some(b'=')
+                && !matches!(previous, Some(b'=') | Some(b'!') | Some(b'<') | Some(b'>'))
+            {
+                return Some(index);
+            }
+        }
+        depth.update(ch);
+    }
+    None
+}
+
+fn relative_module_specifier(current: &Path, target: &Path) -> String {
+    let from = current.parent().unwrap_or_else(|| Path::new(""));
+    let from_components = from.components().collect::<Vec<_>>();
+    let target_components = target.components().collect::<Vec<_>>();
+    let common = from_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut result = PathBuf::new();
+    for _ in common..from_components.len() {
+        result.push("..");
+    }
+    for component in &target_components[common..] {
+        result.push(component.as_os_str());
+    }
+    let mut value = result.to_string_lossy().replace('\\', "/");
+    if let Some(stem) = value.strip_suffix(".d.ts") {
+        value = format!("{stem}.js");
+    } else {
+        value.push_str(".js");
+    }
+    if !value.starts_with('.') {
+        value.insert_str(0, "./");
+    }
+    value
+}
+
 fn leading_identifier(value: &str) -> &str {
     let end = value
         .char_indices()
@@ -908,7 +1639,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("wake-tsdoc-{id}"));
         fs::create_dir_all(&root).expect("fixture directory");
         for (name, source) in files {
-            fs::write(root.join(name), source).expect("fixture file");
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("fixture parent directory");
+            fs::write(path, source).expect("fixture file");
         }
         root
     }
@@ -1089,5 +1823,167 @@ mod tests {
             .expect("unresolved typed demo");
         assert!(broken.props.is_empty());
         assert!(!broken.warnings.is_empty());
+    }
+
+    #[test]
+    fn extracts_default_component_from_fc_and_typed_arrow_forms() {
+        let root = fixture(&[
+            (
+                "button.tsx",
+                r#"
+                    import type { FC } from "react";
+                    /** Primary button. */
+                    export interface ButtonProps {
+                        /** Text. */
+                        label: string;
+                        /** Disabled state. */
+                        disabled?: boolean;
+                    }
+                    /** Render a button. */
+                    const Button: FC<ButtonProps> = ({ disabled = false, label }) => <button>{label}</button>;
+                    export default Button;
+                "#,
+            ),
+            (
+                "divider.tsx",
+                r#"
+                    interface DividerProps { vertical?: boolean; }
+                    const Divider = ({ vertical = true }: DividerProps) => <hr />;
+                    export default Divider;
+                "#,
+            ),
+            (
+                "alert.tsx",
+                r#"
+                    interface AlertProps { message: string; }
+                    export default function Alert(props: AlertProps) { return <div>{props.message}</div>; }
+                "#,
+            ),
+        ]);
+        let button = extract_component_api(root.join("button.tsx")).unwrap();
+        assert_eq!(button.display_name, "Button");
+        assert_eq!(button.description, "Render a button.");
+        assert_eq!(button.api.symbol, "ButtonProps");
+        assert_eq!(button.api.props.len(), 2);
+        assert_eq!(
+            button
+                .api
+                .props
+                .iter()
+                .find(|prop| prop.name == "disabled")
+                .unwrap()
+                .default_value
+                .as_deref(),
+            Some("false")
+        );
+
+        let divider = extract_component_api(root.join("divider.tsx")).unwrap();
+        assert_eq!(divider.display_name, "Divider");
+        assert_eq!(divider.api.symbol, "DividerProps");
+        let alert = extract_component_api(root.join("alert.tsx")).unwrap();
+        assert_eq!(alert.display_name, "Alert");
+        assert_eq!(alert.api.symbol, "AlertProps");
+    }
+
+    #[test]
+    fn emits_preserved_library_declarations_without_any() {
+        let root = fixture(&[
+            ("package.json", r#"{"name":"@demo/button","type":"module"}"#),
+            (
+                "src/index.ts",
+                r#"
+                    import Button from "./button.js";
+                    export type { ButtonProps } from "./button.js";
+                    export { default as ButtonGroup } from "./group.js";
+                    export type { Shader } from "./shaders/flat.vert.js";
+                    export default Button;
+                "#,
+            ),
+            (
+                "src/shaders/flat.vert.ts",
+                "export interface Shader { source: string; }",
+            ),
+            (
+                "src/group.tsx",
+                r#"
+                    import { internal } from './internal.js';
+                    export interface GroupProps { children: string; }
+                    function ButtonGroup(props: GroupProps) { return <div>{internal}{props.children}</div>; }
+                    export default ButtonGroup;
+                "#,
+            ),
+            ("src/internal.ts", "export const internal = 42;"),
+            (
+                "src/button.tsx",
+                r#"
+                    import type { FC, ReactNode } from "react";
+                    export interface ButtonProps { label: ReactNode; }
+                    export const Icon = ({ title }: { title: string }) => <span>{title}</span>;
+                    export const vars = { 'color': '--button-color', nested: { gap: '4px' } };
+                    export const EPS = 1e-6;
+                    export const ORDER = ['a', 'b'] as const;
+                    export const alias = vars;
+                    export const sizeOf = (value: number): string => String(value);
+                    const Button: FC<ButtonProps> = (props) => <button>{props.label}</button>;
+                    export default Button;
+                "#,
+            ),
+        ]);
+        let files = emit_library_declarations(&root, "src/index.ts").unwrap();
+        assert_eq!(files.len(), 4);
+        let entry = files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(entry.code.contains("./_wake/src/button.js"));
+        let button = files
+            .iter()
+            .find(|file| file.file_name == Path::new("_wake/src/button.d.ts"))
+            .unwrap();
+        assert!(button.code.contains("export interface ButtonProps"));
+        assert!(
+            button
+                .code
+                .contains("declare const Button: FC<ButtonProps>;")
+        );
+        assert!(button.code.contains(
+            "export declare const Icon: ({ title }: { title: string }) => import(\"react\").JSX.Element;"
+        ));
+        assert!(button.code.contains("export declare const vars: { readonly 'color': string; readonly nested: { readonly gap: string; }; };"));
+        assert!(button.code.contains("export declare const EPS: 1e-6;"));
+        assert!(
+            button
+                .code
+                .contains("export declare const ORDER: readonly ['a', 'b'];")
+        );
+        assert!(
+            button
+                .code
+                .contains("export declare const alias: typeof vars;")
+        );
+        assert!(
+            button
+                .code
+                .contains("export declare const sizeOf: (value: number) => string;")
+        );
+        assert!(!button.code.contains("any"));
+        let group = files
+            .iter()
+            .find(|file| file.file_name == Path::new("_wake/src/group.d.ts"))
+            .unwrap();
+        assert!(group.code.contains(
+            "declare function ButtonGroup(props: GroupProps): import(\"react\").JSX.Element;"
+        ));
+        assert!(!group.code.contains("internal.js"));
+    }
+
+    #[test]
+    fn declarations_reject_untyped_public_values() {
+        let root = fixture(&[
+            ("package.json", r#"{"name":"demo"}"#),
+            ("src/index.ts", "export const answer = compute();"),
+        ]);
+        let error = emit_library_declarations(&root, "src/index.ts").unwrap_err();
+        assert!(error.to_string().contains("explicit type annotation"));
     }
 }

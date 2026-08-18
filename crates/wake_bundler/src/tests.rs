@@ -5235,6 +5235,7 @@ const CRAB_CSS_INDEX: &str = "export const css = () => { throw new Error('css sh
      export const keyframes = css; export const globalStyle = css;\n\
      export const createVar = () => 'runtime-var';\n\
      export const assignVars = (values) => values;\n\
+     export const defineTokens = (value) => value;\n\
      export const cx = (...a) => a.filter(Boolean).join(' ');\n";
 
 fn crab_css_fixture(source: &'static str) -> MemoryFileSystem {
@@ -5653,6 +5654,46 @@ fn crab_css_static_tokens_propagate_through_esm_barrels() {
         .expect("CSS asset");
     assert!(css.contains("color: rebeccapurple"), "{css}");
     assert!(css.contains("gap: 8px"), "{css}");
+}
+
+#[test]
+fn crab_css_explicitly_frozen_structured_tokens_cross_module_boundaries() {
+    let fs = MemoryFileSystem::from_files([
+        ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+        ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
+        (
+            "src/tokens.js",
+            "import { defineTokens } from '@crab-dev/css';\n\
+             export const vars = defineTokens({ 'ring.indicator-color': '--spin-ring-indicator-color' });\n\
+             const token = defineTokens({ color: { primary: 'rebeccapurple' } });\n\
+             export default token;",
+        ),
+        (
+            "src/index.js",
+            "import { css } from '@crab-dev/css';\n\
+             import token, { vars as spinVars } from './tokens.js';\n\
+             export const button = css`\n\
+               color: ${token.color.primary};\n\
+               ${spinVars['ring.indicator-color']}: currentColor;\n\
+             `;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_in_js();
+    bundler.enable_css_extraction();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let css = out
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .map(|asset| String::from_utf8_lossy(&asset.bytes))
+        .expect("CSS asset");
+    assert!(css.contains("color: rebeccapurple"), "{css}");
+    assert!(
+        css.contains("--spin-ring-indicator-color: currentColor"),
+        "{css}"
+    );
 }
 
 #[test]

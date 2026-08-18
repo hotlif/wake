@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 
@@ -60,4 +63,48 @@ test('bundle parser errors use the Rust CLI usage exit code', () => {
   assert.equal(invalidPlatform.status, 2)
   assert.match(invalidPlatform.stderr, /WAKE_CONFIG/)
   assert.match(invalidPlatform.stderr, /browser, node/)
+})
+
+test('library token generates the configured TypeScript file', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-cli-token-'))
+  await writeFile(
+    join(cwd, 'token.toml'),
+    "[build]\noutput='./src/token.ts'\nprefix='demo'\n[token]\ncolor='red'\n",
+  )
+  const result = run(['--no-color', 'library', 'token', cwd])
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /LIBRARY TOKEN/)
+  assert.match(await readFile(join(cwd, 'src/token.ts'), 'utf8'), /--demo-color/)
+  await rm(cwd, { recursive: true, force: true })
+})
+
+test('library build emits ESM, CommonJS, and declarations', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-cli-library-'))
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'package.json'), '{"name":"@demo/button","type":"module"}')
+  await writeFile(join(cwd, 'src', 'index.ts'), "import Button from './button.js';\nexport type { ButtonProps } from './button.js';\nexport default Button;\n")
+  await writeFile(join(cwd, 'src', 'button.tsx'), "import type { FC } from 'react';\nexport interface ButtonProps { label: string; }\nconst Button: FC<ButtonProps> = (props) => <button>{props.label}</button>;\nexport default Button;\n")
+  const result = run(['--no-color', 'library', 'build', cwd])
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /LIBRARY BUILD/)
+  await readFile(join(cwd, 'esm/index.mjs'), 'utf8')
+  await readFile(join(cwd, 'cjs/index.cjs'), 'utf8')
+  await readFile(join(cwd, 'declarations/index.d.ts'), 'utf8')
+  await rm(cwd, { recursive: true, force: true })
+})
+
+test('library docgen generates the deterministic react-docgen payload', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-cli-docgen-'))
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'package.json'), '{}')
+  await writeFile(
+    join(cwd, 'src', 'button.tsx'),
+    'export default function Button(props: ButtonProps) { return null }\ninterface ButtonProps { label: string }\n',
+  )
+  const result = run(['--no-color', 'library', 'docgen', cwd, '--entry', 'src/button.tsx'])
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /LIBRARY DOCGEN/)
+  const docgen = JSON.parse(await readFile(join(cwd, 'public/docgen.json'), 'utf8'))
+  assert.equal(docgen['./src/button.tsx'][0].displayName, 'Button')
+  await rm(cwd, { recursive: true, force: true })
 })

@@ -80,6 +80,11 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Build and generate component-library artifacts.
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommand,
+    },
     /// Start the application development server and HMR.
     Dev {
         /// Project root.
@@ -152,6 +157,37 @@ enum DocsCommand {
 enum DocsModeArg {
     Site,
     Components,
+}
+
+#[derive(Subcommand)]
+enum LibraryCommand {
+    /// Build ESM, CommonJS, declarations, and optional CSS for a component package.
+    Build {
+        /// Component package root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Library source entry relative to the package root.
+        #[arg(long, default_value = "src/index.ts")]
+        entry: PathBuf,
+    },
+    /// Generate TypeScript design tokens from token.toml.
+    Token {
+        /// Component package root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Token configuration path relative to the package root.
+        #[arg(long, default_value = "token.toml")]
+        config: PathBuf,
+    },
+    /// Generate React component documentation into public/docgen.json.
+    Docgen {
+        /// Component package root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Explicit component source entry relative to the package root.
+        #[arg(long)]
+        entry: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -227,6 +263,16 @@ fn main() -> ExitCode {
                 ui,
             )
         }),
+        Command::Library { command } => {
+            match command {
+                LibraryCommand::Build { project, entry } => ensure_static_mode(cli.ui)
+                    .and_then(|()| cmd_library_build(&project, &entry, ui)),
+                LibraryCommand::Token { project, config } => ensure_static_mode(cli.ui)
+                    .and_then(|()| cmd_library_token(&project, &config, ui)),
+                LibraryCommand::Docgen { project, entry } => ensure_static_mode(cli.ui)
+                    .and_then(|()| cmd_library_docgen(&project, entry.as_deref(), ui)),
+            }
+        }
         Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port, ui, cli.ui),
         Command::Docs { command } => match command {
             DocsCommand::Dev { root, port, mode } => cmd_docs_dev(&root, port, mode, ui, cli.ui),
@@ -389,6 +435,92 @@ fn cmd_bundle(options: BundleCommandOptions, ui: Ui) -> Result<(), ExitCode> {
     ) {
         Ok(result) => {
             ui.bundle_result("Bundled", &result, None);
+            Ok(())
+        }
+        Err(error) => {
+            ui.app_error(&error);
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn cmd_library_token(project: &Path, config: &Path, ui: Ui) -> Result<(), ExitCode> {
+    ui.header("library token");
+    match wake_app::generate_css_token(
+        wake_app::GenerateCssTokenOptions {
+            project: wake_app::ProjectOptions {
+                cwd: Some(project.to_path_buf()),
+                config_path: None,
+            },
+            config_path: Some(config.to_path_buf()),
+        },
+        &wake_app::CancellationToken::default(),
+    ) {
+        Ok(result) => {
+            eprintln!(
+                "  {}  Generated {}",
+                ui.ok("✓"),
+                ui.accent(&result.output_file)
+            );
+            eprintln!();
+            Ok(())
+        }
+        Err(error) => {
+            ui.app_error(&error);
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn cmd_library_build(project: &Path, entry: &Path, ui: Ui) -> Result<(), ExitCode> {
+    ui.header("library build");
+    match wake_app::build_library(
+        wake_app::LibraryBuildOptions {
+            project: wake_app::ProjectOptions {
+                cwd: Some(project.to_path_buf()),
+                config_path: None,
+            },
+            entry: Some(entry.to_path_buf()),
+        },
+        &wake_app::CancellationToken::default(),
+    ) {
+        Ok(result) => {
+            eprintln!(
+                "  {}  Built {} files from {} modules in {:.1}ms",
+                ui.ok("✓"),
+                ui.accent(&result.files.len().to_string()),
+                ui.accent(&result.module_count.to_string()),
+                result.duration_ms
+            );
+            eprintln!();
+            Ok(())
+        }
+        Err(error) => {
+            ui.app_error(&error);
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn cmd_library_docgen(project: &Path, entry: Option<&Path>, ui: Ui) -> Result<(), ExitCode> {
+    ui.header("library docgen");
+    match wake_app::generate_docgen(
+        wake_app::GenerateDocgenOptions {
+            project: wake_app::ProjectOptions {
+                cwd: Some(project.to_path_buf()),
+                config_path: None,
+            },
+            entry: entry.map(Path::to_path_buf),
+        },
+        &wake_app::CancellationToken::default(),
+    ) {
+        Ok(result) => {
+            eprintln!(
+                "  {}  Generated {}",
+                ui.ok("✓"),
+                ui.accent(&result.output_file)
+            );
+            eprintln!();
             Ok(())
         }
         Err(error) => {

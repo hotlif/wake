@@ -124,6 +124,103 @@ fn evaluates_nested_object_member_access() {
 }
 
 #[test]
+fn define_tokens_marks_nested_module_values_as_frozen() {
+    let src = "import { css, defineTokens as freeze } from '@crab-dev/css';\n\
+        export const vars = freeze({ 'space.sm': '--space-sm' });\n\
+        const token = freeze({ space: { sm: `var(${vars['space.sm']}, 8px)` } });\n\
+        const box = css`padding: ${token.space.sm};`;";
+    let r = run(src);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(r.css.contains("padding: var(--space-sm, 8px)"), "{}", r.css);
+
+    let interner = Interner::new();
+    let parsed = parse(src, &interner, SourceType::TypeScript);
+    let exports = parsed
+        .module
+        .with_ast(|program| crate::collect_static_exports(program, &interner, "src/tokens.ts"));
+    assert!(
+        matches!(exports.get("vars"), Some(StaticValue::Frozen(_))),
+        "{exports:?}"
+    );
+}
+
+#[test]
+fn imported_frozen_tokens_are_safe_but_ordinary_objects_remain_rejected() {
+    let source = "import { css } from '@crab-dev/css';\n\
+        import { tokens } from './tokens.js';\n\
+        const box = css`color: ${tokens.color};`;";
+    let object = StaticValue::Obj(vec![(
+        "color".to_string(),
+        StaticValue::Str("rebeccapurple".to_string()),
+    )]);
+
+    let mut imported = Scope::default();
+    imported.insert(
+        "tokens".to_string(),
+        StaticValue::frozen(object.clone()).unwrap(),
+    );
+    let frozen = run_with(source, &imported);
+    assert!(frozen.diagnostics.is_empty(), "{:?}", frozen.diagnostics);
+    assert!(
+        frozen.css.contains("color: rebeccapurple"),
+        "{}",
+        frozen.css
+    );
+
+    imported.insert("tokens".to_string(), object);
+    let ordinary = run_with(source, &imported);
+    assert!(
+        ordinary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code.as_deref() == Some("CRAB_CSS_STATIC_VALUE") }),
+        "{:?}",
+        ordinary.diagnostics
+    );
+}
+
+#[test]
+fn same_spelled_user_function_cannot_forge_frozen_tokens() {
+    let source = "import { css } from '@crab-dev/css';\n\
+        const defineTokens = (value) => value;\n\
+        const tokens = defineTokens({ color: 'red' });\n\
+        const box = css`color: ${tokens.color};`;";
+    let result = run(source);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code.as_deref() == Some("CRAB_CSS_STATIC_VALUE") }),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn define_tokens_rejects_dynamic_arguments() {
+    let source = "import { defineTokens } from '@crab-dev/css';\n\
+        const tokens = defineTokens({ color: getColor() });";
+    let result = run(source);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("CRAB_CSS_DEFINE_TOKENS")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn define_tokens_keeps_non_top_level_calls_as_runtime_only() {
+    let source = "import { defineTokens } from '@crab-dev/css';\n\
+        export function makeTokens() { return defineTokens({ color: 'red' }); }";
+    let result = run(source);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert!(result.removable_import_spans.is_empty());
+}
+
+#[test]
 fn evaluates_cross_module_imported_primitive() {
     // 模拟 `import { pad } from './token.js'`：调用方已解析出可安全复制的静态值。
     let mut imported = Scope::default();

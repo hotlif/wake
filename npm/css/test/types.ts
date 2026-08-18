@@ -3,6 +3,7 @@ import {
   createVar,
   css,
   cx,
+  defineTokens,
   globalStyle,
   keyframes,
   type CSSVar,
@@ -45,6 +46,20 @@ const styles: Record<string, string | number> = assignVars({
 
 const variable: CSSVar = spacing
 
+const tokens = defineTokens({
+  color: 'red',
+  nested: { gap: 8 },
+  steps: ['sm', 'lg'],
+})
+const tokenColor: 'red' = tokens.color
+const tokenGap: 8 = tokens.nested.gap
+
+// @ts-expect-error defineTokens returns a deeply readonly structure.
+tokens.nested.gap = 12
+
+// @ts-expect-error Functions are outside the static token value contract.
+defineTokens({ color: () => 'red' })
+
 // @ts-expect-error CSS variables are branded custom-property names.
 const invalidVariable: CSSVar = 'var(--ordinary-variable)'
 
@@ -60,5 +75,7 @@ assignVars({ 'var(--ordinary-variable)': 'red' })
 void combined
 void styles
 void variable
+void tokenColor
+void tokenGap
 void invalidVariable
 void invalidClassName

@@ -25,6 +25,21 @@ async function bundle(options) {
   return invoke(native.bundle(JSON.stringify(value), signal))
 }
 
+async function buildLibrary(options) {
+  const [value, signal] = splitOptions(options)
+  return invoke(native.buildLibrary(JSON.stringify(value), signal))
+}
+
+async function generateCssToken(options) {
+  const [value, signal] = splitOptions(options)
+  return invoke(native.generateCssToken(JSON.stringify(value), signal))
+}
+
+async function generateDocgen(options) {
+  const [value, signal] = splitOptions(options)
+  return invoke(native.generateDocgen(JSON.stringify(value), signal))
+}
+
 class BuildContext {
   #native
   #closed = false
@@ -197,8 +212,11 @@ module.exports = {
   DevServer,
   WakeError,
   build,
+  buildLibrary,
   buildDocs,
   bundle,
+  generateCssToken,
+  generateDocgen,
   createBuildContext,
   startDevServer,
   startDocsDevServer,

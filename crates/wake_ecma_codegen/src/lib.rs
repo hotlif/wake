@@ -40,6 +40,7 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
         interner,
         indent: 0,
         linker: None,
+        specifier_rewriter: None,
         link_tmp: 0,
         define: &[],
         define_leaves: Vec::new(),
@@ -48,6 +49,7 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
         minify: false,
         rename: None,
         module_renames: FxHashMap::default(),
+        preserved_imports: FxHashMap::default(),
         prop_rename: None,
         minify_ctx: None,
         no_esmodule: false,
@@ -84,6 +86,72 @@ pub trait ModuleLinker {
     fn is_async_module(&self, _id: u32) -> bool {
         false
     }
+}
+
+/// Rewrites one module specifier while preserving the surrounding module syntax.
+///
+/// Library preserve-modules output uses this seam to map source requests such as `./button.js`
+/// to the final `.mjs` or `.cjs` artifact. Returning `None` keeps a runtime external unchanged.
+pub trait ModuleSpecifierRewriter {
+    fn rewrite(&self, specifier: &str) -> Option<String>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreserveModuleFormat {
+    EsModule,
+    CommonJs,
+}
+
+/// Stable namespace binding used by preserve-modules CommonJS lowering for one import statement.
+/// Callers that build symbol-level live-import substitutions use the same name.
+pub fn preserved_import_namespace(span: Span) -> String {
+    format!("_wi{}", span.lo)
+}
+
+struct ExternalOnlyLinker;
+
+impl ModuleLinker for ExternalOnlyLinker {
+    fn module_id(&self, _specifier: &str) -> Option<u32> {
+        None
+    }
+}
+
+/// Emit one transformed module without adding Wake's bundle runtime.
+///
+/// ESM keeps native import/export syntax. CommonJS lowers the same module to direct `require()` and
+/// `exports` operations. In both cases the caller owns the output graph and provides final relative
+/// specifiers through [`ModuleSpecifierRewriter`].
+#[allow(clippy::too_many_arguments)]
+pub fn codegen_preserved_module_mangled(
+    program: &Program,
+    interner: &Interner,
+    format: PreserveModuleFormat,
+    rewriter: &dyn ModuleSpecifierRewriter,
+    define: &[(&str, &str)],
+    minify: bool,
+    rename: Option<&FxHashMap<Span, Atom>>,
+    minify_ctx: Option<&MinifyCtx>,
+    minify_names: bool,
+) -> String {
+    let linker: Option<&dyn ModuleLinker> = match format {
+        PreserveModuleFormat::EsModule => None,
+        PreserveModuleFormat::CommonJs => Some(&ExternalOnlyLinker),
+    };
+    codegen_impl(
+        program,
+        interner,
+        linker,
+        Some(rewriter),
+        None,
+        define,
+        minify,
+        rename,
+        minify_ctx,
+        false,
+        minify_names,
+        false,
+    )
+    .0
 }
 
 /// 生成 **已链接**（ESM→CJS）的模块体，供函数包装打包。
@@ -172,7 +240,8 @@ pub fn codegen_module_shaken_mangled(
     codegen_impl(
         program,
         interner,
-        linker,
+        Some(linker),
+        None,
         keep_exports,
         define,
         minify,
@@ -208,7 +277,8 @@ pub fn codegen_module_shaken_with_map(
     let (code, map) = codegen_impl(
         program,
         interner,
-        linker,
+        Some(linker),
+        None,
         keep_exports,
         define,
         minify,
@@ -226,7 +296,8 @@ pub fn codegen_module_shaken_with_map(
 fn codegen_impl(
     program: &Program,
     interner: &Interner,
-    linker: &dyn ModuleLinker,
+    linker: Option<&dyn ModuleLinker>,
+    specifier_rewriter: Option<&dyn ModuleSpecifierRewriter>,
     keep_exports: Option<&[String]>,
     define: &[(&str, &str)],
     minify: bool,
@@ -248,11 +319,17 @@ fn codegen_impl(
     });
     let prop_rename = minify_ctx.and_then(|ctx| ctx.prop_rename);
     let module_renames = collect_module_renames(program, rename);
+    let preserved_imports = collect_preserved_import_bindings(
+        program,
+        interner,
+        linker.is_some() && specifier_rewriter.is_some(),
+    );
     let mut cg = Codegen {
         out: String::new(),
         interner,
         indent: 0,
-        linker: Some(linker),
+        linker,
+        specifier_rewriter,
         link_tmp: 0,
         define,
         define_leaves: define_leaf_atoms(define, interner),
@@ -261,6 +338,7 @@ fn codegen_impl(
         minify,
         rename,
         module_renames,
+        preserved_imports,
         prop_rename,
         minify_ctx,
         no_esmodule,
@@ -277,7 +355,7 @@ fn codegen_impl(
     // ESM 模块（含 import/export 语法）标记 `__esModule`，供默认导入 interop 区分「转译 ESM」
     // 与「纯 CJS」。纯 CJS 模块（只有 `module.exports`/`require`）不标记，保持整体 exports 语义。
     // 单包模式下 `no_esmodule` 为 true 时省略此标记（bundler 静态处理 interop，见 emit）。
-    if program_is_esm(program) && !cg.no_esmodule {
+    if linker.is_some() && program_is_esm(program) && !cg.no_esmodule {
         cg.push("Object.defineProperty(exports, \"__esModule\", { value: true });");
         cg.newline();
     }
@@ -392,11 +470,12 @@ fn need_sep(a: u8, b: u8) -> bool {
         || (a == b'/' && (b == b'/' || b == b'*'))
 }
 
-struct Codegen<'i, 'l, 'd, 'm, 'mc> {
+struct Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     out: String,
     interner: &'i Interner,
     indent: usize,
     linker: Option<&'l dyn ModuleLinker>,
+    specifier_rewriter: Option<&'r dyn ModuleSpecifierRewriter>,
     /// 链接时生成临时变量的计数器。
     link_tmp: u32,
     /// 编译期常量替换表（静态成员链 → 字面量源码）。见 [`DEFAULT_DEFINE`]。
@@ -420,6 +499,8 @@ struct Codegen<'i, 'l, 'd, 'm, 'mc> {
     rename: Option<&'m FxHashMap<Span, Atom>>,
     /// Module-scope binding rename fallback for synthetic export references whose span is DUMMY.
     module_renames: FxHashMap<Atom, Atom>,
+    /// Preserve-modules CJS live binding expression for each module-scope import binding.
+    preserved_imports: FxHashMap<Atom, String>,
     /// Property mangling side-table (span → new name).
     /// Built by `plan_prop_mangle`, consumed to shorten property names in
     /// member access expressions and object literal keys.
@@ -485,7 +566,7 @@ const P_POSTFIX: u8 = 17;
 const P_CALL_MEMBER: u8 = 18;
 const P_PRIMARY: u8 = 19;
 
-impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
+impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     fn name(&self, atom: Atom) -> String {
         self.interner.resolve(atom)
     }
@@ -1813,7 +1894,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         if wrote_leading {
             self.push(" from ");
         }
-        self.emit_string_atom(d.source);
+        self.emit_module_specifier(d.source);
         self.emit_import_attributes(d.attributes);
         self.push(";");
     }
@@ -1858,7 +1939,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         self.punct(" }");
         if let Some(src) = s.source {
             self.push(" from ");
-            self.emit_string_atom(src);
+            self.emit_module_specifier(src);
             self.emit_import_attributes(s.attributes);
         }
         self.push(";");
@@ -1883,7 +1964,7 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.emit_module_export_name(ns);
         }
         self.push(" from ");
-        self.emit_string_atom(s.source);
+        self.emit_module_specifier(s.source);
         self.emit_import_attributes(s.attributes);
         self.push(";");
     }
@@ -1892,6 +1973,18 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         match n {
             ModuleExportName::Ident(id) => self.push_name(id.name),
             ModuleExportName::String(a) => self.emit_string_atom(*a),
+        }
+    }
+
+    fn emit_module_specifier(&mut self, atom: Atom) {
+        let specifier = self.name(atom);
+        if let Some(rewritten) = self
+            .specifier_rewriter
+            .and_then(|rewriter| rewriter.rewrite(&specifier))
+        {
+            self.emit_string(&rewritten);
+        } else {
+            self.emit_string_atom(atom);
         }
     }
 
@@ -1907,7 +2000,13 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
 
     /// `__wake_require__(id)` 或外部回退 `require("spec")`。
     fn require_expr(&self, specifier: &str) -> String {
-        let linker = self.linker.unwrap();
+        if let Some(rewritten) = self
+            .specifier_rewriter
+            .and_then(|rewriter| rewriter.rewrite(specifier))
+        {
+            return format!("require({rewritten:?})");
+        }
+        let linker = self.linker.expect("linked require must have a linker");
         match linker.module_id(specifier) {
             Some(id) => format!("{}({})", linker.require_fn(), id),
             None => format!("require({specifier:?})"),
@@ -1921,6 +2020,12 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
     /// 只用于 `import` / `export ... from` 的降级；`require("x")` 改写点与动态 `import()`
     /// 不走这里（前者可能嵌在普通函数内，后者本就产出 Promise）。
     fn require_expr_static(&self, specifier: &str) -> String {
+        if let Some(rewritten) = self
+            .specifier_rewriter
+            .and_then(|rewriter| rewriter.rewrite(specifier))
+        {
+            return format!("require({rewritten:?})");
+        }
         let linker = self.linker.unwrap();
         match linker.module_id(specifier) {
             Some(id) if linker.is_async_module(id) => {
@@ -1959,7 +2064,11 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
             self.push(";");
             return;
         }
-        let tmp = self.next_tmp();
+        let tmp = if self.specifier_rewriter.is_some() {
+            preserved_import_namespace(d.span)
+        } else {
+            self.next_tmp()
+        };
         self.push(&format!("const {tmp} = {req};"));
         for spec in d.specifiers.iter() {
             if is_unused(spec) {
@@ -2069,10 +2178,16 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                     // 用字面量 `exports`（与 emit_export_binding / 本地 re-export 一致）——单包模式
                     // 由 compact_body_names 统一转 `$`。曾误用 `self.ex()`（minify_names 下 = "e"）→
                     // 单包 wrapper 无 `e` 绑定 → 运行期 `e is not defined`。
-                    self.emit_property_access("exports", &exported);
-                    self.punct(" = ");
-                    self.emit_property_access(&tmp, &local);
-                    self.push(";");
+                    if self.specifier_rewriter.is_some() {
+                        self.emit_export_getter(&exported, |codegen| {
+                            codegen.emit_property_access(&tmp, &local);
+                        });
+                    } else {
+                        self.emit_property_access("exports", &exported);
+                        self.punct(" = ");
+                        self.emit_property_access(&tmp, &local);
+                        self.push(";");
+                    }
                 }
             }
             None => {
@@ -2096,10 +2211,21 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                             .unwrap_or(local_atom),
                         ModuleExportName::String(_) => local_atom,
                     };
-                    self.emit_property_access("exports", &exported);
-                    self.punct(" = ");
-                    self.push_name(local_val);
-                    self.push(";");
+                    if self.specifier_rewriter.is_some() {
+                        let live = self.preserved_imports.get(&local_atom).cloned();
+                        self.emit_export_getter(&exported, |codegen| {
+                            if let Some(live) = live {
+                                codegen.push(&live);
+                            } else {
+                                codegen.push_name(local_val);
+                            }
+                        });
+                    } else {
+                        self.emit_property_access("exports", &exported);
+                        self.punct(" = ");
+                        self.push_name(local_val);
+                        self.push(";");
+                    }
                 }
             }
         }
@@ -2133,10 +2259,22 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         let value = decl_span.map_or(name, |sp| self.renamed_or(name, sp));
         let key = self.interner.resolve(name);
         let val = self.interner.resolve(value);
+        if self.specifier_rewriter.is_some() {
+            self.emit_export_getter(&key, |codegen| codegen.push(&val));
+            return;
+        }
         self.emit_property_access("exports", &key);
         self.punct(" = ");
         self.push(&val);
         self.push(";");
+    }
+
+    fn emit_export_getter(&mut self, exported: &str, value: impl FnOnce(&mut Self)) {
+        self.push("Object.defineProperty(exports, ");
+        self.emit_string(exported);
+        self.push(", { enumerable: true, get: function () { return ");
+        value(self);
+        self.push("; } });");
     }
 
     /// Emit a static property access. In compact output, identifier-like keys are shorter and
@@ -2264,9 +2402,15 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.push(";");
             }
             None => {
-                self.push(&format!(
-                    "for (const _k in {tmp}) if (_k !== \"default\") exports[_k] = {tmp}[_k];"
-                ));
+                if self.specifier_rewriter.is_some() {
+                    self.push(&format!(
+                        "for (const _k in {tmp}) if (_k !== \"default\" && !Object.prototype.hasOwnProperty.call(exports, _k)) Object.defineProperty(exports, _k, {{ enumerable: true, get: function () {{ return {tmp}[_k]; }} }});"
+                    ));
+                } else {
+                    self.push(&format!(
+                        "for (const _k in {tmp}) if (_k !== \"default\") exports[_k] = {tmp}[_k];"
+                    ));
+                }
             }
         }
     }
@@ -3132,7 +3276,9 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 self.emit_expr(&c.alternate, P_ASSIGN);
             }
             Expression::Call(c) => {
-                if self.linker.is_some() && self.emit_require_call(c) {
+                if (self.linker.is_some() || self.specifier_rewriter.is_some())
+                    && self.emit_require_call(c)
+                {
                     // require("x") 已改写为 __wake_require__(id)
                 } else {
                     self.emit_expr(&c.callee, P_CALL_MEMBER);
@@ -3183,7 +3329,19 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
                 }
             }
             Expression::Import(i) => {
-                if let Some(linker) = self.linker
+                if let Expression::StringLiteral(s) = &i.source
+                    && let Some(rewritten) = self
+                        .specifier_rewriter
+                        .and_then(|rewriter| rewriter.rewrite(&self.name(s.value)))
+                {
+                    self.push("import(");
+                    self.emit_string(&rewritten);
+                    if let Some(o) = &i.options {
+                        self.punct(", ");
+                        self.emit_expr(o, P_ASSIGN);
+                    }
+                    self.push(")");
+                } else if let Some(linker) = self.linker
                     && let Expression::StringLiteral(s) = &i.source
                 {
                     let spec = self.name(s.value);
@@ -3478,6 +3636,28 @@ impl<'i, 'l, 'd, 'm, 'mc> Codegen<'i, 'l, 'd, 'm, 'mc> {
         // 转义后的字面量已直写 out（可能含 `\n` 两字符转义、非 ASCII 原样字符）→ 统一回算游标。
         self.sync_from(before);
     }
+
+    fn emit_string(&mut self, value: &str) {
+        let before = self.out.len();
+        self.out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => self.out.push_str("\\\""),
+                '\\' => self.out.push_str("\\\\"),
+                '\n' => self.out.push_str("\\n"),
+                '\r' => self.out.push_str("\\r"),
+                '\t' => self.out.push_str("\\t"),
+                '\u{2028}' => self.out.push_str("\\u2028"),
+                '\u{2029}' => self.out.push_str("\\u2029"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(self.out, "\\x{:02x}", c as u32);
+                }
+                c => self.out.push(c),
+            }
+        }
+        self.out.push('"');
+        self.sync_from(before);
+    }
 }
 
 /// Extract the return value expression from a single-return statement (possibly wrapped in a block).
@@ -3678,6 +3858,48 @@ fn collect_module_renames(
         }
     }
     out
+}
+
+fn collect_preserved_import_bindings(
+    program: &Program,
+    interner: &Interner,
+    enabled: bool,
+) -> FxHashMap<Atom, String> {
+    if !enabled {
+        return FxHashMap::default();
+    }
+    let mut bindings = FxHashMap::default();
+    for statement in program.body.iter() {
+        let Statement::Import(import) = statement else {
+            continue;
+        };
+        let namespace = preserved_import_namespace(import.span);
+        for specifier in import.specifiers.iter() {
+            match specifier {
+                ImportSpecifier::Default { local, .. } => {
+                    bindings.insert(
+                        local.name,
+                        format!(
+                            "({namespace} && {namespace}.__esModule ? {namespace}.default : {namespace})"
+                        ),
+                    );
+                }
+                ImportSpecifier::Namespace { local, .. } => {
+                    bindings.insert(local.name, format!("__wake_interop_star({namespace})"));
+                }
+                ImportSpecifier::Named {
+                    imported, local, ..
+                } => {
+                    let imported = match imported {
+                        ModuleExportName::Ident(identifier) => interner.resolve(identifier.name),
+                        ModuleExportName::String(value) => interner.resolve(*value),
+                    };
+                    bindings.insert(local.name, format!("{namespace}[{imported:?}]"));
+                }
+            }
+        }
+    }
+    bindings
 }
 
 fn collect_used_export_locals(program: &Program, used: &FxHashSet<Atom>) -> FxHashSet<Atom> {

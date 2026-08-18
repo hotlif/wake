@@ -38,6 +38,7 @@ enum BindingKind {
     GlobalStyle,
     CreateVar,
     AssignVars,
+    DefineTokens,
 }
 
 /// A build-time tagged-template API recognized from `@crab-dev/css`.
@@ -88,6 +89,7 @@ impl BindingKind {
             "globalStyle" => Some(Self::GlobalStyle),
             "createVar" => Some(Self::CreateVar),
             "assignVars" => Some(Self::AssignVars),
+            "defineTokens" => Some(Self::DefineTokens),
             _ => None,
         }
     }
@@ -97,7 +99,7 @@ impl BindingKind {
             Self::Css => "class",
             Self::Keyframes => "keyframes",
             Self::CreateVar => "variable",
-            Self::Cx | Self::GlobalStyle | Self::AssignVars => "runtime",
+            Self::Cx | Self::GlobalStyle | Self::AssignVars | Self::DefineTokens => "runtime",
         }
     }
 
@@ -106,7 +108,7 @@ impl BindingKind {
             Self::Css => Some(CssTemplateKind::Css),
             Self::Keyframes => Some(CssTemplateKind::Keyframes),
             Self::GlobalStyle => Some(CssTemplateKind::GlobalStyle),
-            Self::Cx | Self::CreateVar | Self::AssignVars => None,
+            Self::Cx | Self::CreateVar | Self::AssignVars | Self::DefineTokens => None,
         }
     }
 
@@ -115,7 +117,9 @@ impl BindingKind {
             Self::Css => CssSyntaxContext::StyleBlock,
             Self::Keyframes => CssSyntaxContext::Keyframes,
             Self::GlobalStyle => CssSyntaxContext::Stylesheet,
-            Self::Cx | Self::CreateVar | Self::AssignVars => CssSyntaxContext::ComponentValues,
+            Self::Cx | Self::CreateVar | Self::AssignVars | Self::DefineTokens => {
+                CssSyntaxContext::ComponentValues
+            }
         }
     }
 }
@@ -295,6 +299,43 @@ impl BindingRegistry {
         check.visit_program(program);
         check.found
     }
+
+    fn define_token_calls(&self, program: &Program) -> FxHashSet<Span> {
+        let mut calls = FxHashSet::default();
+        for statement in program.body.iter() {
+            let declaration = match statement {
+                Statement::VariableDeclaration(declaration) => Some(*declaration),
+                Statement::ExportNamed(export) => export.declaration.and_then(|declaration| {
+                    if let Statement::VariableDeclaration(declaration) = declaration {
+                        Some(declaration)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+            let Some(declaration) = declaration else {
+                continue;
+            };
+            if declaration.kind != VarKind::Const {
+                continue;
+            }
+            for declarator in declaration.declarations.iter() {
+                let (Pattern::Ident(_), Some(Expression::Call(call))) =
+                    (&declarator.id, &declarator.init)
+                else {
+                    continue;
+                };
+                if self
+                    .binding_for_expression(&call.callee)
+                    .is_some_and(|binding| binding.kind == BindingKind::DefineTokens)
+                {
+                    calls.insert(call.span);
+                }
+            }
+        }
+        calls
+    }
 }
 
 /// 收集模块可被其它模块静态引用的导出常量，**并把 `css` 绑定的类名一并导出**。
@@ -315,14 +356,27 @@ pub fn collect_static_exports_with(
     seed: &str,
     imported: &value::Scope,
 ) -> StaticExports {
-    let mut out = value::collect_static_exports_with(program, interner, imported);
+    collect_static_exports_with_class_prefix(program, interner, seed, imported, None)
+}
+
+/// Library-mode variant whose generated CSS classes use a stable package-name prefix.
+pub fn collect_static_exports_with_class_prefix(
+    program: &Program,
+    interner: &Interner,
+    seed: &str,
+    imported: &value::Scope,
+    class_prefix: Option<&str>,
+) -> StaticExports {
     let bindings = BindingRegistry::collect(program, interner);
+    let frozen_calls = bindings.define_token_calls(program);
+    let mut out =
+        value::collect_static_exports_with_frozen_calls(program, interner, imported, &frozen_calls);
     if bindings.bindings.is_empty() {
         return out;
     }
     // 只有被 export 的编译期值才需登记，供下游模块安全静态求值。
     let exported = exported_names(program, interner);
-    for style in assign_style_names(program, interner, &bindings, seed) {
+    for style in assign_style_names(program, interner, &bindings, seed, class_prefix) {
         if let Some(exported_as) = style
             .export_as
             .as_ref()
@@ -623,6 +677,18 @@ pub fn transform(
     seed: &str,
     imported: &value::Scope,
 ) -> TransformResult {
+    transform_with_class_prefix(program, interner, source, seed, imported, None)
+}
+
+/// Library-mode variant whose generated CSS classes use a stable package-name prefix.
+pub fn transform_with_class_prefix(
+    program: &Program,
+    interner: &Interner,
+    source: &str,
+    seed: &str,
+    imported: &value::Scope,
+    class_prefix: Option<&str>,
+) -> TransformResult {
     let mut out = TransformResult::default();
 
     // 1) 以语义符号而非名字登记编译期 marker，支持 import alias 且正确处理局部遮蔽。
@@ -637,13 +703,21 @@ pub fn transform(
     // before this module executes. Until graph-wide provenance/mutation analysis is available,
     // propagate only copy-safe primitive/class/variable values across ESM.
     imported.retain(|_, value| !matches!(value, StaticValue::Obj(_) | StaticValue::Arr(_)));
-    let mut scope = value::collect_module_scope(program, interner, &imported);
+    let frozen_calls = bindings.define_token_calls(program);
+    let mut scope =
+        value::collect_module_scope_with_frozen_calls(program, interner, &imported, &frozen_calls);
+    out.diagnostics.extend(define_token_diagnostics(
+        program,
+        interner,
+        &scope,
+        &frozen_calls,
+    ));
     if bindings.structured_values_may_escape_through_user_tags(program) {
         scope.retain(|_, value| !matches!(value, StaticValue::Obj(_) | StaticValue::Arr(_)));
     }
 
     // 2′) 预分配 css/keyframes 名称，打破样式互相引用时的求值循环。
-    for style in assign_style_names(program, interner, &bindings, seed) {
+    for style in assign_style_names(program, interner, &bindings, seed, class_prefix) {
         scope.insert(style.local, value::StaticValue::Str(style.value));
     }
 
@@ -674,6 +748,7 @@ pub fn transform(
             bindings: &bindings,
             ctx: &ctx,
             seed,
+            class_prefix,
             out: &mut out,
             name_hint: None,
             counters: FxHashMap::default(),
@@ -730,6 +805,54 @@ pub fn transform(
         }
     }
     out
+}
+
+fn define_token_diagnostics(
+    program: &Program,
+    interner: &Interner,
+    scope: &value::Scope,
+    top_level_calls: &FxHashSet<Span>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for statement in program.body.iter() {
+        let declaration = match statement {
+            Statement::VariableDeclaration(declaration) => Some(*declaration),
+            Statement::ExportNamed(export) => export.declaration.and_then(|declaration| {
+                if let Statement::VariableDeclaration(declaration) = declaration {
+                    Some(declaration)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
+        let Some(declaration) = declaration else {
+            continue;
+        };
+        for declarator in declaration.declarations.iter() {
+            let (Pattern::Ident(identifier), Some(Expression::Call(call))) =
+                (&declarator.id, &declarator.init)
+            else {
+                continue;
+            };
+            if !top_level_calls.contains(&call.span) {
+                continue;
+            }
+            let local = interner.resolve(identifier.name);
+            if !matches!(scope.get(&local), Some(StaticValue::Frozen(_))) {
+                diagnostics.push(
+                    Diagnostic::error("defineTokens() 参数必须是可静态求值的纯对象或数组")
+                        .with_code("CRAB_CSS_DEFINE_TOKENS")
+                        .with_primary(
+                            call.span,
+                            "只支持纯字面量、静态常量和已冻结 token 的成员访问",
+                        )
+                        .with_note("Wake 不会执行函数、getter、构造器或项目模块来生成 token"),
+                );
+            }
+        }
+    }
+    diagnostics
 }
 
 struct CssInJsUsage<'a, 'b> {
@@ -856,15 +979,24 @@ fn cx_replacement(call: &CallExpression, source: &str) -> Option<String> {
 
 /// 名称身份由「schema + 规范化模块 id + API 种类 + binding 名 + 同名 ordinal」组成，刻意
 /// 不混入 CSS 内容。向文件前方插入另一个不同 binding 的样式不会让已有名称 churn。
-fn generated_name(kind: BindingKind, hint: &str, seed: &str, ordinal: u32) -> String {
+fn generated_name(
+    kind: BindingKind,
+    hint: &str,
+    seed: &str,
+    ordinal: u32,
+    class_prefix: Option<&str>,
+) -> String {
     const SCHEMA: &str = "crab-css-v1";
     let seed = normalize_style_seed(seed);
     let key = format!("{SCHEMA}\0{seed}\0{}\0{hint}\0{ordinal}", kind.slug());
-    format!(
-        "{}_{:012x}",
-        sanitize_ident(hint),
-        fnv1a64(&key) & 0x0000_ffff_ffff_ffff
-    )
+    let hash = fnv1a64(&key) & 0x0000_ffff_ffff_ffff;
+    if matches!(kind, BindingKind::Css | BindingKind::Keyframes)
+        && let Some(prefix) = class_prefix.filter(|prefix| !prefix.is_empty())
+    {
+        format!("{}-{hash:012x}", sanitize_ident(prefix).replace('_', "-"))
+    } else {
+        format!("{}_{hash:012x}", sanitize_ident(hint))
+    }
 }
 
 fn normalize_style_seed(seed: &str) -> String {
@@ -899,11 +1031,13 @@ fn assign_style_names(
     interner: &Interner,
     bindings: &BindingRegistry,
     seed: &str,
+    class_prefix: Option<&str>,
 ) -> Vec<AssignedStyle> {
     let mut assigner = NameAssigner {
         interner,
         bindings,
         seed,
+        class_prefix,
         out: Vec::new(),
         name_hint: None,
         counters: FxHashMap::default(),
@@ -916,6 +1050,7 @@ struct NameAssigner<'a> {
     interner: &'a Interner,
     bindings: &'a BindingRegistry,
     seed: &'a str,
+    class_prefix: Option<&'a str>,
     out: Vec<AssignedStyle>,
     name_hint: Option<(String, Span)>,
     counters: FxHashMap<String, u32>,
@@ -970,7 +1105,8 @@ impl<'ast> Visit<'ast> for NameAssigner<'_> {
                 .map(|(name, _)| name.as_str())
                 .unwrap_or(fallback);
             let ordinal = next_ordinal(&mut self.counters, binding.kind, hint);
-            let generated = generated_name(binding.kind, hint, self.seed, ordinal);
+            let generated =
+                generated_name(binding.kind, hint, self.seed, ordinal, self.class_prefix);
             if let Some((local, declaration)) = self.name_hint.clone() {
                 self.out.push(AssignedStyle {
                     local,
@@ -1038,7 +1174,7 @@ fn assign_create_vars(
                 continue;
             }
             let local = interner.resolve(identifier.name);
-            let slug = generated_name(BindingKind::CreateVar, &local, seed, 0);
+            let slug = generated_name(BindingKind::CreateVar, &local, seed, 0, None);
             out.push(AssignedVariable {
                 local,
                 declaration: identifier.span,
@@ -1055,6 +1191,7 @@ struct Collector<'a, 'b> {
     bindings: &'a BindingRegistry,
     ctx: &'a value::EvalCtx<'a>,
     seed: &'a str,
+    class_prefix: Option<&'a str>,
     out: &'b mut TransformResult,
     name_hint: Option<String>,
     counters: FxHashMap<String, u32>,
@@ -1190,7 +1327,8 @@ impl Collector<'_, '_> {
                 };
                 let hint = self.name_hint.as_deref().unwrap_or(fallback);
                 let ordinal = next_ordinal(&mut self.counters, binding.kind, hint);
-                let generated = generated_name(binding.kind, hint, self.seed, ordinal);
+                let generated =
+                    generated_name(binding.kind, hint, self.seed, ordinal, self.class_prefix);
                 if binding.kind == BindingKind::Css {
                     self.out.css.push_str(&nesting::flatten_tree(
                         &format!(".{generated}"),

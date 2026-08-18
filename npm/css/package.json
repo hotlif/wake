@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/css",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Type-safe, zero-runtime CSS authoring for Wake",
   "keywords": [
     "css",

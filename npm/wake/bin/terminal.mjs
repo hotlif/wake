@@ -87,6 +87,16 @@ export function formatBuildResult(ui, result, label = 'Built', extra = '') {
   return lines
 }
 
+export function formatGeneratorResult(ui, result, label) {
+  const bytes = (result.files || []).reduce((sum, file) => sum + Number(file.bytes || 0), 0)
+  return [
+    `  ${ui.ok('✓')}  ${ui.bold(label)} ${ui.accent(`in ${humanDuration(result.durationMs)}`)}`,
+    `     ${(result.files || []).length} ${ui.dim('files')} ${ui.dim('·')} ${ui.accent(humanBytes(bytes))}`,
+    `     ${ui.dim('Output')}  ${ui.accent(result.outputFile)}`,
+    '',
+  ]
+}
+
 export function formatServerReady(ui, url, metrics) {
   const lines = [
     `  ${ui.ok('✓')}  ${ui.bold('Development server ready')}`,

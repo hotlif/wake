@@ -70,25 +70,28 @@ pub enum PnpError {
 }
 
 impl PnpManifest {
+    /// 查找 `dir` 所属的 Yarn PnP 项目根目录。
+    ///
+    /// 根发现与清单解析分离，使需要缓存解析上下文的产品边缘可以用稳定的项目根作为 key，
+    /// 同时仍由 resolver 唯一拥有 `.pnp.cjs` 的发现规则。
+    pub fn discover_root(fs: &dyn FileSystem, start_dir: &Path) -> Option<PathBuf> {
+        let mut dir = normalize(start_dir);
+        loop {
+            if fs.is_file(&dir.join(".pnp.cjs")) {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                return fs.is_file(Path::new(".pnp.cjs")).then(PathBuf::new);
+            }
+        }
+    }
+
     /// 若 `dir`（含各祖先目录）存在 `.pnp.cjs`/`.pnp.data.json`，加载并返回（清单, pnp_root 相对 cwd 路径）。
     ///
     /// `start_dir` 应为入口文件所在目录（相对 cwd）。逐级上溯查找。
     pub fn discover(fs: &dyn FileSystem, start_dir: &Path) -> Option<PnpManifest> {
-        let mut dir = normalize(start_dir);
-        loop {
-            let cjs = dir.join(".pnp.cjs");
-            if fs.is_file(&cjs) {
-                return PnpManifest::load(fs, &dir);
-            }
-            if !dir.pop() {
-                // 到达相对根后再试一次 cwd 本身（空路径）。
-                let cjs = Path::new(".pnp.cjs");
-                if fs.is_file(cjs) {
-                    return PnpManifest::load(fs, Path::new(""));
-                }
-                return None;
-            }
-        }
+        let root = PnpManifest::discover_root(fs, start_dir)?;
+        PnpManifest::load(fs, &root)
     }
 
     /// 从 `pnp_root` 目录（相对 cwd）加载清单。

@@ -140,6 +140,160 @@ fn bundle_writes_exact_node_commonjs_outfile_without_web_outputs() {
 }
 
 #[test]
+fn library_token_generates_configured_typescript_and_fails_strictly() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("wake_cli_token_{}_{}", std::process::id(), unique));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("design.toml"),
+        "[build]\noutput='./src/token.ts'\nprefix='demo'\n[token]\ncolor='red'\n",
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args([
+            "--ui",
+            "plain",
+            "library",
+            "token",
+            root.to_str().unwrap(),
+            "--config",
+            "design.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let generated = std::fs::read_to_string(root.join("src/token.ts")).unwrap();
+    assert!(generated.contains("--demo-color"), "{generated}");
+
+    std::fs::write(
+        root.join("design.toml"),
+        "[build]\noutput='./src/token.ts'\nprefix='demo'\n[token]\ncolor='$ref(missing)'\n",
+    )
+    .unwrap();
+    let failed = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args([
+            "--ui",
+            "plain",
+            "library",
+            "token",
+            root.to_str().unwrap(),
+            "--config",
+            "design.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("WAKE_TOKEN_REF"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/token.ts")).unwrap(),
+        generated
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn library_docgen_generates_public_json_and_preserves_it_on_failure() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("wake_cli_docgen_{}_{}", std::process::id(), unique));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"name":"demo"}"#).unwrap();
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export { default } from './button.js';",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/button.tsx"),
+        "interface Props { label: string; }\nconst Button = (props: Props) => null;\nexport default Button;\n",
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["--ui", "plain", "library", "docgen", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = root.join("public/docgen.json");
+    let generated = std::fs::read_to_string(&output).unwrap();
+    assert!(generated.contains("./src/button.tsx"), "{generated}");
+    assert!(
+        generated.contains("\"displayName\":\"Button\""),
+        "{generated}"
+    );
+
+    std::fs::write(root.join("src/index.ts"), "export default Missing;").unwrap();
+    let failed = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["--ui", "plain", "library", "docgen", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("WAKE_DOCGEN_ENTRY"));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), generated);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn library_build_emits_packify_compatible_entry_paths() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "wake_cli_library_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"@demo/button","type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import Button from './button.js';\nexport type { ButtonProps } from './button.js';\nexport default Button;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/button.tsx"),
+        "import type { FC } from 'react';\nexport interface ButtonProps { label: string; }\nconst Button: FC<ButtonProps> = (props) => <button>{props.label}</button>;\nexport default Button;\n",
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["--ui", "plain", "library", "build", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(root.join("esm/index.mjs").is_file());
+    assert!(root.join("cjs/index.cjs").is_file());
+    assert!(root.join("declarations/index.d.ts").is_file());
+    assert!(!root.join("css").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn bundle_missing_outfile_is_a_usage_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_wake"))
         .args(["bundle", fixture_file().to_str().unwrap()])

@@ -46,6 +46,12 @@ dependency-aware static export collection and compiler analysis for the saved mo
 reverse importers. Revision checks prevent stale results from being published. Closing or deleting a
 document clears its diagnostics.
 
+Workspace dependency resolution follows the nearest project context. Node-style projects use the
+ordinary filesystem resolver; Yarn Plug'n'Play projects discovered through `.pnp.cjs` use the PnP
+manifest and PnP filesystem, including content-addressed zip entries. Both paths feed resolved
+modules into the same compiler static-export collector, so `defineTokens` provenance and
+`CRAB_CSS_*` diagnostics cannot diverge between build and editor analysis.
+
 ## Configuration
 
 - `crabCss.enable`: boolean, default `true`.

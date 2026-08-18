@@ -40,6 +40,22 @@ export type ClassValue =
 
 export type CSSVariableStyles = Record<string, string | number>
 
+export type TokenPrimitive = string | number | boolean | null | undefined
+
+export type TokenValue =
+  | TokenPrimitive
+  | { readonly [key: string]: TokenValue }
+  | readonly TokenValue[]
+
+export type DeepReadonlyToken<T> =
+  T extends TokenPrimitive
+    ? T
+    : T extends readonly unknown[]
+      ? { readonly [K in keyof T]: DeepReadonlyToken<T[K]> }
+      : T extends object
+        ? { readonly [K in keyof T]: DeepReadonlyToken<T[K]> }
+        : never
+
 /**
  * Declares a scoped class. Wake replaces this template tag with a ClassName
  * and extracts its CSS during compilation.
@@ -69,6 +85,9 @@ export declare function globalStyle(
   strings: TemplateStringsArray,
   ...interpolations: readonly CSSInterpolation[]
 ): void
+
+/** Marks a recursively pure token structure as deeply immutable for safe ESM propagation. */
+export declare function defineTokens<const T extends TokenValue>(value: T): DeepReadonlyToken<T>
 
 /** Creates a realm-unique `var(--custom-property)` reference. */
 export declare function createVar(debugName?: string): CSSVar

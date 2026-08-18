@@ -7,8 +7,10 @@ use wake_common::{Diagnostic, Interner, Severity, SourceFile, Span};
 use wake_css::syntax::{
     CssBlockKind, CssSyntaxContext, CssSyntaxKind, CssSyntaxNode, CssSyntaxTree,
 };
-use wake_css_in_js::value::{Scope, StaticExports, collect_imports, collect_static_exports_with};
-use wake_css_in_js::{CssTemplateKind, discover_css_templates, transform};
+use wake_css_in_js::value::{Scope, StaticExports, collect_imports};
+use wake_css_in_js::{
+    CssTemplateKind, collect_static_exports_with, discover_css_templates, transform,
+};
 use wake_ecma_ast::SourceType;
 use wake_ecma_parser::{ParseOutput, parse};
 
@@ -210,9 +212,9 @@ impl LanguageDocument {
     }
 
     pub fn static_exports(&self, imported: &Scope) -> StaticExports {
-        self.parsed
-            .module
-            .with_ast(|program| collect_static_exports_with(program, &self.interner, imported))
+        self.parsed.module.with_ast(|program| {
+            collect_static_exports_with(program, &self.interner, self.source.name(), imported)
+        })
     }
 
     pub fn completions(&self, host_offset: u32) -> Vec<Completion> {

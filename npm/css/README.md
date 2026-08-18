@@ -78,6 +78,27 @@ const style = assignVars({
 })
 ```
 
+## Immutable design tokens
+
+Use `defineTokens` for nested token structures that are interpolated from another module. Wake
+recognizes only a direct top-level `const` initialized through this imported helper; the argument
+must contain statically evaluable plain objects, arrays, and primitive values.
+
+```ts
+import { css, defineTokens } from '@crab-dev/css'
+
+export const tokens = defineTokens({
+  color: { accent: 'rebeccapurple' },
+})
+
+export const button = css`
+  color: ${tokens.color.accent};
+`
+```
+
+The return type is deeply readonly and the runtime value is deeply frozen. Ordinary mutable
+objects do not acquire this cross-module compiler guarantee.
+
 ## Compile-time contract
 
 `css`, `keyframes`, and `globalStyle` must be used as direct tagged templates

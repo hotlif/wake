@@ -11,13 +11,13 @@ use tokio::time::{Duration, sleep};
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
-use wake_common::{OsFileSystem, SourceFile, Span};
+use wake_common::{FileSystem, OsFileSystem, SourceFile, Span};
 use wake_css_in_js::value::Scope;
 use wake_css_language::{
     CompletionKind as CssCompletionKind, HostLanguage, LanguageDiagnostic, LanguageDocument,
     LanguageSeverity, SemanticKind, TextEdit as CssTextEdit,
 };
-use wake_resolver::Resolver;
+use wake_resolver::{PnpFileSystem, PnpManifest, Resolver};
 
 const LIVE_DEBOUNCE: Duration = Duration::from_millis(150);
 const CLOSED_CACHE_ENTRIES: usize = 512;
@@ -115,6 +115,12 @@ impl DependencyCache {
         Some(analysis)
     }
 
+    fn get_immutable(&mut self, path: &Path) -> Option<Arc<LanguageDocument>> {
+        let analysis = Arc::clone(&self.entries.get(path)?.analysis);
+        self.touch(path);
+        Some(analysis)
+    }
+
     fn insert(&mut self, path: PathBuf, entry: CachedDependency) {
         self.remove(&path);
         self.source_bytes += entry.source_len;
@@ -141,18 +147,37 @@ impl DependencyCache {
         self.order.retain(|candidate| candidate != path);
         self.order.push_back(path.to_path_buf());
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.source_bytes = 0;
+    }
+}
+
+struct ResolverContext {
+    fs: Arc<dyn FileSystem>,
+    resolver: Resolver,
 }
 
 struct WorkspaceAnalyzer {
-    resolver: Resolver,
+    os_fs: Arc<dyn FileSystem>,
+    default_context: Arc<ResolverContext>,
+    pnp_contexts: Mutex<HashMap<PathBuf, Arc<ResolverContext>>>,
     cache: Mutex<DependencyCache>,
     reverse_imports: Mutex<HashMap<PathBuf, HashSet<PathBuf>>>,
 }
 
 impl WorkspaceAnalyzer {
     fn new() -> Self {
+        let os_fs: Arc<dyn FileSystem> = Arc::new(OsFileSystem);
         Self {
-            resolver: Resolver::new(Arc::new(OsFileSystem)),
+            default_context: Arc::new(ResolverContext {
+                fs: Arc::clone(&os_fs),
+                resolver: Resolver::new(Arc::clone(&os_fs)),
+            }),
+            os_fs,
+            pnp_contexts: Mutex::new(HashMap::new()),
             cache: Mutex::new(DependencyCache::default()),
             reverse_imports: Mutex::new(HashMap::new()),
         }
@@ -164,7 +189,34 @@ impl WorkspaceAnalyzer {
         document: &LanguageDocument,
         open: &HashMap<PathBuf, Arc<LanguageDocument>>,
     ) -> Scope {
-        self.imported_scope_inner(path, document, open, &mut HashSet::new(), 0)
+        let context = self.resolver_context(path);
+        self.imported_scope_inner(path, document, open, &context, &mut HashSet::new(), 0)
+    }
+
+    fn resolver_context(&self, path: &Path) -> Arc<ResolverContext> {
+        let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let Some(root) = PnpManifest::discover_root(self.os_fs.as_ref(), from_dir) else {
+            return Arc::clone(&self.default_context);
+        };
+        if let Some(context) = self
+            .pnp_contexts
+            .lock()
+            .expect("PnP resolver context lock")
+            .get(&root)
+            .cloned()
+        {
+            return context;
+        }
+        let Some(manifest) = PnpManifest::load(self.os_fs.as_ref(), &root) else {
+            return Arc::clone(&self.default_context);
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(PnpFileSystem::new(Arc::clone(&self.os_fs)));
+        let context = Arc::new(ResolverContext {
+            resolver: Resolver::with_pnp(Arc::clone(&fs), Arc::new(manifest)),
+            fs,
+        });
+        let mut contexts = self.pnp_contexts.lock().expect("PnP resolver context lock");
+        Arc::clone(contexts.entry(root).or_insert(context))
     }
 
     fn imported_scope_inner(
@@ -172,6 +224,7 @@ impl WorkspaceAnalyzer {
         path: &Path,
         document: &LanguageDocument,
         open: &HashMap<PathBuf, Arc<LanguageDocument>>,
+        context: &ResolverContext,
         visiting: &mut HashSet<PathBuf>,
         depth: usize,
     ) -> Scope {
@@ -184,7 +237,7 @@ impl WorkspaceAnalyzer {
             if import.specifier == "@crab-dev/css" || import.imported == "*" {
                 continue;
             }
-            let Ok(dependency_path) = self.resolver.resolve(&import.specifier, from_dir) else {
+            let Ok(dependency_path) = context.resolver.resolve(&import.specifier, from_dir) else {
                 continue;
             };
             self.reverse_imports
@@ -196,12 +249,18 @@ impl WorkspaceAnalyzer {
             let dependency = open
                 .get(&dependency_path)
                 .cloned()
-                .or_else(|| self.load_dependency(&dependency_path));
+                .or_else(|| self.load_dependency(&dependency_path, context));
             let Some(dependency) = dependency else {
                 continue;
             };
-            let dependency_scope =
-                self.imported_scope_inner(&dependency_path, &dependency, open, visiting, depth + 1);
+            let dependency_scope = self.imported_scope_inner(
+                &dependency_path,
+                &dependency,
+                open,
+                context,
+                visiting,
+                depth + 1,
+            );
             let exports = dependency.static_exports(&dependency_scope);
             if let Some(value) = exports.get(&import.imported) {
                 imported.insert(import.local, value.clone());
@@ -211,19 +270,36 @@ impl WorkspaceAnalyzer {
         imported
     }
 
-    fn load_dependency(&self, path: &Path) -> Option<Arc<LanguageDocument>> {
-        let metadata = std::fs::metadata(path).ok()?;
-        let modified = metadata.modified().ok();
-        let source_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-        if let Some(cached) = self
+    fn load_dependency(
+        &self,
+        path: &Path,
+        context: &ResolverContext,
+    ) -> Option<Arc<LanguageDocument>> {
+        let metadata = std::fs::metadata(path).ok();
+        if let Some(metadata) = &metadata {
+            let modified = metadata.modified().ok();
+            let source_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if let Some(cached) = self
+                .cache
+                .lock()
+                .expect("dependency cache lock")
+                .get(path, modified, source_len)
+            {
+                return Some(cached);
+            }
+        } else if let Some(cached) = self
             .cache
             .lock()
             .expect("dependency cache lock")
-            .get(path, modified, source_len)
+            .get_immutable(path)
         {
+            // Yarn cache archives are content-addressed. Workspace files remain ordinary files and
+            // take the metadata-validated branch above; zip entries are immutable for this context.
             return Some(cached);
         }
-        let source = std::fs::read_to_string(path).ok()?;
+        let source = context.fs.read_to_string(path).ok()?;
+        let source_len = source.len();
+        let modified = metadata.and_then(|metadata| metadata.modified().ok());
         let language = language_from_path(path)?;
         let analysis = Arc::new(LanguageDocument::analyze(
             path.to_string_lossy(),
@@ -242,10 +318,22 @@ impl WorkspaceAnalyzer {
     }
 
     fn invalidate(&self, path: &Path) {
-        self.cache
-            .lock()
-            .expect("dependency cache lock")
-            .remove(path);
+        let pnp_manifest_changed = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, ".pnp.cjs" | ".pnp.data.json"));
+        if pnp_manifest_changed {
+            self.pnp_contexts
+                .lock()
+                .expect("PnP resolver context lock")
+                .clear();
+            self.cache.lock().expect("dependency cache lock").clear();
+        } else {
+            self.cache
+                .lock()
+                .expect("dependency cache lock")
+                .remove(path);
+        }
     }
 
     fn affected_paths(&self, changed: &Path) -> HashSet<PathBuf> {
@@ -1164,6 +1252,103 @@ mod tests {
                 .is_empty()
         );
         assert!(workspace.affected_paths(&tokens).contains(&component));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn saved_analysis_resolves_static_exports_from_pnp_workspace_packages() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("wake-css-lsp-pnp-{unique}"));
+        let button = root.join("packages/button");
+        let spin = root.join("packages/spin");
+        std::fs::create_dir_all(button.join("src")).unwrap();
+        std::fs::create_dir_all(spin.join("esm")).unwrap();
+        std::fs::write(root.join(".pnp.cjs"), "").unwrap();
+        std::fs::write(
+            root.join(".pnp.data.json"),
+            r#"{
+                "enableTopLevelFallback": false,
+                "fallbackExclusionList": [],
+                "fallbackPool": [],
+                "packageRegistryData": [
+                    [null, [[null, {
+                        "packageLocation": "./",
+                        "packageDependencies": [["@crab-dev/rc-button", "workspace:packages/button"]],
+                        "linkType": "SOFT"
+                    }]]],
+                    ["@crab-dev/rc-button", [["workspace:packages/button", {
+                        "packageLocation": "./packages/button/",
+                        "packageDependencies": [
+                            ["@crab-dev/rc-button", "workspace:packages/button"],
+                            ["@crab-dev/rc-spin", "workspace:packages/spin"]
+                        ],
+                        "linkType": "SOFT"
+                    }]]],
+                    ["@crab-dev/rc-spin", [["workspace:packages/spin", {
+                        "packageLocation": "./packages/spin/",
+                        "packageDependencies": [["@crab-dev/rc-spin", "workspace:packages/spin"]],
+                        "linkType": "SOFT"
+                    }]]]
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            spin.join("package.json"),
+            r#"{"exports":{".":{"import":"./esm/index.mjs"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            spin.join("esm/index.mjs"),
+            "import { defineTokens } from '@crab-dev/css'; const v = defineTokens({'ring.indicator-color': '--spin-ring-indicator-color'}); export { v as vars };",
+        )
+        .unwrap();
+        let component = button.join("src/button.tsx");
+        let source = "import { css } from '@crab-dev/css';\n\
+            import { vars as spinVars } from '@crab-dev/rc-spin';\n\
+            export const loading = css`${spinVars['ring.indicator-color']}: currentColor;`;";
+        std::fs::write(&component, source).unwrap();
+        let document = Arc::new(LanguageDocument::analyze(
+            component.to_string_lossy(),
+            source,
+            HostLanguage::TypeScriptReact,
+        ));
+        let workspace = WorkspaceAnalyzer::new();
+        let context = workspace.resolver_context(&component);
+        let resolved = context
+            .resolver
+            .resolve("@crab-dev/rc-spin", component.parent().unwrap());
+        let expected = spin.join("esm/index.mjs");
+        assert_eq!(resolved.as_deref(), Ok(expected.as_path()));
+        let dependency = workspace.load_dependency(&expected, &context).unwrap();
+        let exports = dependency.static_exports(&Scope::default());
+        assert!(
+            matches!(exports.get("vars"), Some(StaticValue::Frozen(_))),
+            "defineTokens export must be frozen: {exports:?}"
+        );
+        let open = HashMap::from([(component.clone(), Arc::clone(&document))]);
+        let imported = workspace.imported_scope(&component, &document, &open);
+        assert!(
+            matches!(imported.get("spinVars"), Some(StaticValue::Frozen(_))),
+            "PnP workspace export must enter the compiler scope: {imported:?}"
+        );
+        assert!(
+            document
+                .compiler_diagnostics(&component.to_string_lossy(), &imported)
+                .is_empty(),
+            "PnP workspace static interpolation must not be reported as dynamic"
+        );
+        assert_eq!(
+            workspace
+                .pnp_contexts
+                .lock()
+                .expect("PnP resolver context lock")
+                .len(),
+            1
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

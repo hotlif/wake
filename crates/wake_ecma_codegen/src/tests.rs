@@ -5,7 +5,9 @@ use wake_ecma_ast::SourceType;
 use wake_ecma_minify::MinifyCtx;
 use wake_ecma_parser::parse;
 
-use crate::codegen;
+use crate::{
+    ModuleSpecifierRewriter, PreserveModuleFormat, codegen, codegen_preserved_module_mangled,
+};
 
 fn directive_helper_program(interner: &Interner) -> wake_ecma_ast::ModuleAst {
     use wake_common::Span;
@@ -2291,4 +2293,64 @@ fn unused_using_declaration_is_never_eliminated() {
         !js.contains("deadConst"),
         "对照组未被消除，本用例没走到消除路径:\n{js}"
     );
+}
+
+struct ExtensionRewriter(&'static str);
+
+impl ModuleSpecifierRewriter for ExtensionRewriter {
+    fn rewrite(&self, specifier: &str) -> Option<String> {
+        specifier
+            .starts_with('.')
+            .then(|| format!("{}{}", specifier.trim_end_matches(".js"), self.0))
+    }
+}
+
+fn preserved_module(source: &str, format: PreserveModuleFormat, extension: &'static str) -> String {
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    parsed.module.with_ast(|program| {
+        codegen_preserved_module_mangled(
+            program,
+            &interner,
+            format,
+            &ExtensionRewriter(extension),
+            &[],
+            false,
+            None,
+            None,
+            false,
+        )
+    })
+}
+
+#[test]
+fn preserved_modules_rewrite_every_module_edge_without_a_wake_runtime() {
+    let source = r#"
+import value, { named as local } from "./dep.js";
+export { item } from "./other.js";
+export * from "external";
+export const legacy = require("./legacy.js");
+export async function load() { return import("./lazy.js"); }
+export default value + local;
+"#;
+
+    let esm = preserved_module(source, PreserveModuleFormat::EsModule, ".mjs");
+    assert!(esm.contains("from \"./dep.mjs\""), "{esm}");
+    assert!(esm.contains("from \"./other.mjs\""), "{esm}");
+    assert!(esm.contains("from \"external\""), "{esm}");
+    assert!(esm.contains("require(\"./legacy.mjs\")"), "{esm}");
+    assert!(esm.contains("import(\"./lazy.mjs\")"), "{esm}");
+    assert!(esm.contains("export default"), "{esm}");
+    assert!(!esm.contains("__wake_"), "{esm}");
+    assert!(!esm.contains("Object.defineProperty(exports"), "{esm}");
+
+    let cjs = preserved_module(source, PreserveModuleFormat::CommonJs, ".cjs");
+    assert!(cjs.contains("require(\"./dep.cjs\")"), "{cjs}");
+    assert!(cjs.contains("require(\"./other.cjs\")"), "{cjs}");
+    assert!(cjs.contains("require(\"external\")"), "{cjs}");
+    assert!(cjs.contains("require(\"./legacy.cjs\")"), "{cjs}");
+    assert!(cjs.contains("import(\"./lazy.cjs\")"), "{cjs}");
+    assert!(cjs.contains("exports.default"), "{cjs}");
+    assert!(!cjs.contains("__wake_modules__"), "{cjs}");
 }

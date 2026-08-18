@@ -64,7 +64,7 @@ pages = ["reference/configuration/project", "reference/configuration/dev-server"
 [[group.section]]
 id = "cli"
 title = "CLI"
-pages = ["reference/cli/build", "reference/cli/bundle", "reference/cli/dev", "reference/cli/docs"]
+pages = ["reference/cli/build", "reference/cli/bundle", "reference/cli/library", "reference/cli/dev", "reference/cli/docs"]
 
 [[group.section]]
 id = "node-api"

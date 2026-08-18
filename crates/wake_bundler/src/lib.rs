@@ -15,6 +15,7 @@ use wake_ecma_codegen::ModuleLinker;
 
 mod chunk;
 pub mod incremental;
+pub mod library;
 mod loader;
 mod session;
 pub use incremental::IncrementalBundler;

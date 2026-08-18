@@ -25,6 +25,50 @@ export function globalStyle() {
   return compilerOnly('globalStyle')
 }
 
+export function defineTokens(value) {
+  if (value === null || typeof value !== 'object') {
+    throw new TypeError('@crab-dev/css: defineTokens expects a plain object or array.')
+  }
+
+  const pending = [value]
+  const seen = new WeakSet()
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (seen.has(current)) continue
+    seen.add(current)
+
+    const prototype = Object.getPrototypeOf(current)
+    const plainObject = prototype === null || Object.getPrototypeOf(prototype) === null
+    if (!Array.isArray(current) && !plainObject) {
+      throw new TypeError('@crab-dev/css: defineTokens accepts only plain objects and arrays.')
+    }
+
+    const descriptors = Object.getOwnPropertyDescriptors(current)
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key === 'symbol') {
+        throw new TypeError('@crab-dev/css: defineTokens does not accept symbol keys.')
+      }
+      const descriptor = descriptors[key]
+      if ('get' in descriptor || 'set' in descriptor) {
+        throw new TypeError('@crab-dev/css: defineTokens does not accept accessors.')
+      }
+      const item = descriptor.value
+      if (item === null) {
+        continue
+      } else if (typeof item === 'object') {
+        pending.push(item)
+      } else if (
+        !['string', 'number', 'boolean', 'undefined'].includes(typeof item) ||
+        (typeof item === 'number' && !Number.isFinite(item))
+      ) {
+        throw new TypeError('@crab-dev/css: defineTokens contains an unsupported value.')
+      }
+    }
+    Object.freeze(current)
+  }
+  return value
+}
+
 export function cx(...values) {
   const classes = []
   const pending = values.slice().reverse()

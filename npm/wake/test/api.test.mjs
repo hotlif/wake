@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { access, appendFile, cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -13,9 +13,12 @@ import { assertComponentsRuntime } from '../../../scripts/components-runtime-smo
 import {
   WakeError,
   build,
+  buildLibrary,
   buildDocs,
   bundle,
   createBuildContext,
+  generateCssToken,
+  generateDocgen,
   startDevServer,
   startDocsDevServer,
   version,
@@ -37,6 +40,50 @@ test('loads the same API from ESM and CommonJS', () => {
   assert.equal(version(), packageVersion)
   assert.equal(commonjs.version(), version())
   assert.equal(typeof commonjs.build, 'function')
+  assert.equal(typeof commonjs.buildLibrary, 'function')
+  assert.equal(typeof commonjs.generateCssToken, 'function')
+  assert.equal(typeof commonjs.generateDocgen, 'function')
+})
+
+test('generates native design tokens with strict references', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-token-'))
+  await writeFile(join(cwd, 'token.toml'), `[build]\noutput='./src/token.ts'\nprefix='demo'\n[token]\ncolor='red'\n`)
+  const result = await generateCssToken({ cwd })
+  assert.equal(result.success, true)
+  assert.equal(result.outputFile, join(cwd, 'src', 'token.ts'))
+  assert.match(await readFile(result.outputFile, 'utf8'), /--demo-color/)
+  await rm(cwd, { recursive: true, force: true })
+})
+
+test('generates native component docgen with deterministic output', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-docgen-'))
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'package.json'), '{"docgen":{"entry":"./src/button.tsx"}}')
+  await writeFile(join(cwd, 'src', 'button.tsx'), '/** Button docs. */\nexport default function Button(props: ButtonProps) { return null }\n/** Public props. */\ninterface ButtonProps { /** Label. */ label: string }\n')
+  const result = await generateDocgen({ cwd })
+  assert.equal(result.success, true)
+  const docgen = JSON.parse(await readFile(result.outputFile, 'utf8'))
+  assert.equal(docgen['./src/button.tsx'][0].displayName, 'Button')
+  assert.equal(docgen['./src/button.tsx'][0].props.label.required, true)
+  await rm(cwd, { recursive: true, force: true })
+})
+
+test('builds native component-library entry contracts', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-library-'))
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'package.json'), '{"name":"@demo/button","type":"module"}')
+  await writeFile(join(cwd, 'src', 'index.ts'), "import Button from './button.js';\nexport type { ButtonProps } from './button.js';\nexport default Button;\n")
+  await writeFile(join(cwd, 'src', 'button.tsx'), "import type { FC } from 'react';\nexport interface ButtonProps { label: string; }\nconst Button: FC<ButtonProps> = (props) => <button>{props.label}</button>;\nexport default Button;\n")
+  const result = await buildLibrary({ cwd })
+  assert.equal(result.success, true)
+  assert.equal(result.esmEntry, join(cwd, 'esm', 'index.mjs'))
+  assert.equal(result.cjsEntry, join(cwd, 'cjs', 'index.cjs'))
+  assert.equal(result.declarationEntry, join(cwd, 'declarations', 'index.d.ts'))
+  assert.equal(result.cssEntry, undefined)
+  await access(result.esmEntry)
+  await access(result.cjsEntry)
+  await access(result.declarationEntry)
+  await rm(cwd, { recursive: true, force: true })
 })
 
 test('reports platform details when the optional native package is missing', () => {

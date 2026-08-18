@@ -140,6 +140,9 @@ await server.waitUntilClosed();
 公开 API 还包括：
 
 - `bundle()`：在内存中生成 bundle；
+- `buildLibrary()`：原生生成组件库 ESM、CommonJS、声明和可选 CSS 发布产物；
+- `generateCssToken()`：从 `token.toml` 严格生成组件 token TypeScript；
+- `generateDocgen()`：原生生成兼容 react-docgen 消费结构的组件 API 文档；
 - `createBuildContext()`：创建可重复增量构建的上下文；
 - `buildDocs()` 和 `startDocsDevServer()`：构建或开发文档站；
 - `WakeError`：提供稳定错误码、路径和结构化诊断。

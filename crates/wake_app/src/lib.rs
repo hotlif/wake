@@ -25,6 +25,12 @@ use wake_common::{Diagnostic, OsFileSystem};
 pub use wake_docs::DocsMode;
 use wake_ecma_transform::{BrowserTarget, TargetEnv};
 
+mod library;
+pub use library::{
+    GenerateCssTokenOptions, GenerateCssTokenResult, GenerateDocgenOptions, GenerateDocgenResult,
+    LibraryBuildOptions, LibraryBuildResult, build_library, generate_css_token, generate_docgen,
+};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize)]

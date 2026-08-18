@@ -11,7 +11,7 @@
 //! // css`padding: ${token.a.b};`
 //! ```
 
-use wake_common::{FxHashMap, Interner};
+use wake_common::{FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
 
 /// 一个可在构建期确定的值。
@@ -25,9 +25,18 @@ pub enum StaticValue {
     /// 对象：**保序**（用 Vec 而非 HashMap），以便产物确定性。
     Obj(Vec<(String, StaticValue)>),
     Arr(Vec<StaticValue>),
+    /// 由 `@crab-dev/css#defineTokens` 显式建立的深度不可变结构值。
+    ///
+    /// 该 provenance 只能由语义绑定识别后的顶层 marker 调用创建，普通对象不能自行升级。
+    Frozen(Box<StaticValue>),
 }
 
 impl StaticValue {
+    pub fn frozen(value: StaticValue) -> Option<StaticValue> {
+        matches!(value, StaticValue::Obj(_) | StaticValue::Arr(_))
+            .then(|| StaticValue::Frozen(Box::new(value)))
+    }
+
     /// **JS 模板字符串拼接**时的文本形式（如求值 `` `var(${vars.x}, 8px)` ``）。
     ///
     /// 与 [`StaticValue::to_css`] 的分工：本方法模拟 JS 的字符串拼接，只接受原始值；
@@ -42,6 +51,7 @@ impl StaticValue {
             StaticValue::Num(n) if n.is_finite() => Some(format_number(*n)),
             StaticValue::Num(_) => None,
             StaticValue::Bool(b) => Some(b.to_string()),
+            StaticValue::Frozen(value) => value.to_css_text(),
             // null/undefined/对象/数组插进 CSS 只会产生垃圾文本（JS 会得到 "[object Object]"），
             // 视为求值失败，由调用方报警跳过该声明。
             _ => None,
@@ -62,6 +72,7 @@ impl StaticValue {
             StaticValue::Num(n) if n.is_finite() => Some(format_number(*n)),
             StaticValue::Num(_) => None,
             StaticValue::Bool(b) => Some(b.to_string()),
+            StaticValue::Frozen(value) => value.to_css(),
             StaticValue::Arr(items) => {
                 let mut parts = Vec::with_capacity(items.len());
                 for it in items {
@@ -105,6 +116,7 @@ impl StaticValue {
         match self {
             StaticValue::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             StaticValue::Arr(items) => key.parse::<usize>().ok().and_then(|i| items.get(i)),
+            StaticValue::Frozen(value) => value.get(key),
             _ => None,
         }
     }
@@ -147,6 +159,7 @@ impl std::hash::Hash for StaticValue {
             StaticValue::Bool(value) => value.hash(state),
             StaticValue::Obj(entries) => entries.hash(state),
             StaticValue::Arr(items) => items.hash(state),
+            StaticValue::Frozen(value) => value.hash(state),
             StaticValue::Null | StaticValue::Undefined => {}
         }
     }
@@ -350,17 +363,23 @@ pub fn eval(expr: &Expression, ctx: &EvalCtx) -> Option<StaticValue> {
                         }
                     }
                     // `{ ...base, x: 1 }`：base 可求值为对象时展开，否则失败。
-                    ObjectMember::Spread(s) => match eval(&s.argument, ctx)? {
-                        StaticValue::Obj(inner) => {
-                            for (k, v) in inner {
-                                match entries.iter_mut().find(|(ek, _)| *ek == k) {
-                                    Some(slot) => slot.1 = v,
-                                    None => entries.push((k, v)),
-                                }
+                    ObjectMember::Spread(s) => {
+                        let spread = eval(&s.argument, ctx)?;
+                        let inner = match spread {
+                            StaticValue::Obj(inner) => inner,
+                            StaticValue::Frozen(value) => match *value {
+                                StaticValue::Obj(inner) => inner,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        for (k, v) in inner {
+                            match entries.iter_mut().find(|(ek, _)| *ek == k) {
+                                Some(slot) => slot.1 = v,
+                                None => entries.push((k, v)),
                             }
                         }
-                        _ => return None,
-                    },
+                    }
                 }
             }
             Some(StaticValue::Obj(entries))
@@ -427,6 +446,15 @@ pub fn cooked_text(q: &TemplateElement, interner: &Interner) -> Option<String> {
 ///
 /// 只走**顶层**声明：函数体/块内的同名变量不参与，避免作用域误命中。
 pub fn collect_module_scope(program: &Program, interner: &Interner, imported: &Scope) -> Scope {
+    collect_module_scope_with_frozen_calls(program, interner, imported, &FxHashSet::default())
+}
+
+pub(crate) fn collect_module_scope_with_frozen_calls(
+    program: &Program,
+    interner: &Interner,
+    imported: &Scope,
+    frozen_calls: &FxHashSet<Span>,
+) -> Scope {
     let mut scope = Scope::default();
     let unsafe_bindings = mutated_top_level_bindings(program, interner);
     for stmt in program.body.iter() {
@@ -454,7 +482,16 @@ pub fn collect_module_scope(program: &Program, interner: &Interner, imported: &S
                 scope: &scope,
                 imported,
             };
-            if let Some(v) = eval(init, &ctx) {
+            let value = if let Expression::Call(call) = init
+                && frozen_calls.contains(&call.span)
+                && !call.optional
+                && call.arguments.len() == 1
+            {
+                eval(&call.arguments[0], &ctx).and_then(StaticValue::frozen)
+            } else {
+                eval(init, &ctx)
+            };
+            if let Some(v) = value {
                 if unsafe_bindings.contains(&name)
                     && matches!(v, StaticValue::Obj(_) | StaticValue::Arr(_))
                 {
@@ -814,9 +851,18 @@ pub fn collect_static_exports_with(
     interner: &Interner,
     imported: &Scope,
 ) -> StaticExports {
+    collect_static_exports_with_frozen_calls(program, interner, imported, &FxHashSet::default())
+}
+
+pub(crate) fn collect_static_exports_with_frozen_calls(
+    program: &Program,
+    interner: &Interner,
+    imported: &Scope,
+    frozen_calls: &FxHashSet<Span>,
+) -> StaticExports {
     let imported = safe_imported_scope(program, interner, imported);
     let empty = &imported;
-    let scope = collect_module_scope(program, interner, &imported);
+    let scope = collect_module_scope_with_frozen_calls(program, interner, &imported, frozen_calls);
     let mut out = StaticExports::default();
 
     for stmt in program.body.iter() {

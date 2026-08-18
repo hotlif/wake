@@ -8,7 +8,7 @@ status = "stable"
 # Node.js 构建 API
 
 ```ts
-import { build, bundle, createBuildContext } from "@crab-dev/wake";
+import { build, buildLibrary, bundle, createBuildContext, generateCssToken, generateDocgen } from "@crab-dev/wake";
 ```
 
 ## `build(options)`
@@ -46,6 +46,49 @@ Node 平台自动外置 Node 内置模块。显式 external 必须是裸 npm 包
 启用 `sourceMap` 时，内存构建通过 `result.sourceMap` 返回映射；设置 `outfile` 后还会原子写入
 `<outfile>.map`、返回 `result.sourceMapFile`，并在 JavaScript 末尾写入对应的
 `sourceMappingURL`。
+
+## `buildLibrary(options)`
+
+构建组件发布合同：真实 ESM、CommonJS、声明入口和可选静态 CSS。所有裸包保持 external，四个
+输出目录使用 staging 与备份交换统一提交。公开类型无法安全生成或静态 CSS 无法证明时 Promise
+会拒绝，上一份有效产物保持不变。
+
+```ts
+const result = await buildLibrary({ cwd: "components/rc-button", entry: "src/index.ts" });
+console.log(result.esmEntry, result.cjsEntry, result.declarationEntry, result.cssEntry);
+```
+
+## `generateCssToken(options)`
+
+原生解析组件包的 `token.toml`，并把 TypeScript 写到 `[build].output`。`configPath`
+相对 `cwd` 解析，默认是 `token.toml`。递归导入支持 Yarn PnP 与传统 `node_modules`；
+循环、缺失 `$ref`、非法配置和写盘失败都会拒绝 Promise，已有输出不会被半成品覆盖。
+
+```ts
+const result = await generateCssToken({
+  cwd: "components/rc-button",
+  configPath: "token.toml",
+  signal: AbortSignal.timeout(10_000),
+});
+
+console.log(result.outputFile);
+```
+
+## `generateDocgen(options)`
+
+使用与 `wake library docgen` 相同的 Rust 后端生成 `public/docgen.json`。`entry` 相对 `cwd`
+解析；省略时先读取 `package.json.docgen.entry`，再追踪 `src/index.ts` 的默认导出。解析、
+公开 props 类型推断或写盘失败都会拒绝 Promise，且不会覆盖上一份有效输出。
+
+```ts
+const result = await generateDocgen({
+  cwd: "components/rc-button",
+  entry: "src/button.tsx",
+  signal: AbortSignal.timeout(10_000),
+});
+
+console.log(result.outputFile);
+```
 
 ## `createBuildContext(options)`
 

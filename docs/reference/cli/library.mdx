@@ -1,0 +1,36 @@
++++
+title = "library 命令"
+description = "生成组件库辅助产物"
+kind = "reference"
+status = "experimental"
++++
+
+# library 命令
+
+`library` 是组件包产品边界，不会生成应用 HTML、manifest 或浏览器 runtime。目前已发布的
+原生子命令包括 token 和组件 API 文档生成：
+
+## 用法
+
+```sh
+wake library token [PROJECT] [--config token.toml]
+wake library docgen [PROJECT] [--entry src/button.tsx]
+wake library build [PROJECT] [--entry src/index.ts]
+```
+
+`PROJECT` 默认为当前目录，`--config` 相对项目根解析。配置中的 `[build].output` 决定唯一
+写盘目标。生成器递归读取 `[build].imports` 指向的包，后导入覆盖先导入，并把字符串中的
+`$ref(name)` 展开成带 fallback 的 CSS 变量。
+
+缺失引用、循环导入、非法 CSS 前缀、无效 TOML 或写盘错误都返回非零；失败不会覆盖上一份
+有效输出。Yarn PnP（包括 zip 包）与传统 `node_modules` 均受支持。
+
+`docgen` 的入口优先级是 `--entry`、`package.json` 的 `docgen.entry`，最后是从
+`src/index.ts` 的默认导出沿 import、re-export 和局部别名追踪。它原子写入紧凑且确定性的
+`public/docgen.json`，保持 react-docgen 的 `displayName`、`description`、`props`、
+`tsType` 和 `defaultValue` 消费结构。公开 props 无法安全确定时命令严格失败。
+
+`build` 生成 `esm/index.mjs`、`cjs/index.cjs`、`declarations/index.d.ts`，有静态样式时再生成
+`css/index.css`。裸包保持 external，本地源码进入真实 ESM/CJS 保留模块图。全部输出先在包根的
+临时 staging 中完成，随后通过备份交换一次提交；扫描、CSS、声明或写盘失败会保留上一份四目录。
+首版声明后端保留模块化 `.d.ts` 辅助文件，公开值缺少显式可证明类型时严格失败，不降级为 `any`。

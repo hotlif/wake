@@ -8,6 +8,18 @@ export type WakeErrorCode =
   | 'WAKE_CANCELLED'
   | 'WAKE_UNSUPPORTED_PLATFORM'
   | 'WAKE_INTERNAL'
+  | 'WAKE_TOKEN_IO'
+  | 'WAKE_TOKEN_CONFIG'
+  | 'WAKE_TOKEN_IMPORT'
+  | 'WAKE_TOKEN_CYCLE'
+  | 'WAKE_TOKEN_REF'
+  | 'WAKE_DOCGEN_IO'
+  | 'WAKE_DOCGEN_CONFIG'
+  | 'WAKE_DOCGEN_ENTRY'
+  | 'WAKE_DOCGEN_TYPE'
+  | 'WAKE_LIBRARY_BUILD'
+  | 'WAKE_LIBRARY_TYPE'
+  | 'WAKE_LIBRARY_OUTPUT'
 
 export interface Diagnostic {
   severity: 'error' | 'warning' | 'note' | 'help'
@@ -57,7 +69,7 @@ export interface BundleOptions extends ProjectOptions {
 
 export interface OutputFile {
   path: string
-  kind: 'chunk' | 'css' | 'asset' | 'html' | 'map'
+  kind: 'entry' | 'chunk' | 'css' | 'declaration' | 'asset' | 'html' | 'map'
   bytes: number
 }
 
@@ -85,6 +97,47 @@ export interface BundleResult {
   sourceMapFile?: string
   files: OutputFile[]
   diagnostics: Diagnostic[]
+}
+
+export interface LibraryBuildOptions {
+  cwd?: string
+  entry?: string
+  signal?: AbortSignal
+}
+
+export interface LibraryBuildResult extends BuildResult {
+  outputDir: string
+  esmEntry: string
+  cjsEntry: string
+  declarationEntry: string
+  cssEntry?: string
+}
+
+export interface GenerateCssTokenOptions {
+  cwd?: string
+  configPath?: string
+  signal?: AbortSignal
+}
+
+export interface GenerateCssTokenResult {
+  success: true
+  durationMs: number
+  outputFile: string
+  files: OutputFile[]
+}
+
+export interface GenerateDocgenOptions {
+  cwd?: string
+  entry?: string
+  signal?: AbortSignal
+}
+
+export interface GenerateDocgenResult {
+  success: true
+  durationMs: number
+  entry: string
+  outputFile: string
+  files: OutputFile[]
 }
 
 export type DocsMode = 'site' | 'components'
@@ -176,6 +229,9 @@ export class DevServer extends EventEmitter {
 export function version(): string
 export function bundle(options: BundleOptions): Promise<BundleResult>
 export function build(options?: BuildOptions): Promise<BuildResult>
+export function buildLibrary(options?: LibraryBuildOptions): Promise<LibraryBuildResult>
+export function generateCssToken(options?: GenerateCssTokenOptions): Promise<GenerateCssTokenResult>
+export function generateDocgen(options?: GenerateDocgenOptions): Promise<GenerateDocgenResult>
 export function createBuildContext(options?: BuildOptions): Promise<BuildContext>
 export function startDevServer(options?: DevServerOptions): Promise<DevServer>
 export function buildDocs(options?: DocsBuildOptions): Promise<DocsBuildResult>
@@ -186,8 +242,11 @@ declare const wake: {
   DevServer: typeof DevServer
   WakeError: typeof WakeError
   build: typeof build
+  buildLibrary: typeof buildLibrary
   buildDocs: typeof buildDocs
   bundle: typeof bundle
+  generateCssToken: typeof generateCssToken
+  generateDocgen: typeof generateDocgen
   createBuildContext: typeof createBuildContext
   startDevServer: typeof startDevServer
   startDocsDevServer: typeof startDocsDevServer

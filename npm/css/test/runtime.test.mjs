@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import vm from 'node:vm'
 
 import * as esm from '../index.mjs'
 
@@ -27,6 +28,7 @@ const publicExports = [
   'createVar',
   'css',
   'cx',
+  'defineTokens',
   'globalStyle',
   'keyframes',
 ]
@@ -68,6 +70,45 @@ test('cx flattens nested arrays and conditional objects in source order', () => 
     'button primary compact selected loading with-spacing',
   )
   assert.equal(cjs.cx(), '')
+})
+
+test('defineTokens deeply freezes pure structures without invoking accessors', () => {
+  for (const implementation of [esm, cjs]) {
+    const tokens = implementation.defineTokens({
+      color: 'red',
+      nested: { gap: 8 },
+      steps: ['sm', { value: null }],
+    })
+    assert.ok(Object.isFrozen(tokens))
+    assert.ok(Object.isFrozen(tokens.nested))
+    assert.ok(Object.isFrozen(tokens.steps))
+    assert.ok(Object.isFrozen(tokens.steps[1]))
+    assert.throws(() => {
+      tokens.nested.gap = 12
+    }, TypeError)
+  }
+
+  let getterCalls = 0
+  const accessor = Object.defineProperty({}, 'color', {
+    get() {
+      getterCalls += 1
+      return 'red'
+    },
+  })
+  assert.throws(() => esm.defineTokens(accessor), errorMessageIncludes('does not accept accessors'))
+  assert.equal(getterCalls, 0)
+  for (const invalid of [null, new Date(), { value: Infinity }, { value: () => 'red' }]) {
+    assert.throws(() => esm.defineTokens(invalid), TypeError)
+  }
+})
+
+test('defineTokens accepts plain structures created in another JavaScript realm', () => {
+  const tokens = vm.runInNewContext("({ color: { accent: 'rebeccapurple' }, gap: [4, 8] })")
+  const frozen = esm.defineTokens(tokens)
+  assert.equal(frozen.color.accent, 'rebeccapurple')
+  assert.equal(Object.isFrozen(frozen), true)
+  assert.equal(Object.isFrozen(frozen.color), true)
+  assert.equal(Object.isFrozen(frozen.gap), true)
 })
 
 test('createVar is realm-unique across ESM and CommonJS and sanitizes debug labels', () => {
@@ -121,7 +162,7 @@ test('package metadata has no runtime dependencies and publishes only artifacts'
   )
 
   assert.equal(packageJson.name, '@crab-dev/css')
-  assert.equal(packageJson.version, '0.1.17')
+  assert.equal(packageJson.version, '0.1.18')
   assert.equal(packageJson.sideEffects, false)
   assert.equal(packageJson.dependencies, undefined)
   assert.deepEqual(packageJson.files, [
