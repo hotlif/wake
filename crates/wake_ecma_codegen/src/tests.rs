@@ -2359,11 +2359,12 @@ fn preserved_module(source: &str, format: PreserveModuleFormat, extension: &'sta
 fn preserved_modules_rewrite_every_module_edge_without_a_wake_runtime() {
     let source = r#"
 import value, { named as local } from "./dep.js";
+import * as namespace from "./namespace.js";
 export { item } from "./other.js";
 export * from "external";
 export const legacy = require("./legacy.js");
 export async function load() { return import("./lazy.js"); }
-export default value + local;
+export default value + local + namespace.value;
 "#;
 
     let esm = preserved_module(source, PreserveModuleFormat::EsModule, ".mjs");
@@ -2384,4 +2385,14 @@ export default value + local;
     assert!(cjs.contains("import(\"./lazy.cjs\")"), "{cjs}");
     assert!(cjs.contains("exports.default"), "{cjs}");
     assert!(!cjs.contains("__wake_modules__"), "{cjs}");
+    assert_eq!(
+        cjs.matches("function __wake_interop_default(").count(),
+        1,
+        "standalone CJS must define the default interop helper exactly once:\n{cjs}"
+    );
+    assert_eq!(
+        cjs.matches("function __wake_interop_star(").count(),
+        1,
+        "standalone CJS must define the namespace interop helper exactly once:\n{cjs}"
+    );
 }

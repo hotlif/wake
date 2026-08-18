@@ -73,6 +73,8 @@ Link 阶段从入口计算模块、导出和绑定活跃性。缓存摘要保存
 ## 6.1 CJS/ESM 互操作
 
 runtime 为 ESM namespace、CommonJS exports、循环模块和异步模块维持单次执行与缓存身份。
+Library preserve-modules 的每个 CommonJS 文件是独立执行单元，由 codegen 按实际引用在文件内
+去重注入 default/namespace interop helper，不能依赖入口先执行或应用 bundler runtime。
 
 ## 6.1.1 顶层 await
 
@@ -81,6 +83,8 @@ runtime 为 ESM namespace、CommonJS exports、循环模块和异步模块维持
 ## 6.2 Emit
 
 Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map。文件路径在跨平台输出前统一规范化。
+Library emit 先生成确定性 staging 清单，再在稳定输出目录内跳过相同文件、逐文件原子替换变化、
+删除 stale 文件并在失败时回滚；不得整体 rename 已存在的输出目录。
 
 ## 6.3 Chunk 与动态导入
 

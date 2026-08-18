@@ -57,6 +57,8 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
         skip_inline: false,
         smap: None,
         needs_decorator_helpers: std::cell::Cell::new(false),
+        needs_interop_default: false,
+        needs_interop_star: false,
     };
     cg.emit_program(program);
     cg.out
@@ -307,6 +309,7 @@ fn codegen_impl(
     minify_names: bool,
     want_map: bool,
 ) -> (String, Option<ModuleMappings>) {
+    let standalone_commonjs = linker.is_some() && specifier_rewriter.is_some();
     let shake = keep_exports.map(|keep| {
         let used: FxHashSet<Atom> = keep.iter().map(|s| interner.intern(s)).collect();
         ShakeCtx {
@@ -351,6 +354,8 @@ fn codegen_impl(
             last_src: None,
         }),
         needs_decorator_helpers: std::cell::Cell::new(false),
+        needs_interop_default: false,
+        needs_interop_star: false,
     };
     // ESM 模块（含 import/export 语法）标记 `__esModule`，供默认导入 interop 区分「转译 ESM」
     // 与「纯 CJS」。纯 CJS 模块（只有 `module.exports`/`require`）不标记，保持整体 exports 语义。
@@ -360,6 +365,28 @@ fn codegen_impl(
         cg.newline();
     }
     cg.emit_program(program);
+    if standalone_commonjs {
+        let mut prelude = String::new();
+        if cg.needs_interop_default {
+            prelude.push_str(
+                "function __wake_interop_default(m){return m&&m.__esModule?m.default:m}\n",
+            );
+        }
+        if cg.needs_interop_star {
+            prelude.push_str("function __wake_interop_star(m){if(m&&m.__esModule)return m;var ns={};if(m!=null){for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}ns.default=m;return ns}\n");
+        }
+        if !prelude.is_empty() {
+            let generated_line_offset =
+                prelude.bytes().filter(|byte| *byte == b'\n').count() as u32;
+            if let Some(smap) = &mut cg.smap {
+                for mapping in &mut smap.mappings {
+                    mapping.gen_line += generated_line_offset;
+                }
+            }
+            prelude.push_str(&cg.out);
+            cg.out = prelude;
+        }
+    }
     let map = cg.smap.map(|sm| ModuleMappings {
         mappings: sm.mappings,
     });
@@ -500,7 +527,7 @@ struct Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     /// Module-scope binding rename fallback for synthetic export references whose span is DUMMY.
     module_renames: FxHashMap<Atom, Atom>,
     /// Preserve-modules CJS live binding expression for each module-scope import binding.
-    preserved_imports: FxHashMap<Atom, String>,
+    preserved_imports: FxHashMap<Atom, PreservedImportBinding>,
     /// Property mangling side-table (span → new name).
     /// Built by `plan_prop_mangle`, consumed to shorten property names in
     /// member access expressions and object literal keys.
@@ -513,6 +540,9 @@ struct Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     skip_inline: bool,
     /// 本模块是否发射了装饰器降级 → 需在模块顶部注入 `__esDecorate`/`__runInitializers`。
     needs_decorator_helpers: std::cell::Cell<bool>,
+    /// Standalone preserve-modules CommonJS helpers actually referenced by emitted code.
+    needs_interop_default: bool,
+    needs_interop_star: bool,
     /// SourceMap 采集（`None` = 不产 map，零开销）。WAKE-COMPATIBILITY §M4d。
     smap: Option<SmapState>,
 }
@@ -2080,11 +2110,13 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
                     let n = self.name(local.name);
                     // CJS interop：转译 ESM（有 __esModule）取 `.default`，纯 CJS 取整个 exports
                     //（如 `import React from 'react'`，react 是 `module.exports = {...}`）。
+                    self.needs_interop_default = true;
                     self.push(&format!("const {n} = __wake_interop_default({tmp});"));
                 }
                 ImportSpecifier::Namespace { local, .. } => {
                     let n = self.name(local.name);
                     // namespace interop：转译 ESM 原样；纯 CJS 复制属性并补 `default` = 整个 exports。
+                    self.needs_interop_star = true;
                     self.push(&format!("const {n} = __wake_interop_star({tmp});"));
                 }
                 ImportSpecifier::Named {
@@ -2215,7 +2247,8 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
                         let live = self.preserved_imports.get(&local_atom).cloned();
                         self.emit_export_getter(&exported, |codegen| {
                             if let Some(live) = live {
-                                codegen.push(&live);
+                                codegen.mark_interop_helper(live.helper);
+                                codegen.push(&live.expression);
                             } else {
                                 codegen.push_name(local_val);
                             }
@@ -3666,6 +3699,15 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     }
 }
 
+impl Codegen<'_, '_, '_, '_, '_, '_> {
+    fn mark_interop_helper(&mut self, helper: Option<InteropHelper>) {
+        match helper {
+            Some(InteropHelper::Star) => self.needs_interop_star = true,
+            None => {}
+        }
+    }
+}
+
 /// Extract the return value expression from a single-return statement (possibly wrapped in a block).
 fn extract_return_expression<'a>(stmt: &'a Statement<'a>) -> Option<&'a Expression<'a>> {
     let ret = match stmt {
@@ -3866,11 +3908,22 @@ fn collect_module_renames(
     out
 }
 
+#[derive(Clone, Copy)]
+enum InteropHelper {
+    Star,
+}
+
+#[derive(Clone)]
+struct PreservedImportBinding {
+    expression: String,
+    helper: Option<InteropHelper>,
+}
+
 fn collect_preserved_import_bindings(
     program: &Program,
     interner: &Interner,
     enabled: bool,
-) -> FxHashMap<Atom, String> {
+) -> FxHashMap<Atom, PreservedImportBinding> {
     if !enabled {
         return FxHashMap::default();
     }
@@ -3885,13 +3938,22 @@ fn collect_preserved_import_bindings(
                 ImportSpecifier::Default { local, .. } => {
                     bindings.insert(
                         local.name,
-                        format!(
-                            "({namespace} && {namespace}.__esModule ? {namespace}.default : {namespace})"
-                        ),
+                        PreservedImportBinding {
+                            expression: format!(
+                                "({namespace} && {namespace}.__esModule ? {namespace}.default : {namespace})"
+                            ),
+                            helper: None,
+                        },
                     );
                 }
                 ImportSpecifier::Namespace { local, .. } => {
-                    bindings.insert(local.name, format!("__wake_interop_star({namespace})"));
+                    bindings.insert(
+                        local.name,
+                        PreservedImportBinding {
+                            expression: format!("__wake_interop_star({namespace})"),
+                            helper: Some(InteropHelper::Star),
+                        },
+                    );
                 }
                 ImportSpecifier::Named {
                     imported, local, ..
@@ -3900,7 +3962,13 @@ fn collect_preserved_import_bindings(
                         ModuleExportName::Ident(identifier) => interner.resolve(identifier.name),
                         ModuleExportName::String(value) => interner.resolve(*value),
                     };
-                    bindings.insert(local.name, format!("{namespace}[{imported:?}]"));
+                    bindings.insert(
+                        local.name,
+                        PreservedImportBinding {
+                            expression: format!("{namespace}[{imported:?}]"),
+                            helper: None,
+                        },
+                    );
                 }
             }
         }

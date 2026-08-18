@@ -19,10 +19,18 @@ not an acceptable compatibility implementation.
 ## Decision
 
 Wake will add a separate `library` product boundary. `wake_app` owns the public operation contracts,
-project resolution, cancellation and transactional artifact writes. `wake_bundler` will own a new
-format-neutral symbol link plan and the ESM/CommonJS renderers. A type-syntax graph shared by
+project resolution, cancellation and transactional artifact writes. `wake_bundler` owns the
+format-neutral module graph and the ESM/CommonJS renderers, while `wake_ecma_codegen` owns making
+each preserve-modules CommonJS file self-contained by injecting every interop helper referenced by
+that file. A type-syntax graph shared by
 declaration and docgen generation will remain independent from the runtime AST, which intentionally
 erases TypeScript types.
+
+Library artifact commit keeps the `esm`, `cjs`, `declarations` and `css` directory identities stable
+while they contain live outputs. `wake_app` compares a deterministic staging manifest with the
+current manifest, skips byte-identical files, backs up every changed or stale file, atomically
+replaces changed files, removes stale files and rolls back completed operations after a failure.
+Directory-level rename is not part of the contract because Windows directory watchers can deny it.
 
 The public commands will be `wake library build`, `wake library token` and `wake library docgen`.
 The npm API will expose `buildLibrary`, `generateCssToken` and `generateDocgen`. A capability is not
@@ -43,9 +51,13 @@ escapes generated TypeScript and atomically replaces only the configured output 
 
 - Existing application build and ADR 0008 bundle behavior remain unchanged.
 - ESM library output contains no Wake IIFE, module table or browser loader.
+- Every emitted CommonJS file resolves its own runtime helpers; no generated file depends on an
+  undeclared process global or on the package entry executing first.
 - Bare runtime dependencies are never bundled, including dependencies loaded for static analysis.
 - CSS static-analysis failure is an error; styles are never silently omitted.
 - Library output is staged and exchanged transactionally; failure preserves the last valid output.
+- Byte-identical rebuilds do not rewrite output files, and output commit does not rename a populated
+  top-level output directory.
 - Type declaration generation never substitutes `any` for an unsupported public inference.
 - CLI, Node-API and npm entry points converge through `wake_app`.
 - Generator output contains no absolute checkout path or nondeterministic metadata.
@@ -54,6 +66,8 @@ escapes generated TypeScript and atomically replaces only the configured output 
 
 - `crates/wake_bundler/src/incremental.rs`
 - `crates/wake_ecma_codegen/src/lib.rs`
+- `crates/wake_ecma_codegen/src/tests.rs`
+- `crates/wake_bundler/src/library.rs`
 - `crates/wake_ecma_parser/src/stmt.rs`
 - `crates/wake_css_in_js/src/lib.rs`
 - `crates/wake_app/src/lib.rs`
@@ -71,6 +85,8 @@ static CSS forms remain required.
 
 - Run token text-golden, recursive-import, cycle, missing-reference, PnP and atomic-write tests.
 - Run ESM live-binding/cycle/re-export/TLA and CommonJS interop tests against Node.
+- Hold a Windows directory handle without delete sharing across two library builds, and inject a
+  later file-replacement failure to prove rollback and diagnostic context.
 - Run CSS cross-package static-value and stable-class-name fixtures.
 - Typecheck generated declarations from a real consumer project.
 - Compare docgen JSON structurally against the Packify oracle.
@@ -83,6 +99,12 @@ The first native vertical path is implemented: format-neutral runtime/analysis e
 preserve-module ESM and CommonJS renderers, strict static CSS extraction, stable package-prefixed
 class names, a source-preserving declaration module graph, and staging/backup exchange for the four
 Packify output directories. Rust CLI and Node/npm expose build, token and docgen through `wake_app`.
+
+The release-candidate audit additionally established that standalone CommonJS modules, not only the
+application bundler runtime, own interop availability. Preserve-module codegen now injects default
+and namespace helpers once per file when referenced. Artifact commit now uses content-aware
+per-file replacement and rollback under stable output directories, including a Windows regression
+that keeps `declarations` open without delete sharing during consecutive builds.
 
 An isolated copy of the current crab-dev component workspace built 43 of 51 package entries without
 source changes. The remaining eight failures are intentionally fail-closed: four public declaration

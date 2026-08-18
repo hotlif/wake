@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -750,53 +750,303 @@ fn write_library_file(
     Ok(())
 }
 
+const LIBRARY_OUTPUT_DIRS: [&str; 4] = ["esm", "cjs", "declarations", "css"];
+
 fn commit_library_outputs(root: &Path, staging: &Path) -> Result<(), WakeError> {
+    let staged_files = collect_library_output_files(staging)?;
+    let existing_files = collect_library_output_files(root)?;
+    let staged_set = staged_files.iter().cloned().collect::<BTreeSet<_>>();
+
+    let mut replacements = Vec::new();
+    for relative in staged_files {
+        let source = staging.join(&relative);
+        let target = root.join(&relative);
+        let bytes = std::fs::read(&source).map_err(|error| {
+            library_commit_io_error("prepare", "read staged file", Some(&source), &target, error)
+        })?;
+        if target.is_file() {
+            let current = std::fs::read(&target).map_err(|error| {
+                library_commit_io_error(
+                    "prepare",
+                    "read current file",
+                    Some(&target),
+                    &target,
+                    error,
+                )
+            })?;
+            if current == bytes {
+                continue;
+            }
+        }
+        replacements.push((relative, bytes));
+    }
+    let stale = existing_files
+        .into_iter()
+        .filter(|relative| !staged_set.contains(relative))
+        .collect::<Vec<_>>();
+    if replacements.is_empty() && stale.is_empty() {
+        return Ok(());
+    }
+
     let backup = tempfile::Builder::new()
         .prefix(".wake-library-backup-")
         .tempdir_in(root)
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(root))?;
-    let names = ["esm", "cjs", "declarations", "css"];
-    let mut backed_up = Vec::new();
-    for name in names {
-        let target = root.join(name);
-        if !target.exists() {
+        .map_err(|error| {
+            library_commit_io_error("backup", "create backup directory", None, root, error)
+        })?;
+    let mut backup_paths = replacements
+        .iter()
+        .map(|(relative, _)| relative.clone())
+        .chain(stale.iter().cloned())
+        .collect::<Vec<_>>();
+    backup_paths.sort();
+    backup_paths.dedup();
+    for relative in backup_paths {
+        let target = root.join(&relative);
+        if !target.is_file() {
             continue;
         }
-        let saved = backup.path().join(name);
-        if let Err(error) = std::fs::rename(&target, &saved) {
-            restore_library_backups(root, backup.path(), &backed_up);
-            return Err(WakeError::new("WAKE_IO", error.to_string()).at(&target));
-        }
-        backed_up.push(name);
+        let saved = backup.path().join(&relative);
+        let parent = saved.parent().unwrap_or_else(|| backup.path());
+        std::fs::create_dir_all(parent).map_err(|error| {
+            library_commit_io_error("backup", "create backup parent", None, parent, error)
+        })?;
+        std::fs::copy(&target, &saved).map_err(|error| {
+            library_commit_io_error("backup", "copy current file", Some(&target), &saved, error)
+        })?;
     }
 
-    let mut installed = Vec::new();
-    for name in names {
-        let source = staging.join(name);
-        if !source.exists() {
-            continue;
+    let mut touched = Vec::new();
+    for (relative, bytes) in replacements {
+        let source = staging.join(&relative);
+        let target = root.join(&relative);
+        if let Err(error) = atomic_write(&target, &bytes) {
+            let primary =
+                library_commit_wake_error("install", "replace file", Some(&source), &target, error);
+            return Err(rollback_library_outputs(
+                root,
+                backup.path(),
+                &touched,
+                primary,
+            ));
         }
-        let target = root.join(name);
-        if let Err(error) = std::fs::rename(&source, &target) {
-            for installed_name in installed.iter().rev() {
-                let installed_path = root.join(installed_name);
-                let _ = std::fs::remove_dir_all(installed_path);
-            }
-            restore_library_backups(root, backup.path(), &backed_up);
-            return Err(WakeError::new("WAKE_IO", error.to_string()).at(&target));
+        touched.push(relative);
+    }
+    for relative in stale {
+        let target = root.join(&relative);
+        if let Err(error) = std::fs::remove_file(&target) {
+            let primary =
+                library_commit_io_error("remove", "remove stale file", None, &target, error);
+            return Err(rollback_library_outputs(
+                root,
+                backup.path(),
+                &touched,
+                primary,
+            ));
         }
-        installed.push(name);
+        touched.push(relative);
+    }
+    if let Err(primary) = remove_empty_library_output_dirs(root) {
+        return Err(rollback_library_outputs(
+            root,
+            backup.path(),
+            &touched,
+            primary,
+        ));
     }
     Ok(())
 }
 
-fn restore_library_backups(root: &Path, backup: &Path, names: &[&str]) {
-    for name in names.iter().rev() {
-        let saved = backup.join(name);
-        if saved.exists() {
-            let _ = std::fs::rename(saved, root.join(name));
+fn collect_library_output_files(base: &Path) -> Result<Vec<PathBuf>, WakeError> {
+    fn visit(base: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), WakeError> {
+        let entries = std::fs::read_dir(directory).map_err(|error| {
+            library_commit_io_error("prepare", "read output directory", None, directory, error)
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                library_commit_io_error("prepare", "read output entry", None, directory, error)
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                library_commit_io_error("prepare", "inspect output entry", None, &path, error)
+            })?;
+            if metadata.is_dir() {
+                visit(base, &path, files)?;
+            } else if metadata.is_file() {
+                files.push(
+                    path.strip_prefix(base)
+                        .expect("output is below base")
+                        .to_path_buf(),
+                );
+            } else {
+                return Err(WakeError::new(
+                    "WAKE_IO",
+                    format!(
+                        "library output prepare failed: unsupported filesystem entry `{}`",
+                        path.display()
+                    ),
+                )
+                .at(&path));
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    for name in LIBRARY_OUTPUT_DIRS {
+        let directory = base.join(name);
+        if !directory.exists() {
+            continue;
+        }
+        if !directory.is_dir() {
+            return Err(WakeError::new(
+                "WAKE_IO",
+                format!(
+                    "library output prepare failed: expected directory `{}`",
+                    directory.display()
+                ),
+            )
+            .at(&directory));
+        }
+        visit(base, &directory, &mut files)?;
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn remove_empty_library_output_dirs(root: &Path) -> Result<(), WakeError> {
+    fn collect(directory: &Path, directories: &mut Vec<PathBuf>) -> Result<bool, WakeError> {
+        if !directory.is_dir() {
+            return Ok(false);
+        }
+        let mut contains_files = false;
+        for entry in std::fs::read_dir(directory).map_err(|error| {
+            library_commit_io_error("cleanup", "read output directory", None, directory, error)
+        })? {
+            let path = entry
+                .map_err(|error| {
+                    library_commit_io_error("cleanup", "read output entry", None, directory, error)
+                })?
+                .path();
+            if path.is_dir() {
+                contains_files |= collect(&path, directories)?;
+            } else {
+                contains_files = true;
+            }
+        }
+        if !contains_files {
+            directories.push(directory.to_path_buf());
+        }
+        Ok(contains_files)
+    }
+
+    let mut directories = Vec::new();
+    for name in LIBRARY_OUTPUT_DIRS {
+        collect(&root.join(name), &mut directories)?;
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match std::fs::remove_dir(&directory) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => {
+                return Err(library_commit_io_error(
+                    "cleanup",
+                    "remove empty directory",
+                    None,
+                    &directory,
+                    error,
+                ));
+            }
         }
     }
+    Ok(())
+}
+
+fn rollback_library_outputs(
+    root: &Path,
+    backup: &Path,
+    touched: &[PathBuf],
+    primary: WakeError,
+) -> WakeError {
+    let mut rollback_failures = Vec::new();
+    for relative in touched.iter().rev() {
+        let saved = backup.join(relative);
+        let target = root.join(relative);
+        let result = if saved.is_file() {
+            std::fs::read(&saved)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| atomic_write(&target, &bytes).map_err(|error| error.message))
+        } else if target.exists() {
+            std::fs::remove_file(&target).map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            rollback_failures.push(format!("{}: {error}", target.display()));
+        }
+    }
+    if rollback_failures.is_empty() {
+        return primary;
+    }
+    WakeError::new(
+        primary.code,
+        format!(
+            "{}; rollback also failed for {}",
+            primary.message,
+            rollback_failures.join(", ")
+        ),
+    )
+    .at(Path::new(
+        primary
+            .path
+            .as_deref()
+            .unwrap_or_else(|| root.to_str().unwrap_or(".")),
+    ))
+}
+
+fn library_commit_io_error(
+    phase: &str,
+    operation: &str,
+    source: Option<&Path>,
+    target: &Path,
+    error: std::io::Error,
+) -> WakeError {
+    library_commit_error(phase, operation, source, target, error.to_string())
+}
+
+fn library_commit_wake_error(
+    phase: &str,
+    operation: &str,
+    source: Option<&Path>,
+    target: &Path,
+    error: WakeError,
+) -> WakeError {
+    library_commit_error(phase, operation, source, target, error.message)
+}
+
+fn library_commit_error(
+    phase: &str,
+    operation: &str,
+    source: Option<&Path>,
+    target: &Path,
+    error: String,
+) -> WakeError {
+    let source = source
+        .map(|path| format!("; source `{}`", path.display()))
+        .unwrap_or_default();
+    WakeError::new(
+        "WAKE_IO",
+        format!(
+            "library output {phase} failed: {operation}{source}; target `{}`: {error}",
+            target.display()
+        ),
+    )
+    .at(target)
 }
 
 fn react_docgen_type(type_text: &str) -> Value {
@@ -1034,6 +1284,84 @@ mod tests {
         assert_eq!(
             fs::read_to_string(fixture.path("esm/index.mjs")).unwrap(),
             previous
+        );
+    }
+
+    #[test]
+    fn repeated_library_build_keeps_output_directories_stable() {
+        let fixture = Fixture::new();
+        fixture.write("package.json", r#"{"name":"@demo/button","type":"module"}"#);
+        fixture.write(
+            "src/index.ts",
+            "export type { ButtonProps } from './button.js'; export { default } from './button.js';",
+        );
+        fixture.write(
+            "src/button.tsx",
+            "export interface ButtonProps { label: string; } export default function Button() { return null; }",
+        );
+
+        fixture.build_library().unwrap();
+
+        #[cfg(windows)]
+        let _declarations_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001 | 0x0000_0002)
+                .custom_flags(0x0200_0000)
+                .open(fixture.path("declarations"))
+                .unwrap()
+        };
+
+        fixture.build_library().unwrap();
+        fixture.write(
+            "src/button.tsx",
+            "export interface ButtonProps { label: string; disabled: boolean; } export default function Button() { return null; }",
+        );
+        fixture.build_library().unwrap();
+
+        let declaration =
+            fs::read_to_string(fixture.path("declarations/_wake/src/button.d.ts")).unwrap();
+        assert!(declaration.contains("disabled: boolean"), "{declaration}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn library_commit_rolls_back_files_replaced_before_a_windows_lock_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = Fixture::new();
+        fixture.write("cjs/a.cjs", "old-a");
+        fixture.write("cjs/b.cjs", "old-b");
+        let staging = tempfile::Builder::new()
+            .prefix(".wake-library-test-stage-")
+            .tempdir_in(fixture.root.path())
+            .unwrap();
+        fs::create_dir_all(staging.path().join("cjs")).unwrap();
+        fs::write(staging.path().join("cjs/a.cjs"), "new-a").unwrap();
+        fs::write(staging.path().join("cjs/b.cjs"), "new-b").unwrap();
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(fixture.path("cjs/b.cjs"))
+            .unwrap();
+
+        let error = commit_library_outputs(fixture.root.path(), staging.path()).unwrap_err();
+        assert_eq!(error.code, "WAKE_IO");
+        assert!(
+            error.message.contains("install failed"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("cjs\\b.cjs"), "{}", error.message);
+        assert_eq!(
+            fs::read_to_string(fixture.path("cjs/a.cjs")).unwrap(),
+            "old-a"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path("cjs/b.cjs")).unwrap(),
+            "old-b"
         );
     }
 

@@ -1051,15 +1051,19 @@ export async function lazy() { return (await import('./lazy.js')).answer; }"#,
         );
         write(
             &project.path().join("src/index.ts"),
-            "import { value as observed } from './state.js'; export { value, increment } from './state.js'; export { default } from './default.js'; export { pair } from './a.js'; export { read as readA } from './b.js'; export function read() { return observed; } export async function load() { return (await import('./lazy.js')).answer; }",
+            "import answer from './default.js'; import { value as observed } from './state.js'; export { value, increment } from './state.js'; export { default } from './default.js'; export { pair } from './a.js'; export { read as readA } from './b.js'; export function read() { return observed; } export function readDefault() { return answer(); } export async function load() { return (await import('./lazy.js')).answer; }",
         );
         write(
             &project.path().join("src/state.ts"),
             "export let value = 0; export function increment() { value += 1; }",
         );
         write(
-            &project.path().join("src/default.ts"),
-            "export default function answer() { return 42; }",
+            &project.path().join("src/default.tsx"),
+            "import value from './constant.js'; export default function answer() { return value; }",
+        );
+        write(
+            &project.path().join("src/constant.ts"),
+            "export default 42;",
         );
         write(
             &project.path().join("src/a.ts"),
@@ -1084,7 +1088,7 @@ export async function lazy() { return (await import('./lazy.js')).answer; }"#,
             .to_string_lossy()
             .replace('\\', "\\\\");
         let script = format!(
-            "const m=require(\"{entry}\");if(m.value!==0||m.read()!==0)throw Error('initial');m.increment();if(m.value!==1||m.read()!==1)throw Error('live');if(m.default()!==42)throw Error('default');if(m.pair()!=='ab'||m.readA()!=='a')throw Error('cycle');m.load().then(v=>{{if(v!==42)throw Error('dynamic');process.stdout.write('OK')}}).catch(e=>{{console.error(e);process.exit(2)}})"
+            "const m=require(\"{entry}\");if(m.value!==0||m.read()!==0)throw Error('initial');m.increment();if(m.value!==1||m.read()!==1)throw Error('live');if(m.default()!==42||m.readDefault()!==42)throw Error('default');if(m.pair()!=='ab'||m.readA()!=='a')throw Error('cycle');m.load().then(v=>{{if(v!==42)throw Error('dynamic');process.stdout.write('OK')}}).catch(e=>{{console.error(e);process.exit(2)}})"
         );
         let result = Command::new("node").args(["-e", &script]).output().unwrap();
         assert!(

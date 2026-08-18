@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.19
+
+- Fixed preserve-module CommonJS output so every generated file defines the default and namespace interop helpers it uses.
+- Made repeated library builds reliable on Windows by keeping output directories stable, skipping unchanged files, and rolling back failed per-file commits with actionable diagnostics.
+
 ## 0.1.18
 
 - Added native component-library ESM, CommonJS, declaration, and extracted CSS builds through `wake library build` and `buildLibrary()` without changing application builds.
