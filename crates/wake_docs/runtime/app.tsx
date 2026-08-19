@@ -112,7 +112,9 @@ function useTheme() {
     localStorage.setItem("wake-docs-theme", theme);
     document.documentElement.lang = siteConfig.locale;
     document.documentElement.dataset.theme = resolved;
-    document.documentElement.style.setProperty("--wake-accent", siteConfig.accentColor);
+    if (siteConfig.accentColor) {
+      document.documentElement.style.setProperty("--wake-accent", siteConfig.accentColor);
+    }
     document.querySelectorAll("iframe[data-wake-demo]").forEach((frame) => {
       (frame as HTMLIFrameElement).contentWindow?.postMessage({ type: "wake:theme", theme: resolved }, "*");
     });

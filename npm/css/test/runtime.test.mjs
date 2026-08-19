@@ -162,7 +162,7 @@ test('package metadata has no runtime dependencies and publishes only artifacts'
   )
 
   assert.equal(packageJson.name, '@crab-dev/css')
-  assert.equal(packageJson.version, '0.1.19')
+  assert.equal(packageJson.version, '0.1.20')
   assert.equal(packageJson.sideEffects, false)
   assert.equal(packageJson.dependencies, undefined)
   assert.deepEqual(packageJson.files, [

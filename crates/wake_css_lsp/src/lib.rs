@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::notification::Notification;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 use wake_common::{FileSystem, OsFileSystem, SourceFile, Span};
@@ -22,6 +23,22 @@ use wake_resolver::{PnpFileSystem, PnpManifest, Resolver};
 const LIVE_DEBOUNCE: Duration = Duration::from_millis(150);
 const CLOSED_CACHE_ENTRIES: usize = 512;
 const CLOSED_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TriggerSuggestParams {
+    uri: Uri,
+    version: i32,
+    position: Position,
+}
+
+enum TriggerSuggest {}
+
+impl Notification for TriggerSuggest {
+    type Params = TriggerSuggestParams;
+
+    const METHOD: &'static str = "crabCss/triggerSuggest";
+}
 
 pub const SERVER_NAME: &str = "wake-css-language-server";
 
@@ -580,6 +597,7 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
+        let completion_position = automatic_completion_position(&params.content_changes);
         let mut documents = self.documents.write().await;
         let Some(previous) = documents.get(&uri) else {
             return;
@@ -587,6 +605,12 @@ impl LanguageServer for Backend {
         let text = apply_content_changes(previous.analysis.source(), params.content_changes);
         let language = previous.language;
         let analysis = Arc::new(LanguageDocument::analyze(uri.to_string(), text, language));
+        let should_trigger_completion = completion_position.is_some_and(|position| {
+            let offset = position_to_offset(analysis.source(), position);
+            analysis
+                .completions(offset)
+                .is_some_and(|items| !items.is_empty())
+        });
         documents.insert(
             uri.clone(),
             OpenDocument {
@@ -596,6 +620,15 @@ impl LanguageServer for Backend {
             },
         );
         drop(documents);
+        if should_trigger_completion {
+            self.client
+                .send_notification::<TriggerSuggest>(TriggerSuggestParams {
+                    uri: uri.clone(),
+                    version,
+                    position: completion_position.expect("checked completion position"),
+                })
+                .await;
+        }
         self.schedule_live_diagnostics(uri, version).await;
     }
 
@@ -648,10 +681,13 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let offset = position_to_offset(document.source(), params.text_document_position.position);
-        let items = document
-            .completions(offset)
+        let Some(completions) = document.completions(offset) else {
+            return Ok(None);
+        };
+        let items = completions
             .into_iter()
-            .map(|item| CompletionItem {
+            .enumerate()
+            .map(|(sort_index, item)| CompletionItem {
                 label: item.label,
                 kind: Some(match item.kind {
                     CssCompletionKind::Property => CompletionItemKind::PROPERTY,
@@ -664,6 +700,7 @@ impl LanguageServer for Backend {
                     value: item.documentation,
                 })),
                 insert_text: Some(item.insert_text),
+                sort_text: Some(format!("{sort_index:04}")),
                 ..CompletionItem::default()
             })
             .collect();
@@ -950,6 +987,7 @@ fn server_capabilities() -> ServerCapabilities {
                         SemanticTokenType::NUMBER,
                         SemanticTokenType::STRING,
                         SemanticTokenType::FUNCTION,
+                        SemanticTokenType::new("crabCssValue"),
                     ],
                     token_modifiers: Vec::new(),
                 },
@@ -1015,6 +1053,32 @@ fn apply_content_changes(
         text.replace_range(span.lo as usize..span.hi as usize, &change.text);
     }
     text
+}
+
+fn automatic_completion_position(changes: &[TextDocumentContentChangeEvent]) -> Option<Position> {
+    let [change] = changes else {
+        return None;
+    };
+    let range = change.range?;
+    let is_identifier_insertion = range.start == range.end
+        && !change.text.is_empty()
+        && change
+            .text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'));
+    let is_property_completion = change.text.strip_suffix(": ").is_some_and(|property| {
+        !property.is_empty()
+            && property.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+    });
+    if change.text.len() > 64 || (!is_identifier_insertion && !is_property_completion) {
+        return None;
+    }
+    Some(Position::new(
+        range.start.line,
+        range.start.character + change.text.encode_utf16().count() as u32,
+    ))
 }
 
 fn position_to_offset(source: &SourceFile, position: Position) -> u32 {
@@ -1088,6 +1152,7 @@ fn encode_semantic_tokens(document: &LanguageDocument) -> Vec<SemanticToken> {
                     length: range.end.character - range.start.character,
                     token_type: match token.kind {
                         SemanticKind::Property => 0,
+                        SemanticKind::Value => 5,
                         SemanticKind::Keyword => 1,
                         SemanticKind::Number => 2,
                         SemanticKind::String => 3,
@@ -1171,12 +1236,51 @@ mod tests {
     }
 
     #[test]
+    fn derives_automatic_completion_positions_only_from_identifier_insertions() {
+        let insertion = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(4, 8), Position::new(4, 8))),
+            range_length: Some(0),
+            text: "disp".to_string(),
+        };
+        assert_eq!(
+            automatic_completion_position(std::slice::from_ref(&insertion)),
+            Some(Position::new(4, 12))
+        );
+
+        let property_completion = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(4, 8), Position::new(4, 12))),
+            range_length: Some(4),
+            text: "display: ".to_string(),
+        };
+        assert_eq!(
+            automatic_completion_position(&[property_completion]),
+            Some(Position::new(4, 17))
+        );
+
+        let unrelated_replacement = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(4, 8), Position::new(4, 9))),
+            range_length: Some(1),
+            text: "d".to_string(),
+        };
+        assert_eq!(
+            automatic_completion_position(&[unrelated_replacement]),
+            None
+        );
+        assert_eq!(automatic_completion_position(&[]), None);
+        assert_eq!(
+            automatic_completion_position(&[insertion.clone(), insertion]),
+            None
+        );
+    }
+
+    #[test]
     fn semantic_tokens_are_monotonic_and_utf16_encoded() {
         let source = "// 𝒳\nimport { css } from '@crab-dev/css';\nconst box = css`display: grid;`;";
         let document = LanguageDocument::analyze("a.ts", source, HostLanguage::TypeScript);
         let tokens = encode_semantic_tokens(&document);
         assert!(!tokens.is_empty());
         assert!(tokens.iter().all(|token| token.length > 0));
+        assert!(tokens.iter().any(|token| token.token_type == 5));
     }
 
     #[test]
@@ -1212,8 +1316,29 @@ mod tests {
     #[test]
     fn capabilities_do_not_compete_with_typescript_navigation() {
         let capabilities = server_capabilities();
-        assert!(capabilities.semantic_tokens_provider.is_some());
-        assert!(capabilities.completion_provider.is_some());
+        let Some(SemanticTokensServerCapabilities::SemanticTokensOptions(options)) =
+            capabilities.semantic_tokens_provider
+        else {
+            panic!("semantic token options");
+        };
+        assert_eq!(
+            options.legend.token_types,
+            vec![
+                SemanticTokenType::PROPERTY,
+                SemanticTokenType::KEYWORD,
+                SemanticTokenType::NUMBER,
+                SemanticTokenType::STRING,
+                SemanticTokenType::FUNCTION,
+                SemanticTokenType::new("crabCssValue"),
+            ]
+        );
+        let completion = capabilities
+            .completion_provider
+            .expect("completion provider options");
+        let triggers = completion
+            .trigger_characters
+            .expect("completion trigger characters");
+        assert_eq!(triggers, vec![":", "@", "-"]);
         assert!(capabilities.definition_provider.is_none());
         assert!(capabilities.references_provider.is_none());
         assert!(capabilities.rename_provider.is_none());

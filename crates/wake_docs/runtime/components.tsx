@@ -231,7 +231,9 @@ function useTheme() {
     localStorage.setItem("wake-docs-theme", theme);
     document.documentElement.lang = siteConfig.locale;
     document.documentElement.dataset.theme = resolved;
-    document.documentElement.style.setProperty("--wake-accent", siteConfig.accentColor);
+    if (siteConfig.accentColor) {
+      document.documentElement.style.setProperty("--wake-accent", siteConfig.accentColor);
+    }
   }, [theme, resolved]);
   return { theme, resolved, setTheme };
 }

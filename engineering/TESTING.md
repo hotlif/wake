@@ -54,6 +54,10 @@ cargo test -p wake_css_language -p wake_css_lsp
 
 本平台先构建 `wake_css_lsp` release 二进制，再用 `editors/vscode-css` 的 `package:vsix`
 脚本生成 VSIX。脚本会检查归档只包含一个目标二进制、无开发目录且不超过 15 MiB。
+Manifest 与语言服务测试还必须验证自定义 semantic token 的名称、legend 索引和 CSS TextMate
+scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `keyword` 主题规则。补全测试必须
+在真实 Extension Host 中键入属性前缀、接受自动弹出的候选并断言编辑结果，同时验证模板外位置
+返回不适用；不能只覆盖等同于 `Ctrl+Space` 的显式请求。
 
 # 2. CI 矩阵
 

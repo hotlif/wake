@@ -125,7 +125,7 @@ pub struct Docs {
     pub preview: Option<String>,
     pub theme_css: Option<String>,
     pub default_theme: String,
-    pub accent_color: String,
+    pub accent_color: Option<String>,
 }
 
 impl Default for Docs {
@@ -141,7 +141,7 @@ impl Default for Docs {
             preview: None,
             theme_css: None,
             default_theme: "system".to_string(),
-            accent_color: "#8b5cf6".to_string(),
+            accent_color: None,
         }
     }
 }
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(default.base_path, "/");
         assert_eq!(default.default_theme, "system");
         assert_eq!(default.locale, "zh-CN");
-        assert_eq!(default.accent_color, "#8b5cf6");
+        assert_eq!(default.accent_color, None);
 
         let config: Config = toml::from_str(
             r##"
@@ -599,6 +599,7 @@ mod tests {
         assert_eq!(config.docs.locale, "en-US");
         assert_eq!(config.docs.preview.as_deref(), Some("docs/preview.tsx"));
         assert_eq!(config.docs.default_theme, "dark");
+        assert_eq!(config.docs.accent_color.as_deref(), Some("#7c3aed"));
     }
 
     #[test]

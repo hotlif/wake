@@ -5,6 +5,42 @@ export async function run(): Promise<void> {
   if (!extension) throw new Error('Crab CSS extension is not registered')
   await extension.activate()
 
+  const automaticDocument = await vscode.workspace.openTextDocument({
+    language: 'typescriptreact',
+    content: "import { css } from '@crab-dev/css'\nconst automatic = css``\nconst ordinary = ''\n",
+  })
+  const automaticEditor = await vscode.window.showTextDocument(automaticDocument)
+  const automaticPosition = automaticDocument.positionAt(
+    automaticDocument.getText().indexOf('``') + 1,
+  )
+  automaticEditor.selection = new vscode.Selection(automaticPosition, automaticPosition)
+  for (const character of 'disp') {
+    await vscode.commands.executeCommand('type', { text: character })
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  await waitFor(async () => {
+    await vscode.commands.executeCommand('acceptSelectedSuggestion')
+    return automaticDocument.getText().includes('css`display: `')
+  }, 'typing a CSS property prefix did not open and accept the display completion')
+  await waitFor(async () => {
+    await vscode.commands.executeCommand('acceptSelectedSuggestion')
+    return automaticDocument.getText().includes('css`display: block`')
+  }, 'accepting a CSS property did not open and accept its top-ranked value completion')
+
+  const ordinaryPosition = automaticDocument.positionAt(
+    automaticDocument.getText().indexOf("''") + 1,
+  )
+  automaticEditor.selection = new vscode.Selection(ordinaryPosition, ordinaryPosition)
+  for (const character of 'disp') {
+    await vscode.commands.executeCommand('type', { text: character })
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  await new Promise(resolve => setTimeout(resolve, 300))
+  await vscode.commands.executeCommand('acceptSelectedSuggestion')
+  if (!automaticDocument.getText().includes("ordinary = 'disp'")) {
+    throw new Error('CSS completion changed an ordinary TypeScript string')
+  }
+
   const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'component.tsx')
   const document = await vscode.workspace.openTextDocument(uri)
   await vscode.window.showTextDocument(document)

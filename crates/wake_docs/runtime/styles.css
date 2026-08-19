@@ -89,11 +89,8 @@
   --switch-disabled-handle-background-color: color-mix(in srgb, #fff 42%, var(--surface));
 }
 .workbench-shell { --wake-accent: var(--workbench-accent); }
-/* Demo previews keep the configured site accent. The `:root:has(...)` arm also
-   reaches Select/Dialog/Drawer portals mounted next to `.demo-frame-root` under
-   `body`; the class arm covers the normal preview subtree without relying on a
-   portal implementation detail. */
-:root:has(.demo-frame-root),
+/* Demo previews keep the configured site accent without rewriting semantic
+   component tokens on the document root or the surrounding workbench. */
 .demo-frame-root {
   --token-semantic-color-background-hover-subtle: color-mix(in srgb, var(--wake-accent) 7%, var(--surface));
   --token-semantic-color-background-active-subtle: color-mix(in srgb, var(--wake-accent) 12%, var(--surface));

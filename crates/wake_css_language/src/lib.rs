@@ -78,6 +78,7 @@ pub struct Hover {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemanticKind {
     Property,
+    Value,
     Keyword,
     Number,
     String,
@@ -217,18 +218,13 @@ impl LanguageDocument {
         })
     }
 
-    pub fn completions(&self, host_offset: u32) -> Vec<Completion> {
-        let Some((index, document)) = self
+    pub fn completions(&self, host_offset: u32) -> Option<Vec<Completion>> {
+        let (index, document) = self
             .virtual_documents
             .iter()
             .enumerate()
-            .find(|(_, document)| document.contains_host_offset(host_offset))
-        else {
-            return Vec::new();
-        };
-        let Some(virtual_offset) = document.host_to_virtual_offset(host_offset) else {
-            return Vec::new();
-        };
+            .find(|(_, document)| document.contains_host_offset(host_offset))?;
+        let virtual_offset = document.host_to_virtual_offset(host_offset)?;
         let tree = &self.syntax_trees[index];
         let node = tree.node_at_cursor(virtual_offset);
         let prefix = node
@@ -242,12 +238,54 @@ impl LanguageDocument {
             node.map(|node| &node.kind),
             Some(CssSyntaxKind::AtKeyword(_))
         ) {
-            return facts::css_facts()
-                .at_rules
-                .iter()
-                .filter(|value| value.starts_with(prefix))
-                .map(|value| completion(value, "CSS at-rule", "", CompletionKind::Keyword))
-                .collect();
+            return Some(
+                facts::css_facts()
+                    .at_rules
+                    .iter()
+                    .filter(|value| value.starts_with(prefix))
+                    .map(|value| completion(value, "CSS at-rule", "", CompletionKind::Keyword))
+                    .collect(),
+            );
+        }
+        let declaration = tree.declaration_at(virtual_offset).or_else(|| {
+            tree.declarations.iter().rev().find(|declaration| {
+                declaration.colon_span.hi <= virtual_offset
+                    && document
+                        .text
+                        .get(declaration.colon_span.hi as usize..virtual_offset as usize)
+                        .is_some_and(|trailing| trailing.chars().all(char::is_whitespace))
+            })
+        });
+        if let Some(declaration) = declaration
+            && virtual_offset >= declaration.colon_span.hi
+            && let Some(property) = facts::property(&declaration.name)
+        {
+            let value_prefix = node
+                .filter(|node| {
+                    matches!(node.kind, CssSyntaxKind::Ident(_))
+                        && declaration.colon_span.hi <= node.span.lo
+                })
+                .and_then(|node| {
+                    document
+                        .text
+                        .get(node.span.lo as usize..virtual_offset as usize)
+                })
+                .unwrap_or("");
+            return Some(
+                property
+                    .values
+                    .iter()
+                    .filter(|value| value.starts_with(value_prefix))
+                    .map(|value| {
+                        completion(
+                            value,
+                            &format!("Value for {}", property.name),
+                            &property.description,
+                            CompletionKind::Value,
+                        )
+                    })
+                    .collect(),
+            );
         }
         if node.is_some_and(|node| {
             matches!(node.kind, CssSyntaxKind::Ident(_))
@@ -256,42 +294,31 @@ impl LanguageDocument {
                     .is_some_and(|previous| matches!(previous.kind, CssSyntaxKind::Colon))
         }) {
             let prefix = format!(":{prefix}");
-            return facts::css_facts()
-                .pseudos
-                .iter()
-                .filter(|value| value.starts_with(&prefix))
-                .map(|value| completion(value, "CSS pseudo selector", "", CompletionKind::Keyword))
-                .collect();
+            return Some(
+                facts::css_facts()
+                    .pseudos
+                    .iter()
+                    .filter(|value| value.starts_with(&prefix))
+                    .map(|value| {
+                        completion(value, "CSS pseudo selector", "", CompletionKind::Keyword)
+                    })
+                    .collect(),
+            );
         }
-        if let Some(declaration) = tree.declaration_at(virtual_offset)
-            && virtual_offset >= declaration.colon_span.hi
-            && let Some(property) = facts::property(&declaration.name)
-        {
-            return property
-                .values
+        Some(
+            facts::css_facts()
+                .properties
                 .iter()
-                .map(|value| {
-                    completion(
-                        value,
-                        &format!("Value for {}", property.name),
-                        &property.description,
-                        CompletionKind::Value,
-                    )
+                .filter(|property| property.name.starts_with(prefix))
+                .map(|property| Completion {
+                    label: property.name.clone(),
+                    detail: "CSS property".to_string(),
+                    documentation: property.description.clone(),
+                    insert_text: format!("{}: ", property.name),
+                    kind: CompletionKind::Property,
                 })
-                .collect();
-        }
-        facts::css_facts()
-            .properties
-            .iter()
-            .filter(|property| property.name.starts_with(prefix))
-            .map(|property| Completion {
-                label: property.name.clone(),
-                detail: "CSS property".to_string(),
-                documentation: property.description.clone(),
-                insert_text: format!("{}: ", property.name),
-                kind: CompletionKind::Property,
-            })
-            .collect()
+                .collect(),
+        )
     }
 
     pub fn hover(&self, host_offset: u32) -> Option<Hover> {
@@ -504,10 +531,17 @@ fn semantic_tokens(document: &VirtualCssDocument, tree: &CssSyntaxTree) -> Vec<S
                 SemanticKind::Function,
             ),
             CssSyntaxKind::Ident(_) => {
-                let kind = if tree.declaration_with_name_span(node.span).is_some() {
-                    SemanticKind::Property
-                } else {
-                    SemanticKind::Keyword
+                let kind = match tree.declaration_at(node.span.lo) {
+                    Some(declaration) if declaration.name_span == node.span => {
+                        SemanticKind::Property
+                    }
+                    Some(declaration)
+                        if declaration.value_span.lo <= node.span.lo
+                            && node.span.hi <= declaration.value_span.hi =>
+                    {
+                        SemanticKind::Value
+                    }
+                    _ => SemanticKind::Keyword,
                 };
                 (node.span, kind)
             }

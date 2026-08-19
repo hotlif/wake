@@ -18,3 +18,28 @@ reused by highlighting, diagnostics, hover, colors, folding and formatting.
 
 The extension never executes project JavaScript. TypeScript definition, reference and rename
 features remain owned by VS Code's built-in TypeScript service.
+
+Property suggestions open automatically from the first typed property letter inside a recognized
+Crab CSS template. `:`, `@` and `-` continue to trigger value, at-rule and prefixed-property
+suggestions. Manual completion (`Ctrl+Space` / `Cmd+Space`) remains available. The extension does
+not enable string suggestions globally, so ordinary JavaScript and TypeScript strings are
+unaffected.
+
+## Theming
+
+CSS identifier values use the custom semantic token `crabCssValue` instead of the host language's
+`keyword` token. Themes without an explicit semantic rule fall back to the standard
+`support.constant.property-value.css` TextMate scope. This keeps values such as `inline-flex`,
+`center` and `unset` visually distinct from TypeScript keywords without hard-coding a color.
+
+Users can override the value style independently:
+
+```json
+{
+  "editor.semanticTokenColorCustomizations": {
+    "rules": {
+      "crabCssValue": "#D19A66"
+    }
+  }
+}
+```

@@ -3,7 +3,7 @@
   "private": true,
   "displayName": "Crab CSS",
   "description": "CSS language intelligence for @crab-dev/css tagged templates.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "crab-dev",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -48,6 +48,21 @@
     "onCommand:crabCss.showOutput"
   ],
   "contributes": {
+    "semanticTokenTypes": [
+      {
+        "id": "crabCssValue",
+        "description": "A CSS identifier used as a value inside an @crab-dev/css template."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "scopes": {
+          "crabCssValue": [
+            "support.constant.property-value.css"
+          ]
+        }
+      }
+    ],
     "commands": [
       {
         "command": "crabCss.restartLanguageServer",

@@ -62,7 +62,7 @@ pub struct DocsOptions {
     pub preview: Option<PathBuf>,
     pub theme_css: Option<PathBuf>,
     pub default_theme: String,
-    pub accent_color: String,
+    pub accent_color: Option<String>,
 }
 
 impl Default for DocsOptions {
@@ -78,7 +78,7 @@ impl Default for DocsOptions {
             preview: None,
             theme_css: None,
             default_theme: "system".to_string(),
-            accent_color: "#8b5cf6".to_string(),
+            accent_color: None,
         }
     }
 }
@@ -2627,11 +2627,13 @@ fn validate_options(options: &DocsOptions) -> Result<(), DocsError> {
             "default_theme must be light, dark, or system".to_string(),
         ));
     }
-    let color = Regex::new(r"^#[0-9a-fA-F]{6}$").expect("valid color regex");
-    if !color.is_match(&options.accent_color) {
-        return Err(DocsError::InvalidConfig(
-            "accent_color must be a six-digit hex color".to_string(),
-        ));
+    if let Some(accent_color) = &options.accent_color {
+        let color = Regex::new(r"^#[0-9a-fA-F]{6}$").expect("valid color regex");
+        if !color.is_match(accent_color) {
+            return Err(DocsError::InvalidConfig(
+                "accent_color must be a six-digit hex color".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3043,14 +3045,15 @@ mod tests {
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn component_preview_keeps_configured_accent_while_workbench_stays_neutral() {
+    fn component_preview_scopes_configured_accent_without_mutating_document_root() {
         assert!(
             RUNTIME_STYLE.contains(".workbench-shell { --wake-accent: var(--workbench-accent); }")
         );
+        assert!(
+            !RUNTIME_STYLE.contains(":root:has(.demo-frame-root)"),
+            "Demo 不能在文档根节点重写语义颜色"
+        );
         let demo_scope = RUNTIME_STYLE
-            .split_once(":root:has(.demo-frame-root),")
-            .expect("Demo token scope selector")
-            .1
             .split_once(".demo-frame-root {")
             .expect("Demo token scope")
             .1
@@ -3077,12 +3080,12 @@ mod tests {
                 "缺少 Demo 强调色映射: {expected}"
             );
         }
-        assert!(
-            RUNTIME_APP.contains(
-                "document.documentElement.style.setProperty(\"--wake-accent\", siteConfig.accentColor)"
-            ),
-            "iframe runtime 必须把配置色写入根节点"
-        );
+        for runtime in [RUNTIME_APP, RUNTIME_COMPONENTS] {
+            assert!(
+                runtime.contains("if (siteConfig.accentColor)"),
+                "Docs runtime 必须只在显式配置时写入强调色"
+            );
+        }
     }
 
     #[test]
@@ -3639,6 +3642,30 @@ pages = ["build"]
         };
         let config = render_config(Path::new("."), &options, DocsMode::Site).unwrap();
         assert!(config.contains(r#""locale":"en-US""#));
+    }
+
+    #[test]
+    fn accent_color_is_optional_and_serializes_explicit_overrides() {
+        let default_config =
+            render_config(Path::new("."), &DocsOptions::default(), DocsMode::Site).unwrap();
+        assert!(default_config.contains(r#""accentColor":null"#));
+
+        let options = DocsOptions {
+            accent_color: Some("#7c3aed".to_string()),
+            ..DocsOptions::default()
+        };
+        let explicit_config = render_config(Path::new("."), &options, DocsMode::Site).unwrap();
+        assert!(explicit_config.contains(r##""accentColor":"#7c3aed""##));
+
+        let invalid = DocsOptions {
+            accent_color: Some("purple".to_string()),
+            ..DocsOptions::default()
+        };
+        assert!(matches!(
+            validate_options(&invalid),
+            Err(DocsError::InvalidConfig(message))
+                if message == "accent_color must be a six-digit hex color"
+        ));
     }
 
     #[test]

@@ -68,7 +68,9 @@ fn incomplete_templates_are_tolerated() {
 fn completes_properties_values_at_rules_and_pseudos() {
     let properties = "import { css } from '@crab-dev/css'; const box = css`disp`;";
     let document = analyze(properties);
-    let items = document.completions(properties.find("disp").unwrap() as u32 + 4);
+    let items = document
+        .completions(properties.find("disp").unwrap() as u32 + 4)
+        .expect("completion position is inside a Crab CSS template");
     assert!(
         items
             .iter()
@@ -77,18 +79,43 @@ fn completes_properties_values_at_rules_and_pseudos() {
 
     let values = "import { css } from '@crab-dev/css'; const box = css`display: `;";
     let document = analyze(values);
-    let items = document.completions(values.find("display: ").unwrap() as u32 + 9);
+    let items = document
+        .completions(values.find("display: ").unwrap() as u32 + 9)
+        .expect("completion position is inside a Crab CSS template");
     assert!(items.iter().any(|item| item.label == "grid"));
+    assert!(items.iter().all(|item| item.kind == CompletionKind::Value));
+
+    let filtered_values = "import { css } from '@crab-dev/css'; const box = css`display: inl`;";
+    let document = analyze(filtered_values);
+    let items = document
+        .completions(filtered_values.find("display: inl").unwrap() as u32 + 12)
+        .expect("completion position is inside a Crab CSS template");
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|item| { item.kind == CompletionKind::Value && item.label.starts_with("inl") })
+    );
 
     let global = "import { globalStyle } from '@crab-dev/css'; globalStyle`@med`;";
     let document = analyze(global);
-    let items = document.completions(global.find("@med").unwrap() as u32 + 4);
+    let items = document
+        .completions(global.find("@med").unwrap() as u32 + 4)
+        .expect("completion position is inside a Crab CSS template");
     assert!(items.iter().any(|item| item.label == "@media"));
 
     let pseudo = "import { css } from '@crab-dev/css'; const box = css`&:hov`;";
     let document = analyze(pseudo);
-    let items = document.completions(pseudo.find(":hov").unwrap() as u32 + 4);
+    let items = document
+        .completions(pseudo.find(":hov").unwrap() as u32 + 4)
+        .expect("completion position is inside a Crab CSS template");
     assert!(items.iter().any(|item| item.label == ":hover"));
+
+    assert!(
+        document
+            .completions(pseudo.find("import").unwrap() as u32)
+            .is_none()
+    );
 }
 
 #[test]
@@ -108,6 +135,37 @@ fn reports_unknown_properties_and_exposes_hover_and_tokens() {
     assert!(document.semantic_tokens().iter().any(|token| {
         token.kind == SemanticKind::Property && token.span.slice(source) == "display"
     }));
+    assert!(
+        document.semantic_tokens().iter().any(|token| {
+            token.kind == SemanticKind::Value && token.span.slice(source) == "grid"
+        })
+    );
+}
+
+#[test]
+fn semantic_tokens_keep_css_values_distinct_from_host_keywords() {
+    let source = "import { css } from '@crab-dev/css'; const box = css`\n\
+        display: inline-flex;\n\
+        transition: var(--duration, ease-in-out);\n\
+        color: ${token.color};\n\
+        &:hover { cursor: pointer; }\n\
+    `;";
+    let document = analyze(source);
+    for value in ["inline-flex", "--duration", "ease-in-out", "pointer"] {
+        assert!(document.semantic_tokens().iter().any(|token| {
+            token.kind == SemanticKind::Value && token.span.slice(source) == value
+        }));
+    }
+    let interpolation = Span::new(
+        source.find("token.color").unwrap() as u32,
+        (source.find("token.color").unwrap() + "token.color".len()) as u32,
+    );
+    assert!(
+        document
+            .semantic_tokens()
+            .iter()
+            .all(|token| token.span.hi <= interpolation.lo || interpolation.hi <= token.span.lo)
+    );
 }
 
 #[test]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.20
+
+- Added binding-aware Crab CSS semantic values, scoped automatic property and value completions, and deterministic suggestion ranking in the VS Code language service.
+- Made Wake Docs accent colors optional and confined accent-derived component tokens to Demo previews without rewriting global workbench semantics.
+- Preserved side effects inside `void` expressions during minification so editor and application commands cannot be deleted.
+
 ## 0.1.19
 
 - Fixed preserve-module CommonJS output so every generated file defines the default and namespace interop helpers it uses.

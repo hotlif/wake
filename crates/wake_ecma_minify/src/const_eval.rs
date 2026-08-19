@@ -204,7 +204,11 @@ fn const_eval_unary<'a>(u: &UnaryExpression<'a>, ctx: &ConstCtx) -> Option<Const
         LogicalNot => const_eval(&u.argument, ctx).map(|v| ConstVal::Bool(!v.truthy())),
         Plus => const_eval(&u.argument, ctx).map(|v| to_number_val(&v)),
         Minus => const_eval(&u.argument, ctx).map(|v| ConstVal::Num(-to_number(&v))),
-        Void => Some(ConstVal::Undefined),
+        // `void` always produces `undefined`, but its operand must still be
+        // evaluated. Only expose a foldable constant when the operand itself
+        // can be evaluated as a constant; otherwise callers could replace
+        // `void sideEffect()` with `undefined` and silently drop the call.
+        Void => const_eval(&u.argument, ctx).map(|_| ConstVal::Undefined),
         Typeof => const_eval_typeof(&u.argument, ctx),
         BitwiseNot => const_eval(&u.argument, ctx).map(|v| {
             let n = to_int32(&v);
@@ -715,6 +719,10 @@ mod tests {
     #[test]
     fn eval_void() {
         assert_eval("void 0;", ConstVal::Undefined);
+    }
+    #[test]
+    fn eval_void_preserves_unknown_operand_effects() {
+        assert_eq!(eval("void sideEffect();"), None);
     }
     #[test]
     fn eval_typeof_num() {

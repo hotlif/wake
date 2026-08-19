@@ -5,6 +5,7 @@ import {
   Executable,
   LanguageClient,
   LanguageClientOptions,
+  NotificationType,
   ServerOptions,
   TransportKind,
 } from 'vscode-languageclient/node'
@@ -23,6 +24,16 @@ const documentSelector = [
 let client: LanguageClient | undefined
 let output: vscode.LogOutputChannel
 let context: vscode.ExtensionContext
+
+interface TriggerSuggestParams {
+  uri: string
+  version: number
+  position: { line: number; character: number }
+}
+
+const triggerSuggestNotification = new NotificationType<TriggerSuggestParams>(
+  'crabCss/triggerSuggest',
+)
 
 export async function activate(extensionContext: vscode.ExtensionContext): Promise<void> {
   context = extensionContext
@@ -90,12 +101,29 @@ async function startLanguageServer(): Promise<void> {
     clientOptions,
   )
   await client.start()
+  context.subscriptions.push(
+    client.onNotification(triggerSuggestNotification, triggerAutomaticCompletion),
+  )
 }
 
 async function stopLanguageServer(): Promise<void> {
   const current = client
   client = undefined
   if (current) await current.stop()
+}
+
+function triggerAutomaticCompletion(params: TriggerSuggestParams): void {
+  const editor = vscode.window.activeTextEditor
+  if (
+    !editor
+    || editor.document.uri.toString() !== params.uri
+    || editor.document.version !== params.version
+    || !editor.selection.isEmpty
+  ) return
+
+  const position = new vscode.Position(params.position.line, params.position.character)
+  if (!editor.selection.active.isEqual(position)) return
+  void vscode.commands.executeCommand('editor.action.triggerSuggest')
 }
 
 function serverExecutable(extensionContext: vscode.ExtensionContext): Executable {

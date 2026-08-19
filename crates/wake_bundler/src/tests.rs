@@ -156,6 +156,24 @@ fn minify_uses_dot_access_for_identifier_export_names() {
 }
 
 #[test]
+fn minify_preserves_void_call_side_effects() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "void globalThis.vscode.commands.executeCommand('editor.action.triggerSuggest');",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify();
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(
+        output.bundle.contains("editor.action.triggerSuggest"),
+        "void operand side effect was removed:\n{}",
+        output.bundle
+    );
+}
+
+#[test]
 fn set_define_dev_replaces_node_env() {
     // dev 口径：set_define 覆盖默认 prod，`process.env.NODE_ENV` → `"development"`（WAKE-COMPATIBILITY §M3）。
     let fs =

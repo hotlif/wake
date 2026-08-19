@@ -10,9 +10,23 @@ test('manifest exposes the stable Crab CSS contract', async () => {
   assert.equal(manifest.name, 'crab-css')
   assert.equal(manifest.private, true)
   assert.equal(manifest.publisher, 'crab-dev')
-  assert.equal(manifest.version, '0.1.1')
+  assert.equal(manifest.version, '0.1.2')
   assert.equal(manifest.engines.vscode, '^1.96.0')
   assert.deepEqual(manifest.extensionKind, ['workspace'])
+  assert.deepEqual(manifest.contributes.semanticTokenTypes, [
+    {
+      id: 'crabCssValue',
+      description: 'A CSS identifier used as a value inside an @crab-dev/css template.',
+    },
+  ])
+  assert.deepEqual(manifest.contributes.semanticTokenScopes, [
+    {
+      scopes: {
+        crabCssValue: ['support.constant.property-value.css'],
+      },
+    },
+  ])
+  assert.equal(manifest.contributes.semanticTokenTypes[0].superType, undefined)
   assert.equal(manifest.contributes.configuration.properties['crabCss.validation.mode'].default, 'onType')
   assert.equal(manifest.contributes.configuration.properties['crabCss.format.enable'].default, true)
 })
@@ -30,6 +44,11 @@ test('client and manifest use only @crab-dev/css', async () => {
   assert.ok(!source.includes('manifestSectionHasCrabCss'))
   assert.ok(!source.includes('@wake/css'))
   assert.ok(!source.includes('@vanilla-extract'))
+})
+
+test('compiled client preserves the automatic suggestion command', async () => {
+  const compiled = await readFile(new URL('dist/extension.js', root), 'utf8')
+  assert.ok(compiled.includes('editor.action.triggerSuggest'))
 })
 
 test('language highlighting has no spelling or byte-scanner fallback', async () => {
