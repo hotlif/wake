@@ -1,0 +1,14 @@
+{
+  "commands": [
+    { "input": "help", "command": "help" },
+    { "input": "/HELP", "command": "help" },
+    { "input": "clear", "command": "clear" },
+    { "input": "/clear", "command": "clear" },
+    { "input": "open", "command": "open" },
+    { "input": "/OPEN", "command": "open" },
+    { "input": "quit", "command": "quit" },
+    { "input": "/quit", "command": "quit" },
+    { "input": "q", "command": "quit" }
+  ],
+  "invalid": ["", "unknown", "open https://example.com", "/quit now"]
+}

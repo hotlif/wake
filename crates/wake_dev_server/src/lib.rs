@@ -140,8 +140,8 @@ pub enum ServerEvent {
         assets: usize,
         duration_ms: f64,
     },
-    Diagnostic {
-        message: String,
+    Diagnostics {
+        diagnostics: Vec<Diagnostic>,
     },
     Closed,
 }
@@ -639,8 +639,10 @@ fn watch_and_rebuild(
                         eprintln!("  {} 生成步骤失败：{error}", sty.err("✗"));
                     }
                     if let Some(handler) = &event_handler {
-                        handler(ServerEvent::Diagnostic {
-                            message: error.clone(),
+                        handler(ServerEvent::Diagnostics {
+                            diagnostics: vec![
+                                Diagnostic::error(error.clone()).with_code("WAKE_BUILD"),
+                            ],
                         });
                     }
                     let _ = tx.send(msg_error(&error));
@@ -756,9 +758,13 @@ fn rebuild(
             }
         }
         if let Some(handler) = event_handler {
-            handler(ServerEvent::Diagnostic {
-                message: err.clone(),
-            });
+            let diagnostics = out
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error())
+                .cloned()
+                .collect();
+            handler(ServerEvent::Diagnostics { diagnostics });
         }
         let _ = tx.send(msg_error(&err));
         None

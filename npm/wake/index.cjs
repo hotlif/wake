@@ -124,11 +124,7 @@ class DevServer extends EventEmitter {
       } else if (event.type === 'rebuilt') {
         this.emit('rebuilt', event)
       } else if (event.type === 'diagnostic') {
-        this.emit('diagnostic', {
-          severity: 'error',
-          code: 'WAKE_BUILD',
-          message: event.message,
-        })
+        this.emit('diagnostic', event.diagnostic)
       } else if (event.type === 'closed' && !this.#closed) {
         this.#closed = true
         clearInterval(this.#eventTimer)

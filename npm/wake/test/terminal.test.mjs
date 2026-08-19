@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import {
   applyDashboardEvent,
@@ -8,6 +9,7 @@ import {
   createUi,
   formatBanner,
   formatBuildResult,
+  formatDiagnostic,
   formatServerReady,
   humanDuration,
   observeServer,
@@ -17,6 +19,11 @@ import {
   supportsColor,
   supportsTui,
 } from '../bin/terminal.mjs'
+
+const diagnosticContract = JSON.parse(readFileSync(
+  new URL('../../../fixtures/terminal-diagnostic-contract.json', import.meta.url),
+  'utf8',
+))
 
 test('terminal capability detection follows tty, NO_COLOR, and TERM', () => {
   assert.equal(supportsColor({ isTTY: true }, {}), true)
@@ -69,6 +76,15 @@ test('colored output strips to the exact plain content', () => {
   assert.equal(stripAnsi(colored), plain)
 })
 
+test('shared diagnostic contract renders an exact source code frame', () => {
+  assert.deepEqual(
+    formatDiagnostic(createUi(false), diagnosticContract.diagnostic),
+    diagnosticContract.plainLines,
+  )
+  const colored = formatDiagnostic(createUi(true), diagnosticContract.diagnostic).join('\n')
+  assert.equal(stripAnsi(colored), diagnosticContract.plainLines.join('\n'))
+})
+
 test('durations use the same human-readable scale as Rust', () => {
   assert.equal(humanDuration(0), '1ms')
   assert.equal(humanDuration(24), '24ms')
@@ -107,7 +123,7 @@ test('dashboard activity history is bounded and tracks rebuilds', () => {
   for (let index = 0; index < 250; index += 1) {
     applyDashboardEvent(state, {
       type: 'diagnostic',
-      message: `error ${index}`,
+      diagnostic: { severity: 'error', message: `error ${index}` },
     })
   }
   assert.equal(state.activity.length, 200)
@@ -142,22 +158,20 @@ test('plain server activity reports rebuilds and diagnostics to stderr', () => {
     assets: 1,
     durationMs: 18.6,
   })
-  server.emit('diagnostic', {
-    code: 'WAKE_BUILD',
-    message: 'Unexpected token',
-  })
+  server.emit('diagnostic', diagnosticContract.diagnostic)
   assert.deepEqual(errors, [
     '  ↻  Rebuilding after 2 file changes…',
     '  ✓  Updated  ·  1 module  ·  11 cache hits  19ms',
-    '  ✗  Build failed  [WAKE_BUILD] Unexpected token',
+    `  ✗  ${diagnosticContract.plainLines[0]}`,
+    ...diagnosticContract.plainLines.slice(1).map((line) => `     ${line}`),
   ])
 
   stop()
   server.emit('rebuilt', { initial: false, modules: 1, durationMs: 1 })
-  assert.equal(errors.length, 3)
+  assert.equal(errors.length, 2 + diagnosticContract.plainLines.length)
 })
 
-test('dashboard session restores raw mode, cursor, and alternate screen', () => {
+test('dashboard session restores raw mode and every interactive terminal mode', () => {
   class Input extends EventEmitter {
     isTTY = true
     isRaw = false
@@ -191,7 +205,60 @@ test('dashboard session restores raw mode, cursor, and alternate screen', () => 
 
   assert.deepEqual(input.rawChanges, [true, false])
   assert.match(output.writes.join(''), /\x1b\[\?1049h/)
+  assert.match(output.writes.join(''), /\x1b\[\?1002h/)
+  assert.match(output.writes.join(''), /\x1b\[\?1006h/)
+  assert.match(output.writes.join(''), /\x1b\[\?2004h/)
   assert.match(output.writes.join(''), /\x1b\[\?25l/)
+  assert.match(output.writes.join(''), /\x1b\[\?2004l/)
+  assert.match(output.writes.join(''), /\x1b\[\?1006l/)
+  assert.match(output.writes.join(''), /\x1b\[\?1002l/)
   assert.match(output.writes.join(''), /\x1b\[\?25h/)
   assert.match(output.writes.join(''), /\x1b\[\?1049l/)
+})
+
+test('dashboard session accepts commands, mouse copy, and clipboard paste', async () => {
+  class Input extends EventEmitter {
+    isTTY = true
+    isRaw = false
+    setRawMode(value) { this.isRaw = value }
+    resume() {}
+    pause() {}
+  }
+  class Output extends EventEmitter {
+    isTTY = true
+    columns = 80
+    rows = 20
+    writes = []
+    write(value) { this.writes.push(String(value)) }
+  }
+  const input = new Input()
+  const output = new Output()
+  const copied = []
+  const opened = []
+  const state = createDashboardState({ command: 'dev' })
+  state.version = '0.1.3'
+  setDashboardEndpoint(state, 'http://127.0.0.1:5173/')
+  const session = createDashboardSession(state, {
+    input,
+    output,
+    ui: createUi(false),
+    clipboardAdapter: {
+      async write(value) { copied.push(value) },
+      async read() { return '/help\n' },
+    },
+    async openUrl(value) { opened.push(value) },
+  })
+
+  input.emit('data', Buffer.from('open\r'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(opened, ['http://127.0.0.1:5173/'])
+
+  input.emit('data', Buffer.from('\x1b[<0;2;1M\x1b[<0;9;1m'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.ok(copied.at(-1)?.includes('WAKE'), copied)
+
+  input.emit('data', Buffer.from('\x1b[<2;5;19M\r'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.match(state.activity.at(-1).message, /Commands:/)
+  session.close()
 })

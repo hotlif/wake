@@ -1,3 +1,15 @@
+import clipboard from 'clipboardy'
+import open from 'open'
+import stringWidth from 'string-width'
+
+import {
+  InputEditor,
+  TerminalInputDecoder,
+  extractSelection,
+  lineToCells,
+  selectionContains,
+} from './console.mjs'
+
 const RESET = '\x1b[0m'
 const BOLD = '\x1b[1m'
 const DIM = '\x1b[2m'
@@ -81,7 +93,7 @@ export function formatBuildResult(ui, result, label = 'Built', extra = '') {
   ]
   if (result.outputDir) lines.push(`     ${ui.dim('Output')}  ${ui.accent(result.outputDir)}`)
   for (const diagnostic of result.diagnostics || []) {
-    lines.push(`     ${ui.warn(String(diagnostic.severity || 'warning').toUpperCase())}  ${diagnostic.message}`)
+    lines.push(...formatDiagnostic(ui, diagnostic).map((line) => `     ${line}`))
   }
   lines.push('')
   return lines
@@ -119,14 +131,67 @@ export function formatError(ui, error) {
   ]
   if (error?.path) lines.push(`     ${ui.dim('Path')}  ${ui.accent(error.path)}`)
   for (const diagnostic of error?.diagnostics || []) {
-    const diagnosticCode = diagnostic.code ? `[${diagnostic.code}] ` : ''
-    lines.push(
-      `     ${ui.warn(String(diagnostic.severity || 'error').toUpperCase())}  ${diagnosticCode}${diagnostic.message}`,
-    )
-    for (const note of diagnostic.notes || []) lines.push(`        ${ui.dim('·')} ${note}`)
+    lines.push(...formatDiagnostic(ui, diagnostic).map((line) => `     ${line}`))
   }
   lines.push('')
   return lines
+}
+
+export function formatDiagnostic(ui, diagnostic) {
+  const severity = String(diagnostic?.severity || 'error').toUpperCase()
+  const heading = diagnostic?.code
+    ? `${severity} [${diagnostic.code}]: ${diagnostic.message}`
+    : `${severity}: ${diagnostic?.message || ''}`
+  const lines = [
+    diagnostic?.severity === 'warning'
+      ? ui.warn(heading)
+      : diagnostic?.severity === 'error'
+        ? ui.error(heading)
+        : ui.accent(heading),
+  ]
+  const location = diagnostic?.location
+  if (diagnostic?.path && location) {
+    lines.push(` ${ui.dim('-->')} ${ui.accent(diagnostic.path)}:${location.line}:${location.column}`)
+  } else if (diagnostic?.path) {
+    lines.push(` ${ui.dim('-->')} ${ui.accent(diagnostic.path)}`)
+  }
+  if (location) {
+    const lineText = expandTabs(String(location.lineText || ''))
+    const gutter = String(location.line).length
+    const start = displayColumn(String(location.lineText || ''), location.column)
+    const end = location.endLine === location.line
+      ? displayColumn(String(location.lineText || ''), location.endColumn)
+      : stringWidth(lineText)
+    const width = Math.max(1, end - start)
+    const label = location.label ? ` ${location.label}` : ''
+    lines.push(`${' '.repeat(gutter)} ${ui.dim('|')}`)
+    lines.push(`${String(location.line).padStart(gutter)} ${ui.dim('|')} ${lineText}`)
+    lines.push(`${' '.repeat(gutter)} ${ui.dim('|')} ${ui.error(`${' '.repeat(start)}${'^'.repeat(width)}${label}`)}`)
+  }
+  for (const note of diagnostic?.notes || []) lines.push(`  ${ui.dim('=')} note: ${note}`)
+  return lines
+}
+
+function displayColumn(line, oneBasedColumn) {
+  const prefix = [...line].slice(0, Math.max(0, Number(oneBasedColumn || 1) - 1)).join('')
+  return stringWidth(expandTabs(prefix))
+}
+
+function expandTabs(line) {
+  const tabStop = 4
+  let width = 0
+  let value = ''
+  for (const character of line) {
+    if (character === '\t') {
+      const spaces = tabStop - (width % tabStop)
+      value += ' '.repeat(spaces)
+      width += spaces
+    } else {
+      value += character
+      width += stringWidth(character)
+    }
+  }
+  return value
 }
 
 export function formatFinalSummary(ui, state, reason, label = 'Server stopped') {
@@ -161,8 +226,9 @@ export function observeServer(server, ui, output = console) {
     )
   }
   const onDiagnostic = (diagnostic) => {
-    const code = diagnostic.code ? `[${diagnostic.code}] ` : ''
-    output.error(`  ${ui.error('✗')}  ${ui.bold('Build failed')}  ${code}${diagnostic.message}`)
+    for (const [index, line] of formatDiagnostic(ui, diagnostic).entries()) {
+      output.error(index === 0 ? `  ${ui.error('✗')}  ${ui.bold(line)}` : `     ${line}`)
+    }
   }
 
   server.on('rebuildStart', onRebuildStart)
@@ -240,7 +306,7 @@ export function applyDashboardEvent(state, event) {
     )
   } else if (event.type === 'diagnostic') {
     state.status = 'error'
-    pushActivity(state, 'error', event.message)
+    pushActivity(state, 'error', formatDiagnostic(createUi(false), event.diagnostic).join('\n'))
   } else if (event.type === 'closed') {
     state.status = 'stopped'
     pushActivity(state, 'info', 'Wake stopped')
@@ -286,14 +352,19 @@ function elapsedStamp(durationMs) {
 }
 
 function charLength(text) {
-  return [...stripAnsi(String(text))].length
+  return stringWidth(stripAnsi(String(text)))
 }
 
 function truncate(text, width) {
   const chars = [...String(text)]
-  if (chars.length <= width) return String(text)
+  if (charLength(text) <= width) return String(text)
   if (width <= 1) return chars.slice(0, width).join('')
-  return `${chars.slice(0, width - 1).join('')}…`
+  let value = ''
+  for (const character of chars) {
+    if (charLength(value + character) > width - 1) break
+    value += character
+  }
+  return `${value}…`
 }
 
 function pad(text, width) {
@@ -330,15 +401,22 @@ function metricsText(state) {
 }
 
 function activityRows(state, available) {
-  const end = Math.max(0, state.activity.length - state.scrollFromBottom)
-  const start = Math.max(0, end - Math.max(1, available))
-  return state.activity.slice(start, end).map((item) => {
+  const rows = state.activity.flatMap((item) => {
     const symbol = { info: '·', success: '✓', warning: '↻', error: '✗' }[item.level]
-    return `${elapsedStamp(item.elapsedMs)}  ${symbol} ${String(item.message).replaceAll('\n', ' ')}`
+    return String(item.message).split('\n').map((line, index) => index === 0
+      ? `${elapsedStamp(item.elapsedMs)}  ${symbol} ${line}`
+      : `          ${line}`)
   })
+  const end = Math.max(0, rows.length - state.scrollFromBottom)
+  const start = Math.max(0, end - Math.max(1, available))
+  return rows.slice(start, end)
 }
 
-function plainFrame(state, width, height) {
+function activityRowCount(state) {
+  return state.activity.reduce((count, item) => count + String(item.message).split('\n').length, 0)
+}
+
+function plainFrame(state, width, height, editor = new InputEditor(), notice) {
   width = Math.max(10, width || 80)
   height = Math.max(6, height || 24)
   const runtime = humanRuntime(Date.now() - state.startedAt)
@@ -348,13 +426,13 @@ function plainFrame(state, width, height) {
   let activityHeight
 
   if (width < 60 || height < 14) {
-    fixed = [
-      topBorder(state, width),
-      boxLine(header, width),
-      boxLine(state.endpoint || state.watchLabel, width),
-      boxLine(state.activity.at(-1)?.message || 'Starting Wake…', width),
-      boxLine('Resize for details · q/Ctrl-C quit', width),
-    ]
+    const latest = String(state.activity.at(-1)?.message || 'Starting Wake…').split('\n')
+    fixed = [topBorder(state, width), boxLine(header, width)]
+    const diagnosticRows = latest.length > 1
+    for (const line of latest.slice(0, Math.max(1, height - (diagnosticRows ? 5 : 6)))) {
+      fixed.push(boxLine(line, width))
+    }
+    if (!diagnosticRows) fixed.push(boxLine('Resize for details · type help for commands', width))
     activityHeight = 0
   } else if (width < 80 || height < 20) {
     fixed = [
@@ -381,10 +459,18 @@ function plainFrame(state, width, height) {
   }
 
   for (const row of activityRows(state, activityHeight)) fixed.push(boxLine(row, width))
-  while (activityHeight > 0 && fixed.length < height - 2) fixed.push(boxLine('', width))
-  if (height >= 14) fixed.push(boxLine('↑↓/PgUp/PgDn scroll · End follow · c clear · q/Ctrl-C quit', width))
+  while (fixed.length < height - 3) fixed.push(boxLine('', width))
+  fixed.splice(Math.max(0, height - 3))
+  const visible = editor.visible(Math.max(0, width - 6))
+  fixed.push(boxLine(
+    notice
+      ? `${notice.error ? '✗' : '✓'} ${notice.message}`
+      : 'Enter command · PgUp/PgDn logs · drag to copy · Ctrl-C quit',
+    width,
+  ))
+  fixed.push(boxLine(`› ${visible.text}`, width))
   fixed.push(bottomBorder(width))
-  return fixed.slice(0, height)
+  return { lines: fixed.slice(0, height), cursor: visible.cursor }
 }
 
 function colorizeLine(line, ui) {
@@ -398,16 +484,67 @@ function colorizeLine(line, ui) {
   return value
 }
 
+function renderDashboardFrame(
+  state,
+  width = 80,
+  height = 24,
+  ui = createUi(false),
+  editor = new InputEditor(),
+  selection,
+  notice,
+) {
+  const frame = plainFrame(state, width, height, editor, notice)
+  const rows = frame.lines.map((line) => lineToCells(line, width))
+  const rendered = rows.map((cells, y) => {
+    let selected = false
+    let line = ''
+    for (let x = 0; x < cells.length; x += 1) {
+      const nextSelected = selectionContains(selection, x, y)
+      if (nextSelected !== selected) {
+        line += nextSelected ? '\x1b[7m' : RESET
+        selected = nextSelected
+      }
+      line += cells[x]
+    }
+    if (selected) line += RESET
+    return colorizeLine(line, ui)
+  })
+  return {
+    text: rendered.join('\n'),
+    rows,
+    inputY: Math.max(0, rows.length - 2),
+    inputX: 4,
+    cursorX: Math.min(width - 2, 4 + frame.cursor),
+  }
+}
+
 export function renderDashboard(state, width = 80, height = 24, ui = createUi(false)) {
-  return plainFrame(state, width, height).map((line) => colorizeLine(line, ui)).join('\n')
+  return renderDashboardFrame(state, width, height, ui).text
 }
 
 export function createDashboardSession(
   state,
-  { input = process.stdin, output = process.stderr, ui = createUi() } = {},
+  {
+    input = process.stdin,
+    output = process.stderr,
+    ui = createUi(),
+    clipboardAdapter = clipboard,
+    openUrl = open,
+    env = process.env,
+  } = {},
 ) {
   let closed = false
   let previousRaw = false
+  const editor = new InputEditor()
+  const decoder = new TerminalInputDecoder()
+  let rows = []
+  let inputY = 0
+  let inputX = 0
+  let selection
+  let dragStart
+  let lastSelection = ''
+  let notice
+  let eventQueue = Promise.resolve()
   let resolveExit
   const exit = new Promise((resolve) => { resolveExit = resolve })
 
@@ -415,25 +552,121 @@ export function createDashboardSession(
     if (closed) return
     const width = output.columns || 80
     const height = output.rows || 24
-    output.write(`\x1b[H${renderDashboard(state, width, height, ui)}\x1b[J`)
+    if (notice && Date.now() - notice.startedAt >= 1500) notice = undefined
+    const frame = renderDashboardFrame(state, width, height, ui, editor, selection, notice)
+    rows = frame.rows
+    inputY = frame.inputY
+    inputX = frame.inputX
+    output.write(`\x1b[H${frame.text}\x1b[J\x1b[${inputY + 1};${frame.cursorX + 1}H\x1b[?25h`)
   }
   const requestExit = (reason) => {
     if (!closed) resolveExit(reason)
   }
-  const onData = (chunk) => {
-    const key = chunk.toString('utf8')
-    if (key === '\u0003') requestExit('SIGINT')
-    else if (key === 'q' || key === 'Q') requestExit('q')
-    else if (key === 'c' || key === 'C') {
+  const setNotice = (message, error = false) => {
+    notice = { message, error, startedAt: Date.now() }
+    draw()
+  }
+  const osc52 = (value) => {
+    const sequence = `\x1b]52;c;${Buffer.from(value).toString('base64')}\x07`
+    output.write(env.TMUX ? `\x1bPtmux;${sequence.replaceAll('\x1b', '\x1b\x1b')}\x1b\\` : sequence)
+  }
+  const copyText = async (value) => {
+    if (env.SSH_CONNECTION || env.SSH_TTY) {
+      osc52(value)
+      setNotice('Copied to clipboard')
+      return
+    }
+    try {
+      await clipboardAdapter.write(value)
+      setNotice('Copied to clipboard')
+    } catch {
+      try {
+        osc52(value)
+        setNotice('Copied to clipboard')
+      } catch {
+        setNotice('Failed to copy; terminal clipboard is unavailable', true)
+      }
+    }
+  }
+  const pasteClipboard = async () => {
+    try {
+      editor.insertPaste(await clipboardAdapter.read())
+      selection = undefined
+      draw()
+    } catch {
+      setNotice('Clipboard paste is unavailable; use terminal paste', true)
+    }
+  }
+  const submit = async () => {
+    const result = editor.submit()
+    if (result.error) pushActivity(state, 'warning', result.error)
+    else if (result.command === 'help') pushActivity(state, 'info', 'Commands: help · clear · open · quit (a leading / is optional)')
+    else if (result.command === 'clear') {
       state.activity.length = 0
       state.scrollFromBottom = 0
-      draw()
-    } else if (key === '\x1b[A') state.scrollFromBottom = Math.max(0, Math.min(state.activity.length - 1, state.scrollFromBottom + 1))
-    else if (key === '\x1b[B') state.scrollFromBottom = Math.max(0, state.scrollFromBottom - 1)
-    else if (key === '\x1b[5~') state.scrollFromBottom = Math.max(0, Math.min(state.activity.length - 1, state.scrollFromBottom + 10))
-    else if (key === '\x1b[6~') state.scrollFromBottom = Math.max(0, state.scrollFromBottom - 10)
-    else if (key === '\x1b[F' || key === '\x1b[4~') state.scrollFromBottom = 0
+      setNotice('Activity cleared')
+    } else if (result.command === 'open') {
+      if (!/^https?:\/\//u.test(state.endpoint)) pushActivity(state, 'warning', 'No development-server URL is available to open')
+      else {
+        try {
+          await openUrl(state.endpoint)
+          setNotice('Opened development server')
+        } catch (error) {
+          pushActivity(state, 'warning', `Failed to open ${state.endpoint}: ${error.message || error}`)
+        }
+      }
+    } else if (result.command === 'quit') requestExit('q')
     draw()
+  }
+  const handleEvent = async (event) => {
+    if (event.type === 'paste') editor.insertPaste(event.value)
+    else if (event.type === 'text') {
+      editor.insert(event.value)
+      selection = undefined
+    } else if (event.type === 'mouse') {
+      const position = { x: event.x, y: event.y }
+      if (event.kind === 'down' && event.button === 'left') {
+        dragStart = position
+        selection = { start: position, end: position }
+      } else if (event.kind === 'drag' && dragStart) selection = { start: dragStart, end: position }
+      else if (event.kind === 'up' && event.button === 'left' && dragStart) {
+        selection = { start: dragStart, end: position }
+        dragStart = undefined
+        const value = extractSelection(rows, selection)
+        if (value) {
+          lastSelection = value
+          await copyText(value)
+        } else {
+          if (position.y === inputY) editor.setCursorFromCell(Math.max(0, position.x - inputX))
+          selection = undefined
+        }
+      } else if (event.kind === 'down' && event.button === 'right' && position.y === inputY) await pasteClipboard()
+      else if (event.kind === 'scroll-up') state.scrollFromBottom = Math.max(0, Math.min(activityRowCount(state) - 1, state.scrollFromBottom + 3))
+      else if (event.kind === 'scroll-down') state.scrollFromBottom = Math.max(0, state.scrollFromBottom - 3)
+    } else if (event.type === 'key') {
+      if (event.key === 'ctrl-c') requestExit('SIGINT')
+      else if (event.key === 'ctrl-y') lastSelection ? await copyText(lastSelection) : setNotice('No selected text to copy', true)
+      else if (event.key === 'ctrl-v') await pasteClipboard()
+      else if (event.key === 'enter') await submit()
+      else if (event.key === 'escape') { editor.clear(); selection = undefined }
+      else if (event.key === 'left') editor.moveLeft()
+      else if (event.key === 'right') editor.moveRight()
+      else if (event.key === 'home') editor.moveHome()
+      else if (event.key === 'end') editor.moveEnd()
+      else if (event.key === 'ctrl-end') state.scrollFromBottom = 0
+      else if (event.key === 'backspace') editor.backspace()
+      else if (event.key === 'delete') editor.delete()
+      else if (event.key === 'up') editor.historyPrevious()
+      else if (event.key === 'down') editor.historyNext()
+      else if (event.key === 'pageup') state.scrollFromBottom = Math.max(0, Math.min(activityRowCount(state) - 1, state.scrollFromBottom + 10))
+      else if (event.key === 'pagedown') state.scrollFromBottom = Math.max(0, state.scrollFromBottom - 10)
+    }
+    draw()
+  }
+  const onData = (chunk) => {
+    for (const event of decoder.push(chunk)) {
+      eventQueue = eventQueue.then(() => handleEvent(event))
+    }
   }
   const onResize = () => draw()
 
@@ -442,7 +675,7 @@ export function createDashboardSession(
   input.resume?.()
   input.on('data', onData)
   output.on?.('resize', onResize)
-  output.write('\x1b[?1049h\x1b[?25l\x1b[2J')
+  output.write('\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[2J')
   const timer = setInterval(draw, 100)
   timer.unref?.()
   draw()
@@ -459,7 +692,7 @@ export function createDashboardSession(
       output.off?.('resize', onResize)
       if (typeof input.setRawMode === 'function') input.setRawMode(previousRaw)
       if (!previousRaw) input.pause?.()
-      output.write('\x1b[?25h\x1b[?1049l')
+      output.write('\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l')
     },
   }
 }

@@ -1,0 +1,27 @@
+{
+  "diagnostic": {
+    "severity": "error",
+    "code": "WAKE_PARSE",
+    "message": "Unexpected token",
+    "path": "src/App.tsx",
+    "start": 20,
+    "end": 23,
+    "location": {
+      "line": 12,
+      "column": 8,
+      "endLine": 12,
+      "endColumn": 9,
+      "lineText": "\tconst 名 = ;",
+      "label": "expected expression"
+    },
+    "notes": ["remove the incomplete declaration"]
+  },
+  "plainLines": [
+    "ERROR [WAKE_PARSE]: Unexpected token",
+    " --> src/App.tsx:12:8",
+    "   |",
+    "12 |     const 名 = ;",
+    "   |           ^^ expected expression",
+    "  = note: remove the incomplete declaration"
+  ]
+}

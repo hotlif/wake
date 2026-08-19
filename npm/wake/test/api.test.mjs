@@ -316,6 +316,32 @@ test('emits rebuild events and releases the port on idempotent close', async () 
   await rm(cwd, { recursive: true, force: true })
 })
 
+test('dev diagnostics preserve native source locations', async () => {
+  const source = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-node-diagnostic-'))
+  await cp(source, cwd, { recursive: true })
+  await writeFile(
+    join(cwd, 'src/index.js'),
+    'const first = 1;\nconst second = 2;\nconst broken = ;\n',
+  )
+  const reservation = createServer()
+  const port = await listen(reservation)
+  await new Promise((resolve) => reservation.close(resolve))
+  const server = await startDevServer({ cwd, port })
+  try {
+    const [diagnostic] = await once(server, 'diagnostic', {
+      signal: AbortSignal.timeout(10_000),
+    })
+    assert.equal(diagnostic.severity, 'error')
+    assert.equal(diagnostic.location.line, 3)
+    assert.equal(diagnostic.location.lineText, 'const broken = ;')
+    assert.ok(diagnostic.location.column > 1)
+  } finally {
+    await server.close()
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 test('addon cleanup releases native resources when a Worker exits', async () => {
   const source = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
   const cwd = await mkdtemp(join(tmpdir(), 'wake-node-worker-'))

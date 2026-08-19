@@ -77,6 +77,11 @@ ctrlc = "3.5.1"
 signal-hook = "0.4.4"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 crossterm = "0.29.0"
+arboard = { version = "=3.6.1", default-features = false, features = ["wayland-data-control"] }
+base64 = "=0.22.1"
+open = "=5.4.0"
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.1"
 
 # —— 内部 crate（路径依赖）——
 wake_common = { path = "crates/wake_common" }

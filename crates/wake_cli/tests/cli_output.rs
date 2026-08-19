@@ -302,3 +302,38 @@ fn bundle_missing_outfile_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--outfile"));
 }
+
+#[test]
+fn build_error_prints_numbered_source_code_frame() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "wake_cli_diagnostic_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("wake.config.toml"),
+        "[html]\nentry = 'src/index.js'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/index.js"),
+        "const first = 1;\nconst second = 2;\nconst broken = ;\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .current_dir(&root)
+        .args(["--ui", "plain", "build"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("src/index.js:3:"), "{stderr}");
+    assert!(stderr.contains("3 | const broken = ;"), "{stderr}");
+    assert!(stderr.contains('^'), "{stderr}");
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -3,6 +3,15 @@
 Wake is a Rust-native web builder exposed as both a Node.js library and the
 `wake` command.
 
+Interactive `dev` and `docs dev` sessions use the full-screen TUI when stdin
+and stderr are terminals. The command line accepts `help`, `clear`, `open`,
+and `quit` (with optional `/` prefixes), keeps in-memory history, supports
+paste, and copies mouse-selected screen text to the clipboard. Use
+`--ui plain` for stable non-interactive logs; Ctrl-C always interrupts.
+Compiler failures include `path:line:column`, a numbered source line, and a caret when the diagnostic
+has a valid source span. The same structured location is available from Node build errors and server
+`diagnostic` events.
+
 ```sh
 npm install --save-dev @crab-dev/wake
 npx wake build

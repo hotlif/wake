@@ -1,22 +1,30 @@
 //! Full-screen terminal dashboard for long-running Wake commands.
 
 use std::collections::VecDeque;
-use std::io::{self, IsTerminal, Stderr};
+use std::io::{self, IsTerminal, Stderr, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use crate::console::{CellPosition, ConsoleCommand, InputEditor, ScreenSelection, ScreenSnapshot};
 
 const MAX_ACTIVITY: usize = 200;
 
@@ -188,6 +196,14 @@ impl DashboardState {
         self.scroll_from_bottom = 0;
     }
 
+    fn info(&mut self, message: impl Into<String>) {
+        self.push(ActivityLevel::Info, message);
+    }
+
+    fn warning(&mut self, message: impl Into<String>) {
+        self.push(ActivityLevel::Warning, message);
+    }
+
     fn push(&mut self, level: ActivityLevel, message: impl Into<String>) {
         if self.activity.len() == MAX_ACTIVITY {
             self.activity.pop_front();
@@ -204,11 +220,18 @@ impl DashboardState {
 
     fn scroll_up(&mut self, amount: usize) {
         self.scroll_from_bottom =
-            (self.scroll_from_bottom + amount).min(self.activity.len().saturating_sub(1));
+            (self.scroll_from_bottom + amount).min(self.activity_row_count().saturating_sub(1));
     }
 
     fn scroll_down(&mut self, amount: usize) {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(amount);
+    }
+
+    fn activity_row_count(&self) -> usize {
+        self.activity
+            .iter()
+            .map(|item| item.message.lines().count().max(1))
+            .sum()
     }
 }
 
@@ -301,6 +324,13 @@ impl Palette {
 pub struct Dashboard {
     terminal: Terminal<CrosstermBackend<Stderr>>,
     palette: Palette,
+    editor: InputEditor,
+    snapshot: ScreenSnapshot,
+    selection: Option<ScreenSelection>,
+    drag_start: Option<CellPosition>,
+    last_selection: Option<String>,
+    clipboard: Option<arboard::Clipboard>,
+    notice: Option<(String, Instant, bool)>,
     restored: bool,
 }
 
@@ -316,7 +346,13 @@ impl Dashboard {
     pub fn new(color: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stderr = std::io::stderr();
-        if let Err(error) = execute!(stderr, EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(
+            stderr,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        ) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -325,19 +361,38 @@ impl Dashboard {
             Ok(mut terminal) => {
                 if let Err(error) = terminal.clear() {
                     let _ = disable_raw_mode();
-                    let _ = execute!(terminal.backend_mut(), Show, LeaveAlternateScreen);
+                    let _ = execute!(
+                        terminal.backend_mut(),
+                        DisableBracketedPaste,
+                        DisableMouseCapture,
+                        Show,
+                        LeaveAlternateScreen
+                    );
                     return Err(error);
                 }
                 Ok(Self {
                     terminal,
                     palette: Palette::detect(color),
+                    editor: InputEditor::default(),
+                    snapshot: ScreenSnapshot::default(),
+                    selection: None,
+                    drag_start: None,
+                    last_selection: None,
+                    clipboard: arboard::Clipboard::new().ok(),
+                    notice: None,
                     restored: false,
                 })
             }
             Err(error) => {
                 let _ = disable_raw_mode();
                 let mut stderr = std::io::stderr();
-                let _ = execute!(stderr, Show, LeaveAlternateScreen);
+                let _ = execute!(
+                    stderr,
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    Show,
+                    LeaveAlternateScreen
+                );
                 Err(error)
             }
         }
@@ -345,7 +400,39 @@ impl Dashboard {
 
     pub fn draw(&mut self, state: &DashboardState) -> io::Result<()> {
         let palette = self.palette;
-        self.terminal.draw(|frame| render(frame, state, palette))?;
+        let input = self.editor.value().to_string();
+        let cursor_cell = self.editor.cursor_cell();
+        let selection = self.selection;
+        let notice = self
+            .active_notice()
+            .map(|(text, error)| (text.to_string(), error));
+        let completed = self.terminal.draw(|frame| {
+            render_interactive(
+                frame,
+                state,
+                palette,
+                &input,
+                cursor_cell,
+                selection,
+                notice.as_ref().map(|(text, error)| (text.as_str(), *error)),
+            )
+        })?;
+        let buffer = completed.buffer.clone();
+        let area = completed.area;
+        let input_area = command_line_area(area);
+        self.snapshot = ScreenSnapshot {
+            width: area.width,
+            height: area.height,
+            rows: (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect()
+                })
+                .collect(),
+            input_y: input_area.y,
+            input_x: input_area.x.saturating_add(2),
+        };
         Ok(())
     }
 
@@ -357,7 +444,23 @@ impl Dashboard {
         if !event::poll(timeout)? {
             return Ok(DashboardAction::Continue);
         }
-        let Event::Key(key) = event::read()? else {
+        let input = event::read()?;
+        if let Event::Paste(value) = input {
+            self.editor.insert_paste(&value);
+            self.selection = None;
+            return Ok(DashboardAction::Continue);
+        }
+        if let Event::Mouse(mouse) = input {
+            return self.handle_mouse(
+                state,
+                mouse.kind,
+                CellPosition {
+                    x: mouse.column,
+                    y: mouse.row,
+                },
+            );
+        }
+        let Event::Key(key) = input else {
             return Ok(DashboardAction::Continue);
         };
         if key.kind != KeyEventKind::Press {
@@ -367,17 +470,58 @@ impl Dashboard {
             (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 Ok(DashboardAction::Interrupt)
             }
-            (KeyCode::Char('q'), _) => Ok(DashboardAction::Quit),
-            (KeyCode::Char('c'), _) => {
-                state.clear_activity();
+            (KeyCode::Char('y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(value) = self.last_selection.clone() {
+                    self.copy_text(&value);
+                } else {
+                    self.set_notice("No selected text to copy", true);
+                }
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.paste_from_clipboard();
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Enter, _) => self.submit_command(state),
+            (KeyCode::Esc, _) => {
+                self.editor.clear();
+                self.selection = None;
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Left, _) => {
+                self.editor.move_left();
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Right, _) => {
+                self.editor.move_right();
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Home, _) => {
+                self.editor.move_home();
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.scroll_from_bottom = 0;
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::End, _) => {
+                self.editor.move_end();
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Backspace, _) => {
+                self.editor.backspace();
+                Ok(DashboardAction::Continue)
+            }
+            (KeyCode::Delete, _) => {
+                self.editor.delete();
                 Ok(DashboardAction::Continue)
             }
             (KeyCode::Up, _) => {
-                state.scroll_up(1);
+                self.editor.history_previous();
                 Ok(DashboardAction::Continue)
             }
             (KeyCode::Down, _) => {
-                state.scroll_down(1);
+                self.editor.history_next();
                 Ok(DashboardAction::Continue)
             }
             (KeyCode::PageUp, _) => {
@@ -388,12 +532,157 @@ impl Dashboard {
                 state.scroll_down(10);
                 Ok(DashboardAction::Continue)
             }
-            (KeyCode::End, _) => {
-                state.scroll_from_bottom = 0;
+            (KeyCode::Char(value), modifiers)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.editor.insert_char(value);
+                self.selection = None;
                 Ok(DashboardAction::Continue)
             }
             _ => Ok(DashboardAction::Continue),
         }
+    }
+
+    fn submit_command(&mut self, state: &mut DashboardState) -> io::Result<DashboardAction> {
+        match self.editor.submit() {
+            Ok(ConsoleCommand::Help) => {
+                state.info("Commands: help · clear · open · quit (a leading / is optional)");
+                Ok(DashboardAction::Continue)
+            }
+            Ok(ConsoleCommand::Clear) => {
+                state.clear_activity();
+                self.set_notice("Activity cleared", false);
+                Ok(DashboardAction::Continue)
+            }
+            Ok(ConsoleCommand::Open) => {
+                let endpoint = state.endpoint.trim();
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                    state.warning("No development-server URL is available to open");
+                } else {
+                    match open::that(endpoint) {
+                        Ok(()) => self.set_notice("Opened development server", false),
+                        Err(error) => state.warning(format!("Failed to open {endpoint}: {error}")),
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            Ok(ConsoleCommand::Quit) => Ok(DashboardAction::Quit),
+            Err(message) => {
+                state.warning(message);
+                Ok(DashboardAction::Continue)
+            }
+        }
+    }
+
+    fn handle_mouse(
+        &mut self,
+        state: &mut DashboardState,
+        kind: MouseEventKind,
+        position: CellPosition,
+    ) -> io::Result<DashboardAction> {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag_start = Some(position);
+                self.selection = Some(ScreenSelection {
+                    start: position,
+                    end: position,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(start) = self.drag_start {
+                    self.selection = Some(ScreenSelection {
+                        start,
+                        end: position,
+                    });
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(start) = self.drag_start.take() {
+                    let selection = ScreenSelection {
+                        start,
+                        end: position,
+                    };
+                    let value = self.snapshot.extract(selection);
+                    if value.is_empty() {
+                        if position.y == self.snapshot.input_y {
+                            self.editor.set_cursor_from_cell(
+                                position.x.saturating_sub(self.snapshot.input_x) as usize,
+                            );
+                        }
+                        self.selection = None;
+                    } else {
+                        self.selection = Some(selection);
+                        self.last_selection = Some(value.clone());
+                        self.copy_text(&value);
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if position.y == self.snapshot.input_y => {
+                self.paste_from_clipboard();
+            }
+            MouseEventKind::ScrollUp => state.scroll_up(3),
+            MouseEventKind::ScrollDown => state.scroll_down(3),
+            _ => {}
+        }
+        Ok(DashboardAction::Continue)
+    }
+
+    fn paste_from_clipboard(&mut self) {
+        match self
+            .clipboard
+            .as_mut()
+            .and_then(|clipboard| clipboard.get_text().ok())
+        {
+            Some(value) => {
+                self.editor.insert_paste(&value);
+                self.selection = None;
+            }
+            None => self.set_notice("Clipboard paste is unavailable; use terminal paste", true),
+        }
+    }
+
+    fn copy_text(&mut self, value: &str) {
+        let remote =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        let copied = if remote {
+            self.write_osc52(value).is_ok()
+        } else {
+            self.clipboard
+                .as_mut()
+                .is_some_and(|clipboard| clipboard.set_text(value.to_string()).is_ok())
+                || self.write_osc52(value).is_ok()
+        };
+        if copied {
+            self.set_notice("Copied to clipboard", false);
+        } else {
+            self.set_notice("Failed to copy; terminal clipboard is unavailable", true);
+        }
+    }
+
+    fn write_osc52(&mut self, value: &str) -> io::Result<()> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        let sequence = format!("\x1b]52;c;{encoded}\x07");
+        if std::env::var_os("TMUX").is_some() {
+            write!(
+                self.terminal.backend_mut(),
+                "\x1bPtmux;{}\x1b\\",
+                sequence.replace('\x1b', "\x1b\x1b")
+            )?;
+        } else {
+            write!(self.terminal.backend_mut(), "{sequence}")?;
+        }
+        self.terminal.backend_mut().flush()
+    }
+
+    fn set_notice(&mut self, message: impl Into<String>, error: bool) {
+        self.notice = Some((message.into(), Instant::now(), error));
+    }
+
+    fn active_notice(&self) -> Option<(&str, bool)> {
+        self.notice
+            .as_ref()
+            .filter(|(_, started, _)| started.elapsed() < Duration::from_millis(1500))
+            .map(|(message, _, error)| (message.as_str(), *error))
     }
 
     pub fn restore(&mut self) {
@@ -401,7 +690,13 @@ impl Dashboard {
             return;
         }
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            Show,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
         self.restored = true;
     }
@@ -413,7 +708,20 @@ impl Drop for Dashboard {
     }
 }
 
+#[cfg(test)]
 fn render(frame: &mut Frame<'_>, state: &DashboardState, palette: Palette) {
+    render_interactive(frame, state, palette, "", 0, None, None);
+}
+
+fn render_interactive(
+    frame: &mut Frame<'_>,
+    state: &DashboardState,
+    palette: Palette,
+    input: &str,
+    cursor_cell: usize,
+    selection: Option<ScreenSelection>,
+    notice: Option<(&str, bool)>,
+) {
     let area = frame.area();
     if area.width < 60 || area.height < 14 {
         render_minimal(frame, area, state, palette);
@@ -422,6 +730,102 @@ fn render(frame: &mut Frame<'_>, state: &DashboardState, palette: Palette) {
     } else {
         render_full(frame, area, state, palette);
     }
+    render_command_line(frame, area, input, cursor_cell, palette, notice);
+    if let Some(selection) = selection {
+        let buffer = frame.buffer_mut();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if selection.contains(x, y) {
+                    buffer[(x, y)].set_style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+}
+
+fn command_line_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(2),
+        y: area.bottom().saturating_sub(2),
+        width: area.width.saturating_sub(4),
+        height: u16::from(area.height > 2),
+    }
+}
+
+fn render_command_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &str,
+    cursor_cell: usize,
+    palette: Palette,
+    notice: Option<(&str, bool)>,
+) {
+    let input_area = command_line_area(area);
+    if input_area.height == 0 || input_area.width < 3 {
+        return;
+    }
+    let hint_area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(1),
+        width: input_area.width,
+        height: 1,
+    };
+    let hint = notice.map_or(
+        "Enter command · PgUp/PgDn logs · drag to copy · Ctrl-C quit",
+        |(message, _)| message,
+    );
+    let hint_style = if notice.is_some_and(|(_, error)| error) {
+        palette.error()
+    } else {
+        palette.muted()
+    };
+    frame.render_widget(Paragraph::new(hint).style(hint_style), hint_area);
+
+    let available = input_area.width.saturating_sub(2) as usize;
+    let (visible, visible_cursor) = visible_input(input, cursor_cell, available);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ", palette.accent().add_modifier(Modifier::BOLD)),
+            Span::raw(visible),
+        ])),
+        input_area,
+    );
+    frame.set_cursor_position(Position {
+        x: input_area
+            .x
+            .saturating_add(2)
+            .saturating_add(visible_cursor.min(available) as u16),
+        y: input_area.y,
+    });
+}
+
+fn visible_input(input: &str, cursor_cell: usize, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let total_width = UnicodeWidthStr::width(input);
+    let start_cell = if cursor_cell >= width {
+        cursor_cell + 1 - width
+    } else {
+        0
+    };
+    if total_width <= width && start_cell == 0 {
+        return (input.to_string(), cursor_cell);
+    }
+    let mut position = 0;
+    let mut visible = String::new();
+    for grapheme in input.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        let end = position + grapheme_width;
+        if end > start_cell && position < start_cell + width {
+            visible.push_str(grapheme);
+        }
+        position = end;
+        if position >= start_cell + width {
+            break;
+        }
+    }
+    (visible, cursor_cell.saturating_sub(start_cell).min(width))
 }
 
 fn chrome<'a>(state: &DashboardState, palette: Palette) -> Block<'a> {
@@ -467,7 +871,8 @@ fn render_full(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, palett
         Constraint::Length(2),
         Constraint::Length(3),
         Constraint::Length(2),
-        Constraint::Min(4),
+        Constraint::Min(2),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
@@ -498,19 +903,6 @@ fn render_full(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, palett
     );
     frame.render_widget(metrics_line(state, palette), rows[2]);
     render_activity(frame, rows[3], state, palette);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("↑↓/PgUp/PgDn", palette.accent()),
-            Span::styled(" scroll   ", palette.muted()),
-            Span::styled("End", palette.accent()),
-            Span::styled(" follow   ", palette.muted()),
-            Span::styled("c", palette.accent()),
-            Span::styled(" clear   ", palette.muted()),
-            Span::styled("q/Ctrl-C", palette.accent()),
-            Span::styled(" quit", palette.muted()),
-        ])),
-        rows[4],
-    );
 }
 
 fn render_compact(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, palette: Palette) {
@@ -520,7 +912,8 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, pal
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(2),
-        Constraint::Min(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
@@ -544,13 +937,6 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, pal
         rows[1],
     );
     render_activity(frame, rows[2], state, palette);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "↑↓ scroll · End follow · c clear · q/Ctrl-C quit",
-            palette.muted(),
-        )),
-        rows[3],
-    );
 }
 
 fn render_minimal(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, palette: Palette) {
@@ -571,7 +957,10 @@ fn render_minimal(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, pal
                 state.endpoint.clone()
             }),
             Line::styled(last.to_string(), palette.muted()),
-            Line::styled("Resize for details · q/Ctrl-C quit", palette.accent()),
+            Line::styled(
+                "Resize for details · type help for commands",
+                palette.accent(),
+            ),
         ])
         .wrap(Wrap { trim: true }),
         inner,
@@ -607,31 +996,46 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, pa
         .border_style(palette.muted())
         .title(Span::styled(" ACTIVITY ", palette.brand()));
     let height = block.inner(area).height as usize;
-    let end = state
+    let rows = state
         .activity
-        .len()
-        .saturating_sub(state.scroll_from_bottom);
+        .iter()
+        .flat_map(|item| {
+            item.message
+                .lines()
+                .enumerate()
+                .map(move |(index, line)| (item, index == 0, line.to_string()))
+        })
+        .collect::<Vec<_>>();
+    let end = rows.len().saturating_sub(state.scroll_from_bottom);
     let start = end.saturating_sub(height.max(1));
-    let items = state
-        .activity
+    let items = rows
         .iter()
         .skip(start)
         .take(end.saturating_sub(start))
-        .map(|item| {
+        .map(|(item, first, line)| {
             let symbol = match item.level {
                 ActivityLevel::Info => "·",
                 ActivityLevel::Success => "✓",
                 ActivityLevel::Warning => "↻",
                 ActivityLevel::Error => "✗",
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{}  ", elapsed_stamp(item.elapsed)),
-                    palette.muted(),
-                ),
-                Span::styled(format!("{symbol} "), palette.activity(item.level)),
-                Span::raw(item.message.clone()),
-            ]))
+            let prefix = if *first {
+                vec![
+                    Span::styled(
+                        format!("{}  ", elapsed_stamp(item.elapsed)),
+                        palette.muted(),
+                    ),
+                    Span::styled(format!("{symbol} "), palette.activity(item.level)),
+                ]
+            } else {
+                vec![Span::raw("          ")]
+            };
+            ListItem::new(Line::from(
+                prefix
+                    .into_iter()
+                    .chain(std::iter::once(Span::raw(line.clone())))
+                    .collect::<Vec<_>>(),
+            ))
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items).block(block), area);
@@ -713,7 +1117,8 @@ mod tests {
         assert!(text.contains("WAKE"), "{text}");
         assert!(text.contains("128 modules"), "{text}");
         assert!(text.contains("ACTIVITY"), "{text}");
-        assert!(text.contains("q/Ctrl-C"), "{text}");
+        assert!(text.contains("drag to copy"), "{text}");
+        assert!(text.contains("›"), "{text}");
 
         state.built(
             BuildMetrics {
@@ -748,5 +1153,20 @@ mod tests {
         }
         assert_eq!(state.activity.len(), MAX_ACTIVITY);
         assert!(state.activity.front().unwrap().message.contains("error 50"));
+    }
+
+    #[test]
+    fn multiline_diagnostics_expand_into_scrollable_activity_rows() {
+        let mut state = DashboardState::new("dev", Path::new("demo"), "LOCAL", "watching");
+        state.error(
+            "ERROR [WAKE_PARSE]: Unexpected token\n --> src/App.tsx:12:8\n   |\n12 | const value = ;\n   |               ^",
+        );
+        assert_eq!(state.activity_row_count(), 6);
+        state.scroll_up(3);
+        assert_eq!(state.scroll_from_bottom, 3);
+        state.scroll_down(3);
+        let text = render_text(90, 24, &state);
+        assert!(text.contains("src/App.tsx:12:8"), "{text}");
+        assert!(text.contains("12 | const value = ;"), "{text}");
     }
 }

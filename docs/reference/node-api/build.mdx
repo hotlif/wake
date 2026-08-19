@@ -95,3 +95,17 @@ console.log(result.outputFile);
 返回可重复 `rebuild()` 的 `BuildContext`。结束时必须 `close()`，也可使用 `await using` 调用异步释放。
 
 所有操作都接受 `AbortSignal`。失败抛出 `WakeError`，调用方应根据 `code` 分支并展示 `diagnostics`。
+诊断继续提供 `path`、`start`、`end` 字节范围；存在有效源码 span 时还提供 `location`：
+
+```ts
+interface DiagnosticLocation {
+  line: number;       // 1 基
+  column: number;     // 1 基
+  endLine: number;    // 1 基，结束位置排他
+  endColumn: number;
+  lineText: string;
+  label?: string;
+}
+```
+
+开发服务器的 `diagnostic` 事件传入同一个结构化 `Diagnostic`，不会把整次构建失败压成一段文本。

@@ -184,7 +184,7 @@ async function runServer(factory, options, command, root, ui, uiMode) {
       dashboard?.draw()
     }
     const onDiagnostic = (diagnostic) => {
-      applyDashboardEvent(state, { type: 'diagnostic', message: diagnostic.message })
+      applyDashboardEvent(state, { type: 'diagnostic', diagnostic })
       dashboard?.draw()
     }
     const onClosed = () => {

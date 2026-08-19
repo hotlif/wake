@@ -60,7 +60,12 @@ async function api() {
   await context.close()
 
   const server: DevServer = await startDevServer({ port: 5173 })
-  server.on('diagnostic', (diagnostic) => console.log(diagnostic.message))
+  server.on('diagnostic', (diagnostic) => {
+    console.log(diagnostic.message)
+    diagnostic.location?.lineText.toUpperCase()
+    diagnostic.location?.line.toFixed()
+    diagnostic.location?.column.toFixed()
+  })
   server.unref()
   await server.close()
 

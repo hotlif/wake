@@ -10,7 +10,7 @@ use napi_derive::napi;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use wake_app::{CancellationToken, WakeError};
-use wake_common::Interner;
+use wake_common::{Interner, SourceFile};
 use wake_ecma_ast::SourceType;
 use wake_ecma_parser::ParseOutput;
 
@@ -749,11 +749,14 @@ impl NativeParsedModule {
     #[napi(js_name = "summaryJson")]
     pub fn summary_json(&self) -> napi::Result<String> {
         self.with_parsed(|parsed| {
+            let source = SourceFile::new("<input>", parsed.source.clone());
             let diagnostics = parsed
                 .output
                 .diagnostics
                 .iter()
-                .map(wake_app::DiagnosticInfo::from)
+                .map(|diagnostic| {
+                    wake_app::DiagnosticInfo::from_diagnostic(diagnostic, Some(&source))
+                })
                 .collect::<Vec<_>>();
             Ok(json!({
                 "sourceBytes": parsed.source.len(),
@@ -769,13 +772,14 @@ impl NativeParsedModule {
     #[napi(js_name = "transformJson")]
     pub fn transform_json(&self) -> napi::Result<String> {
         self.with_parsed(|parsed| {
+            let source = SourceFile::new("<input>", parsed.source.clone());
             let code = parsed
                 .output
                 .module
                 .with_ast(|program| wake_ecma_codegen::codegen(program, &parsed.interner));
             Ok(json!({
                 "code": code,
-                "diagnostics": parsed.output.diagnostics.iter().map(wake_app::DiagnosticInfo::from).collect::<Vec<_>>()
+                "diagnostics": parsed.output.diagnostics.iter().map(|diagnostic| wake_app::DiagnosticInfo::from_diagnostic(diagnostic, Some(&source))).collect::<Vec<_>>()
             }))
         })
         .and_then(value_string)
@@ -880,6 +884,7 @@ impl NativeParsedModule {
 pub fn tokenize(source: String) -> napi::Result<String> {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let (tokens, diagnostics) = wake_ecma_lexer::tokenize(&source);
+        let source_file = SourceFile::new("<input>", source.clone());
         json!({
             "tokens": tokens.into_iter().map(|token| {
                 json!({
@@ -890,7 +895,7 @@ pub fn tokenize(source: String) -> napi::Result<String> {
                     "text": source.get(token.span.lo as usize..token.span.hi as usize).unwrap_or_default()
                 })
             }).collect::<Vec<_>>(),
-            "diagnostics": diagnostics.iter().map(wake_app::DiagnosticInfo::from).collect::<Vec<_>>()
+            "diagnostics": diagnostics.iter().map(|diagnostic| wake_app::DiagnosticInfo::from_diagnostic(diagnostic, Some(&source_file))).collect::<Vec<_>>()
         })
     }))
     .map_err(|_| napi_wake_error(WakeError::new("WAKE_INTERNAL", "Wake tokenizer panicked")))?;

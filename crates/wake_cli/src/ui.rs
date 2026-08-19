@@ -4,6 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 use clap::ValueEnum;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::dashboard::{BuildMetrics, human_duration, human_runtime};
 
@@ -146,14 +147,7 @@ impl Ui {
             eprintln!("     {}  {}", self.dim("Output"), self.accent(output_dir));
         }
         for diagnostic in &result.diagnostics {
-            eprintln!(
-                "     {}  {}",
-                self.warn(&diagnostic.severity.to_uppercase()),
-                diagnostic.message
-            );
-            if let Some(path) = &diagnostic.path {
-                eprintln!("        {} {}", self.dim("-->"), self.accent(path));
-            }
+            self.write_diagnostic(diagnostic, "     ");
         }
         eprintln!();
         let _ = io::stderr().flush();
@@ -181,14 +175,7 @@ impl Ui {
             eprintln!("     {}  {}", self.dim("Output"), self.accent(output_file));
         }
         for diagnostic in &result.diagnostics {
-            eprintln!(
-                "     {}  {}",
-                self.warn(&diagnostic.severity.to_uppercase()),
-                diagnostic.message
-            );
-            if let Some(path) = &diagnostic.path {
-                eprintln!("        {} {}", self.dim("-->"), self.accent(path));
-            }
+            self.write_diagnostic(diagnostic, "     ");
         }
         eprintln!();
         let _ = io::stderr().flush();
@@ -206,22 +193,7 @@ impl Ui {
             eprintln!("     {}  {}", self.dim("Path"), self.accent(path));
         }
         for diagnostic in &error.diagnostics {
-            let code = diagnostic
-                .code
-                .as_deref()
-                .map(|code| format!("[{code}] "))
-                .unwrap_or_default();
-            eprintln!(
-                "     {}  {code}{}",
-                self.warn(&diagnostic.severity.to_uppercase()),
-                diagnostic.message
-            );
-            if let Some(path) = &diagnostic.path {
-                eprintln!("        {} {}", self.dim("-->"), self.accent(path));
-            }
-            for note in &diagnostic.notes {
-                eprintln!("        {} {note}", self.dim("·"));
-            }
+            self.write_diagnostic(diagnostic, "     ");
         }
         eprintln!();
     }
@@ -286,13 +258,85 @@ impl Ui {
         );
     }
 
-    pub fn diagnostic(&self, message: &str) {
-        for (index, line) in message.lines().enumerate() {
+    pub fn diagnostic(&self, diagnostic: &wake_app::DiagnosticInfo) {
+        for (index, line) in self.format_diagnostic(diagnostic).lines().enumerate() {
             if index == 0 {
                 eprintln!("  {}  {}", self.err("✗"), self.bold(line));
             } else {
-                eprintln!("     {}", self.dim(line));
+                eprintln!("     {line}");
             }
+        }
+    }
+
+    pub fn format_diagnostic(&self, diagnostic: &wake_app::DiagnosticInfo) -> String {
+        let mut lines = Vec::new();
+        let severity = diagnostic.severity.to_uppercase();
+        let heading = match &diagnostic.code {
+            Some(code) => format!("{severity} [{code}]: {}", diagnostic.message),
+            None => format!("{severity}: {}", diagnostic.message),
+        };
+        lines.push(match diagnostic.severity.as_str() {
+            "error" => self.err(&heading),
+            "warning" => self.warn(&heading),
+            _ => self.accent(&heading),
+        });
+
+        match (&diagnostic.path, &diagnostic.location) {
+            (Some(path), Some(location)) => lines.push(format!(
+                " {} {}:{}:{}",
+                self.dim("-->"),
+                self.accent(path),
+                location.line,
+                location.column
+            )),
+            (Some(path), None) => {
+                lines.push(format!(" {} {}", self.dim("-->"), self.accent(path)));
+            }
+            _ => {}
+        }
+
+        if let Some(location) = &diagnostic.location {
+            let line_text = expand_tabs(&location.line_text);
+            let gutter = location.line.to_string().len();
+            let start = display_column(&location.line_text, location.column);
+            let end = if location.end_line == location.line {
+                display_column(&location.line_text, location.end_column)
+            } else {
+                UnicodeWidthStr::width(line_text.as_str())
+            };
+            let width = end.saturating_sub(start).max(1);
+            lines.push(format!("{} {}", " ".repeat(gutter), self.dim("|")));
+            lines.push(format!(
+                "{:>gutter$} {} {line_text}",
+                location.line,
+                self.dim("|")
+            ));
+            let marker = format!(
+                "{}{}{}",
+                " ".repeat(start),
+                "^".repeat(width),
+                location
+                    .label
+                    .as_deref()
+                    .map(|label| format!(" {label}"))
+                    .unwrap_or_default()
+            );
+            lines.push(format!(
+                "{} {} {}",
+                " ".repeat(gutter),
+                self.dim("|"),
+                self.err(&marker)
+            ));
+        }
+        for note in &diagnostic.notes {
+            lines.push(format!("  {} note: {note}", self.dim("=")));
+        }
+        lines.join("\n")
+    }
+
+    fn write_diagnostic(&self, diagnostic: &wake_app::DiagnosticInfo, indent: &str) {
+        for line in self.format_diagnostic(diagnostic).lines() {
+            eprintln!("{indent}{line}");
         }
     }
 
@@ -323,6 +367,35 @@ impl Ui {
         );
         eprintln!();
     }
+}
+
+pub fn format_diagnostic_plain(diagnostic: &wake_app::DiagnosticInfo) -> String {
+    Ui::new(false).format_diagnostic(diagnostic)
+}
+
+fn display_column(line: &str, one_based_column: u32) -> usize {
+    let prefix = line
+        .chars()
+        .take(one_based_column.saturating_sub(1) as usize)
+        .collect::<String>();
+    UnicodeWidthStr::width(expand_tabs(&prefix).as_str())
+}
+
+fn expand_tabs(line: &str) -> String {
+    const TAB_STOP: usize = 4;
+    let mut output = String::new();
+    let mut width = 0;
+    for character in line.chars() {
+        if character == '\t' {
+            let spaces = TAB_STOP - width % TAB_STOP;
+            output.push_str(&" ".repeat(spaces));
+            width += spaces;
+        } else {
+            output.push(character);
+            width += UnicodeWidthChar::width(character).unwrap_or(0);
+        }
+    }
+    output
 }
 
 pub fn human_bytes(bytes: usize) -> String {
@@ -366,5 +439,49 @@ mod tests {
     fn output_format_uses_explicit_value() {
         assert_eq!(OutputFormat::Human.resolve(), OutputFormat::Human);
         assert_eq!(OutputFormat::Json.resolve(), OutputFormat::Json);
+    }
+
+    #[test]
+    fn shared_diagnostic_contract_renders_exact_code_frame() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/terminal-diagnostic-contract.json"
+        ))
+        .unwrap();
+        let value = &contract["diagnostic"];
+        let location = &value["location"];
+        let diagnostic = wake_app::DiagnosticInfo {
+            severity: value["severity"].as_str().unwrap().to_string(),
+            code: value["code"].as_str().map(str::to_string),
+            message: value["message"].as_str().unwrap().to_string(),
+            path: value["path"].as_str().map(str::to_string),
+            start: value["start"].as_u64().map(|value| value as u32),
+            end: value["end"].as_u64().map(|value| value as u32),
+            location: Some(wake_app::DiagnosticLocation {
+                line: location["line"].as_u64().unwrap() as u32,
+                column: location["column"].as_u64().unwrap() as u32,
+                end_line: location["endLine"].as_u64().unwrap() as u32,
+                end_column: location["endColumn"].as_u64().unwrap() as u32,
+                line_text: location["lineText"].as_str().unwrap().to_string(),
+                label: location["label"].as_str().map(str::to_string),
+            }),
+            notes: value["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|note| note.as_str().unwrap().to_string())
+                .collect(),
+        };
+        let expected = contract["plainLines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            format_diagnostic_plain(&diagnostic)
+                .lines()
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }

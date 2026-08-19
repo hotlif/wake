@@ -21,4 +21,20 @@ wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap]
 | `--watch` | 关闭 | 构建后持续监听 |
 | `--sourcemap` | 关闭 | 输出 source map，同时关闭压缩和代码分割 |
 
-全局 `--no-color` 关闭颜色，`--ui auto|plain|dashboard` 控制长任务终端界面。自动化脚本应根据退出码和结构化诊断判断成功，不解析进度文案。
+全局 `--no-color` 关闭颜色，`--ui auto|tui|plain` 控制长任务终端界面。自动化脚本应根据退出码和结构化诊断判断成功，不解析进度文案。
+
+编译诊断会显示稳定错误码、`path:line:column`、带行号的源码行和 `^` 范围。`build --watch`
+和 `dev` 重建使用同一格式；配置、I/O 等没有源码 span 的错误只显示消息与路径，不伪造行号。
+
+## 交互式控制台
+
+`tui` 模式在底部提供单行命令栏。命令可以直接输入，也可以使用 `/help` 形式：
+
+| 命令 | 行为 |
+| --- | --- |
+| `help` | 在活动区显示命令提示 |
+| `clear` | 清空活动记录，保留构建状态和命令历史 |
+| `open` | 打开当前开发服务器 URL；`build --watch` 没有可打开的 URL |
+| `quit` | 正常停止任务；提交 `q` 是兼容别名 |
+
+鼠标拖选当前画面会自动复制，Ctrl+Y 可再次复制最近选区；Ctrl+V、终端 bracketed paste 和输入行右键均可粘贴。方向键编辑或浏览命令历史，PgUp/PgDn 滚动活动记录，Ctrl+End 恢复跟随，Ctrl+C 立即中断。`plain` 模式不会启用鼠标、剪贴板或交互输入。

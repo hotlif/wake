@@ -8,11 +8,12 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use wake_common::{FileSystem, OsFileSystem, RenderStyle, SourceFile, render};
 
+mod console;
 mod dashboard;
 mod ui;
 
 use dashboard::{BuildMetrics, Dashboard, DashboardAction, DashboardState};
-use ui::{OutputFormat, Ui, UiMode};
+use ui::{OutputFormat, Ui, UiMode, format_diagnostic_plain};
 
 #[derive(Parser)]
 #[command(name = "wake", version, about = "High-performance Rust web build tools", long_about = None)]
@@ -771,7 +772,13 @@ fn cmd_build_watch(
                 }
             }
             Err(error) => {
-                state.error(format!("[{}] {}", error.code, error.message));
+                if error.diagnostics.is_empty() {
+                    state.error(format!("[{}] {}", error.code, error.message));
+                } else {
+                    for diagnostic in &error.diagnostics {
+                        state.error(format_diagnostic_plain(diagnostic));
+                    }
+                }
                 if dashboard.is_none() {
                     ui.app_error(&error);
                 }
@@ -1113,10 +1120,10 @@ fn apply_server_events(
                     ui.rebuilt(metrics, initial);
                 }
             }
-            wake_app::DevServerEvent::Diagnostic { message } => {
-                state.error(message.clone());
+            wake_app::DevServerEvent::Diagnostic { diagnostic } => {
+                state.error(format_diagnostic_plain(&diagnostic));
                 if let Some(ui) = plain_ui {
-                    ui.diagnostic(&message);
+                    ui.diagnostic(&diagnostic);
                 }
             }
             wake_app::DevServerEvent::Closed => state.stopped(),
@@ -1205,10 +1212,11 @@ fn cmd_parse(
     let statement_count = output.module.with_ast(|program| program.body.len());
 
     if format == OutputFormat::Json {
+        let source = SourceFile::new(file.display().to_string(), source_text.clone());
         let diagnostics = output
             .diagnostics
             .iter()
-            .map(wake_app::DiagnosticInfo::from)
+            .map(|diagnostic| wake_app::DiagnosticInfo::from_diagnostic(diagnostic, Some(&source)))
             .collect::<Vec<_>>();
         let value = serde_json::json!({
             "sourceBytes": source_text.len(),
@@ -1278,6 +1286,7 @@ fn cmd_tokenize(
     let (tokens, diagnostics) = wake_ecma_lexer::tokenize(&source_text);
 
     if format == OutputFormat::Json {
+        let source = SourceFile::new(file.display().to_string(), source_text.clone());
         let token_values = tokens
             .iter()
             .filter(|token| !token.is_eof())
@@ -1293,7 +1302,7 @@ fn cmd_tokenize(
             .collect::<Vec<_>>();
         let diagnostic_values = diagnostics
             .iter()
-            .map(wake_app::DiagnosticInfo::from)
+            .map(|diagnostic| wake_app::DiagnosticInfo::from_diagnostic(diagnostic, Some(&source)))
             .collect::<Vec<_>>();
         let value = serde_json::json!({
             "tokens": token_values,

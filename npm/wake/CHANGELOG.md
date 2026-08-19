@@ -2,6 +2,8 @@
 
 ## 0.1.20
 
+- Added a modern interactive terminal console with editable commands, history, Unicode-aware selection, clipboard copy and paste, and safe development-server opening across Rust and npm CLIs.
+- Added source-located compiler diagnostics with numbered code frames across Rust and npm build, bundle, watch, and development terminals.
 - Added binding-aware Crab CSS semantic values, scoped automatic property and value completions, and deterministic suggestion ranking in the VS Code language service.
 - Made Wake Docs accent colors optional and confined accent-derived component tokens to Demo previews without rewriting global workbench semantics.
 - Preserved side effects inside `void` expressions during minification so editor and application commands cannot be deleted.

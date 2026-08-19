@@ -4,6 +4,7 @@
 //! Rust CLI and the Node-API addon are responsible only for argument parsing,
 //! presentation, and process lifecycle.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -20,7 +21,7 @@ use wake_bundler::{
     ResolveOptions,
 };
 pub use wake_bundler::{BuildPlatform, ModuleFormat};
-use wake_common::{Diagnostic, OsFileSystem};
+use wake_common::{Diagnostic, OsFileSystem, SourceFile};
 
 pub use wake_docs::DocsMode;
 use wake_ecma_transform::{BrowserTarget, TargetEnv};
@@ -60,7 +61,15 @@ impl WakeError {
     }
 
     pub fn with_diagnostics(mut self, diagnostics: &[Diagnostic]) -> Self {
-        self.diagnostics = diagnostics.iter().map(DiagnosticInfo::from).collect();
+        self.diagnostics = diagnostics
+            .iter()
+            .map(|diagnostic| DiagnosticInfo::from_diagnostic(diagnostic, None))
+            .collect();
+        self
+    }
+
+    fn with_diagnostic_infos(mut self, diagnostics: Vec<DiagnosticInfo>) -> Self {
+        self.diagnostics = diagnostics;
         self
     }
 
@@ -97,13 +106,61 @@ pub struct DiagnosticInfo {
     pub start: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<DiagnosticLocation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
 
-impl From<&Diagnostic> for DiagnosticInfo {
-    fn from(value: &Diagnostic) -> Self {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticLocation {
+    /// One-based source line.
+    pub line: u32,
+    /// One-based Unicode-scalar column.
+    pub column: u32,
+    /// One-based source line containing the exclusive end offset.
+    pub end_line: u32,
+    /// One-based Unicode-scalar column of the exclusive end offset.
+    pub end_column: u32,
+    /// Exact source line without its line terminator.
+    pub line_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl DiagnosticInfo {
+    pub fn from_diagnostic(value: &Diagnostic, source: Option<&SourceFile>) -> Self {
         let span = value.primary_span();
+        let primary_label = value
+            .labels
+            .iter()
+            .find(|label| label.primary)
+            .or_else(|| value.labels.first());
+        let location = span
+            .filter(|span| {
+                source.is_some_and(|source| {
+                    span.lo <= span.hi
+                        && span.hi <= source.len()
+                        && source.src().is_char_boundary(span.lo as usize)
+                        && source.src().is_char_boundary(span.hi as usize)
+                })
+            })
+            .and_then(|span| {
+                let source = source?;
+                let start = source.location(span.lo);
+                let end = source.location(span.hi);
+                Some(DiagnosticLocation {
+                    line: start.line,
+                    column: start.column,
+                    end_line: end.line,
+                    end_column: end.column,
+                    line_text: source
+                        .line_text(start.line.saturating_sub(1) as usize)
+                        .to_string(),
+                    label: primary_label.and_then(|label| label.message.clone()),
+                })
+            });
         Self {
             severity: value.severity.as_str().to_string(),
             code: value.code.as_ref().map(ToString::to_string),
@@ -111,9 +168,36 @@ impl From<&Diagnostic> for DiagnosticInfo {
             path: value.path.clone(),
             start: span.map(|span| span.lo),
             end: span.map(|span| span.hi),
+            location,
             notes: value.notes.clone(),
         }
     }
+}
+
+fn diagnostic_infos(diagnostics: &[Diagnostic], root: &Path) -> Vec<DiagnosticInfo> {
+    let mut sources = HashMap::<String, Option<SourceFile>>::new();
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let source = diagnostic.path.as_deref().and_then(|path| {
+                sources
+                    .entry(path.to_string())
+                    .or_insert_with(|| {
+                        let path_buf = PathBuf::from(path);
+                        let resolved = if path_buf.is_absolute() {
+                            path_buf
+                        } else {
+                            root.join(path_buf)
+                        };
+                        std::fs::read_to_string(resolved)
+                            .ok()
+                            .map(|text| SourceFile::new(path, text))
+                    })
+                    .as_ref()
+            });
+            DiagnosticInfo::from_diagnostic(diagnostic, source)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -668,14 +752,10 @@ fn finish_output(
     output: BuildOutput,
     duration_ms: f64,
 ) -> Result<BuildResult, WakeError> {
-    let diagnostics = output
-        .diagnostics
-        .iter()
-        .map(DiagnosticInfo::from)
-        .collect::<Vec<_>>();
+    let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root);
     if output.has_errors() {
         return Err(
-            WakeError::new("WAKE_BUILD", "Wake build failed").with_diagnostics(&output.diagnostics)
+            WakeError::new("WAKE_BUILD", "Wake build failed").with_diagnostic_infos(diagnostics)
         );
     }
 
@@ -729,14 +809,11 @@ fn finish_bundle(
     output: BuildOutput,
     duration_ms: f64,
 ) -> Result<BundleResult, WakeError> {
-    let diagnostics = output
-        .diagnostics
-        .iter()
-        .map(DiagnosticInfo::from)
-        .collect::<Vec<_>>();
+    let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root);
     if output.has_errors() {
-        return Err(WakeError::new("WAKE_BUILD", "Wake bundle failed")
-            .with_diagnostics(&output.diagnostics));
+        return Err(
+            WakeError::new("WAKE_BUILD", "Wake bundle failed").with_diagnostic_infos(diagnostics)
+        );
     }
     if options.platform == BuildPlatform::Node && !output.assets.is_empty() {
         return Err(WakeError::new(
@@ -1269,7 +1346,7 @@ pub enum DevServerEvent {
         duration_ms: f64,
     },
     Diagnostic {
-        message: String,
+        diagnostic: DiagnosticInfo,
     },
     Closed,
 }
@@ -1277,7 +1354,7 @@ pub enum DevServerEvent {
 #[derive(Clone)]
 pub struct DevServer {
     handle: wake_dev_server::ServerHandle,
-    events: Arc<Mutex<mpsc::Receiver<wake_dev_server::ServerEvent>>>,
+    events: Arc<Mutex<mpsc::Receiver<DevServerEvent>>>,
 }
 
 impl DevServer {
@@ -1305,40 +1382,51 @@ impl DevServer {
             .events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        receiver
-            .try_iter()
-            .map(|event| match event {
-                wake_dev_server::ServerEvent::RebuildStart { changed_paths } => {
-                    DevServerEvent::RebuildStart {
-                        changed_paths: changed_paths
-                            .into_iter()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .collect(),
-                    }
-                }
-                wake_dev_server::ServerEvent::Rebuilt {
-                    initial,
-                    modules,
-                    updated_modules,
-                    cached_modules,
-                    chunks,
-                    assets,
-                    duration_ms,
-                } => DevServerEvent::Rebuilt {
-                    initial,
-                    modules,
-                    updated_modules,
-                    cached_modules,
-                    chunks,
-                    assets,
-                    duration_ms,
-                },
-                wake_dev_server::ServerEvent::Diagnostic { message } => {
-                    DevServerEvent::Diagnostic { message }
-                }
-                wake_dev_server::ServerEvent::Closed => DevServerEvent::Closed,
-            })
-            .collect()
+        receiver.try_iter().collect()
+    }
+}
+
+fn forward_dev_server_event(
+    sender: &mpsc::Sender<DevServerEvent>,
+    root: &Path,
+    event: wake_dev_server::ServerEvent,
+) {
+    match event {
+        wake_dev_server::ServerEvent::RebuildStart { changed_paths } => {
+            let _ = sender.send(DevServerEvent::RebuildStart {
+                changed_paths: changed_paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+            });
+        }
+        wake_dev_server::ServerEvent::Rebuilt {
+            initial,
+            modules,
+            updated_modules,
+            cached_modules,
+            chunks,
+            assets,
+            duration_ms,
+        } => {
+            let _ = sender.send(DevServerEvent::Rebuilt {
+                initial,
+                modules,
+                updated_modules,
+                cached_modules,
+                chunks,
+                assets,
+                duration_ms,
+            });
+        }
+        wake_dev_server::ServerEvent::Diagnostics { diagnostics } => {
+            for diagnostic in diagnostic_infos(&diagnostics, root) {
+                let _ = sender.send(DevServerEvent::Diagnostic { diagnostic });
+            }
+        }
+        wake_dev_server::ServerEvent::Closed => {
+            let _ = sender.send(DevServerEvent::Closed);
+        }
     }
 }
 
@@ -1389,8 +1477,9 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
             .map_err(|error| error.to_string())
     });
     let (event_tx, event_rx) = mpsc::channel();
+    let event_root = prepared.root.clone();
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
-        let _ = event_tx.send(event);
+        forward_dev_server_event(&event_tx, &event_root, event);
     });
     let serve_options = wake_dev_server::ServeOptions {
         entry: prepared.entry,
@@ -1476,7 +1565,7 @@ pub fn build_docs_with_mode(
     if output.has_errors() {
         return Err(
             WakeError::new("WAKE_BUILD", "Wake documentation build failed")
-                .with_diagnostics(&output.diagnostics),
+                .with_diagnostic_infos(diagnostic_infos(&output.diagnostics, &prepared.root)),
         );
     }
     let scripts = output
@@ -1509,6 +1598,7 @@ pub fn build_docs_with_mode(
             path: None,
             start: None,
             end: None,
+            location: None,
             notes: Vec::new(),
         }));
 
@@ -1553,11 +1643,15 @@ pub fn start_docs_dev_server_with_mode(
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let (event_tx, event_rx) = mpsc::channel();
     for warning in warnings {
-        let _ = event_tx.send(wake_dev_server::ServerEvent::Diagnostic { message: warning });
+        let diagnostic = Diagnostic::warning(warning).with_code("WAKE_DOCS");
+        let _ = event_tx.send(DevServerEvent::Diagnostic {
+            diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
+        });
     }
     let rebuild_event_tx = event_tx.clone();
+    let event_root = prepared.root.clone();
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
-        let _ = event_tx.send(event);
+        forward_dev_server_event(&event_tx, &event_root, event);
     });
     let docs_root = prepared.root.clone();
     let docs_scan_config = config.clone();
@@ -1570,8 +1664,10 @@ pub fn start_docs_dev_server_with_mode(
         )
         .map_err(|error| error.to_string())?;
         for warning in generated.warnings {
-            let _ = rebuild_event_tx
-                .send(wake_dev_server::ServerEvent::Diagnostic { message: warning });
+            let diagnostic = Diagnostic::warning(warning).with_code("WAKE_DOCS");
+            let _ = rebuild_event_tx.send(DevServerEvent::Diagnostic {
+                diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
+            });
         }
         let mut changed = generated.changed_files;
         changed.extend(
@@ -1758,6 +1854,42 @@ mod tests {
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
+    fn diagnostic_locations_preserve_unicode_crlf_and_safe_fallbacks() {
+        let text = "const first = 1;\r\n\tconst 名 = ;\r\n";
+        let start = text.find('名').unwrap() as u32;
+        let end = start + '名'.len_utf8() as u32;
+        let source = SourceFile::new("src/index.ts", text);
+        let diagnostic = Diagnostic::error("Unexpected token")
+            .with_code("WAKE_PARSE")
+            .with_path("src/index.ts")
+            .with_primary(wake_common::Span::new(start, end), "expected expression");
+        let info = DiagnosticInfo::from_diagnostic(&diagnostic, Some(&source));
+        let location = info.location.expect("valid source location");
+        assert_eq!(location.line, 2);
+        assert_eq!(location.column, 8);
+        assert_eq!(location.end_line, 2);
+        assert_eq!(location.end_column, 9);
+        assert_eq!(location.line_text, "\tconst 名 = ;");
+        assert_eq!(location.label.as_deref(), Some("expected expression"));
+
+        let invalid = Diagnostic::error("invalid")
+            .with_path("src/index.ts")
+            .with_primary(wake_common::Span::new(0, source.len() + 1), "outside");
+        assert!(
+            DiagnosticInfo::from_diagnostic(&invalid, Some(&source))
+                .location
+                .is_none()
+        );
+        let missing = diagnostic_infos(
+            &[Diagnostic::error("missing")
+                .with_path("does-not-exist.ts")
+                .with_primary(wake_common::Span::new(0, 1), "missing")],
+            Path::new("."),
+        );
+        assert!(missing[0].location.is_none());
+    }
+
+    #[test]
     fn build_defines_disable_esm_hmr_syntax_in_classic_script_chunks() {
         let config = wake_config::Config::default();
         let defines = build_defines(&config, true);
@@ -1903,6 +2035,32 @@ mod tests {
                 .code,
             "WAKE_INTERNAL"
         );
+    }
+
+    #[test]
+    fn build_errors_include_numbered_source_location_data() {
+        let fixture = Fixture::new("diagnostic-location");
+        fixture.write(
+            "src/index.js",
+            "const first = 1;\nconst second = 2;\nconst broken = ;\n",
+        );
+        let error = build(
+            BuildOptions {
+                project: fixture.project(),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        let diagnostic = error
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == "error")
+            .expect("parse diagnostic");
+        let location = diagnostic.location.as_ref().expect("source location");
+        assert_eq!(location.line, 3);
+        assert_eq!(location.line_text, "const broken = ;");
+        assert!(location.column > 1);
     }
 
     #[test]
@@ -2160,6 +2318,51 @@ mod tests {
         );
         let rebound = TcpListener::bind(("127.0.0.1", port)).unwrap();
         drop(rebound);
+    }
+
+    #[test]
+    fn dev_server_events_keep_structured_source_diagnostics() {
+        let fixture = Fixture::new("dev-diagnostic");
+        fixture.write(
+            "src/index.js",
+            "const first = 1;\nconst second = 2;\nconst broken = ;\n",
+        );
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let server = start_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        let events = server.drain_events();
+        let json = serde_json::to_value(&events).unwrap();
+        assert!(json.as_array().unwrap().iter().any(|event| {
+            event["type"] == "diagnostic"
+                && event["diagnostic"]["location"]["line"] == 3
+                && event["diagnostic"]["location"]["lineText"] == "const broken = ;"
+        }));
+        let diagnostic = events
+            .iter()
+            .find_map(|event| match event {
+                DevServerEvent::Diagnostic { diagnostic } => Some(diagnostic),
+                _ => None,
+            })
+            .expect("structured diagnostic event");
+        assert_eq!(diagnostic.severity, "error");
+        assert_eq!(
+            diagnostic.location.as_ref().map(|location| location.line),
+            Some(3)
+        );
+        assert_eq!(
+            diagnostic
+                .location
+                .as_ref()
+                .map(|location| location.line_text.as_str()),
+            Some("const broken = ;")
+        );
+        server.close().unwrap();
     }
 
     #[test]

@@ -21,6 +21,20 @@ export type WakeErrorCode =
   | 'WAKE_LIBRARY_TYPE'
   | 'WAKE_LIBRARY_OUTPUT'
 
+export interface DiagnosticLocation {
+  /** One-based source line. */
+  line: number
+  /** One-based Unicode-scalar column. */
+  column: number
+  /** One-based line containing the exclusive end position. */
+  endLine: number
+  /** One-based Unicode-scalar column of the exclusive end position. */
+  endColumn: number
+  /** Exact source line without its line terminator. */
+  lineText: string
+  label?: string
+}
+
 export interface Diagnostic {
   severity: 'error' | 'warning' | 'note' | 'help'
   code?: string
@@ -28,6 +42,7 @@ export interface Diagnostic {
   path?: string
   start?: number
   end?: number
+  location?: DiagnosticLocation
   notes?: string[]
 }
 

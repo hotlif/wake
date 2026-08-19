@@ -110,7 +110,7 @@ wake [--no-color] [--ui auto|tui|plain] <COMMAND>
 | `wake parse <FILE>` | 解析源码并打印 AST |
 | `wake tokenize <FILE>` | 对源码执行词法分析并打印 token 流 |
 
-交互式终端中的 `dev`、`docs dev` 和 `build --watch` 默认使用品牌化全屏控制台；重定向或 CI 环境自动降级为普通日志。使用全局 `--ui plain` 可显式关闭全屏模式，`--no-color` 或 `NO_COLOR` 只关闭颜色。`parse` 与 `tokenize` 支持 `--format auto|human|json`，并将机器数据与界面输出分别写入 stdout 和 stderr。
+交互式终端中的 `dev`、`docs dev` 和 `build --watch` 默认使用品牌化全屏控制台；重定向或 CI 环境自动降级为普通日志。控制台支持鼠标拖选自动复制、Ctrl+Y 重新复制、粘贴、命令历史，以及 `help`、`clear`、`open`、`quit`（也接受 `/` 前缀）命令。Ctrl+C 仍立即中断任务。使用全局 `--ui plain` 可显式关闭全屏模式，`--no-color` 或 `NO_COLOR` 只关闭颜色。`parse` 与 `tokenize` 支持 `--format auto|human|json`，并将机器数据与界面输出分别写入 stdout 和 stderr。
 
 使用 `wake <COMMAND> --help` 查看当前版本支持的参数。更详细的组合、默认值和退出行为见 [CLI 参考](docs/reference/cli/build.mdx)。
 

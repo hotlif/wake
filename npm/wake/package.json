@@ -50,6 +50,7 @@
     "node": ">=22.14 <27"
   },
   "dependencies": {
+    "@crab-dev/css": "0.1.20",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-dialog": "^0.0.2",
@@ -64,8 +65,10 @@
     "@crab-dev/rc-text-edit": "^0.0.1",
     "@crab-dev/rc-tooltip": "^0.0.2",
     "@crab-dev/rc-tree": "^0.1.2",
-    "@crab-dev/css": "0.1.20",
-    "lucide-react": "^1.23.0"
+    "clipboardy": "5.3.2",
+    "lucide-react": "^1.23.0",
+    "open": "11.0.0",
+    "string-width": "8.2.2"
   },
   "peerDependencies": {
     "react": "^19.2.8",

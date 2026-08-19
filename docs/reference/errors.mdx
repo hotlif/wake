@@ -12,13 +12,13 @@ status = "stable"
 | 错误码 | 含义 | 首要检查 |
 | --- | --- | --- |
 | `WAKE_CONFIG` | 配置或项目边界错误 | `wake.config.toml` 与项目根 |
-| `WAKE_PARSE` | JS、TS、JSX 或 TSX 解析失败 | 报错文件和字节区间 |
+| `WAKE_PARSE` | JS、TS、JSX 或 TSX 解析失败 | 报错文件、行列和字节区间 |
 | `WAKE_BUILD` | 模块、CSS 或输出构建失败 | 第一条 diagnostic |
 | `WAKE_IO` | 文件或目录访问失败 | 路径、权限和占用进程 |
 | `WAKE_CANCELLED` | `AbortSignal` 取消操作 | 调用方取消逻辑 |
 | `WAKE_UNSUPPORTED_PLATFORM` | 没有可用原生包 | 操作系统、CPU 与安装树 |
 | `WAKE_INTERNAL` | 资源关闭、panic 或内部不变量失败 | 完整诊断与复现步骤 |
 
-不要根据英文 `message` 分支。Node.js 调用使用 `WakeError.code`，并把 `diagnostics` 中的路径、范围、notes 和 help 展示给用户。
+不要根据英文 `message` 分支。Node.js 调用使用 `WakeError.code`，并把 `diagnostics` 中的路径、范围、notes 和 help 展示给用户。有效源码诊断的 `location` 包含 1 基行列、源码行和标签；没有源码 span 时该字段不存在。
 
 CSS 专用诊断见[静态边界](/styles/static-boundary)。
