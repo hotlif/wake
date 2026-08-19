@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Stabilized the real Extension Host automatic-completion gate by waiting for the language server
+  to register the test document before exercising focused typing and suggestion acceptance.
+
 ## 0.1.2
 
 - Keep CSS identifier values visually independent from TypeScript keywords through the

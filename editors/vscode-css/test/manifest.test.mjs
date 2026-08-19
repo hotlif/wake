@@ -10,7 +10,7 @@ test('manifest exposes the stable Crab CSS contract', async () => {
   assert.equal(manifest.name, 'crab-css')
   assert.equal(manifest.private, true)
   assert.equal(manifest.publisher, 'crab-dev')
-  assert.equal(manifest.version, '0.1.2')
+  assert.equal(manifest.version, '0.1.3')
   assert.equal(manifest.engines.vscode, '^1.96.0')
   assert.deepEqual(manifest.extensionKind, ['workspace'])
   assert.deepEqual(manifest.contributes.semanticTokenTypes, [

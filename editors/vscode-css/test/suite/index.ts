@@ -13,6 +13,15 @@ export async function run(): Promise<void> {
   const automaticPosition = automaticDocument.positionAt(
     automaticDocument.getText().indexOf('``') + 1,
   )
+  await waitFor(async () => {
+    const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      automaticDocument.uri,
+      automaticPosition,
+    )
+    return completions?.items.some(item => item.label === 'display') ?? false
+  }, 'CSS completion provider was not ready for the automatic-suggestion document')
+  await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup')
   automaticEditor.selection = new vscode.Selection(automaticPosition, automaticPosition)
   for (const character of 'disp') {
     await vscode.commands.executeCommand('type', { text: character })
