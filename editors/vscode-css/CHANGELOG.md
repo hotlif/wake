@@ -2,8 +2,11 @@
 
 ## 0.1.3
 
-- Stabilized the real Extension Host automatic-completion gate by waiting for the language server
-  to register the test document before exercising focused typing and suggestion acceptance.
+- Made automatic property-value suggestions reliable across VS Code hosts by synchronizing the
+  completion edit's document update with its following cursor movement while rejecting stale or
+  user-moved selections.
+- Added phase-located Extension Host failures and wait for language-server readiness before the
+  real typing and suggestion-acceptance release gate.
 
 ## 0.1.2
 

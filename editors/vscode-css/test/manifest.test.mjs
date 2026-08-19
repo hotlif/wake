@@ -49,6 +49,7 @@ test('client and manifest use only @crab-dev/css', async () => {
 test('compiled client preserves the automatic suggestion command', async () => {
   const compiled = await readFile(new URL('dist/extension.js', root), 'utf8')
   assert.ok(compiled.includes('editor.action.triggerSuggest'))
+  assert.ok(compiled.includes('onDidChangeTextEditorSelection'))
 })
 
 test('language highlighting has no spelling or byte-scanner fallback', async () => {

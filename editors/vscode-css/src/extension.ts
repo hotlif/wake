@@ -122,8 +122,34 @@ function triggerAutomaticCompletion(params: TriggerSuggestParams): void {
   ) return
 
   const position = new vscode.Position(params.position.line, params.position.character)
-  if (!editor.selection.active.isEqual(position)) return
+  if (triggerSuggestionAt(params, position)) return
+
+  let timeout: ReturnType<typeof setTimeout>
+  const selectionSubscription = vscode.window.onDidChangeTextEditorSelection(() => {
+    selectionSubscription.dispose()
+    clearTimeout(timeout)
+    triggerSuggestionAt(params, position)
+  })
+  timeout = setTimeout(() => selectionSubscription.dispose(), 250)
+
+  if (triggerSuggestionAt(params, position)) {
+    selectionSubscription.dispose()
+    clearTimeout(timeout)
+  }
+}
+
+function triggerSuggestionAt(params: TriggerSuggestParams, position: vscode.Position): boolean {
+  const editor = vscode.window.activeTextEditor
+  if (
+    !editor
+    || editor.document.uri.toString() !== params.uri
+    || editor.document.version !== params.version
+    || !editor.selection.isEmpty
+    || !editor.selection.active.isEqual(position)
+  ) return false
+
   void vscode.commands.executeCommand('editor.action.triggerSuggest')
+  return true
 }
 
 function serverExecutable(extensionContext: vscode.ExtensionContext): Executable {

@@ -47,6 +47,12 @@ when the new value position has semantic candidates. This avoids querying the se
 completion edit has synchronized. The language layer returns only values declared for the current
 property and filters them by the value prefix already typed.
 
+VS Code can publish the completion edit's document version before it publishes the corresponding
+cursor movement. The client therefore checks the notification immediately, then observes at most
+the first subsequent editor-selection event when only the cursor has not caught up. It triggers
+only if that event reaches the exact URI, version and position; any other movement or a bounded
+timeout cancels the notification.
+
 The LSP assigns stable `sortText` keys from the semantic fact order. VS Code therefore keeps common
 standard values ahead of legacy vendor values instead of alphabetically promoting `-moz-*` items.
 
@@ -56,6 +62,8 @@ standard values ahead of legacy vendor values instead of alphabetically promotin
 - `:`, `@` and `-` remain triggers for values, at-rules and prefixed properties.
 - Automatic suggestions require a positive result from the updated server analysis.
 - Stale document versions, moved cursors and stopped or replaced clients cannot trigger suggestions.
+- Completion-induced cursor movement may satisfy only the first subsequent selection event; it is
+  never polled or accepted after another movement.
 - Positions outside virtual CSS documents return no Crab CSS completion response.
 - The extension never enables suggestions globally for JavaScript or TypeScript string tokens.
 - The VS Code client owns no source or template recognizer.
