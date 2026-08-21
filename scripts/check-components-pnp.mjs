@@ -181,6 +181,7 @@ try {
   const localReference = (metadata) => `file:./.wake-packs/${basename(metadata.filename)}`
   projectManifest.dependencies['@crab-dev/wake'] = localReference(mainPack)
   projectManifest.resolutions = Object.fromEntries([
+    ['@crab-dev/wake', localReference(mainPack)],
     [cssPackageName, localReference(cssPack)],
     ...platformPackageNames.map((name) => [name, localReference(packed.get(name))]),
   ])
@@ -254,6 +255,38 @@ try {
     assert.match(css, new RegExp(escapeRegExp(prefix)), `Components CSS must include ${prefix}`)
   }
 
+  runCorepack(['yarn', 'run', 'docs:build'], {
+    cwd: temporaryProject,
+    env: environment,
+  })
+  const aggregateDirectory = join(temporaryProject, 'aggregate-dist')
+  const aggregateManifest = JSON.parse(
+    await readFile(join(aggregateDirectory, 'manifest.json'), 'utf8'),
+  )
+  assert.deepEqual(
+    aggregateManifest.workspaces,
+    [{
+      name: 'rc-pnp',
+      basePath: '/components/rc-pnp/workbench/',
+      manifest: 'components/rc-pnp/workbench/manifest.json',
+    }],
+    'The PnP gate must publish a deterministic aggregate workspace manifest',
+  )
+  const workspaceDirectory = join(aggregateDirectory, 'components/rc-pnp/workbench')
+  const workspaceManifest = JSON.parse(
+    await readFile(join(workspaceDirectory, 'manifest.json'), 'utf8'),
+  )
+  assert.ok(
+    (await readdir(workspaceDirectory)).includes(workspaceManifest.entry),
+    'The aggregate PnP workspace must emit its isolated entry chunk',
+  )
+  await assertComponentsRuntime(join(workspaceDirectory, workspaceManifest.entry))
+  const workspaceConfig = await readFile(
+    join(temporaryProject, 'workspaces/rc-pnp/.wake/docs/generated/config.tsx'),
+    'utf8',
+  )
+  assert.match(workspaceConfig, /"presentation":"embedded"/)
+
   completed = true
   console.log(JSON.stringify({
     corepack: corepackVersion,
@@ -262,6 +295,7 @@ try {
     css: cssFile,
     cssBytes: Buffer.byteLength(css),
     componentPrefixes: componentPrefixes.length,
+    aggregateWorkspaces: aggregateManifest.workspaces.length,
   }, null, 2))
 } finally {
   if (process.env.WAKE_PNP_KEEP_TEMP === '1') {

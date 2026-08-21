@@ -48,10 +48,13 @@ async function api() {
   tokenResult.outputFile.toUpperCase()
   const docgenResult = await generateDocgen({ entry: 'src/button.tsx' })
   docgenResult.entry.toUpperCase()
-  await buildDocs({ basePath: '/docs/' })
+  const docs = await buildDocs({ basePath: '/docs/' })
+  docs.workspaces.forEach((workspace) => console.log(workspace.name, workspace.presentation))
   const workbench = await buildDocs({ mode: 'components' })
   workbench.demos.forEach((demo) => console.log(demo.component, demo.controlCount))
   const docsServer = await startDocsDevServer({ mode: 'components' })
+  docsServer.on('workspaceState', (event) => console.log(event.loaded, event.failedNames))
+  docsServer.on('rebuilt', (event) => console.log(event.workspace, event.basePath))
   await docsServer.close()
 
 

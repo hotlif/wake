@@ -1092,7 +1092,7 @@ fn apply_server_events(
 ) {
     for event in server.drain_events() {
         match event {
-            wake_app::DevServerEvent::RebuildStart { changed_paths } => {
+            wake_app::DevServerEvent::RebuildStart { changed_paths, .. } => {
                 state.rebuilding(changed_paths.len());
                 if let Some(ui) = plain_ui {
                     ui.rebuild_start(changed_paths.len());
@@ -1106,6 +1106,7 @@ fn apply_server_events(
                 chunks,
                 assets,
                 duration_ms,
+                ..
             } => {
                 let metrics = BuildMetrics {
                     modules,
@@ -1126,6 +1127,13 @@ fn apply_server_events(
                     ui.diagnostic(&diagnostic);
                 }
             }
+            wake_app::DevServerEvent::WorkspaceState {
+                total,
+                loaded,
+                failed,
+                current,
+                ..
+            } => state.workspace_state(total, loaded, failed, current),
             wake_app::DevServerEvent::Closed => state.stopped(),
         }
     }
@@ -1152,6 +1160,7 @@ fn cmd_docs_build(
             },
             outdir: outdir.map(Path::to_path_buf),
             base_path: base.map(str::to_string),
+            presentation: None,
         },
         docs_mode.into(),
         &wake_app::CancellationToken::default(),
@@ -1162,8 +1171,16 @@ fn cmd_docs_build(
     })?;
     let extra = if components {
         format!("  {} {} demos", ui.dim("·"), result.demos.len())
-    } else {
+    } else if result.workspaces.is_empty() {
         format!("  {} {} routes", ui.dim("·"), result.routes.len())
+    } else {
+        format!(
+            "  {} {} routes  {} {} workspaces",
+            ui.dim("·"),
+            result.routes.len(),
+            ui.dim("·"),
+            result.workspaces.len()
+        )
     };
     ui.build_result(
         if components {

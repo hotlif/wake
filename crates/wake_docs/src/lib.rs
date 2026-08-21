@@ -41,6 +41,23 @@ pub enum DocsMode {
     Components,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocsPresentation {
+    Embedded,
+    #[default]
+    Standalone,
+}
+
+impl DocsPresentation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Standalone => "standalone",
+        }
+    }
+}
+
 impl DocsMode {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -63,6 +80,7 @@ pub struct DocsOptions {
     pub theme_css: Option<PathBuf>,
     pub default_theme: String,
     pub accent_color: Option<String>,
+    pub presentation: DocsPresentation,
 }
 
 impl Default for DocsOptions {
@@ -79,6 +97,7 @@ impl Default for DocsOptions {
             theme_css: None,
             default_theme: "system".to_string(),
             accent_color: None,
+            presentation: DocsPresentation::Standalone,
         }
     }
 }
@@ -1527,6 +1546,7 @@ fn render_config(
         "title": options.title, "description": options.description, "locale": options.locale, "logo": logo,
         "repositoryUrl": options.repository_url, "basePath": base_path,
         "defaultTheme": options.default_theme, "accentColor": options.accent_color,
+        "presentation": options.presentation.as_str(),
         "mode": docs_mode.as_str(),
     });
     output.push_str(&format!(
@@ -2884,9 +2904,17 @@ fn copy_public_directory(base: &Path, directory: &Path, outdir: &Path) -> Result
         let entry =
             entry.map_err(|error| DocsError::Io(directory.to_path_buf(), error.to_string()))?;
         let path = entry.path();
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(DocsError::InvalidConfig(format!(
+                "public assets must not contain symbolic links: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
             copy_public_directory(base, &path, outdir)?;
-        } else {
+        } else if metadata.is_file() {
             let destination = outdir.join(path.strip_prefix(base).expect("public descendant"));
             if destination.exists() {
                 return Err(DocsError::PublicCollision(destination));
@@ -2897,6 +2925,11 @@ fn copy_public_directory(base: &Path, directory: &Path, outdir: &Path) -> Result
             }
             fs::copy(&path, &destination)
                 .map_err(|error| DocsError::Io(destination, error.to_string()))?;
+        } else {
+            return Err(DocsError::InvalidConfig(format!(
+                "unsupported public asset entry: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -3215,6 +3248,13 @@ mod tests {
                 "Docs runtime 必须只在显式配置时写入强调色"
             );
         }
+    }
+
+    #[test]
+    fn embedded_components_runtime_only_renders_the_preview_surface() {
+        assert!(RUNTIME_COMPONENTS.contains("siteConfig.presentation === \"embedded\""));
+        assert!(RUNTIME_COMPONENTS.contains("workbench-embedded-preview"));
+        assert!(RUNTIME_COMPONENT_STYLE.contains(".workbench-embedded-preview iframe"));
     }
 
     #[test]
@@ -3875,6 +3915,10 @@ pages = ["build"]
     #[test]
     fn docs_options_default_to_chinese_and_allow_explicit_english() {
         assert_eq!(DocsOptions::default().locale, "zh-CN");
+        assert_eq!(
+            DocsOptions::default().presentation,
+            DocsPresentation::Standalone
+        );
 
         let options = DocsOptions {
             locale: "en-US".to_string(),
@@ -3882,6 +3926,18 @@ pages = ["build"]
         };
         let config = render_config(Path::new("."), &options, DocsMode::Site).unwrap();
         assert!(config.contains(r#""locale":"en-US""#));
+        assert!(config.contains(r#""presentation":"standalone""#));
+
+        let embedded = render_config(
+            Path::new("."),
+            &DocsOptions {
+                presentation: DocsPresentation::Embedded,
+                ..DocsOptions::default()
+            },
+            DocsMode::Components,
+        )
+        .unwrap();
+        assert!(embedded.contains(r#""presentation":"embedded""#));
     }
 
     #[test]

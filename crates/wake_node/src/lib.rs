@@ -704,6 +704,7 @@ pub fn build_docs(
                     },
                     outdir: options.outdir.map(PathBuf::from),
                     base_path: options.base_path,
+                    presentation: None,
                 },
                 docs_mode,
                 &cancellation,

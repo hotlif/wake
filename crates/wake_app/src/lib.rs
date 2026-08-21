@@ -4,7 +4,7 @@
 //! Rust CLI and the Node-API addon are responsible only for argument parsing,
 //! presentation, and process lifecycle.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -23,7 +23,7 @@ use wake_bundler::{
 pub use wake_bundler::{BuildPlatform, ModuleFormat};
 use wake_common::{Diagnostic, OsFileSystem, SourceFile};
 
-pub use wake_docs::DocsMode;
+pub use wake_docs::{DocsMode, DocsPresentation};
 use wake_ecma_transform::{BrowserTarget, TargetEnv};
 
 mod library;
@@ -1335,6 +1335,10 @@ pub struct DevServerOptions {
 pub enum DevServerEvent {
     RebuildStart {
         changed_paths: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base_path: Option<String>,
     },
     Rebuilt {
         initial: bool,
@@ -1344,9 +1348,21 @@ pub enum DevServerEvent {
         chunks: usize,
         assets: usize,
         duration_ms: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base_path: Option<String>,
     },
     Diagnostic {
         diagnostic: DiagnosticInfo,
+    },
+    WorkspaceState {
+        total: usize,
+        loaded: usize,
+        failed: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current: Option<String>,
+        failed_names: Vec<String>,
     },
     Closed,
 }
@@ -1392,12 +1408,18 @@ fn forward_dev_server_event(
     event: wake_dev_server::ServerEvent,
 ) {
     match event {
-        wake_dev_server::ServerEvent::RebuildStart { changed_paths } => {
+        wake_dev_server::ServerEvent::RebuildStart {
+            changed_paths,
+            workspace,
+            base_path,
+        } => {
             let _ = sender.send(DevServerEvent::RebuildStart {
                 changed_paths: changed_paths
                     .into_iter()
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect(),
+                workspace,
+                base_path,
             });
         }
         wake_dev_server::ServerEvent::Rebuilt {
@@ -1408,6 +1430,8 @@ fn forward_dev_server_event(
             chunks,
             assets,
             duration_ms,
+            workspace,
+            base_path,
         } => {
             let _ = sender.send(DevServerEvent::Rebuilt {
                 initial,
@@ -1417,12 +1441,29 @@ fn forward_dev_server_event(
                 chunks,
                 assets,
                 duration_ms,
+                workspace,
+                base_path,
             });
         }
         wake_dev_server::ServerEvent::Diagnostics { diagnostics } => {
             for diagnostic in diagnostic_infos(&diagnostics, root) {
                 let _ = sender.send(DevServerEvent::Diagnostic { diagnostic });
             }
+        }
+        wake_dev_server::ServerEvent::WorkspaceState {
+            total,
+            loaded,
+            failed,
+            current,
+            failed_names,
+        } => {
+            let _ = sender.send(DevServerEvent::WorkspaceState {
+                total,
+                loaded,
+                failed,
+                current,
+                failed_names,
+            });
         }
         wake_dev_server::ServerEvent::Closed => {
             let _ = sender.send(DevServerEvent::Closed);
@@ -1483,6 +1524,7 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
     });
     let serve_options = wake_dev_server::ServeOptions {
         entry: prepared.entry,
+        base_path: config.public_path().to_string(),
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
             pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks,
@@ -1502,6 +1544,7 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         before_rebuild: Some(before_rebuild),
         quiet: true,
         event_handler: Some(event_handler),
+        mounts: Vec::new(),
     };
     let handle = wake_dev_server::start(&prepared.root, port, serve_options)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
@@ -1516,6 +1559,18 @@ pub struct DocsBuildOptions {
     pub project: ProjectOptions,
     pub outdir: Option<PathBuf>,
     pub base_path: Option<String>,
+    pub presentation: Option<DocsPresentation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocsWorkspaceBuildInfo {
+    pub name: String,
+    pub root: String,
+    pub base_path: String,
+    pub mode: DocsMode,
+    pub presentation: String,
+    pub demos: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1526,6 +1581,300 @@ pub struct DocsBuildResult {
     pub routes: Vec<wake_docs::RouteInfo>,
     pub mode: DocsMode,
     pub demos: Vec<wake_docs::DemoDescriptor>,
+    pub workspaces: Vec<DocsWorkspaceBuildInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDocsWorkspace {
+    name: String,
+    config_dir: PathBuf,
+    root: PathBuf,
+    base_path: String,
+    presentation: wake_config::DocsWorkspacePresentation,
+    dev_loading: wake_config::DocsWorkspaceDevLoading,
+}
+
+fn discover_docs_workspaces(
+    options: &DocsBuildOptions,
+) -> Result<Vec<ResolvedDocsWorkspace>, WakeError> {
+    let cwd = options
+        .project
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
+    let config = wake_config::load(&config_dir)
+        .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
+    if config.docs.workspace.is_empty() {
+        return Ok(Vec::new());
+    }
+    let configured_root = normalize_path(&config.resolved_root(&config_dir));
+    let site_root = canonical_project_root(&configured_root)?;
+    let site_base = normalize_public_path(
+        options
+            .base_path
+            .as_deref()
+            .unwrap_or(&config.docs.base_path),
+    );
+    let mut discovered = Vec::new();
+    let mut seen_names = BTreeSet::new();
+    let mut seen_roots = BTreeSet::new();
+    let mut seen_bases = BTreeSet::new();
+
+    for rule in &config.docs.workspace {
+        validate_docs_workspace_rule(rule)?;
+        let parent = absolute_from(&site_root, Path::new(&rule.root));
+        let parent = canonical_project_root(&parent).map_err(|error| {
+            WakeError::new(
+                "WAKE_CONFIG",
+                format!(
+                    "cannot discover Docs workspaces below `{}`: {}",
+                    parent.display(),
+                    error.message
+                ),
+            )
+            .at(&parent)
+        })?;
+        if !parent.is_dir() {
+            return Err(WakeError::new(
+                "WAKE_CONFIG",
+                format!(
+                    "Docs workspace root is not a directory: {}",
+                    parent.display()
+                ),
+            )
+            .at(&parent));
+        }
+        let mut children = std::fs::read_dir(&parent)
+            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&parent))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&parent))?;
+        children.sort_by_key(std::fs::DirEntry::file_name);
+
+        for child in children {
+            let Some(name) = child.file_name().to_str().map(str::to_string) else {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!(
+                        "Docs workspace name below `{}` is not valid UTF-8",
+                        parent.display()
+                    ),
+                ));
+            };
+            if !rule
+                .include
+                .iter()
+                .any(|pattern| wildcard_name_match(&name, pattern))
+            {
+                continue;
+            }
+            validate_workspace_name(&name)?;
+            let child_path = child.path();
+            if !child_path.is_dir() || !child_path.join(wake_config::CONFIG_FILE).is_file() {
+                continue;
+            }
+            let child_root = canonical_project_root(&child_path)?;
+            if !child_root.starts_with(&parent) {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("Docs workspace `{name}` resolves outside its configured parent"),
+                )
+                .at(&child_path));
+            }
+            let child_config = wake_config::load(&child_root).map_err(|error| {
+                WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("Docs workspace `{name}` configuration is invalid: {error}"),
+                )
+                .at(&child_root)
+            })?;
+            let resolved_root =
+                canonical_project_root(&normalize_path(&child_config.resolved_root(&child_root)))?;
+            if !resolved_root.starts_with(&child_root) {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("Docs workspace `{name}` root_dir escapes its workspace"),
+                )
+                .at(&resolved_root));
+            }
+            let base_path = effective_workspace_base(&site_base, &rule.base_path, &name)?;
+            if !seen_names.insert(name.clone()) {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("duplicate Docs workspace name `{name}`"),
+                )
+                .at(&resolved_root));
+            }
+            if !seen_roots.insert(resolved_root.clone()) {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("Docs workspace `{name}` was discovered more than once"),
+                )
+                .at(&resolved_root));
+            }
+            if !seen_bases.insert(base_path.clone()) {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!("duplicate Docs workspace base path `{base_path}`"),
+                ));
+            }
+            discovered.push(ResolvedDocsWorkspace {
+                name,
+                config_dir: child_root,
+                root: resolved_root,
+                base_path,
+                presentation: rule.presentation,
+                dev_loading: rule.dev_loading,
+            });
+        }
+    }
+
+    discovered.sort_by(|left, right| left.name.cmp(&right.name));
+    for (index, workspace) in discovered.iter().enumerate() {
+        for other in &discovered[index + 1..] {
+            if workspace.base_path.starts_with(&other.base_path)
+                || other.base_path.starts_with(&workspace.base_path)
+            {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!(
+                        "overlapping Docs workspace base paths `{}` and `{}`",
+                        workspace.base_path, other.base_path
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(discovered)
+}
+
+fn validate_docs_workspace_rule(rule: &wake_config::DocsWorkspace) -> Result<(), WakeError> {
+    if rule.root.trim().is_empty() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "Docs workspace root must not be empty",
+        ));
+    }
+    if rule.include.is_empty() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "Docs workspace include must contain at least one name pattern",
+        ));
+    }
+    for pattern in &rule.include {
+        if pattern.is_empty()
+            || pattern.chars().any(|character| {
+                !(character.is_ascii_alphanumeric() || "._-*?".contains(character))
+            })
+        {
+            return Err(WakeError::new(
+                "WAKE_CONFIG",
+                format!("invalid Docs workspace include pattern `{pattern}`"),
+            ));
+        }
+    }
+    if !rule.base_path.contains("{name}") {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "Docs workspace base_path must contain `{name}`",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_name(name: &str) -> Result<(), WakeError> {
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        || characters.any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+        })
+    {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("Docs workspace name `{name}` is not a URL-safe path segment"),
+        ));
+    }
+    Ok(())
+}
+
+fn wildcard_name_match(value: &str, pattern: &str) -> bool {
+    let value = value.as_bytes();
+    let pattern = pattern.as_bytes();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut next = vec![false; value.len() + 1];
+        if *token == b'*' {
+            next[0] = previous[0];
+            for index in 1..=value.len() {
+                next[index] = previous[index] || next[index - 1];
+            }
+        } else {
+            for index in 1..=value.len() {
+                next[index] = previous[index - 1] && (*token == b'?' || *token == value[index - 1]);
+            }
+        }
+        previous = next;
+    }
+    previous[value.len()]
+}
+
+fn effective_workspace_base(
+    site_base: &str,
+    template: &str,
+    name: &str,
+) -> Result<String, WakeError> {
+    if !site_base.starts_with('/')
+        || site_base
+            .chars()
+            .any(|character| matches!(character, '\\' | '%' | '?' | '#'))
+        || site_base
+            .trim_matches('/')
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Docs site base path `{site_base}`"),
+        ));
+    }
+    if !template.starts_with('/')
+        || template
+            .chars()
+            .any(|character| matches!(character, '\\' | '%' | '?' | '#'))
+        || template.contains("//")
+    {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Docs workspace base_path `{template}`"),
+        ));
+    }
+    let expanded = template.replace("{name}", name);
+    if expanded.contains('{') || expanded.contains('}') {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Docs workspace base_path placeholder in `{template}`"),
+        ));
+    }
+    let segments = expanded.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || matches!(*segment, "." | ".."))
+    {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Docs workspace base_path `{template}`"),
+        ));
+    }
+    let relative = segments.join("/");
+    Ok(if site_base == "/" {
+        format!("/{relative}/")
+    } else {
+        format!("{}{relative}/", site_base)
+    })
 }
 
 pub fn build_docs(
@@ -1535,6 +1884,20 @@ pub fn build_docs(
     build_docs_with_mode(options, DocsMode::Site, cancellation)
 }
 pub fn build_docs_with_mode(
+    options: DocsBuildOptions,
+    docs_mode: DocsMode,
+    cancellation: &CancellationToken,
+) -> Result<DocsBuildResult, WakeError> {
+    if docs_mode == DocsMode::Site {
+        let workspaces = discover_docs_workspaces(&options)?;
+        if !workspaces.is_empty() {
+            return build_aggregated_docs(options, workspaces, cancellation);
+        }
+    }
+    build_docs_leaf(options, docs_mode, cancellation)
+}
+
+fn build_docs_leaf(
     options: DocsBuildOptions,
     docs_mode: DocsMode,
     cancellation: &CancellationToken,
@@ -1618,7 +1981,700 @@ pub fn build_docs_with_mode(
         routes,
         mode: docs_mode,
         demos,
+        workspaces: Vec::new(),
     })
+}
+
+fn build_aggregated_docs(
+    options: DocsBuildOptions,
+    workspaces: Vec<ResolvedDocsWorkspace>,
+    cancellation: &CancellationToken,
+) -> Result<DocsBuildResult, WakeError> {
+    cancellation.check()?;
+    let started = Instant::now();
+    let cwd = options
+        .project
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
+    let config = wake_config::load(&config_dir)
+        .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
+    let site_root = canonical_project_root(&normalize_path(&config.resolved_root(&config_dir)))?;
+    let site_base = normalize_public_path(
+        options
+            .base_path
+            .as_deref()
+            .unwrap_or(&config.docs.base_path),
+    );
+    let final_outdir = absolute_from(
+        &site_root,
+        options
+            .outdir
+            .as_deref()
+            .unwrap_or_else(|| Path::new("docs-dist")),
+    );
+    validate_output_directory(&final_outdir)?;
+    let stage_parent = final_outdir.parent().unwrap_or(&site_root);
+    std::fs::create_dir_all(stage_parent)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(stage_parent))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".wake-docs-stage-")
+        .tempdir_in(stage_parent)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(stage_parent))?;
+    let stage_root = staging.path().join("output");
+
+    let mut site_options = options.clone();
+    site_options.outdir = Some(stage_root.clone());
+    site_options.presentation = Some(DocsPresentation::Standalone);
+    let mut result = build_docs_leaf(site_options, DocsMode::Site, cancellation)?;
+    validate_workspace_route_mounts(&site_base, &result.routes, &workspaces)?;
+
+    let mut workspace_infos = Vec::new();
+    for workspace in workspaces {
+        cancellation.check()?;
+        let relative = workspace_output_relative(&site_base, &workspace.base_path)?;
+        let workspace_outdir = stage_root.join(&relative);
+        if workspace_outdir.exists() {
+            return Err(WakeError::new(
+                "WAKE_BUILD",
+                format!(
+                    "Docs workspace `{}` output collides with the parent site at `{}`",
+                    workspace.name, workspace.base_path
+                ),
+            )
+            .at(&workspace_outdir));
+        }
+        let presentation = match workspace.presentation {
+            wake_config::DocsWorkspacePresentation::Embedded => DocsPresentation::Embedded,
+            wake_config::DocsWorkspacePresentation::Standalone => DocsPresentation::Standalone,
+        };
+        let workspace_options = DocsBuildOptions {
+            project: ProjectOptions {
+                cwd: Some(workspace.config_dir.clone()),
+                config_path: None,
+            },
+            outdir: Some(workspace_outdir),
+            base_path: Some(workspace.base_path.clone()),
+            presentation: Some(presentation),
+        };
+        let mut workspace_result =
+            build_docs_leaf(workspace_options, DocsMode::Components, cancellation)
+                .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
+        result.build.module_count += workspace_result.build.module_count;
+        result.build.updated_module_count += workspace_result.build.updated_module_count;
+        result.build.cached_module_count += workspace_result.build.cached_module_count;
+        for file in &mut workspace_result.build.files {
+            file.path = relative
+                .join(&file.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+        for diagnostic in &mut workspace_result.build.diagnostics {
+            diagnostic
+                .notes
+                .push(format!("Docs workspace: {}", workspace.name));
+        }
+        result.build.files.extend(workspace_result.build.files);
+        result
+            .build
+            .diagnostics
+            .extend(workspace_result.build.diagnostics);
+        workspace_infos.push(DocsWorkspaceBuildInfo {
+            name: workspace.name,
+            root: workspace.root.to_string_lossy().into_owned(),
+            base_path: workspace.base_path,
+            mode: DocsMode::Components,
+            presentation: presentation.as_str().to_string(),
+            demos: workspace_result.demos.len(),
+        });
+    }
+
+    write_aggregate_docs_manifest(&stage_root, &site_base, &workspace_infos)?;
+    let published_files = docs_output_inventory(&stage_root)?;
+    commit_output_tree(&stage_root, &final_outdir)?;
+    result.build.output_dir = Some(final_outdir.to_string_lossy().into_owned());
+    result.build.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    result.build.files = published_files;
+    result.workspaces = workspace_infos;
+    Ok(result)
+}
+
+fn docs_output_inventory(root: &Path) -> Result<Vec<OutputFile>, WakeError> {
+    collect_output_tree_files(root, "documentation")?
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(&relative);
+            let bytes = std::fs::metadata(&path)
+                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?
+                .len() as usize;
+            let file_name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let extension = relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default();
+            let kind = if file_name == "manifest.json" {
+                "manifest"
+            } else {
+                match extension {
+                    "html" => "html",
+                    "js" | "mjs" | "cjs" => "chunk",
+                    "map" => "map",
+                    _ => "asset",
+                }
+            };
+            Ok(OutputFile {
+                path: relative.to_string_lossy().replace('\\', "/"),
+                kind: kind.to_string(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn validate_output_directory(outdir: &Path) -> Result<(), WakeError> {
+    if outdir.file_name().is_none() || outdir == Path::new(".") {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "refusing to write unsafe documentation output directory: {}",
+                outdir.display()
+            ),
+        ));
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(outdir)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "refusing to write documentation output through a symbolic link: {}",
+                outdir.display()
+            ),
+        )
+        .at(outdir));
+    }
+    Ok(())
+}
+
+fn validate_workspace_route_mounts(
+    site_base: &str,
+    routes: &[wake_docs::RouteInfo],
+    workspaces: &[ResolvedDocsWorkspace],
+) -> Result<(), WakeError> {
+    for workspace in workspaces {
+        for route in routes {
+            let relative = route.slug.trim_matches('/');
+            let route_base = if relative.is_empty() {
+                site_base.to_string()
+            } else if site_base == "/" {
+                format!("/{relative}/")
+            } else {
+                format!("{site_base}{relative}/")
+            };
+            if route_base.starts_with(&workspace.base_path) {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!(
+                        "Docs workspace `{}` mount `{}` shadows parent site route `{}`",
+                        workspace.name, workspace.base_path, route.slug
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workspace_output_relative(site_base: &str, workspace_base: &str) -> Result<PathBuf, WakeError> {
+    let relative = workspace_base
+        .strip_prefix(site_base)
+        .ok_or_else(|| {
+            WakeError::new(
+                "WAKE_CONFIG",
+                format!(
+                    "Docs workspace base path `{workspace_base}` is outside site base `{site_base}`"
+                ),
+            )
+        })?
+        .trim_matches('/');
+    if relative.is_empty() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "Docs workspace cannot replace the parent site root",
+        ));
+    }
+    Ok(relative.split('/').collect())
+}
+
+fn scope_workspace_error(mut error: WakeError, name: &str, root: &Path) -> WakeError {
+    error.message = format!("Docs workspace `{name}` failed: {}", error.message);
+    if error.path.is_none() {
+        error.path = Some(root.to_string_lossy().into_owned());
+    }
+    for diagnostic in &mut error.diagnostics {
+        diagnostic.notes.push(format!("Docs workspace: {name}"));
+        if let Some(path) = &diagnostic.path {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                diagnostic.path = Some(root.join(path).to_string_lossy().into_owned());
+            }
+        }
+    }
+    error
+}
+
+fn write_aggregate_docs_manifest(
+    stage_root: &Path,
+    site_base: &str,
+    workspaces: &[DocsWorkspaceBuildInfo],
+) -> Result<(), WakeError> {
+    let path = stage_root.join("manifest.json");
+    let bytes = std::fs::read(&path)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        WakeError::new(
+            "WAKE_INTERNAL",
+            format!("Wake generated an invalid Docs manifest: {error}"),
+        )
+        .at(&path)
+    })?;
+    let object = manifest.as_object_mut().ok_or_else(|| {
+        WakeError::new("WAKE_INTERNAL", "Wake generated a non-object Docs manifest").at(&path)
+    })?;
+    let values = workspaces
+        .iter()
+        .map(|workspace| {
+            let relative = workspace_output_relative(site_base, &workspace.base_path)?;
+            Ok(serde_json::json!({
+                "name": workspace.name,
+                "basePath": workspace.base_path,
+                "manifest": relative.join("manifest.json").to_string_lossy().replace('\\', "/"),
+            }))
+        })
+        .collect::<Result<Vec<_>, WakeError>>()?;
+    object.insert("workspaces".to_string(), serde_json::Value::Array(values));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&manifest).expect("serializable Docs manifest"),
+    )
+    .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
+    Ok(())
+}
+
+fn commit_output_tree(staging: &Path, target: &Path) -> Result<(), WakeError> {
+    commit_staged_output(staging, target, None, "documentation", ".wake-docs-backup-")
+}
+
+pub(crate) fn commit_staged_output(
+    staging: &Path,
+    target: &Path,
+    owned_roots: Option<&[&str]>,
+    product: &str,
+    backup_prefix: &str,
+) -> Result<(), WakeError> {
+    if !staging.is_dir() {
+        return Err(WakeError::new(
+            "WAKE_IO",
+            format!(
+                "{product} output prepare failed: staging directory does not exist: {}",
+                staging.display()
+            ),
+        )
+        .at(staging));
+    }
+    let staged_files = collect_scoped_output_files(staging, owned_roots, product)?;
+    let existing_files = collect_scoped_output_files(target, owned_roots, product)?;
+    let staged_set = staged_files.iter().cloned().collect::<BTreeSet<_>>();
+    let mut replacements = Vec::new();
+
+    for relative in staged_files {
+        let source = staging.join(&relative);
+        let destination = target.join(&relative);
+        validate_output_file_shape(target, &relative, product)?;
+        let bytes = std::fs::read(&source).map_err(|error| {
+            output_commit_error(product, "prepare", "read staged file", &source, error)
+        })?;
+        if destination.is_file() {
+            let current = std::fs::read(&destination).map_err(|error| {
+                output_commit_error(
+                    product,
+                    "prepare",
+                    "read existing output file",
+                    &destination,
+                    error,
+                )
+            })?;
+            if current == bytes {
+                continue;
+            }
+        }
+        replacements.push((relative, bytes));
+    }
+    let stale = existing_files
+        .into_iter()
+        .filter(|relative| !staged_set.contains(relative))
+        .collect::<Vec<_>>();
+    if replacements.is_empty() && stale.is_empty() {
+        return Ok(());
+    }
+
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| {
+        output_commit_error(product, "prepare", "create output parent", parent, error)
+    })?;
+    let backup = tempfile::Builder::new()
+        .prefix(backup_prefix)
+        .tempdir_in(parent)
+        .map_err(|error| {
+            output_commit_error(product, "backup", "create output backup", parent, error)
+        })?;
+    let mut backup_paths = replacements
+        .iter()
+        .map(|(relative, _)| relative.clone())
+        .chain(stale.iter().cloned())
+        .collect::<Vec<_>>();
+    backup_paths.sort();
+    backup_paths.dedup();
+    for relative in backup_paths {
+        let current = target.join(&relative);
+        if !current.is_file() {
+            continue;
+        }
+        let saved = backup.path().join(&relative);
+        let saved_parent = saved.parent().unwrap_or_else(|| backup.path());
+        std::fs::create_dir_all(saved_parent).map_err(|error| {
+            output_commit_error(
+                product,
+                "backup",
+                "create output backup directory",
+                saved_parent,
+                error,
+            )
+        })?;
+        std::fs::copy(&current, &saved).map_err(|error| {
+            output_commit_error(product, "backup", "back up output file", &current, error)
+        })?;
+    }
+
+    let mut touched = Vec::new();
+    for (relative, bytes) in replacements {
+        let destination = target.join(&relative);
+        if let Err(error) = atomic_write(&destination, &bytes) {
+            return Err(rollback_output_tree(
+                target,
+                backup.path(),
+                &touched,
+                WakeError::new(
+                    "WAKE_IO",
+                    format!(
+                        "{product} output install failed while replacing `{}`: {}",
+                        destination.display(),
+                        error.message
+                    ),
+                )
+                .at(&destination),
+            ));
+        }
+        touched.push(relative);
+    }
+    for relative in stale {
+        let destination = target.join(&relative);
+        if let Err(error) = std::fs::remove_file(&destination) {
+            return Err(rollback_output_tree(
+                target,
+                backup.path(),
+                &touched,
+                output_commit_error(
+                    product,
+                    "remove",
+                    "remove stale output file",
+                    &destination,
+                    error,
+                ),
+            ));
+        }
+        touched.push(relative);
+    }
+    if let Err(error) = remove_empty_output_directories(target, owned_roots, product) {
+        return Err(rollback_output_tree(target, backup.path(), &touched, error));
+    }
+    Ok(())
+}
+
+fn collect_scoped_output_files(
+    base: &Path,
+    owned_roots: Option<&[&str]>,
+    product: &str,
+) -> Result<Vec<PathBuf>, WakeError> {
+    let Some(owned_roots) = owned_roots else {
+        return collect_output_tree_files(base, product);
+    };
+    let mut files = Vec::new();
+    for owned in owned_roots {
+        let directory = base.join(owned);
+        if !directory.exists() {
+            continue;
+        }
+        if !directory.is_dir() {
+            return Err(WakeError::new(
+                "WAKE_IO",
+                format!(
+                    "{product} output prepare failed: expected directory `{}`",
+                    directory.display()
+                ),
+            )
+            .at(&directory));
+        }
+        files.extend(
+            collect_output_tree_files(&directory, product)?
+                .into_iter()
+                .map(|relative| PathBuf::from(owned).join(relative)),
+        );
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn collect_output_tree_files(base: &Path, product: &str) -> Result<Vec<PathBuf>, WakeError> {
+    fn visit(
+        base: &Path,
+        directory: &Path,
+        files: &mut Vec<PathBuf>,
+        product: &str,
+    ) -> Result<(), WakeError> {
+        for entry in std::fs::read_dir(directory).map_err(|error| {
+            output_commit_error(
+                product,
+                "prepare",
+                "read output directory",
+                directory,
+                error,
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                output_commit_error(product, "prepare", "read output entry", directory, error)
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                output_commit_error(product, "prepare", "inspect output entry", &path, error)
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(WakeError::new(
+                    "WAKE_IO",
+                    format!(
+                        "{product} output contains a symbolic link, which Wake will not follow: {}",
+                        path.display()
+                    ),
+                )
+                .at(&path));
+            }
+            if metadata.is_dir() {
+                visit(base, &path, files, product)?;
+            } else if metadata.is_file() {
+                files.push(
+                    path.strip_prefix(base)
+                        .expect("visited output is below its root")
+                        .to_path_buf(),
+                );
+            } else {
+                return Err(WakeError::new(
+                    "WAKE_IO",
+                    format!("unsupported {product} output entry: {}", path.display()),
+                )
+                .at(&path));
+            }
+        }
+        Ok(())
+    }
+
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = std::fs::symlink_metadata(base).map_err(|error| {
+        output_commit_error(product, "prepare", "inspect output root", base, error)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(WakeError::new(
+            "WAKE_IO",
+            format!(
+                "{product} output root is not a real directory: {}",
+                base.display()
+            ),
+        )
+        .at(base));
+    }
+    let mut files = Vec::new();
+    visit(base, base, &mut files, product)?;
+    files.sort();
+    Ok(files)
+}
+
+fn validate_output_file_shape(
+    target: &Path,
+    relative: &Path,
+    product: &str,
+) -> Result<(), WakeError> {
+    let destination = target.join(relative);
+    if destination.is_dir() {
+        return Err(WakeError::new(
+            "WAKE_IO",
+            format!(
+                "{product} output file collides with an existing directory: {}",
+                destination.display()
+            ),
+        )
+        .at(&destination));
+    }
+    let mut ancestor = relative.parent();
+    while let Some(path) = ancestor {
+        let destination = target.join(path);
+        if destination.is_file() {
+            return Err(WakeError::new(
+                "WAKE_IO",
+                format!(
+                    "{product} output directory collides with an existing file: {}",
+                    destination.display()
+                ),
+            )
+            .at(&destination));
+        }
+        ancestor = path.parent();
+    }
+    Ok(())
+}
+
+fn remove_empty_output_directories(
+    root: &Path,
+    owned_roots: Option<&[&str]>,
+    product: &str,
+) -> Result<(), WakeError> {
+    fn collect(
+        directory: &Path,
+        directories: &mut Vec<PathBuf>,
+        product: &str,
+    ) -> Result<bool, WakeError> {
+        if !directory.is_dir() {
+            return Ok(false);
+        }
+        let mut contains_files = false;
+        for entry in std::fs::read_dir(directory).map_err(|error| {
+            output_commit_error(
+                product,
+                "cleanup",
+                "read output directory",
+                directory,
+                error,
+            )
+        })? {
+            let path = entry
+                .map_err(|error| {
+                    output_commit_error(product, "cleanup", "read output entry", directory, error)
+                })?
+                .path();
+            if path.is_dir() {
+                contains_files |= collect(&path, directories, product)?;
+            } else {
+                contains_files = true;
+            }
+        }
+        if !contains_files {
+            directories.push(directory.to_path_buf());
+        }
+        Ok(contains_files)
+    }
+
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut directories = Vec::new();
+    if let Some(owned_roots) = owned_roots {
+        for owned in owned_roots {
+            collect(&root.join(owned), &mut directories, product)?;
+        }
+    } else {
+        collect(root, &mut directories, product)?;
+        directories.retain(|directory| directory != root);
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match std::fs::remove_dir(&directory) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => {
+                return Err(output_commit_error(
+                    product,
+                    "cleanup",
+                    "remove empty output directory",
+                    &directory,
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_output_tree(
+    target: &Path,
+    backup: &Path,
+    touched: &[PathBuf],
+    primary: WakeError,
+) -> WakeError {
+    let mut failures = Vec::new();
+    for relative in touched.iter().rev() {
+        let saved = backup.join(relative);
+        let destination = target.join(relative);
+        let result = if saved.is_file() {
+            std::fs::read(&saved)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| atomic_write(&destination, &bytes).map_err(|error| error.message))
+        } else if destination.exists() {
+            std::fs::remove_file(&destination).map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", destination.display()));
+        }
+    }
+    if failures.is_empty() {
+        primary
+    } else {
+        WakeError::new(
+            primary.code,
+            format!(
+                "{}; rollback also failed for {}",
+                primary.message,
+                failures.join(", ")
+            ),
+        )
+        .at(Path::new(primary.path.as_deref().unwrap_or(".")))
+    }
+}
+
+fn output_commit_error(
+    product: &str,
+    phase: &str,
+    operation: &str,
+    path: &Path,
+    error: std::io::Error,
+) -> WakeError {
+    WakeError::new(
+        "WAKE_IO",
+        format!(
+            "{product} output {phase} failed while attempting to {operation} `{}`: {error}",
+            path.display()
+        ),
+    )
+    .at(path)
 }
 
 pub fn start_docs_dev_server(options: DevServerOptions) -> Result<DevServer, WakeError> {
@@ -1628,10 +2684,30 @@ pub fn start_docs_dev_server_with_mode(
     options: DevServerOptions,
     docs_mode: DocsMode,
 ) -> Result<DevServer, WakeError> {
+    if docs_mode == DocsMode::Site {
+        let docs_options = DocsBuildOptions {
+            project: options.project.clone(),
+            outdir: None,
+            base_path: None,
+            presentation: None,
+        };
+        let workspaces = discover_docs_workspaces(&docs_options)?;
+        if !workspaces.is_empty() {
+            return start_aggregated_docs_dev_server(options, docs_options, workspaces);
+        }
+    }
+    start_docs_dev_server_leaf(options, docs_mode)
+}
+
+fn start_docs_dev_server_leaf(
+    options: DevServerOptions,
+    docs_mode: DocsMode,
+) -> Result<DevServer, WakeError> {
     let docs_options = DocsBuildOptions {
         project: options.project.clone(),
         outdir: None,
         base_path: None,
+        presentation: None,
     };
     let (prepared, docs, _routes, _demos, warnings) =
         prepare_docs(&docs_options, wake_docs::BuildMode::Development, docs_mode)?;
@@ -1648,38 +2724,25 @@ pub fn start_docs_dev_server_with_mode(
             diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
         });
     }
-    let rebuild_event_tx = event_tx.clone();
     let event_root = prepared.root.clone();
+    let forwarded_tx = event_tx.clone();
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
-        forward_dev_server_event(&event_tx, &event_root, event);
+        forward_dev_server_event(&forwarded_tx, &event_root, event);
     });
-    let docs_root = prepared.root.clone();
-    let docs_scan_config = config.clone();
-    let before_rebuild: wake_dev_server::BeforeRebuild = Arc::new(move |_| {
-        let generated = wake_docs::generate_with_mode(
-            &docs_root,
-            &docs,
-            wake_docs::BuildMode::Development,
-            docs_mode,
-        )
-        .map_err(|error| error.to_string())?;
-        for warning in generated.warnings {
-            let diagnostic = Diagnostic::warning(warning).with_code("WAKE_DOCS");
-            let _ = rebuild_event_tx.send(DevServerEvent::Diagnostic {
-                diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
-            });
-        }
-        let mut changed = generated.changed_files;
-        changed.extend(
-            prepare_aliases_and_scans(&docs_scan_config, &docs_root)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter_map(|(name, path)| name.starts_with("@@@/").then_some(path)),
-        );
-        Ok(changed)
-    });
+    let docs_base_path = docs.base_path.clone();
+    let before_rebuild = docs_before_rebuild(
+        prepared.root.clone(),
+        config.clone(),
+        docs,
+        docs_mode,
+        event_tx.clone(),
+        None,
+        None,
+        false,
+    );
     let serve_options = wake_dev_server::ServeOptions {
         entry: prepared.entry,
+        base_path: docs_base_path,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
             pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks,
@@ -1709,30 +2772,11 @@ pub fn start_docs_dev_server_with_mode(
             .collect(),
         target_env: resolve_target_env(config, &prepared.root)?,
         jsx_import_source: config.react.jsx_import_source.clone(),
-        watch_roots: {
-            let mut roots = vec![
-                prepared.root.join(&config.docs.source_dir),
-                prepared.root.join("src"),
-            ];
-            if let Some(preview) = &config.docs.preview {
-                roots.push(prepared.root.join(preview));
-            }
-            if let Some(theme_css) = &config.docs.theme_css {
-                roots.push(prepared.root.join(theme_css));
-            }
-            roots.extend(
-                config
-                    .component_scan
-                    .iter()
-                    .map(|rule| prepared.root.join(&rule.cwd)),
-            );
-            roots.sort();
-            roots.dedup();
-            roots
-        },
+        watch_roots: docs_watch_roots(&prepared.root, config),
         before_rebuild: Some(before_rebuild),
         quiet: true,
         event_handler: Some(event_handler),
+        mounts: Vec::new(),
     };
     let handle = wake_dev_server::start(&prepared.root, port, serve_options)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
@@ -1740,6 +2784,291 @@ pub fn start_docs_dev_server_with_mode(
         handle,
         events: Arc::new(Mutex::new(event_rx)),
     })
+}
+
+fn start_aggregated_docs_dev_server(
+    options: DevServerOptions,
+    docs_options: DocsBuildOptions,
+    workspaces: Vec<ResolvedDocsWorkspace>,
+) -> Result<DevServer, WakeError> {
+    let (prepared, site_docs, _routes, _demos, warnings) = prepare_docs(
+        &docs_options,
+        wake_docs::BuildMode::Development,
+        DocsMode::Site,
+    )?;
+    let config = prepared.config.clone();
+    let port = options.port.or(config.dev_server.port).unwrap_or(5173);
+    let host = options
+        .host
+        .or_else(|| config.dev_server.host.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let (event_tx, event_rx) = mpsc::channel();
+    send_docs_warnings(&event_tx, warnings, None);
+    let event_root = prepared.root.clone();
+    let forwarded_tx = event_tx.clone();
+    let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
+        forward_dev_server_event(&forwarded_tx, &event_root, event);
+    });
+
+    let topology = docs_workspace_topology(&workspaces);
+    let topology_options = docs_options.clone();
+    let site_before_rebuild = docs_before_rebuild(
+        prepared.root.clone(),
+        config.clone(),
+        site_docs.clone(),
+        DocsMode::Site,
+        event_tx.clone(),
+        None,
+        Some(Arc::new(move |changed| {
+            if !changed.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == wake_config::CONFIG_FILE)
+            }) {
+                return Ok(());
+            }
+            let discovered =
+                discover_docs_workspaces(&topology_options).map_err(|error| error.to_string())?;
+            if docs_workspace_topology(&discovered) != topology {
+                return Err(
+                    "Docs workspace topology changed; restart the development server".to_string(),
+                );
+            }
+            Ok(())
+        })),
+        true,
+    );
+
+    let mut mounts = Vec::new();
+    for workspace in workspaces {
+        let presentation = match workspace.presentation {
+            wake_config::DocsWorkspacePresentation::Embedded => DocsPresentation::Embedded,
+            wake_config::DocsWorkspacePresentation::Standalone => DocsPresentation::Standalone,
+        };
+        let workspace_options = DocsBuildOptions {
+            project: ProjectOptions {
+                cwd: Some(workspace.config_dir.clone()),
+                config_path: None,
+            },
+            outdir: None,
+            base_path: Some(workspace.base_path.clone()),
+            presentation: Some(presentation),
+        };
+        let (workspace_prepared, workspace_docs, _routes, _demos, warnings) = prepare_docs(
+            &workspace_options,
+            wake_docs::BuildMode::Development,
+            DocsMode::Components,
+        )
+        .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
+        send_docs_warnings(&event_tx, warnings, Some(&workspace.name));
+        let workspace_config = workspace_prepared.config.clone();
+        let before_rebuild = docs_before_rebuild(
+            workspace_prepared.root.clone(),
+            workspace_config.clone(),
+            workspace_docs,
+            DocsMode::Components,
+            event_tx.clone(),
+            Some(workspace.name.clone()),
+            None,
+            true,
+        );
+        let resolve_options = ResolveOptions {
+            alias: workspace_prepared.aliases,
+            pnp_dependency_fallbacks: workspace_prepared.pnp_dependency_fallbacks,
+            conditions: ["browser", "development", "import", "module", "default"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            ..ResolveOptions::default()
+        };
+        let target_env = resolve_target_env(&workspace_config, &workspace_prepared.root)?;
+        mounts.push(wake_dev_server::MountedServeOptions {
+            name: workspace.name,
+            root: workspace_prepared.root.clone(),
+            base_path: workspace.base_path,
+            loading: match workspace.dev_loading {
+                wake_config::DocsWorkspaceDevLoading::Lazy => wake_dev_server::DevLoading::Lazy,
+                wake_config::DocsWorkspaceDevLoading::Eager => wake_dev_server::DevLoading::Eager,
+            },
+            entry: workspace_prepared.entry,
+            resolve_options,
+            define: build_defines(&workspace_config, true),
+            target_env,
+            jsx_import_source: workspace_config.react.jsx_import_source.clone(),
+            watch_roots: docs_watch_roots(&workspace_prepared.root, &workspace_config),
+            before_rebuild: Some(before_rebuild),
+        });
+    }
+
+    let serve_options = wake_dev_server::ServeOptions {
+        entry: prepared.entry,
+        base_path: site_docs.base_path,
+        resolve_options: ResolveOptions {
+            alias: prepared.aliases,
+            pnp_dependency_fallbacks: prepared.pnp_dependency_fallbacks,
+            conditions: ["browser", "development", "import", "module", "default"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            ..ResolveOptions::default()
+        },
+        define: build_defines(&config, true),
+        host,
+        open: options.open.unwrap_or(config.dev_server.open),
+        proxy: config
+            .dev_server
+            .proxy
+            .iter()
+            .map(|proxy| wake_dev_server::ProxyRule {
+                context: proxy.context.clone(),
+                target: proxy.target.clone(),
+                path_rewrite: proxy
+                    .path_rewrite
+                    .iter()
+                    .map(|(pattern, replacement)| (pattern.clone(), replacement.clone()))
+                    .collect(),
+                change_origin: proxy.change_origin,
+            })
+            .collect(),
+        target_env: resolve_target_env(&config, &prepared.root)?,
+        jsx_import_source: config.react.jsx_import_source.clone(),
+        watch_roots: docs_watch_roots(&prepared.root, &config),
+        before_rebuild: Some(site_before_rebuild),
+        quiet: true,
+        event_handler: Some(event_handler),
+        mounts,
+    };
+    let handle = wake_dev_server::start(&prepared.root, port, serve_options)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
+    Ok(DevServer {
+        handle,
+        events: Arc::new(Mutex::new(event_rx)),
+    })
+}
+
+type DocsTopologyCheck = Arc<dyn Fn(&[PathBuf]) -> Result<(), String> + Send + Sync + 'static>;
+
+fn docs_before_rebuild(
+    root: PathBuf,
+    config: wake_config::Config,
+    docs: wake_docs::DocsOptions,
+    docs_mode: DocsMode,
+    event_tx: mpsc::Sender<DevServerEvent>,
+    workspace: Option<String>,
+    topology_check: Option<DocsTopologyCheck>,
+    lock_base_path: bool,
+) -> wake_dev_server::BeforeRebuild {
+    let state = Arc::new(Mutex::new((config, docs)));
+    Arc::new(move |changed| {
+        if let Some(check) = &topology_check {
+            check(changed)?;
+        }
+        if let Some(config_path) = changed.iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == wake_config::CONFIG_FILE)
+        }) {
+            let config_dir = config_path.parent().unwrap_or(&root);
+            let refreshed_config =
+                wake_config::load(config_dir).map_err(|error| error.to_string())?;
+            let refreshed_root = canonical_project_root(&normalize_path(
+                &refreshed_config.resolved_root(config_dir),
+            ))
+            .map_err(|error| error.to_string())?;
+            if refreshed_root != root {
+                return Err("Docs project root changed; restart the development server".to_string());
+            }
+            let mut state = state.lock().unwrap();
+            let previous_docs = &state.1;
+            if refreshed_config.docs.source_dir != state.0.docs.source_dir
+                || refreshed_config.docs.preview != state.0.docs.preview
+                || refreshed_config.docs.theme_css != state.0.docs.theme_css
+            {
+                return Err(
+                    "Docs source, Preview, or theme file topology changed; restart the development server"
+                        .to_string(),
+                );
+            }
+            let mut refreshed_docs =
+                docs_options(&refreshed_config, None, previous_docs.presentation);
+            if lock_base_path {
+                refreshed_docs.base_path = previous_docs.base_path.clone();
+            }
+            *state = (refreshed_config, refreshed_docs);
+        }
+        let (config, docs) = state.lock().unwrap().clone();
+        let generated = wake_docs::generate_with_mode(
+            &root,
+            &docs,
+            wake_docs::BuildMode::Development,
+            docs_mode,
+        )
+        .map_err(|error| error.to_string())?;
+        send_docs_warnings(&event_tx, generated.warnings, workspace.as_deref());
+        let mut invalidated = generated.changed_files;
+        invalidated.extend(
+            prepare_aliases_and_scans(&config, &root)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter_map(|(name, path)| name.starts_with("@@@/").then_some(path)),
+        );
+        Ok(invalidated)
+    })
+}
+
+fn docs_watch_roots(root: &Path, config: &wake_config::Config) -> Vec<PathBuf> {
+    let mut roots = vec![
+        root.join(&config.docs.source_dir),
+        root.join("src"),
+        root.join(wake_config::CONFIG_FILE),
+        root.join("navigation.toml"),
+    ];
+    if let Some(preview) = &config.docs.preview {
+        roots.push(root.join(preview));
+    }
+    if let Some(theme_css) = &config.docs.theme_css {
+        roots.push(root.join(theme_css));
+    }
+    roots.extend(
+        config
+            .component_scan
+            .iter()
+            .map(|rule| root.join(&rule.cwd)),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn send_docs_warnings(
+    sender: &mpsc::Sender<DevServerEvent>,
+    warnings: Vec<String>,
+    workspace: Option<&str>,
+) {
+    for warning in warnings {
+        let message = workspace
+            .map(|workspace| format!("Docs workspace `{workspace}`: {warning}"))
+            .unwrap_or(warning);
+        let diagnostic = Diagnostic::warning(message).with_code("WAKE_DOCS");
+        let _ = sender.send(DevServerEvent::Diagnostic {
+            diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
+        });
+    }
+}
+
+fn docs_workspace_topology(
+    workspaces: &[ResolvedDocsWorkspace],
+) -> Vec<(String, String, String, &'static str, &'static str)> {
+    workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                workspace.name.clone(),
+                workspace.root.to_string_lossy().into_owned(),
+                workspace.base_path.clone(),
+                workspace.presentation.as_str(),
+                workspace.dev_loading.as_str(),
+            )
+        })
+        .collect()
 }
 
 fn prepare_docs(
@@ -1768,7 +3097,11 @@ fn prepare_docs(
     }
     let root = canonical_project_root(&configured_root)?;
     let mut aliases = prepare_aliases_and_scans(&config, &root)?;
-    let docs = docs_options(&config, options.base_path.as_deref());
+    let docs = docs_options(
+        &config,
+        options.base_path.as_deref(),
+        options.presentation.unwrap_or_default(),
+    );
     let generated = wake_docs::generate_with_mode(&root, &docs, mode, docs_mode)
         .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
     aliases.retain(|(name, _)| name != "@wake/docs" && name != "@wake/docs-project");
@@ -1820,7 +3153,11 @@ fn components_pnp_dependency_fallbacks(root: &Path) -> Vec<PnpDependencyFallback
         .collect()
 }
 
-fn docs_options(config: &wake_config::Config, base_path: Option<&str>) -> wake_docs::DocsOptions {
+fn docs_options(
+    config: &wake_config::Config,
+    base_path: Option<&str>,
+    presentation: DocsPresentation,
+) -> wake_docs::DocsOptions {
     let docs = &config.docs;
     wake_docs::DocsOptions {
         source_dir: PathBuf::from(&docs.source_dir),
@@ -1834,6 +3171,7 @@ fn docs_options(config: &wake_config::Config, base_path: Option<&str>) -> wake_d
         theme_css: docs.theme_css.as_deref().map(PathBuf::from),
         default_theme: docs.default_theme.clone(),
         accent_color: docs.accent_color.clone(),
+        presentation,
     }
 }
 
@@ -1980,6 +3318,133 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn docs_workspace_discovery_is_direct_stable_and_base_prefixed() {
+        let fixture = Fixture::new("docs-workspaces");
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            r#"[docs]
+base_path = "/docs/"
+
+[[docs.workspace]]
+root = "components"
+include = ["rc-*"]
+base_path = "/components/{name}/workbench/"
+"#,
+        );
+        for name in ["rc-zeta", "ignored", "rc-alpha"] {
+            fixture.write(&format!("components/{name}/wake.config.toml"), "");
+        }
+        fixture.write("components/rc-nested/child/wake.config.toml", "");
+
+        let workspaces = discover_docs_workspaces(&DocsBuildOptions {
+            project: fixture.project(),
+            ..DocsBuildOptions::default()
+        })
+        .unwrap();
+        assert_eq!(
+            workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>(),
+            ["rc-alpha", "rc-zeta"]
+        );
+        assert_eq!(
+            workspaces[0].base_path,
+            "/docs/components/rc-alpha/workbench/"
+        );
+        assert_eq!(
+            workspaces[0].presentation,
+            wake_config::DocsWorkspacePresentation::Embedded
+        );
+        assert_eq!(
+            workspaces[0].dev_loading,
+            wake_config::DocsWorkspaceDevLoading::Lazy
+        );
+    }
+
+    #[test]
+    fn docs_workspace_rules_reject_ambiguous_paths_and_patterns() {
+        assert!(wildcard_name_match("rc-grid", "rc-*"));
+        assert!(wildcard_name_match("rc-a", "rc-?"));
+        assert!(!wildcard_name_match("RC-grid", "rc-*"));
+        assert!(
+            effective_workspace_base("/docs/", "/components/{other}/", "rc-grid")
+                .unwrap_err()
+                .message
+                .contains("placeholder")
+        );
+        assert!(effective_workspace_base("/../", "/components/{name}/", "rc-grid").is_err());
+        assert!(effective_workspace_base("/", "/components/../{name}/", "rc-grid").is_err());
+    }
+
+    #[test]
+    fn docs_output_commit_skips_equal_files_and_removes_stale_files() {
+        let fixture = Fixture::new("docs-commit");
+        let staging = fixture.0.join("stage");
+        let target = fixture.0.join("docs-dist");
+        std::fs::create_dir_all(staging.join("assets")).unwrap();
+        std::fs::create_dir_all(target.join("assets")).unwrap();
+        std::fs::write(staging.join("index.html"), "same").unwrap();
+        std::fs::write(staging.join("assets/new.js"), "new").unwrap();
+        std::fs::write(target.join("index.html"), "same").unwrap();
+        std::fs::write(target.join("assets/stale.js"), "stale").unwrap();
+        let original_modified = std::fs::metadata(target.join("index.html"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        commit_output_tree(&staging, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.html")).unwrap(),
+            "same"
+        );
+        assert_eq!(
+            std::fs::metadata(target.join("index.html"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original_modified
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("assets/new.js")).unwrap(),
+            "new"
+        );
+        assert!(!target.join("assets/stale.js").exists());
+        commit_output_tree(&staging, &target).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn docs_output_commit_rolls_back_after_a_locked_stale_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = Fixture::new("docs-commit-rollback");
+        let staging = fixture.0.join("stage");
+        let target = fixture.0.join("docs-dist");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(staging.join("a.txt"), "new-a").unwrap();
+        std::fs::write(target.join("a.txt"), "old-a").unwrap();
+        std::fs::write(target.join("z-stale.txt"), "old-z").unwrap();
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(target.join("z-stale.txt"))
+            .unwrap();
+
+        let error = commit_output_tree(&staging, &target).unwrap_err();
+        assert_eq!(error.code, "WAKE_IO");
+        assert_eq!(
+            std::fs::read_to_string(target.join("a.txt")).unwrap(),
+            "old-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("z-stale.txt")).unwrap(),
+            "old-z"
+        );
     }
 
     #[test]

@@ -106,12 +106,21 @@ test('dashboard renders full, compact, and minimal states', () => {
     assets: 4,
     durationMs: 42,
   })
+  applyDashboardEvent(state, {
+    type: 'workspaceState',
+    total: 2,
+    loaded: 1,
+    failed: 0,
+    current: 'rc-alpha',
+    failedNames: [],
+  })
 
   const full = renderDashboard(state, 90, 24, createUi(false))
   const compact = renderDashboard(state, 70, 18, createUi(false))
   const minimal = renderDashboard(state, 50, 10, createUi(false))
   assert.match(full, /WAKE \/ DEV/)
   assert.match(full, /128 modules · 3 chunks · 4 assets · 42ms/)
+  assert.match(full, /WORKSPACES  1\/2 loaded · loading rc-alpha/)
   assert.match(full, /ACTIVITY/)
   assert.match(compact, /READY/)
   assert.match(minimal, /Resize for details/)

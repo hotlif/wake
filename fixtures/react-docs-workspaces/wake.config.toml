@@ -1,0 +1,20 @@
+[docs]
+source_dir = "docs"
+title = "Wake aggregate Docs fixture"
+description = "One site with two isolated component workbenches"
+locale = "en-US"
+base_path = "/docs/"
+
+[[docs.workspace]]
+root = "components"
+include = ["rc-alpha"]
+base_path = "/components/{name}/workbench/"
+presentation = "embedded"
+dev_loading = "lazy"
+
+[[docs.workspace]]
+root = "components"
+include = ["rc-beta"]
+base_path = "/components/{name}/workbench/"
+presentation = "standalone"
+dev_loading = "eager"

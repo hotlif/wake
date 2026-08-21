@@ -103,6 +103,7 @@ Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补�
 - `react-ts-app-yarn-pnp`：Yarn PnP/zip 包；
 - `react-components-yarn-pnp`：只声明 Wake、React 和 React DOM 的 Components PnP 发布包门禁；
 - `react-docs`：MDX、Demo、Props、主题和组件工作台；
+- `react-docs-workspaces`：一个主站与两个隔离工作台的聚合生产构建；
 - `2k-modules`：生成式压力与跨工具测量。
 
 关键语义必须执行产物或在真实服务器中验证。仅检查 bundle 字符串适合局部形态断言，不能替代运行时回归。
@@ -115,6 +116,7 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
 - Demo glob、Preview、主题、Props/JSDoc 和 API 表；
 - Components 模式的 Controls、默认值、显式 unset、hash round-trip、视口和错误恢复；
 - `base_path`、404 外壳、public 资源和静态托管路径。
+- 聚合挂载冲突、lazy single-flight、作用域 HMR、事务回滚和根/子 manifest。
 
 ## 3.5 Node API
 

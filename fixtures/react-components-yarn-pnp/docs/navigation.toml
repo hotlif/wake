@@ -1,0 +1,4 @@
+[[group]]
+id = "docs"
+title = "Docs"
+pages = ["index", "components/button"]

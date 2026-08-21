@@ -267,6 +267,7 @@ export function createDashboardState({
     rebuilds: 0,
     startedAt: Date.now(),
     activity: [],
+    workspaceState: undefined,
     scrollFromBottom: 0,
   }
   pushActivity(state, 'info', 'Starting Wake…')
@@ -307,6 +308,17 @@ export function applyDashboardEvent(state, event) {
   } else if (event.type === 'diagnostic') {
     state.status = 'error'
     pushActivity(state, 'error', formatDiagnostic(createUi(false), event.diagnostic).join('\n'))
+  } else if (event.type === 'workspaceState') {
+    state.workspaceState = {
+      total: event.total,
+      loaded: event.loaded,
+      failed: event.failed,
+      current: event.current,
+      failedNames: event.failedNames || [],
+    }
+    if (event.current) {
+      pushActivity(state, 'info', `Loading workspace ${event.current}…`)
+    }
   } else if (event.type === 'closed') {
     state.status = 'stopped'
     pushActivity(state, 'info', 'Wake stopped')
@@ -412,6 +424,14 @@ function activityRows(state, available) {
   return rows.slice(start, end)
 }
 
+function workspaceText(state) {
+  const workspaces = state.workspaceState
+  if (!workspaces) return undefined
+  const current = workspaces.current ? ` · loading ${workspaces.current}` : ''
+  const failed = workspaces.failed ? ` · ${workspaces.failed} failed` : ''
+  return `WORKSPACES  ${workspaces.loaded}/${workspaces.total} loaded${failed}${current}`
+}
+
 function activityRowCount(state) {
   return state.activity.reduce((count, item) => count + String(item.message).split('\n').length, 0)
 }
@@ -442,6 +462,7 @@ function plainFrame(state, width, height, editor = new InputEditor(), notice) {
       boxLine(metricsText(state), width),
       separator(width, 'ACTIVITY'),
     ]
+    if (workspaceText(state)) fixed.splice(-1, 0, boxLine(workspaceText(state), width))
     activityHeight = Math.max(1, height - fixed.length - 2)
   } else {
     fixed = [
@@ -455,6 +476,7 @@ function plainFrame(state, width, height, editor = new InputEditor(), notice) {
       boxLine(metricsText(state), width),
       separator(width, 'ACTIVITY'),
     ]
+    if (workspaceText(state)) fixed.splice(-1, 0, boxLine(workspaceText(state), width))
     activityHeight = Math.max(1, height - fixed.length - 2)
   }
 

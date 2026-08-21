@@ -22,8 +22,13 @@ const result = await buildDocs({
 });
 ```
 
-结果在普通 `BuildResult` 基础上增加 `routes`、`mode` 和 `demos`。
+结果在普通 `BuildResult` 基础上增加 `routes`、`mode`、`demos` 和必有的 `workspaces`。
+非聚合构建返回空 `workspaces`；聚合构建中的每项包含 `name`、绝对 `root`、`basePath`、
+`mode: "components"`、`presentation` 和 Demo 数量。`routes` 与 `demos` 始终只描述主项目。
 
 ## `startDocsDevServer(options)`
 
 返回与应用开发服务器相同的 `DevServer`，额外接受 `mode: "site" | "components"`。服务关闭、事件和取消语义与 `startDevServer` 一致。
+
+`site` 模式自动读取 `[[docs.workspace]]`。聚合服务器会发送 `workspaceState`，工作区重建的
+`rebuildStart` 与 `rebuilt` 还包含 `workspace` 和 `basePath`。

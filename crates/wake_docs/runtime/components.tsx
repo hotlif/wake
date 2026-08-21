@@ -689,6 +689,17 @@ export function ComponentsApp() {
     />
   </main>;
 
+  if (siteConfig.presentation === "embedded") return <main className="workbench-embedded">
+    <div className="workbench-embedded-preview">
+      {selected && <iframe key={selected.id} ref={frameRef} title={selected.title} src={frameUrl} sandbox="allow-scripts allow-same-origin" />}
+    </div>
+    {Boolean(error || selected?.warnings.length || runtimeWarnings.length) && <div className="workbench-diagnostics" role="status">
+      {error && <Alert className="workbench-diagnostics-alert" type="error" title={text("Runtime error", "运行错误")} showIcon>{error}</Alert>}
+      {selected?.warnings.map((warning) => <Alert className="workbench-diagnostics-alert" type="warning" title={text("Warning", "警告")} showIcon key={warning}>{warning}</Alert>)}
+      {runtimeWarnings.map((warning) => <Alert className="workbench-diagnostics-alert" type="warning" title={text("Warning", "警告")} showIcon key={warning}>{warning}</Alert>)}
+    </div>}
+  </main>;
+
   return <div className="workbench-shell">
     <aside className="workbench-sidebar">
       <div className="workbench-brand"><strong>{siteConfig.title}</strong><span>{text("Components", "组件")}</span></div>

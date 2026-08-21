@@ -14,7 +14,7 @@
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Condvar, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -112,15 +112,55 @@ struct BundleState {
 
 /// HTTP 处理器共享数据。
 struct AppState {
-    bundle: Arc<RwLock<BundleState>>,
+    mounts: Arc<Vec<Arc<MountedAppState>>>,
     /// HMR 事件广播（消息本身为 JSON 文本）。
     tx: broadcast::Sender<String>,
-    /// 注入了 HMR client 脚本的 HTML 外壳。
-    html: Arc<RwLock<String>>,
     /// 代理规则（已编译）；命中前缀的请求转发到后端 target。
     proxies: Arc<Vec<CompiledProxy>>,
-    /// `public/` 静态资源目录（保持既定行为 / Vite：原样映射到 URL 根）。
+}
+
+struct MountedAppState {
+    name: Option<String>,
+    base_path: String,
+    bundle: Arc<RwLock<BundleState>>,
+    html: Arc<RwLock<String>>,
     public_dir: PathBuf,
+    loading: Arc<MountLoadingState>,
+}
+
+#[derive(Debug, Clone)]
+enum MountStatus {
+    Pending,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+struct MountLoadingState {
+    status: Mutex<MountStatus>,
+    changed: Condvar,
+    load_tx: mpsc::Sender<usize>,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevLoading {
+    Lazy,
+    Eager,
+}
+
+pub struct MountedServeOptions {
+    pub name: String,
+    pub root: PathBuf,
+    pub base_path: String,
+    pub loading: DevLoading,
+    pub entry: PathBuf,
+    pub resolve_options: ResolveOptions,
+    pub define: Vec<(String, String)>,
+    pub target_env: TargetEnv,
+    pub jsx_import_source: String,
+    pub watch_roots: Vec<PathBuf>,
+    pub before_rebuild: Option<BeforeRebuild>,
 }
 
 /// 文件变化后、BuildSession 失效前运行的生成钩子。返回需要一并失效的生成文件。
@@ -130,6 +170,8 @@ pub type BeforeRebuild =
 pub enum ServerEvent {
     RebuildStart {
         changed_paths: Vec<PathBuf>,
+        workspace: Option<String>,
+        base_path: Option<String>,
     },
     Rebuilt {
         initial: bool,
@@ -139,9 +181,18 @@ pub enum ServerEvent {
         chunks: usize,
         assets: usize,
         duration_ms: f64,
+        workspace: Option<String>,
+        base_path: Option<String>,
     },
     Diagnostics {
         diagnostics: Vec<Diagnostic>,
+    },
+    WorkspaceState {
+        total: usize,
+        loaded: usize,
+        failed: usize,
+        current: Option<String>,
+        failed_names: Vec<String>,
     },
     Closed,
 }
@@ -152,6 +203,8 @@ pub type EventHandler = Arc<dyn Fn(ServerEvent) + Send + Sync + 'static>;
 pub struct ServeOptions {
     /// 已由调用方解析完成的入口文件。
     pub entry: PathBuf,
+    /// URL base path owned by the primary application.
+    pub base_path: String,
     /// 解析选项（含别名 `@`/`@@`/`@@@`）。
     pub resolve_options: ResolveOptions,
     /// 编译期 define（dev 口径：`process.env.NODE_ENV → "development"` + 用户 `[define]`）。
@@ -174,12 +227,15 @@ pub struct ServeOptions {
     pub quiet: bool,
     /// Optional structured event sink used by library frontends.
     pub event_handler: Option<EventHandler>,
+    /// Additional independently bundled applications mounted below this server.
+    pub mounts: Vec<MountedServeOptions>,
 }
 
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
             entry: PathBuf::from("src/index.tsx"),
+            base_path: "/".to_string(),
             resolve_options: ResolveOptions::default(),
             define: Vec::new(),
             host: "127.0.0.1".to_string(),
@@ -191,6 +247,7 @@ impl Default for ServeOptions {
             before_rebuild: None,
             quiet: false,
             event_handler: None,
+            mounts: Vec::new(),
         }
     }
 }
@@ -213,6 +270,42 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
     start(root, port, options)?.wait()
 }
 
+struct MountSpec {
+    name: Option<String>,
+    root: PathBuf,
+    base_path: String,
+    loading: DevLoading,
+    entry: PathBuf,
+    resolve_options: ResolveOptions,
+    define: Vec<(String, String)>,
+    target_env: TargetEnv,
+    jsx_import_source: String,
+    watch_roots: Vec<PathBuf>,
+    before_rebuild: Option<BeforeRebuild>,
+}
+
+fn normalize_mount_base(value: &str) -> std::io::Result<String> {
+    if value.contains('\\') || value.contains('%') || value.contains('?') || value.contains('#') {
+        return Err(std::io::Error::other(format!(
+            "invalid Wake dev mount base path `{value}`"
+        )));
+    }
+    let segments = value.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "." | ".."))
+    {
+        return Err(std::io::Error::other(format!(
+            "invalid Wake dev mount base path `{value}`"
+        )));
+    }
+    Ok(if value.trim_matches('/').is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}/", value.trim_matches('/'))
+    })
+}
+
 fn run_server(
     root: &Path,
     port: u16,
@@ -222,6 +315,7 @@ fn run_server(
 ) -> std::io::Result<()> {
     let ServeOptions {
         entry,
+        base_path,
         resolve_options,
         define,
         host,
@@ -233,6 +327,7 @@ fn run_server(
         before_rebuild,
         quiet,
         event_handler,
+        mounts,
     } = options;
     // 编译代理规则（pathRewrite 正则一次编译）。非法正则跳过并告警。
     let proxies: Vec<CompiledProxy> = proxy
@@ -240,28 +335,116 @@ fn run_server(
         .filter_map(CompiledProxy::compile)
         .collect();
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let base_path = normalize_mount_base(&base_path)?;
     let entry = if entry.is_absolute() {
         entry
     } else {
         root.join(entry)
     };
-    if !entry.is_file() {
-        return Err(std::io::Error::other(format!(
-            "入口文件不存在：{}",
-            entry.display()
-        )));
+    let mut specs = vec![MountSpec {
+        name: None,
+        root: root.clone(),
+        base_path: base_path.clone(),
+        loading: DevLoading::Eager,
+        entry,
+        resolve_options,
+        define,
+        target_env,
+        jsx_import_source,
+        watch_roots,
+        before_rebuild,
+    }];
+    for mount in mounts {
+        let mount_root = mount
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| mount.root.clone());
+        let mount_base = normalize_mount_base(&mount.base_path)?;
+        if !mount_base.starts_with(&base_path) || mount_base == base_path {
+            return Err(std::io::Error::other(format!(
+                "Wake dev mount `{}` at `{mount_base}` is outside primary base `{base_path}`",
+                mount.name
+            )));
+        }
+        let mount_entry = if mount.entry.is_absolute() {
+            mount.entry
+        } else {
+            mount_root.join(mount.entry)
+        };
+        specs.push(MountSpec {
+            name: Some(mount.name),
+            root: mount_root,
+            base_path: mount_base,
+            loading: mount.loading,
+            entry: mount_entry,
+            resolve_options: mount.resolve_options,
+            define: mount.define,
+            target_env: mount.target_env,
+            jsx_import_source: mount.jsx_import_source,
+            watch_roots: mount.watch_roots,
+            before_rebuild: mount.before_rebuild,
+        });
     }
-    let html = Arc::new(RwLock::new(load_html_template(&root)));
+    for spec in &specs {
+        if !spec.entry.is_file() {
+            return Err(std::io::Error::other(format!(
+                "entry file does not exist for Wake dev mount `{}`: {}",
+                spec.name.as_deref().unwrap_or("site"),
+                spec.entry.display()
+            )));
+        }
+    }
+    for index in 1..specs.len() {
+        for other in index + 1..specs.len() {
+            if specs[index].base_path.starts_with(&specs[other].base_path)
+                || specs[other].base_path.starts_with(&specs[index].base_path)
+            {
+                return Err(std::io::Error::other(format!(
+                    "overlapping Wake dev mounts `{}` and `{}`",
+                    specs[index].base_path, specs[other].base_path
+                )));
+            }
+        }
+    }
 
     let sty = Sty::detect(quiet);
-    let bundle = Arc::new(RwLock::new(BundleState {
-        js: String::new(),
-        chunks: std::collections::HashMap::new(),
-        assets: std::collections::HashMap::new(),
-        map: None,
-        error: None,
-    }));
     let (tx, _rx) = broadcast::channel::<String>(64);
+    let (load_tx, load_rx) = mpsc::channel::<usize>();
+    let mounted_states = Arc::new(
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                Arc::new(MountedAppState {
+                    name: spec.name.clone(),
+                    base_path: spec.base_path.clone(),
+                    bundle: Arc::new(RwLock::new(BundleState {
+                        js: String::new(),
+                        chunks: std::collections::HashMap::new(),
+                        assets: std::collections::HashMap::new(),
+                        map: None,
+                        error: None,
+                    })),
+                    html: Arc::new(RwLock::new(load_html_template(
+                        &spec.root,
+                        &spec.base_path,
+                        spec.name.as_deref(),
+                    ))),
+                    public_dir: spec.root.join("public"),
+                    loading: Arc::new(MountLoadingState {
+                        status: Mutex::new(if spec.loading == DevLoading::Lazy {
+                            MountStatus::Pending
+                        } else {
+                            MountStatus::Loading
+                        }),
+                        changed: Condvar::new(),
+                        load_tx: load_tx.clone(),
+                        index,
+                    }),
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
 
     // 品牌行保持克制；运行状态与构建数据在首次构建结束后统一展示。
     if !sty.quiet {
@@ -280,29 +463,19 @@ fn run_server(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<Option<BuildSummary>, String>>();
     let watcher_stop = Arc::clone(&stop);
     let watcher_join = {
-        let bundle = bundle.clone();
         let tx = tx.clone();
-        let html = html.clone();
-        let entry = entry.clone();
-        let watch_root = root.clone();
+        let watcher_mounts = Arc::clone(&mounted_states);
         let watcher_events = event_handler.clone();
         std::thread::Builder::new()
             .name("wake-dev-watch".into())
             .spawn(move || {
                 watch_and_rebuild(
-                    watch_root,
-                    entry,
-                    bundle,
-                    html,
+                    specs,
+                    watcher_mounts,
                     tx,
                     ready_tx,
                     sty,
-                    resolve_options,
-                    define,
-                    target_env,
-                    jsx_import_source,
-                    watch_roots,
-                    before_rebuild,
+                    load_rx,
                     watcher_stop,
                     watcher_events,
                 );
@@ -333,7 +506,7 @@ fn run_server(
     } else {
         host.as_str()
     };
-    let url = format!("http://{display_host}:{port}/");
+    let url = format!("http://{display_host}:{port}{base_path}");
 
     if !sty.quiet {
         if let Some(summary) = &summary {
@@ -385,19 +558,15 @@ fn run_server(
     }
 
     let data = web::Data::new(AppState {
-        bundle,
+        mounts: mounted_states,
         tx,
-        html,
         proxies: Arc::new(proxies),
-        public_dir: root.join("public"),
     });
     let server = HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
             // 放宽负载上限，便于代理转发较大的 POST 请求体。
             .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
-            .route("/bundle.js", web::get().to(serve_bundle))
-            .route("/bundle.js.map", web::get().to(serve_bundle_map))
             .route("/__wake/client.js", web::get().to(serve_client))
             .route("/__wake_hmr", web::get().to(ws_handler))
             // 默认服务：先试代理转发（任意方法），未命中且为 GET 则回退 SPA HTML。
@@ -405,7 +574,7 @@ fn run_server(
     })
     .bind((host.as_str(), port));
     let server = match server {
-        Ok(server) => server.workers(2).run(),
+        Ok(server) => server.workers(4).run(),
         Err(error) => {
             stop.store(true, Ordering::Release);
             let _ = watcher_join.join();
@@ -495,28 +664,318 @@ fn open_browser(url: &str) {
 // ======================================================================
 
 fn watch_and_rebuild(
-    root: PathBuf,
-    entry: PathBuf,
-    bundle: Arc<RwLock<BundleState>>,
-    html: Arc<RwLock<String>>,
+    specs: Vec<MountSpec>,
+    mounts: Arc<Vec<Arc<MountedAppState>>>,
     tx: broadcast::Sender<String>,
     ready_tx: mpsc::Sender<Result<Option<BuildSummary>, String>>,
     sty: Sty,
-    resolve_options: ResolveOptions,
-    define: Vec<(String, String)>,
-    target_env: TargetEnv,
-    jsx_import_source: String,
-    watch_roots: Vec<PathBuf>,
-    before_rebuild: Option<BeforeRebuild>,
+    load_rx: mpsc::Receiver<usize>,
     stop: Arc<AtomicBool>,
     event_handler: Option<EventHandler>,
 ) {
+    struct Worker {
+        spec: MountSpec,
+        session: Option<BuildSession>,
+        watch_targets: Vec<(PathBuf, RecursiveMode)>,
+    }
+
+    let mut workers = specs
+        .into_iter()
+        .map(|spec| {
+            let watch_targets = mount_watch_targets(&spec);
+            Worker {
+                spec,
+                session: None,
+                watch_targets,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (evt_tx, evt_rx) = mpsc::channel::<(Vec<PathBuf>, bool)>();
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res
+                && is_source_event(&event)
+            {
+                let structural = is_structural_event(&event);
+                let _ = evt_tx.send((event.paths, structural));
+            }
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let message = format!("cannot create Wake file watcher: {error}");
+                let _ = ready_tx.send(Err(message));
+                return;
+            }
+        };
+    let mut registered = std::collections::BTreeMap::<PathBuf, RecursiveMode>::new();
+    for worker in &workers {
+        for (path, mode) in &worker.watch_targets {
+            let should_register = match registered.get(path) {
+                Some(RecursiveMode::Recursive) => false,
+                Some(RecursiveMode::NonRecursive) => *mode == RecursiveMode::Recursive,
+                None => true,
+            };
+            if should_register {
+                if let Err(error) = watcher.watch(path, *mode) {
+                    let message = format!("cannot watch {}: {error}", path.display());
+                    let _ = ready_tx.send(Err(message));
+                    return;
+                }
+                registered.insert(path.clone(), *mode);
+            }
+        }
+    }
+
+    let mut primary_summary = None;
+    for index in 0..workers.len() {
+        if workers[index].spec.loading == DevLoading::Lazy {
+            continue;
+        }
+        workers[index].session = Some(create_mount_session(&workers[index].spec));
+        let worker = &mut workers[index];
+        let summary = rebuild_mount(
+            worker.session.as_mut().expect("created session"),
+            &worker.spec,
+            &mounts[index],
+            &tx,
+            true,
+            sty,
+            event_handler.as_ref(),
+        );
+        if index == 0 {
+            primary_summary = summary;
+            set_mount_status(&mounts[index], MountStatus::Loaded);
+        } else if summary.is_some() {
+            set_mount_status(&mounts[index], MountStatus::Loaded);
+        } else {
+            let error = mounts[index]
+                .bundle
+                .read()
+                .unwrap()
+                .error
+                .clone()
+                .unwrap_or_else(|| "workspace build failed".to_string());
+            set_mount_status(&mounts[index], MountStatus::Failed(error));
+        }
+    }
+    emit_workspace_state(&mounts, None, event_handler.as_ref());
+    if ready_tx.send(Ok(primary_summary)).is_err() {
+        return;
+    }
+
+    while !stop.load(Ordering::Acquire) {
+        while let Ok(index) = load_rx.try_recv() {
+            if index == 0 || index >= workers.len() || workers[index].session.is_some() {
+                continue;
+            }
+            emit_workspace_state(
+                &mounts,
+                workers[index].spec.name.clone(),
+                event_handler.as_ref(),
+            );
+            if let Some(regenerate) = &workers[index].spec.before_rebuild
+                && let Err(error) = regenerate(&[])
+            {
+                mounts[index].bundle.write().unwrap().error = Some(error.clone());
+                if let Some(handler) = &event_handler {
+                    handler(ServerEvent::Diagnostics {
+                        diagnostics: vec![Diagnostic::error(error.clone()).with_code("WAKE_BUILD")],
+                    });
+                }
+                let _ = tx.send(msg_error(&error, workers[index].spec.name.as_deref()));
+                set_mount_status(&mounts[index], MountStatus::Failed(error));
+                emit_workspace_state(&mounts, None, event_handler.as_ref());
+                continue;
+            }
+            workers[index].session = Some(create_mount_session(&workers[index].spec));
+            let worker = &mut workers[index];
+            let summary = rebuild_mount(
+                worker.session.as_mut().expect("created session"),
+                &worker.spec,
+                &mounts[index],
+                &tx,
+                true,
+                sty,
+                event_handler.as_ref(),
+            );
+            if summary.is_some() {
+                set_mount_status(&mounts[index], MountStatus::Loaded);
+            } else {
+                let error = mounts[index]
+                    .bundle
+                    .read()
+                    .unwrap()
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "workspace build failed".to_string());
+                set_mount_status(&mounts[index], MountStatus::Failed(error));
+            }
+            emit_workspace_state(&mounts, None, event_handler.as_ref());
+        }
+
+        let (mut changed, mut structural) = match evt_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        while let Ok((paths, event_structural)) = evt_rx.recv_timeout(WATCH_SETTLE_QUIET) {
+            changed.extend(paths);
+            structural |= event_structural;
+        }
+        changed.sort();
+        changed.dedup();
+        let config_changed = changed.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "wake.config.toml")
+        });
+        for (index, worker) in workers.iter().enumerate().skip(1) {
+            let matches_mount = changed.iter().any(|path| {
+                worker
+                    .watch_targets
+                    .iter()
+                    .any(|(target, mode)| match mode {
+                        RecursiveMode::Recursive => path.starts_with(target),
+                        RecursiveMode::NonRecursive => {
+                            path == target || path.parent() == Some(target.as_path())
+                        }
+                    })
+            });
+            if matches_mount
+                && worker.session.is_none()
+                && matches!(
+                    &*mounts[index].loading.status.lock().unwrap(),
+                    MountStatus::Failed(_)
+                )
+            {
+                set_mount_status(&mounts[index], MountStatus::Pending);
+            }
+        }
+
+        let affected = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| {
+                worker.session.is_some()
+                    && changed.iter().any(|path| {
+                        worker
+                            .watch_targets
+                            .iter()
+                            .any(|(target, mode)| match mode {
+                                RecursiveMode::Recursive => path.starts_with(target),
+                                RecursiveMode::NonRecursive => {
+                                    path == target || path.parent() == Some(target.as_path())
+                                }
+                            })
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        for index in affected {
+            let workspace = workers[index].spec.name.clone();
+            let mount_base = workers[index].spec.base_path.clone();
+            if let Some(handler) = &event_handler {
+                handler(ServerEvent::RebuildStart {
+                    changed_paths: changed.clone(),
+                    workspace: workspace.clone(),
+                    base_path: workspace.as_ref().map(|_| mount_base.clone()),
+                });
+            }
+            let mut invalidated = changed.clone();
+            if let Some(regenerate) = &workers[index].spec.before_rebuild {
+                match regenerate(&changed) {
+                    Ok(mut generated) => {
+                        structural |= !generated.is_empty();
+                        invalidated.append(&mut generated);
+                        invalidated.sort();
+                        invalidated.dedup();
+                    }
+                    Err(error) => {
+                        mounts[index].bundle.write().unwrap().error = Some(error.clone());
+                        if let Some(handler) = &event_handler {
+                            handler(ServerEvent::Diagnostics {
+                                diagnostics: vec![
+                                    Diagnostic::error(error.clone()).with_code("WAKE_BUILD"),
+                                ],
+                            });
+                        }
+                        let _ = tx.send(msg_error(&error, workspace.as_deref()));
+                        continue;
+                    }
+                }
+            }
+            *mounts[index].html.write().unwrap() = load_html_template(
+                &workers[index].spec.root,
+                &workers[index].spec.base_path,
+                workers[index].spec.name.as_deref(),
+            );
+            let worker = &mut workers[index];
+            if config_changed {
+                worker.session = Some(create_mount_session(&worker.spec));
+            } else {
+                worker
+                    .session
+                    .as_mut()
+                    .expect("loaded session")
+                    .invalidate_paths(&invalidated, structural);
+            }
+            let session = worker.session.as_mut().expect("loaded session");
+            let _ = rebuild_mount(
+                session,
+                &worker.spec,
+                &mounts[index],
+                &tx,
+                false,
+                sty,
+                event_handler.as_ref(),
+            );
+        }
+    }
+}
+
+fn mount_watch_targets(spec: &MountSpec) -> Vec<(PathBuf, RecursiveMode)> {
+    let default_watch_dir = {
+        let src = spec.root.join("src");
+        if src.is_dir() { src } else { spec.root.clone() }
+    };
+    let mut targets = if spec.watch_roots.is_empty() {
+        vec![(default_watch_dir, RecursiveMode::Recursive)]
+    } else {
+        spec.watch_roots
+            .iter()
+            .filter_map(|path| {
+                let path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    spec.root.join(path)
+                };
+                if path.is_dir() {
+                    Some((path, RecursiveMode::Recursive))
+                } else {
+                    path.parent()
+                        .map(|parent| (parent.to_path_buf(), RecursiveMode::NonRecursive))
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let public_dir = spec.root.join("public");
+    if public_dir.is_dir() {
+        targets.push((public_dir, RecursiveMode::Recursive));
+    }
+    targets.push((spec.root.clone(), RecursiveMode::NonRecursive));
+    targets.sort_by(|left, right| left.0.cmp(&right.0));
+    targets.dedup_by(|left, right| left.0 == right.0);
+    targets
+}
+
+fn create_mount_session(spec: &MountSpec) -> BuildSession {
     let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
-    bundler.set_project_root(root.clone());
+    bundler.set_project_root(spec.root.clone());
     // 别名（@/@@）+ define（dev 口径）须在首次 build 前设置，dev 与 build 一致。
-    bundler.set_resolve_options(resolve_options);
-    bundler.set_define(define);
-    bundler.set_target_env(target_env);
+    bundler.set_resolve_options(spec.resolve_options.clone());
+    bundler.set_define(spec.define.clone());
+    bundler.set_target_env(spec.target_env.clone());
+    bundler.set_public_path(spec.base_path.clone());
     // dev 走非 minify 单包路径 → 可产出精确 sourcemap（WAKE-COMPATIBILITY §M4d）。
     bundler.enable_sourcemap();
     // 零运行时 CSS-in-JS（§M5）：dev 不抽取 `.css`，抽出的样式随模块体 `<style>` 注入，
@@ -528,141 +987,44 @@ fn watch_and_rebuild(
     // JSX **dev runtime**：`jsxDEV` 携带 `{fileName,lineNumber,columnNumber}`，
     // React DevTools 借此显示组件栈、报错能定位到源文件行列（保持既定行为 的 dev 口径）。
     // 该口径已混入 `content_key`，与 prod 的模块摘要缓存互不干扰。
-    bundler.set_jsx_runtime(true, Box::leak(jsx_import_source.into_boxed_str()));
-    let mut session = BuildSession::from_incremental(bundler);
-    // 普通应用默认监听 src；文档模式可提供 docs/src 等多个根目录。
-    let default_watch_dir = {
-        let src = root.join("src");
-        if src.is_dir() { src } else { root.clone() }
-    };
-    let mut watch_targets: Vec<(PathBuf, RecursiveMode)> = if watch_roots.is_empty() {
-        vec![(default_watch_dir.clone(), RecursiveMode::Recursive)]
-    } else {
-        watch_roots
-            .into_iter()
-            .filter_map(|path| {
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    root.join(path)
-                };
-                if path.is_dir() {
-                    Some((path, RecursiveMode::Recursive))
-                } else {
-                    path.parent()
-                        .map(|parent| (parent.to_path_buf(), RecursiveMode::NonRecursive))
-                }
-            })
-            .collect()
-    };
-    let (evt_tx, evt_rx) = mpsc::channel::<(Vec<PathBuf>, bool)>();
-    let mut watcher =
-        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res
-                && is_source_event(&ev)
-            {
-                let structural = is_structural_event(&ev);
-                let _ = evt_tx.send((ev.paths, structural));
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                let error = format!("无法创建文件监听器：{e}");
-                eprintln!("  {} {error}", sty.err("✗"));
-                let _ = ready_tx.send(Err(error));
-                return;
-            }
-        };
-    let public_dir = root.join("public");
-    if public_dir.is_dir() {
-        watch_targets.push((public_dir, RecursiveMode::Recursive));
-    }
-    watch_targets.push((root.clone(), RecursiveMode::NonRecursive));
-    watch_targets.sort_by(|left, right| left.0.cmp(&right.0));
-    watch_targets.dedup_by(|left, right| left.0 == right.0);
-    for (watch_dir, mode) in watch_targets {
-        if let Err(error) = watcher.watch(&watch_dir, mode) {
-            let error = format!("无法监听 {}：{error}", watch_dir.display());
-            eprintln!("  {} {error}", sty.err("✗"));
-            let _ = ready_tx.send(Err(error));
-            return;
+    let import_source = Box::leak(spec.jsx_import_source.clone().into_boxed_str());
+    bundler.set_jsx_runtime(true, import_source);
+    BuildSession::from_incremental(bundler)
+}
+
+fn set_mount_status(mount: &MountedAppState, status: MountStatus) {
+    *mount.loading.status.lock().unwrap() = status;
+    mount.loading.changed.notify_all();
+}
+
+fn emit_workspace_state(
+    mounts: &[Arc<MountedAppState>],
+    current: Option<String>,
+    handler: Option<&EventHandler>,
+) {
+    let Some(handler) = handler else { return };
+    let mut loaded = 0;
+    let mut failed_names = Vec::new();
+    for mount in mounts.iter().skip(1) {
+        match &*mount.loading.status.lock().unwrap() {
+            MountStatus::Loaded => loaded += 1,
+            MountStatus::Failed(_) => failed_names.push(
+                mount
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| mount.base_path.clone()),
+            ),
+            MountStatus::Pending | MountStatus::Loading => {}
         }
     }
-    // 先完成 watcher 注册再进行首次构建。构建期间到达的变更会进入 evt_rx，避免
-    // “已读取模块、尚未开始监听”之间的启动盲区。
-    let summary = rebuild(
-        &mut session,
-        &entry,
-        &bundle,
-        &tx,
-        true,
-        sty,
-        event_handler.as_ref(),
-    );
-    if ready_tx.send(Ok(summary)).is_err() {
-        return;
-    }
-    while !stop.load(Ordering::Acquire) {
-        let (mut changed, mut structural) = match evt_rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        // Windows 的 ReadDirectoryChangesW 可能把一次写入拆成 size / last-write 等多个
-        // Modify(Any) 通知。等待最后一个通知后的完整静默窗口，避免在 CI 负载下先用旧内容
-        // 触发一次 updated_modules=0 的空重建，再收到真正的内容事件。
-        while let Ok((paths, event_structural)) = evt_rx.recv_timeout(WATCH_SETTLE_QUIET) {
-            changed.extend(paths);
-            structural |= event_structural;
-        }
-        changed.sort();
-        changed.dedup();
-        if let Some(handler) = &event_handler {
-            handler(ServerEvent::RebuildStart {
-                changed_paths: changed.clone(),
-            });
-        }
-        if let Some(regenerate) = &before_rebuild {
-            match regenerate(&changed) {
-                Ok(mut generated) => {
-                    structural |= !generated.is_empty();
-                    changed.append(&mut generated);
-                    changed.sort();
-                    changed.dedup();
-                }
-                Err(error) => {
-                    {
-                        let mut state = bundle.write().unwrap();
-                        state.error = Some(error.clone());
-                    }
-                    if !sty.quiet {
-                        eprintln!("  {} 生成步骤失败：{error}", sty.err("✗"));
-                    }
-                    if let Some(handler) = &event_handler {
-                        handler(ServerEvent::Diagnostics {
-                            diagnostics: vec![
-                                Diagnostic::error(error.clone()).with_code("WAKE_BUILD"),
-                            ],
-                        });
-                    }
-                    let _ = tx.send(msg_error(&error));
-                    continue;
-                }
-            }
-        }
-        // HTML 外壳不经过 bundler，必须在通知浏览器刷新前单独刷新共享模板。
-        *html.write().unwrap() = load_html_template(&root);
-        session.invalidate_paths(&changed, structural);
-        let _ = rebuild(
-            &mut session,
-            &entry,
-            &bundle,
-            &tx,
-            false,
-            sty,
-            event_handler.as_ref(),
-        );
-    }
+    failed_names.sort();
+    handler(ServerEvent::WorkspaceState {
+        total: mounts.len().saturating_sub(1),
+        loaded,
+        failed: failed_names.len(),
+        current,
+        failed_names,
+    });
 }
 
 /// notify 事件是否为源码相关（忽略目录/元数据类噪声）。
@@ -702,6 +1064,7 @@ fn is_watched_ext(e: &str) -> bool {
             | "mts"
             | "cts"
             | "json"
+            | "toml"
             | "html"
             | "css"
             | "raw"
@@ -725,17 +1088,17 @@ fn is_watched_ext(e: &str) -> bool {
 }
 
 /// 执行一次（增量）构建并更新共享状态 + 广播 HMR 事件。
-fn rebuild(
+fn rebuild_mount(
     session: &mut BuildSession,
-    entry: &Path,
-    bundle: &Arc<RwLock<BundleState>>,
+    spec: &MountSpec,
+    mount: &MountedAppState,
     tx: &broadcast::Sender<String>,
     first: bool,
     sty: Sty,
     event_handler: Option<&EventHandler>,
 ) -> Option<BuildSummary> {
     let t = Instant::now();
-    let out = session.build_current_ref(BuildRequest::new(entry));
+    let out = session.build_current_ref(BuildRequest::new(&spec.entry));
     let elapsed = t.elapsed();
     let dur = human_dur(elapsed);
     let sep = sty.dim("·");
@@ -743,7 +1106,7 @@ fn rebuild(
         let errs = out.diagnostics.iter().filter(|d| d.is_error()).count();
         let err = format_diagnostics(&out.diagnostics);
         {
-            let mut s = bundle.write().unwrap();
+            let mut s = mount.bundle.write().unwrap();
             s.error = Some(err.clone());
         }
         if !sty.quiet {
@@ -763,10 +1126,25 @@ fn rebuild(
                 .iter()
                 .filter(|diagnostic| diagnostic.is_error())
                 .cloned()
+                .map(|mut diagnostic| {
+                    if let Some(path) = diagnostic.path.as_deref() {
+                        let path = PathBuf::from(path);
+                        if !path.is_absolute() {
+                            diagnostic.path =
+                                Some(spec.root.join(path).to_string_lossy().into_owned());
+                        }
+                    }
+                    if let Some(workspace) = &spec.name {
+                        diagnostic
+                            .notes
+                            .push(format!("Docs workspace: {workspace}"));
+                    }
+                    diagnostic
+                })
                 .collect();
             handler(ServerEvent::Diagnostics { diagnostics });
         }
-        let _ = tx.send(msg_error(&err));
+        let _ = tx.send(msg_error(&err, spec.name.as_deref()));
         None
     } else {
         let summary = BuildSummary {
@@ -779,11 +1157,14 @@ fn rebuild(
             duration_ms: elapsed.as_secs_f64() * 1000.0,
         };
         {
-            let mut s = bundle.write().unwrap();
+            let mut s = mount.bundle.write().unwrap();
             // 追加 sourceMappingURL 让 DevTools 自动拉取（外链 .map，不膨胀 bundle 体积）。
             let map = out.chunks[out.entry_chunk].source_map.clone();
             s.js = if map.is_some() {
-                format!("{}\n//# sourceMappingURL=/bundle.js.map\n", out.bundle)
+                format!(
+                    "{}\n//# sourceMappingURL={}bundle.js.map\n",
+                    out.bundle, spec.base_path
+                )
             } else {
                 out.bundle.clone()
             };
@@ -817,7 +1198,7 @@ fn rebuild(
             );
         }
         if !first {
-            let _ = tx.send(r#"{"type":"reload"}"#.to_string());
+            let _ = tx.send(msg_reload(spec.name.as_deref()));
         }
         if let Some(handler) = event_handler {
             handler(ServerEvent::Rebuilt {
@@ -828,6 +1209,8 @@ fn rebuild(
                 chunks: summary.chunks,
                 assets: summary.assets,
                 duration_ms: summary.duration_ms,
+                workspace: spec.name.clone(),
+                base_path: spec.name.as_ref().map(|_| spec.base_path.clone()),
             });
         }
         Some(summary)
@@ -847,25 +1230,6 @@ fn format_diagnostics(diags: &[Diagnostic]) -> String {
 // HTTP 处理器
 // ======================================================================
 
-async fn serve_bundle(data: web::Data<AppState>) -> HttpResponse {
-    let js = data.bundle.read().unwrap().js.clone();
-    HttpResponse::Ok()
-        .content_type("application/javascript; charset=utf-8")
-        .insert_header(("Cache-Control", "no-cache"))
-        .body(js)
-}
-
-/// 提供 `/bundle.js.map`（DevTools 依 `sourceMappingURL` 自动拉取）。
-async fn serve_bundle_map(data: web::Data<AppState>) -> HttpResponse {
-    match data.bundle.read().unwrap().map.clone() {
-        Some(map) => HttpResponse::Ok()
-            .content_type("application/json; charset=utf-8")
-            .insert_header(("Cache-Control", "no-cache"))
-            .body(map),
-        None => HttpResponse::NotFound().body("no source map"),
-    }
-}
-
 async fn serve_client() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("application/javascript; charset=utf-8")
@@ -873,8 +1237,8 @@ async fn serve_client() -> HttpResponse {
 }
 
 /// 服务 HTML（含 SPA fallback：任何未知 GET 路径都回退到应用外壳）。
-async fn serve_html(data: web::Data<AppState>) -> HttpResponse {
-    let html = data.html.read().unwrap().clone();
+async fn serve_html(mount: &MountedAppState) -> HttpResponse {
+    let html = mount.html.read().unwrap().clone();
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .insert_header(("Cache-Control", "no-cache"))
@@ -903,36 +1267,156 @@ async fn serve_default(
         return HttpResponse::NotFound().finish();
     }
 
-    let rel = req.path().trim_start_matches('/');
+    let Some(mount) = select_mount(&data.mounts, req.path()) else {
+        return HttpResponse::NotFound()
+            .content_type("text/plain; charset=utf-8")
+            .body("wake dev: request is outside every configured mount");
+    };
+    if req.path() != "/" && format!("{}/", req.path()) == mount.base_path {
+        return HttpResponse::PermanentRedirect()
+            .insert_header(("Location", mount.base_path.clone()))
+            .finish();
+    }
+    if let Err(error) = ensure_mount_ready(&mount) {
+        return HttpResponse::ServiceUnavailable()
+            .content_type("text/html; charset=utf-8")
+            .insert_header(("Retry-After", "1"))
+            .body(format!(
+                "<!doctype html><meta charset=\"utf-8\"><title>Wake workspace unavailable</title><main style=\"font:14px/1.6 ui-monospace,monospace;padding:32px\"><h1>Workspace unavailable</h1><pre>{}</pre></main>",
+                escape_html(&error)
+            ));
+    }
+    let raw_rel = req
+        .path()
+        .strip_prefix(&mount.base_path)
+        .unwrap_or_default();
+    let Some(rel) = safe_request_relative(raw_rel) else {
+        return HttpResponse::BadRequest()
+            .content_type("text/plain; charset=utf-8")
+            .body("wake dev: unsafe request path");
+    };
+
+    if rel == "bundle.js" {
+        let js = mount.bundle.read().unwrap().js.clone();
+        return HttpResponse::Ok()
+            .content_type("application/javascript; charset=utf-8")
+            .insert_header(("Cache-Control", "no-cache"))
+            .body(js);
+    }
+    if rel == "bundle.js.map" {
+        return match mount.bundle.read().unwrap().map.clone() {
+            Some(map) => HttpResponse::Ok()
+                .content_type("application/json; charset=utf-8")
+                .insert_header(("Cache-Control", "no-cache"))
+                .body(map),
+            None => HttpResponse::NotFound().body("no source map"),
+        };
+    }
 
     // ② chunk（内存）
-    if let Some(code) = data.bundle.read().unwrap().chunks.get(rel).cloned() {
+    if let Some(code) = mount.bundle.read().unwrap().chunks.get(&rel).cloned() {
         return HttpResponse::Ok()
             .content_type("application/javascript; charset=utf-8")
             .insert_header(("Cache-Control", "no-cache"))
             .body(code);
     }
     // ③ 资源产物（内存）
-    if let Some(bytes) = data.bundle.read().unwrap().assets.get(rel).cloned() {
+    if let Some(bytes) = mount.bundle.read().unwrap().assets.get(&rel).cloned() {
         return HttpResponse::Ok()
-            .content_type(mime_for(rel))
+            .content_type(mime_for(&rel))
             .insert_header(("Cache-Control", "no-cache"))
             .body(bytes);
     }
     // ④ public/ 静态文件
-    if let Some((bytes, ct)) = read_public_file(&data.public_dir, rel) {
+    if let Some((bytes, ct)) = read_public_file(&mount.public_dir, &rel) {
         return HttpResponse::Ok()
             .content_type(ct)
             .insert_header(("Cache-Control", "no-cache"))
             .body(bytes);
     }
     // ⑤ SPA 回退：仅无扩展名的路径（前端路由），形似文件者 404。
-    if looks_like_file(rel) {
+    if looks_like_file(&rel) {
         return HttpResponse::NotFound()
             .content_type("text/plain; charset=utf-8")
-            .body(format!("wake dev: 未找到 `/{rel}`"));
+            .body(format!("wake dev: 未找到 `{}`", req.path()));
     }
-    serve_html(data).await
+    serve_html(&mount).await
+}
+
+fn select_mount(mounts: &[Arc<MountedAppState>], path: &str) -> Option<Arc<MountedAppState>> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            path.starts_with(&mount.base_path)
+                || (path != "/" && format!("{path}/") == mount.base_path)
+        })
+        .max_by_key(|mount| mount.base_path.len())
+        .cloned()
+}
+
+fn ensure_mount_ready(mount: &MountedAppState) -> Result<(), String> {
+    let mut status = mount.loading.status.lock().unwrap();
+    loop {
+        match &*status {
+            MountStatus::Loaded => return Ok(()),
+            MountStatus::Failed(error) => return Err(error.clone()),
+            MountStatus::Pending => {
+                *status = MountStatus::Loading;
+                if mount.loading.load_tx.send(mount.loading.index).is_err() {
+                    *status = MountStatus::Failed("Wake workspace loader stopped".to_string());
+                    mount.loading.changed.notify_all();
+                }
+            }
+            MountStatus::Loading => {
+                status = mount.loading.changed.wait(status).unwrap();
+            }
+        }
+    }
+}
+
+fn safe_request_relative(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push(hex_value(high)? * 16 + hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    if decoded.contains('\\') || decoded.contains('\0') {
+        return None;
+    }
+    if decoded
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return None;
+    }
+    Some(decoded.trim_start_matches('/').to_string())
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// 路径末段是否含扩展名（`assets/a.png` → true；`users/1` → false）。
@@ -948,6 +1432,13 @@ fn looks_like_file(rel: &str) -> bool {
 /// 这类请求不得逃出该目录。
 fn read_public_file(public_dir: &Path, rel: &str) -> Option<(Vec<u8>, &'static str)> {
     if rel.is_empty() {
+        return None;
+    }
+    if std::fs::symlink_metadata(public_dir)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
         return None;
     }
     let candidate = public_dir.join(rel);
@@ -1051,12 +1542,25 @@ async fn ws_handler(
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, mut stream) = actix_ws::handle(&req, body)?;
     let mut rx = data.tx.subscribe();
-    let init = data.bundle.read().unwrap().error.clone();
+    let requested_mount = req
+        .query_string()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("mount="))
+        .and_then(safe_request_relative)
+        .unwrap_or_default();
+    let init = data
+        .mounts
+        .iter()
+        .find(|mount| mount.name.as_deref().unwrap_or("") == requested_mount)
+        .and_then(|mount| mount.bundle.read().unwrap().error.clone());
 
     actix_web::rt::spawn(async move {
         // 连接即同步当前状态。
         let first = match init {
-            Some(err) => msg_error(&err),
+            Some(err) => msg_error(
+                &err,
+                (!requested_mount.is_empty()).then_some(requested_mount.as_str()),
+            ),
             None => r#"{"type":"ok"}"#.to_string(),
         };
         if session.text(first).await.is_err() {
@@ -1090,40 +1594,70 @@ async fn ws_handler(
 
 /// 加载 HTML 外壳：优先项目 `public/index.html` / `index.html`，注入 HMR client 脚本；
 /// 无则生成默认外壳。
-fn load_html_template(root: &Path) -> String {
+fn load_html_template(root: &Path, base_path: &str, mount: Option<&str>) -> String {
     let candidates = [root.join("public/index.html"), root.join("index.html")];
     for c in candidates {
         if let Ok(mut html) = std::fs::read_to_string(&c) {
-            let inject = "<script src=\"/__wake/client.js\"></script>";
+            let mount = format!("\"{}\"", json_escape(mount.unwrap_or("")));
+            let inject = format!(
+                "<script>window.__WAKE_MOUNT__={mount}</script><script src=\"/__wake/client.js\"></script>"
+            );
             if let Some(pos) = html.find("</head>") {
-                html.insert_str(pos, inject);
+                html.insert_str(pos, &inject);
             } else {
-                html.insert_str(0, inject);
+                html.insert_str(0, &inject);
             }
             // 保证有 bundle 脚本引用。
             if !html.contains("bundle.js")
                 && let Some(pos) = html.find("</body>")
             {
-                html.insert_str(pos, "<script src=\"/bundle.js\"></script>");
+                html.insert_str(
+                    pos,
+                    &format!("<script src=\"{base_path}bundle.js\"></script>"),
+                );
+            }
+            if base_path != "/" {
+                html = html.replace(
+                    "src=\"/bundle.js\"",
+                    &format!("src=\"{base_path}bundle.js\""),
+                );
             }
             return html;
         }
     }
-    default_html()
+    default_html(base_path, mount)
 }
 
-fn default_html() -> String {
-    "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"/>\
-     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\
-     <title>wake dev</title>\
-     <script src=\"/__wake/client.js\"></script></head>\
-     <body><div id=\"root\"></div><script src=\"/bundle.js\"></script></body></html>"
-        .to_string()
+fn default_html(base_path: &str, mount: Option<&str>) -> String {
+    let mount = format!("\"{}\"", json_escape(mount.unwrap_or("")));
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"/>\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\
+         <title>wake dev</title>\
+         <script>window.__WAKE_MOUNT__={mount}</script>\
+         <script src=\"/__wake/client.js\"></script></head>\
+         <body><div id=\"root\"></div><script src=\"{base_path}bundle.js\"></script></body></html>"
+    )
 }
 
 /// 构造错误消息 JSON（转义 message）。
-fn msg_error(err: &str) -> String {
-    format!(r#"{{"type":"error","message":"{}"}}"#, json_escape(err))
+fn msg_error(err: &str, mount: Option<&str>) -> String {
+    format!(
+        r#"{{"type":"error","message":"{}","mount":{}}}"#,
+        json_escape(err),
+        json_mount_string(mount)
+    )
+}
+
+fn msg_reload(mount: Option<&str>) -> String {
+    format!(
+        r#"{{"type":"reload","mount":{}}}"#,
+        json_mount_string(mount)
+    )
+}
+
+fn json_mount_string(value: Option<&str>) -> String {
+    format!("\"{}\"", json_escape(value.unwrap_or("")))
 }
 
 fn json_escape(s: &str) -> String {
@@ -1165,10 +1699,12 @@ const CLIENT_RUNTIME: &str = r#"(function () {
   function clearError() { if (overlay) overlay.style.display = "none"; }
   function connect() {
     var proto = location.protocol === "https:" ? "wss" : "ws";
-    var ws = new WebSocket(proto + "://" + location.host + "/__wake_hmr");
+    var mount = window.__WAKE_MOUNT__ || "";
+    var ws = new WebSocket(proto + "://" + location.host + "/__wake_hmr?mount=" + encodeURIComponent(mount));
     ws.onmessage = function (e) {
       var m;
       try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (m.mount != null && m.mount !== mount) return;
       if (m.type === "reload") { clearError(); location.reload(); }
       else if (m.type === "error") { showError(m.message); }
       else if (m.type === "ok") { clearError(); }
@@ -1183,6 +1719,23 @@ const CLIENT_RUNTIME: &str = r#"(function () {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn http_get(port: u16, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
 
     #[test]
     fn json_escape_handles_control_chars() {
@@ -1191,23 +1744,203 @@ mod tests {
 
     #[test]
     fn msg_error_is_valid_shape() {
-        let m = msg_error("boom \"x\"\nline2");
+        let m = msg_error("boom \"x\"\nline2", Some("rc-grid"));
         assert!(m.starts_with(r#"{"type":"error","message":""#));
         assert!(m.ends_with(r#""}"#));
         assert!(m.contains("\\\"x\\\""));
+        assert!(m.contains(r#""mount":"rc-grid""#));
     }
 
     #[test]
     fn default_html_has_hooks() {
-        let h = default_html();
+        let h = default_html("/docs/", Some("rc-grid"));
         assert!(h.contains("/__wake/client.js"));
-        assert!(h.contains("/bundle.js"));
+        assert!(h.contains("/docs/bundle.js"));
         assert!(h.contains("id=\"root\""));
+        assert!(h.contains("window.__WAKE_MOUNT__=\"rc-grid\""));
     }
 
     #[test]
     fn html_changes_are_watched() {
         assert!(is_watched_ext("html"));
+    }
+
+    #[test]
+    fn request_paths_reject_encoded_and_backslash_traversal() {
+        assert_eq!(
+            safe_request_relative("assets/a.png"),
+            Some("assets/a.png".into())
+        );
+        assert!(safe_request_relative("../secret").is_none());
+        assert!(safe_request_relative("%2e%2e/secret").is_none());
+        assert!(safe_request_relative("assets%5csecret").is_none());
+        assert!(safe_request_relative("assets\\secret").is_none());
+    }
+
+    #[test]
+    fn lazy_mounts_build_once_and_route_by_the_longest_base_path() {
+        let root = tempfile::Builder::new()
+            .prefix("wake-dev-mount-site-")
+            .tempdir()
+            .unwrap();
+        let workspace = tempfile::Builder::new()
+            .prefix("wake-dev-mount-workspace-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/index.js"),
+            "globalThis.__site_marker = 'site';",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("src/index.js"),
+            "globalThis.__workspace_marker = 'rc-grid';",
+        )
+        .unwrap();
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let events = Arc::new(Mutex::new(Vec::<ServerEvent>::new()));
+        let captured = Arc::clone(&events);
+        let server = start(
+            root.path(),
+            port,
+            ServeOptions {
+                entry: root.path().join("src/index.js"),
+                quiet: true,
+                event_handler: Some(Arc::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                })),
+                mounts: vec![MountedServeOptions {
+                    name: "rc-grid".to_string(),
+                    root: workspace.path().to_path_buf(),
+                    base_path: "/components/rc-grid/workbench/".to_string(),
+                    loading: DevLoading::Lazy,
+                    entry: workspace.path().join("src/index.js"),
+                    resolve_options: ResolveOptions::default(),
+                    define: Vec::new(),
+                    target_env: TargetEnv::default(),
+                    jsx_import_source: "react".to_string(),
+                    watch_roots: vec![workspace.path().join("src")],
+                    before_rebuild: None,
+                }],
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+
+        let site_route = http_get(port, "/components/rc-grid/");
+        assert!(site_route.starts_with("HTTP/1.1 200"), "{site_route}");
+        assert!(site_route.contains("window.__WAKE_MOUNT__=\"\""));
+
+        let first = std::thread::spawn(move || http_get(port, "/components/rc-grid/workbench/"));
+        let second =
+            std::thread::spawn(move || http_get(port, "/components/rc-grid/workbench/bundle.js"));
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(first.contains("window.__WAKE_MOUNT__=\"rc-grid\""));
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+        assert!(second.contains("__workspace_marker"));
+
+        let missing = http_get(port, "/components/rc-grid/workbench/missing.js");
+        assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+        let captured = events.lock().unwrap();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ServerEvent::Rebuilt {
+                        initial: true,
+                        workspace: Some(workspace),
+                        ..
+                    } if workspace == "rc-grid"
+                ))
+                .count(),
+            1
+        );
+        assert!(captured.iter().any(|event| matches!(
+            event,
+            ServerEvent::WorkspaceState {
+                total: 1,
+                loaded: 1,
+                failed: 0,
+                ..
+            }
+        )));
+        drop(captured);
+        server.close().unwrap();
+    }
+
+    #[test]
+    fn many_lazy_mount_descriptors_do_not_build_at_startup() {
+        let root = tempfile::Builder::new()
+            .prefix("wake-dev-many-lazy-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/index.js"),
+            "export const site = true;",
+        )
+        .unwrap();
+        let mounts = (0..51)
+            .map(|index| MountedServeOptions {
+                name: format!("rc-{index:02}"),
+                root: root.path().to_path_buf(),
+                base_path: format!("/components/rc-{index:02}/workbench/"),
+                loading: DevLoading::Lazy,
+                entry: root.path().join("src/index.js"),
+                resolve_options: ResolveOptions::default(),
+                define: Vec::new(),
+                target_env: TargetEnv::default(),
+                jsx_import_source: "react".to_string(),
+                watch_roots: vec![root.path().join("src")],
+                before_rebuild: None,
+            })
+            .collect();
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let events = Arc::new(Mutex::new(Vec::<ServerEvent>::new()));
+        let captured = Arc::clone(&events);
+        let server = start(
+            root.path(),
+            port,
+            ServeOptions {
+                entry: root.path().join("src/index.js"),
+                quiet: true,
+                mounts,
+                event_handler: Some(Arc::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                })),
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+        let captured = events.lock().unwrap();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|event| matches!(event, ServerEvent::Rebuilt { .. }))
+                .count(),
+            1,
+            "only the primary application should build at startup"
+        );
+        assert!(captured.iter().any(|event| matches!(
+            event,
+            ServerEvent::WorkspaceState {
+                total: 51,
+                loaded: 0,
+                failed: 0,
+                ..
+            }
+        )));
+        drop(captured);
+        server.close().unwrap();
     }
 
     #[test]

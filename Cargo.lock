@@ -3263,6 +3263,7 @@ dependencies = [
  "futures-util",
  "notify",
  "regex",
+ "tempfile",
  "tokio",
  "wake_bundler",
  "wake_common",

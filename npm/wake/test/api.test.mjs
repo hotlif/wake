@@ -395,6 +395,7 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   const result = await buildDocs({ cwd, outdir })
   assert.equal(result.success, true)
   assert.ok(result.routes.length > 0)
+  assert.deepEqual(result.workspaces, [])
   const componentsCwd = fileURLToPath(new URL('../../../fixtures/react-docs/', import.meta.url))
   const componentsRoot = await mkdtemp(join(tmpdir(), 'wake-components-api-'))
   const componentsOutdir = join(componentsRoot, 'dist')
@@ -406,6 +407,7 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   })
   assert.equal(workbench.mode, 'components')
   assert.deepEqual(workbench.routes, [])
+  assert.deepEqual(workbench.workspaces, [])
   assert.ok(workbench.demos.some((demo) => demo.component === '按钮' && demo.controlCount > 0))
   const generatedComponentsRuntime = await readFile(
     join(componentsCwd, '.wake/docs/generated/runtime/components.tsx'),
@@ -472,6 +474,43 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
     assert.match(componentCss, new RegExp(prefix), `Components CSS must include ${prefix}`)
   }
 
+  const aggregateCwd = fileURLToPath(
+    new URL('../../../fixtures/react-docs-workspaces/', import.meta.url),
+  )
+  const aggregateOutdir = fileURLToPath(
+    new URL('../../../target/node-docs-workspaces-api-test/', import.meta.url),
+  )
+  const aggregate = await buildDocs({ cwd: aggregateCwd, outdir: aggregateOutdir })
+  assert.deepEqual(
+    aggregate.workspaces.map(({ name, basePath, presentation, demos }) => ({
+      name,
+      basePath,
+      presentation,
+      demos,
+    })),
+    [
+      {
+        name: 'rc-alpha',
+        basePath: '/docs/components/rc-alpha/workbench/',
+        presentation: 'embedded',
+        demos: 1,
+      },
+      {
+        name: 'rc-beta',
+        basePath: '/docs/components/rc-beta/workbench/',
+        presentation: 'standalone',
+        demos: 1,
+      },
+    ],
+  )
+  const aggregateManifest = JSON.parse(
+    await readFile(join(aggregateOutdir, 'manifest.json'), 'utf8'),
+  )
+  assert.deepEqual(
+    aggregateManifest.workspaces.map(({ name }) => name),
+    ['rc-alpha', 'rc-beta'],
+  )
+
   const reservation = createServer()
   const port = await listen(reservation)
   await new Promise((resolve) => reservation.close(resolve))
@@ -481,6 +520,33 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   const probe = createServer()
   await listen(probe, port)
   await new Promise((resolve) => probe.close(resolve))
+
+  const aggregateReservation = createServer()
+  const aggregatePort = await listen(aggregateReservation)
+  await new Promise((resolve) => aggregateReservation.close(resolve))
+  const aggregateServer = await startDocsDevServer({ cwd: aggregateCwd, port: aggregatePort })
+  try {
+    const allLoaded = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('lazy workspace did not load')), 15_000)
+      aggregateServer.on('workspaceState', (event) => {
+        if (event.total === 2 && event.loaded === 2 && event.failed === 0) {
+          clearTimeout(timeout)
+          resolve(event)
+        }
+      })
+    })
+    const parentRoute = await fetch(
+      `http://127.0.0.1:${aggregatePort}/docs/components/rc-alpha/`,
+    )
+    assert.equal(parentRoute.status, 200)
+    const lazyRoute = await fetch(
+      `http://127.0.0.1:${aggregatePort}/docs/components/rc-alpha/workbench/`,
+    )
+    assert.equal(lazyRoute.status, 200)
+    await allLoaded
+  } finally {
+    await aggregateServer.close()
+  }
 
   const invalid = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
   await assert.rejects(

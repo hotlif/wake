@@ -6,3 +6,10 @@ locale = "zh-CN"
 default_theme = "system"
 accent_color = "#2563eb"
 theme_css = "docs/theme.css"
+
+[[docs.workspace]]
+root = "workspaces"
+include = ["rc-pnp"]
+base_path = "/components/{name}/workbench/"
+presentation = "embedded"
+dev_loading = "lazy"

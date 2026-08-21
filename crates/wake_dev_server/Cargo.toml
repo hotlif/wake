@@ -20,3 +20,6 @@ regex.workspace = true
 tokio.workspace = true
 notify.workspace = true
 futures-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

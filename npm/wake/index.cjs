@@ -123,6 +123,8 @@ class DevServer extends EventEmitter {
         this.emit('rebuildStart', event)
       } else if (event.type === 'rebuilt') {
         this.emit('rebuilt', event)
+      } else if (event.type === 'workspaceState') {
+        this.emit('workspaceState', event)
       } else if (event.type === 'diagnostic') {
         this.emit('diagnostic', event.diagnostic)
       } else if (event.type === 'closed' && !this.#closed) {

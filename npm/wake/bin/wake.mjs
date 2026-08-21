@@ -187,6 +187,10 @@ async function runServer(factory, options, command, root, ui, uiMode) {
       applyDashboardEvent(state, { type: 'diagnostic', diagnostic })
       dashboard?.draw()
     }
+    const onWorkspaceState = (event) => {
+      applyDashboardEvent(state, event)
+      dashboard?.draw()
+    }
     const onClosed = () => {
       applyDashboardEvent(state, { type: 'closed' })
       dashboard?.draw()
@@ -194,6 +198,7 @@ async function runServer(factory, options, command, root, ui, uiMode) {
     server.on('rebuildStart', onRebuildStart)
     server.on('rebuilt', onRebuilt)
     server.on('diagnostic', onDiagnostic)
+    server.on('workspaceState', onWorkspaceState)
     server.on('closed', onClosed)
 
     if (!useTui) stopObserving = observeServer(server, ui)
@@ -235,6 +240,7 @@ async function runServer(factory, options, command, root, ui, uiMode) {
       server.off('rebuildStart', onRebuildStart)
       server.off('rebuilt', onRebuilt)
       server.off('diagnostic', onDiagnostic)
+      server.off('workspaceState', onWorkspaceState)
       server.off('closed', onClosed)
     }
   } catch (error) {

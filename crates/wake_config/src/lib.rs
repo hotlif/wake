@@ -126,6 +126,7 @@ pub struct Docs {
     pub theme_css: Option<String>,
     pub default_theme: String,
     pub accent_color: Option<String>,
+    pub workspace: Vec<DocsWorkspace>,
 }
 
 impl Default for Docs {
@@ -142,6 +143,79 @@ impl Default for Docs {
             theme_css: None,
             default_theme: "system".to_string(),
             accent_color: None,
+            workspace: Vec::new(),
+        }
+    }
+}
+
+/// A components documentation workspace mounted by a parent Docs site.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocsWorkspace {
+    /// Parent directory whose direct children are candidate workspaces.
+    pub root: String,
+    /// Case-sensitive wildcard patterns matched against the child directory name.
+    pub include: Vec<String>,
+    /// Site-relative public path template. Must contain `{name}`.
+    pub base_path: String,
+    /// Workspace Docs product. Aggregation currently supports components only.
+    pub mode: DocsWorkspaceMode,
+    /// Workbench presentation when mounted by the parent site.
+    pub presentation: DocsWorkspacePresentation,
+    /// Development loading policy. Production always builds every workspace.
+    pub dev_loading: DocsWorkspaceDevLoading,
+}
+
+impl Default for DocsWorkspace {
+    fn default() -> Self {
+        Self {
+            root: String::new(),
+            include: Vec::new(),
+            base_path: String::new(),
+            mode: DocsWorkspaceMode::Components,
+            presentation: DocsWorkspacePresentation::Embedded,
+            dev_loading: DocsWorkspaceDevLoading::Lazy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocsWorkspaceMode {
+    #[default]
+    Components,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocsWorkspacePresentation {
+    #[default]
+    Embedded,
+    Standalone,
+}
+
+impl DocsWorkspacePresentation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Standalone => "standalone",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocsWorkspaceDevLoading {
+    #[default]
+    Lazy,
+    Eager,
+}
+
+impl DocsWorkspaceDevLoading {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lazy => "lazy",
+            Self::Eager => "eager",
         }
     }
 }
@@ -600,6 +674,58 @@ mod tests {
         assert_eq!(config.docs.preview.as_deref(), Some("docs/preview.tsx"));
         assert_eq!(config.docs.default_theme, "dark");
         assert_eq!(config.docs.accent_color.as_deref(), Some("#7c3aed"));
+    }
+
+    #[test]
+    fn docs_workspace_configuration_is_strict_and_defaults_to_lazy_embedded_components() {
+        let config: Config = toml::from_str(
+            r#"
+            [[docs.workspace]]
+            root = "../components"
+            include = ["rc-*"]
+            base_path = "/components/{name}/workbench/"
+        "#,
+        )
+        .unwrap();
+        let workspace = &config.docs.workspace[0];
+        assert_eq!(workspace.root, "../components");
+        assert_eq!(workspace.include, ["rc-*"]);
+        assert_eq!(workspace.mode, DocsWorkspaceMode::Components);
+        assert_eq!(workspace.presentation, DocsWorkspacePresentation::Embedded);
+        assert_eq!(workspace.dev_loading, DocsWorkspaceDevLoading::Lazy);
+
+        let eager: Config = toml::from_str(
+            r#"
+            [[docs.workspace]]
+            root = "../components"
+            include = ["rc-*"]
+            base_path = "/components/{name}/workbench/"
+            presentation = "standalone"
+            dev_loading = "eager"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            eager.docs.workspace[0].presentation,
+            DocsWorkspacePresentation::Standalone
+        );
+        assert_eq!(
+            eager.docs.workspace[0].dev_loading,
+            DocsWorkspaceDevLoading::Eager
+        );
+
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+                [[docs.workspace]]
+                root = "../components"
+                include = ["*"]
+                base_path = "/components/{name}/"
+                typo = true
+            "#
+            )
+            .is_err()
+        );
     }
 
     #[test]

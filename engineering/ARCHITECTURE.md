@@ -108,6 +108,11 @@ docs source_dir
 
 Site 模式生成页面、导航、搜索索引和静态子路由外壳。Components 模式只要求 `.demo.tsx`，以 hash 保存 Demo、非默认 Args、显式 unset 字段和视口状态，因此不要求托管端重写深链接。
 
+聚合 Docs 由 `wake_app` 发现和编排：主站与每个 Components 工作台仍分别调用单项目
+`wake_docs` 生成器并独立打包。生产输出先进入隔离 staging 树再逐文件事务提交；开发时
+`wake_dev_server` 用一个最长前缀挂载注册表、一个监听线程和一个 HMR endpoint 持有多个
+独立 `BuildSession`。lazy 工作台首次请求才创建会话，事件和浏览器刷新按挂载身份隔离。
+
 ## 6. 对外边界
 
 `wake_app` 是 CLI 与 Node 绑定的稳定内部边界：

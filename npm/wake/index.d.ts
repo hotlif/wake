@@ -183,6 +183,15 @@ export interface DocsDemo {
   warnings: string[]
 }
 
+export interface DocsWorkspaceBuildInfo {
+  name: string
+  root: string
+  basePath: string
+  mode: 'components'
+  presentation: 'embedded' | 'standalone'
+  demos: number
+}
+
 export interface DocsBuildOptions extends ProjectOptions {
   outdir?: string
   basePath?: string
@@ -193,6 +202,7 @@ export interface DocsBuildResult extends BuildResult {
   routes: DocsRoute[]
   mode: DocsMode
   demos: DocsDemo[]
+  workspaces: DocsWorkspaceBuildInfo[]
 }
 
 export interface DevServerOptions extends ProjectOptions {
@@ -208,6 +218,8 @@ export interface DocsDevServerOptions extends DevServerOptions {
 export interface DevServerRebuildStartEvent {
   type: 'rebuildStart'
   changedPaths: string[]
+  workspace?: string
+  basePath?: string
 }
 
 export interface DevServerRebuiltEvent {
@@ -219,6 +231,17 @@ export interface DevServerRebuiltEvent {
   chunks: number
   assets: number
   durationMs: number
+  workspace?: string
+  basePath?: string
+}
+
+export interface DevServerWorkspaceStateEvent {
+  type: 'workspaceState'
+  total: number
+  loaded: number
+  failed: number
+  current?: string
+  failedNames: string[]
 }
 
 export class BuildContext {
@@ -237,6 +260,7 @@ export class DevServer extends EventEmitter {
   [Symbol.asyncDispose](): Promise<void>
   on(event: 'rebuildStart', listener: (event: DevServerRebuildStartEvent) => void): this
   on(event: 'rebuilt', listener: (event: DevServerRebuiltEvent) => void): this
+  on(event: 'workspaceState', listener: (event: DevServerWorkspaceStateEvent) => void): this
   on(event: 'diagnostic', listener: (diagnostic: Diagnostic) => void): this
   on(event: 'closed', listener: () => void): this
 }

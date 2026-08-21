@@ -160,6 +160,7 @@ Wake Docs 将文档页面、组件示例和类型信息编译为静态站点。�
 - 从 TypeScript Props 和 JSDoc 生成 API 表格；
 - Preview 包装器、自定义主题、搜索索引和静态子路由；
 - 开发时增量更新，以及带 `base_path` 的生产部署。
+- 用 `[[docs.workspace]]` 在同一站点聚合多个独立打包、可懒加载的组件工作台。
 
 在 `wake.config.toml` 中添加文档配置：
 
@@ -170,6 +171,11 @@ title = "My UI"
 description = "React 19 component documentation"
 locale = "zh-CN"
 base_path = "/"
+
+[[docs.workspace]]
+root = "../components"
+include = ["rc-*"]
+base_path = "/components/{name}/workbench/"
 ```
 
 ```bash

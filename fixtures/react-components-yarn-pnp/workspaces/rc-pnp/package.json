@@ -1,0 +1,11 @@
+{
+  "name": "wake-react-components-yarn-pnp-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@crab-dev/wake": "0.1.16",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  }
+}

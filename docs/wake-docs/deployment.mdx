@@ -23,6 +23,10 @@ npx wake docs build . --outdir docs-dist
 
 发布整个 `docs-dist`。HTML 使用短缓存，带哈希的 JS/CSS 使用长缓存。部署到子路径时在 `[docs]` 中设置一致的 `base_path`。
 
+聚合站会把每个工作台写入其 `base_path` 对应的隔离子树，并在根 `manifest.json` 中记录
+子 manifest。必须原样发布整个输出目录，不要把工作台目录单独搬到站点前缀之外。构建
+只有在主站和全部工作台成功后才提交；失败时上一次完整产物保持不变。
+
 ## CI 门禁
 
 ```bash

@@ -4,8 +4,12 @@
   "private": true,
   "type": "module",
   "packageManager": "yarn@4.16.0",
+  "workspaces": [
+    "workspaces/*"
+  ],
   "scripts": {
-    "components:build": "wake docs build . --mode components --outdir dist"
+    "components:build": "wake docs build . --mode components --outdir dist",
+    "docs:build": "wake docs build . --outdir aggregate-dist"
   },
   "dependencies": {
     "@crab-dev/wake": "0.1.16",

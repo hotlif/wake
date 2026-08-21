@@ -1,0 +1,4 @@
+[[group]]
+id = "start"
+title = "Start"
+pages = ["index", "components/rc-alpha"]

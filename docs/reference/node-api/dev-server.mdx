@@ -21,6 +21,10 @@ server.on("diagnostic", (diagnostic) => console.error(diagnostic));
 await server.waitUntilClosed();
 ```
 
-`DevServer` 事件包括 `rebuildStart`、`rebuilt`、`diagnostic` 和 `closed`。`unref()` 允许 Node 在没有其他任务时退出；`close()` 返回服务真正关闭后的 Promise。
+`DevServer` 事件包括 `rebuildStart`、`rebuilt`、`diagnostic`、`workspaceState` 和 `closed`。
+聚合 Docs 的重建事件可带 `workspace`、`basePath`；`workspaceState` 报告总数、已加载数、
+失败数、当前加载目标和失败名称。普通应用服务器不会发送工作区状态。
+
+`unref()` 允许 Node 在没有其他任务时退出；`close()` 返回服务真正关闭后的 Promise。
 
 测试必须在 `finally` 中关闭服务器，避免端口和文件监听泄漏。

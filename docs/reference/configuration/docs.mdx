@@ -37,5 +37,31 @@ accent_color = "#7c3aed"
 | `theme_css` | 文档外壳主题覆盖 |
 | `default_theme` | `light`、`dark` 或 `system` |
 | `accent_color` | 可选的六位十六进制强调色；未设置时不覆盖主题 CSS |
+| `workspace` | 可重复的组件工作区发现与挂载规则，见下文 |
 
 `navigation.toml` 必须位于 `source_dir` 根。页面路由始终由相对文件路径生成。
+
+## 聚合组件工作区
+
+站点可以发现一个目录下的多个组件项目，并把每个项目作为独立工作台挂载：
+
+```toml
+[docs]
+base_path = "/"
+
+[[docs.workspace]]
+root = "../components"
+include = ["rc-*"]
+base_path = "/components/{name}/workbench/"
+mode = "components"
+presentation = "embedded"
+dev_loading = "lazy"
+```
+
+`root`、非空 `include` 和包含 `{name}` 的 `base_path` 必填。`mode` 目前只接受
+`components`；`presentation` 默认为 `embedded`，可设为 `standalone`；`dev_loading`
+默认为 `lazy`，可设为 `eager`。
+
+Wake 只检查 `root` 的直接子目录。`include` 使用大小写敏感的 `*`、`?` 名称匹配，工作区
+名称必须是 URL 安全的单个路径段。站点 `base_path` 会成为所有工作台的统一前缀。重复、
+嵌套、逃逸或遮蔽站点路由的挂载会在启动或构建前失败。

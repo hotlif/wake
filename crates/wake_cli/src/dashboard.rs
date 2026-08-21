@@ -96,6 +96,7 @@ pub struct DashboardState {
     pub state: RunState,
     pub metrics: Option<BuildMetrics>,
     pub rebuilds: usize,
+    workspace_state: Option<(usize, usize, usize, Option<String>)>,
     started: Instant,
     activity: VecDeque<Activity>,
     scroll_from_bottom: usize,
@@ -117,6 +118,7 @@ impl DashboardState {
             state: RunState::Starting,
             metrics: None,
             rebuilds: 0,
+            workspace_state: None,
             started: Instant::now(),
             activity: VecDeque::new(),
             scroll_from_bottom: 0,
@@ -175,6 +177,19 @@ impl DashboardState {
     pub fn error(&mut self, message: impl Into<String>) {
         self.state = RunState::Error;
         self.push(ActivityLevel::Error, message);
+    }
+
+    pub fn workspace_state(
+        &mut self,
+        total: usize,
+        loaded: usize,
+        failed: usize,
+        current: Option<String>,
+    ) {
+        if let Some(workspace) = &current {
+            self.info(format!("Loading workspace {workspace}…"));
+        }
+        self.workspace_state = Some((total, loaded, failed, current));
     }
 
     pub fn stopping(&mut self, reason: &str) {
@@ -968,7 +983,23 @@ fn render_minimal(frame: &mut Frame<'_>, area: Rect, state: &DashboardState, pal
 }
 
 fn metrics_line(state: &DashboardState, palette: Palette) -> Paragraph<'static> {
-    Paragraph::new(metrics_spans(state, palette))
+    let mut lines = vec![metrics_spans(state, palette)];
+    if let Some((total, loaded, failed, current)) = &state.workspace_state {
+        let mut spans = vec![
+            Span::styled("WORKSPACES   ", palette.muted()),
+            Span::styled(format!("{loaded}/{total} loaded"), palette.accent()),
+        ];
+        if *failed > 0 {
+            spans.push(Span::styled(" · ", palette.muted()));
+            spans.push(Span::styled(format!("{failed} failed"), palette.error()));
+        }
+        if let Some(current) = current {
+            spans.push(Span::styled(" · loading ", palette.muted()));
+            spans.push(Span::raw(current.clone()));
+        }
+        lines.push(Line::from(spans));
+    }
+    Paragraph::new(lines)
 }
 
 fn metrics_spans(state: &DashboardState, palette: Palette) -> Line<'static> {
