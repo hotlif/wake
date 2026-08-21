@@ -34,6 +34,11 @@ status = "stable"
 
 普通段落、列表、表格、任务列表、代码围栏、链接和静态 JSX 都会编译成 React。导入语句必须位于 Frontmatter 后、正文前。
 
+Wake 会在 AST 层把 flow JSX、HTML 块元素、块 fragment 和独占段落的自定义组件提升到
+段落外；混合内容会拆成合法的兄弟节点。普通文本与行内 JSX 仍保留在 `<p>` 中，组件内部
+显式编写的 Markdown children 也继续生成段落。无需用空行、字符串替换或 CSS 修补
+`<p><div>` 一类非法结构。
+
 ## 编译期组件
 
 `<Demo>`、`<Demos>` 和 `<API>` 的路径、glob、symbol 等属性必须是静态字面量。Wake 在构建前收集它们，动态表达式会得到带行列的诊断。

@@ -1585,7 +1585,7 @@ impl<'a> Renderer<'a> {
     fn render(&mut self, node: &Node) -> String {
         match node {
             Node::Root(value) => self.render_children(&value.children),
-            Node::Paragraph(value) => format!("<p>{}</p>", self.render_children(&value.children)),
+            Node::Paragraph(value) => self.render_paragraph(&value.children),
             Node::Heading(value) => {
                 let title = value
                     .children
@@ -1732,6 +1732,43 @@ impl<'a> Renderer<'a> {
         children.iter().map(|child| self.render(child)).collect()
     }
 
+    fn render_paragraph(&mut self, children: &[Node]) -> String {
+        let jsx_only = children
+            .iter()
+            .filter(|child| !is_whitespace_text(child))
+            .all(is_jsx_node);
+        if !children
+            .iter()
+            .any(|child| is_paragraph_block_boundary(child, jsx_only))
+        {
+            return format!("<p>{}</p>", self.render_children(children));
+        }
+
+        let mut output = String::new();
+        let mut phrasing = Vec::new();
+        for child in children {
+            if is_paragraph_block_boundary(child, jsx_only) {
+                self.flush_paragraph_phrasing(&mut output, &mut phrasing);
+                output.push_str(&self.render(child));
+            } else {
+                phrasing.push(child);
+            }
+        }
+        self.flush_paragraph_phrasing(&mut output, &mut phrasing);
+        output
+    }
+
+    fn flush_paragraph_phrasing(&mut self, output: &mut String, phrasing: &mut Vec<&Node>) {
+        if phrasing.iter().any(|child| !is_whitespace_text(child)) {
+            output.push_str("<p>");
+            for child in phrasing.iter() {
+                output.push_str(&self.render(child));
+            }
+            output.push_str("</p>");
+        }
+        phrasing.clear();
+    }
+
     fn render_table(&mut self, rows: &[Node]) -> String {
         let Some((head, body)) = rows.split_first() else {
             return "<div className=\"table-scroll\"><table /></div>".to_string();
@@ -1782,6 +1819,98 @@ impl<'a> Renderer<'a> {
             format!("<{name}{attrs}>{}</{name}>", self.render_children(children))
         }
     }
+}
+
+fn is_whitespace_text(node: &Node) -> bool {
+    matches!(node, Node::Text(value) if value.value.trim().is_empty())
+}
+
+fn is_jsx_node(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::MdxJsxFlowElement(_) | Node::MdxJsxTextElement(_)
+    )
+}
+
+fn is_paragraph_block_boundary(node: &Node, jsx_only: bool) -> bool {
+    match node {
+        Node::MdxJsxFlowElement(_) => true,
+        Node::MdxJsxTextElement(element) => match element.name.as_deref() {
+            Some(name) if is_html_block_element(name) => true,
+            Some(name) => jsx_only && is_custom_jsx_name(name),
+            None => {
+                jsx_only
+                    || element
+                        .children
+                        .iter()
+                        .any(|child| is_paragraph_block_boundary(child, false))
+            }
+        },
+        _ => false,
+    }
+}
+
+fn is_custom_jsx_name(name: &str) -> bool {
+    name.split('.').next().is_some_and(|head| {
+        head.chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase() || character == '_')
+    })
+}
+
+fn is_html_block_element(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "caption"
+            | "col"
+            | "colgroup"
+            | "dd"
+            | "details"
+            | "dialog"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "html"
+            | "legend"
+            | "li"
+            | "main"
+            | "menu"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "search"
+            | "section"
+            | "summary"
+            | "table"
+            | "tbody"
+            | "td"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
 }
 
 fn render_code_block(language: Option<&str>, meta: Option<&str>, code: &str) -> String {
@@ -3266,6 +3395,117 @@ import Badge from "../src/badge.tsx"
         assert!(registry.contains("basic.demo.tsx"));
         assert!(registry.contains("ButtonProps"));
         assert!(!registry.contains(&root.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn lifts_block_jsx_out_of_markdown_paragraphs() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            r#"# Blocks
+
+<div className="cards">
+  <div className="card">One</div>
+  <div className="card">Two</div>
+</div>
+
+<div className="callout"><strong>Title</strong> Content</div>
+
+<section>
+Text <em>inline</em>
+
+<div className="mixed-block">Block</div>
+
+Tail
+</section>
+"#,
+        )
+        .unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+
+        assert!(page.contains(r#"<div className={"cards"}><div className={"card"}>"#));
+        assert!(page.contains(r#"<div className={"callout"}><strong>"#));
+        assert!(page.contains(r#"<section><p>"#));
+        assert!(page.contains(r#"</p><div className={"mixed-block"}>"#));
+        for invalid in ["<p><div", "<p><section", "<p><article"] {
+            assert!(
+                !page.contains(invalid),
+                "generated invalid JSX: {invalid}\n{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_markdown_children_but_lifts_standalone_components_and_fragments() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            r#"# Components
+
+<Panel>
+
+Markdown **strong**.
+
+</Panel>
+
+<Card />
+
+<>
+  <div>One</div>
+  <article>Two</article>
+</>
+
+Inline <Badge>status</Badge> text.
+"#,
+        )
+        .unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+
+        assert!(page.contains("<Panel><p>"), "{page}");
+        assert!(page.contains("<Card />"), "{page}");
+        assert!(!page.contains("<p><Card />"), "{page}");
+        assert!(page.contains("<><div>"), "{page}");
+        assert!(!page.contains("<p><div"), "{page}");
+        assert!(page.contains("<p>{\"Inline \"}<Badge>"), "{page}");
+    }
+
+    #[test]
+    fn keeps_jsx_blocks_valid_next_to_markdown_flow_nodes() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            r#"# Adjacent
+
+> Quote
+
+<div>After quote</div>
+
+- Item
+
+<section>After list</section>
+
+| A | B |
+| --- | --- |
+| 1 | 2 |
+
+<article>After table</article>
+"#,
+        )
+        .unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+
+        assert!(page.contains("</blockquote>\n    <div>"), "{page}");
+        assert!(page.contains("</ul>\n    <section>"), "{page}");
+        assert!(page.contains("</div>\n    <article>"), "{page}");
+        assert!(!page.contains("<p><div"), "{page}");
+        assert!(!page.contains("<p><section"), "{page}");
+        assert!(!page.contains("<p><article"), "{page}");
     }
 
     #[test]
