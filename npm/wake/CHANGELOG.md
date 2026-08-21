@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.21
+
+- Added aggregate Wake Docs workspaces with isolated production bundles, deterministic manifests,
+  transactional output commits, one-port lazy/eager development mounts, scoped HMR events, and
+  embedded or standalone workbench presentation.
+- Fixed MDX JSX structure generation by lifting block JSX and splitting mixed paragraphs at AST
+  boundaries, preventing invalid paragraph/block nesting without changing inline JSX or component
+  Markdown children.
+- Fixed constrained, defaulted, and comma-disambiguated generic arrow functions in TSX so Wake
+  parses them as TypeScript instead of emitting cascading JSX diagnostics.
+- Added a TypeScript 7 compatibility gate covering strict type checking, TS/TSX erasure, module
+  extensions, value transforms, and production/development JSX runtime execution.
+- Fixed top-level TypeScript overload signatures so only their implementation is emitted, and
+  removed false runtime dependencies from imports and exports containing only inline `type`
+  specifiers.
+
 ## 0.1.20
 
 - Added a modern interactive terminal console with editable commands, history, Unicode-aware selection, clipboard copy and paste, and safe development-server opening across Rust and npm CLIs.

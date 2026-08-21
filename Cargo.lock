@@ -3112,7 +3112,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wake_app"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "regex",
  "serde",
@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "wake_bundler"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "criterion",
  "crossbeam-utils",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "wake_cache"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "wake_common",
  "wake_turbo",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "wake_cli"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "arboard",
  "base64",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "wake_common"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "criterion",
  "insta",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "wake_config"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "browserslist-rs",
  "serde",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "cssparser",
  "wake_common",
@@ -3216,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_in_js"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "wake_common",
  "wake_css",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_language"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "serde",
  "serde_json",
@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_lsp"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "serde",
  "serde_json",
@@ -3255,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "wake_dev_server"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "actix-web",
  "actix-ws",
@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "wake_docs"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "markdown",
  "regex",
@@ -3285,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_ast"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "bumpalo",
  "wake_common",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_codegen"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "insta",
  "wake_common",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_lexer"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "criterion",
  "insta",
@@ -3314,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_minify"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "insta",
  "wake_common",
@@ -3325,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_parser"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "bumpalo",
  "criterion",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_semantic"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
@@ -3348,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_transform"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "bumpalo",
  "wake_common",
@@ -3357,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "wake_graph"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
@@ -3365,11 +3365,11 @@ dependencies = [
 
 [[package]]
 name = "wake_html"
-version = "0.1.20"
+version = "0.1.21"
 
 [[package]]
 name = "wake_node"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "napi",
  "napi-build",
@@ -3387,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "wake_resolver"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "criterion",
  "rustc-hash",
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "wake_scan"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "regex",
  "serde_json",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "wake_tsdoc"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "regex",
  "serde",
@@ -3415,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "wake_turbo"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "criterion",
  "crossbeam-deque",
@@ -3428,7 +3428,7 @@ dependencies = [
 
 [[package]]
 name = "wake_turbo_macros"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "proc-macro2",
  "quote",
