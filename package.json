@@ -20,6 +20,7 @@
     "npm:typecheck": "npm run npm:typecheck:wake && npm run npm:typecheck:css",
     "npm:typecheck:wake": "tsc -p npm/wake/test/tsconfig.json",
     "npm:typecheck:css": "npm run typecheck --workspace @crab-dev/css",
+    "typescript:7:check": "node scripts/check-typescript-7.mjs",
     "npm:pack:check": "node scripts/check-npm-packs.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",

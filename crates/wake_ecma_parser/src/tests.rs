@@ -468,6 +468,127 @@ fn tsx_generic_arrows_coexist_with_real_and_generic_jsx() {
 }
 
 #[test]
+fn typescript_7_compatibility_matrix_parses_without_false_dependencies() {
+    let cases = [
+        (
+            "advanced types",
+            "interface Row { readonly id: string; label: string }
+             type Producer<out Value> = () => Value;
+             type Consumer<in Value> = (value: Value) => void;
+             type AwaitedValue<Value> = Value extends Promise<infer Inner> ? Inner : Value;
+             type Getters<Value extends Row> = { [Key in keyof Value as `get${Capitalize<string & Key>}`]-?: () => Value[Key] };
+             type Tuple = [head: string, count?: number, ...flags: boolean[]];
+             type HeadTail<Value extends string> = Value extends `${infer Head}${infer Tail}` ? [Head, Tail] : never;
+             type Imported = import('./types.js').Row;
+             const rows = [{ id: 'a', label: 'A' }] as const satisfies readonly Row[];
+             type RowId = typeof rows[number]['id'];",
+            SourceType::TypeScript,
+            0,
+        ),
+        (
+            "functions",
+            "interface Row { id: string; label: string }
+             function isRow(value: unknown): value is Row { return value != null; }
+             function assertRow(value: unknown): asserts value is Row { if (!value) throw Error(); }
+             export function format(value: string): string;
+             export function format(value: number): string;
+             export function format(value: string | number): string { return String(value); }
+             function prefixed(this: { prefix: string }, value: string): string { return this.prefix + value; }
+             function collect<const Values extends readonly unknown[]>(values: Values): Values { return values; }
+             const identity = <Value>(value: Value): Value => value;
+             const asyncIdentity = async <Value,>(value: Value): Promise<Value> => value;",
+            SourceType::TypeScript,
+            0,
+        ),
+        (
+            "classes and decorators",
+            "interface Named { readonly name: string }
+             function logged(target: Function, context: ClassMethodDecoratorContext) { return target; }
+             abstract class Entity implements Named {
+               abstract readonly name: string;
+               constructor(public readonly id: string, private rank = 1) {}
+               protected score(): number { return this.rank; }
+             }
+             class User extends Entity {
+               accessor nickname: string = 'wake';
+               constructor(id: string, public override readonly name: string) { super(id); }
+               @logged label(): string { return this.name; }
+             }
+             declare class AmbientService { readonly ready: boolean; }",
+            SourceType::TypeScript,
+            0,
+        ),
+        (
+            "type-only modules",
+            "import type { Row } from './row.js';
+             import { type Config } from './config.js';
+             export type { Result } from './result.js';
+             export { type Options } from './options.js';
+             type Imported = import('./types.js').Value;
+             export const ready = true;",
+            SourceType::TypeScript,
+            0,
+        ),
+        (
+            "runtime modules",
+            "import metadata from './data.json' with { type: 'json' };
+             export { value } from './value.js' with { type: 'javascript' };
+             export const loaded = import('./dynamic.js');
+             export const name: string = metadata.name;",
+            SourceType::TypeScript,
+            3,
+        ),
+        (
+            "value-bearing TypeScript",
+            "enum Color { Red, Green, Blue }
+             const enum Direction { Up = 1, Down }
+             namespace Metrics { export const base = 7; }
+             namespace Metrics { export function score(value: number): number { return Metrics.base * value; } }
+             class Point { constructor(public x: number, public y: number) {} }
+             class Resource { [Symbol.dispose](): void {} }
+             function useResource(): number { using resource = new Resource(); return Color.Blue + Direction.Down; }",
+            SourceType::TypeScript,
+            0,
+        ),
+        (
+            "TSX generics and JSX",
+            "interface Row { id: string; label: string }
+             interface FormProps<Value> { value: Value }
+             declare function Form<Value>(props: FormProps<Value>): unknown;
+             const before = <div />;
+             const trailing = <Value,>(value: Value): Value => value;
+             const constrained = <Value extends Row>(value: Value): string => value.label;
+             const defaulted = <Value = Row>(value: Value): Value => value;
+             const constant = <const Value extends Row>(value: Value): Value => value;
+             const asyncIdentity = async <Value,>(value: Value): Promise<Value> => value;
+             const after = <Form<Row> value={{ id: 'row', label: 'TSX' }} />;",
+            SourceType::Tsx,
+            1,
+        ),
+    ];
+
+    for (name, source, source_type, expected_dependencies) in cases {
+        let interner = Interner::new();
+        let output = parse(source, &interner, source_type);
+        assert!(
+            !output.has_errors(),
+            "TypeScript 7 case {name:?} failed: {:?}",
+            output.diagnostics
+        );
+        assert_eq!(
+            output.dependencies.len(),
+            expected_dependencies,
+            "TypeScript 7 case {name:?} produced false or missing dependencies: {:?}",
+            output
+                .dependencies
+                .iter()
+                .map(|dependency| interner.resolve(dependency.specifier))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn ts_type_queries_allow_indexed_access() {
     parse_ok(
         "const VALUES = { A: 0, B: 1 } as const;

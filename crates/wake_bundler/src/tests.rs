@@ -3360,6 +3360,120 @@ fn typescript_bundle_runs_in_node() {
     );
 }
 
+fn typescript_7_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        (
+            "src/index.tsx",
+            "import legacy from './legacy.cts';\n\
+             import { scale } from './math.mts';\n\
+             import { type MissingType } from './missing-types.ts';\n\
+             interface Row { readonly id: string; label: string }\n\
+             export function format(value: string): number;\n\
+             export function format(value: number): number;\n\
+             export function format(value: string | number): number { return Number(value); }\n\
+             enum Color { Red, Green, Blue }\n\
+             namespace Metrics { export const base = 7; }\n\
+             namespace Metrics { export function score(value: number): number { return Metrics.base * value; } }\n\
+             class Point { constructor(public x: number, public y: number) {} total(): number { return this.x + this.y; } }\n\
+             const same = <Value extends Row>(left: Readonly<Value>, right: Readonly<Value>): boolean => left.id === right.id;\n\
+             const row = { id: 'row-7', label: 'TypeScript 7' } as const satisfies Row;\n\
+             export const result: number = scale(4) + legacy.legacy + Color.Blue + Metrics.score(3) + new Point(1, 2).total() + format(6) + (same(row, row) ? 1 : 0);\n\
+             export const view = <section data-version=\"7\"><span>{result}</span></section>;",
+        ),
+        (
+            "src/math.mts",
+            "export function scale(value: number): number { return value * 2; }",
+        ),
+        (
+            "src/legacy.cts",
+            "const legacy: number = 5; export = { legacy };",
+        ),
+        (
+            "node_modules/react/package.json",
+            r#"{"name":"react","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/react/jsx-runtime.js",
+            "function element(type, props, key) { return { runtime: 'production', type, props: props || {}, key: key == null ? null : key }; }\n\
+             exports.jsx = element; exports.jsxs = element; exports.Fragment = '#fragment';",
+        ),
+        (
+            "node_modules/react/jsx-dev-runtime.js",
+            "exports.jsxDEV = function(type, props, key, isStaticChildren, source) {\n\
+               return { runtime: 'development', type, props: props || {}, key: key == null ? null : key, isStaticChildren, source };\n\
+             }; exports.Fragment = '#fragment';",
+        ),
+    ])
+}
+
+#[test]
+fn typescript_7_project_bundles_all_supported_extensions() {
+    for development in [false, true] {
+        let mut bundler = IncrementalBundler::new(Arc::new(typescript_7_fixture()));
+        bundler.set_jsx_runtime(development, "react");
+        let out = bundler.build(Path::new("src/index.tsx"));
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(
+            out.module_count, 4,
+            "type-only imports must not enter the graph and exactly one JSX runtime is expected"
+        );
+        assert!(out.bundle.contains("Metrics"), "{}", out.bundle);
+        assert!(out.bundle.contains("this.x = x"), "{}", out.bundle);
+        if development {
+            assert!(out.bundle.contains("jsxDEV"), "{}", out.bundle);
+            assert!(out.bundle.contains("src/index.tsx"), "{}", out.bundle);
+        } else {
+            assert!(!out.bundle.contains("jsxDEV"), "{}", out.bundle);
+            assert!(!out.bundle.contains("lineNumber"), "{}", out.bundle);
+        }
+    }
+}
+
+#[test]
+fn typescript_7_bundle_runs_in_node_for_production_and_development_jsx() {
+    assert!(
+        node_available(),
+        "TypeScript 7 runtime matrix requires Node.js"
+    );
+
+    for (development, expected_runtime) in [(false, "production"), (true, "development")] {
+        let mut bundler = IncrementalBundler::new(Arc::new(typescript_7_fixture()));
+        bundler.set_jsx_runtime(development, "react");
+        let out = bundler.build(Path::new("src/index.tsx"));
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+
+        let dir = std::env::temp_dir().join(format!("wake_typescript_7_{expected_runtime}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_path = dir.join("bundle.cjs");
+        std::fs::write(&bundle_path, &out.bundle).unwrap();
+        let script = format!(
+            "const value=require({:?});\
+             if(value.result!==46)throw Error('result='+value.result);\
+             if(value.view.runtime!=={:?})throw Error('runtime='+value.view.runtime);\
+             if(value.view.type!=='section'||value.view.props['data-version']!=='7')throw Error('section');\
+             const child=value.view.props.children;\
+             if(child.runtime!=={:?}||child.type!=='span'||child.props.children!==46)throw Error('child');\
+             if({}&&(!value.view.source||!value.view.source.fileName.endsWith('src/index.tsx')))throw Error('source');\
+             process.stdout.write('OK');",
+            bundle_path.to_string_lossy(),
+            expected_runtime,
+            expected_runtime,
+            development,
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stdout == b"OK",
+            "TypeScript 7 {expected_runtime} bundle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            out.bundle
+        );
+    }
+}
+
 /// 一个真实的 JSX（.tsx）项目：入口用 JSX，自带极简 `react/jsx-runtime`（node_modules 解析）。
 fn jsx_fixture() -> MemoryFileSystem {
     MemoryFileSystem::from_files([

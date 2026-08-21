@@ -29,6 +29,7 @@ fixtures/
 | `hello-esm` | 最小 ESM | 3 模块 ESM import/export 打包验证 |
 | `react-ts-app` | React 19 + TypeScript | 真实 React+TS 项目（npm 依赖） |
 | `react-ts-app-yarn-pnp` | Yarn PnP | 同上，使用 Yarn Plug'n'Play zip 依赖 |
+| `typescript-7` | TypeScript 7 兼容矩阵 | TS7 CLI 类型基准与 Wake parser/codegen/Bundler 回归输入 |
 | `react-docs` | React 19+ 组件文档 | Wake 原生 MDX、Demo、Props API 与主题运行时 |
 | `react-docs-workspaces` | Docs 聚合站 | 一个主站 + 两个隔离工作台，覆盖 embedded/standalone 与 lazy/eager |
 | `react-components-yarn-pnp` | Yarn PnP Components | 隔离安装下的组件工作台、包产物与样式聚合验证 |

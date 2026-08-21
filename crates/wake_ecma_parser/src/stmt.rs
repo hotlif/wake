@@ -39,14 +39,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 Statement::VariableDeclaration(d)
             }
             TokenKind::Keyword(Keyword::Function) => {
-                Statement::FunctionDeclaration(self.parse_function(lo, false))
+                self.parse_function_declaration_statement(lo, false)
             }
             TokenKind::Keyword(Keyword::Async)
                 if self.peek().kind == TokenKind::Keyword(Keyword::Function)
                     && !self.peek().newline_before =>
             {
                 self.bump(); // async
-                Statement::FunctionDeclaration(self.parse_function(lo, true))
+                self.parse_function_declaration_statement(lo, true)
             }
             TokenKind::Keyword(Keyword::Class) => Statement::ClassDeclaration(self.parse_class(lo)),
             TokenKind::Keyword(Keyword::If) => self.parse_if(lo),
@@ -957,8 +957,27 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         Expression::Function(self.parse_function(lo, is_async))
     }
 
+    /// 函数声明允许 TypeScript 重载签名以 `;` 结束；签名是纯类型声明，擦除为空语句。
+    fn parse_function_declaration_statement(&mut self, lo: u32, is_async: bool) -> Statement<'a> {
+        let function = self.parse_function_with_overload(lo, is_async, true);
+        if function.body.is_some() {
+            Statement::FunctionDeclaration(function)
+        } else {
+            Statement::Empty(function.span)
+        }
+    }
+
     /// `function` 声明/表达式共用（`function` 关键字尚未消费；async 已由调用方消费）。
     pub(crate) fn parse_function(&mut self, lo: u32, is_async: bool) -> &'a Function<'a> {
+        self.parse_function_with_overload(lo, is_async, false)
+    }
+
+    fn parse_function_with_overload(
+        &mut self,
+        lo: u32,
+        is_async: bool,
+        allow_overload: bool,
+    ) -> &'a Function<'a> {
         self.expect(TokenKind::Keyword(Keyword::Function));
         let is_generator = self.eat(TokenKind::Star);
         let id = if self.at_ident_name() {
@@ -976,7 +995,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let params = self.parse_params();
         self.ts_type_annotation(); // 返回类型 `): T {`（类型文法遇 `{` 自然停）
         let _ = self.pop_transform_temp_scope();
-        let body = self.parse_function_body();
+        let body = if allow_overload && self.ts && !self.at(TokenKind::LBrace) {
+            self.semicolon();
+            None
+        } else {
+            Some(self.parse_function_body())
+        };
         self.ctx.in_async = saved.0;
         self.ctx.in_generator = saved.1;
         self.ctx.top_level = saved.2;
@@ -985,7 +1009,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             span: self.span_to(lo),
             id,
             params,
-            body: Some(body),
+            body,
             is_async,
             is_generator,
         });
@@ -1740,6 +1764,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
 
         let mut specifiers = self.new_vec::<ImportSpecifier>();
+        let mut saw_inline_type_specifier = false;
 
         // import 'side-effect';
         if self.at(TokenKind::Str) {
@@ -1788,6 +1813,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 let slo = self.start();
                 // TS：内联类型说明符 `import { type A, B }` → 跳过该说明符（`type` 后接名字且非 `as`）。
                 if self.ts && self.at_contextual("type") && self.ts_inline_type_specifier_ahead() {
+                    saw_inline_type_specifier = true;
                     self.bump(); // type
                     let _ = self.parse_module_export_name();
                     if self.eat_keyword(Keyword::As) {
@@ -1827,6 +1853,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let source = self.expect_string_specifier();
         let attributes = self.parse_import_attributes();
         self.semicolon();
+        if saw_inline_type_specifier && specifiers.is_empty() {
+            return Statement::Empty(self.span_to(lo));
+        }
         self.record_dependency(Dependency {
             specifier: source,
             kind: DependencyKind::Import,
@@ -2020,10 +2049,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if self.at(TokenKind::LBrace) {
             self.bump();
             let mut specifiers = self.new_vec::<ExportSpecifier>();
+            let mut saw_inline_type_specifier = false;
             while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
                 let slo = self.start();
                 // TS：内联类型说明符 `export { type A, B }` → 跳过该说明符。
                 if self.ts && self.at_contextual("type") && self.ts_inline_type_specifier_ahead() {
+                    saw_inline_type_specifier = true;
                     self.bump(); // type
                     let _ = self.parse_module_export_name();
                     if self.eat_keyword(Keyword::As) {
@@ -2054,16 +2085,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             let source = if self.eat_keyword(Keyword::From) {
                 let s = self.expect_string_specifier();
                 attributes = self.parse_import_attributes();
-                self.record_dependency(Dependency {
-                    specifier: s,
-                    kind: DependencyKind::ExportFrom,
-                    span: self.span_to(lo),
-                });
                 Some(s)
             } else {
                 None
             };
             self.semicolon();
+            if saw_inline_type_specifier && specifiers.is_empty() {
+                return Statement::Empty(self.span_to(lo));
+            }
+            if let Some(source) = source {
+                self.record_dependency(Dependency {
+                    specifier: source,
+                    kind: DependencyKind::ExportFrom,
+                    span: self.span_to(lo),
+                });
+            }
             return Statement::ExportNamed(self.alloc(ExportNamedDeclaration {
                 span: self.span_to(lo),
                 declaration: None,
@@ -2075,6 +2111,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // export <declaration>
         let declaration = self.parse_statement();
+        if self.ts && matches!(declaration, Statement::Empty(_)) {
+            return declaration;
+        }
         Statement::ExportNamed(self.alloc(ExportNamedDeclaration {
             span: self.span_to(lo),
             declaration: Some(declaration),

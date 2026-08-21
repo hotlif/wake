@@ -27,6 +27,7 @@ npm run versions:check
 npm run native:build
 npm run npm:test
 npm run npm:typecheck
+npm run typescript:7:check
 npm run npm:pack:check
 npm run pnp:components:check
 ```
@@ -68,6 +69,7 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 | `fmt` | Ubuntu / Rust 1.95 | rustfmt 无差异 |
 | `clippy` | Ubuntu / Rust 1.95 | workspace 全 target，warnings 视为错误 |
 | `test` | Ubuntu、Windows / Rust 1.95 + Node 24 | 全 workspace 测试 |
+| `typescript-7` | Ubuntu、Windows / Node 24 + TypeScript 7 | TS7 CLI 版本、严格类型与 TS/TSX 兼容 fixture |
 | `miri` | Ubuntu / nightly | `wake_ecma_ast` 和 `wake_turbo` 手写 unsafe/内存模型 |
 | `loom` | Ubuntu / Rust 1.95 | single-flight 线程交错 |
 | `bench-smoke` | Ubuntu / Rust 1.95 | 全 benchmark 可编译 |
@@ -83,6 +85,7 @@ Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补�
 
 - lexer snapshot：字面量、模板、正则、ASI、类私有名和 JSX 边界；
 - parser/semantic：JS、TS、JSX、TSX、scope、引用、依赖与顶层 await；
+- TypeScript 7 compatibility fixture：高级类型、类/函数、模块、TSX、值语义及严格类型负例；
 - codegen/minify：优先级括号、重命名、DCE、导出和 Source Map；
 - fuzz smoke：随机输入不 panic；深度 fuzz 使用 `cargo +nightly fuzz run lex` 人工执行。
 

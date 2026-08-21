@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2025",
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2025", "DOM", "DOM.Iterable", "ESNext.Disposable", "Decorators"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noUncheckedSideEffectImports": true,
+    "resolveJsonModule": true,
+    "types": []
+  },
+  "include": ["src"]
+}

@@ -83,8 +83,12 @@ fn run(src: &str) -> String {
 
 /// TS 擦除：TypeScript 源码解析（跳过类型语法）→ codegen 出无类型 JS → 可作纯 JS 无错重解析。
 fn strip_ts(src: &str) -> String {
+    strip_typescript(src, SourceType::TypeScript)
+}
+
+fn strip_typescript(src: &str, source_type: SourceType) -> String {
     let it = Interner::new();
-    let out = parse(src, &it, SourceType::TypeScript);
+    let out = parse(src, &it, source_type);
     assert!(
         !out.has_errors(),
         "TS parse errors {src:?}: {:?}",
@@ -227,6 +231,120 @@ fn ts_erasure_declare_and_modules() {
     );
     // 运行时导入保留。
     assert!(js.contains("real") && js.contains("actual"), "{js}");
+}
+
+#[test]
+fn ts_7_erasure_matrix_reparses_as_javascript() {
+    type ErasureCase<'case> = (
+        &'case str,
+        &'case str,
+        SourceType,
+        &'case [&'case str],
+        &'case [&'case str],
+    );
+
+    let cases: [ErasureCase<'_>; 6] = [
+        (
+            "advanced types",
+            "interface Row { readonly id: string; label: string }
+             type Producer<out Value> = () => Value;
+             type Consumer<in Value> = (value: Value) => void;
+             type AwaitedValue<Value> = Value extends Promise<infer Inner> ? Inner : Value;
+             type Getters<Value extends Row> = { [Key in keyof Value as `get${Capitalize<string & Key>}`]-?: () => Value[Key] };
+             type Tuple = [head: string, count?: number, ...flags: boolean[]];
+             type Imported = import('./types.js').Row;
+             const rows = [{ id: 'a', label: 'A' }] as const satisfies readonly Row[];",
+            SourceType::TypeScript,
+            &["const rows = ["],
+            &["interface Row", "type Producer", "satisfies", "as const"],
+        ),
+        (
+            "functions and overloads",
+            "interface Row { id: string }
+             export function format(value: string): string;
+             export function format(value: number): string;
+             export function format(value: string | number): string { return String(value); }
+             function assertRow(value: unknown): asserts value is Row { if (!value) throw Error(); }
+             function collect<const Values extends readonly unknown[]>(values: Values): Values { return values; }
+             const identity = <Value>(value: Value): Value => value;",
+            SourceType::TypeScript,
+            &["export function format(value)", "function collect(values)"],
+            &["asserts", "value is Row", "<const Values", ": string"],
+        ),
+        (
+            "classes",
+            "interface Named { readonly name: string }
+             abstract class Entity implements Named {
+               abstract readonly name: string;
+               constructor(public readonly id: string, private rank = 1) {}
+             }
+             class User extends Entity {
+               accessor nickname: string = 'wake';
+               constructor(id: string, public override readonly name: string) { super(id); }
+             }
+             declare class AmbientService { readonly ready: boolean; }",
+            SourceType::TypeScript,
+            &["class Entity", "class User extends Entity", "this.name = name"],
+            &["implements", "abstract", "override", "declare class"],
+        ),
+        (
+            "type-only modules",
+            "import type { Row } from './row.js';
+             import { type Config } from './config.js';
+             export type { Result } from './result.js';
+             export { type Options } from './options.js';
+             export const ready: boolean = true;",
+            SourceType::TypeScript,
+            &["export const ready = true"],
+            &["./row.js", "./config.js", "./result.js", "./options.js", ": boolean"],
+        ),
+        (
+            "value-bearing TypeScript",
+            "enum Color { Red, Green, Blue }
+             namespace Metrics { export const base = 7; export function score(value: number): number { return base * value; } }
+             class Point { constructor(public x: number, public y: number) {} total(): number { return this.x + this.y; } }
+             export const result: number = Color.Blue + Metrics.score(2) + new Point(1, 2).total();",
+            SourceType::TypeScript,
+            &["Color", "Metrics", "this.x = x", "this.y = y"],
+            &["enum Color", "namespace Metrics", ": number"],
+        ),
+        (
+            "TSX generics",
+            "interface Row { id: string; label: string }
+             interface FormProps<Value> { value: Value }
+             declare function Form<Value>(props: FormProps<Value>): unknown;
+             const before = <div />;
+             const constrained = <Value extends Row>(value: Value): string => value.label;
+             const constant = <const Value extends Row>(value: Value): Value => value;
+             const after = <Form<Row> value={{ id: 'row', label: 'TSX' }} />;",
+            SourceType::Tsx,
+            &["react/jsx-runtime", "value.label"],
+            &["interface Row", "extends Row", ": Value", "<Form<Row>"],
+        ),
+    ];
+
+    for (name, source, source_type, retained, erased) in cases {
+        let js = strip_typescript(source, source_type);
+        for fragment in retained {
+            assert!(
+                js.contains(fragment),
+                "TypeScript 7 case {name:?} lost {fragment:?}:\n{js}"
+            );
+        }
+        for fragment in erased {
+            assert!(
+                !js.contains(fragment),
+                "TypeScript 7 case {name:?} retained {fragment:?}:\n{js}"
+            );
+        }
+        if name == "functions and overloads" {
+            assert_eq!(
+                js.matches("function format(").count(),
+                1,
+                "overload signatures must erase while the implementation remains:\n{js}"
+            );
+        }
+    }
 }
 
 #[test]
