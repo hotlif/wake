@@ -3366,8 +3366,11 @@ fn jsx_fixture() -> MemoryFileSystem {
         (
             "index.tsx",
             "import { render } from './r';\n\
+             interface Row { id: string }\n\
+             const areRowsEqual = <T extends Row>(prev: Readonly<T>, next: Readonly<T>): boolean => prev.id === next.id;\n\
              const el = <div id=\"root\"><span>hi</span>{2 + 3}</div>;\n\
-             export const out = render(el);",
+             export const out = render(el);\n\
+             export const same = areRowsEqual({ id: 'row' }, { id: 'row' });",
         ),
         (
             "r.ts",
@@ -3421,9 +3424,9 @@ fn jsx_bundle_runs_in_node() {
     let bundle_path = dir.join("bundle.cjs");
     std::fs::write(&bundle_path, &out.bundle).unwrap();
 
-    // out = render(<div id="root"><span>hi</span>{2+3}</div>) = "<div><span>hi</span>5</div>"
+    // 泛型箭头类型已擦除，运行时仍应保留比较逻辑与 JSX 输出。
     let script = format!(
-        "const r = require({:?}); const want='<div><span>hi</span>5</div>'; if (r.out !== want) {{ console.error('out=', r.out); process.exit(2); }} process.stdout.write('OK');",
+        "const r = require({:?}); const want='<div><span>hi</span>5</div>'; if (r.out !== want || r.same !== true) {{ console.error('out=', r.out, 'same=', r.same); process.exit(2); }} process.stdout.write('OK');",
         bundle_path.to_string_lossy()
     );
     let output = std::process::Command::new("node")
@@ -6436,7 +6439,9 @@ fn jsx_dev_runtime_wired_through_bundler() {
         ),
         (
             "src/index.tsx",
-            "export default <div className=\"x\">hi</div>;",
+            "interface Item { label: string }\n\
+             const render = <T extends Item>(value: T) => <div className=\"x\">{value.label}</div>;\n\
+             export default render({ label: 'hi' });",
         ),
     ];
 

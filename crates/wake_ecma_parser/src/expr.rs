@@ -1,15 +1,36 @@
 //! 表达式解析（Pratt 优先级爬升）+ 主表达式 + cover grammar 箭头 + 模式转换。DESIGN §4.4
 
-use wake_common::Span;
+use wake_common::{Atom, Span};
 use wake_ecma_ast::*;
 use wake_ecma_lexer::{Keyword, TokenKind};
 
-use crate::Parser;
+use crate::{Context, Parser, ParserCheckpoint};
 
 /// cover 括号：可能是箭头参数，也可能是括号/序列表达式。
 struct CoverParen<'a> {
     items: AVec<'a, Expression<'a>>,
     rest: Option<&'a RestElement<'a>>,
+}
+
+/// 泛型箭头完整试探的输出状态快照。
+///
+/// 普通 [`ParserCheckpoint`] 只服务无语义副作用的 token/type 前瞻。泛型箭头需要按 cover
+/// grammar 解析参数才能确认 `=>`，失败时还必须撤销 JSX、依赖、顶层 await 和 transform 状态。
+struct GenericArrowCheckpoint {
+    parser: ParserCheckpoint,
+    ctx: Context,
+    dependency_len: usize,
+    used_jsx: bool,
+    has_top_level_await: bool,
+    transform_temp: u32,
+    transform_temp_scopes: Vec<Option<Vec<Atom>>>,
+    spread_helper: Option<Atom>,
+    object_spread_helper: Option<Atom>,
+    for_of_helper: Option<Atom>,
+    in_cover_paren: bool,
+    preserve_optional_chain_tail: bool,
+    suppress_optional_chain_in_delete_cover: bool,
+    in_for_head_init: bool,
 }
 
 #[inline]
@@ -81,19 +102,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     }));
                 }
                 TokenKind::Lt if self.ts => {
-                    // TSX 中 `async <T,>(value: T) => value` 必须先按泛型箭头试探，
-                    // 否则 `<T>` 会落入比较/JSX 分支并产生级联诊断。
-                    let checkpoint = self.checkpoint();
-                    self.bump(); // async
-                    self.ts_type_parameters();
-                    if self.at(TokenKind::LParen) {
-                        let cover = self.parse_cover_paren();
-                        self.skip_arrow_return_type_if_arrow();
-                        if self.at(TokenKind::Arrow) && !self.newline_before() {
-                            return self.finish_arrow(lo, cover, true);
-                        }
+                    if let Some(arrow) = self.try_parse_ts_generic_arrow(lo, true) {
+                        return arrow;
                     }
-                    self.rewind(checkpoint);
                 }
                 _ if is_ident_name_kind(p.kind) => {
                     self.bump(); // async
@@ -102,6 +113,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 }
                 _ => {}
             }
+        }
+
+        // 同步 TS/TSX 泛型箭头必须在普通 JSX primary / TS 类型断言之前试探。
+        if self.ts
+            && self.at(TokenKind::Lt)
+            && let Some(arrow) = self.try_parse_ts_generic_arrow(lo, false)
+        {
+            return arrow;
         }
 
         // 单标识符箭头 `x => ...`。
@@ -1464,6 +1483,81 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
     // cover grammar / 箭头
     // ==================================================================
+
+    /// 试探同步/异步 TypeScript 泛型箭头，并在失败时完整回滚。
+    ///
+    /// TSX 的单个无约束 `<T>` 按 TypeScript 规则继续归 JSX；逗号、约束或默认类型才允许
+    /// 进入完整箭头试探。轻量前瞻先排除绝大多数普通 JSX，避免在热路径克隆 transform 状态。
+    fn try_parse_ts_generic_arrow(&mut self, lo: u32, is_async: bool) -> Option<Expression<'a>> {
+        debug_assert!(self.ts);
+        debug_assert!(
+            (!is_async && self.at(TokenKind::Lt)) || (is_async && self.at_keyword(Keyword::Async))
+        );
+
+        let ahead = self.checkpoint();
+        if is_async {
+            self.bump(); // async
+        }
+        let type_parameters = self.ts_type_parameters();
+        let can_be_arrow = type_parameters.closed
+            && (!self.jsx || type_parameters.jsx_unambiguous)
+            && self.at(TokenKind::LParen);
+        self.rewind(ahead);
+        if !can_be_arrow {
+            return None;
+        }
+
+        let checkpoint = self.generic_arrow_checkpoint();
+        if is_async {
+            self.bump(); // async
+        }
+        self.ts_type_parameters();
+        let cover = self.parse_cover_paren();
+        self.skip_arrow_return_type_if_arrow();
+        if self.at(TokenKind::Arrow) && !self.newline_before() {
+            return Some(self.finish_arrow(lo, cover, is_async));
+        }
+
+        self.rewind_generic_arrow(checkpoint);
+        None
+    }
+
+    fn generic_arrow_checkpoint(&self) -> GenericArrowCheckpoint {
+        GenericArrowCheckpoint {
+            parser: self.checkpoint(),
+            ctx: self.ctx,
+            dependency_len: self.dependencies.len(),
+            used_jsx: self.used_jsx,
+            has_top_level_await: self.has_top_level_await,
+            transform_temp: self.transform_temp,
+            transform_temp_scopes: self.transform_temp_scopes.clone(),
+            spread_helper: self.spread_helper,
+            object_spread_helper: self.object_spread_helper,
+            for_of_helper: self.for_of_helper,
+            in_cover_paren: self.in_cover_paren,
+            preserve_optional_chain_tail: self.preserve_optional_chain_tail,
+            suppress_optional_chain_in_delete_cover: self.suppress_optional_chain_in_delete_cover,
+            in_for_head_init: self.in_for_head_init,
+        }
+    }
+
+    fn rewind_generic_arrow(&mut self, checkpoint: GenericArrowCheckpoint) {
+        self.rewind(checkpoint.parser);
+        self.ctx = checkpoint.ctx;
+        self.dependencies.truncate(checkpoint.dependency_len);
+        self.used_jsx = checkpoint.used_jsx;
+        self.has_top_level_await = checkpoint.has_top_level_await;
+        self.transform_temp = checkpoint.transform_temp;
+        self.transform_temp_scopes = checkpoint.transform_temp_scopes;
+        self.spread_helper = checkpoint.spread_helper;
+        self.object_spread_helper = checkpoint.object_spread_helper;
+        self.for_of_helper = checkpoint.for_of_helper;
+        self.in_cover_paren = checkpoint.in_cover_paren;
+        self.preserve_optional_chain_tail = checkpoint.preserve_optional_chain_tail;
+        self.suppress_optional_chain_in_delete_cover =
+            checkpoint.suppress_optional_chain_in_delete_cover;
+        self.in_for_head_init = checkpoint.in_for_head_init;
+    }
 
     fn parse_cover_paren(&mut self) -> CoverParen<'a> {
         self.expect(TokenKind::LParen);

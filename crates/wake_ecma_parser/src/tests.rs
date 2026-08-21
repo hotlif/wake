@@ -394,10 +394,76 @@ fn parenthesized_conditionals_are_not_optional_arrow_parameters() {
 }
 
 #[test]
-fn tsx_async_generic_arrows_are_not_parsed_as_jsx() {
+fn ts_generic_arrows_disambiguate_before_jsx_and_type_assertions() {
+    let source = "interface Row { id: string }
+        const trailing = <T,>(value: T): T => value;
+        const constrained = <T extends Row>(prev: Readonly<T>, next: Readonly<T>): boolean => {
+            return prev.id === next.id;
+        };
+        const defaulted = <T = object>(value: T): T => value;
+        const constrainedDefault = <T extends object = object>(value: T): T => value;
+        const multiple = <T, U extends T = T>(first: T, second: U): U => second;
+        const post = async <T,>(body: T): Promise<T> => body;";
+
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        let output = parse_ok(source, source_type);
+        assert!(
+            output.dependencies.is_empty(),
+            "generic arrows must not inject JSX dependencies for {source_type:?}: {:?}",
+            output.dependencies
+        );
+    }
+
     parse_ok(
-        "const post = useCallback(async <T,>(body: T): Promise<T> => body, []);",
+        "const single = <T>(value: T): T => value;",
+        SourceType::TypeScript,
+    );
+}
+
+#[test]
+fn tsx_single_unconstrained_type_parameter_remains_jsx_ambiguous() {
+    let interner = Interner::new();
+    let output = parse(
+        "const ambiguous = <T>(value: T): T => value;",
+        &interner,
         SourceType::Tsx,
+    );
+    assert!(
+        output.has_errors(),
+        "TSX <T> must remain JSX-ambiguous like TypeScript"
+    );
+}
+
+#[test]
+fn failed_generic_arrow_probe_rolls_back_dependencies() {
+    let output = parse_ok(
+        "const pending = async<T>(import('./value.js'));",
+        SourceType::TypeScript,
+    );
+    assert_eq!(
+        output.dependencies.len(),
+        1,
+        "failed arrow speculation must not duplicate dependencies: {:?}",
+        output.dependencies
+    );
+}
+
+#[test]
+fn tsx_generic_arrows_coexist_with_real_and_generic_jsx() {
+    let output = parse_ok(
+        "interface Row { id: string }
+         interface Props<T> { value: T }
+         declare const Form: unknown;
+         const before = <div />;
+         const compare = <T extends Row>(prev: T, next: T): boolean => prev.id === next.id;
+         const after = <Form<Row> value={{ id: 'row' }} />;",
+        SourceType::Tsx,
+    );
+    assert_eq!(
+        output.dependencies.len(),
+        1,
+        "real JSX must inject exactly one runtime dependency: {:?}",
+        output.dependencies
     );
 }
 

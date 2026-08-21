@@ -13,6 +13,16 @@ use wake_ecma_lexer::{Keyword, TokenKind};
 
 use crate::Parser;
 
+/// 类型参数列表在 TSX 表达式起始位置的消歧信息。
+///
+/// 单个无约束参数 `<T>` 与 JSX 起始标签有歧义；逗号、约束或默认类型则能明确表明
+/// 这是 TypeScript 类型参数列表。`closed` 防止试探把未闭合的 JSX 标签头提交为泛型箭头。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TsTypeParametersInfo {
+    pub(crate) closed: bool,
+    pub(crate) jsx_unambiguous: bool,
+}
+
 impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
     // 对外集成入口
@@ -53,9 +63,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// 类型参数声明 `<T extends U = D, ...>`（仅 ts 且当前 `<`）。
-    pub(crate) fn ts_type_parameters(&mut self) {
+    pub(crate) fn ts_type_parameters(&mut self) -> TsTypeParametersInfo {
+        let mut info = TsTypeParametersInfo::default();
         if !self.ts || !self.at(TokenKind::Lt) {
-            return;
+            return info;
         }
         self.bump(); // <
         while !self.at_type_gt() && !self.at(TokenKind::Eof) {
@@ -71,16 +82,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.bump(); // 参数名
             }
             if self.eat_keyword(Keyword::Extends) {
+                info.jsx_unambiguous = true;
                 self.ts_type();
             }
             if self.eat(TokenKind::Eq) {
+                info.jsx_unambiguous = true;
                 self.ts_type();
             }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
+            info.jsx_unambiguous = true;
         }
+        info.closed = self.at_type_gt();
         self.consume_type_gt();
+        info
     }
 
     /// 类型实参 `<A, B>`（非试探，假设当前 `<`）。用于 `expr as Foo<T>`、`extends Base<T>` 等。
