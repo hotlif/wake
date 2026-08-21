@@ -369,6 +369,7 @@ pre code { padding: 0; color: inherit; border: 0; background: transparent; font-
 .page-loading span { width: 24px; height: 24px; border: 2px solid var(--border); border-top-color: var(--wake-accent); border-radius: 50%; animation: spin .7s linear infinite; }
 .demo-frame-root { min-height: calc(100vh - 2px); padding: 1px; }
 .demo-frame-root > * { min-height: inherit; }
+.demo-default-preview { min-width: 0; display: grid; place-content: safe center; place-items: safe center; }
 .frame-loading, .frame-error { padding: 18px; color: var(--text-faint); font: 12px ui-monospace, monospace; }
 .frame-error { color: #fb7185; }
 

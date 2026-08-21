@@ -1535,7 +1535,7 @@ fn render_config(
             js_string(&root_relative_alias(root, &absolute_from(root, preview))?)
         ));
     } else {
-        output.push_str("export const Preview = React.Fragment;\n");
+        output.push_str("export function Preview({ children }: { children: React.ReactNode }) { return <div className=\"demo-default-preview\">{children}</div>; }\n");
     }
     let base_path = normalize_base(&options.base_path);
     let logo = options
@@ -3938,6 +3938,45 @@ pages = ["build"]
         )
         .unwrap();
         assert!(embedded.contains(r#""presentation":"embedded""#));
+    }
+
+    #[test]
+    fn default_preview_centers_demos_while_explicit_preview_owns_layout() {
+        for docs_mode in [DocsMode::Site, DocsMode::Components] {
+            let config =
+                render_config(Path::new("project"), &DocsOptions::default(), docs_mode).unwrap();
+            assert!(config.contains("function Preview({ children }"));
+            assert!(config.contains("demo-default-preview"));
+            assert!(!config.contains("React.Fragment"));
+        }
+
+        let explicit = render_config(
+            Path::new("project"),
+            &DocsOptions {
+                preview: Some(PathBuf::from("docs/preview.tsx")),
+                ..DocsOptions::default()
+            },
+            DocsMode::Components,
+        )
+        .unwrap();
+        assert!(explicit.contains(
+            r#"export { default as Preview } from "@wake/docs-project/docs/preview.tsx";"#
+        ));
+        assert!(!explicit.contains("demo-default-preview"));
+    }
+
+    #[test]
+    fn default_preview_safely_centers_runtime_content() {
+        let default_preview = RUNTIME_STYLE
+            .split_once(".demo-default-preview {")
+            .expect("default Preview style")
+            .1
+            .split_once('}')
+            .expect("default Preview style end")
+            .0;
+        assert!(default_preview.contains("display: grid;"));
+        assert!(default_preview.contains("place-content: safe center;"));
+        assert!(default_preview.contains("place-items: safe center;"));
     }
 
     #[test]
