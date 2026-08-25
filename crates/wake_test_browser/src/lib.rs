@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1897,7 +1897,15 @@ impl ResourceOrigin {
             .spawn(move || {
                 while !worker_stop.load(Ordering::Acquire) {
                     match listener.accept() {
-                        Ok((mut stream, _)) => serve_resource(&mut stream, &resources),
+                        Ok((mut stream, peer)) => {
+                            if let Err(error) = serve_resource(&mut stream, &resources)
+                                && !is_client_termination(&error)
+                            {
+                                eprintln!(
+                                    "wake_test_browser: resource origin connection from {peer} failed: {error}"
+                                );
+                            }
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
                         }
@@ -1931,12 +1939,27 @@ impl Drop for ResourceOrigin {
     }
 }
 
-fn serve_resource(stream: &mut TcpStream, resources: &BTreeMap<String, Vec<u8>>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+fn is_client_termination(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+fn serve_resource(
+    stream: &mut TcpStream,
+    resources: &BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut request = [0_u8; 8 * 1024];
-    let Ok(read) = stream.read(&mut request) else {
-        return;
-    };
+    let read = stream.read(&mut request)?;
+    if read == 0 {
+        return Ok(());
+    }
     let request = String::from_utf8_lossy(&request[..read]);
     let path = request
         .lines()
@@ -1965,14 +1988,50 @@ fn serve_resource(stream: &mut TcpStream, resources: &BTreeMap<String, Vec<u8>>)
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(headers.as_bytes());
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    stream.shutdown(Shutdown::Write)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+
+    fn fetch_resource(address: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: wake\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let mut content_length = None;
+        loop {
+            let mut header = String::new();
+            assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(value) = header
+                .strip_prefix("Content-Length:")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+            {
+                content_length = Some(value);
+            }
+        }
+        let mut body = vec![0; content_length.expect("response must have Content-Length")];
+        reader.read_exact(&mut body).unwrap();
+        (status.trim_end().to_string(), body)
+    }
 
     fn start_cdp_server<R, F>(handler: F) -> (String, JoinHandle<R>)
     where
@@ -2093,14 +2152,31 @@ mod tests {
         )]))
         .unwrap();
         let address = origin.address;
-        let mut stream = TcpStream::connect(address).unwrap();
-        stream
-            .write_all(b"GET /suite.js HTTP/1.1\r\nHost: wake\r\nConnection: close\r\n\r\n")
-            .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.ends_with("export const answer = 42;"));
+
+        drop(TcpStream::connect(address).unwrap());
+
+        let (status, body) = fetch_resource(address, "/suite.js");
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, b"export const answer = 42;");
+
+        let (status, body) = fetch_resource(address, "/missing.js");
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+        assert_eq!(body, b"not found");
+    }
+
+    #[test]
+    fn loopback_origin_classifies_client_termination() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert!(is_client_termination(&std::io::Error::from(kind)));
+        }
+        assert!(!is_client_termination(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
     }
 
     #[test]
