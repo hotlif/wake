@@ -4269,6 +4269,15 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
+    fn assert_same_existing_file(actual: impl AsRef<Path>, expected: impl AsRef<Path>) {
+        let actual = std::fs::canonicalize(actual.as_ref()).unwrap();
+        let expected = std::fs::canonicalize(expected.as_ref()).unwrap();
+        assert_eq!(
+            wake_common::fs::normalize(&actual),
+            wake_common::fs::normalize(&expected)
+        );
+    }
+
     #[test]
     fn test_session_event_fields_use_the_public_camel_case_contract() {
         let event = TestSessionEvent::TestCaseResult {
@@ -5198,9 +5207,9 @@ base_path = "/components/{name}/workbench/"
         )
         .unwrap();
         let outfile = output_dir.join("extension.js");
-        assert_eq!(
-            result.output_file.as_deref(),
-            Some(outfile.to_string_lossy().as_ref())
+        assert_same_existing_file(
+            result.output_file.as_deref().expect("bundle output path"),
+            &outfile,
         );
         assert!(
             std::fs::read_to_string(&outfile)
@@ -5298,9 +5307,12 @@ base_path = "/components/{name}/workbench/"
         .unwrap();
         let outfile = fixture.0.join("artifacts/extension.js");
         let mapfile = fixture.0.join("artifacts/extension.js.map");
-        assert_eq!(
-            written.source_map_file.as_deref().map(PathBuf::from),
-            Some(mapfile.clone())
+        assert_same_existing_file(
+            written
+                .source_map_file
+                .as_deref()
+                .expect("bundle source map path"),
+            &mapfile,
         );
         let disk_map = std::fs::read_to_string(&mapfile).unwrap();
         assert_eq!(written.source_map.as_deref(), Some(disk_map.as_str()));
