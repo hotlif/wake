@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { test } from 'node:test'
+import { test } from '@crab-dev/wake/test'
 
 const cli = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url))
 const fixture = fileURLToPath(new URL('../../../fixtures/hello-esm/src/index.js', import.meta.url))
@@ -37,6 +37,39 @@ test('forced TUI is rejected for static commands without control sequences', () 
   assert.equal(result.status, 1)
   assert.match(result.stderr, /only available/)
   assert.doesNotMatch(result.stderr, /\x1b\[/)
+})
+
+test('test command exposes only the Wake dashed option contract', () => {
+  const help = run(['test', '--help'])
+  assert.equal(help.status, 0, help.stderr)
+  assert.match(help.stdout, /--name-pattern/)
+  for (const value of ['--environment', 'auto', 'dom', 'browser']) {
+    assert.match(help.stdout, new RegExp(value))
+  }
+  for (const value of ['--reporter', 'pretty', 'json', 'junit']) {
+    assert.match(help.stdout, new RegExp(value))
+  }
+  assert.doesNotMatch(help.stdout, /testNamePattern|runInBand|--json\b|--init\b/)
+
+  for (const args of [
+    ['test', '--testNamePattern', 'renders'],
+    ['test', '--runInBand'],
+    ['test', '--updateSnapshot'],
+    ['test', '--passWithNoTests'],
+    ['test', '--watchAll'],
+    ['test', '--config', 'wake.config.toml'],
+    ['test', '--init'],
+    ['test', '--json'],
+    ['test', '--randomize'],
+    ['test', '--root'],
+    ['test', '--workers', '0'],
+    ['test', '--serial', '--workers', '2'],
+    ['test', '--changed', '--related', 'src/button.tsx'],
+  ]) {
+    const result = run(args)
+    assert.equal(result.status, 2, `${args.join(' ')}\n${result.stderr}`)
+    assert.match(result.stderr, /WAKE_TEST_CONFIG/)
+  }
 })
 
 test('validates the docs mode before starting a build', () => {

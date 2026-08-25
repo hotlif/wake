@@ -40,7 +40,7 @@
     "node": ">=22.14 <27"
   },
   "scripts": {
-    "test": "node --test --test-isolation=none test/*.test.mjs",
+    "test": "wake test test",
     "typecheck": "tsc -p test/tsconfig.json",
     "pack:check": "npm pack --dry-run"
   },

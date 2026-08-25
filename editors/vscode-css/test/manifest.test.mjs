@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import test from 'node:test'
+import { test } from '@crab-dev/wake/test'
 
 const root = new URL('..', import.meta.url)
 const readJson = async path => JSON.parse(await readFile(new URL(path, root), 'utf8'))

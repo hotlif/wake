@@ -1,14 +1,41 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 
+import {
+  PLATFORM_CONTRACTS,
+  expectedPlatformFiles,
+} from './native-package-contract.mjs'
+import { readSystemBrowserConformanceManifest } from './check-system-browser-conformance.mjs'
+
 const root = resolve(import.meta.dirname, '..')
 const npmRoot = resolve(root, 'npm')
 const workflowPath = resolve(root, '.github/workflows/release-npm.yml')
 const workflow = readFileSync(workflowPath, 'utf8')
+readSystemBrowserConformanceManifest()
 const vscodeWorkflow = readFileSync(
   resolve(root, '.github/workflows/vscode-css.yml'),
   'utf8',
 )
+
+const releaseJobs = [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
+function releaseJob(name) {
+  const matches = releaseJobs.filter((match) => match[1] === name)
+  if (matches.length !== 1) {
+    throw new Error(`release-npm.yml must define exactly one ${name} job; found ${matches.length}`)
+  }
+  const match = matches[0]
+  const index = releaseJobs.indexOf(match)
+  const end = releaseJobs[index + 1]?.index ?? workflow.length
+  return { index: match.index, source: workflow.slice(match.index, end) }
+}
+
+function requireJobMarkers(name, source, markers) {
+  for (const marker of markers) {
+    if (!source.includes(marker)) {
+      throw new Error(`release-npm.yml ${name} job is missing contract marker ${marker}`)
+    }
+  }
+}
 
 const packages = readdirSync(npmRoot, { withFileTypes: true })
   .filter((entry) => entry.isDirectory())
@@ -28,10 +55,125 @@ for (const required of [
   "- 'v*'",
   "- '!vscode-css-v*'",
   "if: github.ref_type == 'tag' && github.ref_name == format('v{0}', needs.verify.outputs.version)",
+  'node scripts/stage-test-host.mjs',
+  'node scripts/prepare-rusty-v8.mjs',
+  'package/test-host/wake-test-host',
+  'package/native-manifest.json',
+  'package/sbom.spdx.json',
+  'package/THIRD_PARTY_LICENSES.txt',
+  'node scripts/verify-native-package.mjs',
+  'npm run browser:conformance:test',
+  'check-system-browser-conformance.mjs',
+  '67108864',
+  '58720256',
+  '201326592',
+  'React browser and screenshot smoke',
+  'visual.browser.test.mjs',
+  "toMatchScreenshot('published-ready')",
   'npm publish',
 ]) {
   if (!workflow.includes(required)) {
     throw new Error(`release-npm.yml is missing release contract marker ${required}`)
+  }
+}
+
+const auditTarballsJob = releaseJob('audit-tarballs')
+const prepublishSmokeJob = releaseJob('prepublish-smoke')
+const publishJob = releaseJob('publish')
+const registrySmokeJob = releaseJob('smoke')
+if (!(auditTarballsJob.index < prepublishSmokeJob.index
+  && prepublishSmokeJob.index < publishJob.index)) {
+  throw new Error('local tarball smoke must run after audit-tarballs and before publish')
+}
+requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
+  'needs: [verify, audit-tarballs]',
+  'platform: [win32-x64-msvc, linux-x64-gnu, linux-arm64-gnu, darwin-x64, darwin-arm64]',
+  "node: ['22.14.0', '24', '26']",
+  'runner: windows-latest',
+  'runner: ubuntu-24.04',
+  'runner: ubuntu-24.04-arm',
+  'runner: macos-15-intel',
+  'runner: macos-15',
+  'pattern: npm-*',
+  'actions/checkout@v4',
+  'node-version: ${{ matrix.node }}',
+  "Clean install this build's local tarballs",
+  '--ignore-scripts',
+  '--omit=optional',
+  'PLATFORM_ARCHIVE',
+  "requested.startsWith('file:')",
+  'Wake Test CLI, runTests and TestContext smoke',
+  'npx --no-install wake test smoke.test.mjs --serial',
+  'runTests(options)',
+  'createTestContext(options)',
+  'context.startWatch()',
+  'context.stopWatch()',
+  'await context.close()',
+  'Select a system Chrome, Edge or Chromium',
+  "if: matrix.node == '24'",
+  'ubuntu-24.04-arm',
+  'WAKE_RELEASE_BROWSER_PATH',
+  'A compatible system Chrome, Edge or Chromium is required',
+  'React browser and screenshot smoke from local tarballs',
+  "toMatchScreenshot('local-ready')",
+  '--browser-path "$WAKE_RELEASE_BROWSER_PATH"',
+  '--reporter json',
+  '--output browser-result.json',
+  '--target "${{ matrix.platform }}"',
+  '--result browser-result.json',
+])
+if (prepublishSmokeJob.source.includes('continue-on-error')) {
+  throw new Error('prepublish local tarball smoke must never continue on error')
+}
+if (prepublishSmokeJob.source.includes('npm publish')) {
+  throw new Error('prepublish local tarball smoke must not mutate the npm registry')
+}
+const node24GateCount = prepublishSmokeJob.source.split("if: matrix.node == '24'").length - 1
+if (node24GateCount !== 2) {
+  throw new Error(`prepublish smoke must have exactly two Node 24 browser gates; found ${node24GateCount}`)
+}
+const prepublishConditions = [...prepublishSmokeJob.source.matchAll(/^\s+if:\s*(.+)\r?$/gm)]
+  .map((match) => match[1])
+if (prepublishConditions.length !== 2
+  || prepublishConditions.some((condition) => condition !== "matrix.node == '24'")) {
+  throw new Error(
+    `prepublish smoke must gate only the two Node 24 browser steps, found ${prepublishConditions.join(', ')}`,
+  )
+}
+for (const [platform, runner] of [
+  ['win32-x64-msvc', 'windows-latest'],
+  ['linux-x64-gnu', 'ubuntu-24.04'],
+  ['linux-arm64-gnu', 'ubuntu-24.04-arm'],
+  ['darwin-x64', 'macos-15-intel'],
+  ['darwin-arm64', 'macos-15'],
+]) {
+  const pair = new RegExp(`- platform: ${platform}\\r?\\n\\s+runner: ${runner}(?:\\r?\\n|$)`)
+  if (!pair.test(prepublishSmokeJob.source)) {
+    throw new Error(`prepublish smoke is missing the ${platform} -> ${runner} runner mapping`)
+  }
+}
+requireJobMarkers('publish', publishJob.source, [
+  'needs: [verify, audit-tarballs, prepublish-smoke]',
+  'npm publish',
+])
+requireJobMarkers('smoke', registrySmokeJob.source, [
+  'needs: publish',
+  'registry-url: https://registry.npmjs.org',
+  'Clean registry install without build tools',
+])
+if (workflow.includes('test-host/node')) {
+  throw new Error('release-npm.yml must use the canonical wake-test-host name')
+}
+for (const [marker, expectedCount] of [
+  ['cargo fetch --locked --target ${{ matrix.target }}', 2],
+  ['cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}', 2],
+  ['CARGO_NET_OFFLINE: "true"', 4],
+]) {
+  const count = workflow.split(marker).length - 1
+  if (count !== expectedCount) {
+    throw new Error(
+      `release-npm.yml must contain ${expectedCount} copies of ${marker}; found ${count}`,
+    )
   }
 }
 
@@ -60,6 +202,39 @@ for (const { directory, directoryName, manifest } of packages) {
 
 if (missing.length > 0) {
   throw new Error(`npm packages missing automatic release coverage:\n${missing.join('\n')}`)
+}
+
+for (const { directory, manifest } of packages) {
+  const contract = PLATFORM_CONTRACTS[manifest.name]
+  if (!contract) continue
+  if (directory !== contract.directory) {
+    throw new Error(`${manifest.name} must be published from ${contract.directory}`)
+  }
+  const expectedFiles = expectedPlatformFiles(manifest, contract)
+    .filter((path) => path !== 'package.json')
+    .sort()
+  const actualFiles = (manifest.files ?? []).slice().sort()
+  if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    throw new Error(
+      `${directory} must stage only the canonical binding, test host, provenance and license files`,
+    )
+  }
+  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'scripts']) {
+    if (Object.keys(manifest[field] ?? {}).length !== 0) {
+      throw new Error(`${manifest.name} must not declare ${field}`)
+    }
+  }
+}
+
+const wakeLoader = readFileSync(resolve(root, 'npm/wake/loader.cjs'), 'utf8')
+if (
+  !wakeLoader.includes("'wake-test-host.exe'")
+  || !wakeLoader.includes("'wake-test-host'")
+) {
+  throw new Error('npm loader must resolve the canonical wake-test-host basename')
+}
+if (wakeLoader.includes("'node.exe' : 'node'")) {
+  throw new Error('npm loader must not use the retired node test-host basename')
 }
 
 const extensionManifest = JSON.parse(

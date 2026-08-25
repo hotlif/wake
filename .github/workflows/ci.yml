@@ -61,7 +61,67 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
       - run: cargo test --workspace
+
+  test262-es2024:
+    name: selected Test262 ES2024 / embedded V8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test262-es2024
+      - run: npm run test262:es2024
+
+  browser-conformance:
+    name: React Chromium conformance / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win32-x64-msvc
+            os: windows-latest
+          - target: linux-x64-gnu
+            os: ubuntu-24.04
+          - target: linux-arm64-gnu
+            os: ubuntu-24.04-arm
+          - target: darwin-arm64
+            os: macos-15
+          - target: darwin-x64
+            os: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: browser-${{ matrix.target }}
+      - run: npm ci --ignore-scripts
+      - run: npm run browser:conformance:test
+      - name: Require the pinned post-CDP system browser identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity="$RUNNER_TEMP/wake-system-browser.json"
+          cargo run --locked --quiet -p wake_test_browser --example system_browser_identity > "$identity"
+          node scripts/check-system-browser-conformance.mjs \
+            --target "${{ matrix.target }}" \
+            --identity "$identity"
+      - name: CDP transport against the installed system browser
+        run: cargo test -p wake_test_browser --lib -- --ignored --nocapture
+      - name: React, input, source-map and screenshot conformance
+        run: cargo test -p wake_test --lib -- --ignored --nocapture
+      - name: Browser TSX V8 coverage reports and thresholds
+        run: cargo test -p wake_test --test browser_coverage_conformance -- --ignored --nocapture
 
   typescript-7:
     name: TypeScript 7 compatibility / ${{ matrix.os }}

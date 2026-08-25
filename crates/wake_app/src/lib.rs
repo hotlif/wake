@@ -5,15 +5,17 @@
 //! presentation, and process lifecycle.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use wake_bundler::{
@@ -25,6 +27,15 @@ use wake_common::{Diagnostic, OsFileSystem, SourceFile};
 
 pub use wake_docs::{DocsMode, DocsPresentation};
 use wake_ecma_transform::{BrowserTarget, TargetEnv};
+pub use wake_test_contract::protocol::WatchControl as TestWatchControl;
+use wake_test_contract::protocol::{
+    FrameDecoder, HOST_BUILD_ID, HostAck, HostCommand, HostError, HostEvent, HostHello,
+    HostRequest, HostResponse, HostResponseBody, PROTOCOL_VERSION, WatchControl, write_frame,
+};
+pub use wake_test_contract::{
+    TestCaseResult, TestDiagnostic, TestFailure, TestOptions, TestRunResult, TestStatus,
+    TestSuiteResult, TestTerminationReason, WorkerOverride,
+};
 
 mod library;
 pub use library::{
@@ -352,6 +363,1073 @@ pub fn bundle(
     cancellation: &CancellationToken,
 ) -> Result<BundleResult, WakeError> {
     execute_bundle(options, cancellation)
+}
+
+/// Run native JavaScript tests through the crash-isolated Wake test host.
+pub fn run_tests(
+    options: TestOptions,
+    cancellation: &CancellationToken,
+) -> Result<TestRunResult, WakeError> {
+    run_tests_with_host(options, None, cancellation)
+}
+
+/// Run tests with an explicit packaged host path.
+///
+/// Node's package loader supplies this path because the Node executable itself is not installed
+/// beside the platform package. Other frontends normally use [`run_tests`].
+pub fn run_tests_with_host(
+    options: TestOptions,
+    host_path: Option<&Path>,
+    cancellation: &CancellationToken,
+) -> Result<TestRunResult, WakeError> {
+    let mut session = TestSession::start_with_host(host_path, cancellation)?;
+    let outcome = session.run(options, cancellation);
+    let close = session.close();
+    match (outcome, close) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(mut error), Err(close_error)) => {
+            error.message.push_str("; test-host shutdown failed: ");
+            error.message.push_str(&close_error.message);
+            Err(error)
+        }
+    }
+}
+
+fn reap_test_host(child: &mut Child) {
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+const TEST_HOST_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const TEST_HOST_READER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TEST_HOST_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_TEST_RUN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TEST_WATCH_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TestSessionEvent {
+    RunStart {
+        run_id: String,
+        watching: bool,
+    },
+    TestCaseResult {
+        run_id: String,
+        suite_id: String,
+        result: Box<TestCaseResult>,
+    },
+    SuiteResult {
+        run_id: String,
+        result: Box<TestSuiteResult>,
+    },
+    Diagnostic {
+        run_id: Option<String>,
+        diagnostic: Box<TestDiagnostic>,
+    },
+    RunComplete {
+        result: Box<TestRunResult>,
+    },
+    Closed,
+}
+
+/// A persistent client session for the isolated Wake test host.
+pub struct TestSession {
+    child: Child,
+    stderr: Option<ChildStderr>,
+    protocol: Option<TestProtocolSession>,
+    events: Vec<TestSessionEvent>,
+    closed: bool,
+}
+
+impl TestSession {
+    pub fn start(cancellation: &CancellationToken) -> Result<Self, WakeError> {
+        Self::start_with_host(None, cancellation)
+    }
+
+    pub fn start_with_host(
+        explicit_host: Option<&Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, WakeError> {
+        cancellation.check()?;
+        let host_path = resolve_test_host(explicit_host)?;
+        let token = test_host_token()?;
+        let mut child = Command::new(&host_path)
+            .arg("--token")
+            .arg(&token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                WakeError::new(
+                    "WAKE_TEST_HOST",
+                    format!("could not start test host: {error}"),
+                )
+                .at(&host_path)
+            })?;
+        match connect_test_host(&mut child, &token, cancellation) {
+            Ok(protocol) => {
+                let stderr = child.stderr.take();
+                Ok(Self {
+                    child,
+                    stderr,
+                    protocol: Some(protocol),
+                    events: Vec::new(),
+                    closed: false,
+                })
+            }
+            Err(mut error) => {
+                let mut stderr = child.stderr.take();
+                let _ = child.kill();
+                reap_test_host(&mut child);
+                append_test_host_stderr(&mut error, &mut stderr);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn run(
+        &mut self,
+        options: TestOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<TestRunResult, WakeError> {
+        if self.closed {
+            return Err(WakeError::closed("TestSession"));
+        }
+        let protocol = self.protocol.as_mut().ok_or_else(|| {
+            WakeError::new("WAKE_TEST_HOST", "test-host protocol is not connected")
+        })?;
+        let result = protocol.run(options, cancellation);
+        self.events.extend(protocol.drain_events());
+        result
+    }
+
+    pub fn start_watch(&mut self, options: TestOptions) -> Result<(), WakeError> {
+        if self.closed {
+            return Err(WakeError::closed("TestSession"));
+        }
+        self.protocol
+            .as_mut()
+            .ok_or_else(|| WakeError::new("WAKE_TEST_HOST", "test-host protocol is not connected"))?
+            .start_watch(options)
+    }
+
+    pub fn stop_watch(&mut self) -> Result<(), WakeError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.protocol
+            .as_mut()
+            .ok_or_else(|| WakeError::new("WAKE_TEST_HOST", "test-host protocol is not connected"))?
+            .stop_watch()
+    }
+
+    pub fn is_watching(&self) -> bool {
+        self.protocol
+            .as_ref()
+            .is_some_and(TestProtocolSession::is_watching)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn watch_control(&mut self, control: TestWatchControl) -> Result<(), WakeError> {
+        if self.closed {
+            return Err(WakeError::closed("TestSession"));
+        }
+        self.protocol
+            .as_mut()
+            .ok_or_else(|| WakeError::new("WAKE_TEST_HOST", "test-host protocol is not connected"))?
+            .watch_control(control)
+    }
+
+    pub fn poll_events(&mut self) -> Result<(), WakeError> {
+        if self.closed {
+            return Ok(());
+        }
+        let protocol = self.protocol.as_mut().ok_or_else(|| {
+            WakeError::new("WAKE_TEST_HOST", "test-host protocol is not connected")
+        })?;
+        let outcome = protocol.poll_watch_events();
+        self.events.extend(protocol.drain_events());
+        outcome
+    }
+
+    pub fn drain_events(&mut self) -> Vec<TestSessionEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub fn close(&mut self) -> Result<(), WakeError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let mut outcome = Ok(());
+        if let Some(mut protocol) = self.protocol.take() {
+            if !protocol.closed {
+                if protocol.is_watching()
+                    && let Err(error) = protocol.stop_watch()
+                {
+                    outcome = Err(error);
+                }
+                if outcome.is_ok()
+                    && let Err(error) = protocol.wait_for_watch_idle()
+                {
+                    outcome = Err(error);
+                }
+                if outcome.is_ok()
+                    && let Err(error) = protocol.shutdown()
+                {
+                    outcome = Err(error);
+                }
+            }
+            protocol.close_transport();
+            self.events.extend(protocol.drain_events());
+        }
+        if outcome.is_err() {
+            let _ = self.child.kill();
+        }
+        reap_test_host(&mut self.child);
+        if let Err(error) = &mut outcome {
+            append_test_host_stderr(error, &mut self.stderr);
+        }
+        if !self
+            .events
+            .iter()
+            .any(|event| matches!(event, TestSessionEvent::Closed))
+        {
+            self.events.push(TestSessionEvent::Closed);
+        }
+        outcome
+    }
+}
+
+impl Drop for TestSession {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn connect_test_host(
+    child: &mut Child,
+    token: &str,
+    cancellation: &CancellationToken,
+) -> Result<TestProtocolSession, WakeError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| WakeError::new("WAKE_TEST_HOST", "test host stdout was not connected"))?;
+    let (handshake_sender, handshake_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut handshake = String::new();
+        let result = stdout.read_line(&mut handshake).map(|_| handshake);
+        let _ = handshake_sender.send(result);
+    });
+    let handshake_started = Instant::now();
+    let handshake = loop {
+        match handshake_receiver.recv_timeout(TEST_HOST_POLL_INTERVAL) {
+            Ok(Ok(handshake)) => break handshake,
+            Ok(Err(error)) => {
+                return Err(WakeError::new(
+                    "WAKE_TEST_HOST",
+                    format!("could not read test host handshake: {error}"),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancellation.check()?;
+                if handshake_started.elapsed() >= TEST_HOST_CONTROL_TIMEOUT {
+                    return Err(WakeError::new(
+                        "WAKE_TEST_HOST",
+                        "test host did not complete its handshake within 10 seconds",
+                    ));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(WakeError::new(
+                    "WAKE_TEST_HOST",
+                    "test host closed stdout before its handshake",
+                ));
+            }
+        }
+    };
+    let hello = serde_json::from_str::<HostHello>(handshake.trim()).map_err(|error| {
+        WakeError::new(
+            "WAKE_TEST_HOST",
+            format!("test host returned an invalid handshake: {error}"),
+        )
+    })?;
+    if hello.protocol_version != PROTOCOL_VERSION {
+        return Err(WakeError::new(
+            "WAKE_TEST_HOST",
+            format!(
+                "test host protocol mismatch: application {}, host {}",
+                PROTOCOL_VERSION, hello.protocol_version
+            ),
+        ));
+    }
+    if hello.build_id != HOST_BUILD_ID {
+        return Err(WakeError::new(
+            "WAKE_TEST_HOST",
+            format!(
+                "test host build mismatch: application {}, host {}",
+                HOST_BUILD_ID, hello.build_id
+            ),
+        ));
+    }
+    let address = hello
+        .address
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| {
+            WakeError::new(
+                "WAKE_TEST_HOST",
+                format!("test host returned an invalid address: {error}"),
+            )
+        })?;
+    if !address.ip().is_loopback() {
+        return Err(WakeError::new(
+            "WAKE_TEST_HOST",
+            "test host attempted to use a non-loopback address",
+        ));
+    }
+    cancellation.check()?;
+
+    let stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(10)).map_err(|error| {
+            WakeError::new(
+                "WAKE_TEST_HOST",
+                format!("could not connect to test host: {error}"),
+            )
+        })?;
+    TestProtocolSession::new(stream, token.to_string())
+}
+
+fn append_test_host_stderr(error: &mut WakeError, stderr: &mut Option<ChildStderr>) {
+    let Some(stderr) = stderr else {
+        return;
+    };
+    let mut details = String::new();
+    let _ = stderr.read_to_string(&mut details);
+    if !details.trim().is_empty() {
+        error.message.push_str("; host stderr: ");
+        error.message.push_str(details.trim());
+    }
+}
+
+enum TestProtocolIncoming {
+    Response(Box<HostResponse>),
+    Closed,
+    DecodeError(String),
+}
+
+struct TestProtocolSession {
+    writer: TcpStream,
+    token: String,
+    incoming: mpsc::Receiver<TestProtocolIncoming>,
+    reader_stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
+    next_request_id: u64,
+    next_sequence: u64,
+    watch_id: Option<String>,
+    watch_request_id: Option<u64>,
+    watch_run_active: bool,
+    watch_run_id: Option<String>,
+    events: Vec<TestSessionEvent>,
+    closed: bool,
+}
+
+impl TestProtocolSession {
+    fn new(writer: TcpStream, token: String) -> Result<Self, WakeError> {
+        writer
+            .set_write_timeout(Some(TEST_HOST_CONTROL_TIMEOUT))
+            .map_err(|error| test_protocol_error(format!("could not configure writer: {error}")))?;
+        let reader_stream = writer
+            .try_clone()
+            .map_err(|error| test_protocol_error(format!("could not clone socket: {error}")))?;
+        let (sender, incoming) = mpsc::channel();
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let stop = reader_stop.clone();
+        let reader = thread::Builder::new()
+            .name("wake-test-client-reader".to_string())
+            .spawn(move || read_test_protocol_frames(reader_stream, &sender, &stop))
+            .map_err(|error| {
+                test_protocol_error(format!("could not create response reader: {error}"))
+            })?;
+        Ok(Self {
+            writer,
+            token,
+            incoming,
+            reader_stop,
+            reader: Some(reader),
+            next_request_id: 0,
+            next_sequence: 0,
+            watch_id: None,
+            watch_request_id: None,
+            watch_run_active: false,
+            watch_run_id: None,
+            events: Vec::new(),
+            closed: false,
+        })
+    }
+
+    fn run(
+        &mut self,
+        options: TestOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<TestRunResult, WakeError> {
+        cancellation.check()?;
+        let run_id = format!(
+            "wake-run-{}-{}",
+            std::process::id(),
+            NEXT_TEST_RUN_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let run_request = self.send_command(HostCommand::Run {
+            run_id: run_id.clone(),
+            options: Box::new(options),
+        })?;
+        let mut cancel_request = None;
+        let mut cancel_done = false;
+        let mut run_acknowledged = false;
+        let mut terminal: Option<Result<TestRunResult, WakeError>> = None;
+
+        loop {
+            if cancellation.is_cancelled() && cancel_request.is_none() && terminal.is_none() {
+                cancel_request = Some(self.send_command(HostCommand::Cancel {
+                    run_id: run_id.clone(),
+                })?);
+            }
+            if (cancel_request.is_none() || cancel_done)
+                && let Some(terminal) = terminal.take()
+            {
+                if let Ok(result) = &terminal {
+                    self.events.push(TestSessionEvent::RunComplete {
+                        result: Box::new(result.clone()),
+                    });
+                }
+                return terminal;
+            }
+
+            let Some(response) = self.receive_response()? else {
+                continue;
+            };
+            if self.watch_request_id == Some(response.request_id) {
+                self.record_watch_response(response)?;
+                continue;
+            }
+            let is_run_response = response.request_id == run_request;
+            let is_cancel_response = cancel_request == Some(response.request_id);
+            if !is_run_response && !is_cancel_response {
+                return Err(test_protocol_error(format!(
+                    "response {} does not match run request {}{}",
+                    response.request_id,
+                    run_request,
+                    cancel_request.map_or_else(String::new, |request| format!(
+                        " or cancel request {request}"
+                    ))
+                )));
+            }
+
+            match response.body {
+                HostResponseBody::Ack { command } => match command {
+                    HostAck::Run {
+                        run_id: acknowledged,
+                    } if is_run_response && acknowledged == run_id => {
+                        run_acknowledged = true;
+                    }
+                    HostAck::Cancel { run_id: cancelled }
+                        if is_cancel_response && cancelled == run_id =>
+                    {
+                        cancel_done = true;
+                    }
+                    _ => {
+                        return Err(test_protocol_error(
+                            "test host returned an acknowledgement for the wrong command",
+                        ));
+                    }
+                },
+                HostResponseBody::Event { event } => {
+                    if !is_run_response || !run_acknowledged {
+                        return Err(test_protocol_error(
+                            "test host emitted a run event before acknowledging the run",
+                        ));
+                    }
+                    self.record_event(&run_id, *event)?;
+                }
+                HostResponseBody::Result {
+                    run_id: completed,
+                    result,
+                } => {
+                    if !is_run_response || !run_acknowledged {
+                        return Err(test_protocol_error(
+                            "test host returned a result before acknowledging the run",
+                        ));
+                    }
+                    if completed != run_id || result.run_id != run_id {
+                        return Err(test_protocol_error(format!(
+                            "test host returned result `{completed}` for active run `{run_id}`"
+                        )));
+                    }
+                    terminal = Some(Ok(*result));
+                }
+                HostResponseBody::Error { error, .. } if is_cancel_response => {
+                    if error.code == "WAKE_TEST_UNKNOWN_RUN" {
+                        cancel_done = true;
+                    } else {
+                        return Err(wake_error_from_host(error));
+                    }
+                }
+                HostResponseBody::Error { error, .. } => {
+                    terminal = Some(Err(wake_error_from_host(error)));
+                    if run_acknowledged {
+                        self.events.push(TestSessionEvent::Closed);
+                        self.close_transport();
+                    }
+                }
+                HostResponseBody::WatchRunError { .. } => {
+                    return Err(test_protocol_error(
+                        "test host emitted a watch terminal on a run request",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn start_watch(&mut self, options: TestOptions) -> Result<(), WakeError> {
+        if self.watch_id.is_some() {
+            return Ok(());
+        }
+        let watch_id = format!(
+            "wake-watch-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WATCH_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let request = self.send_command(HostCommand::StartWatch {
+            watch_id: watch_id.clone(),
+            options: Box::new(options),
+        })?;
+        self.await_control_ack(request, |command| {
+            matches!(command, HostAck::StartWatch { watch_id: active } if active == &watch_id)
+        })?;
+        self.watch_id = Some(watch_id);
+        self.watch_request_id = Some(request);
+        let started = Instant::now();
+        loop {
+            if started.elapsed() >= TEST_HOST_CONTROL_TIMEOUT {
+                return Err(test_protocol_error(
+                    "test host did not report a ready filesystem watcher within 10 seconds",
+                ));
+            }
+            let Some(response) = self.receive_response()? else {
+                continue;
+            };
+            if response.request_id != request {
+                return Err(test_protocol_error(
+                    "test host returned an unrelated response while starting watch",
+                ));
+            }
+            match response.body {
+                HostResponseBody::Event { event } if matches!(&*event, HostEvent::WatchReady { watch_id: ready, .. } if ready == self.watch_id.as_deref().unwrap_or_default()) =>
+                {
+                    break;
+                }
+                HostResponseBody::Error { error, .. } => return Err(wake_error_from_host(error)),
+                HostResponseBody::WatchRunError { error, .. } => {
+                    return Err(wake_error_from_host(error));
+                }
+                _ => {
+                    return Err(test_protocol_error(
+                        "test host returned the wrong watch-ready response",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_watch(&mut self) -> Result<(), WakeError> {
+        let Some(watch_id) = self.watch_id.clone() else {
+            return Ok(());
+        };
+        let request = self.send_command(HostCommand::StopWatch {
+            watch_id: watch_id.clone(),
+        })?;
+        self.await_control_ack(request, |command| {
+            matches!(command, HostAck::StopWatch { watch_id: active } if active == &watch_id)
+        })?;
+        self.watch_id = None;
+        // The public stop boundary is quiescent: callers may immediately run, restart watch, or
+        // shut down without racing the cancelled worker that belonged to the old watch.
+        self.wait_for_watch_idle()
+    }
+
+    fn watch_control(&mut self, control: WatchControl) -> Result<(), WakeError> {
+        let watch_id = self
+            .watch_id
+            .clone()
+            .ok_or_else(|| WakeError::new("WAKE_TEST_UNKNOWN_WATCH", "no test watch is active"))?;
+        let request = self.send_command(HostCommand::WatchControl {
+            watch_id: watch_id.clone(),
+            control,
+        })?;
+        self.await_control_ack(request, |command| {
+            matches!(command, HostAck::WatchControl { watch_id: active } if active == &watch_id)
+        })
+    }
+
+    fn shutdown(&mut self) -> Result<(), WakeError> {
+        if self.closed {
+            return Ok(());
+        }
+        let request = self.send_command(HostCommand::Shutdown)?;
+        self.await_control_ack(request, |command| matches!(command, HostAck::Shutdown))?;
+        self.closed = true;
+        Ok(())
+    }
+
+    fn is_watching(&self) -> bool {
+        self.watch_id.is_some()
+    }
+
+    fn poll_watch_events(&mut self) -> Result<(), WakeError> {
+        loop {
+            let Some(response) = self.try_receive_response()? else {
+                return Ok(());
+            };
+            if self.watch_request_id != Some(response.request_id) {
+                return Err(test_protocol_error(format!(
+                    "unsolicited response {} does not belong to the active watch",
+                    response.request_id
+                )));
+            }
+            self.record_watch_response(response)?;
+        }
+    }
+
+    fn wait_for_watch_idle(&mut self) -> Result<(), WakeError> {
+        let started = Instant::now();
+        while self.watch_run_active {
+            if started.elapsed() >= TEST_HOST_CONTROL_TIMEOUT {
+                return Err(test_protocol_error(
+                    "watch run did not stop within 10 seconds",
+                ));
+            }
+            let Some(response) = self.receive_response()? else {
+                continue;
+            };
+            if self.watch_request_id != Some(response.request_id) {
+                return Err(test_protocol_error(
+                    "received an unrelated response while stopping watch",
+                ));
+            }
+            self.record_watch_response(response)?;
+        }
+        self.watch_request_id = None;
+        Ok(())
+    }
+
+    fn record_watch_response(&mut self, response: HostResponse) -> Result<(), WakeError> {
+        match response.body {
+            HostResponseBody::Event { event } => match *event {
+                HostEvent::RunStart { run_id, watching } if watching => {
+                    if self.watch_run_active {
+                        return Err(test_protocol_error(
+                            "test host started a second watch run before completing the first",
+                        ));
+                    }
+                    self.watch_run_active = true;
+                    self.watch_run_id = Some(run_id.clone());
+                    self.events
+                        .push(TestSessionEvent::RunStart { run_id, watching });
+                }
+                HostEvent::RunComplete {
+                    watch_id,
+                    run_id,
+                    result,
+                } => {
+                    if self
+                        .watch_id
+                        .as_deref()
+                        .is_some_and(|active| active != watch_id)
+                        || self.watch_run_id.as_deref() != Some(run_id.as_str())
+                        || result.run_id != run_id
+                    {
+                        return Err(test_protocol_error(
+                            "test host completed a run for an unrelated watch",
+                        ));
+                    }
+                    self.watch_run_active = false;
+                    self.watch_run_id = None;
+                    self.events.push(TestSessionEvent::RunComplete { result });
+                    if self.watch_id.is_none() {
+                        self.watch_request_id = None;
+                    }
+                }
+                HostEvent::WatchReady { .. } => {}
+                HostEvent::Diagnostic {
+                    run_id: None,
+                    diagnostic,
+                } => self.events.push(TestSessionEvent::Diagnostic {
+                    run_id: None,
+                    diagnostic,
+                }),
+                event => {
+                    let run_id = self.watch_run_id.clone().ok_or_else(|| {
+                        test_protocol_error("test host emitted a watch result outside a watch run")
+                    })?;
+                    self.record_event(&run_id, event)?;
+                }
+            },
+            HostResponseBody::WatchRunError {
+                watch_id,
+                run_id,
+                started,
+                error,
+            } => {
+                if self.watch_id.as_deref() != Some(watch_id.as_str()) {
+                    return Err(test_protocol_error("test host failed an unrelated watch"));
+                }
+                if started {
+                    if self.watch_run_id.as_deref() != run_id.as_deref() || !self.watch_run_active {
+                        return Err(test_protocol_error(
+                            "test host failed an unrelated active watch run",
+                        ));
+                    }
+                    self.watch_run_active = false;
+                    self.watch_run_id = None;
+                } else if run_id.is_some() || self.watch_run_active {
+                    return Err(test_protocol_error(
+                        "test host reported a pre-start watch failure during an active run",
+                    ));
+                }
+                self.events.push(TestSessionEvent::Diagnostic {
+                    run_id: run_id.clone(),
+                    diagnostic: Box::new(TestDiagnostic {
+                        severity: wake_test_contract::DiagnosticSeverity::Error,
+                        code: error.code.clone(),
+                        message: error.message.clone(),
+                        path: error.path.clone(),
+                        location: None,
+                        notes: Vec::new(),
+                    }),
+                });
+                if started {
+                    self.watch_id = None;
+                    self.watch_request_id = None;
+                    self.events.push(TestSessionEvent::Closed);
+                    self.close_transport();
+                    return Err(wake_error_from_host(error));
+                }
+            }
+            HostResponseBody::Error { .. } => {
+                return Err(test_protocol_error(
+                    "test host used a one-shot error frame on the watch stream",
+                ));
+            }
+            _ => {
+                return Err(test_protocol_error(
+                    "test host emitted a non-event frame on the watch stream",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_events(&mut self) -> Vec<TestSessionEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn send_command(&mut self, command: HostCommand) -> Result<u64, WakeError> {
+        if self.closed {
+            return Err(WakeError::closed("TestSession"));
+        }
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| test_protocol_error("test-host request id overflowed"))?;
+        let request = HostRequest {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: HOST_BUILD_ID.to_string(),
+            token: self.token.clone(),
+            request_id: self.next_request_id,
+            command,
+        };
+        write_frame(&mut self.writer, &request)
+            .map_err(|error| test_protocol_error(format!("could not send request: {error}")))?;
+        Ok(self.next_request_id)
+    }
+
+    fn receive_response(&mut self) -> Result<Option<HostResponse>, WakeError> {
+        let response = match self.incoming.recv_timeout(TEST_HOST_POLL_INTERVAL) {
+            Ok(TestProtocolIncoming::Response(response)) => *response,
+            Ok(TestProtocolIncoming::Closed) => {
+                return Err(test_protocol_error("test host closed the protocol session"));
+            }
+            Ok(TestProtocolIncoming::DecodeError(error)) => {
+                return Err(test_protocol_error(format!(
+                    "could not decode response: {error}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(test_protocol_error(
+                    "test-host response reader disconnected",
+                ));
+            }
+        };
+        self.accept_response(response).map(Some)
+    }
+
+    fn try_receive_response(&mut self) -> Result<Option<HostResponse>, WakeError> {
+        let response = match self.incoming.try_recv() {
+            Ok(TestProtocolIncoming::Response(response)) => *response,
+            Ok(TestProtocolIncoming::Closed) => {
+                return Err(test_protocol_error("test host closed the protocol session"));
+            }
+            Ok(TestProtocolIncoming::DecodeError(error)) => {
+                return Err(test_protocol_error(format!(
+                    "could not decode response: {error}"
+                )));
+            }
+            Err(mpsc::TryRecvError::Empty) => return Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(test_protocol_error(
+                    "test-host response reader disconnected",
+                ));
+            }
+        };
+        self.accept_response(response).map(Some)
+    }
+
+    fn accept_response(&mut self, response: HostResponse) -> Result<HostResponse, WakeError> {
+        if response.protocol_version != PROTOCOL_VERSION || response.build_id != HOST_BUILD_ID {
+            return Err(test_protocol_error(
+                "test host returned a mismatched protocol/build envelope",
+            ));
+        }
+        let expected_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| test_protocol_error("test-host response sequence overflowed"))?;
+        if response.sequence != expected_sequence {
+            return Err(test_protocol_error(format!(
+                "test host response sequence {}, expected {}",
+                response.sequence, expected_sequence
+            )));
+        }
+        self.next_sequence = response.sequence;
+        Ok(response)
+    }
+
+    fn await_control_ack(
+        &mut self,
+        request_id: u64,
+        matches_ack: impl Fn(&HostAck) -> bool,
+    ) -> Result<(), WakeError> {
+        let started = Instant::now();
+        loop {
+            if started.elapsed() >= TEST_HOST_CONTROL_TIMEOUT {
+                return Err(test_protocol_error(format!(
+                    "test host did not acknowledge request {request_id} within 10 seconds"
+                )));
+            }
+            let Some(response) = self.receive_response()? else {
+                continue;
+            };
+            if self.watch_request_id == Some(response.request_id)
+                && response.request_id != request_id
+            {
+                self.record_watch_response(response)?;
+                continue;
+            }
+            if response.request_id != request_id {
+                return Err(test_protocol_error(format!(
+                    "response {} does not match control request {request_id}",
+                    response.request_id
+                )));
+            }
+            match response.body {
+                HostResponseBody::Ack { command } if matches_ack(&command) => return Ok(()),
+                HostResponseBody::Error { error, .. } => return Err(wake_error_from_host(error)),
+                _ => {
+                    return Err(test_protocol_error(
+                        "test host returned the wrong control response",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn record_event(&mut self, active_run: &str, event: HostEvent) -> Result<(), WakeError> {
+        let event = match event {
+            HostEvent::RunStart { run_id, watching } if run_id == active_run => {
+                TestSessionEvent::RunStart { run_id, watching }
+            }
+            HostEvent::TestCaseResult {
+                run_id,
+                suite_id,
+                result,
+            } if run_id == active_run => TestSessionEvent::TestCaseResult {
+                run_id,
+                suite_id,
+                result,
+            },
+            HostEvent::SuiteResult { run_id, result } if run_id == active_run => {
+                TestSessionEvent::SuiteResult { run_id, result }
+            }
+            HostEvent::Diagnostic { run_id, diagnostic }
+                if run_id.as_deref().is_none_or(|run_id| run_id == active_run) =>
+            {
+                TestSessionEvent::Diagnostic { run_id, diagnostic }
+            }
+            _ => {
+                return Err(test_protocol_error(format!(
+                    "test host emitted an event for a run other than `{active_run}`"
+                )));
+            }
+        };
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn close_transport(&mut self) {
+        self.reader_stop.store(true, Ordering::Release);
+        let _ = self.writer.shutdown(Shutdown::Both);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.closed = true;
+    }
+}
+
+impl Drop for TestProtocolSession {
+    fn drop(&mut self) {
+        self.close_transport();
+    }
+}
+
+fn read_test_protocol_frames(
+    mut stream: TcpStream,
+    sender: &mpsc::Sender<TestProtocolIncoming>,
+    stop: &AtomicBool,
+) {
+    if let Err(error) = stream.set_read_timeout(Some(TEST_HOST_READER_POLL_INTERVAL)) {
+        let _ = sender.send(TestProtocolIncoming::DecodeError(error.to_string()));
+        return;
+    }
+    let mut decoder = FrameDecoder::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                let incoming = if decoder.is_empty() {
+                    TestProtocolIncoming::Closed
+                } else {
+                    TestProtocolIncoming::DecodeError(
+                        "session ended in the middle of a frame".to_string(),
+                    )
+                };
+                let _ = sender.send(incoming);
+                return;
+            }
+            Ok(length) => {
+                decoder.push(&chunk[..length]);
+                loop {
+                    match decoder.decode_next::<HostResponse>() {
+                        Ok(Some(response)) => {
+                            if sender
+                                .send(TestProtocolIncoming::Response(Box::new(response)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ =
+                                sender.send(TestProtocolIncoming::DecodeError(error.to_string()));
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                let _ = sender.send(TestProtocolIncoming::DecodeError(error.to_string()));
+                return;
+            }
+        }
+    }
+}
+
+fn test_protocol_error(message: impl Into<String>) -> WakeError {
+    WakeError::new("WAKE_TEST_HOST", message)
+}
+
+fn wake_error_from_host(error: HostError) -> WakeError {
+    let mut wake_error = WakeError::new(error.code, error.message);
+    wake_error.path = error.path;
+    wake_error
+}
+
+fn resolve_test_host(explicit: Option<&Path>) -> Result<PathBuf, WakeError> {
+    let candidate = explicit
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("WAKE_TEST_HOST_PATH").map(PathBuf::from))
+        .or_else(|| {
+            let executable = std::env::current_exe().ok()?;
+            Some(executable.with_file_name(if cfg!(windows) {
+                "wake-test-host.exe"
+            } else {
+                "wake-test-host"
+            }))
+        })
+        .ok_or_else(|| WakeError::new("WAKE_TEST_HOST", "could not resolve test host path"))?;
+    if !candidate.is_file() {
+        return Err(WakeError::new(
+            "WAKE_TEST_HOST",
+            "test host executable is missing; reinstall Wake or set WAKE_TEST_HOST_PATH",
+        )
+        .at(&candidate));
+    }
+    Ok(candidate)
+}
+
+fn test_host_token() -> Result<String, WakeError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        WakeError::new(
+            "WAKE_TEST_HOST",
+            format!("could not create test-host authentication token: {error}"),
+        )
+    })?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push(char::from(HEX[usize::from(byte >> 4)]));
+        token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(token)
 }
 
 fn execute_build(
@@ -3190,6 +4268,576 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn test_session_event_fields_use_the_public_camel_case_contract() {
+        let event = TestSessionEvent::TestCaseResult {
+            run_id: "run-public-contract".to_string(),
+            suite_id: "suite-public-contract".to_string(),
+            result: Box::new(TestCaseResult {
+                id: "case-public-contract".to_string(),
+                name: "case".to_string(),
+                full_name: "suite case".to_string(),
+                status: TestStatus::Passed,
+                duration_ms: 1,
+                assertions: 1,
+                attempts: 1,
+                location: None,
+                failures: Vec::new(),
+            }),
+        };
+        let serialized = serde_json::to_value(event).unwrap();
+
+        assert_eq!(serialized["type"], "testCaseResult");
+        assert_eq!(serialized["runId"], "run-public-contract");
+        assert_eq!(serialized["suiteId"], "suite-public-contract");
+        assert!(serialized.get("run_id").is_none());
+        assert!(serialized.get("suite_id").is_none());
+    }
+
+    fn test_protocol_pair() -> (TestProtocolSession, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (
+            TestProtocolSession::new(client, "test-token".to_string()).unwrap(),
+            server,
+        )
+    }
+
+    fn test_host_response(request_id: u64, sequence: u64, body: HostResponseBody) -> HostResponse {
+        HostResponse {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: HOST_BUILD_ID.to_string(),
+            request_id,
+            sequence,
+            body,
+        }
+    }
+
+    fn empty_test_result(run_id: String) -> TestRunResult {
+        TestRunResult::empty(
+            run_id,
+            "test-seed".to_string(),
+            wake_test_contract::TestEnvironmentInfo {
+                kind: "dom".to_string(),
+                react: None,
+                react_dom: None,
+                v8: "test-v8".to_string(),
+                browser: None,
+            },
+        )
+    }
+
+    #[test]
+    fn test_protocol_reuses_one_connection_for_run_events_and_shutdown() {
+        let (mut protocol, mut server) = test_protocol_pair();
+        let host = thread::spawn(move || {
+            let run: HostRequest = wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            let HostCommand::Run { run_id, .. } = run.command else {
+                panic!("expected run command");
+            };
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    run.request_id,
+                    1,
+                    HostResponseBody::Ack {
+                        command: HostAck::Run {
+                            run_id: run_id.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    run.request_id,
+                    2,
+                    HostResponseBody::Event {
+                        event: Box::new(HostEvent::RunStart {
+                            run_id: run_id.clone(),
+                            watching: false,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    run.request_id,
+                    3,
+                    HostResponseBody::Result {
+                        run_id: run_id.clone(),
+                        result: Box::new(empty_test_result(run_id)),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let shutdown: HostRequest =
+                wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            assert!(matches!(shutdown.command, HostCommand::Shutdown));
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    shutdown.request_id,
+                    4,
+                    HostResponseBody::Ack {
+                        command: HostAck::Shutdown,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+
+        let result = protocol
+            .run(TestOptions::default(), &CancellationToken::default())
+            .unwrap();
+        assert!(result.success);
+        let events = protocol.drain_events();
+        assert!(matches!(
+            &events[..],
+            [
+                TestSessionEvent::RunStart { run_id, watching: false },
+                TestSessionEvent::RunComplete { result }
+            ] if run_id == &result.run_id
+        ));
+        protocol.shutdown().unwrap();
+        protocol.close_transport();
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn test_protocol_cancel_uses_the_active_connection_and_resolves_cancelled_result() {
+        let (mut protocol, mut server) = test_protocol_pair();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let host = thread::spawn(move || {
+            let run: HostRequest = wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            let HostCommand::Run { run_id, .. } = run.command else {
+                panic!("expected run command");
+            };
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    run.request_id,
+                    1,
+                    HostResponseBody::Ack {
+                        command: HostAck::Run {
+                            run_id: run_id.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    run.request_id,
+                    2,
+                    HostResponseBody::Event {
+                        event: Box::new(HostEvent::RunStart {
+                            run_id: run_id.clone(),
+                            watching: false,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+            started_tx.send(()).unwrap();
+
+            let cancel: HostRequest =
+                wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            assert!(matches!(
+                &cancel.command,
+                HostCommand::Cancel { run_id: cancelled } if cancelled == &run_id
+            ));
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    cancel.request_id,
+                    3,
+                    HostResponseBody::Ack {
+                        command: HostAck::Cancel {
+                            run_id: run_id.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            let mut result = empty_test_result(run_id.clone());
+            result.success = false;
+            result.termination_reason = TestTerminationReason::Cancelled;
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    run.request_id,
+                    4,
+                    HostResponseBody::Result {
+                        run_id,
+                        result: Box::new(result),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let shutdown: HostRequest =
+                wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    shutdown.request_id,
+                    5,
+                    HostResponseBody::Ack {
+                        command: HostAck::Shutdown,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let cancellation = CancellationToken::default();
+        let cancelling = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            started_rx.recv().unwrap();
+            cancelling.cancel();
+        });
+
+        let result = protocol.run(TestOptions::default(), &cancellation).unwrap();
+        assert!(!result.success);
+        assert_eq!(result.termination_reason, TestTerminationReason::Cancelled);
+        protocol.shutdown().unwrap();
+        protocol.close_transport();
+        canceller.join().unwrap();
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn test_protocol_validates_build_request_and_sequence_envelopes() {
+        for invalid in ["build", "request", "sequence"] {
+            let (mut protocol, mut server) = test_protocol_pair();
+            let host = thread::spawn(move || {
+                let request: HostRequest =
+                    wake_test_contract::protocol::read_frame(&mut server).unwrap();
+                let HostCommand::StartWatch { watch_id, .. } = request.command else {
+                    panic!("expected start-watch command");
+                };
+                let mut response = test_host_response(
+                    request.request_id,
+                    1,
+                    HostResponseBody::Ack {
+                        command: HostAck::StartWatch { watch_id },
+                    },
+                );
+                match invalid {
+                    "build" => response.build_id = "incompatible-build".to_string(),
+                    "request" => response.request_id += 1,
+                    "sequence" => response.sequence += 1,
+                    _ => unreachable!(),
+                }
+                write_frame(&mut server, &response).unwrap();
+            });
+
+            let error = protocol.start_watch(TestOptions::default()).unwrap_err();
+            assert_eq!(error.code, "WAKE_TEST_HOST", "{invalid}");
+            protocol.close_transport();
+            host.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_protocol_pre_start_watch_error_is_diagnostic_and_the_next_run_recovers() {
+        let (mut protocol, mut server) = test_protocol_pair();
+        let host = thread::spawn(move || {
+            let start: HostRequest = wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            let HostCommand::StartWatch { watch_id, .. } = start.command else {
+                panic!("expected start-watch command");
+            };
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    start.request_id,
+                    1,
+                    HostResponseBody::Ack {
+                        command: HostAck::StartWatch {
+                            watch_id: watch_id.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    start.request_id,
+                    2,
+                    HostResponseBody::Event {
+                        event: Box::new(HostEvent::WatchReady {
+                            watch_id: watch_id.clone(),
+                            root: "/workspace".to_string(),
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    start.request_id,
+                    3,
+                    HostResponseBody::WatchRunError {
+                        watch_id: watch_id.clone(),
+                        run_id: None,
+                        started: false,
+                        error: HostError {
+                            code: "WAKE_TEST_RUNTIME".to_string(),
+                            message: "temporary pre-start failure".to_string(),
+                            path: Some("view.test.tsx".to_string()),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    start.request_id,
+                    4,
+                    HostResponseBody::Event {
+                        event: Box::new(HostEvent::RunStart {
+                            run_id: "watch-run-recovery".to_string(),
+                            watching: true,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    start.request_id,
+                    5,
+                    HostResponseBody::Event {
+                        event: Box::new(HostEvent::RunComplete {
+                            watch_id: watch_id.clone(),
+                            run_id: "watch-run-recovery".to_string(),
+                            result: Box::new(empty_test_result("watch-run-recovery".to_string())),
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let stop: HostRequest = wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    stop.request_id,
+                    6,
+                    HostResponseBody::Ack {
+                        command: HostAck::StopWatch { watch_id },
+                    },
+                ),
+            )
+            .unwrap();
+            let shutdown: HostRequest =
+                wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            write_frame(
+                &mut server,
+                &test_host_response(
+                    shutdown.request_id,
+                    7,
+                    HostResponseBody::Ack {
+                        command: HostAck::Shutdown,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+
+        protocol.start_watch(TestOptions::default()).unwrap();
+        for _ in 0..100 {
+            protocol.poll_watch_events().unwrap();
+            if protocol
+                .events
+                .iter()
+                .any(|event| matches!(event, TestSessionEvent::RunComplete { .. }))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let events = protocol.drain_events();
+        assert!(matches!(
+            &events[..],
+            [
+                TestSessionEvent::Diagnostic { run_id: None, diagnostic },
+                TestSessionEvent::RunStart { run_id: recovered, .. },
+                TestSessionEvent::RunComplete { result },
+            ] if diagnostic.code == "WAKE_TEST_RUNTIME"
+                && recovered == "watch-run-recovery"
+                && result.run_id == *recovered
+        ));
+        protocol.stop_watch().unwrap();
+        protocol.shutdown().unwrap();
+        protocol.close_transport();
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn test_protocol_started_watch_error_is_diagnostic_then_terminal() {
+        let (mut protocol, mut server) = test_protocol_pair();
+        let host = thread::spawn(move || {
+            let start: HostRequest = wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            let HostCommand::StartWatch { watch_id, .. } = start.command else {
+                panic!("expected start-watch command");
+            };
+            for response in [
+                HostResponseBody::Ack {
+                    command: HostAck::StartWatch {
+                        watch_id: watch_id.clone(),
+                    },
+                },
+                HostResponseBody::Event {
+                    event: Box::new(HostEvent::WatchReady {
+                        watch_id: watch_id.clone(),
+                        root: "/workspace".to_string(),
+                    }),
+                },
+                HostResponseBody::Event {
+                    event: Box::new(HostEvent::RunStart {
+                        run_id: "fatal-run".to_string(),
+                        watching: true,
+                    }),
+                },
+                HostResponseBody::WatchRunError {
+                    watch_id,
+                    run_id: Some("fatal-run".to_string()),
+                    started: true,
+                    error: HostError {
+                        code: "WAKE_TEST_HOST".to_string(),
+                        message: "fatal host failure".to_string(),
+                        path: None,
+                    },
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                write_frame(
+                    &mut server,
+                    &test_host_response(start.request_id, response.0 as u64 + 1, response.1),
+                )
+                .unwrap();
+            }
+        });
+
+        protocol.start_watch(TestOptions::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = loop {
+            match protocol.poll_watch_events() {
+                Ok(()) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(()) => panic!("watch terminal did not arrive before the deadline"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.code, "WAKE_TEST_HOST");
+        assert!(!protocol.is_watching());
+        assert!(matches!(
+            &protocol.drain_events()[..],
+            [
+                TestSessionEvent::RunStart { run_id, .. },
+                TestSessionEvent::Diagnostic {
+                    run_id: Some(failed),
+                    diagnostic,
+                },
+                TestSessionEvent::Closed,
+            ] if run_id == "fatal-run"
+                && failed == run_id
+                && diagnostic.message == "fatal host failure"
+        ));
+        protocol.close_transport();
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn test_protocol_started_run_error_closes_the_public_event_sequence() {
+        let (mut protocol, mut server) = test_protocol_pair();
+        let host = thread::spawn(move || {
+            let request: HostRequest =
+                wake_test_contract::protocol::read_frame(&mut server).unwrap();
+            let HostCommand::Run { run_id, .. } = request.command else {
+                panic!("expected run command");
+            };
+            for (index, body) in [
+                HostResponseBody::Ack {
+                    command: HostAck::Run {
+                        run_id: run_id.clone(),
+                    },
+                },
+                HostResponseBody::Event {
+                    event: Box::new(HostEvent::RunStart {
+                        run_id: run_id.clone(),
+                        watching: false,
+                    }),
+                },
+                HostResponseBody::Error {
+                    run_id: Some(run_id),
+                    error: HostError {
+                        code: "WAKE_TEST_CONFIG".to_string(),
+                        message: "invalid test configuration".to_string(),
+                        path: None,
+                    },
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                write_frame(
+                    &mut server,
+                    &test_host_response(request.request_id, index as u64 + 1, body),
+                )
+                .unwrap();
+            }
+        });
+
+        let error = protocol
+            .run(TestOptions::default(), &CancellationToken::default())
+            .unwrap_err();
+        assert_eq!(error.code, "WAKE_TEST_CONFIG");
+        assert!(matches!(
+            &protocol.drain_events()[..],
+            [
+                TestSessionEvent::RunStart {
+                    watching: false,
+                    ..
+                },
+                TestSessionEvent::Closed,
+            ]
+        ));
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn test_host_state_errors_preserve_their_public_codes() {
+        for code in [
+            "WAKE_TEST_BUSY",
+            "WAKE_TEST_UNKNOWN_RUN",
+            "WAKE_TEST_UNKNOWN_WATCH",
+        ] {
+            let error = wake_error_from_host(HostError {
+                code: code.to_string(),
+                message: "state error".to_string(),
+                path: None,
+            });
+            assert_eq!(error.code, code);
+        }
+    }
 
     #[test]
     fn diagnostic_locations_preserve_unicode_crlf_and_safe_fallbacks() {

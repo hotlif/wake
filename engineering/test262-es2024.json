@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "contract": "ADR-0020",
+  "suite": "test262",
+  "target": "ES2024",
+  "commit": "3655e7464de3d52643ecddd4b5f9f4f3e7f62398",
+  "archiveUrl": "https://github.com/tc39/test262/archive/3655e7464de3d52643ecddd4b5f9f4f3e7f62398.tar.gz",
+  "sha256": "2d36d6affd4d527f5022c55c486a86ae499e02eb88182b76b5463958db49094d",
+  "license": "BSD-3-Clause",
+  "expectedFiles": 209,
+  "expectedVariants": 418,
+  "selectedRoots": [
+    "test/built-ins/Promise/withResolvers",
+    "test/built-ins/Object/groupBy",
+    "test/built-ins/Map/groupBy",
+    "test/built-ins/String/prototype/isWellFormed",
+    "test/built-ins/String/prototype/toWellFormed",
+    "test/built-ins/ArrayBuffer/prototype/transfer",
+    "test/built-ins/ArrayBuffer/prototype/transferToFixedLength",
+    "test/built-ins/RegExp/unicodeSets"
+  ],
+  "excludedTests": [
+    "test/built-ins/ArrayBuffer/prototype/transfer/this-is-immutable-arraybuffer.js",
+    "test/built-ins/ArrayBuffer/prototype/transferToFixedLength/this-is-immutable-arraybuffer.js",
+    "test/built-ins/RegExp/unicodeSets/generated/rgi-emoji-17.0.js"
+  ],
+  "exclusionReasons": {
+    "test/built-ins/ArrayBuffer/prototype/transfer/this-is-immutable-arraybuffer.js": "Tests the post-ES2024 immutable ArrayBuffer proposal added to this directory in 2025.",
+    "test/built-ins/ArrayBuffer/prototype/transferToFixedLength/this-is-immutable-arraybuffer.js": "Tests the post-ES2024 immutable ArrayBuffer proposal added to this directory in 2025.",
+    "test/built-ins/RegExp/unicodeSets/generated/rgi-emoji-17.0.js": "Generated against Unicode Emoji 17.0, which is outside the ES2024 target profile."
+  }
+}

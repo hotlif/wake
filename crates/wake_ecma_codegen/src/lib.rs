@@ -96,6 +96,31 @@ pub trait ModuleLinker {
 /// to the final `.mjs` or `.cjs` artifact. Returning `None` keeps a runtime external unchanged.
 pub trait ModuleSpecifierRewriter {
     fn rewrite(&self, specifier: &str) -> Option<String>;
+
+    /// Rewrites a request while retaining whether JavaScript will load it through ESM semantics
+    /// or CommonJS `require`. Existing preserve-module callers that do not need conditional-export
+    /// profiles inherit the original [`Self::rewrite`] behavior.
+    fn rewrite_with_kind(&self, specifier: &str, _kind: ModuleSpecifierKind) -> Option<String> {
+        self.rewrite(specifier)
+    }
+
+    /// Whether preserve-CommonJS output should lower literal `import()` through its synchronous
+    /// graph loader. Artifact-oriented rewriters keep native `import()` by default; embedded graph
+    /// runtimes opt in so the request stays inside their owned module registry.
+    fn lower_dynamic_import_to_require(&self) -> bool {
+        false
+    }
+}
+
+/// Runtime loading semantics of a module request emitted by preserve-modules codegen.
+///
+/// Static and dynamic ESM imports share the `Import` profile; raw `require()` calls use
+/// `Require`. Keeping this distinction at the emitter boundary lets a single graph resolver select
+/// the correct conditional export even when one module loads the same package both ways.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleSpecifierKind {
+    Import,
+    Require,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +132,10 @@ pub enum PreserveModuleFormat {
 /// Stable namespace binding used by preserve-modules CommonJS lowering for one import statement.
 /// Callers that build symbol-level live-import substitutions use the same name.
 pub fn preserved_import_namespace(span: Span) -> String {
-    format!("_wi{}", span.lo)
+    // JSX automatic-runtime imports are synthetic (`0..0`) and may precede a real import that
+    // starts at byte zero. Both span bounds are part of the identity so those two declarations
+    // cannot alias while symbol-level live-import substitutions still derive the exact same name.
+    format!("_wi{}_{}", span.lo, span.hi)
 }
 
 struct ExternalOnlyLinker;
@@ -154,6 +182,45 @@ pub fn codegen_preserved_module_mangled(
         false,
     )
     .0
+}
+
+/// Emit one transformed preserve-modules artifact together with its module-local source mappings.
+///
+/// This is the mapped counterpart of [`codegen_preserved_module_mangled`]. Both entry points share
+/// [`codegen_impl`], so enabling mappings cannot select a different parser, lowering, or emitter
+/// path. Generated columns are UTF-16 code units and source positions remain byte offsets into the
+/// caller's parsed source.
+#[allow(clippy::too_many_arguments)]
+pub fn codegen_preserved_module_mangled_with_map(
+    program: &Program,
+    interner: &Interner,
+    format: PreserveModuleFormat,
+    rewriter: &dyn ModuleSpecifierRewriter,
+    define: &[(&str, &str)],
+    minify: bool,
+    rename: Option<&FxHashMap<Span, Atom>>,
+    minify_ctx: Option<&MinifyCtx>,
+    minify_names: bool,
+) -> (String, ModuleMappings) {
+    let linker: Option<&dyn ModuleLinker> = match format {
+        PreserveModuleFormat::EsModule => None,
+        PreserveModuleFormat::CommonJs => Some(&ExternalOnlyLinker),
+    };
+    let (code, mappings) = codegen_impl(
+        program,
+        interner,
+        linker,
+        Some(rewriter),
+        None,
+        define,
+        minify,
+        rename,
+        minify_ctx,
+        false,
+        minify_names,
+        true,
+    );
+    (code, mappings.unwrap_or_default())
 }
 
 /// 生成 **已链接**（ESM→CJS）的模块体，供函数包装打包。
@@ -2008,10 +2075,9 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
 
     fn emit_module_specifier(&mut self, atom: Atom) {
         let specifier = self.name(atom);
-        if let Some(rewritten) = self
-            .specifier_rewriter
-            .and_then(|rewriter| rewriter.rewrite(&specifier))
-        {
+        if let Some(rewritten) = self.specifier_rewriter.and_then(|rewriter| {
+            rewriter.rewrite_with_kind(&specifier, ModuleSpecifierKind::Import)
+        }) {
             self.emit_string(&rewritten);
         } else {
             self.emit_string_atom(atom);
@@ -2029,10 +2095,10 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     }
 
     /// `__wake_require__(id)` 或外部回退 `require("spec")`。
-    fn require_expr(&self, specifier: &str) -> String {
+    fn require_expr(&self, specifier: &str, kind: ModuleSpecifierKind) -> String {
         if let Some(rewritten) = self
             .specifier_rewriter
-            .and_then(|rewriter| rewriter.rewrite(specifier))
+            .and_then(|rewriter| rewriter.rewrite_with_kind(specifier, kind))
         {
             return format!("require({rewritten:?})");
         }
@@ -2052,7 +2118,7 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
     fn require_expr_static(&self, specifier: &str) -> String {
         if let Some(rewritten) = self
             .specifier_rewriter
-            .and_then(|rewriter| rewriter.rewrite(specifier))
+            .and_then(|rewriter| rewriter.rewrite_with_kind(specifier, ModuleSpecifierKind::Import))
         {
             return format!("require({rewritten:?})");
         }
@@ -2505,7 +2571,7 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
             && self.interner.with_resolved(id.name, |n| n == "require")
         {
             let spec = self.name(s.value);
-            let req = self.require_expr(&spec);
+            let req = self.require_expr(&spec, ModuleSpecifierKind::Require);
             self.push(&req);
             return true;
         }
@@ -3368,10 +3434,15 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
                 }
             }
             Expression::Import(i) => {
-                if let Expression::StringLiteral(s) = &i.source
-                    && let Some(rewritten) = self
+                let lower_with_linker = self.linker.is_some()
+                    && self
                         .specifier_rewriter
-                        .and_then(|rewriter| rewriter.rewrite(&self.name(s.value)))
+                        .is_some_and(|rewriter| rewriter.lower_dynamic_import_to_require());
+                if !lower_with_linker
+                    && let Expression::StringLiteral(s) = &i.source
+                    && let Some(rewritten) = self.specifier_rewriter.and_then(|rewriter| {
+                        rewriter.rewrite_with_kind(&self.name(s.value), ModuleSpecifierKind::Import)
+                    })
                 {
                     self.push("import(");
                     self.emit_string(&rewritten);
@@ -3394,7 +3465,7 @@ impl<'i, 'l, 'r, 'd, 'm, 'mc> Codegen<'i, 'l, 'r, 'd, 'm, 'mc> {
                         self.push(&format!("{req_fn}.import({cid}, {id})"));
                     } else {
                         // 未分割 / 外部：与既有实现逐字节一致。
-                        let req = self.require_expr(&spec);
+                        let req = self.require_expr(&spec, ModuleSpecifierKind::Import);
                         self.push("Promise.resolve(");
                         self.push(&req);
                         self.push(")");

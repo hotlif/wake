@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::ThreadId;
 
 use napi::bindgen_prelude::{AbortSignal, AsyncTask};
@@ -22,10 +25,251 @@ struct ServerResource {
     server: wake_app::DevServer,
 }
 
+struct TestContextResource {
+    options: wake_app::TestOptions,
+    host_path: Option<PathBuf>,
+    session: Mutex<Option<wake_app::TestSession>>,
+    events: Mutex<Vec<wake_app::TestSessionEvent>>,
+    event_error: Mutex<Option<WakeError>>,
+    active_cancellation: Mutex<Option<CancellationToken>>,
+    running: AtomicBool,
+    watching: AtomicBool,
+    closed: AtomicBool,
+}
+
+fn test_context_closed_error() -> WakeError {
+    WakeError::new("WAKE_TEST_CONTEXT", "TestContext has already been closed")
+}
+
+impl TestContextResource {
+    fn ensure_not_running(&self, operation: &str) -> Result<(), WakeError> {
+        if self.running.load(Ordering::Acquire) {
+            Err(WakeError::new(
+                "WAKE_TEST_BUSY",
+                format!("cannot {operation} while TestContext.run() is active"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn with_session<T>(
+        &self,
+        startup_cancellation: &CancellationToken,
+        operation: impl FnOnce(&mut wake_app::TestSession) -> Result<T, WakeError>,
+    ) -> Result<T, WakeError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(test_context_closed_error());
+        }
+        let mut slot = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return Err(test_context_closed_error());
+        }
+        if slot.is_none() {
+            *slot = Some(wake_app::TestSession::start_with_host(
+                self.host_path.as_deref(),
+                startup_cancellation,
+            )?);
+        }
+        let session = slot
+            .as_mut()
+            .expect("the persistent test session was initialized");
+        let result = operation(session);
+        let events = session.drain_events();
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(events);
+        drop(slot);
+        result
+    }
+
+    fn run(&self, cancellation: &CancellationToken) -> Result<wake_app::TestRunResult, WakeError> {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return Err(WakeError::new(
+                "WAKE_TEST_BUSY",
+                "TestContext already has an active run",
+            ));
+        }
+        *self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancellation.clone());
+        let result = self.with_session(cancellation, |session| {
+            session.run(self.options.clone(), cancellation)
+        });
+        self.active_cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.running.store(false, Ordering::Release);
+        result
+    }
+
+    fn start_watch(&self) -> Result<(), WakeError> {
+        self.ensure_not_running("start watch")?;
+        let options = self.options.clone();
+        self.with_session(&CancellationToken::default(), |session| {
+            session.start_watch(options)
+        })?;
+        self.watching.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn stop_watch(&self) -> Result<(), WakeError> {
+        self.ensure_not_running("stop watch")?;
+        self.with_session(
+            &CancellationToken::default(),
+            wake_app::TestSession::stop_watch,
+        )?;
+        self.watching.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn watch_control(&self, control: wake_app::TestWatchControl) -> Result<(), WakeError> {
+        self.ensure_not_running("control watch")?;
+        self.with_session(&CancellationToken::default(), |session| {
+            session.watch_control(control)
+        })
+    }
+
+    fn watching(&self) -> bool {
+        self.watching.load(Ordering::Acquire)
+    }
+
+    fn drain_events(&self) -> Result<Vec<wake_app::TestSessionEvent>, WakeError> {
+        let take_buffered = || {
+            std::mem::take(
+                &mut *self
+                    .events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        };
+        let buffered = take_buffered();
+        if !buffered.is_empty() {
+            return Ok(buffered);
+        }
+        if let Some(error) = self
+            .event_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Err(error);
+        }
+        if !self.closed.load(Ordering::Acquire) {
+            match self.session.try_lock() {
+                Ok(mut slot) => {
+                    if let Some(session) = slot.as_mut() {
+                        if let Err(error) = session.poll_events() {
+                            self.watching.store(false, Ordering::Release);
+                            self.events
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .extend(session.drain_events());
+                            *self
+                                .event_error
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                        }
+                        self.events
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .extend(session.drain_events());
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let mut slot = poisoned.into_inner();
+                    if let Some(session) = slot.as_mut() {
+                        if let Err(error) = session.poll_events() {
+                            self.watching.store(false, Ordering::Release);
+                            self.events
+                                .lock()
+                                .unwrap_or_else(|events| events.into_inner())
+                                .extend(session.drain_events());
+                            *self
+                                .event_error
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(error);
+                        }
+                        self.events
+                            .lock()
+                            .unwrap_or_else(|events| events.into_inner())
+                            .extend(session.drain_events());
+                    }
+                }
+            }
+        }
+        let buffered = take_buffered();
+        if !buffered.is_empty() {
+            Ok(buffered)
+        } else if let Some(error) = self
+            .event_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            Err(error)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn close(&self) -> Result<(), WakeError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Some(cancellation) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            cancellation.cancel();
+        }
+        self.watching.store(false, Ordering::Release);
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let result = session
+            .as_mut()
+            .map_or(Ok(()), wake_app::TestSession::close);
+        let mut events = Vec::new();
+        if let Some(session) = &mut session {
+            events.extend(session.drain_events());
+        }
+        if !events
+            .iter()
+            .any(|event| matches!(event, wake_app::TestSessionEvent::Closed))
+        {
+            events.push(wake_app::TestSessionEvent::Closed);
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(events);
+        result
+    }
+}
+
+impl Drop for TestContextResource {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 #[derive(Default)]
 struct EnvResources {
     contexts: Mutex<Vec<Weak<ContextResource>>>,
     servers: Mutex<Vec<Weak<ServerResource>>>,
+    test_contexts: Mutex<Vec<Weak<TestContextResource>>>,
 }
 
 impl EnvResources {
@@ -50,6 +294,19 @@ impl EnvResources {
         };
         for server in servers.into_iter().filter_map(|server| server.upgrade()) {
             let _ = server.server.close();
+        }
+        let test_contexts = {
+            let mut test_contexts = self
+                .test_contexts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *test_contexts)
+        };
+        for context in test_contexts
+            .into_iter()
+            .filter_map(|context| context.upgrade())
+        {
+            let _ = context.close();
         }
     }
 }
@@ -158,6 +415,15 @@ impl RawBuildOptions {
             write,
         }
     }
+}
+
+fn parse_test_options(options_json: Option<String>) -> Result<wake_app::TestOptions, WakeError> {
+    options_json
+        .map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|error| WakeError::new("WAKE_TEST_CONFIG", error.to_string()))
+        })
+        .unwrap_or_else(|| Ok(wake_app::TestOptions::default()))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -351,6 +617,139 @@ pub fn native_bundle(
         }),
         signal,
     )
+}
+
+#[napi(js_name = "runTests")]
+pub fn native_run_tests(
+    options_json: Option<String>,
+    signal: Option<AbortSignal>,
+    host_path: Option<String>,
+) -> AsyncTask<JsonTask> {
+    let cancellation = CancellationToken::default();
+    if let Some(signal) = &signal {
+        let cancellation = cancellation.clone();
+        signal.on_abort(move || cancellation.cancel());
+    }
+    async_json(
+        JsonTask::new(move || {
+            let options = parse_test_options(options_json)?;
+            let host_path = host_path.map(PathBuf::from);
+            let result =
+                wake_app::run_tests_with_host(options, host_path.as_deref(), &cancellation)?;
+            serde_json::to_value(result)
+                .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
+        }),
+        signal,
+    )
+}
+
+#[napi]
+pub struct NativeTestContext {
+    resource: Arc<TestContextResource>,
+}
+
+#[napi]
+impl NativeTestContext {
+    #[napi]
+    pub fn run(&self, signal: Option<AbortSignal>) -> AsyncTask<JsonTask> {
+        let resource = Arc::clone(&self.resource);
+        let cancellation = CancellationToken::default();
+        if let Some(signal) = &signal {
+            let cancellation = cancellation.clone();
+            signal.on_abort(move || cancellation.cancel());
+        }
+        async_json(
+            JsonTask::new(move || {
+                if resource.closed.load(Ordering::Acquire) {
+                    return Err(test_context_closed_error());
+                }
+                let result = resource.run(&cancellation)?;
+                serde_json::to_value(result)
+                    .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
+            }),
+            signal,
+        )
+    }
+
+    #[napi(js_name = "startWatch")]
+    pub fn start_watch(&self) -> napi::Result<()> {
+        self.resource.start_watch().map_err(napi_wake_error)
+    }
+
+    #[napi(js_name = "stopWatch")]
+    pub fn stop_watch(&self) -> napi::Result<()> {
+        self.resource.stop_watch().map_err(napi_wake_error)
+    }
+
+    #[napi(js_name = "watchControl")]
+    pub fn watch_control(&self, control_json: String) -> napi::Result<()> {
+        let control = serde_json::from_str(&control_json)
+            .map_err(|error| napi::Error::from_reason(format!("invalid watch control: {error}")))?;
+        self.resource
+            .watch_control(control)
+            .map_err(napi_wake_error)
+    }
+
+    #[napi(js_name = "eventsJson")]
+    pub fn events_json(&self) -> napi::Result<String> {
+        serde_json::to_value(self.resource.drain_events().map_err(napi_wake_error)?)
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+            .and_then(value_string)
+    }
+
+    #[napi]
+    pub fn close(&self) -> AsyncTask<JsonTask> {
+        let resource = Arc::clone(&self.resource);
+        async_json(
+            JsonTask::new(move || {
+                resource.close()?;
+                Ok(Value::Null)
+            }),
+            None,
+        )
+    }
+
+    #[napi(getter)]
+    pub fn closed(&self) -> bool {
+        self.resource.closed.load(Ordering::Acquire)
+    }
+
+    #[napi(getter)]
+    pub fn watching(&self) -> bool {
+        self.resource.watching()
+    }
+}
+
+#[napi(js_name = "createTestContext")]
+pub fn create_test_context(
+    options_json: Option<String>,
+    host_path: Option<String>,
+) -> napi::Result<NativeTestContext> {
+    let options = parse_test_options(options_json).map_err(napi_wake_error)?;
+    let resources = current_env_resources();
+    let resource = Arc::new(TestContextResource {
+        options,
+        host_path: host_path.map(PathBuf::from),
+        session: Mutex::new(None),
+        events: Mutex::new(Vec::new()),
+        event_error: Mutex::new(None),
+        active_cancellation: Mutex::new(None),
+        running: AtomicBool::new(false),
+        watching: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+    });
+    resources
+        .test_contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::downgrade(&resource));
+    Ok(NativeTestContext { resource })
+}
+
+impl Drop for NativeTestContext {
+    fn drop(&mut self) {
+        let _ = self.resource.close();
+    }
 }
 
 #[napi(js_name = "generateCssToken")]
@@ -933,4 +1332,53 @@ fn napi_wake_error(error: WakeError) -> napi::Error {
         "{\"code\":\"WAKE_INTERNAL\",\"message\":\"failed to serialize Wake error\"}".to_string()
     });
     napi::Error::from_reason(format!("WAKE_ERROR_JSON:{payload}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_options_reject_unknown_fields_at_the_native_boundary() {
+        let error = parse_test_options(Some(r#"{"runInBand":true}"#.to_string())).unwrap_err();
+        assert_eq!(error.code, "WAKE_TEST_CONFIG");
+    }
+
+    #[test]
+    fn closed_test_context_uses_the_public_context_error_code() {
+        let resource = TestContextResource {
+            options: wake_app::TestOptions::default(),
+            host_path: None,
+            session: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            event_error: Mutex::new(None),
+            active_cancellation: Mutex::new(None),
+            running: AtomicBool::new(false),
+            watching: AtomicBool::new(false),
+            closed: AtomicBool::new(true),
+        };
+        let error = resource
+            .with_session(&CancellationToken::default(), |_| Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code, "WAKE_TEST_CONTEXT");
+    }
+
+    #[test]
+    fn concurrent_test_context_run_uses_the_public_busy_error_code() {
+        let resource = TestContextResource {
+            options: wake_app::TestOptions::default(),
+            host_path: None,
+            session: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            event_error: Mutex::new(None),
+            active_cancellation: Mutex::new(None),
+            running: AtomicBool::new(true),
+            watching: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        };
+        let error = resource.run(&CancellationToken::default()).unwrap_err();
+        assert_eq!(error.code, "WAKE_TEST_BUSY");
+        assert_eq!(resource.start_watch().unwrap_err().code, "WAKE_TEST_BUSY");
+        assert_eq!(resource.stop_watch().unwrap_err().code, "WAKE_TEST_BUSY");
+    }
 }

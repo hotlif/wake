@@ -44,6 +44,7 @@ struct PackageInfo {
 
 /// 一份解析好的 PnP 清单。
 pub struct PnpManifest {
+    root: PathBuf,
     enable_top_level_fallback: bool,
     /// 被排除出「顶层 fallback」的 issuer locator 集合。
     fallback_exclusion: FxHashSet<Locator>,
@@ -70,6 +71,14 @@ pub enum PnpError {
 }
 
 impl PnpManifest {
+    /// Return the normalized project root that owns this manifest.
+    ///
+    /// Runtime consumers use this only as a physical invalidation witness when a resolution
+    /// fails; package resolution itself remains owned by [`crate::Resolver`].
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// 查找 `dir` 所属的 Yarn PnP 项目根目录。
     ///
     /// 根发现与清单解析分离，使需要缓存解析上下文的产品边缘可以用稳定的项目根作为 key，
@@ -77,11 +86,13 @@ impl PnpManifest {
     pub fn discover_root(fs: &dyn FileSystem, start_dir: &Path) -> Option<PathBuf> {
         let mut dir = normalize(start_dir);
         loop {
-            if fs.is_file(&dir.join(".pnp.cjs")) {
+            if fs.is_file(&dir.join(".pnp.cjs")) || fs.is_file(&dir.join(".pnp.data.json")) {
                 return Some(dir);
             }
             if !dir.pop() {
-                return fs.is_file(Path::new(".pnp.cjs")).then(PathBuf::new);
+                return (fs.is_file(Path::new(".pnp.cjs"))
+                    || fs.is_file(Path::new(".pnp.data.json")))
+                .then(PathBuf::new);
             }
         }
     }
@@ -191,6 +202,7 @@ impl PnpManifest {
         });
 
         Some(PnpManifest {
+            root: normalize(pnp_root),
             enable_top_level_fallback,
             fallback_exclusion,
             fallback_pool,
@@ -547,6 +559,27 @@ fn decode_js_single_quoted(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wake_common::MemoryFileSystem;
+
+    #[test]
+    fn discovers_data_only_pnp_roots() {
+        let fs = MemoryFileSystem::new();
+        fs.insert(
+            "project/.pnp.data.json",
+            r#"{
+                "packageRegistryData": [[null, [[null, {
+                    "packageLocation": "./",
+                    "packageDependencies": [],
+                    "linkType": "SOFT"
+                }]]]]
+            }"#,
+        );
+        assert_eq!(
+            PnpManifest::discover_root(&fs, Path::new("project/src")),
+            Some(PathBuf::from("project"))
+        );
+        assert!(PnpManifest::discover(&fs, Path::new("project/src")).is_some());
+    }
 
     #[test]
     fn decodes_js_string_with_continuations() {

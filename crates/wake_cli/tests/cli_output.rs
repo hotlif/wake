@@ -74,6 +74,19 @@ fn forced_tui_is_rejected_for_static_commands_without_escape_sequences() {
 }
 
 #[test]
+fn removed_test_flags_report_the_wake_test_config_category() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["test", "--testNamePattern", "renders"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WAKE_TEST_CONFIG"), "{stderr}");
+    assert!(stderr.contains("--testNamePattern"), "{stderr}");
+}
+
+#[test]
 fn bundle_writes_exact_node_commonjs_outfile_without_web_outputs() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

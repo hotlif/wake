@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
-import test from 'node:test'
+import { test } from '@crab-dev/wake/test'
 import vm from 'node:vm'
 
 import * as esm from '../index.mjs'

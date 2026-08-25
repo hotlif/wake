@@ -6,7 +6,8 @@ use wake_ecma_minify::MinifyCtx;
 use wake_ecma_parser::parse;
 
 use crate::{
-    ModuleSpecifierRewriter, PreserveModuleFormat, codegen, codegen_preserved_module_mangled,
+    ModuleSpecifierKind, ModuleSpecifierRewriter, PreserveModuleFormat, codegen,
+    codegen_preserved_module_mangled, codegen_preserved_module_mangled_with_map,
 };
 
 fn directive_helper_program(interner: &Interner) -> wake_ecma_ast::ModuleAst {
@@ -2209,6 +2210,46 @@ fn jsx_dev_runtime_shape_matches_tsc() {
 }
 
 #[test]
+fn preserved_commonjs_keeps_synthetic_jsx_and_byte_zero_import_namespaces_distinct() {
+    use wake_ecma_parser::{ParseOptions, parse_with};
+
+    let interner = Interner::new();
+    let source = "import {value} from './dep.js'; const view = <section>{value}</section>;";
+    let parsed = parse_with(
+        source,
+        &interner,
+        SourceType::Tsx,
+        ParseOptions {
+            jsx_dev: true,
+            file_name: "view.test.tsx",
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let generated = parsed.module.with_ast(|program| {
+        codegen_preserved_module_mangled(
+            program,
+            &interner,
+            PreserveModuleFormat::CommonJs,
+            &ExtensionRewriter(".js"),
+            &[],
+            false,
+            None,
+            None,
+            false,
+        )
+    });
+    let namespaces = generated
+        .split("const ")
+        .skip(1)
+        .filter(|tail| tail.starts_with("_wi"))
+        .map(|tail| tail.split(' ').next().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(namespaces.len(), 2, "{generated}");
+    assert_ne!(namespaces[0], namespaces[1], "{generated}");
+}
+
+#[test]
 fn jsx_dev_runtime_static_children_flag() {
     use wake_ecma_parser::{ParseOptions, parse_with};
     let it = Interner::new();
@@ -2454,6 +2495,26 @@ impl ModuleSpecifierRewriter for ExtensionRewriter {
     }
 }
 
+struct ConditionalKindRewriter;
+
+impl ModuleSpecifierRewriter for ConditionalKindRewriter {
+    fn rewrite(&self, _specifier: &str) -> Option<String> {
+        None
+    }
+
+    fn rewrite_with_kind(&self, specifier: &str, kind: ModuleSpecifierKind) -> Option<String> {
+        let profile = match kind {
+            ModuleSpecifierKind::Import => "import",
+            ModuleSpecifierKind::Require => "require",
+        };
+        Some(format!("{profile}:{specifier}"))
+    }
+
+    fn lower_dynamic_import_to_require(&self) -> bool {
+        true
+    }
+}
+
 fn preserved_module(source: &str, format: PreserveModuleFormat, extension: &'static str) -> String {
     let interner = Interner::new();
     let parsed = parse(source, &interner, SourceType::Module);
@@ -2471,6 +2532,43 @@ fn preserved_module(source: &str, format: PreserveModuleFormat, extension: &'sta
             false,
         )
     })
+}
+
+#[test]
+fn preserved_commonjs_retains_import_and_require_edge_kinds_for_one_specifier() {
+    let interner = Interner::new();
+    let parsed = parse(
+        "import value from 'dual'; const required = require('dual'); export async function load() { return import('dual') } globalThis.result = [value, required];",
+        &interner,
+        SourceType::Module,
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let generated = parsed.module.with_ast(|program| {
+        codegen_preserved_module_mangled(
+            program,
+            &interner,
+            PreserveModuleFormat::CommonJs,
+            &ConditionalKindRewriter,
+            &[],
+            false,
+            None,
+            None,
+            false,
+        )
+    });
+
+    assert!(
+        generated.contains("require(\"import:dual\")"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("require(\"require:dual\")"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("Promise.resolve(require(\"import:dual\"))"),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -2512,5 +2610,59 @@ export default value + local + namespace.value;
         cjs.matches("function __wake_interop_star(").count(),
         1,
         "standalone CJS must define the namespace interop helper exactly once:\n{cjs}"
+    );
+}
+
+#[test]
+fn preserve_commonjs_mapping_uses_the_same_emitter_output() {
+    let source = "import value from './dep.js';\nexport const label: string = `🦀${value}`;";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::TypeScript);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+    let (mapped, mappings) = parsed.module.with_ast(|program| {
+        codegen_preserved_module_mangled_with_map(
+            program,
+            &interner,
+            PreserveModuleFormat::CommonJs,
+            &ExtensionRewriter(".cjs"),
+            &[],
+            false,
+            None,
+            None,
+            false,
+        )
+    });
+    let plain = parsed.module.with_ast(|program| {
+        codegen_preserved_module_mangled(
+            program,
+            &interner,
+            PreserveModuleFormat::CommonJs,
+            &ExtensionRewriter(".cjs"),
+            &[],
+            false,
+            None,
+            None,
+            false,
+        )
+    });
+
+    assert_eq!(
+        mapped, plain,
+        "source-map collection must not change codegen"
+    );
+    assert!(!mappings.is_empty());
+    assert!(
+        mappings
+            .mappings
+            .windows(2)
+            .all(|pair| (pair[0].gen_line, pair[0].gen_col) <= (pair[1].gen_line, pair[1].gen_col)),
+        "preserve-module mappings must be generated in deterministic order"
+    );
+    assert!(
+        mappings
+            .mappings
+            .iter()
+            .any(|mapping| mapping.src_offset as usize == source.find("label").unwrap())
     );
 }

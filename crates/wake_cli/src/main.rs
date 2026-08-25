@@ -1,11 +1,12 @@
 //! Wake command-line frontend.
 
-use std::io::Write;
+use std::ffi::OsString;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use wake_common::{FileSystem, OsFileSystem, RenderStyle, SourceFile, render};
 
 mod console;
@@ -122,6 +123,149 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
         format: OutputFormat,
     },
+    /// Run JavaScript and TypeScript tests with Wake's React-focused test runtime.
+    Test {
+        /// Path or glob filters applied after test discovery.
+        patterns: Vec<String>,
+        /// Project root containing wake.config.toml.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Only run tests whose full names contain this pattern.
+        #[arg(long = "name-pattern")]
+        name_pattern: Option<String>,
+        /// Select a configured test project; may be repeated.
+        #[arg(long = "project")]
+        projects: Vec<String>,
+        /// Override the configured execution environment.
+        #[arg(long, value_enum)]
+        environment: Option<TestEnvironmentArg>,
+        /// Keep the test context open and rerun affected tests after changes.
+        #[arg(long)]
+        watch: bool,
+        /// Run tests affected by source-control changes.
+        #[arg(long, conflicts_with = "related")]
+        changed: bool,
+        /// Run tests related to one or more source paths.
+        #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with = "changed")]
+        related: Vec<PathBuf>,
+        /// Collect coverage.
+        #[arg(long)]
+        coverage: bool,
+        /// Update accepted structural and screenshot snapshots.
+        #[arg(long = "update-snapshots")]
+        update_snapshots: bool,
+        /// Execute suites serially.
+        #[arg(long, conflicts_with = "workers")]
+        serial: bool,
+        /// Worker count: auto, a positive integer, or a percentage such as 50%.
+        #[arg(long, value_parser = parse_test_workers, value_name = "COUNT")]
+        workers: Option<String>,
+        /// Stop after this many failing suites; --bail without a value means one.
+        #[arg(long, num_args = 0..=1, default_missing_value = "1")]
+        bail: Option<u32>,
+        /// Execute one 1-based shard, for example 2/3.
+        #[arg(long, value_parser = parse_test_shard)]
+        shard: Option<String>,
+        /// Deterministic test-order seed.
+        #[arg(long)]
+        seed: Option<String>,
+        /// Shuffle test order deterministically using the seed.
+        #[arg(long)]
+        shuffle: bool,
+        /// Select the built-in result reporter.
+        #[arg(long, value_enum)]
+        reporter: Option<TestReporterArg>,
+        /// Write reporter output to this path.
+        #[arg(long, requires = "reporter")]
+        output: Option<PathBuf>,
+        /// Exit successfully when discovery finds no tests.
+        #[arg(long = "allow-no-tests")]
+        allow_no_tests: bool,
+        /// Explicit Chrome, Edge, or Chromium executable.
+        #[arg(long = "browser-path")]
+        browser_path: Option<PathBuf>,
+        /// Show the browser UI for browser suites.
+        #[arg(long)]
+        headful: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TestEnvironmentArg {
+    Auto,
+    Dom,
+    Browser,
+}
+
+impl TestEnvironmentArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dom => "dom",
+            Self::Browser => "browser",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum TestReporterArg {
+    #[default]
+    Pretty,
+    Json,
+    Junit,
+}
+
+impl TestReporterArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pretty => "pretty",
+            Self::Json => "json",
+            Self::Junit => "junit",
+        }
+    }
+}
+
+fn parse_test_workers(value: &str) -> Result<String, String> {
+    if value == "auto" {
+        return Ok(value.to_string());
+    }
+    if let Some(percent) = value.strip_suffix('%') {
+        let percent = percent.parse::<u8>().map_err(|_| {
+            "workers must be auto, a positive integer, or a percentage from 1% to 100%".to_string()
+        })?;
+        if (1..=100).contains(&percent) {
+            return Ok(format!("{percent}%"));
+        }
+    } else if value.parse::<usize>().is_ok_and(|count| count > 0) {
+        return Ok(value.to_string());
+    }
+    Err("workers must be auto, a positive integer, or a percentage from 1% to 100%".to_string())
+}
+
+fn test_worker_override(value: String) -> wake_app::WorkerOverride {
+    value.parse::<usize>().map_or_else(
+        |_| wake_app::WorkerOverride::Text(value),
+        wake_app::WorkerOverride::Count,
+    )
+}
+
+fn parse_test_shard(value: &str) -> Result<String, String> {
+    let Some((index, total)) = value.split_once('/') else {
+        return Err("shard must use the 1-based INDEX/TOTAL form, for example 2/3".to_string());
+    };
+    if total.contains('/') {
+        return Err("shard must use the 1-based INDEX/TOTAL form, for example 2/3".to_string());
+    }
+    let index = index
+        .parse::<u32>()
+        .map_err(|_| "shard index must be a positive integer".to_string())?;
+    let total = total
+        .parse::<u32>()
+        .map_err(|_| "shard total must be a positive integer".to_string())?;
+    if index == 0 || total == 0 || index > total {
+        return Err("shard requires 1 <= INDEX <= TOTAL".to_string());
+    }
+    Ok(format!("{index}/{total}"))
 }
 
 #[derive(Subcommand)]
@@ -212,8 +356,40 @@ impl From<DocsModeArg> for wake_app::DocsMode {
     }
 }
 
+fn selects_test_command(arguments: &[OsString]) -> bool {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index).and_then(|value| value.to_str()) {
+        match argument {
+            "--no-color" => index += 1,
+            "--ui" => index += 2,
+            value if value.starts_with("--ui=") => index += 1,
+            value if value.starts_with('-') => return false,
+            value => return value == "test",
+        }
+    }
+    false
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let raw_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit()
+        }
+        Err(error) => {
+            if selects_test_command(&raw_arguments) {
+                eprintln!("WAKE_TEST_CONFIG: {error}");
+                return ExitCode::from(2);
+            }
+            error.exit()
+        }
+    };
     let ui = Ui::detect(cli.no_color);
     let style = if ui.color {
         RenderStyle::colored()
@@ -291,6 +467,59 @@ fn main() -> ExitCode {
         Command::Tokenize { file, format } => {
             ensure_static_mode(cli.ui).and_then(|()| cmd_tokenize(&file, format, style, ui))
         }
+        Command::Test {
+            patterns,
+            root,
+            name_pattern,
+            projects,
+            environment,
+            watch,
+            changed,
+            related,
+            coverage,
+            update_snapshots,
+            serial,
+            workers,
+            bail,
+            shard,
+            seed,
+            shuffle,
+            reporter,
+            output,
+            allow_no_tests,
+            browser_path,
+            headful,
+        } => ensure_static_mode(cli.ui).and_then(|()| {
+            let selected_reporter = reporter.unwrap_or_default();
+            cmd_test(
+                wake_app::TestOptions {
+                    root: Some(root),
+                    patterns,
+                    name_pattern,
+                    projects,
+                    environment: environment.map(|environment| environment.as_str().to_string()),
+                    watch,
+                    changed,
+                    related,
+                    coverage,
+                    update_snapshots: update_snapshots.then_some("all".to_string()),
+                    serial,
+                    workers: workers.map(test_worker_override),
+                    bail,
+                    shard,
+                    seed,
+                    shuffle,
+                    reporter: reporter.map(|reporter| reporter.as_str().to_string()),
+                    output: output.clone(),
+                    allow_no_tests,
+                    browser_path,
+                    headful,
+                },
+                selected_reporter,
+                output.as_deref(),
+                ui,
+            )
+        }),
     };
 
     match result {
@@ -306,6 +535,503 @@ fn ensure_static_mode(mode: UiMode) -> Result<(), ExitCode> {
     } else {
         Ok(())
     }
+}
+
+fn cmd_test(
+    options: wake_app::TestOptions,
+    reporter: TestReporterArg,
+    output: Option<&Path>,
+    ui: Ui,
+) -> Result<(), ExitCode> {
+    if reporter == TestReporterArg::Pretty && output.is_some() {
+        eprintln!("wake: --output requires --reporter json or --reporter junit");
+        return Err(ExitCode::from(2));
+    }
+    let cancellation = wake_app::CancellationToken::default();
+    let signal_cancellation = cancellation.clone();
+    ctrlc::set_handler(move || signal_cancellation.cancel()).map_err(|error| {
+        eprintln!("wake: could not install test interrupt handler: {error}");
+        ExitCode::from(2)
+    })?;
+    if options.watch {
+        return cmd_test_watch(options, reporter, output, ui, &cancellation);
+    }
+    match wake_app::run_tests(options, &cancellation) {
+        Ok(result) => {
+            match reporter {
+                TestReporterArg::Pretty => print_pretty_test_result(&result, ui),
+                TestReporterArg::Json => {
+                    let serialized = serde_json::to_string(&result).map_err(|error| {
+                        eprintln!("wake: could not serialize test result: {error}");
+                        ExitCode::from(2)
+                    })?;
+                    write_test_report(&serialized, output)?;
+                }
+                TestReporterArg::Junit => {
+                    write_test_report(&junit_test_report(&result), output)?;
+                }
+            }
+            test_result_exit(&result)
+        }
+        Err(error) => Err(test_command_error_exit(ui, &error, &cancellation)),
+    }
+}
+
+fn test_command_error_exit(
+    ui: Ui,
+    error: &wake_app::WakeError,
+    cancellation: &wake_app::CancellationToken,
+) -> ExitCode {
+    ui.app_error(error);
+    if cancellation.is_cancelled() || error.code == "WAKE_CANCELLED" {
+        ExitCode::from(130)
+    } else {
+        ExitCode::from(2)
+    }
+}
+
+fn cmd_test_watch(
+    options: wake_app::TestOptions,
+    reporter: TestReporterArg,
+    output: Option<&Path>,
+    ui: Ui,
+    cancellation: &wake_app::CancellationToken,
+) -> Result<(), ExitCode> {
+    use crossterm::event::Event;
+
+    let mut session = wake_app::TestSession::start(cancellation)
+        .map_err(|error| test_command_error_exit(ui, &error, cancellation))?;
+    session
+        .start_watch(options)
+        .map_err(|error| test_command_error_exit(ui, &error, cancellation))?;
+    let mut last = None;
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
+        crossterm::terminal::enable_raw_mode().map_err(|error| {
+            eprintln!("wake: could not enable test watch input: {error}");
+            ExitCode::from(2)
+        })?;
+        eprintln!(
+            "Watch keys: a all · f failed · p path · t name · u snapshots · r rerun · q quit"
+        );
+    }
+    let mut prompt: Option<(bool, String)> = None;
+
+    let outcome = (|| {
+        while !cancellation.is_cancelled() {
+            session.poll_events().map_err(|error| {
+                ui.app_error(&error);
+                ExitCode::from(2)
+            })?;
+            for event in session.drain_events() {
+                match event {
+                    wake_app::TestSessionEvent::RunComplete { result } => {
+                        if matches!(
+                            result.termination_reason,
+                            wake_app::TestTerminationReason::WatchRestart
+                                | wake_app::TestTerminationReason::Cancelled
+                        ) {
+                            continue;
+                        }
+                        print_test_result(&result, reporter, output, ui)?;
+                        last = Some(*result);
+                    }
+                    wake_app::TestSessionEvent::Diagnostic {
+                        run_id: None,
+                        diagnostic,
+                    } => {
+                        eprintln!("{}: {}", diagnostic.code, diagnostic.message);
+                    }
+                    _ => {}
+                }
+            }
+            let input_ready = interactive
+                && crossterm::event::poll(Duration::from_millis(10)).map_err(|error| {
+                    eprintln!("wake: could not poll test watch input: {error}");
+                    ExitCode::from(2)
+                })?;
+            if input_ready {
+                let event = crossterm::event::read().map_err(|error| {
+                    eprintln!("wake: could not read test watch input: {error}");
+                    ExitCode::from(2)
+                })?;
+                let Event::Key(key) = event else {
+                    continue;
+                };
+                let action = test_watch_key_action(key.code, key.modifiers);
+                if action == TestWatchKeyAction::Interrupt {
+                    cancellation.cancel();
+                    continue;
+                }
+                if let Some((path_prompt, value)) = prompt.as_mut() {
+                    let control = match key.code {
+                        crossterm::event::KeyCode::Enter => {
+                            eprintln!();
+                            let value = value.trim().to_string();
+                            let path_prompt = *path_prompt;
+                            prompt = None;
+                            (!value.is_empty()).then_some({
+                                if path_prompt {
+                                    wake_app::TestWatchControl::Path { pattern: value }
+                                } else {
+                                    wake_app::TestWatchControl::Name { pattern: value }
+                                }
+                            })
+                        }
+                        crossterm::event::KeyCode::Esc => {
+                            eprintln!();
+                            prompt = None;
+                            None
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            if value.pop().is_some() {
+                                eprint!("\u{8} \u{8}");
+                                let _ = std::io::stderr().flush();
+                            }
+                            None
+                        }
+                        crossterm::event::KeyCode::Char(character)
+                            if !key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            value.push(character);
+                            eprint!("{character}");
+                            let _ = std::io::stderr().flush();
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(control) = control {
+                        session.watch_control(control).map_err(|error| {
+                            ui.app_error(&error);
+                            ExitCode::from(2)
+                        })?;
+                    }
+                    continue;
+                }
+                let control = match action {
+                    TestWatchKeyAction::Interrupt => {
+                        unreachable!("interrupt is handled before prompt input")
+                    }
+                    TestWatchKeyAction::Quit => break,
+                    TestWatchKeyAction::All => Some(wake_app::TestWatchControl::All),
+                    TestWatchKeyAction::Failed => Some(wake_app::TestWatchControl::Failed),
+                    TestWatchKeyAction::UpdateSnapshots => {
+                        Some(wake_app::TestWatchControl::UpdateSnapshots)
+                    }
+                    TestWatchKeyAction::Rerun => Some(wake_app::TestWatchControl::Rerun),
+                    TestWatchKeyAction::PromptPath => {
+                        eprint!("\nPath pattern: ");
+                        let _ = std::io::stderr().flush();
+                        prompt = Some((true, String::new()));
+                        None
+                    }
+                    TestWatchKeyAction::PromptName => {
+                        eprint!("\nTest name pattern: ");
+                        let _ = std::io::stderr().flush();
+                        prompt = Some((false, String::new()));
+                        None
+                    }
+                    TestWatchKeyAction::Ignore => None,
+                };
+                if let Some(control) = control {
+                    session.watch_control(control).map_err(|error| {
+                        ui.app_error(&error);
+                        ExitCode::from(2)
+                    })?;
+                }
+            } else if !interactive {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        if cancellation.is_cancelled() {
+            Err(ExitCode::from(130))
+        } else if let Some(last) = &last {
+            test_result_exit(last)
+        } else {
+            Ok(())
+        }
+    })();
+
+    if interactive {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    if let Err(error) = session.close() {
+        ui.app_error(&error);
+        return Err(ExitCode::from(2));
+    }
+    outcome
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestWatchKeyAction {
+    All,
+    Failed,
+    PromptPath,
+    PromptName,
+    UpdateSnapshots,
+    Rerun,
+    Quit,
+    Interrupt,
+    Ignore,
+}
+
+fn test_watch_key_action(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> TestWatchKeyAction {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    match (code, modifiers) {
+        (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            TestWatchKeyAction::Interrupt
+        }
+        (KeyCode::Char('q'), _) => TestWatchKeyAction::Quit,
+        (KeyCode::Char('a'), _) => TestWatchKeyAction::All,
+        (KeyCode::Char('f'), _) => TestWatchKeyAction::Failed,
+        (KeyCode::Char('p'), _) => TestWatchKeyAction::PromptPath,
+        (KeyCode::Char('t'), _) => TestWatchKeyAction::PromptName,
+        (KeyCode::Char('u'), _) => TestWatchKeyAction::UpdateSnapshots,
+        (KeyCode::Char('r'), _) => TestWatchKeyAction::Rerun,
+        _ => TestWatchKeyAction::Ignore,
+    }
+}
+
+fn print_test_result(
+    result: &wake_app::TestRunResult,
+    reporter: TestReporterArg,
+    output: Option<&Path>,
+    ui: Ui,
+) -> Result<(), ExitCode> {
+    match reporter {
+        TestReporterArg::Pretty => print_pretty_test_result(result, ui),
+        TestReporterArg::Json => {
+            let serialized = serde_json::to_string(result).map_err(|error| {
+                eprintln!("wake: could not serialize test result: {error}");
+                ExitCode::from(2)
+            })?;
+            write_test_report(&serialized, output)?;
+        }
+        TestReporterArg::Junit => write_test_report(&junit_test_report(result), output)?,
+    }
+    Ok(())
+}
+
+fn test_result_exit(result: &wake_app::TestRunResult) -> Result<(), ExitCode> {
+    match result.termination_reason {
+        wake_app::TestTerminationReason::Cancelled
+        | wake_app::TestTerminationReason::WatchRestart => Err(ExitCode::from(130)),
+        wake_app::TestTerminationReason::HostCrash
+        | wake_app::TestTerminationReason::Oom
+        | wake_app::TestTerminationReason::InternalError => Err(ExitCode::from(2)),
+        wake_app::TestTerminationReason::Completed
+        | wake_app::TestTerminationReason::Bail
+        | wake_app::TestTerminationReason::Timeout => {
+            if result.success {
+                Ok(())
+            } else {
+                Err(ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+fn print_pretty_test_result(result: &wake_app::TestRunResult, ui: Ui) {
+    for suite in &result.suites {
+        let status = match suite.status {
+            wake_app::TestStatus::Passed => ui.ok("PASS"),
+            wake_app::TestStatus::Failed => ui.err("FAIL"),
+            wake_app::TestStatus::Skipped => ui.dim("SKIP"),
+            wake_app::TestStatus::Todo => ui.dim("TODO"),
+        };
+        eprintln!("{status} {}", suite.path);
+        for test in &suite.tests {
+            let marker = match test.status {
+                wake_app::TestStatus::Passed => ui.ok("✓"),
+                wake_app::TestStatus::Failed => ui.err("✕"),
+                wake_app::TestStatus::Skipped => ui.dim("○"),
+                wake_app::TestStatus::Todo => ui.dim("✎"),
+            };
+            eprintln!("  {marker} {}", test.name);
+            for failure in &test.failures {
+                let failure = format_test_failure(failure);
+                eprintln!("    {}", failure.replace('\n', "\n    "));
+            }
+        }
+        for failure in &suite.failures {
+            let failure = format_test_failure(failure);
+            eprintln!("  {}", failure.replace('\n', "\n  "));
+        }
+    }
+    eprintln!(
+        "Test Suites: {} passed, {} failed, {} total",
+        result.counts.suites.passed, result.counts.suites.failed, result.counts.suites.total
+    );
+    eprintln!(
+        "Tests:       {} passed, {} failed, {} pending, {} total",
+        result.counts.tests.passed,
+        result.counts.tests.failed,
+        result.counts.tests.skipped + result.counts.tests.todo,
+        result.counts.tests.total
+    );
+    if let Some(artifact) = result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "coverage-text")
+    {
+        match std::fs::read_to_string(&artifact.path) {
+            Ok(report) => eprintln!("{}", report.trim_end()),
+            Err(error) => eprintln!(
+                "WAKE_TEST_COVERAGE: could not read text report {}: {error}",
+                artifact.path
+            ),
+        }
+    }
+    eprintln!("Seed:        {}", result.seed);
+    eprintln!("Time:        {} ms", result.duration_ms);
+    if result.termination_reason != wake_app::TestTerminationReason::Completed {
+        eprintln!("Termination: {:?}", result.termination_reason);
+    }
+    for diagnostic in &result.diagnostics {
+        eprintln!("{}: {}", diagnostic.code, diagnostic.message);
+    }
+}
+
+fn format_test_failure(failure: &wake_app::TestFailure) -> String {
+    let mut rendered = String::new();
+    if let Some(code) = failure.code.as_deref() {
+        rendered.push_str(code);
+        rendered.push_str(": ");
+    }
+    rendered.push_str(&failure.message);
+    if let Some(location) = &failure.location {
+        rendered.push_str(&format!(
+            "\n  at {}:{}:{}",
+            location.path, location.line, location.column
+        ));
+    }
+    if let Some(unified) = failure
+        .diff
+        .as_ref()
+        .and_then(|diff| diff.unified.as_deref())
+        .filter(|diff| !diff.is_empty())
+    {
+        rendered.push('\n');
+        rendered.push_str(unified);
+    }
+    if let Some(stack) = failure
+        .stack
+        .as_deref()
+        .filter(|stack| !stack.is_empty() && !rendered.contains(stack))
+    {
+        rendered.push('\n');
+        rendered.push_str(stack);
+    }
+    rendered
+}
+
+fn format_test_failures(failures: &[wake_app::TestFailure]) -> String {
+    failures
+        .iter()
+        .map(format_test_failure)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn write_test_report(report: &str, output: Option<&Path>) -> Result<(), ExitCode> {
+    if let Some(output) = output {
+        std::fs::write(output, report).map_err(|error| {
+            eprintln!(
+                "wake: could not write test report {}: {error}",
+                output.display()
+            );
+            ExitCode::from(2)
+        })
+    } else {
+        println!("{report}");
+        Ok(())
+    }
+}
+
+fn junit_test_report(result: &wake_app::TestRunResult) -> String {
+    let suite_errors = result
+        .suites
+        .iter()
+        .filter(|suite| !suite.failures.is_empty())
+        .count();
+    let mut report = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\" time=\"{:.3}\">\n",
+        result.counts.tests.total + suite_errors,
+        result.counts.tests.failed,
+        suite_errors,
+        result.counts.tests.skipped + result.counts.tests.todo,
+        result.duration_ms as f64 / 1_000.0
+    );
+    for suite in &result.suites {
+        let failures = suite
+            .tests
+            .iter()
+            .filter(|test| test.status == wake_app::TestStatus::Failed)
+            .count();
+        let skipped = suite
+            .tests
+            .iter()
+            .filter(|test| {
+                matches!(
+                    test.status,
+                    wake_app::TestStatus::Skipped | wake_app::TestStatus::Todo
+                )
+            })
+            .count();
+        let suite_error = usize::from(!suite.failures.is_empty());
+        report.push_str(&format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\" time=\"{:.3}\">\n",
+            xml_escape(&suite.path),
+            suite.tests.len() + suite_error,
+            failures,
+            suite_error,
+            skipped,
+            suite.duration_ms as f64 / 1_000.0
+        ));
+        for test in &suite.tests {
+            report.push_str(&format!(
+                "    <testcase name=\"{}\" classname=\"{}\" time=\"{:.3}\">",
+                xml_escape(&test.name),
+                xml_escape(&suite.path),
+                test.duration_ms as f64 / 1_000.0
+            ));
+            match test.status {
+                wake_app::TestStatus::Passed => {}
+                wake_app::TestStatus::Failed => {
+                    report.push_str("<failure>");
+                    report.push_str(&xml_escape(&format_test_failures(&test.failures)));
+                    report.push_str("</failure>");
+                }
+                wake_app::TestStatus::Skipped | wake_app::TestStatus::Todo => {
+                    report.push_str("<skipped />");
+                }
+            }
+            report.push_str("</testcase>\n");
+        }
+        if !suite.failures.is_empty() {
+            report.push_str("    <testcase name=\"[suite setup]\"><error>");
+            report.push_str(&xml_escape(&format_test_failures(&suite.failures)));
+            report.push_str("</error></testcase>\n");
+        }
+        report.push_str("  </testsuite>\n");
+    }
+    report.push_str("</testsuites>");
+    report
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn use_tui(mode: UiMode) -> Result<bool, ExitCode> {
@@ -1351,4 +2077,378 @@ fn cmd_tokenize(
         return Err(ExitCode::FAILURE);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_category_only_applies_to_the_actual_test_subcommand() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        assert!(selects_test_command(&args(&["test", "--removed"])));
+        assert!(selects_test_command(&args(&[
+            "--no-color",
+            "--ui=plain",
+            "test",
+            "--removed",
+        ])));
+        assert!(!selects_test_command(&args(&[
+            "build",
+            "test",
+            "--removed"
+        ])));
+        assert!(!selects_test_command(&args(&["--removed", "test"])));
+    }
+
+    #[test]
+    fn test_watch_keys_map_to_pure_actions() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for (code, modifiers, expected) in [
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::All,
+            ),
+            (
+                KeyCode::Char('f'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::Failed,
+            ),
+            (
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::PromptPath,
+            ),
+            (
+                KeyCode::Char('t'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::PromptName,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::UpdateSnapshots,
+            ),
+            (
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::Rerun,
+            ),
+            (
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::Quit,
+            ),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                TestWatchKeyAction::Interrupt,
+            ),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::NONE,
+                TestWatchKeyAction::Ignore,
+            ),
+            (
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                TestWatchKeyAction::Ignore,
+            ),
+        ] {
+            assert_eq!(test_watch_key_action(code, modifiers), expected);
+        }
+    }
+
+    #[test]
+    fn test_command_accepts_only_the_wake_dashed_contract() {
+        let cli = Cli::try_parse_from([
+            "wake",
+            "test",
+            "src/**/*.test.tsx",
+            "--root",
+            "fixture",
+            "--name-pattern",
+            "renders",
+            "--project",
+            "client",
+            "--project",
+            "browser",
+            "--environment",
+            "dom",
+            "--watch",
+            "--related",
+            "src/button.tsx",
+            "src/dialog.tsx",
+            "--coverage",
+            "--update-snapshots",
+            "--workers",
+            "50%",
+            "--bail",
+            "--shard",
+            "2/3",
+            "--seed",
+            "release-21",
+            "--shuffle",
+            "--reporter",
+            "json",
+            "--output",
+            "reports/tests.json",
+            "--allow-no-tests",
+            "--browser-path",
+            "chromium",
+            "--headful",
+        ])
+        .unwrap();
+
+        let Command::Test {
+            patterns,
+            root,
+            name_pattern,
+            projects,
+            environment,
+            watch,
+            changed,
+            related,
+            coverage,
+            update_snapshots,
+            serial,
+            workers,
+            bail,
+            shard,
+            seed,
+            shuffle,
+            reporter,
+            output,
+            allow_no_tests,
+            browser_path,
+            headful,
+        } = cli.command
+        else {
+            panic!("expected test command");
+        };
+        assert_eq!(patterns, ["src/**/*.test.tsx"]);
+        assert_eq!(root, PathBuf::from("fixture"));
+        assert_eq!(name_pattern.as_deref(), Some("renders"));
+        assert_eq!(projects, ["client", "browser"]);
+        assert_eq!(environment, Some(TestEnvironmentArg::Dom));
+        assert!(watch);
+        assert!(!changed);
+        assert_eq!(
+            related,
+            [
+                PathBuf::from("src/button.tsx"),
+                PathBuf::from("src/dialog.tsx")
+            ]
+        );
+        assert!(coverage);
+        assert!(update_snapshots);
+        assert!(!serial);
+        assert_eq!(workers.as_deref(), Some("50%"));
+        assert_eq!(bail, Some(1));
+        assert_eq!(shard.as_deref(), Some("2/3"));
+        assert_eq!(seed.as_deref(), Some("release-21"));
+        assert!(shuffle);
+        assert_eq!(reporter, Some(TestReporterArg::Json));
+        assert_eq!(output, Some(PathBuf::from("reports/tests.json")));
+        assert!(allow_no_tests);
+        assert_eq!(browser_path, Some(PathBuf::from("chromium")));
+        assert!(headful);
+    }
+
+    #[test]
+    fn test_command_rejects_removed_jest_flags() {
+        for flag in [
+            "--testNamePattern",
+            "--test-name-pattern",
+            "--runInBand",
+            "--run-in-band",
+            "--updateSnapshot",
+            "--update-snapshot",
+            "--passWithNoTests",
+            "--pass-with-no-tests",
+            "--watchAll",
+            "--watch-all",
+            "--config",
+            "--init",
+            "--json",
+            "--randomize",
+        ] {
+            assert!(
+                Cli::try_parse_from(["wake", "test", flag]).is_err(),
+                "unexpectedly accepted {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_worker_and_shard_values_are_validated_during_cli_parsing() {
+        for workers in ["0", "0%", "101%", "half"] {
+            assert!(
+                Cli::try_parse_from(["wake", "test", "--workers", workers]).is_err(),
+                "unexpectedly accepted workers={workers}"
+            );
+        }
+        for shard in ["0/1", "2/1", "1/0", "1", "1/2/3"] {
+            assert!(
+                Cli::try_parse_from(["wake", "test", "--shard", shard]).is_err(),
+                "unexpectedly accepted shard={shard}"
+            );
+        }
+    }
+
+    #[test]
+    fn serial_and_changed_modes_reject_conflicting_overrides() {
+        assert!(Cli::try_parse_from(["wake", "test", "--serial", "--workers", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["wake", "test", "--changed", "--related", "src/button.tsx"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_overrides_preserve_numeric_and_text_protocol_shapes() {
+        assert_eq!(
+            test_worker_override("3".to_string()),
+            wake_app::WorkerOverride::Count(3)
+        );
+        assert_eq!(
+            test_worker_override("auto".to_string()),
+            wake_app::WorkerOverride::Text("auto".to_string())
+        );
+        assert_eq!(
+            test_worker_override("50%".to_string()),
+            wake_app::WorkerOverride::Text("50%".to_string())
+        );
+    }
+
+    #[test]
+    fn test_exit_codes_follow_the_approved_contract() {
+        assert_eq!(test_result_exit(&test_result(true, "completed")), Ok(()));
+        assert_eq!(
+            test_result_exit(&test_result(false, "completed")),
+            Err(ExitCode::FAILURE)
+        );
+        assert_eq!(
+            test_result_exit(&test_result(false, "cancelled")),
+            Err(ExitCode::from(130))
+        );
+        assert_eq!(
+            test_result_exit(&test_result(false, "host-crash")),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn junit_report_uses_structured_counts_and_failures() {
+        let result = serde_json::from_value::<wake_app::TestRunResult>(serde_json::json!({
+            "schemaVersion": "wake.test.v1",
+            "runId": "run-1",
+            "success": false,
+            "seed": "seed-1",
+            "durationMs": 1250,
+            "terminationReason": "completed",
+            "environment": test_environment(),
+            "suites": [{
+                "id": "suite-1",
+                "path": "src/button.test.tsx",
+                "name": "button.test",
+                "project": "client",
+                "environment": test_environment(),
+                "status": "failed",
+                "durationMs": 1000,
+                "tests": [{
+                    "id": "test-1",
+                    "name": "renders",
+                    "fullName": "Button renders",
+                    "status": "failed",
+                    "durationMs": 20,
+                    "assertions": 1,
+                    "attempts": 1,
+                    "location": null,
+                    "failures": [{
+                        "message": "expected <button>",
+                        "code": "WAKE_TEST_ASSERTION",
+                        "stack": null,
+                        "location": null,
+                        "diff": null
+                    }]
+                }],
+                "failures": [{
+                    "message": "setup & cleanup failed",
+                    "code": "WAKE_TEST_RUNTIME",
+                    "stack": null,
+                    "location": null,
+                    "diff": null
+                }],
+                "snapshot": null
+            }],
+            "counts": {
+                "suites": {"total": 1, "passed": 0, "failed": 1, "skipped": 0},
+                "tests": {"total": 1, "passed": 0, "failed": 1, "skipped": 0, "todo": 0}
+            },
+            "snapshot": {
+                "added": 0,
+                "matched": 0,
+                "unmatched": 0,
+                "updated": 0,
+                "obsolete": 0,
+                "filesRemoved": 0
+            },
+            "coverage": null,
+            "leaks": [],
+            "artifacts": [],
+            "diagnostics": []
+        }))
+        .unwrap();
+
+        let report = junit_test_report(&result);
+        assert!(report.contains(
+            "<testsuites tests=\"2\" failures=\"1\" errors=\"1\" skipped=\"0\" time=\"1.250\">"
+        ));
+        assert!(report.contains("WAKE_TEST_ASSERTION: expected &lt;button&gt;"));
+        assert!(report.contains("WAKE_TEST_RUNTIME: setup &amp; cleanup failed"));
+    }
+
+    fn test_result(success: bool, termination_reason: &str) -> wake_app::TestRunResult {
+        serde_json::from_value(serde_json::json!({
+            "schemaVersion": "wake.test.v1",
+            "runId": "run-1",
+            "success": success,
+            "seed": "seed-1",
+            "durationMs": 0,
+            "terminationReason": termination_reason,
+            "environment": test_environment(),
+            "suites": [],
+            "counts": {
+                "suites": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+                "tests": {"total": 0, "passed": 0, "failed": 0, "skipped": 0, "todo": 0}
+            },
+            "snapshot": {
+                "added": 0,
+                "matched": 0,
+                "unmatched": 0,
+                "updated": 0,
+                "obsolete": 0,
+                "filesRemoved": 0
+            },
+            "coverage": null,
+            "leaks": [],
+            "artifacts": [],
+            "diagnostics": []
+        }))
+        .unwrap()
+    }
+
+    fn test_environment() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "dom",
+            "react": "19.2.0",
+            "reactDom": "19.2.0",
+            "v8": "15.0",
+            "browser": null
+        })
+    }
 }

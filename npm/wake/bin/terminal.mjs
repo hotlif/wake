@@ -1,5 +1,3 @@
-import clipboard from 'clipboardy'
-import open from 'open'
 import stringWidth from 'string-width'
 
 import {
@@ -15,6 +13,24 @@ const BOLD = '\x1b[1m'
 const DIM = '\x1b[2m'
 const MAX_ACTIVITY = 200
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧']
+const OPTIONAL_CLIPBOARD_MODULE = 'clip' + 'boardy'
+const OPTIONAL_OPEN_MODULE = 'op' + 'en'
+
+const defaultClipboard = {
+  async read() {
+    const { default: clipboard } = await import(OPTIONAL_CLIPBOARD_MODULE)
+    return clipboard.read()
+  },
+  async write(value) {
+    const { default: clipboard } = await import(OPTIONAL_CLIPBOARD_MODULE)
+    return clipboard.write(value)
+  },
+}
+
+async function defaultOpenUrl(value) {
+  const { default: open } = await import(OPTIONAL_OPEN_MODULE)
+  return open(value)
+}
 
 export function supportsColor(stream = process.stderr, env = process.env) {
   return stream.isTTY === true && !Object.hasOwn(env, 'NO_COLOR')
@@ -550,8 +566,8 @@ export function createDashboardSession(
     input = process.stdin,
     output = process.stderr,
     ui = createUi(),
-    clipboardAdapter = clipboard,
-    openUrl = open,
+    clipboardAdapter = defaultClipboard,
+    openUrl = defaultOpenUrl,
     env = process.env,
   } = {},
 ) {

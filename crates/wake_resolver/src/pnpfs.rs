@@ -39,6 +39,23 @@ impl PnpFileSystem {
         resolve_virtual(&normalize(path))
     }
 
+    /// Project one logical PnP path onto the physical path used for I/O.
+    ///
+    /// The logical path remains the module identity; callers use this projection only at physical
+    /// boundaries such as diagnostics and file watching.
+    pub fn physical_path(&self, path: &Path) -> PathBuf {
+        self.physical(path)
+    }
+
+    /// Return the physical filesystem object whose mutation can change `path`.
+    ///
+    /// Entries inside a Yarn cache archive are watched through the archive file itself. Virtual
+    /// non-archive paths are watched through their `resolveVirtual` target.
+    pub fn watch_path(&self, path: &Path) -> PathBuf {
+        let physical = self.physical(path);
+        split_zip(&physical).map_or(physical, |(archive, _)| archive)
+    }
+
     /// 打开（或复用缓存）一个 zip 归档。
     fn open_archive(&self, zip_path: &Path) -> io::Result<Arc<ZipArchive>> {
         let key = normalize(zip_path);
@@ -172,5 +189,21 @@ mod tests {
         assert!(!is_zip_name(".zip"));
         assert!(!is_zip_name("zip"));
         assert!(!is_zip_name("foo.zipx"));
+    }
+
+    #[test]
+    fn virtual_zip_paths_project_to_one_physical_watch_archive() {
+        let fs = PnpFileSystem::new(Arc::new(wake_common::MemoryFileSystem::new()));
+        let logical = Path::new(
+            ".yarn/__virtual__/react-virtual/0/cache/react.zip/node_modules/react/index.js",
+        );
+        assert_eq!(
+            fs.physical_path(logical),
+            PathBuf::from(".yarn/cache/react.zip/node_modules/react/index.js")
+        );
+        assert_eq!(
+            fs.watch_path(logical),
+            PathBuf::from(".yarn/cache/react.zip")
+        );
     }
 }

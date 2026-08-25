@@ -252,6 +252,18 @@ impl<'de> Deserialize<'de> for OrderedJsonValue {
 pub struct ResolveError {
     pub specifier: String,
     pub from: PathBuf,
+    witnesses: Vec<PathBuf>,
+}
+
+impl ResolveError {
+    /// Logical filesystem locations whose mutation may make this exact resolution succeed.
+    ///
+    /// These are resolver-owned candidates, not diagnostics guessed by a caller. A PnP-aware
+    /// product must project them through [`PnpFileSystem::watch_path`] before registering a
+    /// physical watcher.
+    pub fn witnesses(&self) -> &[PathBuf] {
+        &self.witnesses
+    }
 }
 
 impl std::fmt::Display for ResolveError {
@@ -483,7 +495,69 @@ impl Resolver {
         ResolveError {
             specifier: specifier.to_string(),
             from: from_dir.to_path_buf(),
+            witnesses: self.resolution_witnesses(specifier, from_dir),
         }
+    }
+
+    fn resolution_witnesses(&self, specifier: &str, from_dir: &Path) -> Vec<PathBuf> {
+        let mut witnesses = std::collections::BTreeSet::from([normalize(from_dir)]);
+        if let Some(aliased) = self.apply_alias(specifier) {
+            witnesses.insert(aliased.clone());
+            if let Some(parent) = aliased.parent() {
+                witnesses.insert(parent.to_path_buf());
+            }
+            return witnesses.into_iter().collect();
+        }
+
+        let specifier_path = Path::new(specifier);
+        if specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier_path.is_absolute()
+        {
+            let candidate = if specifier_path.is_absolute() {
+                normalize(specifier_path)
+            } else {
+                normalize(&from_dir.join(specifier))
+            };
+            if let Some(parent) = candidate.parent() {
+                witnesses.insert(parent.to_path_buf());
+            }
+            witnesses.insert(candidate);
+            return witnesses.into_iter().collect();
+        }
+
+        let (package, subpath) = split_package_ref(specifier);
+        if let Some(pnp) = &self.pnp {
+            witnesses.insert(pnp.root().to_path_buf());
+            if let Ok(package_root) = pnp.resolve_bare(package, from_dir) {
+                let candidate = if subpath.is_empty() {
+                    package_root
+                } else {
+                    normalize(&package_root.join(subpath))
+                };
+                if let Some(parent) = candidate.parent() {
+                    witnesses.insert(parent.to_path_buf());
+                }
+                witnesses.insert(candidate);
+            }
+            return witnesses.into_iter().collect();
+        }
+
+        let mut current = Some(normalize(from_dir));
+        while let Some(directory) = current {
+            let package_root = directory.join("node_modules").join(package);
+            let candidate = if subpath.is_empty() {
+                package_root
+            } else {
+                package_root.join(subpath)
+            };
+            if let Some(parent) = candidate.parent() {
+                witnesses.insert(parent.to_path_buf());
+            }
+            witnesses.insert(candidate);
+            current = directory.parent().map(Path::to_path_buf);
+        }
+        witnesses.into_iter().collect()
     }
 
     fn resolve_uncached(
@@ -496,10 +570,13 @@ impl Resolver {
         if let Some(aliased) = self.apply_alias(specifier) {
             return self.resolve_as_file_or_dir(&aliased);
         }
-        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+        let specifier_path = Path::new(specifier);
+        if specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier_path.is_absolute()
         {
-            let base = if specifier.starts_with('/') {
-                normalize(Path::new(specifier))
+            let base = if specifier_path.is_absolute() {
+                normalize(specifier_path)
             } else {
                 normalize(&from_dir.join(specifier))
             };
@@ -928,6 +1005,17 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_specifiers_use_the_same_file_resolver() {
+        let r = resolver(&[("C:/project/src/value.ts", "export const value = 42")]);
+        assert_eq!(
+            r.resolve("C:/project/src/value", Path::new("C:/project/tests"))
+                .unwrap(),
+            PathBuf::from("C:/project/src/value.ts")
+        );
+    }
+
     #[test]
     fn ts_js_extension_import() {
         // TS 约定：`import "./App.js"` 磁盘上是 `./App.tsx`（moduleResolution nodenext）。
@@ -1234,6 +1322,50 @@ mod tests {
                 .resolve("modern", Path::new("project/src"))
                 .unwrap(),
             PathBuf::from("cache/modern/node_modules/modern/esm/index.mjs")
+        );
+    }
+
+    #[test]
+    fn failed_pnp_exports_keep_resolver_owned_manifest_and_package_witnesses() {
+        let fs = MemoryFileSystem::new();
+        fs.insert(
+            "project/.pnp.data.json",
+            r#"{
+                "packageRegistryData": [
+                    [null, [[null, {
+                        "packageLocation": "./",
+                        "packageDependencies": [["modern", "npm:1.0.0"]],
+                        "linkType": "SOFT"
+                    }]]],
+                    ["modern", [["npm:1.0.0", {
+                        "packageLocation": "../cache/modern/node_modules/modern/",
+                        "packageDependencies": [["modern", "npm:1.0.0"]],
+                        "linkType": "HARD"
+                    }]]]
+                ]
+            }"#,
+        );
+        fs.insert(
+            "cache/modern/node_modules/modern/package.json",
+            r#"{"exports":{".":"./index.js"}}"#,
+        );
+        let manifest = PnpManifest::load(&fs, Path::new("project")).unwrap();
+        let resolver = Resolver::with_pnp(Arc::new(fs), Arc::new(manifest));
+
+        let error = resolver
+            .resolve("modern/private", Path::new("project/src"))
+            .unwrap_err();
+
+        assert!(error.witnesses().contains(&PathBuf::from("project")));
+        assert!(
+            error
+                .witnesses()
+                .contains(&PathBuf::from("cache/modern/node_modules/modern/private"))
+        );
+        assert!(
+            error
+                .witnesses()
+                .contains(&PathBuf::from("cache/modern/node_modules/modern"))
         );
     }
 

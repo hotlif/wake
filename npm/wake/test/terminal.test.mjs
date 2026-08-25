@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
-import { test } from 'node:test'
+import { test } from '@crab-dev/wake/test'
 import {
   applyDashboardEvent,
   createDashboardSession,

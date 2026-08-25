@@ -1,0 +1,14 @@
+[package]
+name = "wake_test_contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stable models and host protocol for Wake Test"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

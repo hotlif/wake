@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.package-version.outputs.version }}
+      source_date_epoch: ${{ steps.source-date.outputs.epoch }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -35,7 +36,12 @@ jobs:
         run: |
           version="$(node -p 'require("./npm/wake/package.json").version')"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Read reproducible source date
+        id: source-date
+        shell: bash
+        run: printf 'epoch=%s\n' "$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
       - run: npm run versions:check
+      - run: npm run browser:conformance:test
       - run: npm run release:check
       - run: npm run npm:test:css
       - run: npm run npm:typecheck:css
@@ -58,15 +64,20 @@ jobs:
             target: x86_64-pc-windows-msvc
             suffix: win32-x64-msvc
             package_dir: wake-win32-x64-msvc
+            host_binary: wake-test-host.exe
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-x64
             package_dir: wake-darwin-x64
+            host_binary: wake-test-host
           - runner: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
             package_dir: wake-darwin-arm64
+            host_binary: wake-test-host
     runs-on: ${{ matrix.runner }}
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -80,6 +91,13 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - run: npm ci --ignore-scripts
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked --target ${{ matrix.target }}
+      - name: Verify pinned Rusty V8 input
+        run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
+      - run: cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}
+        env:
+          CARGO_NET_OFFLINE: "true"
       - run: >-
           npx --no-install napi build --platform --release --strip
           --cwd crates/wake_node
@@ -87,11 +105,16 @@ jobs:
           --package-json-path ../../npm/wake/package.json
           --no-js --dts native.d.ts
           --target ${{ matrix.target }}
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: Stage platform package
         run: >-
-          node -e "require('node:fs').copyFileSync(
-          'npm/wake/wake.${{ matrix.suffix }}.node',
-          'npm/${{ matrix.package_dir }}/wake.${{ matrix.suffix }}.node')"
+          node scripts/stage-test-host.mjs
+          --package-dir npm/${{ matrix.package_dir }}
+          --target ${{ matrix.target }}
+          --suffix ${{ matrix.suffix }}
+          --binding npm/wake/wake.${{ matrix.suffix }}.node
+          --host target/${{ matrix.target }}/release/${{ matrix.host_binary }}
       - name: Verify Components under Yarn PnP
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -120,12 +143,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: linux-x64-gnu
             package_dir: wake-linux-x64-gnu
+            host_binary: wake-test-host
           - runner: ubuntu-24.04-arm
             image: quay.io/pypa/manylinux_2_28_aarch64
             target: aarch64-unknown-linux-gnu
             suffix: linux-arm64-gnu
             package_dir: wake-linux-arm64-gnu
+            host_binary: wake-test-host
     runs-on: ${{ matrix.runner }}
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
     container:
       image: ${{ matrix.image }}
     steps:
@@ -138,6 +165,13 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked --target ${{ matrix.target }}
+      - name: Verify pinned Rusty V8 input
+        run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
+      - run: cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}
+        env:
+          CARGO_NET_OFFLINE: "true"
       - run: >-
           npx --no-install napi build --platform --release --strip
           --cwd crates/wake_node
@@ -145,17 +179,24 @@ jobs:
           --package-json-path ../../npm/wake/package.json
           --no-js --dts native.d.ts
           --target ${{ matrix.target }}
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: Verify glibc baseline
         run: |
           highest="$(readelf --version-info npm/wake/wake.${{ matrix.suffix }}.node | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
           test "$(printf '%s\n' "$highest" 'GLIBC_2.28' | sort -V | tail -1)" = 'GLIBC_2.28'
+          highest_host="$(readelf --version-info target/${{ matrix.target }}/release/${{ matrix.host_binary }} | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          test "$(printf '%s\n' "$highest_host" 'GLIBC_2.28' | sort -V | tail -1)" = 'GLIBC_2.28'
       - name: Run native binding on glibc 2.28
         run: WAKE_NATIVE_PATH="$PWD/npm/wake/wake.${{ matrix.suffix }}.node" node -e "console.log(require(process.env.WAKE_NATIVE_PATH).version())"
       - name: Stage platform package
         run: >-
-          node -e "require('node:fs').copyFileSync(
-          'npm/wake/wake.${{ matrix.suffix }}.node',
-          'npm/${{ matrix.package_dir }}/wake.${{ matrix.suffix }}.node')"
+          node scripts/stage-test-host.mjs
+          --package-dir npm/${{ matrix.package_dir }}
+          --target ${{ matrix.target }}
+          --suffix ${{ matrix.suffix }}
+          --binding npm/wake/wake.${{ matrix.suffix }}.node
+          --host target/${{ matrix.target }}/release/${{ matrix.host_binary }}
       - run: mkdir -p artifacts
       - run: node -e "require('node:fs').mkdirSync('artifacts', {recursive:true})"
       - run: npm run npm:pack:check
@@ -196,6 +237,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: npm-*
@@ -244,7 +286,26 @@ jobs:
                 ;;
               '@crab-dev/wake-'*)
                 test "$native_count" -eq 1
-                test "$(stat -c%s "$archive")" -le 15728640
+                packed_size="$(stat -c%s "$archive")"
+                test "$packed_size" -le 67108864
+                if test "$packed_size" -gt 58720256; then
+                  echo "::warning file=$archive::Platform package is above the 56 MiB packed warning threshold ($packed_size bytes)"
+                fi
+                unpacked_size="$(tar -tvzf "$archive" | awk '{total += $3} END {print total + 0}')"
+                test "$unpacked_size" -le 201326592
+                host_count="$(grep -Ec 'package/test-host/wake-test-host(\.exe)?$' <<<"$list" || true)"
+                test "$host_count" -eq 1
+                if [[ "$name" != *win32* ]]; then
+                  tar -tvzf "$archive" | grep -Eq '^-..x..x..x .*package/test-host/wake-test-host$'
+                fi
+                grep -qx 'package/native-manifest.json' <<<"$list"
+                grep -qx 'package/sbom.spdx.json' <<<"$list"
+                grep -qx 'package/THIRD_PARTY_LICENSES.txt' <<<"$list"
+                unexpected="$(grep -Ev '^package/(LICENSE-APACHE|LICENSE-MIT|README\.md|THIRD_PARTY_LICENSES\.txt|native-manifest\.json|package\.json|sbom\.spdx\.json|wake\.[^/]+\.node|test-host/wake-test-host(\.exe)?)$' <<<"$list" || true)"
+                test -z "$unexpected"
+                extracted="$(mktemp -d)"
+                tar -xzf "$archive" -C "$extracted"
+                node scripts/verify-native-package.mjs "$extracted/package"
                 ;;
               *)
                 echo "Unexpected npm package: $name" >&2
@@ -260,9 +321,185 @@ jobs:
         with:
           subject-path: artifacts/*.tgz
 
+  prepublish-smoke:
+    needs: [verify, audit-tarballs]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [win32-x64-msvc, linux-x64-gnu, linux-arm64-gnu, darwin-x64, darwin-arm64]
+        node: ['22.14.0', '24', '26']
+        include:
+          - platform: win32-x64-msvc
+            runner: windows-latest
+          - platform: linux-x64-gnu
+            runner: ubuntu-24.04
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - platform: darwin-x64
+            runner: macos-15-intel
+          - platform: darwin-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Clean install this build's local tarballs
+        shell: bash
+        env:
+          WAKE_VERSION: ${{ needs.verify.outputs.version }}
+          PLATFORM_PACKAGE: '@crab-dev/wake-${{ matrix.platform }}'
+          PLATFORM_ARCHIVE: 'crab-dev-wake-${{ matrix.platform }}-${{ needs.verify.outputs.version }}.tgz'
+        run: |
+          set -euo pipefail
+          wake_archive="$GITHUB_WORKSPACE/artifacts/crab-dev-wake-${WAKE_VERSION}.tgz"
+          css_archive="$GITHUB_WORKSPACE/artifacts/crab-dev-css-${WAKE_VERSION}.tgz"
+          platform_archive="$GITHUB_WORKSPACE/artifacts/${PLATFORM_ARCHIVE}"
+          test -f "$wake_archive"
+          test -f "$css_archive"
+          test -f "$platform_archive"
+          mkdir local-smoke
+          cd local-smoke
+          npm init -y >/dev/null
+          npm install \
+            --ignore-scripts \
+            --omit=optional \
+            --no-audit \
+            --no-fund \
+            --package-lock=false \
+            "$wake_archive" \
+            "$css_archive" \
+            "$platform_archive" \
+            'react@19.2.8' \
+            'react-dom@19.2.8'
+          node - "$WAKE_VERSION" "$PLATFORM_PACKAGE" "$PLATFORM_ARCHIVE" <<'NODE'
+          const { readFileSync } = require('node:fs')
+          const { join } = require('node:path')
+          const [version, platformPackage, platformArchive] = process.argv.slice(2)
+          const expected = new Map([
+            ['@crab-dev/wake', `crab-dev-wake-${version}.tgz`],
+            ['@crab-dev/css', `crab-dev-css-${version}.tgz`],
+            [platformPackage, platformArchive],
+          ])
+          const rootManifest = JSON.parse(readFileSync('package.json', 'utf8'))
+          for (const [name, archive] of expected) {
+            const requested = rootManifest.dependencies?.[name]
+            if (typeof requested !== 'string'
+              || !requested.startsWith('file:')
+              || !requested.replaceAll('\\', '/').endsWith(archive)) {
+              throw new Error(`${name} was not installed from this build's ${archive}`)
+            }
+            const installed = JSON.parse(readFileSync(join('node_modules', name, 'package.json'), 'utf8'))
+            if (installed.name !== name || installed.version !== version) {
+              throw new Error(`${name} resolved to ${installed.name}@${installed.version}, expected ${name}@${version}`)
+            }
+          }
+          NODE
+      - name: Wake Test CLI, runTests and TestContext smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd local-smoke
+          node -e "require('node:fs').writeFileSync('smoke.test.mjs',\"import {test,expect} from '@crab-dev/wake/test';test('local tarball host',()=>expect(42).toBe(42))\\n\")"
+          npx --no-install wake test smoke.test.mjs --serial
+          node <<'NODE'
+          const { createTestContext, runTests } = require('@crab-dev/wake')
+          async function main() {
+            const options = { root: process.cwd(), patterns: ['smoke.test.mjs'], serial: true }
+            const direct = await runTests(options)
+            if (!direct.success || direct.counts.tests.passed !== 1) {
+              throw new Error(`runTests smoke failed: ${JSON.stringify(direct)}`)
+            }
+            const context = await createTestContext(options)
+            const events = []
+            context.on('runStart', () => events.push('runStart'))
+            context.on('runComplete', () => events.push('runComplete'))
+            context.on('closed', () => events.push('closed'))
+            try {
+              const result = await context.run()
+              if (!result.success || result.counts.tests.passed !== 1) {
+                throw new Error(`TestContext smoke failed: ${JSON.stringify(result)}`)
+              }
+              context.startWatch()
+              if (!context.watching) throw new Error('TestContext did not enter watch mode')
+              context.stopWatch()
+              if (context.watching) throw new Error('TestContext did not leave watch mode')
+            } finally {
+              await context.close()
+            }
+            if (!context.closed || events.join(',') !== 'runStart,runComplete,closed') {
+              throw new Error(`TestContext lifecycle mismatch: closed=${context.closed}; events=${events.join(',')}`)
+            }
+          }
+          main().catch(error => {
+            console.error(error)
+            process.exitCode = 1
+          })
+          NODE
+      - name: Select a system Chrome, Edge or Chromium
+        if: matrix.node == '24'
+        shell: bash
+        run: |
+          set -euo pipefail
+          browser=''
+          case "$RUNNER_OS" in
+            Windows)
+              for candidate in \
+                'C:/Program Files/Google/Chrome/Application/chrome.exe' \
+                'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe' \
+                'C:/Program Files/Microsoft/Edge/Application/msedge.exe' \
+                'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' \
+                'C:/Program Files/Chromium/Application/chrome.exe' \
+                'C:/Program Files (x86)/Chromium/Application/chrome.exe'; do
+                if [[ -f "$candidate" ]]; then browser="$candidate"; break; fi
+              done
+              ;;
+            macOS)
+              for candidate in \
+                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+                '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' \
+                '/Applications/Chromium.app/Contents/MacOS/Chromium'; do
+                if [[ -x "$candidate" ]]; then browser="$candidate"; break; fi
+              done
+              ;;
+            Linux)
+              for command_name in google-chrome-stable google-chrome chromium chromium-browser microsoft-edge-stable microsoft-edge; do
+                if command -v "$command_name" >/dev/null 2>&1; then browser="$(command -v "$command_name")"; break; fi
+              done
+              ;;
+          esac
+          if [[ -z "$browser" ]]; then
+            echo "::error::A compatible system Chrome, Edge or Chromium is required for the Node 24 prepublish gate on $RUNNER_OS/$RUNNER_ARCH"
+            exit 1
+          fi
+          printf 'WAKE_RELEASE_BROWSER_PATH=%s\n' "$browser" >> "$GITHUB_ENV"
+          printf 'Using system browser: %s\n' "$browser"
+      - name: React browser and screenshot smoke from local tarballs
+        if: matrix.node == '24'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd local-smoke
+          node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('local browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('local-ready')})\\n\")"
+          npx --no-install wake test visual.browser.test.mjs \
+            --serial \
+            --browser-path "$WAKE_RELEASE_BROWSER_PATH" \
+            --reporter json \
+            --output browser-result.json
+          node "$GITHUB_WORKSPACE/scripts/check-system-browser-conformance.mjs" \
+            --target "${{ matrix.platform }}" \
+            --result browser-result.json
+          npx --no-install wake test visual.browser.test.mjs --serial --browser-path "$WAKE_RELEASE_BROWSER_PATH"
+
   publish:
     if: github.ref_type == 'tag' && github.ref_name == format('v{0}', needs.verify.outputs.version)
-    needs: [verify, audit-tarballs]
+    needs: [verify, audit-tarballs, prepublish-smoke]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ needs.verify.outputs.version }}
@@ -335,6 +572,8 @@ jobs:
           done
           npx wake --version
           node -e "console.log(require('@crab-dev/wake').version())"
+          node -e "require('node:fs').writeFileSync('smoke.test.mjs',\"import {test,expect} from '@crab-dev/wake/test';test('native host',()=>expect(42).toBe(42))\\n\")"
+          npx wake test smoke.test.mjs --serial
 
   smoke:
     needs: publish
@@ -373,3 +612,15 @@ jobs:
           node -e "const css=require('@crab-dev/css');if(css.cx('wake',{css:true})!=='wake css')process.exit(1)"
           npm run wake-smoke
           node -e "require('@crab-dev/wake').build({cwd:process.cwd()}).then(r=>{if(!r.success)process.exitCode=1})"
+          node -e "require('node:fs').writeFileSync('smoke.test.mjs',\"import {test,expect} from '@crab-dev/wake/test';test('native host',()=>expect(42).toBe(42))\\n\")"
+          npx wake test smoke.test.mjs --serial
+          node -e "require('@crab-dev/wake').runTests({root:process.cwd(),patterns:['smoke.test.mjs']}).then(r=>{if(!r.success||r.counts.tests.passed!==1)process.exitCode=1})"
+      - name: React browser and screenshot smoke
+        if: matrix.node == 24
+        shell: bash
+        run: |
+          cd smoke
+          npm install --ignore-scripts --prefer-online "react@19.2.8" "react-dom@19.2.8"
+          node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('published browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('published-ready')})\\n\")"
+          npx wake test visual.browser.test.mjs --serial
+          npx wake test visual.browser.test.mjs --serial

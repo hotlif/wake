@@ -112,7 +112,7 @@
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "compile": "node scripts/clean.mjs && tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
-    "check": "npm run compile && node --test --test-isolation=none test/*.test.mjs",
+    "check": "npm run compile && node ../../npm/wake/bin/wake.mjs test test/manifest.test.mjs",
     "package:vsix": "npm run compile && node scripts/package-vsix.mjs",
     "test:extension": "npm run compile && node test/run-extension-host.mjs",
     "update:css-data": "node scripts/update-css-data.mjs"

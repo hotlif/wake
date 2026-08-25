@@ -44,13 +44,21 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
 # 声明式项目配置 wake.config.toml（仅 wake_config 使用，CLI 侧，非编译核心）。
-toml = "1.1.4+spec-1.1.0"
+toml = "1.1.4"
 # 组件扫描 include/exclude 正则（仅 wake_scan 使用，CLI 侧，非编译核心）。
 regex = "1"
 # MDX syntax trees stay in the docs edge layer; Wake still compiles JavaScript/TSX.
 markdown = "1.0.0"
 # Browserslist 查询只在配置边缘层使用；编译核心只接收已规范化目标。
 browserslist-rs = "0.20.0"
+# Wake Test embeds the exact engine crates shipped with Deno v2.9.5. Third-party Rust sources are
+# never copied into this repository: crates.io plus Cargo.lock source/checksum fields are the only
+# dependency authority. Release jobs may prefetch the locked crates, but formal builds stay offline.
+deno_core = { version = "=0.410.0", default-features = false, features = ["v8", "reactor-tokio", "v8_use_custom_libcxx"] }
+deno_error = "=0.7.1"
+futures = "0.3.31"
+# Authentication tokens for the loopback test-host protocol come directly from the OS RNG.
+getrandom = "0.3.4"
 
 # —— dev server / 网络（仅 wake_dev_server）——
 # 仅直接启用 broadcast/select 所需能力；运行时、网络与计时能力由 Actix 依赖统一提供。
@@ -79,6 +87,10 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 crossterm = "0.29.0"
 arboard = { version = "=3.6.1", default-features = false, features = ["wayland-data-control"] }
 base64 = "=0.22.1"
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+# Embedded DOM fetch transport. Keep TLS in pure Rust and bound every call in wake_js_runtime;
+# test policy remains owned by wake_test.
+ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 open = "=5.4.0"
 unicode-segmentation = "=1.12.0"
 unicode-width = "=0.2.1"
@@ -97,7 +109,9 @@ wake_ecma_parser = { path = "crates/wake_ecma_parser" }
 wake_ecma_transform = { path = "crates/wake_ecma_transform" }
 wake_ecma_codegen = { path = "crates/wake_ecma_codegen" }
 wake_ecma_minify = { path = "crates/wake_ecma_minify" }
+wake_ecma_vm = { path = "crates/wake_ecma_vm" }
 wake_resolver = { path = "crates/wake_resolver" }
+wake_js_runtime = { path = "crates/wake_js_runtime" }
 wake_graph = { path = "crates/wake_graph" }
 wake_bundler = { path = "crates/wake_bundler" }
 wake_css = { path = "crates/wake_css" }
@@ -109,6 +123,9 @@ wake_dev_server = { path = "crates/wake_dev_server" }
 wake_docs = { path = "crates/wake_docs" }
 wake_tsdoc = { path = "crates/wake_tsdoc" }
 wake_app = { path = "crates/wake_app" }
+wake_test = { path = "crates/wake_test" }
+wake_test_contract = { path = "crates/wake_test_contract" }
+wake_test_browser = { path = "crates/wake_test_browser" }
 
 # —— 测试 / 基准（dev-dependencies 复用）——
 insta = "1.48.0"

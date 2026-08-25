@@ -6,6 +6,8 @@ import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+// This is the one intentionally Node-owned gate: it loads the real `.node` addon and exercises
+// Worker, socket, and cleanup-hook lifecycles. It is not a Wake Test runner or product fallback.
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
@@ -17,8 +19,10 @@ import {
   buildDocs,
   bundle,
   createBuildContext,
+  createTestContext,
   generateCssToken,
   generateDocgen,
+  runTests,
   startDevServer,
   startDocsDevServer,
   version,
@@ -27,10 +31,27 @@ import { analyze, parse, tokenize, transform } from '../experimental.mjs'
 
 const require = createRequire(import.meta.url)
 const commonjs = require('../index.cjs')
+const {
+  getTestContextFatalError,
+  sendTestWatchControl,
+} = require('../test-context-internal.cjs')
 const packageVersion = JSON.parse(
   await readFile(new URL('../package.json', import.meta.url), 'utf8'),
 ).version
 const contexts = []
+
+function loadBuiltNative() {
+  const nativeSuffixes = {
+    'win32-x64': 'win32-x64-msvc',
+    'linux-x64': 'linux-x64-gnu',
+    'linux-arm64': 'linux-arm64-gnu',
+    'darwin-x64': 'darwin-x64',
+    'darwin-arm64': 'darwin-arm64',
+  }
+  const suffix = nativeSuffixes[`${process.platform}-${process.arch}`]
+  assert.ok(suffix, 'the native ABI gate only runs on a supported release target')
+  return require(join(dirname(fileURLToPath(import.meta.url)), '..', `wake.${suffix}.node`))
+}
 
 after(async () => {
   await Promise.all(contexts.map((context) => context.close()))
@@ -43,6 +64,266 @@ test('loads the same API from ESM and CommonJS', () => {
   assert.equal(typeof commonjs.buildLibrary, 'function')
   assert.equal(typeof commonjs.generateCssToken, 'function')
   assert.equal(typeof commonjs.generateDocgen, 'function')
+  assert.equal(typeof commonjs.TestContext.prototype.startWatch, 'function')
+  assert.equal(typeof commonjs.TestContext.prototype.stopWatch, 'function')
+  assert.equal('initTestConfig' in commonjs, false)
+})
+
+test('keeps the raw native test ABI on the persistent v3 context', () => {
+  const rawNative = loadBuiltNative()
+  assert.equal('initTestConfig' in rawNative, false)
+  assert.equal(typeof rawNative.runTests, 'function')
+  assert.equal(typeof rawNative.createTestContext, 'function')
+  assert.equal(typeof rawNative.NativeTestContext, 'function')
+  for (const method of ['run', 'startWatch', 'stopWatch', 'watchControl', 'eventsJson', 'close']) {
+    assert.equal(typeof rawNative.NativeTestContext.prototype[method], 'function', method)
+  }
+})
+
+test('reuses one real native test context across runs and watch control', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-test-context-'))
+  const hostName = process.platform === 'win32' ? 'wake-test-host.exe' : 'wake-test-host'
+  const hostPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'test-host', hostName)
+  const nativeHandle = loadBuiltNative().createTestContext(
+    JSON.stringify({ root: cwd, allowNoTests: true }),
+    hostPath,
+  )
+  const context = new commonjs.TestContext(nativeHandle)
+  const events = []
+  const completedRunIds = []
+  context.on('runStart', (event) => events.push(['start', event.runId]))
+  context.on('runComplete', (result) => events.push(['complete', result.runId]))
+  context.on('closed', () => events.push(['closed']))
+  try {
+    const first = await context.run()
+    const second = await context.run()
+    assert.equal(first.success, true)
+    assert.equal(second.success, true)
+    assert.notEqual(first.runId, second.runId)
+    completedRunIds.push(first.runId, second.runId)
+    context.startWatch()
+    assert.equal(context.watching, true)
+    context.stopWatch()
+    assert.equal(context.watching, false)
+  } finally {
+    await context.close()
+    await rm(cwd, { recursive: true, force: true })
+  }
+  assert.deepEqual(events.map(([type]) => type), [
+    'start', 'complete', 'start', 'complete', 'closed',
+  ])
+  assert.deepEqual(
+    events.filter(([type]) => type === 'start').map(([, runId]) => runId),
+    completedRunIds,
+  )
+})
+
+test('publishes strict Wake test and React entrypoints outside the test realm', async () => {
+  const testExports = [
+    'afterAll',
+    'afterEach',
+    'beforeAll',
+    'beforeEach',
+    'clock',
+    'describe',
+    'expect',
+    'it',
+    'mock',
+    'network',
+    'test',
+  ]
+  const reactExports = [...testExports, ...[
+    'act',
+    'cleanup',
+    'fireEvent',
+    'prettyDOM',
+    'render',
+    'renderHook',
+    'screen',
+    'userEvent',
+    'waitFor',
+    'waitForElementToBeRemoved',
+    'within',
+  ]].sort()
+  const esmTest = await import('../test.mjs')
+  const commonjsTest = require('../test.cjs')
+  const esmReact = await import('../test-react.mjs')
+  const commonjsReact = require('../test-react.cjs')
+
+  assert.deepEqual(Object.keys(esmTest).sort(), testExports)
+  assert.deepEqual(Object.keys(commonjsTest).sort(), testExports)
+  assert.deepEqual(Object.keys(esmReact).sort(), reactExports)
+  assert.deepEqual(Object.keys(commonjsReact).sort(), reactExports)
+  assert.deepEqual(Object.keys(esmTest.mock).sort(), [
+    'actual',
+    'clearAll',
+    'fn',
+    'import',
+    'isolate',
+    'module',
+    'replaceProperty',
+    'resetAll',
+    'restoreAll',
+    'spyOn',
+  ])
+  assert.deepEqual(Object.keys(esmTest.clock).sort(), [
+    'advanceBy',
+    'advanceTo',
+    'fake',
+    'flushMicrotasks',
+    'restore',
+    'runAll',
+    'runNext',
+  ])
+  assert.deepEqual(Object.keys(esmTest.network).sort(), [
+    'allow',
+    'requests',
+    'reset',
+    'route',
+  ])
+  assert.equal(esmTest.it, esmTest.test)
+  assert.equal(commonjsTest.it, commonjsTest.test)
+  assert.equal(esmReact.test, esmTest.test)
+  assert.equal(commonjsReact.test, commonjsTest.test)
+  assert.equal('concurrent' in esmTest.test, false)
+  assert.equal('concurrent' in commonjsTest.test, false)
+
+  for (const invoke of [
+    () => esmTest.test('outside', () => {}),
+    () => commonjsTest.expect(42),
+    () => esmTest.mock.fn(),
+    () => commonjsTest.clock.fake(),
+    () => esmTest.network.route('/api', () => ({ status: 200 })),
+    () => esmReact.render(null),
+    () => commonjsReact.screen.getByRole('button'),
+    () => esmReact.prettyDOM(),
+  ]) {
+    assert.throws(
+      invoke,
+      (error) => error.name === 'WakeError' && error.code === 'WAKE_TEST_CONTEXT',
+    )
+  }
+
+  await assert.rejects(
+    runTests(42),
+    (error) => error instanceof WakeError && error.code === 'WAKE_TEST_CONFIG',
+  )
+  await assert.rejects(
+    createTestContext([]),
+    (error) => error instanceof WakeError && error.code === 'WAKE_TEST_CONFIG',
+  )
+
+  const v1Result = {
+    schemaVersion: 'wake.test.v1',
+    runId: 'run-contract-test',
+    success: true,
+    seed: 'seed-contract-test',
+    durationMs: 1,
+    terminationReason: 'completed',
+    environment: { kind: 'dom', react: null, reactDom: null, v8: 'test', browser: null },
+    suites: [],
+    counts: {
+      suites: { total: 0, passed: 0, failed: 0, skipped: 0 },
+      tests: { total: 0, passed: 0, failed: 0, skipped: 0, todo: 0 },
+    },
+    snapshot: { added: 0, matched: 0, unmatched: 0, updated: 0, obsolete: 0, filesRemoved: 0 },
+    coverage: {
+      summary: {
+        lines: { covered: 0, total: 0, percent: 100 },
+        functions: { covered: 0, total: 0, percent: 100 },
+        blocks: { covered: 0, total: 0, percent: 100 },
+      },
+      files: [],
+      reportArtifactIds: [],
+    },
+    leaks: [],
+    artifacts: [],
+    diagnostics: [],
+  }
+  const envelope = (value) => JSON.stringify({ ok: true, value })
+  const nativeEvents = [
+    { type: 'runStart', runId: 'run-contract-test', watching: false },
+    { type: 'diagnostic', runId: 'run-contract-test', diagnostic: {
+      severity: 'note', code: 'WAKE_TEST_RUNTIME', message: 'native event', path: null, location: null,
+    } },
+    { type: 'runComplete', result: v1Result },
+  ]
+  const nativeContext = {
+    closed: false,
+    watching: false,
+    run: async () => envelope(v1Result),
+    startWatch() { this.watching = true },
+    stopWatch() { this.watching = false },
+    controls: [],
+    watchControl(value) { this.controls.push(JSON.parse(value)) },
+    eventsJson() { return JSON.stringify(nativeEvents.splice(0)) },
+    async close() {
+      this.closed = true
+      nativeEvents.push({ type: 'closed' })
+      return envelope(null)
+    },
+  }
+  const context = new commonjs.TestContext(nativeContext)
+  const starts = []
+  const eventOrder = []
+  context.on('runStart', (event) => starts.push(event))
+  context.on('runStart', () => eventOrder.push('runStart'))
+  context.on('diagnostic', () => eventOrder.push('diagnostic'))
+  context.on('runComplete', () => eventOrder.push('runComplete'))
+  context.on('closed', () => eventOrder.push('closed'))
+  assert.deepEqual(await context.run(), v1Result)
+  assert.deepEqual(starts, [{
+    runId: 'run-contract-test',
+    watching: false,
+  }])
+  assert.deepEqual(eventOrder, ['runStart', 'diagnostic', 'runComplete'])
+  assert.equal(context.watching, false)
+  assert.equal(context.startWatch(), context)
+  assert.equal(context.watching, true)
+  sendTestWatchControl(context, { type: 'failed' })
+  sendTestWatchControl(context, { type: 'name', pattern: 'renders' })
+  assert.deepEqual(nativeContext.controls, [
+    { type: 'failed' },
+    { type: 'name', pattern: 'renders' },
+  ])
+  assert.equal(context.stopWatch(), context)
+  assert.equal(context.watching, false)
+  await context.close()
+  assert.deepEqual(eventOrder, ['runStart', 'diagnostic', 'runComplete', 'closed'])
+})
+
+test('closes a watched context after a fatal host event-pump failure', async () => {
+  let eventReads = 0
+  const nativeContext = {
+    closed: false,
+    watching: false,
+    startWatch() { this.watching = true },
+    stopWatch() { this.watching = false },
+    eventsJson() {
+      if (this.closed) return JSON.stringify([{ type: 'closed' }])
+      if (eventReads++ === 0) return '[]'
+      throw new Error('synthetic protocol failure')
+    },
+    async close() {
+      this.closed = true
+      this.watching = false
+      return JSON.stringify({ ok: true, value: null })
+    },
+  }
+  const context = new commonjs.TestContext(nativeContext)
+  const closed = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('context did not close')), 2_000)
+    context.once('closed', () => {
+      clearTimeout(timeout)
+      resolve()
+    })
+  })
+  context.startWatch()
+  await closed
+  assert.equal(context.closed, true)
+  const fatal = getTestContextFatalError(context)
+  assert.equal(fatal?.code, 'WAKE_TEST_HOST')
+  assert.match(fatal?.message, /synthetic protocol failure/)
 })
 
 test('generates native design tokens with strict references', async () => {
@@ -93,6 +374,15 @@ test('reports platform details when the optional native package is missing', () 
   const script = `
     const Module = require('node:module')
     const load = Module._load
+    const resolve = Module._resolveFilename
+    Module._resolveFilename = function (request) {
+      if (/^@crab-dev\\/wake-(?:win32|linux|darwin)-/.test(request)) {
+        const error = new Error('Simulated missing Wake native package')
+        error.code = 'MODULE_NOT_FOUND'
+        throw error
+      }
+      return resolve.apply(this, arguments)
+    }
     Module._load = function (request) {
       if (/^@crab-dev\\/wake-(?:win32|linux|darwin)-/.test(request)) {
         const error = new Error('Simulated missing Wake native package')

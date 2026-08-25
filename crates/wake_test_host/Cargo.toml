@@ -1,0 +1,23 @@
+[package]
+name = "wake_test_host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Internal isolated host process for Wake JavaScript tests"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wake-test-host"
+path = "src/main.rs"
+
+[dependencies]
+notify.workspace = true
+serde_json.workspace = true
+wake_test.workspace = true
+wake_test_contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

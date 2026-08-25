@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "contract": "ADR-0020",
+  "scope": "ci-release-conformance-only",
+  "versionPolicy": "exact-major",
+  "versionSource": "cdp-browser-get-version",
+  "requiredHeadless": true,
+  "targets": {
+    "win32-x64-msvc": {
+      "major": 151,
+      "acceptedKinds": ["chrome", "edge", "chromium"]
+    },
+    "linux-x64-gnu": {
+      "major": 151,
+      "acceptedKinds": ["chrome", "edge", "chromium"]
+    },
+    "linux-arm64-gnu": {
+      "major": 151,
+      "acceptedKinds": ["chrome", "edge", "chromium"]
+    },
+    "darwin-x64": {
+      "major": 151,
+      "acceptedKinds": ["chrome", "edge", "chromium"]
+    },
+    "darwin-arm64": {
+      "major": 151,
+      "acceptedKinds": ["chrome", "edge", "chromium"]
+    }
+  }
+}

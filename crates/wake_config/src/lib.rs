@@ -10,10 +10,10 @@
 //! 本 crate **只做数据**：不依赖 wake_resolver / wake_bundler，避免依赖倒挂。别名表由
 //! [`Config::resolver_aliases`] 产出 `(前缀, 绝对路径)`，由 CLI 桥接进 `ResolveOptions`。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// 配置文件名（固定）。
 pub const CONFIG_FILE: &str = "wake.config.toml";
@@ -61,6 +61,8 @@ pub struct Config {
     pub react: React,
     /// React 组件文档站配置。
     pub docs: Docs,
+    /// Wake-owned React test runner configuration.
+    pub test: Test,
     /// 手动强制启用/禁用特定 Babel 风格 transform 名。
     pub transforms: TransformControl,
 }
@@ -77,6 +79,364 @@ pub struct BrowserslistOptions {
 pub struct TransformControl {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+}
+
+/// Wake-owned test configuration. This is deliberately not a Jest configuration adapter: every
+/// accepted key is snake_case and every nested table rejects unknown fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Test {
+    pub environment: TestEnvironment,
+    pub include: Vec<String>,
+    pub browser_include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub setup: Vec<String>,
+    pub timeout_ms: u64,
+    pub workers: WorkerCount,
+    pub forbid_only: bool,
+    pub leaks: TestLeakPolicy,
+    pub react: TestReact,
+    pub browser: TestBrowser,
+    pub network: TestNetwork,
+    pub snapshot: TestSnapshot,
+    pub coverage: TestCoverage,
+    #[serde(default, deserialize_with = "deserialize_test_projects")]
+    pub projects: Vec<TestProject>,
+}
+
+impl Default for Test {
+    fn default() -> Self {
+        Self {
+            environment: TestEnvironment::Auto,
+            include: vec!["**/*.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}".to_string()],
+            browser_include: vec![
+                "**/*.browser.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}".to_string(),
+            ],
+            exclude: vec!["**/node_modules/**".to_string(), "**/dist/**".to_string()],
+            setup: Vec::new(),
+            timeout_ms: 5_000,
+            workers: WorkerCount::Auto,
+            forbid_only: false,
+            leaks: TestLeakPolicy::Warn,
+            react: TestReact::default(),
+            browser: TestBrowser::default(),
+            network: TestNetwork::default(),
+            snapshot: TestSnapshot::default(),
+            coverage: TestCoverage::default(),
+            projects: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestEnvironment {
+    #[default]
+    Auto,
+    Dom,
+    Browser,
+}
+
+/// Number of suite workers. TOML accepts `"auto"`, a positive integer, or a percentage such as
+/// `"50%"`; invalid and zero values fail while parsing the configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkerCount {
+    #[default]
+    Auto,
+    Count(usize),
+    Percent(u8),
+}
+
+impl<'de> Deserialize<'de> for WorkerCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Count(usize),
+            Text(String),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Count(0) => Err(serde::de::Error::custom(
+                "workers must be greater than zero",
+            )),
+            Value::Count(count) => Ok(Self::Count(count)),
+            Value::Text(value) if value == "auto" => Ok(Self::Auto),
+            Value::Text(value) => {
+                let percent = value
+                    .strip_suffix('%')
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .filter(|percent| (1..=100).contains(percent))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "workers must be \"auto\", a positive integer, or a percentage from 1% to 100%",
+                        )
+                    })?;
+                Ok(Self::Percent(percent))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestLeakPolicy {
+    Off,
+    #[default]
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestDiagnosticPolicy {
+    Off,
+    Warn,
+    #[default]
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestReact {
+    pub strict_mode: bool,
+    pub cleanup: bool,
+    pub act_warnings: TestDiagnosticPolicy,
+    pub test_id_attribute: String,
+}
+
+impl Default for TestReact {
+    fn default() -> Self {
+        Self {
+            strict_mode: false,
+            cleanup: true,
+            act_warnings: TestDiagnosticPolicy::Error,
+            test_id_attribute: "data-testid".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestBrowser {
+    pub headless: bool,
+    pub sandbox: bool,
+    pub viewport: TestViewport,
+    pub locale: String,
+    pub timezone: String,
+    pub color_scheme: TestColorScheme,
+}
+
+impl Default for TestBrowser {
+    fn default() -> Self {
+        Self {
+            headless: true,
+            sandbox: true,
+            viewport: TestViewport::default(),
+            locale: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            color_scheme: TestColorScheme::Light,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestViewport {
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: f64,
+}
+
+impl Default for TestViewport {
+    fn default() -> Self {
+        Self {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestColorScheme {
+    #[default]
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestNetwork {
+    pub mode: TestNetworkMode,
+    pub allow_hosts: Vec<String>,
+}
+
+impl Default for TestNetwork {
+    fn default() -> Self {
+        Self {
+            mode: TestNetworkMode::Deny,
+            allow_hosts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestNetworkMode {
+    #[default]
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestSnapshot {
+    pub directory: String,
+    pub screenshot_directory: String,
+}
+
+impl Default for TestSnapshot {
+    fn default() -> Self {
+        Self {
+            directory: "__snapshots__".to_string(),
+            screenshot_directory: "__screenshots__".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestCoverage {
+    pub enabled: bool,
+    pub reporters: Vec<TestCoverageReporter>,
+    pub threshold: TestCoverageThreshold,
+    pub per_file: Vec<TestCoverageFileThreshold>,
+}
+
+impl Default for TestCoverage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reporters: vec![TestCoverageReporter::Text],
+            threshold: TestCoverageThreshold::default(),
+            per_file: Vec::new(),
+        }
+    }
+}
+
+/// Minimum percentages required from the aggregate coverage result. A missing metric is not
+/// checked. Values are parsed as either TOML integers or floats and must stay within 0..=100.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestCoverageThreshold {
+    #[serde(default, deserialize_with = "deserialize_optional_coverage_percentage")]
+    pub lines: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_coverage_percentage")]
+    pub functions: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_coverage_percentage")]
+    pub blocks: Option<f64>,
+}
+
+/// Per-file threshold selected with a Wake glob relative to the project root.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestCoverageFileThreshold {
+    #[serde(deserialize_with = "deserialize_non_empty_coverage_pattern")]
+    pub pattern: String,
+    #[serde(default, deserialize_with = "deserialize_optional_coverage_percentage")]
+    pub lines: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_coverage_percentage")]
+    pub functions: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_coverage_percentage")]
+    pub blocks: Option<f64>,
+}
+
+fn deserialize_optional_coverage_percentage<'de, D>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Number {
+        Integer(i64),
+        Float(f64),
+    }
+
+    let value = Option::<Number>::deserialize(deserializer)?.map(|value| match value {
+        Number::Integer(value) => value as f64,
+        Number::Float(value) => value,
+    });
+    if value.is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value)) {
+        return Err(serde::de::Error::custom(
+            "coverage threshold must be a percentage from 0 to 100",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_non_empty_coverage_pattern<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "coverage per-file pattern must not be empty",
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestCoverageReporter {
+    Text,
+    Json,
+    Lcov,
+    Html,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestProject {
+    pub name: String,
+    #[serde(default = "default_test_project_root")]
+    pub root: String,
+    #[serde(default)]
+    pub environment: TestEnvironment,
+}
+
+fn deserialize_test_projects<'de, D>(deserializer: D) -> Result<Vec<TestProject>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let projects = Vec::<TestProject>::deserialize(deserializer)?;
+    let mut names = BTreeSet::new();
+    for project in &projects {
+        if project.name.trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                "test project name must not be empty",
+            ));
+        }
+        if !names.insert(project.name.as_str()) {
+            return Err(serde::de::Error::custom(format!(
+                "test project name {:?} must be unique",
+                project.name
+            )));
+        }
+    }
+    Ok(projects)
+}
+
+fn default_test_project_root() -> String {
+    ".".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -465,6 +825,186 @@ mod tests {
         assert!(c.alias.is_empty());
         assert_eq!(c.public_path(), "/");
         assert!(c.component_scan.is_empty());
+    }
+
+    #[test]
+    fn test_config_defaults_are_wake_owned_and_react_focused() {
+        let test = Config::default().test;
+        assert_eq!(test.environment, TestEnvironment::Auto);
+        assert_eq!(
+            test.include,
+            ["**/*.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"]
+        );
+        assert_eq!(
+            test.browser_include,
+            ["**/*.browser.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"]
+        );
+        assert_eq!(test.exclude, ["**/node_modules/**", "**/dist/**"]);
+        assert!(test.setup.is_empty());
+        assert_eq!(test.timeout_ms, 5_000);
+        assert_eq!(test.workers, WorkerCount::Auto);
+        assert!(!test.forbid_only);
+        assert_eq!(test.leaks, TestLeakPolicy::Warn);
+        assert!(!test.react.strict_mode);
+        assert!(test.react.cleanup);
+        assert_eq!(test.react.act_warnings, TestDiagnosticPolicy::Error);
+        assert_eq!(test.react.test_id_attribute, "data-testid");
+        assert!(test.browser.headless);
+        assert!(test.browser.sandbox);
+        assert_eq!(test.browser.viewport.width, 1_280);
+        assert_eq!(test.browser.viewport.height, 720);
+        assert_eq!(test.browser.viewport.device_scale_factor, 1.0);
+        assert_eq!(test.browser.locale, "en-US");
+        assert_eq!(test.browser.timezone, "UTC");
+        assert_eq!(test.browser.color_scheme, TestColorScheme::Light);
+        assert_eq!(test.network.mode, TestNetworkMode::Deny);
+        assert!(test.network.allow_hosts.is_empty());
+        assert_eq!(test.snapshot.directory, "__snapshots__");
+        assert_eq!(test.snapshot.screenshot_directory, "__screenshots__");
+        assert!(!test.coverage.enabled);
+        assert_eq!(test.coverage.reporters, [TestCoverageReporter::Text]);
+        assert_eq!(test.coverage.threshold, TestCoverageThreshold::default());
+        assert!(test.coverage.per_file.is_empty());
+        assert!(test.projects.is_empty());
+    }
+
+    #[test]
+    fn parses_the_complete_wake_test_contract() {
+        let config: Config = toml::from_str(
+            r#"
+                [test]
+                environment = "dom"
+                include = ["src/**/*.test.tsx"]
+                browser_include = ["src/**/*.browser.test.tsx"]
+                exclude = ["**/generated/**"]
+                setup = ["test/setup.ts"]
+                timeout_ms = 8000
+                workers = "75%"
+                forbid_only = true
+                leaks = "error"
+
+                [test.react]
+                strict_mode = true
+                cleanup = false
+                act_warnings = "warn"
+                test_id_attribute = "data-wake-id"
+
+                [test.browser]
+                headless = false
+                sandbox = false
+                viewport = { width = 1440, height = 900, device_scale_factor = 2.0 }
+                locale = "zh-CN"
+                timezone = "Asia/Singapore"
+                color_scheme = "dark"
+
+                [test.network]
+                mode = "allow"
+                allow_hosts = ["api.example.test"]
+
+                [test.snapshot]
+                directory = "snapshots"
+                screenshot_directory = "screenshots"
+
+                [test.coverage]
+                enabled = true
+                reporters = ["text", "json", "lcov", "html"]
+
+                [test.coverage.threshold]
+                lines = 85
+                functions = 80.5
+                blocks = 75
+
+                [[test.coverage.per_file]]
+                pattern = "src/components/**"
+                lines = 95
+                functions = 90
+                blocks = 85.5
+
+                [[test.projects]]
+                name = "client"
+                root = "packages/client"
+                environment = "browser"
+            "#,
+        )
+        .unwrap();
+
+        let test = config.test;
+        assert_eq!(test.environment, TestEnvironment::Dom);
+        assert_eq!(test.workers, WorkerCount::Percent(75));
+        assert!(test.forbid_only);
+        assert_eq!(test.leaks, TestLeakPolicy::Error);
+        assert!(test.react.strict_mode);
+        assert_eq!(test.react.act_warnings, TestDiagnosticPolicy::Warn);
+        assert_eq!(test.browser.viewport.device_scale_factor, 2.0);
+        assert_eq!(test.browser.color_scheme, TestColorScheme::Dark);
+        assert_eq!(test.network.mode, TestNetworkMode::Allow);
+        assert_eq!(
+            test.coverage.reporters,
+            [
+                TestCoverageReporter::Text,
+                TestCoverageReporter::Json,
+                TestCoverageReporter::Lcov,
+                TestCoverageReporter::Html,
+            ]
+        );
+        assert_eq!(test.coverage.threshold.lines, Some(85.0));
+        assert_eq!(test.coverage.threshold.functions, Some(80.5));
+        assert_eq!(test.coverage.threshold.blocks, Some(75.0));
+        assert_eq!(test.coverage.per_file.len(), 1);
+        assert_eq!(test.coverage.per_file[0].pattern, "src/components/**");
+        assert_eq!(test.coverage.per_file[0].lines, Some(95.0));
+        assert_eq!(test.coverage.per_file[0].functions, Some(90.0));
+        assert_eq!(test.coverage.per_file[0].blocks, Some(85.5));
+        assert_eq!(test.projects.len(), 1);
+        assert_eq!(test.projects[0].name, "client");
+        assert_eq!(test.projects[0].root, "packages/client");
+        assert_eq!(test.projects[0].environment, TestEnvironment::Browser);
+    }
+
+    #[test]
+    fn test_config_rejects_jest_and_unknown_fields_at_every_level() {
+        for source in [
+            "[test]\ntestMatch = []\n",
+            "[test]\ntest_match = []\n",
+            "[test.react]\ncleanup = true\nunknown = true\n",
+            "[test.browser.viewport]\nwidth = 1\nheight = 1\ndevice_scale_factor = 1.0\ndpr = 1.0\n",
+            "[test.coverage]\nenabled = false\nprovider = \"v8\"\n",
+            "[test.coverage.threshold]\nlines = 100.01\n",
+            "[test.coverage.threshold]\nfunctions = -0.1\n",
+            "[[test.coverage.per_file]]\npattern = \"  \"\nlines = 80\n",
+            "[test.coverage.threshold]\nstatements = 80\n",
+            "[[test.projects]]\nname = \"client\"\nroot = \".\"\nenvironment = \"auto\"\nrunner = \"custom\"\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(source).is_err(),
+                "unexpectedly accepted {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_project_names_must_be_non_empty_and_unique() {
+        for source in [
+            "[[test.projects]]\nname = \"\"\n",
+            "[[test.projects]]\nname = \"   \"\n",
+            concat!(
+                "[[test.projects]]\nname = \"client\"\nroot = \"packages/client\"\n",
+                "[[test.projects]]\nname = \"client\"\nroot = \"packages/other\"\n",
+            ),
+        ] {
+            let error = toml::from_str::<Config>(source).unwrap_err().to_string();
+            assert!(error.contains("test project name"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_workers_reject_invalid_or_zero_values() {
+        for value in ["0", "\"0%\"", "\"101%\"", "\"half\""] {
+            let source = format!("[test]\nworkers = {value}\n");
+            assert!(toml::from_str::<Config>(&source).is_err());
+        }
+        let count: Config = toml::from_str("[test]\nworkers = 3\n").unwrap();
+        assert_eq!(count.test.workers, WorkerCount::Count(3));
     }
 
     #[test]

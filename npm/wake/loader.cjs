@@ -17,9 +17,25 @@ function unsupported(message, cause) {
   return error
 }
 
+function attachTestHost(native, nativePath) {
+  const hostPath = process.env.WAKE_TEST_HOST_PATH || path.join(
+    path.dirname(nativePath),
+    'test-host',
+    process.platform === 'win32' ? 'wake-test-host.exe' : 'wake-test-host',
+  )
+  Object.defineProperty(native, '__wakeTestHostPath', {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: hostPath,
+  })
+  return native
+}
+
 function loadNative() {
   if (process.env.WAKE_NATIVE_PATH) {
-    return require(path.resolve(process.env.WAKE_NATIVE_PATH))
+    const nativePath = path.resolve(process.env.WAKE_NATIVE_PATH)
+    return attachTestHost(require(nativePath), nativePath)
   }
 
   const key = `${process.platform}-${process.arch}`
@@ -41,7 +57,8 @@ function loadNative() {
   }
 
   try {
-    return require(packageName)
+    const nativePath = require.resolve(packageName)
+    return attachTestHost(require(nativePath), nativePath)
   } catch (cause) {
     throw unsupported(
       `Unable to load ${packageName} for ${process.platform}/${process.arch}. ` +

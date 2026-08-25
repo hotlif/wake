@@ -1,0 +1,25 @@
+[package]
+name = "wake_js_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wake JavaScript module and host runtime"
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_codegen.workspace = true
+wake_ecma_parser.workspace = true
+wake_ecma_vm.workspace = true
+wake_resolver.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

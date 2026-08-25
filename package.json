@@ -9,18 +9,22 @@
   ],
   "scripts": {
     "architecture:check": "node scripts/check-architecture.mjs",
-    "architecture:test": "node --test --test-isolation=none scripts/check-architecture.test.mjs",
+    "architecture:test": "wake test scripts/check-architecture.test.mjs",
+    "browser:conformance:check": "node scripts/check-system-browser-conformance.mjs --manifest-only true",
+    "browser:conformance:test": "node scripts/check-system-browser-conformance.test.mjs",
     "docs:dev": "cargo run -q -p wake_cli -- docs dev .",
     "docs:build": "cargo run -q -p wake_cli -- docs build .",
     "docs:check": "node scripts/check-docs.mjs",
-    "native:build": "napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts",
+    "native:build": "cargo build -p wake_test_host -p wake_cli --release && napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts && node scripts/stage-test-host.mjs",
     "npm:test": "npm run npm:test:wake && npm run npm:test:css",
-    "npm:test:wake": "node --test npm/wake/test/*.test.mjs",
+    "npm:test:wake": "wake test \"^npm/wake/test/(cli|components-state|console|terminal)\\.test\\.mjs$\" && npm run npm:test:wake:addon",
+    "npm:test:wake:addon": "node --test npm/wake/test/api.test.mjs",
     "npm:test:css": "npm test --workspace @crab-dev/css",
     "npm:typecheck": "npm run npm:typecheck:wake && npm run npm:typecheck:css",
     "npm:typecheck:wake": "tsc -p npm/wake/test/tsconfig.json",
     "npm:typecheck:css": "npm run typecheck --workspace @crab-dev/css",
     "typescript:7:check": "node scripts/check-typescript-7.mjs",
+    "test262:es2024": "node scripts/run-test262.mjs",
     "npm:pack:check": "node scripts/check-npm-packs.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
@@ -28,6 +32,7 @@
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {
+    "@crab-dev/css": "0.1.21",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-card": "^0.0.2",
@@ -44,17 +49,21 @@
     "@crab-dev/rc-text-edit": "^0.0.1",
     "@crab-dev/rc-tooltip": "^0.0.2",
     "@crab-dev/rc-tree": "^0.1.2",
-    "@crab-dev/css": "0.1.21",
     "lucide-react": "^1.23.0",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.4",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/jest-dom": "7.0.0",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.6",
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "corepack": "0.34.6",
+    "happy-dom": "20.11.6",
     "typescript": "^7.0.2"
   }
 }
