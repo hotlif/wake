@@ -461,14 +461,28 @@ jobs:
               if (!result.success || result.counts.tests.passed !== 1) {
                 throw new Error(`TestContext smoke failed: ${JSON.stringify(result)}`)
               }
+              const watchComplete = new Promise((resolve, reject) => {
+                const timeout = setTimeout(
+                  () => reject(new Error('TestContext watch run did not complete within 10 seconds')),
+                  10_000,
+                )
+                context.once('runComplete', watchResult => {
+                  clearTimeout(timeout)
+                  resolve(watchResult)
+                })
+              })
               context.startWatch()
               if (!context.watching) throw new Error('TestContext did not enter watch mode')
+              const watchResult = await watchComplete
+              if (!watchResult.success || watchResult.counts.tests.passed !== 1) {
+                throw new Error(`TestContext watch smoke failed: ${JSON.stringify(watchResult)}`)
+              }
               context.stopWatch()
               if (context.watching) throw new Error('TestContext did not leave watch mode')
             } finally {
               await context.close()
             }
-            if (!context.closed || events.join(',') !== 'runStart,runComplete,closed') {
+            if (!context.closed || events.join(',') !== 'runStart,runComplete,runStart,runComplete,closed') {
               throw new Error(`TestContext lifecycle mismatch: closed=${context.closed}; events=${events.join(',')}`)
             }
           }

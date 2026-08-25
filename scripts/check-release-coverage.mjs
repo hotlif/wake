@@ -232,6 +232,8 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   'runTests(options)',
   'createTestContext(options)',
   'context.startWatch()',
+  'await watchComplete',
+  'TestContext watch smoke failed',
   'context.stopWatch()',
   'await context.close()',
   'Select a system Chrome, Edge or Chromium',
