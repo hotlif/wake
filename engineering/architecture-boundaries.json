@@ -45,6 +45,13 @@
       ],
       "registryIntegrity": "sha512",
       "workspaceLinks": "declared-workspaces-only",
+      "internalOptionalPlaceholders": {
+        "@crab-dev/wake-darwin-arm64": "npm/wake-darwin-arm64",
+        "@crab-dev/wake-darwin-x64": "npm/wake-darwin-x64",
+        "@crab-dev/wake-linux-arm64-gnu": "npm/wake-linux-arm64-gnu",
+        "@crab-dev/wake-linux-x64-gnu": "npm/wake-linux-x64-gnu",
+        "@crab-dev/wake-win32-x64-msvc": "npm/wake-win32-x64-msvc"
+      },
       "exactPackages": {
         "happy-dom": "20.11.6",
         "react": "19.2.8",

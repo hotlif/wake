@@ -21,9 +21,19 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+          cache: npm
       - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: architecture
+      - run: npm ci --ignore-scripts
+      - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
+      - run: cargo build -p wake_test_host -p wake_cli --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
       - run: npm run release:check
-      - run: npm run architecture:test
+      - run: ./target/debug/wake test scripts/check-architecture.test.mjs --serial
       - run: npm run architecture:check
 
   fmt:
@@ -44,8 +54,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: npm ci --ignore-scripts
+      - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
+      - run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+        env:
+          CARGO_NET_OFFLINE: "true"
 
   test:
     name: test
@@ -53,7 +72,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
@@ -62,7 +85,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: npm ci --ignore-scripts
-      - run: cargo test --workspace
+      - run: cargo fetch --locked --target ${{ matrix.target }}
+      - run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
+      - run: cargo test --workspace --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
 
   test262-es2024:
     name: selected Test262 ES2024 / embedded V8
@@ -76,7 +103,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test262-es2024
+      - run: npm ci --ignore-scripts
+      - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - run: npm run test262:es2024
+        env:
+          CARGO_NET_OFFLINE: "true"
 
   browser-conformance:
     name: React Chromium conformance / ${{ matrix.target }}
@@ -87,14 +119,19 @@ jobs:
         include:
           - target: win32-x64-msvc
             os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
           - target: linux-x64-gnu
             os: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
           - target: linux-arm64-gnu
             os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
           - target: darwin-arm64
             os: macos-15
+            rust_target: aarch64-apple-darwin
           - target: darwin-x64
             os: macos-15-intel
+            rust_target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
@@ -106,22 +143,32 @@ jobs:
         with:
           key: browser-${{ matrix.target }}
       - run: npm ci --ignore-scripts
+      - run: cargo fetch --locked --target ${{ matrix.rust_target }}
+      - run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.rust_target }}
       - run: npm run browser:conformance:test
       - name: Require the pinned post-CDP system browser identity
         shell: bash
         run: |
           set -euo pipefail
           identity="$RUNNER_TEMP/wake-system-browser.json"
-          cargo run --locked --quiet -p wake_test_browser --example system_browser_identity > "$identity"
+          cargo run --locked --offline --quiet -p wake_test_browser --example system_browser_identity > "$identity"
           node scripts/check-system-browser-conformance.mjs \
             --target "${{ matrix.target }}" \
             --identity "$identity"
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: CDP transport against the installed system browser
-        run: cargo test -p wake_test_browser --lib -- --ignored --nocapture
+        run: cargo test --locked --offline -p wake_test_browser --lib -- --ignored --nocapture
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: React, input, source-map and screenshot conformance
-        run: cargo test -p wake_test --lib -- --ignored --nocapture
+        run: cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: Browser TSX V8 coverage reports and thresholds
-        run: cargo test -p wake_test --test browser_coverage_conformance -- --ignored --nocapture
+        run: cargo test --locked --offline -p wake_test --test browser_coverage_conformance -- --ignored --nocapture
+        env:
+          CARGO_NET_OFFLINE: "true"
 
   typescript-7:
     name: TypeScript 7 compatibility / ${{ matrix.os }}
@@ -178,11 +225,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
       - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       # Shared runners are too noisy for a millisecond SLA. Gate deterministic avoided-work counts,
       # then compile Criterion benches so measurement surfaces cannot silently rot.
-      - run: cargo test -p wake_bundler --test performance_invariants --release
-      - run: cargo bench --workspace --no-run
+      - run: cargo test --locked --offline -p wake_bundler --test performance_invariants --release
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: cargo bench --workspace --locked --offline --no-run
+        env:
+          CARGO_NET_OFFLINE: "true"
 
   docs:
     name: documentation
@@ -210,8 +268,18 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: css
       - run: npm ci --ignore-scripts
-      - run: npm run npm:test:css
+      - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
+      - run: cargo build -p wake_test_host -p wake_cli --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: ./target/debug/wake test npm/css/test/runtime.test.mjs --serial
+      - run: node --test npm/css/test/realm.node.mjs
       - run: npm run npm:typecheck:css
       - run: npm run npm:pack:check
         env:
@@ -235,13 +303,17 @@ jobs:
         with:
           key: node-${{ matrix.node }}
       - run: npm ci --ignore-scripts
+      - run: cargo fetch --locked --target x86_64-pc-windows-msvc
+      - run: node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc
       - run: npm run versions:check
       - run: npm run native:build
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: node scripts/stage-test-host.mjs --package-dir npm/wake-win32-x64-msvc
       - name: Select local native binding
         shell: pwsh
         run: |
           "WAKE_NATIVE_PATH=$((Resolve-Path npm/wake/wake.win32-x64-msvc.node).Path)" >> $env:GITHUB_ENV
-          Copy-Item npm/wake/wake.win32-x64-msvc.node npm/wake-win32-x64-msvc/wake.win32-x64-msvc.node
       - run: npm run npm:test:wake
       - run: npm run npm:typecheck:wake
       - run: node scripts/check-startup.mjs

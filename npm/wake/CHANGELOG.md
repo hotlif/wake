@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.22
+
+- Added the experimental Wake-native, React-first `wake test` system, `runTests()` and `TestContext`
+  Node APIs, explicit `@crab-dev/wake/test` ESM/CommonJS imports, isolated V8 suite realms, Wake
+  snapshots, function/network mocks, an async clock, projects, sharding, and a token-authenticated
+  crash-isolated test host. ADR 0020 defines the private fast-DOM and system-Chromium boundary;
+  external runner/config/plugin/result compatibility is intentionally outside the contract.
+- Added typed Chromium input and browser screenshot snapshots. `toMatchScreenshot()` stores
+  rendering-profiled PNG baselines and emits received PNG plus self-contained visual-diff artifacts
+  without exposing raw CDP or adding a second browser event consumer.
+
 ## 0.1.21
 
 - Added aggregate Wake Docs workspaces with isolated production bundles, deterministic manifests,

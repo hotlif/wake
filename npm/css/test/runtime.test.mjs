@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
 import { test } from '@crab-dev/wake/test'
-import vm from 'node:vm'
 
 import * as esm from '../index.mjs'
 
@@ -102,15 +101,6 @@ test('defineTokens deeply freezes pure structures without invoking accessors', (
   }
 })
 
-test('defineTokens accepts plain structures created in another JavaScript realm', () => {
-  const tokens = vm.runInNewContext("({ color: { accent: 'rebeccapurple' }, gap: [4, 8] })")
-  const frozen = esm.defineTokens(tokens)
-  assert.equal(frozen.color.accent, 'rebeccapurple')
-  assert.equal(Object.isFrozen(frozen), true)
-  assert.equal(Object.isFrozen(frozen.color), true)
-  assert.equal(Object.isFrozen(frozen.gap), true)
-})
-
 test('createVar is realm-unique across ESM and CommonJS and sanitizes debug labels', () => {
   const first = esm.createVar('accent color')
   const second = cjs.createVar('accent color')
@@ -162,7 +152,7 @@ test('package metadata has no runtime dependencies and publishes only artifacts'
   )
 
   assert.equal(packageJson.name, '@crab-dev/css')
-  assert.equal(packageJson.version, '0.1.21')
+  assert.equal(packageJson.version, '0.1.22')
   assert.equal(packageJson.sideEffects, false)
   assert.equal(packageJson.dependencies, undefined)
   assert.deepEqual(packageJson.files, [

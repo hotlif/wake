@@ -1,6 +1,6 @@
 # Wake 测试与质量门禁
 
-本文描述 v0.1.21 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `npm run native:build`。
+本文描述 v0.1.22 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `npm run native:build`。
 
 # 1. 本地最小门禁
 
@@ -50,7 +50,8 @@ wake test scripts/check-architecture.test.mjs
 wake test npm/wake/test
 ```
 
-唯一保留的 Node runner 例外是 `npm run npm:test:wake:addon`。它加载真实 `.node` 绑定并验证
+唯一保留的 Node runner 边界是 `npm run npm:test:wake:addon`。它加载真实 `.node` 绑定、验证
+Node `vm` 跨 realm 的公开包值语义，并覆盖
 Node Worker、socket 与 cleanup-hook 生命周期，不能由 Wake 自身的测试 realm 证明；它不执行
 Wake Test 语义，也不是产品运行时的回退路径。普通 JavaScript、CLI 和包测试不得加入该例外。
 
@@ -99,18 +100,25 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 
 | Job | 平台/工具链 | 目的 |
 | --- | --- | --- |
+| `architecture` | Ubuntu / Rust 1.95 + Node 24 | 构建本轮 Wake CLI/host 后验证架构、来源和发布覆盖合同 |
 | `fmt` | Ubuntu / Rust 1.95 | rustfmt 无差异 |
 | `clippy` | Ubuntu / Rust 1.95 | workspace 全 target，warnings 视为错误 |
 | `test` | Ubuntu、Windows / Rust 1.95 + Node 24 | 全 workspace 测试 |
+| `test262-es2024` | Ubuntu / Rust 1.95 + Node 24 | checksum 固定的 Test262 ES2024 选择集 |
+| `browser-conformance` | 五个发布目标 / Rust 1.95 + Node 24 | 固定 Chromium major 的 CDP、React、截图和 coverage 门禁 |
 | `typescript-7` | Ubuntu、Windows / Node 24 + TypeScript 7 | TS7 CLI 版本、严格类型与 TS/TSX 兼容 fixture |
 | `miri` | Ubuntu / nightly | `wake_ecma_ast` 和 `wake_turbo` 手写 unsafe/内存模型 |
 | `loom` | Ubuntu / Rust 1.95 | single-flight 线程交错 |
 | `bench-smoke` | Ubuntu / Rust 1.95 | 全 benchmark 可编译 |
+| `css` | Ubuntu / Rust 1.95 + Node 24 | 用本轮构建的 Wake CLI/host 跑 CSS runtime，并单独跑 Node realm 门禁 |
 | `node` | Windows / Node 24、26 | 原生绑定、API、类型、启动与 npm pack；Node 24 另跑 Yarn 4.16 PnP Components 门禁 |
 | `docs` | Ubuntu / Rust 1.95 + Node 24 | 文档链接检查和生产构建 |
 | `vscode-css` | Windows、macOS x64/arm64、manylinux glibc 2.28 x64/arm64 | 语言核心、Extension Host、五个平台 VSIX 和归档白名单 |
 
 Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补齐最低版本覆盖列入路线图。
+所有需要内嵌 V8 或 fast DOM 的 CI job 先以 `npm ci` 和 `cargo fetch --locked` 准备
+registry 依赖，再单独校验目标 Rusty V8 archive；随后的 Cargo test、clippy、bench 和 build
+使用 `--locked --offline`，不会在正式构建阶段联网或从仓库 vendor 第三方源码。
 
 # 3. 回归矩阵
 

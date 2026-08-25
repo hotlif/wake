@@ -312,7 +312,13 @@ function workspacePatterns(manifest) {
   return []
 }
 
-export function validateNpmProvenance({ lock, rootManifest, workspaceManifests, policy }) {
+export function validateNpmProvenance({
+  lock,
+  rootManifest,
+  workspaceManifests,
+  internalManifests = new Map(),
+  policy,
+}) {
   const errors = []
   if (lock.lockfileVersion !== policy.lockfileVersion) {
     errors.push(`[dependency-provenance:npm-lock] package-lock.json version must be ${policy.lockfileVersion}; found ${lock.lockfileVersion}`)
@@ -345,7 +351,37 @@ export function validateNpmProvenance({ lock, rootManifest, workspaceManifests, 
     }
   }
 
+  const mainWorkspace = [...workspaceManifests]
+    .find(([, manifest]) => manifest.name === '@crab-dev/wake')
+  const expectedPlaceholders = new Map()
+  for (const [name, configuredPath] of Object.entries(policy.internalOptionalPlaceholders ?? {})) {
+    const manifestPath = repositoryPath(configuredPath)
+    const internalManifest = internalManifests.get(manifestPath)
+    if (
+      !internalManifest ||
+      internalManifest.name !== name ||
+      !exactSemver(internalManifest.version ?? '')
+    ) {
+      errors.push(`[dependency-provenance:npm-placeholder] ${manifestPath}/package.json must define ${name} at one exact version`)
+      continue
+    }
+    if (!mainWorkspace) {
+      errors.push('[dependency-provenance:npm-placeholder] @crab-dev/wake must be a declared workspace')
+      continue
+    }
+    const [mainWorkspacePath, mainManifest] = mainWorkspace
+    const requested = mainManifest.optionalDependencies?.[name]
+    if (requested !== internalManifest.version) {
+      errors.push(`[dependency-provenance:npm-placeholder] ${mainWorkspacePath}/package.json optionalDependencies.${name} must equal internal ${internalManifest.version}; found ${requested ?? 'missing'}`)
+    }
+    expectedPlaceholders.set(`${mainWorkspacePath}/node_modules/${name}`, {
+      name,
+      manifestPath,
+    })
+  }
+
   const seenLinks = new Set()
+  const seenPlaceholders = new Set()
   const origins = policy.allowedRegistryOrigins ?? []
   for (const [lockPath, pkg] of Object.entries(lock.packages ?? {})) {
     if (!lockPath.includes('node_modules/')) continue
@@ -354,6 +390,15 @@ export function validateNpmProvenance({ lock, rootManifest, workspaceManifests, 
       const expected = expectedLinks.get(lockPath)
       if (!expected || repositoryPath(pkg.resolved ?? '') !== expected) {
         errors.push(`[dependency-provenance:npm-link] ${lockPath} must resolve to a declared workspace; found ${pkg.resolved ?? 'missing'}`)
+      }
+      continue
+    }
+    const placeholder = expectedPlaceholders.get(lockPath)
+    if (placeholder) {
+      seenPlaceholders.add(lockPath)
+      const keys = Object.keys(pkg).sort()
+      if (keys.length !== 1 || keys[0] !== 'optional' || pkg.optional !== true) {
+        errors.push(`[dependency-provenance:npm-placeholder] ${lockPath} must be an unresolved optional-only prerelease placeholder`)
       }
       continue
     }
@@ -373,6 +418,11 @@ export function validateNpmProvenance({ lock, rootManifest, workspaceManifests, 
   for (const [lockPath, target] of expectedLinks) {
     if (!seenLinks.has(lockPath)) {
       errors.push(`[dependency-provenance:npm-link] ${lockPath} -> ${target} is missing from package-lock.json`)
+    }
+  }
+  for (const [lockPath, placeholder] of expectedPlaceholders) {
+    if (!seenPlaceholders.has(lockPath)) {
+      errors.push(`[dependency-provenance:npm-placeholder] ${lockPath} for ${placeholder.name} (${placeholder.manifestPath}) is missing from package-lock.json`)
     }
   }
 
@@ -449,9 +499,10 @@ export function validateRepositorySources({ files, sources, policy }) {
       continue
     }
     for (const [index, line] of source.split(/\r?\n/).entries()) {
-      if (!/\bcargo\s+build\b/.test(line)) continue
+      const command = /\bcargo\s+(build|test|clippy)\b/.exec(line)?.[1]
+      if (!command) continue
       if (!line.includes('--locked') || !line.includes('--offline')) {
-        errors.push(`[dependency-provenance:build-network] ${path}:${index + 1} cargo build must include --locked --offline`)
+        errors.push(`[dependency-provenance:build-network] ${path}:${index + 1} cargo ${command} must include --locked --offline`)
       }
     }
     if (!/CARGO_NET_OFFLINE:\s*["']?true["']?/i.test(source)) {
@@ -548,6 +599,14 @@ export function validatePolicy({ policy, packages, adrRecords, policyPath = 'eng
     }
     if (provenance.npm?.workspaceLinks !== 'declared-workspaces-only') {
       errors.push(`${policyPath}: dependencyProvenance.npm.workspaceLinks must be declared-workspaces-only`)
+    }
+    if (
+      !provenance.npm?.internalOptionalPlaceholders ||
+      typeof provenance.npm.internalOptionalPlaceholders !== 'object' ||
+      Array.isArray(provenance.npm.internalOptionalPlaceholders) ||
+      Object.keys(provenance.npm.internalOptionalPlaceholders).length === 0
+    ) {
+      errors.push(`${policyPath}: dependencyProvenance.npm.internalOptionalPlaceholders must be a non-empty object`)
     }
     for (const [dependency, owners] of Object.entries(provenance.cargo?.exclusiveOwners ?? {})) {
       if (!Array.isArray(owners) || owners.length === 0) {
@@ -810,10 +869,19 @@ export function checkRepository(repoRoot = defaultRepoRoot) {
           const npmLock = readJson(npmLockPath, errors)
           if (rootManifest && npmLock) {
             const workspaceManifests = npmWorkspaces({ repoRoot, rootManifest, files, errors })
+            const internalManifests = new Map()
+            for (const configuredPath of Object.values(
+              provenance.npm.internalOptionalPlaceholders ?? {},
+            )) {
+              const manifestPath = repositoryPath(configuredPath)
+              const manifest = readJson(join(repoRoot, manifestPath, 'package.json'), errors)
+              if (manifest) internalManifests.set(manifestPath, manifest)
+            }
             errors.push(...validateNpmProvenance({
               lock: npmLock,
               rootManifest,
               workspaceManifests,
+              internalManifests,
               policy: provenance.npm,
             }))
           }

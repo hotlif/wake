@@ -114,8 +114,11 @@ test('embedded V8 conformance uses one immutable selected Test262 ES2024 manifes
   const runner = readFileSync(new URL('../scripts/run-test262.mjs', import.meta.url), 'utf8')
   assert.match(runner, /createHash\('sha256'\)/)
   assert.match(runner, /wake_ecma_vm/)
+  assert.match(runner, /'--locked'/)
+  assert.match(runner, /'--offline'/)
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   assert.match(ci, /npm run test262:es2024/)
+  assert.match(ci, /prepare-rusty-v8\.mjs --target x86_64-unknown-linux-gnu/)
   assert.match(ci, /browser-conformance:/)
   for (const platform of [
     'windows-latest',
@@ -126,8 +129,8 @@ test('embedded V8 conformance uses one immutable selected Test262 ES2024 manifes
   ]) {
     assert.match(ci, new RegExp(platform.replaceAll('.', '\\.')))
   }
-  assert.match(ci, /cargo test -p wake_test_browser --lib -- --ignored/)
-  assert.match(ci, /cargo test -p wake_test --lib -- --ignored/)
+  assert.match(ci, /cargo test --locked --offline -p wake_test_browser --lib -- --ignored/)
+  assert.match(ci, /cargo test --locked --offline -p wake_test --lib -- --ignored/)
 })
 
 test('system browser conformance is exact-major pinned without a product download path', () => {
@@ -193,6 +196,27 @@ test('system browser conformance is exact-major pinned without a product downloa
   }
 })
 
+test('Node CI stages the complete local platform package before testing and packing', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const nodeJobStart = ci.search(/\r?\n  node:\r?\n/)
+  assert.notEqual(nodeJobStart, -1)
+  const nodeJob = ci.slice(nodeJobStart)
+  const markers = [
+    'node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc',
+    'npm run native:build',
+    'node scripts/stage-test-host.mjs --package-dir npm/wake-win32-x64-msvc',
+    'npm run npm:test:wake',
+    'npm run npm:pack:check',
+  ]
+  let previous = -1
+  for (const marker of markers) {
+    const index = nodeJob.indexOf(marker)
+    assert(index > previous, `${marker} must follow the preceding Node CI stage`)
+    previous = index
+  }
+  assert.doesNotMatch(nodeJob, /Copy-Item .*\.node/)
+})
+
 function policy(overrides = {}) {
   return {
     schemaVersion: 3,
@@ -208,6 +232,9 @@ function policy(overrides = {}) {
       npm: {
         allowedRegistryOrigins: ['https://registry.npmjs.org/'],
         workspaceLinks: 'declared-workspaces-only',
+        internalOptionalPlaceholders: {
+          '@crab-dev/wake-win32-x64-msvc': 'npm/wake-win32-x64-msvc',
+        },
       },
     },
     crates: ['wake_common', 'wake_ecma_parser', 'wake_app'],
@@ -547,8 +574,51 @@ function npmFixture() {
   }
 }
 
+function npmPlaceholderFixture() {
+  const fixture = npmFixture()
+  const name = '@crab-dev/wake-win32-x64-msvc'
+  const manifestPath = 'npm/wake-win32-x64-msvc'
+  fixture.workspaceManifests.get('npm/wake').optionalDependencies = {
+    [name]: '0.1.0',
+  }
+  fixture.internalManifests = new Map([[manifestPath, {
+    name,
+    version: '0.1.0',
+    os: ['win32'],
+    cpu: ['x64'],
+  }]])
+  fixture.policy.internalOptionalPlaceholders = { [name]: manifestPath }
+  fixture.lock.packages[`npm/wake/node_modules/${name}`] = { optional: true }
+  return fixture
+}
+
 test('npm provenance allows manifest ranges while the lock owns exact registry artifacts', () => {
   assert.deepEqual(validateNpmProvenance(npmFixture()), [])
+})
+
+test('npm provenance allows only exact internal prerelease optional placeholders', () => {
+  assert.deepEqual(validateNpmProvenance(npmPlaceholderFixture()), [])
+
+  const materialized = npmPlaceholderFixture()
+  materialized.lock.packages['npm/wake/node_modules/@crab-dev/wake-win32-x64-msvc'].version = '0.1.0'
+  assert(validateNpmProvenance(materialized).some((error) => error.includes('optional-only')))
+
+  const mismatchedPin = npmPlaceholderFixture()
+  mismatchedPin.workspaceManifests.get('npm/wake').optionalDependencies[
+    '@crab-dev/wake-win32-x64-msvc'
+  ] = '0.1.1'
+  assert(validateNpmProvenance(mismatchedPin).some((error) => error.includes('must equal internal')))
+
+  const wrongPath = npmPlaceholderFixture()
+  wrongPath.lock.packages['node_modules/@crab-dev/wake-win32-x64-msvc'] = { optional: true }
+  delete wrongPath.lock.packages['npm/wake/node_modules/@crab-dev/wake-win32-x64-msvc']
+  const wrongPathErrors = validateNpmProvenance(wrongPath)
+  assert(wrongPathErrors.some((error) => error.includes('exact SemVer')))
+  assert(wrongPathErrors.some((error) => error.includes('is missing from package-lock.json')))
+
+  const missingManifest = npmPlaceholderFixture()
+  missingManifest.internalManifests.clear()
+  assert(validateNpmProvenance(missingManifest).some((error) => error.includes('must define')))
 })
 
 test('npm provenance rejects non-registry locators, corrupt locks, and false workspace links', () => {
@@ -595,7 +665,16 @@ test('repository provenance rejects vendor trees, checked-in binaries, and netwo
   const validSources = new Map([
     ['crates/wake_node/build.rs', 'fn main() { napi_build::setup(); }'],
     ['package.json', '{"scripts":{"build":"node build.mjs"}}'],
-    ['.github/workflows/release-npm.yml', '- run: cargo build --locked --offline\n  env:\n    CARGO_NET_OFFLINE: "true"'],
+    [
+      '.github/workflows/release-npm.yml',
+      [
+        '- run: cargo build --locked --offline',
+        '- run: cargo test --locked --offline',
+        '- run: cargo clippy --locked --offline',
+        '  env:',
+        '    CARGO_NET_OFFLINE: "true"',
+      ].join('\n'),
+    ],
   ])
   assert.deepEqual(validateRepositorySources({ files: validFiles, sources: validSources, policy }), [])
 
@@ -608,12 +687,21 @@ test('repository provenance rejects vendor trees, checked-in binaries, and netwo
   const sources = new Map(validSources)
   sources.set('crates/wake_node/build.rs', 'const URL: &str = "https://example.invalid/archive";')
   sources.set('package.json', '{"scripts":{"install":"node download.mjs"}}')
-  sources.set('.github/workflows/release-npm.yml', '- run: cargo build --release')
+  sources.set(
+    '.github/workflows/release-npm.yml',
+    [
+      '- run: cargo build --release',
+      '- run: cargo test --workspace',
+      '- run: cargo clippy --workspace',
+    ].join('\n'),
+  )
   const errors = validateRepositorySources({ files, sources, policy })
   assert(errors.some((error) => error.includes('vendor/deno_core')))
   assert(errors.some((error) => error.includes('happy-dom')))
   assert(errors.some((error) => error.includes('native.node')))
-  assert(errors.some((error) => error.includes('build-network')))
+  assert(errors.some((error) => error.includes('cargo build must include --locked --offline')))
+  assert(errors.some((error) => error.includes('cargo test must include --locked --offline')))
+  assert(errors.some((error) => error.includes('cargo clippy must include --locked --offline')))
 })
 
 test('rejects an unregistered workspace crate', () => {

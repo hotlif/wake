@@ -62,7 +62,19 @@ if (unpack.status !== 0) throw new Error(`tar exited with ${unpack.status}`)
 const cargo = process.platform === 'win32' ? 'cargo.exe' : 'cargo'
 const result = spawnSync(
   cargo,
-  ['run', '--quiet', '-p', 'wake_ecma_vm', '--example', 'test262', '--', extracted, manifestPath],
+  [
+    'run',
+    '--locked',
+    '--offline',
+    '--quiet',
+    '-p',
+    'wake_ecma_vm',
+    '--example',
+    'test262',
+    '--',
+    extracted,
+    manifestPath,
+  ],
   { cwd: workspace, stdio: 'inherit' },
 )
 if (result.error) throw result.error

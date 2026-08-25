@@ -1,7 +1,7 @@
 {
   "name": "wake-workspace",
   "private": true,
-  "version": "0.1.21",
+  "version": "0.1.22",
   "type": "module",
   "workspaces": [
     "npm/css",
@@ -15,10 +15,10 @@
     "docs:dev": "cargo run -q -p wake_cli -- docs dev .",
     "docs:build": "cargo run -q -p wake_cli -- docs build .",
     "docs:check": "node scripts/check-docs.mjs",
-    "native:build": "cargo build -p wake_test_host -p wake_cli --release && napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts && node scripts/stage-test-host.mjs",
+    "native:build": "cargo build -p wake_test_host -p wake_cli --release --locked --offline && napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts -- --locked --offline && node scripts/stage-test-host.mjs",
     "npm:test": "npm run npm:test:wake && npm run npm:test:css",
     "npm:test:wake": "wake test \"^npm/wake/test/(cli|components-state|console|terminal)\\.test\\.mjs$\" && npm run npm:test:wake:addon",
-    "npm:test:wake:addon": "node --test npm/wake/test/api.test.mjs",
+    "npm:test:wake:addon": "node --test npm/wake/test/api.test.mjs npm/css/test/realm.node.mjs",
     "npm:test:css": "npm test --workspace @crab-dev/css",
     "npm:typecheck": "npm run npm:typecheck:wake && npm run npm:typecheck:css",
     "npm:typecheck:wake": "tsc -p npm/wake/test/tsconfig.json",
@@ -32,7 +32,7 @@
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {
-    "@crab-dev/css": "0.1.21",
+    "@crab-dev/css": "0.1.22",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-card": "^0.0.2",

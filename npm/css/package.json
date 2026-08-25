@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/css",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "Type-safe, zero-runtime CSS authoring for Wake",
   "keywords": [
     "css",
@@ -40,7 +40,7 @@
     "node": ">=22.14 <27"
   },
   "scripts": {
-    "test": "wake test test",
+    "test": "wake test test/runtime.test.mjs",
     "typecheck": "tsc -p test/tsconfig.json",
     "pack:check": "npm pack --dry-run"
   },

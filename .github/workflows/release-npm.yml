@@ -30,6 +30,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - name: Verify pinned Rusty V8 input
+        run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - name: Read package version
         id: package-version
         shell: bash
@@ -43,13 +47,21 @@ jobs:
       - run: npm run versions:check
       - run: npm run browser:conformance:test
       - run: npm run release:check
-      - run: npm run npm:test:css
       - run: npm run npm:typecheck:css
       - run: npm run npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test and build from verified inputs
+        run: |
+          cargo test --workspace --locked --offline
+          cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+          cargo build -p wake_test_host -p wake_cli --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Test CSS with this build's Wake Test host
+        run: ./target/debug/wake test npm/css/test/runtime.test.mjs --serial
+      - name: Test the explicit Node realm boundary
+        run: node --test npm/css/test/realm.node.mjs
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
@@ -105,8 +117,10 @@ jobs:
           --package-json-path ../../npm/wake/package.json
           --no-js --dts native.d.ts
           --target ${{ matrix.target }}
+          -- --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
+      - run: git diff --exit-code -- Cargo.lock
       - name: Stage platform package
         run: >-
           node scripts/stage-test-host.mjs
@@ -179,8 +193,10 @@ jobs:
           --package-json-path ../../npm/wake/package.json
           --no-js --dts native.d.ts
           --target ${{ matrix.target }}
+          -- --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
+      - run: git diff --exit-code -- Cargo.lock
       - name: Verify glibc baseline
         run: |
           highest="$(readelf --version-info npm/wake/wake.${{ matrix.suffix }}.node | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"

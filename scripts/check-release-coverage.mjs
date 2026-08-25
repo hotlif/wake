@@ -37,6 +37,17 @@ function requireJobMarkers(name, source, markers) {
   }
 }
 
+function requireOrderedJobMarkers(name, source, markers) {
+  let previous = -1
+  for (const marker of markers) {
+    const index = source.indexOf(marker)
+    if (index <= previous) {
+      throw new Error(`release-npm.yml ${name} job must order ${marker} after its preceding gate`)
+    }
+    previous = index
+  }
+}
+
 const packages = readdirSync(npmRoot, { withFileTypes: true })
   .filter((entry) => entry.isDirectory())
   .map((entry) => {
@@ -77,6 +88,9 @@ for (const required of [
   }
 }
 
+const verifyJob = releaseJob('verify')
+const buildNativeJob = releaseJob('build-native')
+const buildLinuxJob = releaseJob('build-linux')
 const auditTarballsJob = releaseJob('audit-tarballs')
 const prepublishSmokeJob = releaseJob('prepublish-smoke')
 const publishJob = releaseJob('publish')
@@ -84,6 +98,32 @@ const registrySmokeJob = releaseJob('smoke')
 if (!(auditTarballsJob.index < prepublishSmokeJob.index
   && prepublishSmokeJob.index < publishJob.index)) {
   throw new Error('local tarball smoke must run after audit-tarballs and before publish')
+}
+requireJobMarkers('verify', verifyJob.source, [
+  'cargo fetch --locked --target x86_64-unknown-linux-gnu',
+  'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
+  'cargo test --workspace --locked --offline',
+  'cargo clippy --workspace --all-targets --locked --offline -- -D warnings',
+  'cargo build -p wake_test_host -p wake_cli --locked --offline',
+  './target/debug/wake test npm/css/test/runtime.test.mjs --serial',
+  'node --test npm/css/test/realm.node.mjs',
+])
+if (verifyJob.source.includes('npm run npm:test:css')) {
+  throw new Error('release verify must use the freshly built Wake CLI and host for CSS tests')
+}
+for (const [name, job] of [
+  ['build-native', buildNativeJob],
+  ['build-linux', buildLinuxJob],
+]) {
+  requireOrderedJobMarkers(name, job.source, [
+    'cargo fetch --locked --target ${{ matrix.target }}',
+    'node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}',
+    'cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}',
+    'npx --no-install napi build',
+    '-- --locked --offline',
+    'git diff --exit-code -- Cargo.lock',
+    'node scripts/stage-test-host.mjs',
+  ])
 }
 requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   'needs: [verify, audit-tarballs]',
@@ -167,7 +207,9 @@ if (workflow.includes('test-host/node')) {
 for (const [marker, expectedCount] of [
   ['cargo fetch --locked --target ${{ matrix.target }}', 2],
   ['cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}', 2],
-  ['CARGO_NET_OFFLINE: "true"', 4],
+  ['-- --locked --offline', 2],
+  ['git diff --exit-code -- Cargo.lock', 2],
+  ['CARGO_NET_OFFLINE: "true"', 5],
 ]) {
   const count = workflow.split(marker).length - 1
   if (count !== expectedCount) {
