@@ -312,12 +312,13 @@ jobs:
                 if test "$packed_size" -gt 58720256; then
                   echo "::warning file=$archive::Platform package is above the 56 MiB packed warning threshold ($packed_size bytes)"
                 fi
-                unpacked_size="$(tar -tvzf "$archive" | awk '{total += $3} END {print total + 0}')"
+                archive_details="$(tar -tvzf "$archive")"
+                unpacked_size="$(awk '{total += $3} END {print total + 0}' <<<"$archive_details")"
                 test "$unpacked_size" -le 201326592
                 host_count="$(grep -Ec 'package/test-host/wake-test-host(\.exe)?$' <<<"$list" || true)"
                 test "$host_count" -eq 1
                 if [[ "$name" != *win32* ]]; then
-                  tar -tvzf "$archive" | grep -Eq '^-..x..x..x .*package/test-host/wake-test-host$'
+                  grep -Eq '^-..x..x..x .*package/test-host/wake-test-host$' <<<"$archive_details"
                 fi
                 grep -qx 'package/native-manifest.json' <<<"$list"
                 grep -qx 'package/sbom.spdx.json' <<<"$list"

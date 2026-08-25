@@ -348,6 +348,8 @@ for (const [marker, expectedCount] of [
   ['git diff --exit-code -- Cargo.lock', 1],
   ['cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"', 1],
   ['cmp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"', 1],
+  ['archive_details="$(tar -tvzf "$archive")"', 1],
+  ['<<<"$archive_details"', 2],
   ['CARGO_NET_OFFLINE: "true"', 5],
 ]) {
   const count = workflow.split(marker).length - 1
@@ -356,6 +358,9 @@ for (const [marker, expectedCount] of [
       `release-npm.yml must contain ${expectedCount} copies of ${marker}; found ${count}`,
     )
   }
+}
+if (workflow.includes('tar -tvzf "$archive" |')) {
+  throw new Error('release tarball audit must consume the complete archive listing before matching')
 }
 
 const missing = []
