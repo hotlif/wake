@@ -142,7 +142,7 @@ jobs:
             os: macos-15-intel
             rust_target: x86_64-apple-darwin
             browser_evidence: exact-major-smoke
-            browser_major: 150
+            browser_major: 151
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6

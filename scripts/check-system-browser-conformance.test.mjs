@@ -70,8 +70,6 @@ assert(readiness.blockers.some(({ target, code }) =>
   target === 'linux-arm64-gnu' && code === 'browser-unavailable'))
 assert(readiness.blockers.some(({ target, code }) =>
   target === 'darwin-x64' && code === 'not-conformance-evidence'))
-assert(readiness.blockers.some(({ target, code }) =>
-  target === 'darwin-x64' && code === 'major-mismatch'))
 
 for (const [description, action, pattern] of [
   [
@@ -97,7 +95,7 @@ for (const [description, action, pattern] of [
     () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'darwin-x64',
-      identity: { kind: 'chrome', version: 'Chrome/150.0.0.1', headless: false },
+      identity: { kind: 'chrome', version: 'Chrome/151.0.0.1', headless: false },
     }),
     /requires headless=true/,
   ],

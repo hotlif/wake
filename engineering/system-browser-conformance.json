@@ -69,14 +69,14 @@
       "rustTarget": "x86_64-apple-darwin",
       "experimental": {
         "mode": "exact-major-smoke",
-        "major": 150
+        "major": 151
       },
       "reviewedRunnerEvidence": {
-        "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/macos/macos-15-Readme.md",
-        "imageVersion": "20260727.0377.1",
+        "source": "https://github.com/actions/runner-images/blob/f10516542b8f2fef89b652a8d5f5de63aa543b77/images/macos/macos-15-Readme.md",
+        "imageVersion": "20260824.0482.1",
         "browserVersions": {
-          "chrome": "150.0.7871.187",
-          "edge": "150.0.4078.99"
+          "chrome": "151.0.7922.174",
+          "edge": "151.0.4129.101"
         }
       }
     },

@@ -369,7 +369,7 @@ jobs:
           - platform: darwin-x64
             runner: macos-15-intel
             browser_evidence: exact-major-smoke
-            browser_major: 150
+            browser_major: 151
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke
@@ -677,7 +677,7 @@ jobs:
           - platform: darwin-x64
             runner: macos-15-intel
             browser_evidence: exact-major-smoke
-            browser_major: 150
+            browser_major: 151
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke

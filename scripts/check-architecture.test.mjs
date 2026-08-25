@@ -168,10 +168,10 @@ test('system browser evidence separates experimental publication from stable rea
     manifest.targets['linux-arm64-gnu'].reviewedRunnerEvidence.browserVersions,
     {},
   )
-  for (const target of ['darwin-x64', 'darwin-arm64']) {
-    assert.equal(manifest.targets[target].experimental.mode, 'exact-major-smoke')
-    assert.equal(manifest.targets[target].experimental.major, 150)
-  }
+  assert.equal(manifest.targets['darwin-x64'].experimental.mode, 'exact-major-smoke')
+  assert.equal(manifest.targets['darwin-x64'].experimental.major, 151)
+  assert.equal(manifest.targets['darwin-arm64'].experimental.mode, 'exact-major-smoke')
+  assert.equal(manifest.targets['darwin-arm64'].experimental.major, 150)
   for (const policy of Object.values(manifest.targets)) {
     assert.match(
       policy.reviewedRunnerEvidence.source,
