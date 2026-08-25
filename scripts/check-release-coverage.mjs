@@ -181,17 +181,23 @@ requireJobMarkers('verify', verifyJob.source, [
 if (verifyJob.source.includes('npm run npm:test:css')) {
   throw new Error('release verify must use the freshly built Wake CLI and host for CSS tests')
 }
-for (const [name, job] of [
-  ['build-native', buildNativeJob],
-  ['build-linux', buildLinuxJob],
+for (const [name, job, lockMarkers] of [
+  ['build-native', buildNativeJob, [
+    'git diff --exit-code -- Cargo.lock',
+  ]],
+  ['build-linux', buildLinuxJob, [
+    'cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"',
+    'cmp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"',
+  ]],
 ]) {
   requireOrderedJobMarkers(name, job.source, [
     'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}',
+    ...lockMarkers.slice(0, -1),
     'cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}',
     'npx --no-install napi build',
     '-- --locked --offline',
-    'git diff --exit-code -- Cargo.lock',
+    lockMarkers.at(-1),
     'node scripts/stage-test-host.mjs',
   ])
   if (job.source.includes('cargo fetch --locked --target')) {
@@ -339,7 +345,9 @@ if (workflow.includes('test-host/node')) {
 for (const [marker, expectedCount] of [
   ['cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}', 2],
   ['-- --locked --offline', 2],
-  ['git diff --exit-code -- Cargo.lock', 2],
+  ['git diff --exit-code -- Cargo.lock', 1],
+  ['cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"', 1],
+  ['cmp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"', 1],
   ['CARGO_NET_OFFLINE: "true"', 5],
 ]) {
   const count = workflow.split(marker).length - 1

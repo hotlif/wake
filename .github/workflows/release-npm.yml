@@ -185,6 +185,8 @@ jobs:
         run: cargo fetch --locked
       - name: Verify pinned Rusty V8 input
         run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
+      - name: Snapshot locked dependency graph
+        run: cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"
       - run: cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}
         env:
           CARGO_NET_OFFLINE: "true"
@@ -198,7 +200,8 @@ jobs:
           -- --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
-      - run: git diff --exit-code -- Cargo.lock
+      - name: Verify locked dependency graph stayed unchanged
+        run: cmp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"
       - name: Verify glibc baseline
         run: |
           highest="$(readelf --version-info npm/wake/wake.${{ matrix.suffix }}.node | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
