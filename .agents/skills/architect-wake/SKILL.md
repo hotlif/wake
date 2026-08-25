@@ -1,81 +1,36 @@
 ---
 name: architect-wake
-description: Architecture-first evolution for the Wake repository. Use when designing or implementing Wake features, refactors, bundler/runtime/cache/HMR changes, Rust crate boundaries, Node/npm APIs, Wake Docs routing, @crab-dev/css compiler contracts, performance work, or complex defects. Do not implicitly use for copy-only edits, formatting-only changes, or work outside Wake.
+description: 设计或实现 Wake 行为与架构变更；按风险分级，以证据驱动完整切片和验证。文案、格式及仓库外任务不隐式触发。
 ---
 
-# Architect Wake
+# Wake 架构演进
 
-Treat architecture as a falsifiable model that evolves with evidence. Make implementation serve the target architecture; do not make the target architecture imitate convenient existing code.
+现有代码是可证伪证据，须服务目标架构。取舍顺序：正确性、诊断、跨平台确定性、增量复用、吞吐量。
 
-## Start from the system
+## 分级
 
-1. Confirm the repository root, worktree state, affected product capability, and current public contract.
-2. Classify the task before searching for edit locations:
-   - **L0 local maintenance**: copy, formatting, or mechanical version synchronization with no behavior change. State `No architecture impact`; do not create an ADR.
-   - **L1 behavioral change**: change one subsystem without moving ownership or changing a cross-layer contract. Publish a concise Architecture Brief.
-   - **L2 architecture evolution**: change ownership, dependencies, data flow, cache identity, persistent formats, public contracts, or remove an old path. Publish a complete Architecture Brief and add or update an ADR.
-3. Treat cache, HMR, bundler runtime, persistence, Node/npm APIs, Docs routing, and CSS compiler contracts as L2 unless evidence proves the change is mechanical.
-4. Read [wake-architecture.md](references/wake-architecture.md) to locate the capability. Read only the domain sections needed from [invariants.md](references/invariants.md) and [validation.md](references/validation.md). For L1/L2, read [architecture-loop.md](references/architecture-loop.md) completely.
+- **L0 局部维护**：文案、格式或机械式版本同步，无行为变化。声明 `无架构影响`；无需简报、ADR 或参考文件。
+- **L1 行为变更**：改变单个子系统，但不转移所有权或改变跨层/公共契约。编辑前发布简明的 `架构简报 v1`：目标、当前证据、目标设计、不变量、验证。
+- **L2 架构演进**：改变所有权、依赖、数据流、缓存标识、持久化格式、公共契约，或删除旧路径。读 [architecture-loop.md](references/architecture-loop.md) 并发布简报；长期决策须新增或更新 ADR。缓存、HMR、打包器运行时、Node/npm API、文档路由和 CSS 编译器契约默认属于 L2，除非证据证明只是机械式修改。
 
-## Publish the architecture before editing
+## 工作原则
 
-For L1/L2, send `Architecture Brief v1` before modifying tracked files. Include:
+- 分开列出事实、推断、决策和假设；用最小实验检验最高风险项。假设被证伪即修订简报与目标，禁止用兼容补丁掩盖。
+- 实现最小完整垂直切片；共享契约的实现、调用方、类型、诊断、测试、文档和发布配置一并更新。
+- 默认原子切换并删除被取代路径。只有明确要求兼容时才加桥接，并记录负责人、范围、移除条件和最晚里程碑。
+- 保留无关工作树变更。仅在扩大批准范围、影响用户数据或需不可逆外部操作时请求新授权。
 
-- product goal and measurable success;
-- current architecture with source, test, or manifest evidence;
-- target architecture and ownership;
-- facts, inferences, decisions, and unverified hypotheses as separate lists;
-- components, dependency direction, and end-to-end data flow;
-- correctness, diagnostics, determinism, incremental, and cross-platform invariants;
-- public interface, artifact, configuration, and migration impact;
-- structures to delete or replace;
-- experiments and validation gates;
-- convergence conditions for this task.
+## 按需读取
 
-Expose reviewable decisions and evidence, not private chain-of-thought. Rank tradeoffs in this order: correctness, diagnostics, cross-platform determinism, incremental work avoidance, throughput, implementation convenience.
+从 `engineering/README.md` 定位源码、清单、测试。只读命中领域卡；跨领域读多个，不读无关文件：
 
-## Evolve with evidence
+- crate、编译器、打包器、运行时、并发或 unsafe：[rust-core.md](references/rust-core.md)
+- 缓存或 HMR：[cache-hmr.md](references/cache-hmr.md)
+- Node、npm 或发布：[node-release.md](references/node-release.md)
+- Wake 文档：[docs.md](references/docs.md)
+- Crab CSS：[crab-css.md](references/crab-css.md)
+- 性能：[performance.md](references/performance.md)
 
-1. Audit the current implementation as evidence, not as the desired design.
-2. Test high-risk assumptions with the smallest representative experiment before committing to a broad implementation.
-3. If evidence invalidates a hypothesis, stop at a safe boundary and publish `Architecture Brief vN+1`:
-   - identify the invalidated hypothesis and affected decisions;
-   - revise the target model and vertical slices;
-   - update the ADR when the durable decision changes;
-   - continue from the revised architecture without hiding the contradiction behind a compatibility patch.
-4. Ask for new authority only when the revised architecture materially expands user-approved scope, affects user data, or requires an irreversible external action.
+## 完成条件
 
-## Implement a complete vertical slice
-
-- Choose the smallest complete slice that reaches the target architecture, not the smallest diff and not the largest rewrite.
-- Update the model, implementation, callers, public types, diagnostics, tests, documentation, and release configuration together when they share a contract.
-- Preserve unrelated worktree changes. Never use destructive Git operations to simplify migration.
-- Default to an atomic repository-wide switch. Do not add deprecated wrappers, dual writes, compatibility parsers, old routes, or permanent feature flags unless compatibility is an explicit requirement.
-- When a bridge is necessary, record its owner, scope, removal condition, and latest removal milestone in the ADR.
-- Delete superseded paths in the same slice. Do not finish with an undocumented second implementation or second source of truth.
-
-## Enforce architecture, not prose
-
-- Run `npm run architecture:check` whenever crate boundaries or ADRs may be affected.
-- Update `engineering/architecture-boundaries.json` only with a referenced `proposed` or `accepted` ADR.
-- Create a new ADR when a durable decision changes. Mark the old ADR `superseded`; never rewrite history to make the old decision appear current.
-- Add a machine gate for every deterministic invariant that would otherwise depend on reviewers remembering it.
-- Do not duplicate machine-readable rules in narrative documents. Explain intent and link to the rule source.
-
-## Prove convergence
-
-Before declaring completion, audit all applicable conditions:
-
-- one clear owner for the capability;
-- dependency direction matches the target model;
-- one source of truth for core data;
-- cache identity includes every semantic input;
-- cold, warm, development, and production semantics agree;
-- failures identify the user or caller source;
-- the new contract fully replaces the old contract;
-- temporary bridges and duplicate implementations are removed;
-- each new abstraction serves a real data flow or multiple consumers;
-- hypotheses are supported by tests, executed artifacts, browser behavior, or reproducible benchmarks;
-- introduced complexity is lower than the complexity removed.
-
-For every non-applicable condition, state why. Run the risk-matched gates in [validation.md](references/validation.md), re-audit the diff for new cycles and dual paths, and report completed evidence, skipped gates, deletion results, and remaining unverified risks.
+确认能力只有一个负责人和事实来源，依赖符合目标模型，旧路径、临时桥接和重复实现已移除。运行领域关卡和 `git diff --check`，报告证据、跳过项及未验证风险。
