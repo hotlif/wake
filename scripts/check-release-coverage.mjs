@@ -169,6 +169,12 @@ if (!(auditTarballsJob.index < prepublishSmokeJob.index
   && prepublishSmokeJob.index < publishJob.index)) {
   throw new Error('local tarball smoke must run after audit-tarballs and before publish')
 }
+requireOrderedJobMarkers('audit-tarballs', auditTarballsJob.source, [
+  'actions/setup-node@v6',
+  'node-version: 24',
+  'npm ci --ignore-scripts',
+  'node scripts/verify-native-package.mjs',
+])
 requireJobMarkers('verify', verifyJob.source, [
   'cargo fetch --locked',
   'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
