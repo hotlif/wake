@@ -1,30 +1,100 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "contract": "ADR-0020",
-  "scope": "ci-release-conformance-only",
-  "versionPolicy": "exact-major",
+  "scope": "ci-release-browser-evidence",
   "versionSource": "cdp-browser-get-version",
   "requiredHeadless": true,
+  "browserBinaryPolicy": "system-only-no-download",
+  "acceptedKinds": ["chrome", "edge", "chromium"],
+  "stableReadiness": {
+    "policy": "shared-exact-major",
+    "major": 151,
+    "requiredTargets": [
+      "win32-x64-msvc",
+      "linux-x64-gnu",
+      "linux-arm64-gnu",
+      "darwin-x64",
+      "darwin-arm64"
+    ]
+  },
   "targets": {
     "win32-x64-msvc": {
-      "major": 151,
-      "acceptedKinds": ["chrome", "edge", "chromium"]
+      "runner": "windows-latest",
+      "rustTarget": "x86_64-pc-windows-msvc",
+      "experimental": {
+        "mode": "exact-major-conformance",
+        "major": 151
+      },
+      "reviewedRunnerEvidence": {
+        "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/windows/Windows2025-Readme.md",
+        "imageVersion": "20260818.232.1",
+        "browserVersions": {
+          "chrome": "151.0.7922.170",
+          "edge": "151.0.4129.86"
+        }
+      }
     },
     "linux-x64-gnu": {
-      "major": 151,
-      "acceptedKinds": ["chrome", "edge", "chromium"]
+      "runner": "ubuntu-24.04",
+      "rustTarget": "x86_64-unknown-linux-gnu",
+      "experimental": {
+        "mode": "exact-major-conformance",
+        "major": 151
+      },
+      "reviewedRunnerEvidence": {
+        "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/ubuntu/Ubuntu2404-Readme.md",
+        "imageVersion": "20260816.277.1",
+        "browserVersions": {
+          "chrome": "151.0.7922.137",
+          "chromium": "151.0.7922.0",
+          "edge": "151.0.4129.86"
+        }
+      }
     },
     "linux-arm64-gnu": {
-      "major": 151,
-      "acceptedKinds": ["chrome", "edge", "chromium"]
+      "runner": "ubuntu-24.04-arm",
+      "rustTarget": "aarch64-unknown-linux-gnu",
+      "experimental": {
+        "mode": "unavailable",
+        "reason": "The reviewed hosted-runner image has no system Chrome, Edge, or Chromium binary."
+      },
+      "reviewedRunnerEvidence": {
+        "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/ubuntu/Ubuntu2404-Arm64-Readme.md",
+        "imageVersion": "20260817.96.1",
+        "browserVersions": {}
+      }
     },
     "darwin-x64": {
-      "major": 151,
-      "acceptedKinds": ["chrome", "edge", "chromium"]
+      "runner": "macos-15-intel",
+      "rustTarget": "x86_64-apple-darwin",
+      "experimental": {
+        "mode": "exact-major-smoke",
+        "major": 150
+      },
+      "reviewedRunnerEvidence": {
+        "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/macos/macos-15-Readme.md",
+        "imageVersion": "20260727.0377.1",
+        "browserVersions": {
+          "chrome": "150.0.7871.187",
+          "edge": "150.0.4078.99"
+        }
+      }
     },
     "darwin-arm64": {
-      "major": 151,
-      "acceptedKinds": ["chrome", "edge", "chromium"]
+      "runner": "macos-15",
+      "rustTarget": "aarch64-apple-darwin",
+      "experimental": {
+        "mode": "exact-major-smoke",
+        "major": 150
+      },
+      "reviewedRunnerEvidence": {
+        "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/macos/macos-15-arm64-Readme.md",
+        "imageVersion": "20260727.0256.1",
+        "browserVersions": {
+          "chrome": "150.0.7871.187",
+          "edge": "150.0.4078.99"
+        }
+      }
     }
   }
 }

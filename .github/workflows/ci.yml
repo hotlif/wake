@@ -27,7 +27,9 @@ jobs:
         with:
           key: architecture
       - run: npm ci --ignore-scripts
-      - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+      # The architecture checker runs `cargo tree --target all --offline`; fetch the
+      # complete locked graph before preparing only the Linux rusty_v8 archive.
+      - run: cargo fetch --locked
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - run: cargo build -p wake_test_host -p wake_cli --locked --offline
         env:
@@ -111,7 +113,7 @@ jobs:
           CARGO_NET_OFFLINE: "true"
 
   browser-conformance:
-    name: React Chromium conformance / ${{ matrix.target }}
+    name: Browser evidence / ${{ matrix.target }} / ${{ matrix.browser_evidence }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -120,18 +122,27 @@ jobs:
           - target: win32-x64-msvc
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
+            browser_evidence: exact-major-conformance
+            browser_major: 151
           - target: linux-x64-gnu
             os: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
+            browser_evidence: exact-major-conformance
+            browser_major: 151
           - target: linux-arm64-gnu
             os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
+            browser_evidence: unavailable
           - target: darwin-arm64
             os: macos-15
             rust_target: aarch64-apple-darwin
+            browser_evidence: exact-major-smoke
+            browser_major: 150
           - target: darwin-x64
             os: macos-15-intel
             rust_target: x86_64-apple-darwin
+            browser_evidence: exact-major-smoke
+            browser_major: 150
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
@@ -139,14 +150,26 @@ jobs:
           node-version: 24
           cache: npm
       - uses: dtolnay/rust-toolchain@1.95.0
+        if: matrix.browser_evidence != 'unavailable'
       - uses: Swatinem/rust-cache@v2
+        if: matrix.browser_evidence != 'unavailable'
         with:
           key: browser-${{ matrix.target }}
       - run: npm ci --ignore-scripts
-      - run: cargo fetch --locked --target ${{ matrix.rust_target }}
-      - run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.rust_target }}
       - run: npm run browser:conformance:test
-      - name: Require the pinned post-CDP system browser identity
+      - name: Record reviewed browser unavailability
+        if: matrix.browser_evidence == 'unavailable'
+        shell: bash
+        run: |
+          node scripts/check-system-browser-conformance.mjs \
+            --target "${{ matrix.target }}" \
+            --unavailable true > "$RUNNER_TEMP/wake-browser-evidence.json"
+      - if: matrix.browser_evidence != 'unavailable'
+        run: cargo fetch --locked --target ${{ matrix.rust_target }}
+      - if: matrix.browser_evidence != 'unavailable'
+        run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.rust_target }}
+      - name: Require the reviewed post-CDP system browser identity
+        if: matrix.browser_evidence != 'unavailable'
         shell: bash
         run: |
           set -euo pipefail
@@ -154,21 +177,51 @@ jobs:
           cargo run --locked --offline --quiet -p wake_test_browser --example system_browser_identity > "$identity"
           node scripts/check-system-browser-conformance.mjs \
             --target "${{ matrix.target }}" \
-            --identity "$identity"
+            --identity "$identity" > "$RUNNER_TEMP/wake-browser-evidence.json"
         env:
           CARGO_NET_OFFLINE: "true"
       - name: CDP transport against the installed system browser
+        if: matrix.browser_evidence != 'unavailable'
         run: cargo test --locked --offline -p wake_test_browser --lib -- --ignored --nocapture
         env:
           CARGO_NET_OFFLINE: "true"
       - name: React, input, source-map and screenshot conformance
+        if: matrix.browser_evidence != 'unavailable'
         run: cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture
         env:
           CARGO_NET_OFFLINE: "true"
       - name: Browser TSX V8 coverage reports and thresholds
+        if: matrix.browser_evidence != 'unavailable'
         run: cargo test --locked --offline -p wake_test --test browser_coverage_conformance -- --ignored --nocapture
         env:
           CARGO_NET_OFFLINE: "true"
+      - name: Upload reviewed browser evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence-ci-${{ matrix.target }}
+          path: ${{ runner.temp }}/wake-browser-evidence.json
+          if-no-files-found: error
+
+  browser-stable-readiness:
+    name: Stable browser readiness (expected blocked)
+    needs: browser-conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Prove five-target shared exact-major readiness is blocked
+        shell: bash
+        run: |
+          node scripts/check-system-browser-conformance.mjs \
+            --stable-readiness blocked > "$RUNNER_TEMP/wake-browser-stable-readiness.json"
+      - name: Upload stable readiness evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-stable-readiness-ci
+          path: ${{ runner.temp }}/wake-browser-stable-readiness.json
+          if-no-files-found: error
 
   typescript-7:
     name: TypeScript 7 compatibility / ${{ matrix.os }}
@@ -303,12 +356,14 @@ jobs:
         with:
           key: node-${{ matrix.node }}
       - run: npm ci --ignore-scripts
-      - run: cargo fetch --locked --target x86_64-pc-windows-msvc
+      # napi build invokes offline cargo metadata across the complete locked graph.
+      - run: cargo fetch --locked
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc
       - run: npm run versions:check
       - run: npm run native:build
         env:
           CARGO_NET_OFFLINE: "true"
+      - run: git diff --exit-code -- Cargo.lock
       - run: node scripts/stage-test-host.mjs --package-dir npm/wake-win32-x64-msvc
       - name: Select local native binding
         shell: pwsh

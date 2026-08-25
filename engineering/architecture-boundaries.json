@@ -80,7 +80,8 @@
         "postinstall"
       ],
       "offlineCargoBuildFiles": [
-        ".github/workflows/release-npm.yml"
+        ".github/workflows/release-npm.yml",
+        ".github/workflows/vscode-css.yml"
       ]
     }
   },

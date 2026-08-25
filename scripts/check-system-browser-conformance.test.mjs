@@ -1,37 +1,21 @@
 import assert from 'node:assert/strict'
 
 import {
+  evaluateStableBrowserReadiness,
   parseChromiumMajor,
+  readSystemBrowserConformanceManifest,
+  recordUnavailableBrowserEvidence,
+  validateExperimentalBrowserIdentity,
   validateSystemBrowserConformanceManifest,
-  validateSystemBrowserIdentity,
 } from './check-system-browser-conformance.mjs'
 
-const targets = Object.fromEntries([
-  'win32-x64-msvc',
-  'linux-x64-gnu',
-  'linux-arm64-gnu',
-  'darwin-x64',
-  'darwin-arm64',
-].map((target) => [target, {
-  major: 151,
-  acceptedKinds: ['chrome', 'edge', 'chromium'],
-}]))
-const manifest = {
-  schemaVersion: 1,
-  contract: 'ADR-0020',
-  scope: 'ci-release-conformance-only',
-  versionPolicy: 'exact-major',
-  versionSource: 'cdp-browser-get-version',
-  requiredHeadless: true,
-  targets,
-}
-
+const manifest = readSystemBrowserConformanceManifest()
 assert.equal(validateSystemBrowserConformanceManifest(manifest), manifest)
 assert.equal(parseChromiumMajor('Chrome/151.0.7922.172'), 151)
-assert.equal(parseChromiumMajor('Microsoft Edge 151.0.4129.101'), 151)
+assert.equal(parseChromiumMajor('Microsoft Edge 150.0.4078.99'), 150)
 
 for (const kind of ['chrome', 'edge', 'chromium']) {
-  const checked = validateSystemBrowserIdentity({
+  const checked = validateExperimentalBrowserIdentity({
     manifest,
     target: 'win32-x64-msvc',
     identity: {
@@ -41,8 +25,10 @@ for (const kind of ['chrome', 'edge', 'chromium']) {
       headless: true,
     },
   })
-  assert.equal(checked.major, 151)
-  assert.equal(checked.kind, kind)
+  assert.equal(checked.browser.major, 151)
+  assert.equal(checked.browser.kind, kind)
+  assert.equal(checked.mode, 'exact-major-conformance')
+  assert.equal(checked.stableConformance, true)
 }
 
 const result = {
@@ -52,30 +38,54 @@ const result = {
     kind: 'browser',
     browser: {
       name: 'chrome',
-      version: 'Chrome/151.9.8.7',
+      version: 'Chrome/150.9.8.7',
       headless: true,
     },
   },
 }
-assert.equal(validateSystemBrowserIdentity({
+const macEvidence = validateExperimentalBrowserIdentity({
   manifest,
   target: 'darwin-arm64',
   result,
-}).version, 'Chrome/151.9.8.7')
+})
+assert.equal(macEvidence.browser.version, 'Chrome/150.9.8.7')
+assert.equal(macEvidence.mode, 'exact-major-smoke')
+assert.equal(macEvidence.stableConformance, false)
+
+const armEvidence = recordUnavailableBrowserEvidence({
+  manifest,
+  target: 'linux-arm64-gnu',
+})
+assert.equal(armEvidence.status, 'unavailable')
+assert.equal(armEvidence.browser, null)
+assert.equal(armEvidence.reviewedRunnerEvidence.browserVersions.chrome, undefined)
+
+const readiness = evaluateStableBrowserReadiness(manifest)
+assert.equal(readiness.ready, false)
+assert.deepEqual(
+  new Set(readiness.blockers.map(({ target }) => target)),
+  new Set(['linux-arm64-gnu', 'darwin-x64', 'darwin-arm64']),
+)
+assert(readiness.blockers.some(({ target, code }) =>
+  target === 'linux-arm64-gnu' && code === 'browser-unavailable'))
+assert(readiness.blockers.some(({ target, code }) =>
+  target === 'darwin-x64' && code === 'not-conformance-evidence'))
+assert(readiness.blockers.some(({ target, code }) =>
+  target === 'darwin-x64' && code === 'major-mismatch'))
 
 for (const [description, action, pattern] of [
   [
-    'wrong major',
-    () => validateSystemBrowserIdentity({
+    'wrong exact major',
+    () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'linux-x64-gnu',
       identity: { kind: 'chrome', version: 'Chrome/152.0.0.1', headless: true },
     }),
-    /pins Chromium-family major 151/,
+    /pins experimental Chromium-family major 151/,
   ],
   [
     'unknown browser kind',
-    () => validateSystemBrowserIdentity({
+    () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'linux-x64-gnu',
       identity: { kind: 'unknown', version: 'Chrome/151.0.0.1', headless: true },
@@ -84,10 +94,10 @@ for (const [description, action, pattern] of [
   ],
   [
     'non-headless result',
-    () => validateSystemBrowserIdentity({
+    () => validateExperimentalBrowserIdentity({
       manifest,
-      target: 'linux-x64-gnu',
-      identity: { kind: 'chrome', version: 'Chrome/151.0.0.1', headless: false },
+      target: 'darwin-x64',
+      identity: { kind: 'chrome', version: 'Chrome/150.0.0.1', headless: false },
     }),
     /requires headless=true/,
   ],
@@ -98,12 +108,26 @@ for (const [description, action, pattern] of [
   ],
   [
     'failed Wake result',
-    () => validateSystemBrowserIdentity({
+    () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'darwin-x64',
       result: { ...result, success: false },
     }),
     /successful wake\.test\.v1 result/,
+  ],
+  [
+    'unavailable target rejects browser identity',
+    () => validateExperimentalBrowserIdentity({
+      manifest,
+      target: 'linux-arm64-gnu',
+      identity: { kind: 'chrome', version: 'Chrome/151.0.0.1', headless: true },
+    }),
+    /reviewed as unavailable/,
+  ],
+  [
+    'available target rejects unavailable evidence',
+    () => recordUnavailableBrowserEvidence({ manifest, target: 'linux-x64-gnu' }),
+    /not reviewed as browser-unavailable/,
   ],
 ]) {
   assert.throws(action, pattern, description)
@@ -120,11 +144,32 @@ assert.throws(
   () => validateSystemBrowserConformanceManifest(extraField),
   /must contain exactly/,
 )
-const splitMajor = structuredClone(manifest)
-splitMajor.targets['darwin-arm64'].major = 152
+const inventedArmBrowser = structuredClone(manifest)
+inventedArmBrowser.targets['linux-arm64-gnu'].reviewedRunnerEvidence.browserVersions.chrome =
+  '151.0.0.1'
 assert.throws(
-  () => validateSystemBrowserConformanceManifest(splitMajor),
-  /must pin one shared major/,
+  () => validateSystemBrowserConformanceManifest(inventedArmBrowser),
+  /unavailable evidence cannot list a browser version/,
+)
+const unpinnedEvidence = structuredClone(manifest)
+unpinnedEvidence.targets['darwin-x64'].reviewedRunnerEvidence.source =
+  'https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md'
+assert.throws(
+  () => validateSystemBrowserConformanceManifest(unpinnedEvidence),
+  /immutable official runner-images inventory/,
+)
+const wrongRunner = structuredClone(manifest)
+wrongRunner.targets['darwin-arm64'].runner = 'macos-15-intel'
+assert.throws(
+  () => validateSystemBrowserConformanceManifest(wrongRunner),
+  /darwin-arm64 runner must be macos-15/,
+)
+const wrongInventory = structuredClone(manifest)
+wrongInventory.targets['darwin-x64'].reviewedRunnerEvidence.source =
+  manifest.targets['darwin-arm64'].reviewedRunnerEvidence.source
+assert.throws(
+  () => validateSystemBrowserConformanceManifest(wrongInventory),
+  /darwin-x64 runner evidence must use its immutable official runner-images inventory/,
 )
 
-console.log('System browser conformance checker tests passed: 15 cases')
+console.log('System browser conformance checker tests passed: schema v2 and release split')

@@ -11,13 +11,15 @@ const root = resolve(import.meta.dirname, '..')
 const npmRoot = resolve(root, 'npm')
 const workflowPath = resolve(root, '.github/workflows/release-npm.yml')
 const workflow = readFileSync(workflowPath, 'utf8')
-readSystemBrowserConformanceManifest()
+const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+const browserManifest = readSystemBrowserConformanceManifest()
 const vscodeWorkflow = readFileSync(
   resolve(root, '.github/workflows/vscode-css.yml'),
   'utf8',
 )
 
 const releaseJobs = [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
+const vscodeJobs = [...vscodeWorkflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
 function releaseJob(name) {
   const matches = releaseJobs.filter((match) => match[1] === name)
   if (matches.length !== 1) {
@@ -27,6 +29,28 @@ function releaseJob(name) {
   const index = releaseJobs.indexOf(match)
   const end = releaseJobs[index + 1]?.index ?? workflow.length
   return { index: match.index, source: workflow.slice(match.index, end) }
+}
+
+function vscodeJob(name) {
+  const matches = vscodeJobs.filter((match) => match[1] === name)
+  if (matches.length !== 1) {
+    throw new Error(`vscode-css.yml must define exactly one ${name} job; found ${matches.length}`)
+  }
+  const match = matches[0]
+  const index = vscodeJobs.indexOf(match)
+  const end = vscodeJobs[index + 1]?.index ?? vscodeWorkflow.length
+  return { index: match.index, source: vscodeWorkflow.slice(match.index, end) }
+}
+
+function requireOrderedVscodeJobMarkers(name, source, markers) {
+  let previous = -1
+  for (const marker of markers) {
+    const index = source.indexOf(marker)
+    if (index <= previous) {
+      throw new Error(`vscode-css.yml ${name} job must order ${marker} after its preceding gate`)
+    }
+    previous = index
+  }
 }
 
 function requireJobMarkers(name, source, markers) {
@@ -45,6 +69,40 @@ function requireOrderedJobMarkers(name, source, markers) {
       throw new Error(`release-npm.yml ${name} job must order ${marker} after its preceding gate`)
     }
     previous = index
+  }
+}
+
+function requireUnconditionalShellStep(name, source, stepName) {
+  const pattern = new RegExp(
+    `- name: ${escapeRegExp(stepName)}\\r?\\n\\s+shell:`,
+  )
+  if (!pattern.test(source)) {
+    throw new Error(`${name} must run ${stepName} unconditionally for every matrix cell`)
+  }
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function requireBrowserMatrix(name, source, { targetKey, runnerKey, rustTargetKey }) {
+  for (const [target, targetPolicy] of Object.entries(browserManifest.targets)) {
+    const policy = targetPolicy.experimental
+    const lines = [
+      `- ${targetKey}: ${target}`,
+      `${runnerKey}: ${targetPolicy.runner}`,
+    ]
+    if (rustTargetKey) lines.push(`${rustTargetKey}: ${targetPolicy.rustTarget}`)
+    lines.push(`browser_evidence: ${policy.mode}`)
+    if (policy.mode !== 'unavailable') lines.push(`browser_major: ${policy.major}`)
+    const row = lines
+      .map((line, index) => index === 0
+        ? escapeRegExp(line)
+        : `\\s+${escapeRegExp(line)}`)
+      .join('\\r?\\n')
+    if (!new RegExp(row).test(source)) {
+      throw new Error(`${name} is missing the manifest-backed ${target} browser evidence row`)
+    }
   }
 }
 
@@ -95,12 +153,24 @@ const auditTarballsJob = releaseJob('audit-tarballs')
 const prepublishSmokeJob = releaseJob('prepublish-smoke')
 const publishJob = releaseJob('publish')
 const registrySmokeJob = releaseJob('smoke')
+const ciBrowserJobMatch = ciWorkflow.match(
+  /^  browser-conformance:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:\r?$)/m,
+)
+if (!ciBrowserJobMatch) {
+  throw new Error('ci.yml must define the browser-conformance job')
+}
+const ciBrowserJob = ciBrowserJobMatch[0]
+const ciNodeJobMatch = ciWorkflow.match(/\r?\n  node:\r?\n/)
+if (!ciNodeJobMatch) {
+  throw new Error('ci.yml must define the node job')
+}
+const ciNodeJob = ciWorkflow.slice(ciNodeJobMatch.index)
 if (!(auditTarballsJob.index < prepublishSmokeJob.index
   && prepublishSmokeJob.index < publishJob.index)) {
   throw new Error('local tarball smoke must run after audit-tarballs and before publish')
 }
 requireJobMarkers('verify', verifyJob.source, [
-  'cargo fetch --locked --target x86_64-unknown-linux-gnu',
+  'cargo fetch --locked',
   'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
   'cargo test --workspace --locked --offline',
   'cargo clippy --workspace --all-targets --locked --offline -- -D warnings',
@@ -116,7 +186,7 @@ for (const [name, job] of [
   ['build-linux', buildLinuxJob],
 ]) {
   requireOrderedJobMarkers(name, job.source, [
-    'cargo fetch --locked --target ${{ matrix.target }}',
+    'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}',
     'cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}',
     'npx --no-install napi build',
@@ -124,6 +194,9 @@ for (const [name, job] of [
     'git diff --exit-code -- Cargo.lock',
     'node scripts/stage-test-host.mjs',
   ])
+  if (job.source.includes('cargo fetch --locked --target')) {
+    throw new Error(`${name} must fetch the complete locked graph before offline napi metadata`)
+  }
 }
 requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   'needs: [verify, audit-tarballs]',
@@ -150,7 +223,8 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   'context.stopWatch()',
   'await context.close()',
   'Select a system Chrome, Edge or Chromium',
-  "if: matrix.node == '24'",
+  "matrix.node == '24' && matrix.browser_evidence != 'unavailable'",
+  "matrix.node == '24' && matrix.browser_evidence == 'unavailable'",
   'ubuntu-24.04-arm',
   'WAKE_RELEASE_BROWSER_PATH',
   'A compatible system Chrome, Edge or Chromium is required',
@@ -161,6 +235,11 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   '--output browser-result.json',
   '--target "${{ matrix.platform }}"',
   '--result browser-result.json',
+  '--unavailable true',
+  '--stable-readiness blocked',
+  'browser-evidence-prepublish-${{ matrix.platform }}',
+  '${{ runner.temp }}/wake-browser-evidence.json',
+  '${{ runner.temp }}/wake-browser-stable-readiness.json',
 ])
 if (prepublishSmokeJob.source.includes('continue-on-error')) {
   throw new Error('prepublish local tarball smoke must never continue on error')
@@ -168,28 +247,58 @@ if (prepublishSmokeJob.source.includes('continue-on-error')) {
 if (prepublishSmokeJob.source.includes('npm publish')) {
   throw new Error('prepublish local tarball smoke must not mutate the npm registry')
 }
-const node24GateCount = prepublishSmokeJob.source.split("if: matrix.node == '24'").length - 1
-if (node24GateCount !== 2) {
-  throw new Error(`prepublish smoke must have exactly two Node 24 browser gates; found ${node24GateCount}`)
+requireUnconditionalShellStep(
+  'prepublish-smoke',
+  prepublishSmokeJob.source,
+  "Clean install this build's local tarballs",
+)
+requireUnconditionalShellStep(
+  'prepublish-smoke',
+  prepublishSmokeJob.source,
+  'Wake Test CLI, runTests and TestContext smoke',
+)
+requireBrowserMatrix('ci.yml browser-conformance', ciBrowserJob, {
+  targetKey: 'target',
+  runnerKey: 'os',
+  rustTargetKey: 'rust_target',
+})
+requireBrowserMatrix('release-npm.yml prepublish-smoke', prepublishSmokeJob.source, {
+  targetKey: 'platform',
+  runnerKey: 'runner',
+})
+requireBrowserMatrix('release-npm.yml smoke', registrySmokeJob.source, {
+  targetKey: 'platform',
+  runnerKey: 'runner',
+})
+requireJobMarkers('ci browser-conformance', ciBrowserJob, [
+  "matrix.browser_evidence == 'unavailable'",
+  "matrix.browser_evidence != 'unavailable'",
+  '--identity "$identity" > "$RUNNER_TEMP/wake-browser-evidence.json"',
+  '--unavailable true > "$RUNNER_TEMP/wake-browser-evidence.json"',
+  'browser-evidence-ci-${{ matrix.target }}',
+])
+if (ciBrowserJob.includes('continue-on-error')) {
+  throw new Error('CI browser evidence must never continue on error')
 }
-const prepublishConditions = [...prepublishSmokeJob.source.matchAll(/^\s+if:\s*(.+)\r?$/gm)]
-  .map((match) => match[1])
-if (prepublishConditions.length !== 2
-  || prepublishConditions.some((condition) => condition !== "matrix.node == '24'")) {
-  throw new Error(
-    `prepublish smoke must gate only the two Node 24 browser steps, found ${prepublishConditions.join(', ')}`,
-  )
+requireOrderedJobMarkers('ci node', ciNodeJob, [
+  'npm ci --ignore-scripts',
+  'cargo fetch --locked',
+  'node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc',
+  'npm run native:build',
+  'git diff --exit-code -- Cargo.lock',
+  'node scripts/stage-test-host.mjs',
+])
+if (ciNodeJob.includes('cargo fetch --locked --target')) {
+  throw new Error('CI node must fetch the complete locked graph before offline napi metadata')
 }
-for (const [platform, runner] of [
-  ['win32-x64-msvc', 'windows-latest'],
-  ['linux-x64-gnu', 'ubuntu-24.04'],
-  ['linux-arm64-gnu', 'ubuntu-24.04-arm'],
-  ['darwin-x64', 'macos-15-intel'],
-  ['darwin-arm64', 'macos-15'],
+for (const marker of [
+  'browser-stable-readiness:',
+  'needs: browser-conformance',
+  '--stable-readiness blocked > "$RUNNER_TEMP/wake-browser-stable-readiness.json"',
+  'browser-stable-readiness-ci',
 ]) {
-  const pair = new RegExp(`- platform: ${platform}\\r?\\n\\s+runner: ${runner}(?:\\r?\\n|$)`)
-  if (!pair.test(prepublishSmokeJob.source)) {
-    throw new Error(`prepublish smoke is missing the ${platform} -> ${runner} runner mapping`)
+  if (!ciWorkflow.includes(marker)) {
+    throw new Error(`ci.yml is missing the explicit blocked stable-browser marker ${marker}`)
   }
 }
 requireJobMarkers('publish', publishJob.source, [
@@ -198,14 +307,36 @@ requireJobMarkers('publish', publishJob.source, [
 ])
 requireJobMarkers('smoke', registrySmokeJob.source, [
   'needs: publish',
+  'platform: [win32-x64-msvc, linux-x64-gnu, linux-arm64-gnu, darwin-x64, darwin-arm64]',
+  'node: [24, 26]',
   'registry-url: https://registry.npmjs.org',
   'Clean registry install without build tools',
+  "matrix.node == 24 && matrix.browser_evidence != 'unavailable'",
+  "matrix.node == 24 && matrix.browser_evidence == 'unavailable'",
+  '--browser-path "$browser"',
+  '--output browser-result.json',
+  '--result browser-result.json',
+  '--unavailable true',
+  '--stable-readiness blocked',
+  'browser-evidence-postpublish-${{ matrix.platform }}',
 ])
+if (registrySmokeJob.source.includes('continue-on-error')) {
+  throw new Error('postpublish registry smoke must never continue on error')
+}
+requireUnconditionalShellStep(
+  'smoke',
+  registrySmokeJob.source,
+  'Clean registry install without build tools',
+)
+for (const source of [workflow, ciWorkflow]) {
+  if (/playwright|puppeteer|chrome-for-testing|setup-chrome|browser-actions/i.test(source)) {
+    throw new Error('browser evidence workflows must not install a third-party browser')
+  }
+}
 if (workflow.includes('test-host/node')) {
   throw new Error('release-npm.yml must use the canonical wake-test-host name')
 }
 for (const [marker, expectedCount] of [
-  ['cargo fetch --locked --target ${{ matrix.target }}', 2],
   ['cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}', 2],
   ['-- --locked --offline', 2],
   ['git diff --exit-code -- Cargo.lock', 2],
@@ -286,6 +417,124 @@ if (extensionManifest.private !== true) {
   throw new Error(
     'editors/vscode-css is distributed as a GitHub VSIX and must be private for npm',
   )
+}
+
+const vscodeVerifyJob = vscodeJob('verify')
+const vscodeVerifyMarkers = [
+  'npm ci --ignore-scripts',
+  'npm ci --ignore-scripts --prefix editors/vscode-css',
+  'cargo fetch --locked',
+  'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
+  'cargo build --release -p wake_test_host -p wake_cli --locked --offline',
+  'npm run release:check',
+  'npm run vscode:css:check',
+  'WAKE_BIN: ${{ github.workspace }}/target/release/wake',
+]
+requireOrderedVscodeJobMarkers('verify', vscodeVerifyJob.source, vscodeVerifyMarkers)
+for (const marker of [
+  'cache-dependency-path: |',
+  'package-lock.json',
+  'editors/vscode-css/package-lock.json',
+  'CARGO_NET_OFFLINE: "true"',
+]) {
+  if (!vscodeVerifyJob.source.includes(marker)) {
+    throw new Error(`vscode-css.yml verify job is missing contract marker ${marker}`)
+  }
+}
+for (const forbidden of ['npm run native:build', 'napi build', 'stage-test-host']) {
+  if (vscodeVerifyJob.source.includes(forbidden)) {
+    throw new Error(`vscode-css.yml verify job must not stage the retired Node test path: ${forbidden}`)
+  }
+}
+if (vscodeVerifyJob.source.includes('cargo fetch --locked --target')) {
+  throw new Error('vscode-css.yml verify job must fetch the complete lock graph for architecture:check')
+}
+
+const vscodeBuildJobs = [
+  {
+    name: 'extension-host',
+    job: vscodeJob('extension-host'),
+    fetch: 'cargo fetch --locked --target x86_64-unknown-linux-gnu',
+    build: 'cargo build --release -p wake_css_lsp -p wake_cli --locked --offline',
+  },
+  {
+    name: 'package-native',
+    job: vscodeJob('package-native'),
+    fetch: 'cargo fetch --locked --target ${{ matrix.rust_target }}',
+    build: 'cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline',
+  },
+  {
+    name: 'package-linux',
+    job: vscodeJob('package-linux'),
+    fetch: 'cargo fetch --locked --target ${{ matrix.rust_target }}',
+    build: 'cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline',
+  },
+]
+for (const { name, job, fetch, build } of vscodeBuildJobs) {
+  requireOrderedVscodeJobMarkers(name, job.source, [
+    'npm ci --ignore-scripts --prefix editors/vscode-css',
+    fetch,
+    build,
+    'CARGO_NET_OFFLINE: "true"',
+  ])
+  const cargoBuildLines = job.source
+    .split(/\r?\n/)
+    .filter((line) => line.includes('- run: cargo build'))
+  if (cargoBuildLines.length !== 1 || !cargoBuildLines[0].includes('--locked --offline')) {
+    throw new Error(`vscode-css.yml ${name} must contain one locked/offline Cargo build`)
+  }
+  if (job.source.includes('prepare-rusty-v8.mjs')) {
+    throw new Error(`vscode-css.yml ${name} must not prepare V8 for CLI-only packaging`)
+  }
+}
+
+const extensionBuild = readFileSync(
+  resolve(root, 'editors/vscode-css/scripts/build.mjs'),
+  'utf8',
+)
+const extensionTestLauncher = readFileSync(
+  resolve(root, 'editors/vscode-css/scripts/run-wake-tests.mjs'),
+  'utf8',
+)
+const extensionWakeBinary = readFileSync(
+  resolve(root, 'editors/vscode-css/scripts/wake-binary.mjs'),
+  'utf8',
+)
+if (
+  extensionManifest.scripts?.check
+  !== 'npm run compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs'
+) {
+  throw new Error('Crab CSS package check must use the first-party Wake test launcher')
+}
+for (const marker of ['process.env.WAKE_BIN', 'isAbsolute(wakeBinary)', 'statSync(wakeBinary)']) {
+  if (!extensionWakeBinary.includes(marker)) {
+    throw new Error(`Crab CSS WAKE_BIN resolver is missing contract marker ${marker}`)
+  }
+}
+if (!extensionBuild.includes('spawnSync(wakeBinary, args')) {
+  throw new Error('Crab CSS editor build must consume only the explicit WAKE_BIN executable')
+}
+if (!extensionTestLauncher.includes("spawnSync(wakeBinary, ['test', ...testFiles, '--serial']")) {
+  throw new Error('Crab CSS editor tests must execute the explicit Wake CLI in serial mode')
+}
+for (const [name, source] of [
+  ['package check', extensionManifest.scripts?.check ?? ''],
+  ['editor build', extensionBuild],
+  ['editor test launcher', extensionTestLauncher],
+  ['WAKE_BIN resolver', extensionWakeBinary],
+]) {
+  for (const forbidden of [
+    'npm/wake/bin/wake.mjs',
+    'node_modules',
+    'releaseBinary',
+    "'cargo'",
+    'http://',
+    'https://',
+  ]) {
+    if (source.includes(forbidden)) {
+      throw new Error(`Crab CSS ${name} must not retain a fallback path: ${forbidden}`)
+    }
+  }
 }
 
 const vscodeTargets = [

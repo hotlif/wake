@@ -133,18 +133,22 @@ test('embedded V8 conformance uses one immutable selected Test262 ES2024 manifes
   assert.match(ci, /cargo test --locked --offline -p wake_test --lib -- --ignored/)
 })
 
-test('system browser conformance is exact-major pinned without a product download path', () => {
+test('system browser evidence separates experimental publication from stable readiness', () => {
   const manifest = JSON.parse(
     readFileSync(
       new URL('../engineering/system-browser-conformance.json', import.meta.url),
       'utf8',
     ),
   )
+  assert.equal(manifest.schemaVersion, 2)
   assert.equal(manifest.contract, 'ADR-0020')
-  assert.equal(manifest.scope, 'ci-release-conformance-only')
-  assert.equal(manifest.versionPolicy, 'exact-major')
+  assert.equal(manifest.scope, 'ci-release-browser-evidence')
   assert.equal(manifest.versionSource, 'cdp-browser-get-version')
   assert.equal(manifest.requiredHeadless, true)
+  assert.equal(manifest.browserBinaryPolicy, 'system-only-no-download')
+  assert.deepEqual(manifest.acceptedKinds, ['chrome', 'edge', 'chromium'])
+  assert.equal(manifest.stableReadiness.policy, 'shared-exact-major')
+  assert.equal(manifest.stableReadiness.major, 151)
   assert.deepEqual(
     Object.keys(manifest.targets).sort(),
     [
@@ -155,9 +159,25 @@ test('system browser conformance is exact-major pinned without a product downloa
       'win32-x64-msvc',
     ],
   )
+  assert.equal(manifest.targets['win32-x64-msvc'].experimental.mode, 'exact-major-conformance')
+  assert.equal(manifest.targets['win32-x64-msvc'].experimental.major, 151)
+  assert.equal(manifest.targets['linux-x64-gnu'].experimental.mode, 'exact-major-conformance')
+  assert.equal(manifest.targets['linux-x64-gnu'].experimental.major, 151)
+  assert.equal(manifest.targets['linux-arm64-gnu'].experimental.mode, 'unavailable')
+  assert.deepEqual(
+    manifest.targets['linux-arm64-gnu'].reviewedRunnerEvidence.browserVersions,
+    {},
+  )
+  for (const target of ['darwin-x64', 'darwin-arm64']) {
+    assert.equal(manifest.targets[target].experimental.mode, 'exact-major-smoke')
+    assert.equal(manifest.targets[target].experimental.major, 150)
+  }
   for (const policy of Object.values(manifest.targets)) {
-    assert.equal(policy.major, 151)
-    assert.deepEqual(policy.acceptedKinds, ['chrome', 'edge', 'chromium'])
+    assert.match(
+      policy.reviewedRunnerEvidence.source,
+      /^https:\/\/github\.com\/actions\/runner-images\/blob\/[0-9a-f]{40}\//,
+    )
+    assert.match(policy.reviewedRunnerEvidence.imageVersion, /^\d+\.\d+\.\d+$/)
   }
 
   const checker = readFileSync(
@@ -180,14 +200,19 @@ test('system browser conformance is exact-major pinned without a product downloa
   assert.match(identityExample, /driver\.installation/)
   assert.match(ci, /check-system-browser-conformance\.mjs/)
   assert.match(ci, /--identity/)
+  assert.match(ci, /--unavailable true/)
+  assert.match(ci, /--stable-readiness blocked/)
+  assert.match(ci, /browser-stable-readiness:/)
   assert.match(release, /--reporter json/)
   assert.match(release, /--result browser-result\.json/)
+  assert.match(release, /--unavailable true/)
+  assert.match(release, /--stable-readiness blocked/)
   assert.ok(
     release.indexOf('--result browser-result.json') <
       release.indexOf('  publish:'),
     'the pinned browser result must be checked before publish',
   )
-  assert.doesNotMatch(checker, /download|https?:\/\//i)
+  assert.doesNotMatch(checker, /from ['"]node:(?:http|https|net)['"]|\bfetch\s*\(/)
   for (const source of [ci, release]) {
     assert.doesNotMatch(
       source,
@@ -196,14 +221,48 @@ test('system browser conformance is exact-major pinned without a product downloa
   }
 })
 
+test('architecture CI fetches the complete lock graph before its offline target-all check', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const start = ci.indexOf('  architecture:')
+  const end = ci.indexOf('\n  fmt:', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const job = ci.slice(start, end)
+  const markers = [
+    'npm ci --ignore-scripts',
+    'cargo fetch --locked',
+    'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
+    'cargo build -p wake_test_host -p wake_cli --locked --offline',
+    'npm run release:check',
+    './target/debug/wake test scripts/check-architecture.test.mjs --serial',
+    'npm run architecture:check',
+  ]
+  let previous = -1
+  for (const marker of markers) {
+    const index = job.indexOf(marker)
+    assert.ok(index > previous, `${marker} must follow the preceding clean-cache gate`)
+    previous = index
+  }
+  assert.doesNotMatch(job, /cargo fetch --locked --target/)
+  assert.match(job, /cargo tree --target all --offline/)
+
+  const checker = readFileSync(
+    new URL('./check-architecture.mjs', import.meta.url),
+    'utf8',
+  )
+  assert.match(checker, /'--offline',[\s\S]*?'--target',[\s\S]*?'all'/)
+})
+
 test('Node CI stages the complete local platform package before testing and packing', () => {
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   const nodeJobStart = ci.search(/\r?\n  node:\r?\n/)
   assert.notEqual(nodeJobStart, -1)
   const nodeJob = ci.slice(nodeJobStart)
   const markers = [
+    'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc',
     'npm run native:build',
+    'git diff --exit-code -- Cargo.lock',
     'node scripts/stage-test-host.mjs --package-dir npm/wake-win32-x64-msvc',
     'npm run npm:test:wake',
     'npm run npm:pack:check',
@@ -214,7 +273,112 @@ test('Node CI stages the complete local platform package before testing and pack
     assert(index > previous, `${marker} must follow the preceding Node CI stage`)
     previous = index
   }
+  assert.doesNotMatch(nodeJob, /cargo fetch --locked --target/)
   assert.doesNotMatch(nodeJob, /Copy-Item .*\.node/)
+})
+
+test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/vscode-css.yml', import.meta.url), 'utf8')
+  const architecturePolicy = JSON.parse(
+    readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'),
+  )
+  const manifest = JSON.parse(
+    readFileSync(new URL('../editors/vscode-css/package.json', import.meta.url), 'utf8'),
+  )
+  const build = readFileSync(
+    new URL('../editors/vscode-css/scripts/build.mjs', import.meta.url),
+    'utf8',
+  )
+  const launcher = readFileSync(
+    new URL('../editors/vscode-css/scripts/run-wake-tests.mjs', import.meta.url),
+    'utf8',
+  )
+  const binaryResolver = readFileSync(
+    new URL('../editors/vscode-css/scripts/wake-binary.mjs', import.meta.url),
+    'utf8',
+  )
+  assert.equal(
+    manifest.scripts.check,
+    'npm run compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs',
+  )
+  assert.deepEqual(
+    architecturePolicy.dependencyProvenance.networkFreeBuild.offlineCargoBuildFiles,
+    ['.github/workflows/release-npm.yml', '.github/workflows/vscode-css.yml'],
+  )
+  assert.match(binaryResolver, /process\.env\.WAKE_BIN/)
+  assert.match(binaryResolver, /isAbsolute\(wakeBinary\)/)
+  assert.match(build, /spawnSync\(wakeBinary, args/)
+  assert.match(launcher, /spawnSync\(wakeBinary, \['test', \.\.\.testFiles, '--serial'\]/)
+  for (const source of [manifest.scripts.check, build, launcher, binaryResolver]) {
+    assert.doesNotMatch(source, /npm\/wake\/bin\/wake\.mjs|node_modules|releaseBinary|['"]cargo['"]|https?:\/\//)
+  }
+
+  const verifyStart = workflow.search(/\r?\n  verify:\r?\n/)
+  const verifyEnd = workflow.search(/\r?\n  extension-host:\r?\n/)
+  assert.notEqual(verifyStart, -1)
+  assert(verifyEnd > verifyStart)
+  const verify = workflow.slice(verifyStart, verifyEnd)
+  const markers = [
+    'npm ci --ignore-scripts',
+    'npm ci --ignore-scripts --prefix editors/vscode-css',
+    'cargo fetch --locked',
+    'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
+    'cargo build --release -p wake_test_host -p wake_cli --locked --offline',
+    'npm run release:check',
+    'npm run vscode:css:check',
+    'WAKE_BIN: ${{ github.workspace }}/target/release/wake',
+  ]
+  let previous = -1
+  for (const marker of markers) {
+    const index = verify.indexOf(marker)
+    assert(index > previous, `${marker} must follow the preceding VSIX verify stage`)
+    previous = index
+  }
+  assert.match(verify, /CARGO_NET_OFFLINE: "true"/)
+  assert.doesNotMatch(verify, /npm run native:build|napi build|stage-test-host/)
+  assert.doesNotMatch(verify, /cargo fetch --locked --target/)
+
+  const jobSource = (name, nextName) => {
+    const start = workflow.search(new RegExp(`\\r?\\n  ${name}:\\r?\\n`))
+    const end = workflow.search(new RegExp(`\\r?\\n  ${nextName}:\\r?\\n`))
+    assert.notEqual(start, -1)
+    assert(end > start)
+    return workflow.slice(start, end)
+  }
+  const buildJobs = [
+    {
+      name: 'extension-host',
+      source: jobSource('extension-host', 'package-native'),
+      fetch: 'cargo fetch --locked --target x86_64-unknown-linux-gnu',
+      build: 'cargo build --release -p wake_css_lsp -p wake_cli --locked --offline',
+    },
+    {
+      name: 'package-native',
+      source: jobSource('package-native', 'package-linux'),
+      fetch: 'cargo fetch --locked --target ${{ matrix.rust_target }}',
+      build: 'cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline',
+    },
+    {
+      name: 'package-linux',
+      source: jobSource('package-linux', 'github-release'),
+      fetch: 'cargo fetch --locked --target ${{ matrix.rust_target }}',
+      build: 'cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline',
+    },
+  ]
+  for (const { name, source, fetch, build: buildMarker } of buildJobs) {
+    const fetchIndex = source.indexOf(fetch)
+    const buildIndex = source.indexOf(buildMarker)
+    const offlineIndex = source.indexOf('CARGO_NET_OFFLINE: "true"')
+    assert(fetchIndex >= 0, `${name} is missing its target-scoped Cargo fetch`)
+    assert(buildIndex > fetchIndex, `${name} must build only after its Cargo fetch`)
+    assert(offlineIndex > buildIndex, `${name} must force Cargo offline during its build`)
+    assert.equal(
+      source.split(/\r?\n/).filter((line) => line.includes('- run: cargo build')).length,
+      1,
+      `${name} must contain one Cargo build`,
+    )
+    assert.doesNotMatch(source, /prepare-rusty-v8\.mjs/)
+  }
 })
 
 function policy(overrides = {}) {

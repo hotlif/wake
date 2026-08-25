@@ -68,10 +68,15 @@ The browser environment starts or attaches to an explicitly selected Chrome, Edg
 executable. One browser process may be reused, but every suite receives a fresh BrowserContext and
 page. The executable identity and version are part of diagnostics, results and cache identity.
 Browser binaries are not placed in Wake's existing platform packages; CI supplies and pins the
-browser used for release evidence. `engineering/system-browser-conformance.json` pins one shared,
-exact Chromium-family major across the five release targets and accepts patch/build variation
-within that major.
-The pin is admission policy for CI and release conformance only: ordinary local test runs continue
+browser used for release evidence. `engineering/system-browser-conformance.json` schema v2 keeps
+two claims separate. Experimental publication evidence follows the reviewed hosted-runner
+inventory: Windows x64 and Linux x64 run blocking exact-major conformance at Chromium major 151;
+macOS x64/arm64 run blocking functional browser smoke at the reviewed major 150 and are explicitly
+not stable conformance; Linux ARM64 records machine-readable browser unavailability and never
+downloads a substitute. The stable-readiness policy remains stricter: all five targets must run
+conformance on one shared exact Chromium-family major. The current manifest therefore evaluates
+stable readiness to `ready: false` with explicit per-target blockers.
+These pins are admission policy for CI and release evidence only: ordinary local test runs continue
 to accept any compatible system Chrome, Edge or Chromium and always report its full CDP identity.
 
 Tests within one DOM are sequential. Suites may run in parallel in isolated realms or
@@ -175,11 +180,16 @@ Maintaining both environments adds differential testing and cache inputs; it doe
 framework implementations because they share the Wake test kernel and result model.
 
 Browser mode requires a compatible local Chromium-family executable. System-browser variance is
-made visible through result metadata. CI and the blocking prepublish matrix reject a browser whose
-post-CDP identity does not match the repository's exact-major conformance manifest; a hosted-runner
-upgrade therefore requires a reviewed manifest bump and a green five-platform matrix. This does not
-restrict ordinary users to that major. The browser is kept out of the current npm platform-package
-size budget.
+made visible through result metadata. CI, blocking prepublish smoke and postpublish registry smoke
+validate every available browser's post-CDP identity against the target's reviewed experimental
+policy and preserve an evidence artifact. The five-platform non-browser publication contract never
+becomes optional: Linux ARM64 still performs clean install, `wake test`, `runTests()` and
+`TestContext` smoke, while also recording that its reviewed runner provides no browser. A hosted
+runner inventory change requires a reviewed manifest update; it cannot trigger a download, a
+fallback browser or a silent skip. Experimental publication may proceed with that explicit
+unavailability, but ADR acceptance and stable Wake Test publication remain blocked until all five
+targets pass the shared exact-major conformance policy. This does not restrict ordinary users to
+that major. The browser is kept out of the current npm platform-package size budget.
 
 Native-addon hosting, full Node compatibility, third-party Jest runner/reporter/environment ABI,
 legacy timers, Babel coverage and Jest golden output are removed from the stable-release burden.
@@ -212,16 +222,23 @@ legacy timers, Babel coverage and Jest golden output are removed from the stable
 - Exercise timeout, infinite loop, unhandled rejection, browser/host crash, cancellation, malformed
   IPC, resource-origin authentication and idempotent shutdown without leaking child processes,
   ports, pages or profiles.
-- On Windows x64, macOS x64/arm64 and glibc 2.28 Linux x64/arm64, validate engine startup, system
-  browser discovery or explicit paths, the pinned post-CDP browser major, CDP lifecycle and React
-  smoke fixtures. A mismatch fails without downloading or selecting a fallback browser.
+- On Windows x64 and Linux x64, validate exact-major-151 system-browser identity plus CDP, React,
+  screenshot and coverage conformance. On macOS x64/arm64, validate the reviewed exact-major-150
+  identity and the same functional smoke while marking it non-conformant for stable readiness. On
+  Linux ARM64, execute every non-browser platform gate and emit reviewed `unavailable` evidence;
+  never download or select a fallback browser.
+- Evaluate stable browser readiness independently and require `ready: true` only when Windows x64,
+  Linux x64/arm64 and macOS x64/arm64 all execute conformance against one shared exact major. The
+  current schema-v2 evidence must evaluate `ready: false`, so ADR acceptance remains blocked.
 - Audit registry licenses/SBOM, V8 artifacts, native symbols, GLIBC baseline, npm pack whitelist and
   size limits. Browser executables and third-party source or binary copies must not enter the
   repository or existing platform tarballs.
 
 The public entry remains experimental while any applicable gate above is missing. ADR acceptance
 requires the repository to contain no active Jest/Boa/jsdom/Node-API compatibility path or stale
-release promise and requires every supported platform gate to pass from clean-install artifacts.
+release promise, requires every supported platform gate to pass from clean-install artifacts, and
+requires the five-target shared exact-major browser readiness result to be `ready: true`. Passing
+the schema-v2 experimental publication split alone is insufficient for acceptance or stable status.
 
 ## Supersedes
 

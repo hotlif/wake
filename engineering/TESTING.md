@@ -57,10 +57,14 @@ Wake Test 语义，也不是产品运行时的回退路径。普通 JavaScript�
 
 V8/handle、fast DOM、Chromium/CDP、协议并发与 React 差分 fixture 分别进入普通单元测试、
 固定版本 conformance、真实浏览器 smoke 和 Loom 模型。系统浏览器测试必须记录可执行文件与
-CDP 完整版本；CI 与发布门禁还必须通过 `engineering/system-browser-conformance.json` 的
-exact-major admission。major 不匹配直接失败，不下载、不 vendor、也不选择 fallback 浏览器；
-普通用户仍可运行任意 Wake 可识别的兼容系统浏览器。没有浏览器的普通 Rust 单元测试不得伪装成
-browser gate。
+CDP 完整版本。`engineering/system-browser-conformance.json` schema v2 区分当前 experimental
+发布证据和 stable readiness：Windows/Linux x64 对 reviewed major 151 运行 blocking conformance；
+macOS x64/arm64 对 reviewed major 150 运行 blocking 功能 smoke，但证据明确不是 stable
+conformance；Linux ARM64 对官方 hosted-runner 无系统 Chromium-family 浏览器的事实生成
+machine-readable `unavailable` 证据。major 不匹配直接失败，不下载、不 vendor、也不选择 fallback
+浏览器；普通用户仍可运行任意 Wake 可识别的兼容系统浏览器。没有浏览器的普通 Rust 单元测试
+不得伪装成 browser gate，stable readiness 也必须保持 `ready: false`，直到五个平台能在同一
+exact major 上运行 conformance。
 
 `engineering/test262-es2024.json` 固定 Test262 官方提交、源码归档 SHA-256 与精确的 ES2024
 选择目录。runner 对每个脚本分别执行非严格与严格变体并创建新 V8 realm；选中测试若要求尚未
@@ -82,10 +86,24 @@ cargo test -p wake_docs
 Crab CSS 编辑器修改：
 
 ```bash
+npm ci --ignore-scripts
 npm ci --ignore-scripts --prefix editors/vscode-css
-npm run vscode:css:check
-cargo test -p wake_css_language -p wake_css_lsp
+HOST_TARGET=x86_64-unknown-linux-gnu # 替换为本机受支持的 Rust target
+cargo fetch --locked
+node scripts/prepare-rusty-v8.mjs --target "$HOST_TARGET"
+# 将上一条命令打印的已校验归档绝对路径传入正式离线构建。
+RUSTY_V8_ARCHIVE=/absolute/path/to/verified/archive \
+  cargo build --release -p wake_test_host -p wake_cli --locked --offline
+WAKE_BIN="$PWD/target/release/wake" npm run vscode:css:check
+cargo test -p wake_css_language -p wake_css_lsp --locked --offline
 ```
+
+Windows 使用对应 MSVC target、`wake.exe` 和 PowerShell 环境变量语法。Manifest 测试只由显式
+`WAKE_BIN` 启动本轮 CLI，并解析同目录的 `wake-test-host[.exe]`；不得加载 optional `.node`、从
+`node_modules` staging host，或调用 Cargo/下载 fallback。
+VSIX `verify` 因末尾执行 all-target `architecture:check`，必须先 `cargo fetch --locked` 获取完整
+lock graph；Extension Host 与五个平台打包 job 只 target-scoped fetch 自己的 Rust target，但随后
+正式 `cargo build` 一律使用 `--locked --offline`。这些 CLI-only job 不准备或链接 V8。
 
 本平台先构建 `wake_css_lsp` release 二进制，再用 `editors/vscode-css` 的 `package:vsix`
 脚本生成 VSIX。脚本会检查归档只包含一个目标二进制、无开发目录且不超过 15 MiB。
@@ -105,7 +123,8 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 | `clippy` | Ubuntu / Rust 1.95 | workspace 全 target，warnings 视为错误 |
 | `test` | Ubuntu、Windows / Rust 1.95 + Node 24 | 全 workspace 测试 |
 | `test262-es2024` | Ubuntu / Rust 1.95 + Node 24 | checksum 固定的 Test262 ES2024 选择集 |
-| `browser-conformance` | 五个发布目标 / Rust 1.95 + Node 24 | 固定 Chromium major 的 CDP、React、截图和 coverage 门禁 |
+| `browser-conformance` | 五个发布目标 / Rust 1.95 + Node 24 | Win/Linux x64 major 151 conformance、macOS major 150 功能 smoke、Linux ARM64 reviewed unavailable 证据 |
+| `browser-stable-readiness` | Ubuntu / Node 24 | 验证五平台共享 exact-major readiness 仍明确 blocked，避免把 experimental 证据误标为 stable |
 | `typescript-7` | Ubuntu、Windows / Node 24 + TypeScript 7 | TS7 CLI 版本、严格类型与 TS/TSX 兼容 fixture |
 | `miri` | Ubuntu / nightly | `wake_ecma_ast` 和 `wake_turbo` 手写 unsafe/内存模型 |
 | `loom` | Ubuntu / Rust 1.95 | single-flight 线程交错 |
@@ -119,6 +138,9 @@ Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补�
 所有需要内嵌 V8 或 fast DOM 的 CI job 先以 `npm ci` 和 `cargo fetch --locked` 准备
 registry 依赖，再单独校验目标 Rusty V8 archive；随后的 Cargo test、clippy、bench 和 build
 使用 `--locked --offline`，不会在正式构建阶段联网或从仓库 vendor 第三方源码。
+architecture job 的 all-target Cargo tree 与所有随后执行 NAPI CLI build 的 job 必须先 fetch 完整
+lock graph，不能使用 target-scoped fetch；Rusty V8 archive 校验仍必须保持 target-specific。NAPI
+结束后以 `git diff --exit-code -- Cargo.lock` 证明 offline metadata/build 没有改写锁文件。
 
 # 3. 回归矩阵
 
@@ -193,8 +215,10 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
 - 无限循环、host/browser panic 或 crash、协议损坏、资源 origin 伪造、取消和关闭不泄漏调用
   进程、端口、profile、page 或 V8 handle；
 - CLI、Node `runTests()` 和 `TestContext` 经过唯一持久 host session，返回同一稳定结果与事件模型；
-- Windows x64、macOS x64/arm64、glibc 2.28 Linux x64/arm64 都执行显式 browser path 或系统
-  browser discovery、版本记录、CDP lifecycle 和 React smoke；浏览器二进制不得进入平台包。
+- Windows x64 与 Linux x64 执行 reviewed major 151 的显式 browser path、CDP lifecycle、React、
+  screenshot 和 coverage conformance；macOS x64/arm64 在 reviewed major 150 执行同类功能 smoke，
+  但不计入 stable conformance；Linux ARM64 执行完整非 browser 合同并保存 `unavailable` 证据。
+  浏览器二进制不得进入平台包，任何平台都不得在门禁内下载替代浏览器。
 
 # 4. Miri 与 Loom 分工
 
@@ -233,18 +257,24 @@ cargo bench --workspace --no-run
 5. 发布前在五个目标平台和 Node 22.14/24/26 的 15 个组合中，以本次构建的主包、CSS 包和 matching
    platform package 本地 tarball 执行 `--ignore-scripts` clean install；外部已发布依赖可以来自 registry，
    但三个待发布包必须保持可验证的 `file:` 来源。每个组合执行 `wake test`、`runTests()` 和长期
-   `TestContext` lifecycle；Node 24 还必须用显式发现的系统 Chrome、Edge 或 Chromium 执行 React
-   browser/screenshot smoke，并从 `wake.test.v1` 结果校验仓库固定的 browser family/major。包括
-   Linux ARM 在内，找不到浏览器或版本不匹配必须阻止发布，不得 skip、放宽范围或下载自愈；
+   `TestContext` lifecycle。Node 24 在 Windows/Linux x64 上以系统 Chrome、Edge 或 Chromium 的
+   reviewed major 151 执行 blocking conformance，在 macOS x64/arm64 上以 reviewed major 150 执行
+   blocking React/browser/screenshot 功能 smoke；两者都从 `wake.test.v1` 结果校验 family/major 并
+   上传证据。Linux ARM64 不伪造或 skip 浏览器测试，而是依据 immutable hosted-runner inventory
+   生成 blocking、machine-readable `unavailable` 证据；其 clean install 与全部非 browser smoke
+   仍必须成功。任何可用目标找不到浏览器或版本不匹配都阻止发布，不得放宽范围或下载自愈；
 6. 只有上述本地 tarball matrix 全绿后，才先发布平台包、最后发布主包；
-7. 发布后继续在 Node 24/26 和全部目标平台执行注册表干净安装与构建 smoke。平台包的硬上限为 64 MiB
+7. 发布后继续在 Node 24/26 和全部目标平台执行注册表干净安装与构建 smoke；Node 24 同步复核上述
+   per-target browser evidence，并再次证明 stable readiness 仍为 blocked。平台包的硬上限为 64 MiB
    packed / 192 MiB unpacked，56 MiB packed 起发布 warning；运行期不得下载 host 或浏览器。
 
 部分发布失败不能覆盖已有 npm 版本；修复后统一提升七个包和 workspace 版本。
 
 Wake Test 仍是 experimental。除上述通用发布门禁外，转为 stable 前还必须同时满足：从 registry
 lock 记录固定并审计 Deno/V8 与私有 DOM adapter 的来源、checksum、许可证和 SBOM；在五个平台执行 fast DOM
-与 Chromium React matrix；验证 browser/host crash 与取消；证明 source-mapped coverage、snapshot
+与同一 exact-major Chromium React conformance matrix；`stable-readiness` 必须从当前明确的
+`ready: false` 变为五目标 `ready: true`，macOS experimental smoke 和 Linux ARM64 unavailable 都不能
+算作替代证据；验证 browser/host crash 与取消；证明 source-mapped coverage、snapshot
 和 watch 冷热等价；确认平台包没有浏览器制品且仍满足 GLIBC 2.28、白名单和体积上限；删除活动
 代码、类型、配置和文档中的 Jest、Boa、jsdom 与 Node-API test-runtime 兼容路径。门禁缺一项时，
 CLI、Node API 和 npm test entry 都不得标记 stable。

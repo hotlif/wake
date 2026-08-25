@@ -104,7 +104,8 @@ jobs:
           key: release-${{ matrix.target }}
       - run: npm ci --ignore-scripts
       - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked --target ${{ matrix.target }}
+        # napi build runs offline cargo metadata for the complete locked graph.
+        run: cargo fetch --locked
       - name: Verify pinned Rusty V8 input
         run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
       - run: cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}
@@ -180,7 +181,8 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked --target ${{ matrix.target }}
+        # napi build runs offline cargo metadata for the complete locked graph.
+        run: cargo fetch --locked
       - name: Verify pinned Rusty V8 input
         run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
       - run: cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}
@@ -347,14 +349,23 @@ jobs:
         include:
           - platform: win32-x64-msvc
             runner: windows-latest
+            browser_evidence: exact-major-conformance
+            browser_major: 151
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
+            browser_evidence: exact-major-conformance
+            browser_major: 151
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
+            browser_evidence: unavailable
           - platform: darwin-x64
             runner: macos-15-intel
+            browser_evidence: exact-major-smoke
+            browser_major: 150
           - platform: darwin-arm64
             runner: macos-15
+            browser_evidence: exact-major-smoke
+            browser_major: 150
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -459,7 +470,7 @@ jobs:
           })
           NODE
       - name: Select a system Chrome, Edge or Chromium
-        if: matrix.node == '24'
+        if: matrix.node == '24' && matrix.browser_evidence != 'unavailable'
         shell: bash
         run: |
           set -euo pipefail
@@ -497,7 +508,7 @@ jobs:
           printf 'WAKE_RELEASE_BROWSER_PATH=%s\n' "$browser" >> "$GITHUB_ENV"
           printf 'Using system browser: %s\n' "$browser"
       - name: React browser and screenshot smoke from local tarballs
-        if: matrix.node == '24'
+        if: matrix.node == '24' && matrix.browser_evidence != 'unavailable'
         shell: bash
         run: |
           set -euo pipefail
@@ -510,8 +521,30 @@ jobs:
             --output browser-result.json
           node "$GITHUB_WORKSPACE/scripts/check-system-browser-conformance.mjs" \
             --target "${{ matrix.platform }}" \
-            --result browser-result.json
+            --result browser-result.json > "$RUNNER_TEMP/wake-browser-evidence.json"
           npx --no-install wake test visual.browser.test.mjs --serial --browser-path "$WAKE_RELEASE_BROWSER_PATH"
+      - name: Record reviewed browser unavailability
+        if: matrix.node == '24' && matrix.browser_evidence == 'unavailable'
+        shell: bash
+        run: |
+          node scripts/check-system-browser-conformance.mjs \
+            --target "${{ matrix.platform }}" \
+            --unavailable true > "$RUNNER_TEMP/wake-browser-evidence.json"
+      - name: Prove stable browser readiness remains blocked
+        if: matrix.node == '24'
+        shell: bash
+        run: |
+          node scripts/check-system-browser-conformance.mjs \
+            --stable-readiness blocked > "$RUNNER_TEMP/wake-browser-stable-readiness.json"
+      - name: Upload prepublish browser evidence
+        if: matrix.node == '24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence-prepublish-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/wake-browser-evidence.json
+            ${{ runner.temp }}/wake-browser-stable-readiness.json
+          if-no-files-found: error
 
   publish:
     if: github.ref_type == 'tag' && github.ref_name == format('v{0}', needs.verify.outputs.version)
@@ -596,10 +629,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-24.04, macos-15, macos-15-intel, ubuntu-24.04-arm]
+        platform: [win32-x64-msvc, linux-x64-gnu, linux-arm64-gnu, darwin-x64, darwin-arm64]
         node: [24, 26]
-    runs-on: ${{ matrix.os }}
+        include:
+          - platform: win32-x64-msvc
+            runner: windows-latest
+            browser_evidence: exact-major-conformance
+            browser_major: 151
+          - platform: linux-x64-gnu
+            runner: ubuntu-24.04
+            browser_evidence: exact-major-conformance
+            browser_major: 151
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            browser_evidence: unavailable
+          - platform: darwin-x64
+            runner: macos-15-intel
+            browser_evidence: exact-major-smoke
+            browser_major: 150
+          - platform: darwin-arm64
+            runner: macos-15
+            browser_evidence: exact-major-smoke
+            browser_major: 150
+    runs-on: ${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
@@ -632,11 +686,72 @@ jobs:
           npx wake test smoke.test.mjs --serial
           node -e "require('@crab-dev/wake').runTests({root:process.cwd(),patterns:['smoke.test.mjs']}).then(r=>{if(!r.success||r.counts.tests.passed!==1)process.exitCode=1})"
       - name: React browser and screenshot smoke
+        if: matrix.node == 24 && matrix.browser_evidence != 'unavailable'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd smoke
+          npm install --ignore-scripts --prefer-online "react@19.2.8" "react-dom@19.2.8"
+          browser=''
+          case "$RUNNER_OS" in
+            Windows)
+              for candidate in \
+                'C:/Program Files/Google/Chrome/Application/chrome.exe' \
+                'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe' \
+                'C:/Program Files/Microsoft/Edge/Application/msedge.exe' \
+                'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' \
+                'C:/Program Files/Chromium/Application/chrome.exe' \
+                'C:/Program Files (x86)/Chromium/Application/chrome.exe'; do
+                if [[ -f "$candidate" ]]; then browser="$candidate"; break; fi
+              done
+              ;;
+            macOS)
+              for candidate in \
+                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+                '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' \
+                '/Applications/Chromium.app/Contents/MacOS/Chromium'; do
+                if [[ -x "$candidate" ]]; then browser="$candidate"; break; fi
+              done
+              ;;
+            Linux)
+              for command_name in google-chrome-stable google-chrome chromium chromium-browser microsoft-edge-stable microsoft-edge; do
+                if command -v "$command_name" >/dev/null 2>&1; then browser="$(command -v "$command_name")"; break; fi
+              done
+              ;;
+          esac
+          if [[ -z "$browser" ]]; then
+            echo "::error::Reviewed system browser is unavailable on $RUNNER_OS/$RUNNER_ARCH"
+            exit 1
+          fi
+          node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('published browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('published-ready')})\\n\")"
+          npx wake test visual.browser.test.mjs \
+            --serial \
+            --browser-path "$browser" \
+            --reporter json \
+            --output browser-result.json
+          node "$GITHUB_WORKSPACE/scripts/check-system-browser-conformance.mjs" \
+            --target "${{ matrix.platform }}" \
+            --result browser-result.json > "$RUNNER_TEMP/wake-browser-evidence.json"
+          npx wake test visual.browser.test.mjs --serial --browser-path "$browser"
+      - name: Record reviewed browser unavailability
+        if: matrix.node == 24 && matrix.browser_evidence == 'unavailable'
+        shell: bash
+        run: |
+          node scripts/check-system-browser-conformance.mjs \
+            --target "${{ matrix.platform }}" \
+            --unavailable true > "$RUNNER_TEMP/wake-browser-evidence.json"
+      - name: Prove stable browser readiness remains blocked
         if: matrix.node == 24
         shell: bash
         run: |
-          cd smoke
-          npm install --ignore-scripts --prefer-online "react@19.2.8" "react-dom@19.2.8"
-          node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('published browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('published-ready')})\\n\")"
-          npx wake test visual.browser.test.mjs --serial
-          npx wake test visual.browser.test.mjs --serial
+          node scripts/check-system-browser-conformance.mjs \
+            --stable-readiness blocked > "$RUNNER_TEMP/wake-browser-stable-readiness.json"
+      - name: Upload postpublish browser evidence
+        if: matrix.node == 24
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence-postpublish-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/wake-browser-evidence.json
+            ${{ runner.temp }}/wake-browser-stable-readiness.json
+          if-no-files-found: error

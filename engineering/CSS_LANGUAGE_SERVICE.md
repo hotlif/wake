@@ -82,8 +82,13 @@ From the repository root:
 cargo test -p wake_css_language -p wake_css_lsp
 cargo clippy -p wake_css_language -p wake_css_lsp --all-targets -- -D warnings
 npm ci --ignore-scripts --prefix editors/vscode-css
-npm run vscode:css:check
+WAKE_BIN=/absolute/path/to/target/release/wake npm run vscode:css:check
 ```
+
+Follow the registry, Rusty V8 and locked/offline preparation recipe in
+[TESTING.md](TESTING.md) first. The editor check requires an explicit `WAKE_BIN` built from the same checkout, with its sibling
+`wake-test-host` executable in the same directory. It never falls back to the npm optional native
+binding, a staged `node_modules` platform package or an implicit Cargo/download path.
 
 `editors/vscode-css/scripts/update-css-data.mjs` deterministically regenerates the embedded fact
 snapshot from the pinned `vscode-css-languageservice@6.3.10` package. CI regenerates the file and
