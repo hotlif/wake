@@ -453,7 +453,7 @@ jobs:
             }
             const context = await createTestContext(options)
             const events = []
-            context.on('runStart', () => events.push('runStart'))
+            context.on('runStart', event => events.push(event.watching ? 'watchRunStart' : 'runStart'))
             context.on('runComplete', () => events.push('runComplete'))
             context.on('closed', () => events.push('closed'))
             try {
@@ -482,7 +482,16 @@ jobs:
             } finally {
               await context.close()
             }
-            if (!context.closed || events.join(',') !== 'runStart,runComplete,runStart,runComplete,closed') {
+            const watchEvents = events.slice(2, -1)
+            const watchLifecycleValid = watchEvents.length >= 2
+              && watchEvents.length % 2 === 0
+              && watchEvents.every((event, index) =>
+                event === (index % 2 === 0 ? 'watchRunStart' : 'runComplete'))
+            if (!context.closed
+              || events[0] !== 'runStart'
+              || events[1] !== 'runComplete'
+              || events.at(-1) !== 'closed'
+              || !watchLifecycleValid) {
               throw new Error(`TestContext lifecycle mismatch: closed=${context.closed}; events=${events.join(',')}`)
             }
           }
