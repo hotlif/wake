@@ -196,6 +196,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "crossbeam 无锁结构在 miri 慢且有已知假阳性；见模块文档"
+    )]
     fn global_executor_has_one_process_owner() {
         let first = global_executor();
         let second = global_executor();
@@ -204,6 +208,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "crossbeam 无锁结构在 miri 慢且有已知假阳性；见模块文档"
+    )]
     fn global_executor_supports_concurrent_submitters() {
         let submitters = (0..4)
             .map(|owner| {
