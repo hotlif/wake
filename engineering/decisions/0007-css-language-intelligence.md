@@ -1,4 +1,4 @@
-# ADR 0007: Own CSS language intelligence below editor products
+# ADR 0007: 在编辑器产品下层拥有 CSS 语言智能
 
 - Status: superseded
 - Date: 2026-08-14
@@ -6,38 +6,32 @@
 
 ## Context
 
-`@crab-dev/css` already has one build-time semantic owner in `wake_css_in_js`, but Wake has no
-editor language service. TextMate grammars can color common tag spellings, yet cannot prove that an
-alias refers to an import from `@crab-dev/css` or distinguish a shadowing local binding. Putting an
-editor session, workspace files, or LSP protocol into the compiler or bundler would also reverse the
-existing dependency direction.
+`@crab-dev/css` 已由 `wake_css_in_js` 统一拥有构建时语义，但 Wake 尚无编辑器语言服务。TextMate
+文法可以为常见标签拼写着色，却无法证明别名指向 `@crab-dev/css` 的导入，也无法区分遮蔽它的局部
+绑定。将编辑器会话、工作区文件或 LSP 协议放入编译器或打包器，还会反转现有依赖方向。
 
 ## Decision
 
-`wake_css_language` owns file-system-independent discovery of Crab CSS tagged templates, virtual CSS
-documents, host-to-virtual source mapping and CSS editing analysis. It consumes the existing parser,
-semantic model and `wake_css_in_js` contract, but does not depend on the bundler, resolver, LSP or an
-editor.
+`wake_css_language` 拥有独立于文件系统的 Crab CSS 标签模板发现、虚拟 CSS 文档、宿主到虚拟源码映射
+及 CSS 编辑分析。它使用现有解析器、语义模型和 `wake_css_in_js` 契约，但不依赖打包器、解析器、
+LSP 或编辑器。
 
-`wake_css_lsp` is a product edge. It owns LSP transport, document versions, bounded caches,
-workspace resolution and dependency-aware saved-document analysis. Exact Crab compiler diagnostics
-come from `wake_css_in_js`; the language service does not copy its static evaluation rules.
+`wake_css_lsp` 是产品边缘，拥有 LSP 传输、文档版本、有界缓存、工作区解析和依赖感知的已保存文档
+分析。精确的 Crab 编译器诊断来自 `wake_css_in_js`；语言服务不复制其静态求值规则。
 
-`editors/vscode-css` is a thin workspace extension. It contributes declarative TextMate highlighting
-and launches the target-specific Rust server. TypeScript continues to own JavaScript/TypeScript
-definition, reference and rename behavior.
+`editors/vscode-css` 是轻量工作区扩展，提供声明式 TextMate 高亮并启动特定目标的 Rust 服务器。
+JavaScript/TypeScript 的定义、引用和重命名行为仍由 TypeScript 拥有。
 
 ## Invariants
 
-- Only semantic bindings imported from `@crab-dev/css` activate Crab CSS behavior.
-- `wake_css_language` has no file-system, resolver, bundler, editor or protocol ownership.
-- Build-time static evaluation and `CRAB_CSS_*` diagnostics remain owned by `wake_css_in_js`.
-- Host edits never cross or modify a `${...}` interpolation.
-- LSP positions use zero-based UTF-16 units and retain the host document identity.
-- Results computed for an older document version are never published for a newer version.
-- Runtime caches are bounded and cache identity contains document version, configuration and saved
-  dependency inputs.
-- Every shipped VSIX contains exactly one platform server binary.
+- 只有从 `@crab-dev/css` 导入的语义绑定才能激活 Crab CSS 行为。
+- `wake_css_language` 不拥有文件系统、解析器、打包器、编辑器或协议。
+- 构建时静态求值和 `CRAB_CSS_*` 诊断仍由 `wake_css_in_js` 拥有。
+- 宿主编辑绝不跨越或修改 `${...}` 插值。
+- LSP 位置使用从零开始的 UTF-16 单位，并保留宿主文档标识。
+- 为旧文档版本计算的结果绝不发布到新版本。
+- 运行时缓存有界，缓存标识包含文档版本、配置和已保存的依赖输入。
+- 每个发布的 VSIX 恰好包含一个平台服务器二进制文件。
 
 ## Evidence
 
@@ -53,24 +47,21 @@ definition, reference and rename behavior.
 
 ## Consequences
 
-Wake gains a reusable CSS analysis layer and a native editor product without making the bundler an
-editor dependency. The Rust server and generated CSS fact data increase build and release surface.
-TextMate provides immediate coloring for canonical spellings while semantic tokens provide precise
-alias-aware coloring after analysis.
+Wake 获得可复用的 CSS 分析层和原生编辑器产品，同时不让打包器依赖编辑器。Rust 服务器和生成的
+CSS 事实数据扩大了构建与发布范围。TextMate 为规范拼写即时着色，语义 token 则在分析后提供精确、
+感知别名的着色。
 
-The extension version is independent from Wake. Version `0.1.x` supports VS Code 1.96 or newer and
-`@crab-dev/css >=0.1.0 <0.2.0`; unsupported package versions keep syntax coloring but disable exact
-compiler diagnostics with an actionable warning.
+扩展版本独立于 Wake。`0.1.x` 支持 VS Code 1.96 或更高版本及
+`@crab-dev/css >=0.1.0 <0.2.0`；不受支持的包版本仍保留语法着色，但会禁用精确编译器诊断并给出
+可操作的警告。
 
 ## Validation
 
-- Run `npm run architecture:check` after every crate-boundary change.
-- Test alias, shadowing, incomplete syntax, interpolation mapping, CRLF and UTF-16 positions in
-  `wake_css_language`.
-- Test LSP initialization, document lifecycle, stale-result suppression and protocol features in
-  `wake_css_lsp`.
-- Build and inspect one VSIX per supported target in the release matrix.
-- Run workspace tests, Clippy, editor package checks and `git diff --check`.
+- 每次更改 crate 边界后运行 `npm run architecture:check`。
+- 在 `wake_css_language` 中测试别名、遮蔽、不完整语法、插值映射、CRLF 和 UTF-16 位置。
+- 在 `wake_css_lsp` 中测试 LSP 初始化、文档生命周期、过期结果抑制和协议功能。
+- 为发布矩阵中的每个受支持目标构建并检查一个 VSIX。
+- 运行工作区测试、Clippy、编辑器包检查和 `git diff --check`。
 
 ## Supersedes
 
@@ -78,11 +69,10 @@ None.
 
 ## Superseded by
 
-[ADR 0009](0009-semantic-css-highlighting.md) replaces spelling-based TextMate highlighting with
-AST and semantic-binding-driven tokens as the only highlighting authority.
+[ADR 0009](0009-semantic-css-highlighting.md) 以 AST 和语义绑定驱动的 token 取代基于拼写的
+TextMate 高亮，并将其作为唯一高亮权威。
 
 ## Removal plan
 
-No earlier language server exists. Experiments or temporary parsers used to validate recovery must
-be removed before this decision is accepted; no compatibility crate, old editor directory or second
-CSS package specifier may remain.
+此前没有语言服务器。用于验证恢复能力的实验或临时解析器必须在接受本决策前删除；不得保留兼容
+crate、旧编辑器目录或第二个 CSS 包说明符。

@@ -1,4 +1,4 @@
-# ADR 0019: Own a native JavaScript test runtime
+# ADR 0019: 拥有原生 JavaScript 测试运行时
 
 - Status: superseded
 - Date: 2026-08-21
@@ -6,99 +6,79 @@
 
 ## Context
 
-Wake exposes build, bundle, development-server and documentation behavior through `wake_app`, but
-has no JavaScript execution engine or user-facing test runner. The requested testing contract adds
-`wake test`, Node APIs and a test-only npm module while requiring Jest 30.4 built-in semantics,
-declarative Wake configuration and execution without delegating product behavior to Node or Jest.
+Wake 已通过 `wake_app` 暴露构建、打包、开发服务器和文档行为，但没有 JavaScript 执行引擎或面向用户
+的测试运行器。所需测试契约新增 `wake test`、Node API 和仅测试 npm 模块，同时要求内置 Jest 30.4
+语义、声明式 Wake 配置，并且不得把产品行为委托给 Node 或 Jest。
 
-The compiler AST is arena-owned and cannot be retained as a runtime or cache value. Test module
-mocking and isolation also require a runtime module registry; bundling every suite into one artifact
-would erase the module boundaries that those APIs control.
+编译器 AST 由 arena 拥有，不能作为运行时或缓存值保留。测试模块模拟与隔离还需要运行时模块注册表；
+把每个测试套件打成一个产物会抹去这些 API 所控制的模块边界。
 
 ## Decision
 
-Add four explicit owners. `wake_ecma_vm` owns a stable, product-neutral ECMAScript execution facade
-and uses the pinned pure-Rust Boa engine as its private bytecode, value and garbage-collection
-kernel. `wake_js_runtime` owns Wake parse/codegen preprocessing, module loading and host facilities.
-`wake_test` owns test discovery, Jest-compatible APIs, execution policy and structured results.
-`wake_test_host` is an internal executable shell used for isolation and native-addon hosting.
+新增四个明确所有者。`wake_ecma_vm` 拥有稳定、产品中立的 ECMAScript 执行门面，并将固定版本的纯
+Rust Boa 引擎作为私有的字节码、值和垃圾回收内核。`wake_js_runtime` 拥有 Wake 解析/代码生成预处理、
+模块加载和宿主能力。`wake_test` 拥有测试发现、兼容 Jest 的 API、执行策略和结构化结果。
+`wake_test_host` 是用于隔离与原生扩展托管的内部可执行壳层。
 
-Test sources pass through Wake's parser and code generator before execution so TypeScript, JSX,
-diagnostics and source identity remain Wake contracts. The resulting JavaScript is compiled to VM
-bytecode immediately; arena ASTs and process-local atoms do not enter VM state or persistence.
-The Boa API does not cross `wake_ecma_vm`'s public boundary.
+测试源码在执行前通过 Wake 解析器和代码生成器，因此 TypeScript、JSX、诊断和源码标识仍属于 Wake
+契约。生成的 JavaScript 立即编译为 VM 字节码；arena AST 与进程内 atom 不进入 VM 状态或持久化。
+Boa API 不越过 `wake_ecma_vm` 的公共边界。
 
-CLI and Node callers continue to converge through `wake_app`. The final host transport is a
-versioned, authenticated, length-framed local protocol. The first implementation may execute the
-same service in-process while the protocol is proven, but that bridge must be removed before this
-ADR is accepted and before the stable npm contract is published.
+CLI 和 Node 调用方继续通过 `wake_app` 收敛。最终宿主传输采用版本化、带认证和长度分帧的本地协议。
+首版实现可在验证协议期间于进程内执行同一服务，但必须在接受本 ADR 及发布稳定 npm 契约前删除该桥接。
 
 ## Invariants
 
-- `wake_ecma_vm` has no file-system, resolver, test-framework, shell or product dependency.
-- `wake_js_runtime` owns runtime module identity and never calls the Web bundler.
-- Every test suite receives an isolated realm and module registry.
-- AST references, atoms, VM values, garbage-collector handles and Node-API handles are never
-  serialized or persisted.
-- Source locations survive preprocessing and identify the original test or dependency.
-- Test discovery, result ordering, seeds, snapshots and coverage artifacts are deterministic across
-  supported platforms.
-- CLI and Node options, cancellation, results and failures converge through `wake_app`.
-- Unsupported host or extension behavior fails with a structured diagnostic; there is no hidden
-  Node or Jest fallback.
-- Native addons are limited to Node-API versions 1 through 8 and may not import V8, NAN, `node.h` or
-  direct libuv ABI.
+- `wake_ecma_vm` 不依赖文件系统、解析器、测试框架、壳层或产品。
+- `wake_js_runtime` 拥有运行时模块标识，绝不调用 Web 打包器。
+- 每个测试套件获得隔离的 realm 和模块注册表。
+- AST 引用、atom、VM 值、垃圾回收器句柄和 Node-API 句柄绝不序列化或持久化。
+- 源码位置在预处理后仍指向原测试或依赖。
+- 测试发现、结果排序、种子、快照和覆盖率产物在受支持平台上保持确定。
+- CLI 与 Node 的选项、取消、结果和失败通过 `wake_app` 收敛。
+- 不受支持的宿主或扩展行为以结构化诊断失败；不存在隐藏的 Node 或 Jest 回退。
+- 原生扩展仅限 Node-API 1 至 8，且不得导入 V8、NAN、`node.h` 或直接 libuv ABI。
 
 ## Evidence
 
-- `engineering/ARCHITECTURE.md` defines `wake_app` as the shared application boundary.
-- `crates/wake_ecma_ast` encapsulates arena-backed `ModuleAst` values.
-- `crates/wake_ecma_parser` and `crates/wake_ecma_codegen` already transform JS, TS, JSX and TSX
-  while preserving spans.
-- `crates/wake_resolver` already owns Node package, workspace and Yarn PnP resolution.
-- `crates/wake_node` is built with napi-rs' `napi8` feature.
-- Boa 0.21.1 exposes a pure-Rust bytecode VM, garbage collector, realms, modules and Promise job
-  queue behind an embeddable context.
+- `engineering/ARCHITECTURE.md` 将 `wake_app` 定义为共享应用边界。
+- `crates/wake_ecma_ast` 封装 arena 支持的 `ModuleAst` 值。
+- `crates/wake_ecma_parser` 和 `crates/wake_ecma_codegen` 已能转换 JS、TS、JSX 和 TSX 并保留范围。
+- `crates/wake_resolver` 已拥有 Node 包、工作区及 Yarn PnP 解析。
+- `crates/wake_node` 使用 napi-rs 的 `napi8` feature 构建。
+- Boa 0.21.1 提供纯 Rust 字节码 VM、垃圾回收器、realm、模块和可嵌入上下文中的 Promise 任务队列。
 
 ## Consequences
 
-The workspace gains a substantial execution and testing product without moving test semantics into
-the bundler or shells. Platform artifacts grow to include an internal test host, and release checks
-must audit both the Node binding and host. VM conformance becomes a new correctness gate.
+工作区获得大型执行与测试产品，但测试语义不会移入打包器或壳层。平台产物会增加内部测试宿主，发布检查
+必须同时审计 Node 绑定和宿主。VM 一致性成为新的正确性门禁。
 
-The internal engine remains replaceable, but changing it requires replaying the ECMAScript and Jest
-conformance matrices. Wake's parser and the VM kernel both parse generated JavaScript; only Wake's
-preprocessing result is public, and differential tests must reject syntax or location divergence.
+内部引擎仍可替换，但更换时必须重放 ECMAScript 与 Jest 一致性矩阵。Wake 解析器和 VM 内核都会解析
+生成的 JavaScript；只有 Wake 预处理结果是公共契约，差异测试必须拒绝语法或位置分歧。
 
 ## Validation
 
-- Run architecture checks and crate-focused tests for every ownership change.
-- Execute representative JS, TS, JSX, async and module programs rather than asserting emitted text.
-- Pin and run the applicable Test262, Jest 30.4 and Node-API v8 conformance manifests.
-- Exercise cold and warm test discovery, suite isolation, cancellation and deterministic ordering.
-- Run Node API, TypeScript declaration, npm pack and clean-install tests on every published target.
-- Run Miri for VM/native-handle lifetimes and Loom for host/TSFN shutdown protocols when those
-  implementations land.
+- 每次所有权变更都运行架构检查及聚焦 crate 测试。
+- 执行有代表性的 JS、TS、JSX、异步及模块程序，而非只断言生成文本。
+- 固定并运行适用的 Test262、Jest 30.4 和 Node-API v8 一致性清单。
+- 测试冷/热测试发现、套件隔离、取消和确定性排序。
+- 在每个发布目标上运行 Node API、TypeScript 声明、npm 打包和干净安装测试。
+- 实现落地后，使用 Miri 检查 VM/原生句柄生命周期，使用 Loom 检查宿主/TSFN 关闭协议。
 
-## Current acceptance status
+## 当前接受状态
 
-At the time this decision was superseded, the ownership boundaries, loopback host protocol,
-explicit test module, CLI/Node entry points, isolated suite realms, core assertions and mocks, fake
-timers, external snapshots, discovery, projects, sharding and suite workers were implemented. The
-stable release gate was not satisfied. The following required evidence or implementation was still
-absent:
+本决策被替代时，所有权边界、回环宿主协议、显式测试模块、CLI/Node 入口、隔离套件 realm、核心断言
+与模拟、伪计时器、外部快照、发现、项目、分片和套件 worker 已实现。但稳定发布门禁尚未满足，仍缺少：
 
-- pinned Test262 ES2024 and Jest 30.4 differential matrices;
-- babel/v8 coverage instrumentation, reporters and thresholds;
-- atomic inline snapshot source rewriting against Jest golden fixtures;
-- Node-API v1-v8 addon C ABI and its five-platform conformance matrix;
-- the complete Node/jsdom host manifest, full Jest CLI option matrix, open-handle reporting, cache
-  invalidation and true intra-suite concurrent scheduling;
-- the specified Miri, Loom, fuzz, OOM, corrupted-IPC and cross-platform release gates.
+- 固定的 Test262 ES2024 与 Jest 30.4 差异矩阵；
+- babel/v8 覆盖率插桩、报告器及阈值；
+- 对照 Jest 黄金夹具的原子行内快照源码重写；
+- Node-API v1-v8 扩展 C ABI 及其五平台一致性矩阵；
+- 完整 Node/jsdom 宿主清单、完整 Jest CLI 选项矩阵、开放句柄报告、缓存失效及真正的套件内并发调度；
+- 指定的 Miri、Loom、模糊测试、OOM、损坏 IPC 和跨平台发布门禁。
 
-Coverage requests and missing inline snapshot rewrites fail explicitly instead of returning empty
-or misleading success data. Native `.node` imports return `WAKE_TEST_UNSUPPORTED` until the ABI gate
-is implemented.
+覆盖率请求及缺失的行内快照重写会显式失败，而不会返回空或误导性的成功数据。原生 `.node` 导入在
+ABI 门禁实现前返回 `WAKE_TEST_UNSUPPORTED`。
 
 ## Supersedes
 
@@ -106,11 +86,9 @@ None.
 
 ## Removal plan
 
-Remove the temporary in-process host bridge before accepting this ADR. When the stable runner is
-enabled, migrate the existing JavaScript tests from `node:test` and remove that harness in the same
-repository-wide switch. No Node/Jest execution fallback or second test result schema may remain.
+接受本 ADR 前删除临时进程内宿主桥接。启用稳定运行器时，在同一次仓库级切换中把现有 JavaScript
+测试从 `node:test` 迁出并删除该工具。不保留 Node/Jest 执行回退或第二套测试结果架构。
 
-`npm/wake/test/api.test.mjs` remains a development-only `node:test` conformance gate while it
-exercises the Node-API addon, Worker teardown and real socket lifecycle. It is not a product
-fallback. Remove this exception only after the test host implements and passes the pinned Node-API
-v1-v8 ABI matrix, then migrate the file to `@crab-dev/wake/test`.
+`npm/wake/test/api.test.mjs` 在测试 Node-API 插件、Worker 清理和真实 socket 生命周期期间，仍作为
+开发专用的 `node:test` 一致性门禁，而非产品回退。只有测试宿主实现并通过固定的 Node-API v1-v8 ABI
+矩阵后，才删除此例外并将文件迁移到 `@crab-dev/wake/test`。

@@ -1,33 +1,33 @@
-# ADR 0002: Separate Wake Docs runtime surfaces and enforce content contracts
+# ADR 0002: 分离 Wake Docs 运行时界面并强制执行内容契约
 
 - Status: accepted
 - Date: 2026-08-14
 
 ## Context
 
-Wake Docs serves two products from one generator: the public documentation site and the component workbench. The previous generated entry imported both products unconditionally, so a normal documentation build bundled the component explorer and every installed `@crab-dev/rc-*` package. Navigation expansion also mixed route-derived state with user preference, while content checks only required headings and allowed configuration reference pages to drift from `wake_config`.
+Wake Docs 通过同一个生成器提供两个产品：公共文档站点和组件工作台。此前生成的入口会无条件导入这两个产品，因此普通文档构建也会打包组件浏览器和所有已安装的 `@crab-dev/rc-*` 包。导航展开状态还混合了路由派生状态和用户偏好；内容检查则只要求存在标题，导致配置参考页可能逐渐偏离 `wake_config`。
 
-The public site build measured 2,306 modules, about 2.60 MB of JavaScript and 179 KB of CSS before this decision. Browser inspection also showed that visiting pages accumulated persisted expanded sections.
+作出本决策前，公共站点构建包含 2,306 个模块、约 2.60 MB JavaScript 和 179 KB CSS。浏览器检查还发现，访问页面会不断累积持久化的展开分区。
 
 ## Decision
 
-Generate a mode-specific runtime entry. Site mode owns only the documentation application and its base styles. Components mode owns the component workbench, component state and component styles. Shared code remains in `app.tsx`, but neither mode imports the other product surface.
+生成特定于模式的运行时入口。站点模式只拥有文档应用及其基础样式；组件模式拥有组件工作台、组件状态和组件样式。共享代码仍放在 `app.tsx` 中，但两种模式互不导入对方的产品界面。
 
-Treat the active navigation section as route-derived state. Persist only sections the user explicitly toggles. Group overview pages live directly under their navigation group instead of being repeated as the first page of a child section.
+将当前导航分区视为路由派生状态。只持久化用户明确切换过的分区。分组概览页直接位于其导航分组下，不再重复作为子分区的第一页。
 
-Make page `kind` an executable content contract in `scripts/check-docs.mjs`. Tutorials require an outcome, runnable code, verification, common errors and a next step. Guides require a verification or measurement section and a next step. Overviews require a primary task entry and multiple task-oriented sections.
+在 `scripts/check-docs.mjs` 中把页面 `kind` 变为可执行的内容契约。教程必须包含目标结果、可运行代码、验证、常见错误和下一步；指南必须包含验证或测量章节以及下一步；概览必须包含主要任务入口和多个面向任务的章节。
 
-Use the public Rust configuration structs as the source for reference coverage. The documentation check extracts public fields from `wake_config` and fails if their assigned reference page omits a field.
+以公共 Rust 配置结构体作为参考文档覆盖范围的事实来源。文档检查从 `wake_config` 中提取公共字段；若指定的参考页遗漏任何字段，检查即失败。
 
 ## Invariants
 
-- Site mode must not generate or import the component workbench runtime.
-- Components mode must include the workbench and its state and style resources.
-- The current section is open without being written into the user expansion preference.
-- Navigation order and hierarchy come only from `docs/navigation.toml`.
-- A page kind determines its minimum evidence and completion structure.
-- Every public `wake_config` field appears in one authoritative configuration reference page.
-- Invalid configuration fails with a diagnostic; only a missing file uses defaults.
+- 站点模式不得生成或导入组件工作台运行时。
+- 组件模式必须包含工作台及其状态和样式资源。
+- 当前分区保持展开，但不写入用户的展开偏好。
+- 导航顺序和层级只能来自 `docs/navigation.toml`。
+- 页面种类决定其最低证据要求和完整结构。
+- 每个公共 `wake_config` 字段都出现在唯一的权威配置参考页中。
+- 非法配置必须以诊断失败；只有文件缺失时才使用默认值。
 
 ## Evidence
 
@@ -37,22 +37,22 @@ Use the public Rust configuration structs as the source for reference coverage. 
 - `crates/wake_docs/runtime/app.tsx`
 - `scripts/check-docs.mjs`
 - `docs/reference/configuration/`
-- Production build output and browser checks recorded in the implementation task.
+- 实现任务中记录的生产构建输出和浏览器检查。
 
 ## Consequences
 
-The two runtime products can evolve independently and public documentation no longer pays for the component catalog. Adding a page or public configuration field now requires satisfying an explicit check. Content authors receive earlier failures, at the cost of keeping tutorials and guides structurally complete.
+两个运行时产品可以独立演进，公共文档不再承担组件目录的成本。新增页面或公共配置字段时，现在必须通过明确的检查。内容作者会更早收到失败反馈，代价是必须维持教程和指南的结构完整。
 
-The generated entry filename is an internal implementation detail and changes between modes. Public Wake Docs commands, routes, Frontmatter and MDX APIs do not change.
+生成的入口文件名属于内部实现细节，会随模式变化。公共 Wake Docs 命令、路由、Frontmatter 和 MDX API 均不变。
 
 ## Validation
 
 - `cargo test -p wake_docs`
 - `npm run docs:check`
 - `npm run docs:build`
-- Inspect the site build manifest and asset sizes; no `@crab-dev/rc-*` package may enter site mode.
-- Navigate multiple sections in a real browser and confirm only explicit toggles persist.
-- Verify desktop and mobile layouts, deep links, search and the browser console.
+- 检查站点构建清单和资源大小；任何 `@crab-dev/rc-*` 包都不得进入站点模式。
+- 在真实浏览器中浏览多个分区，确认只有显式切换会持久化。
+- 验证桌面端和移动端布局、深层链接、搜索及浏览器控制台。
 
 ## Supersedes
 
@@ -60,4 +60,4 @@ None.
 
 ## Removal plan
 
-The shared `runtime/entry.tsx` path is removed immediately. No compatibility wrapper, dual entry selection inside the browser, or legacy expansion storage key remains.
+立即删除共享的 `runtime/entry.tsx` 路径。不保留兼容包装器、浏览器内双入口选择或旧版展开状态存储键。

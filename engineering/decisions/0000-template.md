@@ -1,31 +1,31 @@
-# ADR 0000: Decision title
+# ADR 0000: 决策标题
 
 - Status: proposed
 - Date: YYYY-MM-DD
 
 ## Context
 
-Describe the product goal, current architecture, and evidence.
+描述产品目标、当前架构和证据。
 
 ## Decision
 
-Describe the target architecture and ownership.
+描述目标架构和所有权。
 
 ## Invariants
 
-List the properties this decision must preserve.
+列出本决策必须保持的属性。
 
 ## Evidence
 
-List source locations, tests, artifacts, experiments, or measurements.
+列出源码位置、测试、产物、实验或测量结果。
 
 ## Consequences
 
-Describe benefits, costs, breaking changes, and affected consumers.
+描述收益、成本、破坏性变更和受影响的使用方。
 
 ## Validation
 
-Describe executable architecture and behavior gates.
+描述可执行的架构与行为门禁。
 
 ## Supersedes
 
@@ -33,4 +33,4 @@ None.
 
 ## Removal plan
 
-List obsolete paths and temporary bridges, or state that none exist.
+列出废弃路径和临时桥接，若无则明确说明。

@@ -1,44 +1,37 @@
-# ADR 0003: Make compiler stages and shell dependencies explicit
+# ADR 0003: 明确编译器阶段和壳层依赖
 
 - Status: accepted
 - Date: 2026-08-14
 
 ## Context
 
-Wake documents `wake_app` as the shared owner of CLI and Node build behavior, but the executable
-boundary policy only prevented internal crates from depending on the two shells. A shell could
-therefore depend directly on `wake_bundler` and still pass the architecture check. The compiler
-group also had no internal dependency constraints.
+Wake 将 `wake_app` 记为 CLI 和 Node 构建行为的共同所有者，但可执行边界策略只禁止内部 crate
+依赖这两个壳层。因此，壳层仍可直接依赖 `wake_bundler` 并通过架构检查。编译器组内部也没有依赖约束。
 
-`wake_ecma_parser` additionally re-exported `wake_ecma_semantic` as an open-ended compatibility
-path. At the same time, context-sensitive browser lowering is intentionally coordinated while the
-parser still owns cover grammar and lexical scope information.
+此外，`wake_ecma_parser` 还把 `wake_ecma_semantic` 重新导出为开放式兼容路径。与此同时，
+上下文相关的浏览器降级转换需要有意协同，而覆盖文法和词法作用域信息仍由解析器拥有。
 
 ## Decision
 
-Make the compiler dependency graph executable. `wake_common` is the workspace foundation;
-`wake_ecma_ast` and `wake_ecma_lexer` consume only the foundation; `wake_ecma_semantic` and
-`wake_ecma_transform` consume only common AST models; and `wake_ecma_parser` may consume lexer plus
-transform lowering primitives, but not Semantic.
+使编译器依赖图可执行。`wake_common` 是工作区基础；`wake_ecma_ast` 和 `wake_ecma_lexer`
+只能使用该基础；`wake_ecma_semantic` 和 `wake_ecma_transform` 只能使用公共 AST 模型；
+`wake_ecma_parser` 可以使用词法分析器及 transform 的降级转换原语，但不能依赖 Semantic。
 
-Remove the Semantic re-export from `wake_ecma_parser`. Callers that perform analysis depend on
-`wake_ecma_semantic` directly. Treat parse-time lowering as a deliberate fused front-end operation:
-the parser owns syntax context and the transform crate owns reusable lowering rules and AST
-construction helpers.
+删除 `wake_ecma_parser` 对 Semantic 的重新导出。执行分析的调用方应直接依赖
+`wake_ecma_semantic`。将解析时降级转换视为有意融合的前端操作：解析器拥有语法上下文，
+transform crate 拥有可复用的降级规则和 AST 构造辅助函数。
 
-Allow CLI and Node shells to depend directly on compiler crates for their explicit compiler-facing
-commands and experimental APIs. Require all build, configuration, server, Docs and lifecycle
-behavior to enter through `wake_app`; shells may not depend directly on orchestration or other
-product crates.
+允许 CLI 和 Node 壳层为显式面向编译器的命令及实验性 API 直接依赖编译器 crate。所有构建、
+配置、服务器、Docs 和生命周期行为都必须经由 `wake_app`；壳层不得直接依赖编排层或其他产品 crate。
 
 ## Invariants
 
-- `wake_common` has no workspace dependency.
-- Parser does not own or re-export Semantic analysis.
-- Transform helpers do not depend on Parser, orchestration or products.
-- CLI and Node build behavior reaches the build stack through `wake_app`.
-- Experimental compiler APIs cannot create a second bundler, resolver, cache or server path.
-- Every rule above has a failing architecture-check fixture.
+- `wake_common` 不依赖工作区中的其他 crate。
+- Parser 不拥有或重新导出 Semantic 分析。
+- Transform 辅助函数不依赖 Parser、编排层或产品层。
+- CLI 和 Node 构建行为通过 `wake_app` 进入构建栈。
+- 实验性编译器 API 不得创建第二套打包器、解析器、缓存或服务器路径。
+- 上述每条规则都有会失败的架构检查夹具。
 
 ## Evidence
 
@@ -51,19 +44,17 @@ product crates.
 
 ## Consequences
 
-Compiler consumers declare their actual owner instead of relying on the Parser façade. The
-architecture policy becomes more restrictive and a future shell feature must choose explicitly
-between `wake_app` behavior and compiler-only behavior. Context-sensitive lowering remains fused
-with parsing, so a browser-target change can invalidate the front-end task; this is an intentional
-correctness tradeoff rather than an undocumented phase inversion.
+编译器使用方应声明实际所有者，而非依赖 Parser 门面。架构策略因此更严格，未来的壳层功能必须
+明确选择 `wake_app` 行为或仅编译器行为。上下文相关的降级转换仍与解析融合，因此浏览器目标变更
+可能使前端任务失效；这是有意的正确性权衡，而不是未记录的阶段倒置。
 
 ## Validation
 
-- Run `npm run architecture:test` and `npm run architecture:check`.
-- Run Parser, Semantic, Bundler, CLI and Node checks/tests.
-- Verify fixtures reject `wake_common -> wake_css`, `wake_ecma_parser -> wake_ecma_semantic` and
-  `wake_cli -> wake_bundler`.
-- Run `cargo metadata --no-deps` and inspect the resulting workspace dependency graph.
+- 运行 `npm run architecture:test` 和 `npm run architecture:check`。
+- 运行 Parser、Semantic、Bundler、CLI 和 Node 的检查/测试。
+- 验证夹具会拒绝 `wake_common -> wake_css`、`wake_ecma_parser -> wake_ecma_semantic` 和
+  `wake_cli -> wake_bundler`。
+- 运行 `cargo metadata --no-deps` 并检查生成的工作区依赖图。
 
 ## Supersedes
 
@@ -71,6 +62,5 @@ None.
 
 ## Removal plan
 
-The Parser Semantic façade and dependency are removed atomically; no compatibility wrapper remains.
-If parse-time lowering is later separated, a new ADR must replace this decision and preserve cover
-grammar, scope-temporary and source-map correctness before changing the dependency direction.
+以原子方式删除 Parser Semantic 门面及依赖，不保留兼容包装器。若以后拆分解析时降级转换，
+必须用新 ADR 替代本决策，并在改变依赖方向前保证覆盖文法、作用域临时状态和源码映射的正确性。

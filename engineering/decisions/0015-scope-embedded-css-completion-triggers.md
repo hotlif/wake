@@ -1,77 +1,64 @@
-# ADR 0015: Scope automatic completion triggers to embedded CSS
+# ADR 0015: 将自动补全触发器限定在嵌入式 CSS 内
 
 - Status: accepted
 - Date: 2026-08-18
 
 ## Context
 
-`wake_css_language` already computes property, value, at-rule and pseudo-selector completions for
-recognized `@crab-dev/css` templates. The VS Code Extension Host test requested those items through
-`vscode.executeCompletionItemProvider` without a trigger character, which is equivalent to an
-explicit completion request and did not prove the normal typing experience.
+`wake_css_language` 已能为识别出的 `@crab-dev/css` 模板计算属性、值、at-rule 和伪选择器补全。
+VS Code Extension Host 测试过去通过 `vscode.executeCompletionItemProvider` 请求这些项目，但未提供
+触发字符；这等同于显式请求补全，无法证明正常输入体验。
 
-The language server advertised only `:`, `@` and `-` as completion triggers. Embedded CSS is hosted
-inside JavaScript and TypeScript template-string tokens, where VS Code does not use ordinary code
-quick suggestions for a property letter. Consequently, typing `d` in a Crab CSS template did not
-open the existing `display` completion automatically.
+语言服务器只声明 `:`、`@` 和 `-` 为补全触发器。嵌入式 CSS 位于 JavaScript 和 TypeScript 模板
+字符串 token 内；对于属性首字母，VS Code 不会使用普通代码的快速建议。因此，在 Crab CSS 模板中
+输入 `d` 不会自动打开已有的 `display` 补全。
 
-Advertising letters as LSP trigger characters does not solve this gap. VS Code deliberately skips
-trigger-character providers when the cursor is in a word that would normally use quick suggestions,
-then suppresses that quick-suggestion request for a string token. Letter triggers are also scoped to
-the whole TypeScript document rather than to an embedded language region.
+把字母声明为 LSP 触发字符也不能解决问题。光标位于通常应使用快速建议的单词中时，VS Code 会有意
+跳过触发字符提供器，随后又因该 token 是字符串而抑制快速建议请求。此外，字母触发器会作用于整个
+TypeScript 文档，而不是嵌入语言区域。
 
 ## Decision
 
-After applying an incremental identifier insertion, `wake_css_lsp` asks the updated
-`LanguageDocument` whether the resulting cursor has at least one Crab CSS completion. Only then does
-the server emit `crabCss/triggerSuggest` with the document URI, version and cursor position. The
-client invokes `editor.action.triggerSuggest` only when all three still match the active editor.
+应用增量标识符插入后，`wake_css_lsp` 会询问更新后的 `LanguageDocument`：所得光标位置是否至少存在
+一个 Crab CSS 补全。只有结果为肯定时，服务器才发出 `crabCss/triggerSuggest`，其中包含文档 URI、
+版本和光标位置。客户端仅在三者仍与活动编辑器匹配时调用 `editor.action.triggerSuggest`。
 
-The standard LSP completion triggers remain `:`, `@` and `-`. They handle punctuation directly and
-do not claim ordinary letters across an entire JavaScript or TypeScript document.
+标准 LSP 补全触发器仍为 `:`、`@` 和 `-`。它们直接处理标点，不会在整个 JavaScript 或 TypeScript
+文档中占用普通字母。
 
-`wake_css_language::LanguageDocument::completions` returns `None` when the host position is outside
-a semantically recognized Crab CSS virtual document or inside an interpolation hole. The LSP
-transports that as no response from this provider. Inside a recognized template it returns a list,
-including an empty list when the provider applies but no item matches.
+当宿主位置不在语义识别的 Crab CSS 虚拟文档中，或处于插值孔洞内时，
+`wake_css_language::LanguageDocument::completions` 返回 `None`，LSP 将其传输为该提供器不响应。
+在已识别模板内则返回列表；即使提供器适用但无匹配项，也返回空列表。
 
-The extension does not override `editor.quickSuggestions.strings`, because that setting affects
-ordinary strings and every completion provider in JavaScript and TypeScript. The client owns only
-stale-notification rejection and the editor command; it does not recognize templates or decide
-whether completion applies.
+扩展不会覆盖 `editor.quickSuggestions.strings`，因为该设置会影响 JavaScript 和 TypeScript 中的普通
+字符串及所有补全提供器。客户端只负责拒绝过期通知和执行编辑器命令；不识别模板，也不决定补全是否适用。
 
-When VS Code applies a property item such as `display: `, the resulting incremental replacement is
-handled by the same post-analysis notification path as identifier typing. The server recognizes the
-bounded `property: ` edit shape, analyzes the new document version and emits the notification only
-when the new value position has semantic candidates. This avoids querying the server before the
-completion edit has synchronized. The language layer returns only values declared for the current
-property and filters them by the value prefix already typed.
+VS Code 应用 `display: ` 等属性项时，所得增量替换通过与标识符输入相同的分析后通知路径处理。服务器
+识别有界的 `property: ` 编辑形态，分析新文档版本，并仅在新值位置存在语义候选项时发出通知。这样可
+避免在补全编辑同步前查询服务器。语言层只返回为当前属性声明的值，并按已输入的值前缀过滤。
 
-VS Code can publish the completion edit's document version before it publishes the corresponding
-cursor movement. The client therefore checks the notification immediately, then observes at most
-the first subsequent editor-selection event when only the cursor has not caught up. It triggers
-only if that event reaches the exact URI, version and position; any other movement or a bounded
-timeout cancels the notification.
+VS Code 可能先发布补全编辑后的文档版本，再发布相应光标移动。因此客户端会立即检查通知；若只有
+光标尚未跟上，则最多观察第一次后续编辑器选择事件。只有该事件到达精确的 URI、版本和位置时才触发；
+任何其他移动或有界超时都会取消通知。
 
-The LSP assigns stable `sortText` keys from the semantic fact order. VS Code therefore keeps common
-standard values ahead of legacy vendor values instead of alphabetically promoting `-moz-*` items.
+LSP 根据语义事实顺序分配稳定的 `sortText` 键。因此 VS Code 会让常用标准值排在旧版厂商值之前，
+而不会按字母顺序把 `-moz-*` 提前。
 
 ## Invariants
 
-- Semantic binding analysis is the only authority for deciding whether a host position is Crab CSS.
-- `:`, `@` and `-` remain triggers for values, at-rules and prefixed properties.
-- Automatic suggestions require a positive result from the updated server analysis.
-- Stale document versions, moved cursors and stopped or replaced clients cannot trigger suggestions.
-- Completion-induced cursor movement may satisfy only the first subsequent selection event; it is
-  never polled or accepted after another movement.
-- Positions outside virtual CSS documents return no Crab CSS completion response.
-- The extension never enables suggestions globally for JavaScript or TypeScript string tokens.
-- The VS Code client owns no source or template recognizer.
-- Property-item replacement requests follow-up values only after the updated server analysis.
-- Property-value candidates are scoped to the current property and filtered by their typed prefix.
-- Completion ranking preserves the deterministic semantic fact order.
-- Minification must preserve evaluation of every `void` operand; the client intentionally uses
-  `void vscode.commands.executeCommand(...)` for fire-and-forget editor commands.
+- 语义绑定分析是判断宿主位置是否为 Crab CSS 的唯一权威。
+- `:`、`@` 和 `-` 仍分别作为值、at-rule 和带前缀属性的触发器。
+- 自动建议必须由更新后的服务器分析给出肯定结果。
+- 过期文档版本、已移动光标以及已停止或替换的客户端不能触发建议。
+- 补全引起的光标移动最多只能满足第一次后续选择事件；绝不轮询，也不在另一次移动后接受。
+- 虚拟 CSS 文档外的位置不返回 Crab CSS 补全响应。
+- 扩展绝不会为 JavaScript 或 TypeScript 字符串 token 全局启用建议。
+- VS Code 客户端不拥有源码或模板识别器。
+- 属性项替换只有在更新后的服务器完成分析后才请求后续值。
+- 属性值候选项限定于当前属性，并按已输入前缀过滤。
+- 补全排序保留确定性的语义事实顺序。
+- 压缩必须保留每个 `void` 操作数的求值；客户端有意使用
+  `void vscode.commands.executeCommand(...)` 执行即发即弃的编辑器命令。
 
 ## Evidence
 
@@ -88,34 +75,28 @@ standard values ahead of legacy vendor values instead of alphabetically promotin
 
 ## Consequences
 
-Typing a CSS property prefix opens the existing suggestions inside recognized Crab CSS templates
-even though the host token is a template string. The server sends a small notification only for
-Crab positions that have candidates; ordinary JavaScript and TypeScript edits cause no additional
-request or notification. Ordinary string suggestions and TypeScript navigation behavior remain
-unchanged.
+在识别出的 Crab CSS 模板内输入 CSS 属性前缀时，即使宿主 token 是模板字符串，也会打开已有建议。
+服务器只为存在候选项的 Crab 位置发送一条小型通知；普通 JavaScript 和 TypeScript 编辑不会引发额外
+请求或通知。普通字符串建议和 TypeScript 导航行为保持不变。
 
-The Wake constant evaluator reports `void expression` as foldable only when `expression` itself is
-constant. This prevents minification from replacing `void sideEffect()` with `undefined` and is a
-general bundler correctness rule, not an editor-specific workaround.
+Wake 常量求值器只有在 `expression` 本身为常量时，才将 `void expression` 视为可折叠。这可防止
+压缩把 `void sideEffect()` 替换为 `undefined`；它属于通用打包器正确性规则，而非编辑器专用变通。
 
 ## Validation
 
-- Test property, value, at-rule and pseudo completions inside templates and `None` outside them.
-- Type a property prefix one character at a time, accept the automatically opened suggestion and
-  assert the edit in a real VS Code Extension Host.
-- Keep the standard LSP punctuation trigger set covered by a capability test.
-- Bundle a `void`-wrapped command call with minification and assert that its argument remains in the
-  output; inspect the compiled extension for `editor.action.triggerSuggest`.
-- Run affected Rust tests, Clippy, extension checks, architecture checks and VSIX inspection.
+- 测试模板内的属性、值、at-rule 和伪类补全，以及模板外返回 `None`。
+- 在真实 VS Code Extension Host 中逐字符输入属性前缀，接受自动打开的建议，并断言编辑结果。
+- 通过能力测试覆盖标准 LSP 标点触发器集合。
+- 在启用压缩时打包由 `void` 包装的命令调用，断言其参数仍在输出中；检查编译后的扩展含有
+  `editor.action.triggerSuggest`。
+- 运行受影响的 Rust 测试、Clippy、扩展检查、架构检查和 VSIX 检查。
 
 ## Supersedes
 
-None. This decision completes the editor interaction contract established by
-[ADR 0007](0007-css-language-intelligence.md) while preserving the shared syntax and semantic
-binding boundaries in [ADR 0010](0010-shared-css-syntax-tree.md).
+None. 本决策完善了 [ADR 0007](0007-css-language-intelligence.md) 建立的编辑器交互契约，同时保留
+[ADR 0010](0010-shared-css-syntax-tree.md) 中的共享语法与语义绑定边界。
 
 ## Removal plan
 
-Replace the explicit-only Extension Host assertion and the timer-driven `hasCompletion` request in
-the same change. Do not retain alphabetic LSP triggers, a global quick-suggestions override or a
-client-side recognizer as a fallback.
+在同一变更中替换仅显式触发的 Extension Host 断言和定时器驱动的 `hasCompletion` 请求。不得保留字母
+LSP 触发器、全局快速建议覆盖或客户端侧识别器作为回退。

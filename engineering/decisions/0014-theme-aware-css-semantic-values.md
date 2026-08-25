@@ -1,41 +1,36 @@
-# ADR 0014: Give embedded CSS values a theme-aware semantic identity
+# ADR 0014: 为嵌入式 CSS 值赋予主题感知的语义标识
 
 - Status: accepted
 - Date: 2026-08-18
 
 ## Context
 
-`wake_css_language` previously classified every CSS identifier that was not a declaration name as
-the standard semantic token `keyword`. In TypeScript and TSX documents, VS Code therefore applied
-the same theme rule to CSS values such as `inline-flex`, `center` and `unset` as it applied to host
-language keywords such as `import`, `from` and `const`.
+`wake_css_language` 过去会把所有不是声明名的 CSS 标识符归类为标准语义 token `keyword`。因此，
+在 TypeScript 和 TSX 文档中，VS Code 会将 `inline-flex`、`center`、`unset` 等 CSS 值，与
+`import`、`from`、`const` 等宿主语言关键字应用相同的主题规则。
 
-The shared `wake_css::syntax::CssSyntaxTree` already records exact declaration name and value spans,
-so the language service can distinguish declaration values without another parser or spelling
-heuristic. VS Code extensions can declare custom semantic token types and map them to established
-TextMate scopes for themes that do not define an explicit semantic rule.
+共享的 `wake_css::syntax::CssSyntaxTree` 已记录精确的声明名和值范围，因此语言服务无需另一套解析器
+或拼写启发式即可区分声明值。VS Code 扩展可以声明自定义语义 token 类型，并为未显式定义语义规则的
+主题映射到既有 TextMate scope。
 
 ## Decision
 
-`wake_css_language` classifies ordinary identifiers contained by a declaration's parser-owned
-`value_span` as `SemanticKind::Value`. `wake_css_lsp` transports that kind as the custom semantic
-token type `crabCssValue`. The VS Code extension manifest owns the public token declaration and maps
-it to `support.constant.property-value.css` as the theme fallback.
+`wake_css_language` 将声明解析器所拥有的 `value_span` 内普通标识符归类为 `SemanticKind::Value`。
+`wake_css_lsp` 将该种类作为自定义语义 token 类型 `crabCssValue` 传输。VS Code 扩展清单拥有公共
+token 声明，并将其映射到 `support.constant.property-value.css` 作为主题回退。
 
-`crabCssValue` has no `keyword` super type. The extension does not hard-code a foreground color.
-Declaration names remain the standard `property` type, at-keywords remain `keyword`, and numbers,
-strings and functions retain their standard semantic types. TypeScript expressions inside template
-interpolations remain outside the virtual CSS document and are colored only by the host service.
+`crabCssValue` 没有 `keyword` 超类型。扩展不硬编码前景色。声明名仍使用标准 `property` 类型，
+at-keyword 仍为 `keyword`，数字、字符串和函数保留其标准语义类型。模板插值中的 TypeScript 表达式
+不属于虚拟 CSS 文档，只由宿主服务着色。
 
 ## Invariants
 
-- The shared CSS CST is the only authority for declaration name and value boundaries.
-- CSS declaration values never acquire a host-language keyword identity merely because they are
-  identifiers.
-- Semantic tokens never cover TypeScript or JavaScript interpolation holes.
-- The LSP legend, encoded token indexes and VS Code manifest use one stable token identifier.
-- Themes own colors; the extension supplies a standard CSS TextMate fallback only.
-- Semantic binding analysis remains the only authority for discovering Crab CSS templates.
+- 共享 CSS CST 是声明名和值边界的唯一权威。
+- CSS 声明值不能仅因其为标识符就获得宿主语言关键字标识。
+- 语义 token 绝不覆盖 TypeScript 或 JavaScript 插值孔洞。
+- LSP 图例、编码后的 token 索引和 VS Code 清单使用同一稳定 token 标识符。
+- 颜色由主题拥有；扩展只提供标准 CSS TextMate 回退。
+- 语义绑定分析仍是发现 Crab CSS 模板的唯一权威。
 
 ## Evidence
 
@@ -49,27 +44,21 @@ interpolations remain outside the virtual CSS document and are colored only by t
 
 ## Consequences
 
-CSS declaration values can be styled independently from TypeScript keywords while continuing to
-follow each user's theme. Theme authors and users may target `crabCssValue` directly. Existing
-themes that know standard CSS TextMate scopes gain an appropriate fallback without a Crab-specific
-rule. The semantic legend gains one custom type, so clients must consume the legend instead of
-assuming hard-coded indexes.
+CSS 声明值可独立于 TypeScript 关键字设置样式，同时继续遵循用户主题。主题作者和用户可以直接针对
+`crabCssValue`。已识别标准 CSS TextMate scope 的主题无需 Crab 专用规则即可获得合适回退。语义
+图例新增一个自定义类型，因此客户端必须使用图例，不能假定硬编码索引。
 
 ## Validation
 
-- Test declaration names, nested declaration values, interpolation holes and non-declaration CSS
-  identifiers in `wake_css_language`.
-- Test the custom legend entry and encoded value token in `wake_css_lsp`.
-- Test the manifest token declaration, absence of a keyword super type and CSS scope mapping.
-- Run extension checks, affected Rust tests, Clippy, architecture checks, formatting and VSIX
-  inspection.
+- 在 `wake_css_language` 中测试声明名、嵌套声明值、插值孔洞和非声明 CSS 标识符。
+- 在 `wake_css_lsp` 中测试自定义图例项及编码后的值 token。
+- 测试清单 token 声明、不存在 keyword 超类型，以及 CSS scope 映射。
+- 运行扩展检查、受影响的 Rust 测试、Clippy、架构检查、格式化和 VSIX 检查。
 
 ## Supersedes
 
-None. This decision refines the semantic-only highlighting path retained by
-[ADR 0010](0010-shared-css-syntax-tree.md).
+None. 本决策细化了 [ADR 0010](0010-shared-css-syntax-tree.md) 保留的纯语义高亮路径。
 
 ## Removal plan
 
-Remove the old branch that classified declaration-value identifiers as `Keyword` in the same
-change. No compatibility token, duplicate classifier or hard-coded theme color remains.
+在同一变更中删除把声明值标识符归类为 `Keyword` 的旧分支。不保留兼容 token、重复分类器或硬编码主题颜色。
