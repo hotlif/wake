@@ -1589,9 +1589,11 @@
     })
   }
 
-  // Browser user events travel through Chromium's CDP input pipeline. This is higher fidelity than
-  // synthetic dispatch, but it intentionally does not claim complete OS/IME, drag/drop, or native
-  // file-chooser simulation; multiple select remains an explicit browser-realm fallback.
+  // Browser pointer and keyboard events travel through Chromium's CDP input pipeline. This is
+  // higher fidelity than synthetic dispatch, but it intentionally does not claim complete OS/IME,
+  // drag/drop, or native file-chooser simulation. Chromium has no portable CDP command for
+  // selecting an option, so selectOptions uses a CDP click for focus and applies the selection plus
+  // input/change events in the browser realm.
   function browserUserEvent(options) {
     const delay = () => options.delayMs == null ? Promise.resolve() : new Promise(resolve => setTimeout(resolve, Number(options.delayMs)))
     const perform = (action, payload, after) => reactAct(async () => {
@@ -1616,12 +1618,13 @@
         const requested = (Array.isArray(values) ? values : [values]).map(value => typeof value === 'string' ? value : value && value.value)
         const indexes = requested.map(value => [...element.options].findIndex(option => option.value === String(value)))
         if (indexes.some(index => index < 0)) throw browserInputError('selectOptions value does not match an option')
-        const multiple = Boolean(element.multiple)
-        return perform('selectOptions', { target, indexes, multiple }, multiple ? async () => {
-          for (let index = 0; index < element.options.length; index++) element.options[index].selected = indexes.includes(index)
+        if (!element.multiple && indexes.length === 0) throw browserInputError('selectOptions requires one option')
+        const selectedIndexes = element.multiple ? indexes : indexes.slice(0, 1)
+        return perform('selectOptions', { target }, async () => {
+          for (let index = 0; index < element.options.length; index++) element.options[index].selected = selectedIndexes.includes(index)
           element.dispatchEvent(new Event('input', { bubbles: true }))
           element.dispatchEvent(new Event('change', { bubbles: true }))
-        } : null)
+        })
       },
       async upload(element, files) {
         const target = browserInputTarget(element)

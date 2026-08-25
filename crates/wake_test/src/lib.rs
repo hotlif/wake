@@ -2326,8 +2326,6 @@ enum BrowserOperationCommand {
         schema_version: String,
         id: String,
         target: BrowserInputTarget,
-        indexes: Vec<usize>,
-        multiple: bool,
     },
     #[serde(rename = "upload")]
     Upload {
@@ -2630,29 +2628,11 @@ fn handle_browser_input_command(
             page.pointer_move(-1.0, -1.0)
                 .map_err(|error| error.to_string())
         }
-        BrowserOperationCommand::SelectOptions {
-            target,
-            indexes,
-            multiple,
-            ..
-        } => {
+        BrowserOperationCommand::SelectOptions { target, .. } => {
             pointer_click(page, *target)?;
-            if *multiple {
-                return Ok(());
-            }
-            let index = indexes
-                .first()
-                .copied()
-                .ok_or_else(|| "selectOptions requires one option index".to_string())?;
-            for key in std::iter::once("Home")
-                .chain(std::iter::repeat_n("ArrowDown", index))
-                .chain(std::iter::once("Enter"))
-            {
-                let input = named_keyboard_input(key, InputModifiers::NONE)
-                    .expect("selectOptions uses supported named keys");
-                page.press_key(&input).map_err(|error| error.to_string())?;
-            }
-            Ok(())
+            let escape = named_keyboard_input("Escape", InputModifiers::NONE)
+                .expect("Escape is a supported named key");
+            page.press_key(&escape).map_err(|error| error.to_string())
         }
         BrowserOperationCommand::Upload {
             target,
@@ -7968,7 +7948,8 @@ environment = "dom"
                         }),
                         React.createElement('select', {
                             'aria-label': 'Choice', value: selected,
-                            onChange: event => setSelected(event.target.value),
+                            onInput: event => globalThis.__wakeSelectEvents.push(event.type),
+                            onChange: event => { globalThis.__wakeSelectEvents.push(event.type); setSelected(event.target.value) },
                         },
                             React.createElement('option', {value: 'alpha'}, 'Alpha'),
                             React.createElement('option', {value: 'beta'}, 'Beta'),
@@ -8056,6 +8037,7 @@ environment = "dom"
 
                 test('typed CDP user input drives React and browser defaults', async () => {
                     globalThis.__wakeTrustedEvents = []
+                    globalThis.__wakeSelectEvents = []
                     await render(React.createElement(InteractiveForm))
                     const user = userEvent.setup()
                     const button = screen.getByRole('button', {name: 'Clicks 0; doubles 0; hovered false'})
@@ -8097,6 +8079,7 @@ environment = "dom"
                     expect(checkbox).toBeChecked()
                     await user.selectOptions(select, 'beta')
                     expect(select).toHaveValue('beta')
+                    expect(globalThis.__wakeSelectEvents).toEqual(['input', 'change'])
                     await user.upload(upload, new File(['Wake'], 'wake.txt', {type: 'text/plain'}))
                     expect(upload.files[0].name).toBe('wake.txt')
                     expect(await upload.files[0].text()).toBe('Wake')
