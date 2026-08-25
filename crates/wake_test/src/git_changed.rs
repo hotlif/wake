@@ -525,12 +525,16 @@ mod tests {
 
         let directory = TestDirectory::new("not-repository");
         let error = changed_paths(&directory.path).expect_err("reject non-repository root");
+        let canonical_directory = directory
+            .path
+            .canonicalize()
+            .expect("canonical non-repository root");
         assert_eq!(error.kind(), GitChangedErrorKind::NotRepository);
         assert!(error.message().contains("Git work tree"));
         assert!(
             error
                 .message()
-                .contains(&directory.path.display().to_string())
+                .contains(&canonical_directory.display().to_string())
         );
     }
 

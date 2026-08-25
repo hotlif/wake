@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -39,6 +39,10 @@ const packageVersion = JSON.parse(
   await readFile(new URL('../package.json', import.meta.url), 'utf8'),
 ).version
 const contexts = []
+
+async function assertSameExistingPath(actual, expected) {
+  assert.equal(await realpath(actual), await realpath(expected))
+}
 
 function loadBuiltNative() {
   const nativeSuffixes = {
@@ -331,7 +335,7 @@ test('generates native design tokens with strict references', async () => {
   await writeFile(join(cwd, 'token.toml'), `[build]\noutput='./src/token.ts'\nprefix='demo'\n[token]\ncolor='red'\n`)
   const result = await generateCssToken({ cwd })
   assert.equal(result.success, true)
-  assert.equal(result.outputFile, join(cwd, 'src', 'token.ts'))
+  await assertSameExistingPath(result.outputFile, join(cwd, 'src', 'token.ts'))
   assert.match(await readFile(result.outputFile, 'utf8'), /--demo-color/)
   await rm(cwd, { recursive: true, force: true })
 })
@@ -357,9 +361,9 @@ test('builds native component-library entry contracts', async () => {
   await writeFile(join(cwd, 'src', 'button.tsx'), "import type { FC } from 'react';\nexport interface ButtonProps { label: string; }\nconst Button: FC<ButtonProps> = (props) => <button>{props.label}</button>;\nexport default Button;\n")
   const result = await buildLibrary({ cwd })
   assert.equal(result.success, true)
-  assert.equal(result.esmEntry, join(cwd, 'esm', 'index.mjs'))
-  assert.equal(result.cjsEntry, join(cwd, 'cjs', 'index.cjs'))
-  assert.equal(result.declarationEntry, join(cwd, 'declarations', 'index.d.ts'))
+  await assertSameExistingPath(result.esmEntry, join(cwd, 'esm', 'index.mjs'))
+  await assertSameExistingPath(result.cjsEntry, join(cwd, 'cjs', 'index.cjs'))
+  await assertSameExistingPath(result.declarationEntry, join(cwd, 'declarations', 'index.d.ts'))
   assert.equal(result.cssEntry, undefined)
   await access(result.esmEntry)
   await access(result.cjsEntry)
