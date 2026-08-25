@@ -1,0 +1,94 @@
++++
+title = "测试配置"
+description = "配置 Wake 原生 React 测试发现、DOM、浏览器、网络、snapshot 与 coverage"
+kind = "reference"
+status = "experimental"
++++
+
+# 测试配置
+
+## `wake.config.toml`
+
+配置只来自项目根 `wake.config.toml`。未知字段直接报 `WAKE_TEST_CONFIG`。
+
+```toml
+[test]
+environment = "auto"
+include = ["**/*.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"]
+browser_include = ["**/*.browser.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"]
+exclude = ["**/node_modules/**", "**/dist/**"]
+setup = []
+timeout_ms = 5000
+workers = "auto"
+forbid_only = false
+leaks = "warn"
+
+[test.react]
+strict_mode = false
+cleanup = true
+act_warnings = "error"
+test_id_attribute = "data-testid"
+
+[test.browser]
+headless = true
+sandbox = true
+viewport = { width = 1280, height = 720, device_scale_factor = 1.0 }
+locale = "en-US"
+timezone = "UTC"
+color_scheme = "light"
+
+[test.network]
+mode = "deny"
+allow_hosts = []
+
+[test.snapshot]
+directory = "__snapshots__"
+screenshot_directory = "__screenshots__"
+
+[test.coverage]
+enabled = false
+reporters = ["text"]
+
+[test.coverage.threshold]
+lines = 80
+functions = 80
+blocks = 75
+
+[[test.coverage.per_file]]
+pattern = "src/components/**"
+lines = 90
+functions = 85
+blocks = 80
+
+[[test.projects]]
+name = "client"
+root = "."
+environment = "auto"
+```
+
+`environment` 只接受 `auto`、`dom` 或 `browser`。`auto` 根据 `browser_include` 为 suite 选择
+fast DOM 或真实 Chromium；浏览器可执行文件由 CLI/Node option 显式指定或从系统发现，不写入
+配置插件路径。每个 project 只有 `name`、`root`、`environment` 三个覆盖字段。
+
+`workers` 接受 `auto`、正整数或 `1%`–`100%`。`leaks` 接受 `off`、`warn`、`error`；
+`act_warnings` 也接受这三个值：Wake 捕获 React 的 `act(...)` 警告并归因到当前 phase；`off`
+静默忽略，`warn` 产生 `WAKE_TEST_ACT` diagnostic，`error` 同时使当前 case 失败。`network.mode`
+接受 `deny` 或 `allow`，默认拒绝未列入
+`allow_hosts` 的网络访问。`color_scheme` 接受 `light` 或 `dark`。coverage reporter 只接受
+`text`、`json`、`lcov`、`html`。`threshold` 是整个项目的最小百分比；`per_file` 使用相对项目根的
+Wake glob 选择文件。`lines`、`functions`、`blocks` 都接受 `0`–`100` 的整数或小数，未配置的指标
+不参与门禁。阈值未达标属于测试失败（`success = false`），而不是配置或 host 异常。
+`text` 会生成并由 pretty CLI 输出 `coverage/coverage.txt`；`json`、`lcov` 和 `html` 分别生成
+`wake-coverage.json`、带逐行/函数/分支记录的 `lcov.info`，以及包含原始源码逐行标记的
+`coverage/index.html`。这些文件都会作为 owned artifact 返回。
+`leaks` 检测并在 teardown 取消 Wake 拥有的 timeout、interval、immediate、animation-frame、
+idle-callback 与 fake-clock handle，并保留创建 stack；它不声称扫描操作系统或第三方原生进程的
+任意句柄。浏览器 context、拦截请求和 Wake 网络 route 由各自 owner 独立关闭。
+`snapshot.screenshot_directory` 保存 browser-only `toMatchScreenshot()` 的 profile 隔离 PNG
+baseline；mismatch 的 received PNG 与 HTML diff 写入其 `__diffs__` 子目录。为避免宿主系统的
+动画偏好改变截图，browser 环境固定模拟 `prefers-reduced-motion: reduce`；该值不可配置，并参与
+screenshot profile hash。
+
+所有层级都严格拒绝未知字段。配置没有 runner、resolver、transform、环境插件、自动 module mock、
+第二套 timer 模式或源码内 snapshot 改写字段。V8 range 到原始 TSX Source Map 的精确回映仍属于
+experimental 稳定门禁；在该门禁完成前，coverage 结果不会被描述为稳定接口。

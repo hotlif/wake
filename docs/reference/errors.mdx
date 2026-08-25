@@ -18,6 +18,19 @@ status = "stable"
 | `WAKE_CANCELLED` | `AbortSignal` 取消操作 | 调用方取消逻辑 |
 | `WAKE_UNSUPPORTED_PLATFORM` | 没有可用原生包 | 操作系统、CPU 与安装树 |
 | `WAKE_INTERNAL` | 资源关闭、panic 或内部不变量失败 | 完整诊断与复现步骤 |
+| `WAKE_TEST_CONFIG` | 测试配置或 CLI 选项无效 | `[test]` 与参数优先级 |
+| `WAKE_TEST_DISCOVERY` | 测试发现失败或没有匹配文件 | include、browser_include、exclude、pattern |
+| `WAKE_TEST_RUNTIME` | suite 模块或测试执行失败 | `suites[].failures` 与源码位置 |
+| `WAKE_TEST_TIMEOUT` | 测试超时或循环被中断 | timeout_ms 与异步完成条件 |
+| `WAKE_TEST_SNAPSHOT` | snapshot 读取、比较或原子更新失败 | directory、screenshot_directory 与更新模式 |
+| `WAKE_TEST_COVERAGE` | V8 coverage 数据、Source Map 或 reporter 失败 | enabled 与 reporters |
+| `WAKE_TEST_HOST` | test host、IPC 或握手失败 | 平台包、协议版本、取消与崩溃日志 |
+| `WAKE_TEST_UNSUPPORTED` | 请求了范围外宿主、DOM 或插件行为 | 兼容性说明与内置值 |
+| `WAKE_TEST_CONTEXT` | 在测试 realm 外调用测试入口 | 使用 `wake test` 或 `runTests()` |
+| `WAKE_TEST_DOM` | fast DOM 创建、同 realm 身份或清理失败 | environment、React 版本与 suite teardown |
+| `WAKE_TEST_BROWSER` | Chromium 发现、CDP 或 BrowserContext 失败 | browser_path、浏览器版本与 sandbox |
+| `WAKE_TEST_NETWORK` | 网络策略、拦截或 allow_hosts 校验失败 | network.mode、allow_hosts 与 route mock |
+| `WAKE_TEST_LEAK` | suite 结束时仍有资源存活 | leaks 策略与返回的 leak 记录 |
 
 不要根据英文 `message` 分支。Node.js 调用使用 `WakeError.code`，并把 `diagnostics` 中的路径、范围、notes 和 help 展示给用户。有效源码诊断的 `location` 包含 1 基行列、源码行和标签；没有源码 span 时该字段不存在。
 

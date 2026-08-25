@@ -59,19 +59,19 @@ title = "参考"
 [[group.section]]
 id = "configuration"
 title = "配置"
-pages = ["reference/configuration/project", "reference/configuration/dev-server", "reference/configuration/docs"]
+pages = ["reference/configuration/project", "reference/configuration/test", "reference/configuration/dev-server", "reference/configuration/docs"]
 
 [[group.section]]
 id = "cli"
 title = "CLI"
-pages = ["reference/cli/build", "reference/cli/bundle", "reference/cli/library", "reference/cli/dev", "reference/cli/docs"]
+pages = ["reference/cli/build", "reference/cli/test", "reference/cli/bundle", "reference/cli/library", "reference/cli/dev", "reference/cli/docs"]
 
 [[group.section]]
 id = "node-api"
 title = "Node.js API"
-pages = ["reference/node-api/build", "reference/node-api/dev-server", "reference/node-api/docs"]
+pages = ["reference/node-api/build", "reference/node-api/test", "reference/node-api/dev-server", "reference/node-api/docs"]
 
 [[group.section]]
 id = "language"
 title = "API 与诊断"
-pages = ["reference/css-api", "reference/compatibility", "reference/errors", "reference/troubleshooting", "reference/experimental", "reference/glossary"]
+pages = ["reference/css-api", "reference/test-api", "reference/compatibility", "reference/errors", "reference/troubleshooting", "reference/experimental", "reference/glossary"]

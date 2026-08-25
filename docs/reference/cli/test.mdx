@@ -1,0 +1,47 @@
++++
+title = "test 命令"
+description = "使用 Wake 原生运行时发现、执行和监听 JavaScript 与 TypeScript 测试"
+kind = "reference"
+status = "experimental"
++++
+
+# test 命令
+
+## 用法
+
+```text
+wake test [PATTERN...] [--root DIR] [--name-pattern TEXT] [--project NAME]
+          [--environment auto|dom|browser] [--watch] [--changed] [--related PATH...]
+          [--coverage] [--update-snapshots] [--serial] [--workers COUNT]
+          [--bail [COUNT]] [--shard INDEX/TOTAL] [--seed SEED] [--shuffle]
+          [--reporter pretty|json|junit] [--output FILE] [--allow-no-tests]
+          [--browser-path FILE] [--headful]
+```
+
+测试文件必须从 `@crab-dev/wake/test` 或 `@crab-dev/wake/test/react` 显式导入 API。Wake 不注入
+测试全局变量，也不接受 camelCase 别名、自定义 runner/plugin 路径、`--config` 或初始化命令。
+项目配置只读取 `--root` 下发现的 `wake.config.toml`；命令行覆盖对应的 `[test]` 值。
+
+`--project` 可重复。`--workers` 接受 `auto`、正整数或 `1%`–`100%`；`--serial` 与
+`--workers` 互斥。`--bail` 不带值时等于 `1`，`--shard` 使用从 1 开始的 `INDEX/TOTAL`。
+`--changed` 与 `--related` 互斥。`--update-snapshots` 只更新 Wake 外部文本 snapshot 与按渲染
+profile 隔离的 PNG baseline，不改写测试源码。
+
+`--changed` 固定比较 `HEAD` 的 staged/unstaged 文件并加入未被忽略的 untracked 文件；unborn
+`HEAD` 使用 index + untracked。它不会猜测 upstream/base branch。Git 不可用或 root 不在 work
+tree 时返回 `WAKE_TEST_DISCOVERY`。`--related` 使用 Wake 执行时编译图的反向依赖；动态加载、PnP、
+解析缺口或 package/lock/config 拓扑变化会保守全选并给出 diagnostic，绝不静默漏掉 suite。
+
+默认 reporter 为 `pretty`。`json` 输出稳定的 `wake.test.v1` 结果，`junit` 输出 XML；二者可用
+`--output` 写文件。`pretty` 只写终端，不能与 `--output` 组合。
+
+退出码为：成功 `0`、测试或 snapshot 失败 `1`、参数/配置/host/内部错误 `2`、取消 `130`。
+`--watch` 由 test host 持有原生 watcher 与长期协议 session；每轮使用全新 realm/BrowserContext，
+只复用发现和编译依赖图。交互键为 `a` 全量、`f` 上轮失败、`p` 路径、`t` 名称、`u` 更新
+snapshot、`r` 重跑当前选择、`q` 正常退出。非 TTY 模式持续运行到 signal 或 context 关闭。
+coverage 的 V8 range 到 TSX Source Map 规范化尚未
+完成稳定门禁，因此 coverage 接口仍是 experimental；收集、报告或映射发生内部错误时会明确返回
+`WAKE_TEST_COVERAGE`，不会把空报告静默当作成功。
+
+该命令属于[兼容性边界](/reference/compatibility)定义的实验性 React 19 测试面；熟悉的
+`describe`/`test`/`expect` 书写形式不构成对外部测试框架 CLI、配置或结果格式的兼容承诺。

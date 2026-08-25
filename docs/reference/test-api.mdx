@@ -1,0 +1,109 @@
++++
+title = "Wake Test API"
+description = "使用 Wake 原生、Jest 风格的测试 API 测试 React 19.2 应用"
+kind = "reference"
+status = "experimental"
++++
+
+# Wake Test API
+
+Wake Test 当前是 experimental。它采用熟悉的 `describe`、`test` 和 `expect` 写法，但不是
+Jest 兼容层。测试必须显式导入 API；Wake 不注入测试全局变量。
+
+```tsx
+import { describe, expect, test } from '@crab-dev/wake/test'
+import { render, screen, userEvent } from '@crab-dev/wake/test/react'
+
+describe('Counter', () => {
+  test('increments', async () => {
+    const user = userEvent.setup()
+    await render(<Counter />)
+    await user.click(screen.getByRole('button', { name: 'Add' }))
+    expect(screen.getByText('1')).toBeInTheDocument()
+  })
+})
+```
+
+## Core API
+
+`@crab-dev/wake/test` exports only named values:
+
+- `test`/`it`, `describe`, `beforeAll`, `beforeEach`, `afterEach`, `afterAll`
+- `expect`, `mock`, `clock` and `network`
+
+`test` and `describe` support `only`, `skip` and `each`; `test.todo(name)` records a pending case.
+Callbacks may be synchronous or return a Promise. A timeout is written as
+`test(name, callback, { timeout: 10_000 })`. Wake deliberately does not support `done` callbacks,
+focused aliases, `test.concurrent` or default exports.
+
+`expect` includes deep/strict equality, numeric, string, collection, property, exception, Promise,
+asymmetric and mock-function matchers. `expect.extend()` installs an owned custom matcher;
+`expect.assertions()` and `expect.hasAssertions()` enforce assertion counts.
+
+## Explicit module mocks
+
+Module replacement is ordered and never hoisted. Register the factory before loading the module
+through `mock.import()`:
+
+```ts
+mock.module('./api', async () => ({
+  loadUser: mock.fn().resolve({ name: 'Wake' }),
+}))
+
+const { App } = await mock.import('./App')
+```
+
+Factories may be asynchronous and are evaluated before the selected graph. `mock.actual()` loads
+the real module, while `mock.isolate(async () => …)` evaluates a fresh module cache and fresh mock
+factory instances for the callback. A static import that was already evaluated is never changed.
+Wake does not implement hoisting, automock or `__mocks__` directories.
+
+`mock.fn()`, `mock.spyOn()` and `mock.replaceProperty()` expose Wake-owned methods such as
+`implement`, `implementOnce`, `return`, `resolve`, `reject`, `clear`, `reset` and `restore`.
+Spies and replaced properties are restored after every test.
+
+## Clock and network
+
+`clock.fake()` enables the single modern asynchronous clock. `advanceBy`, `advanceTo`, `runNext`,
+`runAll` and `flushMicrotasks` perform a React `act` checkpoint before resolving; `clock.restore()`
+returns to real time. There is no legacy timer mode.
+
+External network access is denied by default. `network.route(matcher, handler)` returns a disposer
+and may return a real `Response` or `{ status, headers, body, delayMs }`. `network.allow(matcher)`
+is an explicit per-test permission even when the project default is `deny`; `allow_hosts` supplies
+project-level permissions. Routes, allows and request history reset after each test. Browser suites
+enforce the decision with CDP Fetch interception, while fast DOM uses Wake's bounded Rust transport
+and rechecks redirects.
+
+## Snapshot
+
+`toMatchSnapshot()` writes only external `// Wake Snapshot v1` files. Object keys and DOM attributes
+are serialized deterministically; DOM text and comments retain their semantic content. Property
+matchers are verified and stored as stable matcher placeholders instead of run-specific values.
+`--update-snapshots` updates and removes obsolete entries atomically. Wake never rewrites test
+source and does not support inline snapshots.
+
+`await expect(document).toMatchScreenshot('page')` captures the current browser viewport;
+receiving an Element captures its visible layout box. The matcher is browser-only and returns
+`WAKE_TEST_BROWSER` in fast DOM. Wake stores PNG baselines under `screenshot_directory`, separated
+by a stable rendering-profile hash (OS/architecture, Chromium family and major version, viewport,
+device scale, locale, timezone, color scheme, fixed `prefers-reduced-motion: reduce` and headless
+mode). Screenshot artifacts expose that fixed value as `metadata.reducedMotion`. Missing baselines
+follow `new`/`none`/`all` snapshot update semantics. A mismatch keeps the baseline and writes owned
+received-PNG and self-contained HTML visual-diff artifacts into `TestRunResult.artifacts`.
+
+Screenshot comparison is exact PNG identity in the first experimental contract. Wake does not
+currently promise tolerance thresholds, font normalization, cross-profile comparison, full-page
+scroll stitching or OS-level image equivalence.
+
+## React API
+
+`@crab-dev/wake/test/react` re-exports the core API and adds `render`, `renderHook`, `cleanup`,
+`act`, `screen`, `within`, `prettyDOM`, `fireEvent`, `userEvent`, `waitFor` and
+`waitForElementToBeRemoved`. React operations always use the official asynchronous `act`, and Wake
+cleans mounted roots after each test. The resolved `react` and `react-dom` packages must be the same
+project instance, have identical versions and satisfy `>=19.2.8 <19.3.0`.
+
+Fast DOM suites provide deterministic component tests. Files matching `browser_include` execute in
+a fresh system-Chromium BrowserContext for real layout, focus, input, hydration, network and visual
+behavior. This distinction is a Wake environment contract, not a jsdom or complete browser ABI.

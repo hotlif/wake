@@ -15,6 +15,7 @@ status = "stable"
 | React | 19 |
 | 模块 | ESM、CommonJS、TypeScript、JSX/TSX |
 | 操作系统 | Windows、Linux、macOS 的已发布原生包 |
+| 原生测试语言目标 | ES2024；TypeScript 仅擦除类型 |
 
 Wake npm 主包按当前平台加载对应原生包。缺少平台产物时抛出 `WAKE_UNSUPPORTED_PLATFORM`。
 
@@ -29,3 +30,24 @@ Wake npm 主包按当前平台加载对应原生包。缺少平台产物时抛�
 ## Wake Docs
 
 文档运行时使用 React 19，输出纯静态文件。MDX 是可信源码输入，不应编译不可信用户上传内容。
+
+## 原生测试
+
+Wake Test 是 experimental、Wake-native、React-first 的测试框架。测试模块支持 ESM、CommonJS、
+JSON、TS、TSX 与 JSX，执行目标为嵌入式 V8。产品路径不启动外部 Node、Deno CLI 或第三方测试
+runner，也不兼容它们的 CLI、配置、插件、snapshot 或结果 schema。
+
+`dom` 为每个 suite 创建隔离的 V8 realm、module registry、Window 和 Document。其私有 DOM
+adapter 只保证 Wake 固定的 React 19.2 conformance manifest，不宣称完整浏览器兼容。layout、
+CSS 渲染、原生输入、导航、截图和浏览器敏感 hydration 只以 `browser` 环境中的系统 Chrome、
+Edge 或 Chromium 为权威；结果会记录浏览器身份、版本与 headless 状态。
+
+Wake 不要求本地项目安装某个固定浏览器主版本；可识别且能建立 CDP 会话的系统
+Chrome、Edge 或 Chromium 均可运行。Wake 自身的 CI/发布 conformance 会另外固定一个
+Chromium-family major，并在托管 runner 升级后通过显式清单变更与五平台门禁完成升级；该发布
+证据约束不会成为项目配置或运行时下载行为。
+
+范围外 DOM、宿主或浏览器行为以 `WAKE_TEST_UNSUPPORTED`、`WAKE_TEST_DOM` 或
+`WAKE_TEST_BROWSER` 失败。第三方 runner、reporter、environment、transform、resolver 与 watch
+plugin ABI 不受支持。转为 stable 前仍须通过 ADR 0020 的 V8/React/DOM/Chromium、coverage、
+snapshot/watch、崩溃隔离和五平台 clean-install 门禁。

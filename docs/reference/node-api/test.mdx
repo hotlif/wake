@@ -1,0 +1,37 @@
++++
+title = "Node.js 测试 API"
+description = "通过 runTests 与 TestContext 调用同一个原生 Wake 测试 host"
+kind = "reference"
+status = "experimental"
++++
+
+# Node.js 测试 API
+
+## `runTests()` 与 `TestContext`
+
+```ts
+import { createTestContext, runTests } from "@crab-dev/wake";
+
+const result = await runTests({ root: process.cwd(), patterns: ["src"] });
+if (!result.success) console.error(result.suites);
+
+await using context = await createTestContext({ root: process.cwd() });
+context.on("testCaseResult", ({ result }) => console.log(result.name));
+await context.run();
+```
+
+`runTests()` 的断言失败会 resolve `TestRunResult` 且 `success === false`；只有配置、host、协议或
+内部错误才 reject `WakeError`。只有一次性 `runTests()` wrapper 接受 `AbortSignal`；context 的
+options 在创建时冻结。`TestContext` 提供无参 `run()`、
+`startWatch()`、`stopWatch()`、`close()`、`watching`、`closed`、异步释放以及 `runStart`、
+`testCaseResult`、`suiteResult`、`runComplete`、`diagnostic`、`closed` 事件。watcher 与事件顺序由
+长期 test-host session 统一拥有；Node 层不创建文件 watcher，也不从最终结果伪造事件。
+
+结果对象使用稳定的 `wake.test.v1` schema，可序列化，包含 environment、suite/case 状态、结构化
+failure、计数、seed、snapshot、coverage、leaks、artifacts、diagnostics 和 `terminationReason`。
+CLI 与 Node API 通过 `wake_app` 和同一 test host 返回该模型，不存在第二个兼容结果格式。
+
+该入口依照 ADR 0020 保持 experimental。React 19.2、fast DOM 与 Chromium conformance、V8
+source-mapped coverage、snapshot/watch 冷热等价、host/browser 崩溃和五平台 clean-install 矩阵是
+转为 stable 前的门禁。请求尚未完成的 coverage 会 reject 带 `WAKE_TEST_COVERAGE` 的
+`WakeError`，而不会 resolve 一个空报告。
