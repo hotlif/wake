@@ -369,8 +369,8 @@ jobs:
             browser_evidence: unavailable
           - platform: darwin-x64
             runner: macos-15-intel
-            browser_evidence: exact-major-smoke
-            browser_major: 151
+            browser_evidence: reviewed-major-smoke
+            browser_majors: '150,151'
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke
@@ -677,8 +677,8 @@ jobs:
             browser_evidence: unavailable
           - platform: darwin-x64
             runner: macos-15-intel
-            browser_evidence: exact-major-smoke
-            browser_major: 151
+            browser_evidence: reviewed-major-smoke
+            browser_majors: '150,151'
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke

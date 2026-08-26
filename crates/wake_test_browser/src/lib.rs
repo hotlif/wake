@@ -1949,18 +1949,43 @@ fn is_client_termination(error: &std::io::Error) -> bool {
     )
 }
 
+const RESOURCE_REQUEST_HEAD_LIMIT: usize = 8 * 1024;
+
+fn read_resource_request_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut request = Vec::with_capacity(1024);
+    while request.len() < RESOURCE_REQUEST_HEAD_LIMIT {
+        let mut chunk = [0_u8; 1024];
+        let remaining = RESOURCE_REQUEST_HEAD_LIMIT - request.len();
+        let read_limit = remaining.min(chunk.len());
+        let read = stream.read(&mut chunk[..read_limit])?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(request);
+        }
+    }
+    if request.is_empty() {
+        return Ok(request);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "resource origin request head is incomplete or exceeds 8 KiB",
+    ))
+}
+
 fn serve_resource(
     stream: &mut TcpStream,
     resources: &BTreeMap<String, Vec<u8>>,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    let mut request = [0_u8; 8 * 1024];
-    let read = stream.read(&mut request)?;
-    if read == 0 {
+    let request = read_resource_request_head(stream)?;
+    if request.is_empty() {
         return Ok(());
     }
-    let request = String::from_utf8_lossy(&request[..read]);
+    let request = String::from_utf8_lossy(&request);
     let path = request
         .lines()
         .next()
@@ -2011,6 +2036,27 @@ mod tests {
         )
         .unwrap();
 
+        read_resource_response(stream)
+    }
+
+    fn fetch_resource_in_two_chunks(
+        address: std::net::SocketAddr,
+        first: &[u8],
+        second: &[u8],
+    ) -> (String, Vec<u8>) {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream.write_all(first).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        stream.write_all(second).unwrap();
+
+        read_resource_response(stream)
+    }
+
+    fn read_resource_response(stream: TcpStream) -> (String, Vec<u8>) {
         let mut reader = BufReader::new(stream);
         let mut status = String::new();
         reader.read_line(&mut status).unwrap();
@@ -2155,7 +2201,11 @@ mod tests {
 
         drop(TcpStream::connect(address).unwrap());
 
-        let (status, body) = fetch_resource(address, "/suite.js");
+        let (status, body) = fetch_resource_in_two_chunks(
+            address,
+            b"GET /sui",
+            b"te.js HTTP/1.1\r\nHost: wake\r\nConnection: close\r\n\r\n",
+        );
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(body, b"export const answer = 42;");
 

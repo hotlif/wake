@@ -141,7 +141,7 @@ test('system browser evidence separates experimental publication from stable rea
       'utf8',
     ),
   )
-  assert.equal(manifest.schemaVersion, 2)
+  assert.equal(manifest.schemaVersion, 3)
   assert.equal(manifest.contract, 'ADR-0020')
   assert.equal(manifest.scope, 'ci-release-browser-evidence')
   assert.equal(manifest.versionSource, 'cdp-browser-get-version')
@@ -166,19 +166,22 @@ test('system browser evidence separates experimental publication from stable rea
   assert.equal(manifest.targets['linux-x64-gnu'].experimental.major, 151)
   assert.equal(manifest.targets['linux-arm64-gnu'].experimental.mode, 'unavailable')
   assert.deepEqual(
-    manifest.targets['linux-arm64-gnu'].reviewedRunnerEvidence.browserVersions,
+    manifest.targets['linux-arm64-gnu'].reviewedRunnerEvidence[0].browserVersions,
     {},
   )
-  assert.equal(manifest.targets['darwin-x64'].experimental.mode, 'exact-major-smoke')
-  assert.equal(manifest.targets['darwin-x64'].experimental.major, 151)
+  assert.equal(manifest.targets['darwin-x64'].experimental.mode, 'reviewed-major-smoke')
+  assert.deepEqual(manifest.targets['darwin-x64'].experimental.majors, [150, 151])
   assert.equal(manifest.targets['darwin-arm64'].experimental.mode, 'exact-major-smoke')
   assert.equal(manifest.targets['darwin-arm64'].experimental.major, 150)
   for (const policy of Object.values(manifest.targets)) {
-    assert.match(
-      policy.reviewedRunnerEvidence.source,
-      /^https:\/\/github\.com\/actions\/runner-images\/blob\/[0-9a-f]{40}\//,
-    )
-    assert.match(policy.reviewedRunnerEvidence.imageVersion, /^\d+\.\d+\.\d+$/)
+    assert(Array.isArray(policy.reviewedRunnerEvidence))
+    for (const evidence of policy.reviewedRunnerEvidence) {
+      assert.match(
+        evidence.source,
+        /^https:\/\/github\.com\/actions\/runner-images\/blob\/[0-9a-f]{40}\//,
+      )
+      assert.match(evidence.imageVersion, /^\d+\.\d+\.\d+$/)
+    }
   }
 
   const checker = readFileSync(

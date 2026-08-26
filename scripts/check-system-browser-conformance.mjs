@@ -48,6 +48,7 @@ const browserKinds = new Set(['chrome', 'edge', 'chromium'])
 const evidenceModes = new Set([
   'exact-major-conformance',
   'exact-major-smoke',
+  'reviewed-major-smoke',
   'unavailable',
 ])
 
@@ -84,6 +85,17 @@ function positiveInteger(value, description) {
   }
 }
 
+function sortedUniquePositiveIntegers(value, description) {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.some((entry) => !Number.isSafeInteger(entry) || entry <= 0) ||
+    value.some((entry, index) => index > 0 && value[index - 1] >= entry)
+  ) {
+    throw new Error(description + ' must be a sorted list of unique positive integers')
+  }
+}
+
 export function parseChromiumMajor(version) {
   if (typeof version !== 'string' || version.trim() === '') {
     throw new Error('system browser CDP version must be a non-empty string')
@@ -96,44 +108,72 @@ export function parseChromiumMajor(version) {
 }
 
 function validateReviewedEvidence(value, target, policy, acceptedKinds, evidencePath) {
-  const evidence = record(value, 'reviewed runner evidence for ' + target)
-  exactKeys(
-    evidence,
-    ['source', 'imageVersion', 'browserVersions'],
-    'reviewed runner evidence for ' + target,
-  )
-  if (
-    typeof evidence.source !== 'string' ||
-    !/^https:\/\/github\.com\/actions\/runner-images\/blob\/[0-9a-f]{40}\//.test(evidence.source) ||
-    !evidence.source.endsWith(evidencePath)
-  ) {
-    throw new Error(
-      target + ' runner evidence must use its immutable official runner-images inventory',
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('reviewed runner evidence for ' + target + ' must be a non-empty array')
+  }
+  if (policy.mode === 'unavailable' && value.length !== 1) {
+    throw new Error(target + ' unavailable policy must have exactly one reviewed runner inventory')
+  }
+  const observedMajors = new Set()
+  for (const item of value) {
+    const evidence = record(item, 'reviewed runner evidence for ' + target)
+    exactKeys(
+      evidence,
+      ['source', 'imageVersion', 'browserVersions'],
+      'reviewed runner evidence for ' + target,
     )
-  }
-  if (typeof evidence.imageVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(evidence.imageVersion)) {
-    throw new Error(target + ' runner evidence imageVersion must be an exact hosted image version')
-  }
-  const versions = record(evidence.browserVersions, 'reviewed browser versions for ' + target)
-  for (const [kind, version] of Object.entries(versions)) {
-    if (!acceptedKinds.includes(kind)) {
-      throw new Error(target + ' runner evidence has unsupported browser kind ' + kind)
+    if (
+      typeof evidence.source !== 'string' ||
+      !/^https:\/\/github\.com\/actions\/runner-images\/blob\/[0-9a-f]{40}\//.test(evidence.source) ||
+      !evidence.source.endsWith(evidencePath)
+    ) {
+      throw new Error(
+        target + ' runner evidence must use its immutable official runner-images inventory',
+      )
     }
-    const major = parseChromiumMajor(version)
-    if (policy.mode === 'unavailable') {
-      throw new Error(target + ' unavailable evidence cannot list a browser version')
+    if (
+      typeof evidence.imageVersion !== 'string' ||
+      !/^\d+\.\d+\.\d+$/.test(evidence.imageVersion)
+    ) {
+      throw new Error(target + ' runner evidence imageVersion must be an exact hosted image version')
     }
-    if (major !== policy.major) {
-      throw new Error(target + ' reviewed browser version must match experimental major ' + policy.major)
+    const versions = record(evidence.browserVersions, 'reviewed browser versions for ' + target)
+    for (const [kind, version] of Object.entries(versions)) {
+      if (!acceptedKinds.includes(kind)) {
+        throw new Error(target + ' runner evidence has unsupported browser kind ' + kind)
+      }
+      const major = parseChromiumMajor(version)
+      if (policy.mode === 'unavailable') {
+        throw new Error(target + ' unavailable evidence cannot list a browser version')
+      }
+      const reviewedMajors = policy.mode === 'reviewed-major-smoke'
+        ? policy.majors
+        : [policy.major]
+      if (!reviewedMajors.includes(major)) {
+        throw new Error(
+          target + ' reviewed browser version must match experimental major policy ' +
+          reviewedMajors.join(', '),
+        )
+      }
+      observedMajors.add(major)
+    }
+    if (policy.mode === 'unavailable' && Object.keys(versions).length !== 0) {
+      throw new Error(target + ' unavailable evidence must have no browser versions')
+    }
+    if (policy.mode !== 'unavailable' && Object.keys(versions).length === 0) {
+      throw new Error(target + ' browser evidence must list at least one reviewed browser version')
     }
   }
-  if (policy.mode === 'unavailable' && Object.keys(versions).length !== 0) {
-    throw new Error(target + ' unavailable evidence must have no browser versions')
+  if (
+    policy.mode === 'reviewed-major-smoke' &&
+    (
+      observedMajors.size !== policy.majors.length ||
+      policy.majors.some((major) => !observedMajors.has(major))
+    )
+  ) {
+    throw new Error(target + ' reviewed runner evidence must cover every reviewed experimental major')
   }
-  if (policy.mode !== 'unavailable' && Object.keys(versions).length === 0) {
-    throw new Error(target + ' browser evidence must list at least one reviewed browser version')
-  }
-  return evidence
+  return value
 }
 
 export function validateSystemBrowserConformanceManifest(value) {
@@ -150,7 +190,7 @@ export function validateSystemBrowserConformanceManifest(value) {
     'targets',
   ], 'system browser conformance manifest')
   if (
-    manifest.schemaVersion !== 2 ||
+    manifest.schemaVersion !== 3 ||
     manifest.contract !== 'ADR-0020' ||
     manifest.scope !== 'ci-release-browser-evidence' ||
     manifest.versionSource !== 'cdp-browser-get-version' ||
@@ -158,7 +198,7 @@ export function validateSystemBrowserConformanceManifest(value) {
     manifest.browserBinaryPolicy !== 'system-only-no-download'
   ) {
     throw new Error(
-      'system browser conformance manifest must be ADR-0020 schema v2 with post-CDP, headless, system-only evidence',
+      'system browser conformance manifest must be ADR-0020 schema v3 with post-CDP, headless, system-only evidence',
     )
   }
   uniqueExactStrings(
@@ -200,6 +240,9 @@ export function validateSystemBrowserConformanceManifest(value) {
       if (typeof policy.reason !== 'string' || policy.reason.trim() === '') {
         throw new Error(target + ' unavailable policy must include a reason')
       }
+    } else if (policy.mode === 'reviewed-major-smoke') {
+      exactKeys(policy, ['mode', 'majors'], 'experimental browser policy for ' + target)
+      sortedUniquePositiveIntegers(policy.majors, target + ' reviewed experimental browser majors')
     } else {
       exactKeys(policy, ['mode', 'major'], 'experimental browser policy for ' + target)
       positiveInteger(policy.major, target + ' experimental browser major')
@@ -262,10 +305,13 @@ export function validateExperimentalBrowserIdentity({ manifest, target, identity
     ? identityFromResult(result)
     : record(identity, 'system browser identity')
   const kind = candidate.kind
+  const reviewedMajors = policy.mode === 'reviewed-major-smoke'
+    ? policy.majors
+    : [policy.major]
   if (!checkedManifest.acceptedKinds.includes(kind)) {
     throw new Error(
       target + ' requires ' + checkedManifest.acceptedKinds.join('/') + ' major ' +
-      policy.major + '; found ' + String(kind),
+      reviewedMajors.join(', ') + '; found ' + String(kind),
     )
   }
   if (candidate.headless !== checkedManifest.requiredHeadless) {
@@ -275,14 +321,20 @@ export function validateExperimentalBrowserIdentity({ manifest, target, identity
     )
   }
   const major = parseChromiumMajor(candidate.version)
-  if (major !== policy.major) {
+  if (!reviewedMajors.includes(major)) {
+    if (policy.mode === 'reviewed-major-smoke') {
+      throw new Error(
+        target + ' permits reviewed Chromium-family majors ' + reviewedMajors.join(', ') +
+        '; found ' + candidate.version,
+      )
+    }
     throw new Error(
       target + ' pins experimental Chromium-family major ' + policy.major +
       '; found ' + candidate.version,
     )
   }
   return {
-    schemaVersion: 'wake.browser.evidence.v1',
+    schemaVersion: 'wake.browser.evidence.v2',
     contract: checkedManifest.contract,
     target,
     runner: targetPolicy.runner,
@@ -290,7 +342,8 @@ export function validateExperimentalBrowserIdentity({ manifest, target, identity
     status: 'passed',
     stableConformance:
       policy.mode === 'exact-major-conformance' &&
-      policy.major === checkedManifest.stableReadiness.major,
+      reviewedMajors.length === 1 &&
+      reviewedMajors[0] === checkedManifest.stableReadiness.major,
     browser: {
       kind,
       version: candidate.version,
@@ -312,7 +365,7 @@ export function recordUnavailableBrowserEvidence({ manifest, target }) {
     throw new Error(target + ' is not reviewed as browser-unavailable')
   }
   return {
-    schemaVersion: 'wake.browser.evidence.v1',
+    schemaVersion: 'wake.browser.evidence.v2',
     contract: checkedManifest.contract,
     target,
     runner: targetPolicy.runner,
@@ -345,11 +398,15 @@ export function evaluateStableBrowserReadiness(value) {
         detail: 'experimental evidence mode is ' + policy.mode,
       })
     }
-    if (policy.major !== manifest.stableReadiness.major) {
+    const reviewedMajors = policy.mode === 'reviewed-major-smoke'
+      ? policy.majors
+      : [policy.major]
+    if (reviewedMajors.length !== 1 || reviewedMajors[0] !== manifest.stableReadiness.major) {
       blockers.push({
         target,
         code: 'major-mismatch',
-        detail: 'reviewed major ' + policy.major + ' does not match shared stable major ' +
+        detail: 'reviewed majors ' + reviewedMajors.join(', ') +
+          ' do not match shared stable major ' +
           manifest.stableReadiness.major,
       })
     }
