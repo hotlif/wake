@@ -49,7 +49,10 @@ use wake_graph::{
     ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
     collect_static_uses, compute_live_keep,
 };
-use wake_resolver::{ModuleIdentity, ResolutionProfile, ResolveOptions, ResolvedModule, Resolver};
+use wake_resolver::{
+    ModuleIdentity, ResolutionEnvironment, ResolutionProfile, ResolveOptions, ResolvedModule,
+    Resolver,
+};
 use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, global_executor, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -335,6 +338,7 @@ impl std::hash::Hash for ParsedModule {
 /// 增量 + 并行打包器。持有引擎、工作窃取执行器与跨构建保留的输入 cell 表。
 pub struct IncrementalBundler {
     fs: Arc<dyn FileSystem>,
+    resolution_environment: Arc<ResolutionEnvironment>,
     interner: Arc<Interner>,
     engine: Arc<Engine>,
     exec: Arc<Executor>,
@@ -512,13 +516,15 @@ impl IncrementalBundler {
         ]);
         let define_hash = hash_define(&default_define);
         let default_target = TargetEnv::default();
+        let resolution_environment = Arc::new(ResolutionEnvironment::new(fs));
         IncrementalBundler {
-            resolver: Arc::new(Resolver::new(fs.clone())),
+            resolver: resolution_environment.resolver(),
             resolve_options: ResolveOptions::default(),
             platform: BuildPlatform::Browser,
             module_format: ModuleFormat::Iife,
             external_packages: Arc::from(Vec::<String>::new()),
-            fs,
+            fs: resolution_environment.file_system(),
+            resolution_environment,
             interner: Arc::new(Interner::new()),
             engine: Arc::new(Engine::new()),
             exec: global_executor(),
@@ -624,31 +630,14 @@ impl IncrementalBundler {
         self.topology_invalidated.store(true, Ordering::Release);
     }
 
-    /// 若入口所在项目根（含祖先）存在 `.pnp.cjs`，启用 Yarn PnP：
-    /// 用 [`PnpFileSystem`](wake_resolver::PnpFileSystem) 包裹文件系统（虚拟路径 + zip 内读取），
-    /// 并把解析器切到 PnP 依赖图模式。返回是否检测到并启用 PnP。
+    /// 若入口所在项目根（含祖先）存在 `.pnp.cjs`，由统一解析环境启用 Yarn PnP。
     ///
     /// 幂等 + 惰性：`build()` 首次调用会自动触发；显式调用可提前决定日志/行为。
     pub fn enable_pnp(&mut self, start_dir: &Path) -> bool {
         if let Some(detected) = self.pnp_detected {
             return detected;
         }
-        let enabled = match wake_resolver::PnpManifest::discover(self.fs.as_ref(), start_dir) {
-            Some(manifest) => {
-                let manifest = Arc::new(manifest);
-                let wrapped: Arc<dyn FileSystem> =
-                    Arc::new(wake_resolver::PnpFileSystem::new(self.fs.clone()));
-                self.fs = wrapped.clone();
-                // 带上已配置的别名，否则切 PnP 后会退回默认丢掉 @/@@/@@@。
-                self.resolver = Arc::new(Resolver::with_pnp_options(
-                    wrapped,
-                    manifest,
-                    self.resolve_options.clone(),
-                ));
-                true
-            }
-            None => false,
-        };
+        let enabled = self.resolution_environment.has_pnp_root(start_dir);
         self.pnp_detected = Some(enabled);
         enabled
     }
@@ -657,7 +646,13 @@ impl IncrementalBundler {
     /// 重建解析器；跨构建保留选项，供 PnP 检测切换解析器时复用（不丢别名）。
     /// 保持既定行为 `resolve.alias`（WAKE-COMPATIBILITY §M1/§H）。
     pub fn set_resolve_options(&mut self, options: ResolveOptions) -> &mut Self {
-        self.resolver = Arc::new(Resolver::with_options(self.fs.clone(), options.clone()));
+        self.resolution_environment = Arc::new(ResolutionEnvironment::with_options(
+            self.resolution_environment.base_file_system(),
+            options.clone(),
+        ));
+        self.fs = self.resolution_environment.file_system();
+        self.resolver = self.resolution_environment.resolver();
+        self.pnp_detected = None;
         self.resolve_options = options;
         self
     }
@@ -1017,7 +1012,7 @@ impl IncrementalBundler {
     /// 通知文件系统 generation 已变化。内容 cell 会在下一次扫描时按文本精确更新；
     /// resolver 的成功/失败路径缓存必须立即清空，以识别新增、删除和重命名文件。
     pub fn invalidate_filesystem(&self) {
-        self.resolver.clear_cache();
+        self.resolution_environment.invalidate_all();
         self.load_cache.lock().unwrap().clear();
         self.topology_invalidated.store(true, Ordering::Release);
     }
@@ -1035,6 +1030,7 @@ impl IncrementalBundler {
                         "package.json"
                             | "wake.toml"
                             | ".pnp.cjs"
+                            | ".pnp.data.json"
                             | "yarn.lock"
                             | "package-lock.json"
                             | "pnpm-lock.yaml"
@@ -1071,7 +1067,8 @@ impl IncrementalBundler {
                         .is_some_and(|e| e.eq_ignore_ascii_case("css")))
         });
         if structural || resolution_metadata_changed {
-            self.resolver.clear_cache();
+            self.resolution_environment
+                .invalidate_paths(normalized.iter().map(PathBuf::as_path));
             self.topology_invalidated.store(true, Ordering::Release);
         }
     }

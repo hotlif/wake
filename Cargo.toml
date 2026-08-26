@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.22"
+version = "0.1.23"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hotlif/wake"
@@ -47,6 +47,8 @@ tempfile = "3.27.0"
 toml = "1.1.4"
 # 组件扫描 include/exclude 正则（仅 wake_scan 使用，CLI 侧，非编译核心）。
 regex = "1"
+fancy-regex = "0.19.0"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # MDX syntax trees stay in the docs edge layer; Wake still compiles JavaScript/TSX.
 markdown = "1.0.0"
 # Browserslist 查询只在配置边缘层使用；编译核心只接收已规范化目标。

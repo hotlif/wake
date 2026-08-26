@@ -65,9 +65,6 @@ function run(command, args, options = {}) {
 }
 
 function runNpm(args, options = {}) {
-  if (process.env.npm_execpath) {
-    return run(process.execPath, [process.env.npm_execpath, ...args], options)
-  }
   return run(process.platform === 'win32' ? 'npm.cmd' : 'npm', args, {
     ...options,
     shell: process.platform === 'win32',

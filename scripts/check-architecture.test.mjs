@@ -10,7 +10,7 @@ import {
   validateCargoManifestSources,
   validateCargoProvenance,
   validateCargoTreeRules,
-  validateNpmProvenance,
+  validateYarnProvenance,
   validatePolicy,
   validateRepositorySources,
 } from './check-architecture.mjs'
@@ -21,7 +21,8 @@ const activeAdrRecords = new Map([
   ['0003-compiler-and-shell-boundaries.md', { status: 'proposed' }],
   ['0010-shared-css-syntax-tree.md', { status: 'accepted' }],
   ['0020-react-browser-test-runtime.md', { status: 'proposed' }],
-  ['0021-local-platform-package-links.md', { status: 'accepted' }],
+  ['0021-local-platform-package-links.md', { status: 'superseded' }],
+  ['0022-yarn-pnp-ownership.md', { status: 'accepted' }],
 ])
 
 const publicTestContractFiles = [
@@ -118,7 +119,7 @@ test('embedded V8 conformance uses one immutable selected Test262 ES2024 manifes
   assert.match(runner, /'--locked'/)
   assert.match(runner, /'--offline'/)
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
-  assert.match(ci, /npm run test262:es2024/)
+  assert.match(ci, /corepack yarn test262:es2024/)
   assert.match(ci, /prepare-rusty-v8\.mjs --target x86_64-unknown-linux-gnu/)
   assert.match(ci, /browser-conformance:/)
   for (const platform of [
@@ -233,13 +234,13 @@ test('architecture CI fetches the complete lock graph before its offline target-
   assert.notEqual(end, -1)
   const job = ci.slice(start, end)
   const markers = [
-    'npm ci --ignore-scripts',
+    'corepack yarn install --immutable --check-cache',
     'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
     'cargo build -p wake_test_host -p wake_cli --locked --offline',
-    'npm run release:check',
+    'corepack yarn release:check',
     './target/debug/wake test scripts/check-architecture.test.mjs --serial',
-    'npm run architecture:check',
+    'corepack yarn architecture:check',
   ]
   let previous = -1
   for (const marker of markers) {
@@ -265,11 +266,11 @@ test('Node CI stages the complete local platform package before testing and pack
   const markers = [
     'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc',
-    'npm run native:build',
+    'corepack yarn native:build',
     'git diff --exit-code -- Cargo.lock',
     'node scripts/stage-test-host.mjs --package-dir npm/wake-win32-x64-msvc',
-    'npm run npm:test:wake',
-    'npm run npm:pack:check',
+    'corepack yarn npm:test:wake',
+    'corepack yarn npm:pack:check',
   ]
   let previous = -1
   for (const marker of markers) {
@@ -279,6 +280,53 @@ test('Node CI stages the complete local platform package before testing and pack
   }
   assert.doesNotMatch(nodeJob, /cargo fetch --locked --target/)
   assert.doesNotMatch(nodeJob, /Copy-Item .*\.node/)
+})
+
+test('npm consumers are built from local tarballs and tested outside the PnP source tree', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const release = readFileSync(
+    new URL('../.github/workflows/release-npm.yml', import.meta.url),
+    'utf8',
+  )
+  const consumer = readFileSync(new URL('./check-npm-consumer.mjs', import.meta.url), 'utf8')
+  const artifactStart = ci.search(/\r?\n  npm-package-artifacts:\r?\n/)
+  const consumerStart = ci.search(/\r?\n  npm-consumer:\r?\n/)
+  const consumerEnd = ci.search(/\r?\n  architecture:\r?\n/)
+  assert.notEqual(artifactStart, -1)
+  assert(consumerStart > artifactStart)
+  assert(consumerEnd > consumerStart)
+  const artifactJob = ci.slice(artifactStart, consumerStart)
+  const consumerJob = ci.slice(consumerStart, consumerEnd)
+
+  for (const marker of [
+    'platform: win32-x64-msvc',
+    'platform: linux-x64-gnu',
+    'corepack yarn install --immutable --check-cache',
+    'corepack yarn native:build',
+    'npm pack ./npm/wake --ignore-scripts --pack-destination artifacts',
+    'npm pack ./npm/css --ignore-scripts --pack-destination artifacts',
+    'npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts',
+  ]) assert.match(artifactJob, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+
+  assert.match(consumerJob, /needs: npm-package-artifacts/)
+  assert.match(consumerJob, /node: '22\.14\.0'/)
+  assert.match(consumerJob, /node: '26'/)
+  assert.match(consumerJob, /node scripts\/check-npm-consumer\.mjs/)
+  assert.match(consumerJob, /WAKE_NPM_PROJECT: \$\{\{ runner\.temp \}\}\/wake-npm-consumer/)
+  assert.doesNotMatch(consumerJob, /corepack|yarn install|cargo |npm pack|WAKE_NATIVE_PATH/)
+
+  assert.match(consumer, /\['install', '--package-lock-only'/)
+  assert.match(consumer, /\['ci', \.\.\.installArguments\]/)
+  assert.match(consumer, /assertNoPnpAncestor\(project\)/)
+  assert.match(consumer, /WAKE_NPM_WORKSPACE_CLASSIC/)
+  assert.match(consumer, /node_modules\/wake-npm-consumer-shared/)
+
+  const prepublishStart = release.search(/\r?\n  prepublish-smoke:\r?\n/)
+  const publishStart = release.search(/\r?\n  publish:\r?\n/)
+  const prepublish = release.slice(prepublishStart, publishStart)
+  assert.match(prepublish, /WAKE_NPM_PROJECT: \$\{\{ runner\.temp \}\}\/wake-npm-consumer/)
+  assert.match(prepublish, /node scripts\/check-npm-consumer\.mjs/)
+  assert.doesNotMatch(prepublish, /--package-lock=false|mkdir local-smoke|cd local-smoke/)
 })
 
 test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host', () => {
@@ -303,7 +351,7 @@ test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host
   )
   assert.equal(
     manifest.scripts.check,
-    'npm run compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs',
+    'yarn compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs',
   )
   assert.deepEqual(
     architecturePolicy.dependencyProvenance.networkFreeBuild.offlineCargoBuildFiles,
@@ -323,13 +371,12 @@ test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host
   assert(verifyEnd > verifyStart)
   const verify = workflow.slice(verifyStart, verifyEnd)
   const markers = [
-    'npm ci --ignore-scripts',
-    'npm ci --ignore-scripts --prefix editors/vscode-css',
+    'corepack yarn install --immutable --check-cache',
     'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
     'cargo build --release -p wake_test_host -p wake_cli --locked --offline',
-    'npm run release:check',
-    'npm run vscode:css:check',
+    'corepack yarn release:check',
+    'corepack yarn vscode:css:check',
     'WAKE_BIN: ${{ github.workspace }}/target/release/wake',
   ]
   let previous = -1
@@ -397,11 +444,12 @@ function policy(overrides = {}) {
         allowedRegistrySources: ['registry+https://github.com/rust-lang/crates.io-index'],
         pathDependencies: 'workspace-members-only',
       },
-      npm: {
-        decision: 'engineering/decisions/0021-local-platform-package-links.md',
-        allowedRegistryOrigins: ['https://registry.npmjs.org/'],
-        workspaceLinks: 'declared-workspaces-only',
-        internalOptionalPackages: {
+      yarn: {
+        decision: 'engineering/decisions/0022-yarn-pnp-ownership.md',
+        packageManager: 'yarn@4.16.0',
+        allowedResolutionProtocols: ['npm:', 'workspace:', 'patch:'],
+        workspaceLocators: 'declared-workspaces-only',
+        internalWorkspacePackages: {
           '@crab-dev/wake-win32-x64-msvc': 'npm/wake-win32-x64-msvc',
         },
       },
@@ -703,148 +751,119 @@ test('Cargo provenance rejects external paths, git sources, missing checksums, a
   assert(manifestErrors.some((error) => error.includes('cargo-source')))
 })
 
-function npmFixture() {
+function yarnFixture() {
+  const checksum = `10c0/${'a'.repeat(128)}`
+  const platformName = '@crab-dev/wake-win32-x64-msvc'
+  const platformPath = 'npm/wake-win32-x64-msvc'
   return {
     rootManifest: {
       name: 'wake-workspace',
       version: '0.1.0',
-      workspaces: ['npm/wake'],
+      packageManager: 'yarn@4.16.0',
+      workspaces: ['npm/*'],
       dependencies: { react: '19.2.8', other: '^1.0.0' },
     },
-    workspaceManifests: new Map([['npm/wake', {
-      name: '@crab-dev/wake',
+    workspaceManifests: new Map([
+      ['npm/wake', {
+        name: '@crab-dev/wake',
+        version: '0.1.0',
+        peerDependencies: { react: '>=19.2.0 <20' },
+        optionalDependencies: { [platformName]: '0.1.0' },
+      }],
+      [platformPath, {
+        name: platformName,
+        version: '0.1.0',
+        os: ['win32'],
+        cpu: ['x64'],
+      }],
+    ]),
+    internalManifests: new Map([[platformPath, {
+      name: platformName,
       version: '0.1.0',
-      peerDependencies: { react: '>=19.2.0 <20' },
+      os: ['win32'],
+      cpu: ['x64'],
     }]]),
     lock: {
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        '': { name: 'wake-workspace', version: '0.1.0' },
-        'npm/wake': { name: '@crab-dev/wake', version: '0.1.0' },
-        'node_modules/@crab-dev/wake': { resolved: 'npm/wake', link: true },
-        'node_modules/react': {
-          version: '19.2.8',
-          resolved: 'https://registry.npmjs.org/react/-/react-19.2.8.tgz',
-          integrity: npmIntegrity,
-        },
-        'node_modules/other': {
-          version: '1.2.3',
-          resolved: 'https://registry.npmjs.org/other/-/other-1.2.3.tgz',
-          integrity: npmIntegrity,
-        },
+      __metadata: { version: '10', cacheKey: '10c0' },
+      '@crab-dev/wake@workspace:npm/wake': {
+        version: '0.0.0-use.local',
+        resolution: '@crab-dev/wake@workspace:npm/wake',
+        linkType: 'soft',
+      },
+      [`${platformName}@workspace:${platformPath}`]: {
+        version: '0.0.0-use.local',
+        resolution: `${platformName}@workspace:${platformPath}`,
+        linkType: 'soft',
+      },
+      'react@npm:19.2.8': {
+        version: '19.2.8',
+        resolution: 'react@npm:19.2.8',
+        checksum,
+      },
+      'other@npm:^1.0.0': {
+        version: '1.2.3',
+        resolution: 'other@npm:1.2.3',
+        checksum,
       },
     },
     policy: {
-      lockfileVersion: 3,
-      allowedRegistryOrigins: ['https://registry.npmjs.org/'],
+      lockfileVersion: 10,
+      packageManager: 'yarn@4.16.0',
+      allowedResolutionProtocols: ['npm:', 'workspace:', 'patch:'],
+      internalWorkspacePackages: { [platformName]: platformPath },
       exactPackages: { react: '19.2.8' },
     },
   }
 }
 
-function npmInternalOptionalFixture() {
-  const fixture = npmFixture()
-  const name = '@crab-dev/wake-win32-x64-msvc'
-  const manifestPath = 'npm/wake-win32-x64-msvc'
-  fixture.rootManifest.optionalDependencies = {
-    [name]: `file:${manifestPath}`,
-  }
-  fixture.workspaceManifests.get('npm/wake').optionalDependencies = {
-    [name]: '0.1.0',
-  }
-  fixture.internalManifests = new Map([[manifestPath, {
-    name,
-    version: '0.1.0',
-    os: ['win32'],
-    cpu: ['x64'],
-  }]])
-  fixture.policy.internalOptionalPackages = { [name]: manifestPath }
-  fixture.lock.packages[`node_modules/${name}`] = {
-    resolved: manifestPath,
-    link: true,
-  }
-  fixture.lock.packages[manifestPath] = {
-    name,
-    version: '0.1.0',
-    optional: true,
-    os: ['win32'],
-    cpu: ['x64'],
-  }
-  return fixture
-}
-
-test('npm provenance allows manifest ranges while the lock owns exact registry artifacts', () => {
-  assert.deepEqual(validateNpmProvenance(npmFixture()), [])
+test('Yarn provenance allows manifest ranges while the lock owns exact npm artifacts', () => {
+  assert.deepEqual(validateYarnProvenance(yarnFixture()), [])
 })
 
-test('npm provenance owns internal optional packages through root-local links', () => {
-  assert.deepEqual(validateNpmProvenance(npmInternalOptionalFixture()), [])
-
-  const mismatchedPin = npmInternalOptionalFixture()
+test('Yarn provenance owns platform packages through workspace locators', () => {
+  const mismatchedPin = yarnFixture()
   mismatchedPin.workspaceManifests.get('npm/wake').optionalDependencies[
     '@crab-dev/wake-win32-x64-msvc'
   ] = '0.1.1'
-  assert(validateNpmProvenance(mismatchedPin).some((error) => error.includes('must equal internal')))
+  assert(validateYarnProvenance(mismatchedPin).some((error) => error.includes('must equal internal')))
 
-  const wrongRootLocator = npmInternalOptionalFixture()
-  wrongRootLocator.rootManifest.optionalDependencies[
+  const retiredRootBridge = yarnFixture()
+  retiredRootBridge.rootManifest.optionalDependencies = {}
+  retiredRootBridge.rootManifest.optionalDependencies[
     '@crab-dev/wake-win32-x64-msvc'
-  ] = '0.1.0'
-  assert(validateNpmProvenance(wrongRootLocator)
-    .some((error) => error.includes('must equal file:npm/wake-win32-x64-msvc')))
+  ] = 'file:npm/wake-win32-x64-msvc'
+  assert(validateYarnProvenance(retiredRootBridge)
+    .some((error) => error.includes('retired file: bridge')))
 
-  const registryBacked = npmInternalOptionalFixture()
-  registryBacked.lock.packages['node_modules/@crab-dev/wake-win32-x64-msvc'] = {
-    version: '0.1.0',
-    resolved: 'https://registry.npmjs.org/@crab-dev/wake-win32-x64-msvc/-/wake-win32-x64-msvc-0.1.0.tgz',
-    integrity: npmIntegrity,
-    optional: true,
-  }
-  assert(validateNpmProvenance(registryBacked)
-    .some((error) => error.includes('must link to npm/wake-win32-x64-msvc')))
-
-  const legacyPlaceholder = npmInternalOptionalFixture()
-  legacyPlaceholder.lock.packages[
-    'npm/wake/node_modules/@crab-dev/wake-win32-x64-msvc'
-  ] = { optional: true }
-  assert(validateNpmProvenance(legacyPlaceholder)
-    .some((error) => error.includes('must have an exact SemVer version; found missing')))
-
-  const mismatchedLocalLock = npmInternalOptionalFixture()
-  mismatchedLocalLock.lock.packages['npm/wake-win32-x64-msvc'].version = '0.1.1'
-  assert(validateNpmProvenance(mismatchedLocalLock)
-    .some((error) => error.includes('must match optional')))
-
-  const missingManifest = npmInternalOptionalFixture()
+  const missingManifest = yarnFixture()
   missingManifest.internalManifests.clear()
-  assert(validateNpmProvenance(missingManifest).some((error) => error.includes('must define')))
+  assert(validateYarnProvenance(missingManifest).some((error) => error.includes('must define')))
 })
 
-test('npm provenance rejects non-registry locators, corrupt locks, and false workspace links', () => {
-  const invalidLocator = npmFixture()
+test('Yarn provenance rejects non-registry locators, corrupt locks, and false workspace locators', () => {
+  const invalidLocator = yarnFixture()
   invalidLocator.rootManifest.dependencies.other = 'file:../other'
-  assert(validateNpmProvenance(invalidLocator).some((error) => error.includes('npm-source')))
+  assert(validateYarnProvenance(invalidLocator).some((error) => error.includes('yarn-source')))
 
-  const badResolved = npmFixture()
-  badResolved.lock.packages['node_modules/react'].resolved = 'https://example.invalid/react.tgz'
-  assert(validateNpmProvenance(badResolved).some((error) => error.includes('canonical npm registry tarball')))
+  const badResolved = yarnFixture()
+  badResolved.lock['react@npm:19.2.8'].resolution = 'react@git:https://example.invalid/react'
+  assert(validateYarnProvenance(badResolved).some((error) => error.includes('yarn-resolution')))
 
-  const badIntegrity = npmFixture()
-  badIntegrity.lock.packages['node_modules/react'].integrity = 'sha1-deadbeef'
-  assert(validateNpmProvenance(badIntegrity).some((error) => error.includes('SHA-512 integrity')))
+  const badChecksum = yarnFixture()
+  badChecksum.lock['react@npm:19.2.8'].checksum = 'sha1-deadbeef'
+  assert(validateYarnProvenance(badChecksum).some((error) => error.includes('yarn-checksum')))
 
-  const rangedLock = npmFixture()
-  rangedLock.lock.packages['node_modules/react'].version = '^19.2.8'
-  assert(validateNpmProvenance(rangedLock).some((error) => error.includes('exact SemVer')))
+  const rangedLock = yarnFixture()
+  rangedLock.lock['react@npm:19.2.8'].version = '^19.2.8'
+  assert(validateYarnProvenance(rangedLock).some((error) => error.includes('exact SemVer')))
 
-  const falseLink = npmFixture()
-  falseLink.lock.packages['node_modules/@crab-dev/wake'].resolved = '../outside'
-  assert(validateNpmProvenance(falseLink).some((error) => error.includes('npm-link')))
+  const falseLocator = yarnFixture()
+  falseLocator.lock['@crab-dev/wake@workspace:npm/wake'].linkType = 'hard'
+  assert(validateYarnProvenance(falseLocator).some((error) => error.includes('yarn-workspace')))
 
-  const missingExactPin = npmFixture()
+  const missingExactPin = yarnFixture()
   missingExactPin.rootManifest.dependencies.react = '^19.2.8'
-  assert(validateNpmProvenance(missingExactPin).some((error) => error.includes('npm-pin')))
+  assert(validateYarnProvenance(missingExactPin).some((error) => error.includes('yarn-pin')))
 })
 
 test('repository provenance rejects vendor trees, checked-in binaries, and networked build hooks', () => {

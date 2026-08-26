@@ -1,6 +1,6 @@
 # Wake 测试与质量门禁
 
-本文描述 v0.1.22 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `npm run native:build`。
+本文描述 v0.1.23 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `corepack yarn native:build`。
 
 # 1. 本地最小门禁
 
@@ -15,28 +15,36 @@ cargo test --workspace
 架构或 crate 依赖修改：
 
 ```bash
-npm run architecture:test
-npm run architecture:check
+corepack yarn architecture:test
+corepack yarn architecture:check
 ```
 
 `architecture:check` 还执行 [architecture-boundaries.json](architecture-boundaries.json) 的依赖
 来源合同：tracked tree 不得包含第三方 source/binary vendor；workspace 外 Rust path dependency、
-非 crates.io lock source 或缺失 checksum 会失败；npm lock 的外部 entry 必须来自 npm registry 且
-带 SHA-512 integrity，声明为 conformance source 的少数 npm 包还必须精确 pin。Cargo build 与 npm
+非 crates.io lock source 或缺失 checksum 会失败；Yarn lock 的外部 locator 必须来自 npm registry、
+带 canonical checksum，声明为 conformance source 的少数 npm 包还必须精确 pin。Cargo build 与 npm
 lifecycle 下载被禁止，依赖和 Rusty V8 归档只能在独立、校验 checksum 的准备步骤获取。
 
-Node/npm 修改：
+JavaScript/Yarn PnP 修改：
 
 ```bash
-npm ci --ignore-scripts
-npm run versions:check
-npm run native:build
-npm run npm:test
-npm run npm:typecheck
-npm run typescript:7:check
-npm run npm:pack:check
-npm run pnp:components:check
+corepack yarn install --immutable --check-cache
+corepack yarn yarn:lock:check
+corepack yarn pnp:conformance:check
+corepack yarn versions:check
+corepack yarn native:build
+corepack yarn npm:test
+corepack yarn npm:typecheck
+corepack yarn typescript:7:check
+corepack yarn npm:pack:check
+corepack yarn pnp:components:check
 ```
+
+npm 经典解析或发布消费修改还必须运行聚焦 resolver/watch 测试，并用本轮主包、CSS 包和 matching
+平台包 tarball 调用 `scripts/check-npm-consumer.mjs`。该脚本强制在源码仓库外创建 npm workspace，
+先执行 `npm install --package-lock-only`，确认尚无安装树，再执行 `npm ci --ignore-scripts`，最后验证
+CLI、CommonJS/ESM Node API、build、workspace link、CSS 与 Wake Test；项目任一祖先存在 `.pnp.cjs`
+都会失败，防止把 npm 门禁误测成 PnP。
 
 JavaScript 测试统一显式导入 `@crab-dev/wake/test`，由 `wake test` 执行；不得新增
 `node:test`、Jest/Deno runner 或调用官方 Node/Deno 的产品回退路径。测试 API 采用熟悉的
@@ -45,12 +53,12 @@ JavaScript 测试统一显式导入 `@crab-dev/wake/test`，由 `wake test` 执�
 
 ```bash
 cargo test -p wake_ecma_vm -p wake_js_runtime -p wake_test_browser -p wake_test -p wake_test_host
-npm run test262:es2024
+corepack yarn test262:es2024
 wake test scripts/check-architecture.test.mjs
 wake test npm/wake/test
 ```
 
-唯一保留的 Node runner 边界是 `npm run npm:test:wake:addon`。它加载真实 `.node` 绑定、验证
+唯一保留的 Node runner 边界是 `corepack yarn npm:test:wake:addon`。它加载真实 `.node` 绑定、验证
 Node `vm` 跨 realm 的公开包值语义，并覆盖
 Node Worker、socket 与 cleanup-hook 生命周期，不能由 Wake 自身的测试 realm 证明；它不执行
 Wake Test 语义，也不是产品运行时的回退路径。普通 JavaScript、CLI 和包测试不得加入该例外。
@@ -78,8 +86,8 @@ PnP 门禁通过根工作区精确锁定的 `corepack@0.34.6` 启动 Yarn，避�
 文档修改：
 
 ```bash
-npm run docs:check
-npm run docs:build
+corepack yarn docs:check
+corepack yarn docs:build
 cargo test -p wake_docs
 ```
 
@@ -88,15 +96,14 @@ cargo test -p wake_docs
 Crab CSS 编辑器修改：
 
 ```bash
-npm ci --ignore-scripts
-npm ci --ignore-scripts --prefix editors/vscode-css
+corepack yarn install --immutable --check-cache
 HOST_TARGET=x86_64-unknown-linux-gnu # 替换为本机受支持的 Rust target
 cargo fetch --locked
 node scripts/prepare-rusty-v8.mjs --target "$HOST_TARGET"
 # 将上一条命令打印的已校验归档绝对路径传入正式离线构建。
 RUSTY_V8_ARCHIVE=/absolute/path/to/verified/archive \
   cargo build --release -p wake_test_host -p wake_cli --locked --offline
-WAKE_BIN="$PWD/target/release/wake" npm run vscode:css:check
+WAKE_BIN="$PWD/target/release/wake" corepack yarn vscode:css:check
 cargo test -p wake_css_language -p wake_css_lsp --locked --offline
 ```
 
@@ -133,12 +140,15 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 | `bench-smoke` | Ubuntu / Rust 1.95 | 全 benchmark 可编译 |
 | `css` | Ubuntu / Rust 1.95 + Node 24 | 用本轮构建的 Wake CLI/host 跑 CSS runtime，并单独跑 Node realm 门禁 |
 | `node` | Windows / Node 24、26 | 原生绑定、API、类型、启动与 npm pack；Node 24 另跑 Yarn 4.16 PnP Components 门禁 |
+| `npm-package-artifacts` | Windows、Linux x64 / Node 24 | 从 Yarn PnP 源码安装构建 matching 主包、CSS 与平台 tarball |
+| `npm-consumer` | Windows、Linux x64 / Node 22.14、26 | 在仓库外生成 npm lock、执行全新 `npm ci` 并验证经典解析与发布包运行 |
 | `docs` | Ubuntu / Rust 1.95 + Node 24 | 文档链接检查和生产构建 |
 | `vscode-css` | Windows、macOS x64/arm64、manylinux glibc 2.28 x64/arm64 | 语言核心、Extension Host、五个平台 VSIX 和归档白名单 |
 
-Node 包声明支持 `>=22.14 <27`，常规 CI 目前只覆盖 24 与 26；补齐最低版本覆盖列入路线图。
-所有需要内嵌 V8 或 fast DOM 的 CI job 先以 `npm ci` 和 `cargo fetch --locked` 准备
-registry 依赖，再单独校验目标 Rusty V8 archive；随后的 Cargo test、clippy、bench 和 build
+Node 包声明支持 `>=22.14 <27`；源码 Node API job 覆盖 24 与 26，npm consumer job 额外覆盖最低
+22.14 与最高 26 端点。
+所有需要内嵌 V8 或 fast DOM 的 CI job 先以 `yarn install --immutable --check-cache` 和
+`cargo fetch --locked` 准备 registry 依赖，再单独校验目标 Rusty V8 archive；随后的 Cargo test、clippy、bench 和 build
 使用 `--locked --offline`，不会在正式构建阶段联网或从仓库 vendor 第三方源码。
 architecture job 的 all-target Cargo tree 与所有随后执行 NAPI CLI build 的 job 必须先 fetch 完整
 lock graph，不能使用 target-scoped fetch；Rusty V8 archive 校验仍必须保持 target-specific。NAPI
@@ -259,8 +269,8 @@ cargo bench --workspace --no-run
    script 或该归档；
 4. 在 Windows 原生发布 leg 中把主包和五个平台包打成本地 tarball，以 Yarn 4.16 PnP 构建 Components fixture，并检查 internal runtime、Lucide 运行时导出、hashed CSS link 和 18 个组件前缀；
 5. 发布前在五个目标平台和 Node 22.14/24/26 的 15 个组合中，以本次构建的主包、CSS 包和 matching
-   platform package 本地 tarball 执行 `--ignore-scripts` clean install；外部已发布依赖可以来自 registry，
-   但三个待发布包必须保持可验证的 `file:` 来源。每个组合执行 `wake test`、`runTests()` 和长期
+   platform package 本地 tarball 先生成 lock、再执行 `npm ci --ignore-scripts`；外部已发布依赖可以来自 registry，
+   但三个待发布包必须保持可验证的 `file:` 来源，消费项目必须位于源码 PnP 根之外。每个组合执行 `wake test`、`runTests()` 和长期
    `TestContext` lifecycle。Node 24 在 Windows/Linux x64 上以系统 Chrome、Edge 或 Chromium 的
    reviewed major 151 执行 blocking conformance，在 macOS x64 上以 reviewed major 150 或 151、macOS arm64
    上以 reviewed major 150 执行

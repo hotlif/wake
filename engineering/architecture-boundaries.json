@@ -2,7 +2,7 @@
   "schemaVersion": 3,
   "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
   "dependencyProvenance": {
-    "decision": "engineering/decisions/0020-react-browser-test-runtime.md",
+    "decision": "engineering/decisions/0022-yarn-pnp-ownership.md",
     "forbiddenTrackedPaths": [
       "vendor/**",
       "crates/**/vendor/**"
@@ -36,17 +36,20 @@
         "deno_core": ["wake_ecma_vm"]
       }
     },
-    "npm": {
-      "decision": "engineering/decisions/0021-local-platform-package-links.md",
+    "yarn": {
+      "decision": "engineering/decisions/0022-yarn-pnp-ownership.md",
       "manifest": "package.json",
-      "lockfile": "package-lock.json",
-      "lockfileVersion": 3,
-      "allowedRegistryOrigins": [
-        "https://registry.npmjs.org/"
+      "lockfile": "yarn.lock",
+      "lockfileVersion": 10,
+      "packageManager": "yarn@4.16.0",
+      "allowedResolutionProtocols": [
+        "npm:",
+        "workspace:",
+        "patch:"
       ],
-      "registryIntegrity": "sha512",
-      "workspaceLinks": "declared-workspaces-only",
-      "internalOptionalPackages": {
+      "registryChecksum": "10c0/sha512",
+      "workspaceLocators": "declared-workspaces-only",
+      "internalWorkspacePackages": {
         "@crab-dev/wake-darwin-arm64": "npm/wake-darwin-arm64",
         "@crab-dev/wake-darwin-x64": "npm/wake-darwin-x64",
         "@crab-dev/wake-linux-arm64-gnu": "npm/wake-linux-arm64-gnu",
@@ -55,6 +58,10 @@
       },
       "exactPackages": {
         "happy-dom": "20.11.6",
+        "entities": "7.0.1",
+        "whatwg-mimetype": "3.0.0",
+        "buffer-image-size": "0.6.4",
+        "ws": "8.21.3",
         "react": "19.2.8",
         "react-dom": "19.2.8",
         "@testing-library/react": "16.3.2",

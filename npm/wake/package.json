@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/wake",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Wake native web build tools for Node.js",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -38,9 +38,7 @@
     },
     "./package.json": "./package.json"
   },
-  "bin": {
-    "wake": "./bin/wake.mjs"
-  },
+  "bin": "./bin/wake.mjs",
   "napi": {
     "binaryName": "wake"
   },
@@ -66,7 +64,7 @@
     "node": ">=22.14 <27"
   },
   "dependencies": {
-    "@crab-dev/css": "0.1.22",
+    "@crab-dev/css": "0.1.23",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-dialog": "^0.0.2",
@@ -90,12 +88,18 @@
     "react": ">=19.2.8 <19.3.0",
     "react-dom": ">=19.2.8 <19.3.0"
   },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
   "optionalDependencies": {
-    "@crab-dev/wake-darwin-arm64": "0.1.22",
-    "@crab-dev/wake-darwin-x64": "0.1.22",
-    "@crab-dev/wake-linux-arm64-gnu": "0.1.22",
-    "@crab-dev/wake-linux-x64-gnu": "0.1.22",
-    "@crab-dev/wake-win32-x64-msvc": "0.1.22"
+    "@crab-dev/wake-darwin-arm64": "0.1.23",
+    "@crab-dev/wake-darwin-x64": "0.1.23",
+    "@crab-dev/wake-linux-arm64-gnu": "0.1.23",
+    "@crab-dev/wake-linux-x64-gnu": "0.1.23",
+    "@crab-dev/wake-win32-x64-msvc": "0.1.23"
   },
   "publishConfig": {
     "access": "public",

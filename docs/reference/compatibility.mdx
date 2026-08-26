@@ -19,6 +19,15 @@ status = "stable"
 
 Wake npm 主包按当前平台加载对应原生包。缺少平台产物时抛出 `WAKE_UNSUPPORTED_PLATFORM`。
 
+## 依赖安装布局
+
+Wake 同时支持 npm 生成的经典 `node_modules` 与 Yarn 4 Plug'n'Play。没有 `.pnp.cjs` 时，Wake 按
+Node 规则逐级查找 `node_modules`，包括 npm workspace 链接、嵌套依赖、作用域包和条件 exports；
+`package-lock.json` 变化会使 watch 模块图失效，但 lock 内容不替代实际安装树。
+
+发现最近的 `.pnp.cjs` 后，Yarn PnP 对受管理 issuer 的成功或拒绝均为最终结果。只有 Yarn 标记为
+ignore/unmanaged 的 issuer 才执行经典解析；孤立 `.pnp.data.json` 或 lock 文件不会激活 PnP。
+
 ## 浏览器目标
 
 默认目标来自 Wake 配置。旧浏览器语法降级取决于声明的 browserslist；Web API polyfill 不由 Wake 自动注入。

@@ -6,7 +6,8 @@
     "moduleResolution": "NodeNext",
     "target": "ES2024",
     "lib": ["ES2024", "ESNext.Disposable", "DOM"],
-    "types": ["node"]
+    "types": ["node", "react", "react-dom"],
+    "skipLibCheck": true
   },
   "include": ["types.ts"]
 }

@@ -14,6 +14,7 @@ wake_common.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+fancy-regex.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

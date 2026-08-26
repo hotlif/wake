@@ -13,31 +13,120 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  npm-lock:
-    name: npm lock provenance
+  yarn-pnp:
+    name: Yarn PnP provenance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm run npm:lock:check
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn yarn:lock:check
+      - run: corepack yarn pnp:conformance:check
+
+  npm-package-artifacts:
+    name: npm package artifacts / ${{ matrix.platform }}
+    needs: yarn-pnp
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64-msvc
+            package_dir: wake-win32-x64-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64-gnu
+            package_dir: wake-linux-x64-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: npm-package-${{ matrix.target }}
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      # napi build evaluates the complete locked Cargo graph before its offline build.
+      - run: cargo fetch --locked
+      - run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
+      - run: corepack yarn native:build
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: git diff --exit-code -- Cargo.lock
+      - name: Stage matching npm platform package
+        run: node scripts/stage-test-host.mjs --package-dir npm/${{ matrix.package_dir }}
+      - run: node -e "require('node:fs').mkdirSync('artifacts', {recursive:true})"
+      - run: corepack yarn npm:pack:check
+        env:
+          WAKE_PACK_TARGETS: npm/css,npm/wake,npm/${{ matrix.package_dir }}
+      - run: npm pack ./npm/wake --ignore-scripts --pack-destination artifacts
+      - run: npm pack ./npm/css --ignore-scripts --pack-destination artifacts
+      - run: npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-consumer-${{ matrix.platform }}
+          path: artifacts/*.tgz
+          if-no-files-found: error
+
+  npm-consumer:
+    name: npm consumer / ${{ matrix.platform }} / Node ${{ matrix.node }}
+    needs: npm-package-artifacts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32-x64-msvc
+            node: '22.14.0'
+          - os: windows-latest
+            platform: win32-x64-msvc
+            node: '26'
+          - os: ubuntu-latest
+            platform: linux-x64-gnu
+            node: '22.14.0'
+          - os: ubuntu-latest
+            platform: linux-x64-gnu
+            node: '26'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-consumer-${{ matrix.platform }}
+          path: artifacts
+      - name: Clean npm ci consumer outside the PnP source tree
+        run: node scripts/check-npm-consumer.mjs
+        env:
+          WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts
+          WAKE_NPM_PLATFORM: ${{ matrix.platform }}
+          WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer
 
   architecture:
     name: architecture boundaries
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: architecture
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       # The architecture checker runs `cargo tree --target all --offline`; fetch the
       # complete locked graph before preparing only the Linux rusty_v8 archive.
       - run: cargo fetch --locked
@@ -45,9 +134,9 @@ jobs:
       - run: cargo build -p wake_test_host -p wake_cli --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
-      - run: npm run release:check
+      - run: corepack yarn release:check
       - run: ./target/debug/wake test scripts/check-architecture.test.mjs --serial
-      - run: npm run architecture:check
+      - run: corepack yarn architecture:check
 
   fmt:
     name: rustfmt
@@ -61,7 +150,7 @@ jobs:
 
   clippy:
     name: clippy -D warnings
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,9 +160,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: Swatinem/rust-cache@v2
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
@@ -82,7 +171,7 @@ jobs:
 
   test:
     name: test
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -99,7 +188,8 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target ${{ matrix.target }}
       - run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
       - run: cargo test --workspace --locked --offline
@@ -108,7 +198,7 @@ jobs:
 
   test262-es2024:
     name: selected Test262 ES2024 / embedded V8
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,16 +209,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test262-es2024
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
-      - run: npm run test262:es2024
+      - run: corepack yarn test262:es2024
         env:
           CARGO_NET_OFFLINE: "true"
 
   browser-conformance:
     name: Browser evidence / ${{ matrix.target }} / ${{ matrix.browser_evidence }}
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -163,15 +254,15 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: dtolnay/rust-toolchain@1.95.0
         if: matrix.browser_evidence != 'unavailable'
       - uses: Swatinem/rust-cache@v2
         if: matrix.browser_evidence != 'unavailable'
         with:
           key: browser-${{ matrix.target }}
-      - run: npm ci --ignore-scripts
-      - run: npm run browser:conformance:test
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn browser:conformance:test
       - name: Record reviewed browser unavailability
         if: matrix.browser_evidence == 'unavailable'
         shell: bash
@@ -240,7 +331,7 @@ jobs:
 
   typescript-7:
     name: TypeScript 7 compatibility / ${{ matrix.os }}
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -251,9 +342,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-      - run: npm ci --ignore-scripts
-      - run: npm run typescript:7:check
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn typescript:7:check
 
   miri:
     name: miri (手写 unsafe 内存模型)
@@ -290,7 +381,7 @@ jobs:
 
   bench-smoke:
     name: performance invariants + benches compile
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -298,9 +389,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: Swatinem/rust-cache@v2
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       # Shared runners are too noisy for a millisecond SLA. Gate deterministic avoided-work counts,
@@ -314,7 +405,7 @@ jobs:
 
   docs:
     name: documentation
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -322,29 +413,29 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: Swatinem/rust-cache@v2
         with:
           key: docs
-      - run: npm ci --ignore-scripts
-      - run: npm run docs:check
-      - run: npm run docs:build
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn docs:check
+      - run: corepack yarn docs:build
 
   css:
     name: css package
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: css
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - run: cargo build -p wake_test_host -p wake_cli --locked --offline
@@ -352,14 +443,14 @@ jobs:
           CARGO_NET_OFFLINE: "true"
       - run: ./target/debug/wake test npm/css/test/runtime.test.mjs --serial
       - run: node --test npm/css/test/realm.node.mjs
-      - run: npm run npm:typecheck:css
-      - run: npm run npm:pack:check
+      - run: corepack yarn npm:typecheck:css
+      - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css
 
   node:
     name: node ${{ matrix.node }} / win32-x64
-    needs: npm-lock
+    needs: yarn-pnp
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -371,16 +462,16 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
       - uses: Swatinem/rust-cache@v2
         with:
           key: node-${{ matrix.node }}
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       # napi build invokes offline cargo metadata across the complete locked graph.
       - run: cargo fetch --locked
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc
-      - run: npm run versions:check
-      - run: npm run native:build
+      - run: corepack yarn versions:check
+      - run: corepack yarn native:build
         env:
           CARGO_NET_OFFLINE: "true"
       - run: git diff --exit-code -- Cargo.lock
@@ -389,12 +480,12 @@ jobs:
         shell: pwsh
         run: |
           "WAKE_NATIVE_PATH=$((Resolve-Path npm/wake/wake.win32-x64-msvc.node).Path)" >> $env:GITHUB_ENV
-      - run: npm run npm:test:wake
-      - run: npm run npm:typecheck:wake
+      - run: corepack yarn npm:test:wake
+      - run: corepack yarn npm:typecheck:wake
       - run: node scripts/check-startup.mjs
-      - run: npm run npm:pack:check
+      - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css,npm/wake,npm/wake-win32-x64-msvc
       - name: Verify Components under Yarn PnP
         if: matrix.node == 24
-        run: npm run pnp:components:check
+        run: corepack yarn pnp:components:check

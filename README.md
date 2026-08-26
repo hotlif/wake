@@ -21,7 +21,7 @@ Wake 是一套 Rust 原生的 Web 构建工具，将 JavaScript / TypeScript 编
 ### 环境要求
 
 - Node.js `>=22.14 <27`；
-- npm；
+- npm，或通过 Corepack 使用 Yarn 4 Plug'n'Play；
 - React 项目和 Wake Docs 使用 React 19；
 - 只有从源码构建 Wake 时才需要 Rust 1.95 或更高版本。
 
@@ -31,6 +31,16 @@ Wake 是一套 Rust 原生的 Web 构建工具，将 JavaScript / TypeScript 编
 npm install react react-dom
 npm install --save-dev @crab-dev/wake typescript @types/react @types/react-dom
 ```
+
+Yarn PnP 项目使用等价命令：
+
+```bash
+corepack yarn add react react-dom
+corepack yarn add --dev @crab-dev/wake typescript @types/react @types/react-dom
+```
+
+Wake 会自动识别两种布局：存在 `.pnp.cjs` 时以 Yarn PnP 为权威；否则按 npm/Node 规则解析实际
+`node_modules`，无需配置解析模式。
 
 创建 `wake.config.toml`：
 
@@ -213,8 +223,8 @@ cargo build --release -p wake_cli
 运行仓库自带的中文文档站：
 
 ```bash
-npm install
-npm run docs:dev
+corepack yarn install --immutable --check-cache
+corepack yarn docs:dev
 ```
 
 ## 项目结构
@@ -222,7 +232,7 @@ npm run docs:dev
 ```text
 crates/
 ├─ wake_ecma_*       # AST、词法、解析、语义、转换、生成与压缩
-├─ wake_resolver     # 模块解析与 Yarn Plug'n'Play 支持
+├─ wake_resolver     # npm/node_modules 与 Yarn Plug'n'Play 模块解析
 ├─ wake_graph        # 模块依赖图
 ├─ wake_bundler      # Bundle、chunk 和增量构建会话
 ├─ wake_turbo        # 并发增量计算引擎
@@ -253,15 +263,17 @@ cargo test --workspace
 修改 Node.js 绑定或 npm 包时运行：
 
 ```bash
-npm install
-npm run versions:check
-npm run native:build
-npm run npm:test
-npm run npm:typecheck
-npm run npm:pack:check
+corepack yarn install --immutable --check-cache
+corepack yarn versions:check
+corepack yarn native:build
+corepack yarn npm:test
+corepack yarn npm:typecheck
+corepack yarn npm:pack:check
 ```
 
-CI 还会在 Linux 和 Windows 上测试 workspace，并使用 Miri 验证手写 `unsafe`、使用 Loom 验证并发 single-flight 协议，以及编译全部 benchmark。
+CI 还会在 Linux 和 Windows 上测试 workspace，并以 Node 22.14/26 对本轮 tarball 执行仓库外
+`npm ci`、CLI、Node API、npm workspace 和 Wake Test 冒烟；Yarn PnP 差分门禁独立运行。Miri
+验证手写 `unsafe`，Loom 验证并发 single-flight 协议，全部 benchmark 也会编译。
 
 当前系统边界、依赖方向和质量门禁见[工程文档](engineering/README.md)。
 

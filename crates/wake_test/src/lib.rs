@@ -5476,7 +5476,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join(".pnp.cjs"),
-            "throw new Error('Wake must load the data manifest without executing Yarn');",
+            "module.exports = require('./.pnp.data.json'); // Wake parses data without executing Yarn",
         )
         .unwrap();
         fs::write(

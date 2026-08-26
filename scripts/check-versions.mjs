@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { parseSyml } from '@yarnpkg/parsers'
 
 const root = resolve(import.meta.dirname, '..')
 const cargo = readFileSync(resolve(root, 'Cargo.toml'), 'utf8')
@@ -61,14 +62,11 @@ for (const directory of ['.', ...publishedDirectories]) {
   }
 }
 
-const lock = JSON.parse(readFileSync(resolve(root, 'package-lock.json'), 'utf8'))
-for (const packagePath of Object.keys(lock.packages ?? {})) {
-  if (
-    packagePath.includes('node_modules/@linaria/') ||
-    packagePath.includes('node_modules/@wyw-in-js/')
-  ) {
+const lock = parseSyml(readFileSync(resolve(root, 'yarn.lock'), 'utf8'))
+for (const locked of Object.values(lock)) {
+  if (/^(?:@linaria\/|@wyw-in-js\/)/.test(locked?.resolution ?? '')) {
     throw new Error(
-      `package-lock.json contains retired CSS implementation ${packagePath}`,
+      `yarn.lock contains retired CSS implementation ${locked.resolution}`,
     )
   }
 }
@@ -145,13 +143,14 @@ for (const source of testRuntimeSources.sources ?? []) {
   if (source.gitHead !== undefined && !/^[0-9a-f]{40}$/.test(source.gitHead)) {
     throw new Error(`${source.name} gitHead must be a 40-character commit when present`)
   }
-  const locked = lock.packages?.[`node_modules/${source.name}`]
+  const locked = Object.values(lock).find((entry) => (
+    entry?.resolution === `${source.name}@npm:${source.version}`
+  ))
   if (
     locked?.version !== source.version ||
-    locked?.integrity !== source.integrity ||
-    locked?.resolved !== source.tarball
+    !/^10c0\/[0-9a-f]{128}$/.test(locked?.checksum ?? '')
   ) {
-    throw new Error(`${source.name} lockfile version/integrity/tarball does not match provenance`)
+    throw new Error(`${source.name} Yarn npm resolution/checksum does not match provenance`)
   }
   if (source.name === 'happy-dom') {
     const adapters = source.wakeAdapters ?? []
@@ -241,9 +240,9 @@ if (JSON.stringify(optionalNames) !== JSON.stringify(platformNames)) {
   )
 }
 const localOptionalNames = Object.keys(workspaceManifest.optionalDependencies ?? {}).sort()
-if (JSON.stringify(localOptionalNames) !== JSON.stringify(platformNames)) {
+if (localOptionalNames.length !== 0) {
   throw new Error(
-    `${workspaceManifest.name} local optional platform packages must be exactly: ${platformNames.join(', ')}`,
+    `${workspaceManifest.name} must not keep a file: optional dependency bridge`,
   )
 }
 for (const platformName of platformNames) {
@@ -253,11 +252,12 @@ for (const platformName of platformNames) {
       `${mainManifest.name} must pin ${platformName} to ${cargoVersion}; found ${pinnedVersion ?? 'missing'}`,
     )
   }
-  const expectedLocal = `file:${manifestDirectories.get(platformName)}`
-  const localLocator = workspaceManifest.optionalDependencies[platformName]
-  if (localLocator !== expectedLocal) {
+  const workspaceResolution = Object.values(lock).find((entry) => (
+    entry?.resolution === `${platformName}@workspace:${manifestDirectories.get(platformName)}`
+  ))
+  if (!workspaceResolution || workspaceResolution.linkType !== 'soft') {
     throw new Error(
-      `${workspaceManifest.name} must link ${platformName} to ${expectedLocal}; found ${localLocator ?? 'missing'}`,
+      `yarn.lock must resolve ${platformName} from workspace:${manifestDirectories.get(platformName)}`,
     )
   }
 }

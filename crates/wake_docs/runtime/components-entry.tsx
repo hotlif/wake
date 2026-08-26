@@ -1,9 +1,9 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { App } from "@wake/docs/runtime/app.tsx";
-import { ComponentsApp } from "@wake/docs/runtime/components.tsx";
-import "@wake/docs/runtime/styles.css";
-import "@wake/docs/runtime/components.css";
+import { App } from "@@wake/docs/runtime/app.tsx";
+import { ComponentsApp } from "@@wake/docs/runtime/components.tsx";
+import "@@wake/docs/runtime/styles.css";
+import "@@wake/docs/runtime/components.css";
 
 const reactMajor = Number.parseInt(React.version.split(".")[0] || "", 10);
 if (!Number.isFinite(reactMajor) || reactMajor < 19) {

@@ -12,6 +12,10 @@ const npmRoot = resolve(root, 'npm')
 const workflowPath = resolve(root, '.github/workflows/release-npm.yml')
 const workflow = readFileSync(workflowPath, 'utf8')
 const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+const npmConsumerScript = readFileSync(
+  resolve(root, 'scripts/check-npm-consumer.mjs'),
+  'utf8',
+)
 const browserManifest = readSystemBrowserConformanceManifest()
 const vscodeWorkflow = readFileSync(
   resolve(root, '.github/workflows/vscode-css.yml'),
@@ -147,7 +151,7 @@ for (const required of [
   'package/sbom.spdx.json',
   'package/THIRD_PARTY_LICENSES.txt',
   'node scripts/verify-native-package.mjs',
-  'npm run browser:conformance:test',
+  'corepack yarn browser:conformance:test',
   'check-system-browser-conformance.mjs',
   '67108864',
   '58720256',
@@ -169,7 +173,9 @@ const auditTarballsJob = releaseJob('audit-tarballs')
 const prepublishSmokeJob = releaseJob('prepublish-smoke')
 const publishJob = releaseJob('publish')
 const registrySmokeJob = releaseJob('smoke')
-const ciNpmLockJob = ciJob('npm-lock')
+const ciYarnPnpJob = ciJob('yarn-pnp')
+const ciNpmPackageArtifactsJob = ciJob('npm-package-artifacts')
+const ciNpmConsumerJob = ciJob('npm-consumer')
 const ciBrowserJobMatch = ciWorkflow.match(
   /^  browser-conformance:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:\r?$)/m,
 )
@@ -186,21 +192,95 @@ if (!(auditTarballsJob.index < prepublishSmokeJob.index
   && prepublishSmokeJob.index < publishJob.index)) {
   throw new Error('local tarball smoke must run after audit-tarballs and before publish')
 }
-let npmLockMarkerIndex = -1
+let yarnPnpMarkerIndex = -1
 for (const marker of [
   'actions/checkout@v4',
   'actions/setup-node@v6',
   'node-version: 24',
-  'npm run npm:lock:check',
+  'npm install --global corepack@0.34.6',
+  'corepack yarn install --immutable --check-cache',
+  'corepack yarn yarn:lock:check',
+  'corepack yarn pnp:conformance:check',
 ]) {
-  const index = ciNpmLockJob.source.indexOf(marker)
-  if (index <= npmLockMarkerIndex) {
-    throw new Error(`ci.yml npm-lock job must order ${marker} after its preceding gate`)
+  const index = ciYarnPnpJob.source.indexOf(marker)
+  if (index <= yarnPnpMarkerIndex) {
+    throw new Error(`ci.yml yarn-pnp job must order ${marker} after its preceding gate`)
   }
-  npmLockMarkerIndex = index
+  yarnPnpMarkerIndex = index
 }
-if (ciNpmLockJob.source.includes('npm ci')) {
-  throw new Error('ci.yml npm-lock job must validate the lock before clean install')
+if (ciYarnPnpJob.source.includes('npm ci')) {
+  throw new Error('ci.yml yarn-pnp job must not use npm for source installation')
+}
+let npmArtifactMarkerIndex = -1
+for (const marker of [
+  'needs: yarn-pnp',
+  'platform: win32-x64-msvc',
+  'platform: linux-x64-gnu',
+  'corepack yarn install --immutable --check-cache',
+  'cargo fetch --locked',
+  'node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}',
+  'corepack yarn native:build',
+  'git diff --exit-code -- Cargo.lock',
+  'node scripts/stage-test-host.mjs --package-dir npm/${{ matrix.package_dir }}',
+  'corepack yarn npm:pack:check',
+  'npm pack ./npm/wake --ignore-scripts --pack-destination artifacts',
+  'npm pack ./npm/css --ignore-scripts --pack-destination artifacts',
+  'npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts',
+  'name: npm-consumer-${{ matrix.platform }}',
+]) {
+  const index = ciNpmPackageArtifactsJob.source.indexOf(marker)
+  if (index <= npmArtifactMarkerIndex) {
+    throw new Error(`ci.yml npm-package-artifacts must order ${marker} after its preceding gate`)
+  }
+  npmArtifactMarkerIndex = index
+}
+if (ciNpmPackageArtifactsJob.source.includes('cargo fetch --locked --target')) {
+  throw new Error('ci.yml npm-package-artifacts must fetch the complete graph before offline napi metadata')
+}
+
+for (const marker of [
+  'needs: npm-package-artifacts',
+  'platform: win32-x64-msvc',
+  "node: '22.14.0'",
+  "node: '26'",
+  'platform: linux-x64-gnu',
+  'name: npm-consumer-${{ matrix.platform }}',
+  'Clean npm ci consumer outside the PnP source tree',
+  'node scripts/check-npm-consumer.mjs',
+  'WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer',
+]) {
+  if (!ciNpmConsumerJob.source.includes(marker)) {
+    throw new Error(`ci.yml npm-consumer is missing contract marker ${marker}`)
+  }
+}
+for (const row of [
+  ["os: windows-latest", 'platform: win32-x64-msvc', "node: '22.14.0'"],
+  ["os: windows-latest", 'platform: win32-x64-msvc', "node: '26'"],
+  ["os: ubuntu-latest", 'platform: linux-x64-gnu', "node: '22.14.0'"],
+  ["os: ubuntu-latest", 'platform: linux-x64-gnu', "node: '26'"],
+]) {
+  const pattern = new RegExp(row.map(escapeRegExp).join('\\r?\\n\\s+'))
+  if (!pattern.test(ciNpmConsumerJob.source)) {
+    throw new Error(`ci.yml npm-consumer is missing matrix row ${row.join(' / ')}`)
+  }
+}
+for (const forbidden of ['corepack', 'yarn install', 'cargo ', 'npm pack', 'WAKE_NATIVE_PATH']) {
+  if (ciNpmConsumerJob.source.includes(forbidden)) {
+    throw new Error(`ci.yml npm-consumer must not use source/build fallback ${forbidden}`)
+  }
+}
+for (const marker of [
+  "['install', '--package-lock-only'",
+  "['ci', ...installArguments]",
+  'assertNoPnpAncestor(project)',
+  "join(project, 'node_modules')",
+  'WAKE_NPM_WORKSPACE_CLASSIC',
+  "['--no-install', 'wake', '--version']",
+  "['--no-install', 'wake', 'test'",
+]) {
+  if (!npmConsumerScript.includes(marker)) {
+    throw new Error(`check-npm-consumer.mjs is missing contract marker ${marker}`)
+  }
 }
 for (const name of [
   'architecture',
@@ -214,19 +294,20 @@ for (const name of [
   'css',
   'node',
 ]) {
-  if (!ciJob(name).source.includes('needs: npm-lock')) {
-    throw new Error(`ci.yml ${name} job must depend on npm-lock before clean install`)
+  if (!ciJob(name).source.includes('needs: yarn-pnp')) {
+    throw new Error(`ci.yml ${name} job must depend on yarn-pnp before source installation`)
   }
 }
 requireOrderedJobMarkers('verify', verifyJob.source, [
   'actions/setup-node@v6',
-  'npm run npm:lock:check',
-  'npm ci --ignore-scripts',
+  'npm install --global corepack@0.34.6',
+  'corepack yarn install --immutable --check-cache',
+  'corepack yarn yarn:lock:check',
 ])
 requireOrderedJobMarkers('audit-tarballs', auditTarballsJob.source, [
   'actions/setup-node@v6',
   'node-version: 24',
-  'npm ci --ignore-scripts',
+  'corepack yarn install --immutable --check-cache',
   'node scripts/verify-native-package.mjs',
 ])
 requireJobMarkers('verify', verifyJob.source, [
@@ -255,7 +336,7 @@ for (const [name, job, lockMarkers] of [
     'node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}',
     ...lockMarkers.slice(0, -1),
     'cargo build -p wake_test_host --release --locked --offline --target ${{ matrix.target }}',
-    'npx --no-install napi build',
+    'corepack yarn exec napi build',
     '-- --locked --offline',
     lockMarkers.at(-1),
     'node scripts/stage-test-host.mjs',
@@ -277,11 +358,11 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   'actions/checkout@v4',
   'node-version: ${{ matrix.node }}',
   "Clean install this build's local tarballs",
-  '--ignore-scripts',
-  '--omit=optional',
-  'PLATFORM_ARCHIVE',
-  "requested.startsWith('file:')",
+  'WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts',
+  'WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer',
+  'node scripts/check-npm-consumer.mjs',
   'Wake Test CLI, runTests and TestContext smoke',
+  'cd "$WAKE_NPM_PROJECT"',
   'npx --no-install wake test smoke.test.mjs --serial',
   'runTests(options)',
   'createTestContext(options)',
@@ -317,11 +398,11 @@ if (prepublishSmokeJob.source.includes('continue-on-error')) {
 if (prepublishSmokeJob.source.includes('npm publish')) {
   throw new Error('prepublish local tarball smoke must not mutate the npm registry')
 }
-requireUnconditionalShellStep(
-  'prepublish-smoke',
-  prepublishSmokeJob.source,
-  "Clean install this build's local tarballs",
-)
+for (const forbidden of ['--package-lock=false', 'mkdir local-smoke', 'cd local-smoke']) {
+  if (prepublishSmokeJob.source.includes(forbidden)) {
+    throw new Error(`prepublish-smoke must use the shared external npm consumer project, not ${forbidden}`)
+  }
+}
 requireUnconditionalShellStep(
   'prepublish-smoke',
   prepublishSmokeJob.source,
@@ -353,10 +434,10 @@ if (ciBrowserJob.includes('continue-on-error')) {
   throw new Error('CI browser evidence must never continue on error')
 }
 requireOrderedJobMarkers('ci node', ciNodeJob, [
-  'npm ci --ignore-scripts',
+  'corepack yarn install --immutable --check-cache',
   'cargo fetch --locked',
   'node scripts/prepare-rusty-v8.mjs --target x86_64-pc-windows-msvc',
-  'npm run native:build',
+  'corepack yarn native:build',
   'git diff --exit-code -- Cargo.lock',
   'node scripts/stage-test-host.mjs',
 ])
@@ -500,29 +581,31 @@ if (extensionManifest.private !== true) {
 
 const vscodeVerifyJob = vscodeJob('verify')
 const vscodeVerifyMarkers = [
-  'npm run npm:lock:check',
-  'npm ci --ignore-scripts',
-  'npm ci --ignore-scripts --prefix editors/vscode-css',
+  'npm install --global corepack@0.34.6',
+  'corepack yarn install --immutable --check-cache',
+  'corepack yarn yarn:lock:check',
   'cargo fetch --locked',
   'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
   'cargo build --release -p wake_test_host -p wake_cli --locked --offline',
-  'npm run release:check',
-  'npm run vscode:css:check',
+  'corepack yarn release:check',
+  'corepack yarn vscode:css:check',
   'WAKE_BIN: ${{ github.workspace }}/target/release/wake',
 ]
 requireOrderedVscodeJobMarkers('verify', vscodeVerifyJob.source, vscodeVerifyMarkers)
 for (const marker of [
-  'cache-dependency-path: |',
-  'package-lock.json',
-  'editors/vscode-css/package-lock.json',
   'CARGO_NET_OFFLINE: "true"',
 ]) {
   if (!vscodeVerifyJob.source.includes(marker)) {
     throw new Error(`vscode-css.yml verify job is missing contract marker ${marker}`)
   }
 }
-if (!vscodeWorkflow.includes("'scripts/check-npm-lock.mjs'")) {
-  throw new Error('vscode-css.yml must run when the npm lock preflight changes')
+for (const marker of ["'yarn.lock'", "'.yarnrc.yml'"]) {
+  if (!vscodeWorkflow.includes(marker)) {
+    throw new Error(`vscode-css.yml must run when ${marker} changes`)
+  }
+}
+if (!vscodeWorkflow.includes("'scripts/check-yarn-lock.mjs'")) {
+  throw new Error('vscode-css.yml must run when the Yarn lock preflight changes')
 }
 for (const forbidden of ['npm run native:build', 'napi build', 'stage-test-host']) {
   if (vscodeVerifyJob.source.includes(forbidden)) {
@@ -555,7 +638,7 @@ const vscodeBuildJobs = [
 ]
 for (const { name, job, fetch, build } of vscodeBuildJobs) {
   requireOrderedVscodeJobMarkers(name, job.source, [
-    'npm ci --ignore-scripts --prefix editors/vscode-css',
+    'corepack yarn install --immutable --check-cache',
     fetch,
     build,
     'CARGO_NET_OFFLINE: "true"',
@@ -585,7 +668,7 @@ const extensionWakeBinary = readFileSync(
 )
 if (
   extensionManifest.scripts?.check
-  !== 'npm run compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs'
+  !== 'yarn compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs'
 ) {
   throw new Error('Crab CSS package check must use the first-party Wake test launcher')
 }

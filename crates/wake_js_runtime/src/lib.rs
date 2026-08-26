@@ -17,7 +17,7 @@ use wake_ecma_codegen::{
 };
 use wake_ecma_parser::{ParseOptions, parse_with};
 use wake_ecma_vm::{ScriptSource, Vm, VmError, VmHandle, VmOptions};
-use wake_resolver::{PnpFileSystem, PnpManifest, ResolutionProfile, Resolver};
+use wake_resolver::{ResolutionEnvironment, ResolutionProfile, Resolver};
 
 mod happy_dom_sources {
     include!(concat!(env!("OUT_DIR"), "/wake_happy_dom_sources.rs"));
@@ -137,6 +137,7 @@ pub enum RuntimeError {
     Resolve {
         path: PathBuf,
         specifier: String,
+        reason: Option<String>,
     },
     Unsupported {
         path: PathBuf,
@@ -183,8 +184,16 @@ impl fmt::Display for RuntimeError {
             Self::Parse { path, messages } => {
                 write!(f, "{}: {}", path.display(), messages.join("; "))
             }
-            Self::Resolve { path, specifier } => {
-                write!(f, "{}: cannot resolve {specifier}", path.display())
+            Self::Resolve {
+                path,
+                specifier,
+                reason,
+            } => {
+                write!(f, "{}: cannot resolve {specifier}", path.display())?;
+                if let Some(reason) = reason {
+                    write!(f, ": {reason}")?;
+                }
+                Ok(())
             }
             Self::Unsupported { path, feature } => {
                 write!(f, "{}: WAKE_TEST_UNSUPPORTED: {feature}", path.display())
@@ -907,50 +916,19 @@ struct ModuleGraphCompilation {
 
 struct ModuleResolutionContext {
     fs: Arc<dyn FileSystem>,
-    resolver: Resolver,
-    pnp_fs: Option<Arc<PnpFileSystem>>,
+    resolver: Arc<Resolver>,
+    environment: ResolutionEnvironment,
     resolver_inputs: Vec<PathBuf>,
 }
 
 impl ModuleResolutionContext {
     fn new(entry: &Path) -> Result<Self, RuntimeError> {
         let os_fs: Arc<dyn FileSystem> = Arc::new(OsFileSystem);
-        let start_dir = entry.parent().unwrap_or_else(|| Path::new("."));
-        let (fs, resolver, pnp_fs) =
-            if let Some(pnp_root) = PnpManifest::discover_root(os_fs.as_ref(), start_dir) {
-                let manifest = PnpManifest::load(os_fs.as_ref(), &pnp_root).ok_or_else(|| {
-                    let data = pnp_root.join(".pnp.data.json");
-                    let path = if os_fs.is_file(&data) {
-                        data.clone()
-                    } else {
-                        pnp_root.join(".pnp.cjs")
-                    };
-                    let mut recovery_watch_paths = existing_resolver_inputs(os_fs.as_ref(), entry);
-                    recovery_watch_paths.extend([
-                        canonical_module_path(&pnp_root),
-                        canonical_module_path(&data),
-                        canonical_module_path(&pnp_root.join(".pnp.cjs")),
-                    ]);
-                    recovery_watch_paths.sort();
-                    recovery_watch_paths.dedup();
-                    RuntimeError::Io {
-                        path,
-                        message: "could not parse the Yarn PnP manifest".to_string(),
-                    }
-                    .with_recovery_watch_paths(recovery_watch_paths)
-                })?;
-                let pnp_fs = Arc::new(PnpFileSystem::new(Arc::clone(&os_fs)));
-                let fs: Arc<dyn FileSystem> = pnp_fs.clone();
-                let resolver = Resolver::with_pnp(Arc::clone(&fs), Arc::new(manifest));
-                (fs, resolver, Some(pnp_fs))
-            } else {
-                let resolver = Resolver::new(Arc::clone(&os_fs));
-                (os_fs, resolver, None)
-            };
+        let environment = ResolutionEnvironment::new(os_fs);
         let mut context = Self {
-            fs,
-            resolver,
-            pnp_fs,
+            fs: environment.file_system(),
+            resolver: environment.resolver(),
+            environment,
             resolver_inputs: Vec::new(),
         };
         context.resolver_inputs = context.collect_resolver_inputs(entry);
@@ -992,6 +970,7 @@ impl ModuleResolutionContext {
                         RuntimeError::Resolve {
                             path: importer.to_path_buf(),
                             specifier: specifier.to_string(),
+                            reason: None,
                         },
                         importer,
                     )
@@ -1010,16 +989,14 @@ impl ModuleResolutionContext {
                 RuntimeError::Resolve {
                     path: importer.to_path_buf(),
                     specifier: specifier.to_string(),
+                    reason: Some(error.to_string()),
                 }
                 .with_recovery_watch_paths(recovery_watch_paths)
             })
     }
 
     fn watch_path(&self, path: &Path) -> PathBuf {
-        let physical = self
-            .pnp_fs
-            .as_ref()
-            .map_or_else(|| path.to_path_buf(), |fs| fs.watch_path(path));
+        let physical = self.environment.watch_path(path);
         canonical_module_path(&physical)
     }
 

@@ -14,7 +14,7 @@
 ## 当前文档站依赖
 
 文档站使用 Alert、Button、Card、Prose 和 Tag 构建首页、提示块及组件示例。版本由根
-`package.json` 和 `package-lock.json` 锁定；本文不复制版本号，避免升级后形成第二份事实来源。
+`package.json`、`.yarnrc.yml` 与 `yarn.lock` 锁定；本文不复制版本号，避免升级后形成第二份事实来源。
 
 项目级包装集中在 `docs/site/components.tsx`，主题映射集中在 `docs/site/theme.css`，Demo
 Provider 位于 `docs/site/preview.tsx`。MDX 页面应优先导入这些包装，而不是散布组件包依赖。
@@ -40,11 +40,12 @@ Wake 对无法原地修改的发布归档保留两条受限迁移措施：
 
 - loader 仅在已经验证包身份的 `@crab-dev/rc-*` 公开入口中，把旧 runtime specifier 改写为
   `@crab-dev/css`；业务源码、其他第三方包和组件内部文件不会被改写；
-- Components 模式的 PnP 供给桥只接受 `@crab-dev/css` 与 `lucide-react`，只对
-  `@crab-dev/rc-*` issuer 生效，并且只在正常依赖解析报告边界错误后使用 Wake 主包声明的版本。
+- Yarn `.yarnrc.yml#packageExtensions` 显式补齐已知 `@crab-dev/rc-*` 归档的 CSS、Lucide、React 与
+  React DOM 元数据；这些条目进入 PnP 清单，Wake resolver 不再提供 Components 私有供给桥。
 
-当所有受支持组件版本都直接导入并声明这两个运行时依赖、且通过普通与隔离 PnP fixture 后，应删除
-loader 迁移、resolver fallback、Components 配置和对应回归 fixture。详见
+使用旧归档的 Yarn PnP 项目应迁移根仓库 `.yarnrc.yml` 中对应的 `packageExtensions`；不得通过
+`pnpFallbackMode` 或隐式顶层 fallback 放宽可见性。当所有受支持组件版本都声明完整元数据后，应删除
+这些扩展及 loader 迁移，但保留隔离 PnP fixture。详见
 [ADR 0006](decisions/0006-crab-css-public-contract.md)。
 
 ## 发布与验证
@@ -52,9 +53,9 @@ loader 迁移、resolver fallback、Components 配置和对应回归 fixture。�
 组件集成变更至少执行：
 
 ```powershell
-npm run docs:check
-npm run docs:build
-npm run pnp:components:check
+corepack yarn docs:check
+corepack yarn docs:build
+corepack yarn pnp:components:check
 ```
 
 PnP 门禁从本地 tarball 建立无 `node_modules` hoist 的隔离安装，验证：

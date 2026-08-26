@@ -28,9 +28,10 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-      - run: npm run npm:lock:check
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn yarn:lock:check
+      - run: corepack yarn pnp:conformance:check
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - name: Verify pinned Rusty V8 input
@@ -45,11 +46,11 @@ jobs:
         id: source-date
         shell: bash
         run: printf 'epoch=%s\n' "$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
-      - run: npm run versions:check
-      - run: npm run browser:conformance:test
-      - run: npm run release:check
-      - run: npm run npm:typecheck:css
-      - run: npm run npm:pack:check
+      - run: corepack yarn versions:check
+      - run: corepack yarn browser:conformance:test
+      - run: corepack yarn release:check
+      - run: corepack yarn npm:typecheck:css
+      - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css
       - name: Test and build from verified inputs
@@ -99,11 +100,11 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - name: Fetch locked Rust dependencies
         # napi build runs offline cargo metadata for the complete locked graph.
         run: cargo fetch --locked
@@ -113,7 +114,7 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
       - run: >-
-          npx --no-install napi build --platform --release --strip
+          corepack yarn exec napi build --platform --release --strip
           --cwd crates/wake_node
           --output-dir ../../npm/wake
           --package-json-path ../../npm/wake/package.json
@@ -136,9 +137,9 @@ jobs:
         shell: pwsh
         run: |
           $env:WAKE_NATIVE_PATH = (Resolve-Path npm/wake/wake.win32-x64-msvc.node).Path
-          npm run pnp:components:check
+          corepack yarn pnp:components:check
       - run: node -e "require('node:fs').mkdirSync('artifacts', {recursive:true})"
-      - run: npm run npm:pack:check
+      - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/${{ matrix.package_dir }}
       - run: npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts
@@ -179,8 +180,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - name: Fetch locked Rust dependencies
         # napi build runs offline cargo metadata for the complete locked graph.
         run: cargo fetch --locked
@@ -192,7 +193,7 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
       - run: >-
-          npx --no-install napi build --platform --release --strip
+          corepack yarn exec napi build --platform --release --strip
           --cwd crates/wake_node
           --output-dir ../../npm/wake
           --package-json-path ../../npm/wake/package.json
@@ -221,7 +222,7 @@ jobs:
           --host target/${{ matrix.target }}/release/${{ matrix.host_binary }}
       - run: mkdir -p artifacts
       - run: node -e "require('node:fs').mkdirSync('artifacts', {recursive:true})"
-      - run: npm run npm:pack:check
+      - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/${{ matrix.package_dir }}
       - run: npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts
@@ -239,8 +240,10 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: mkdir -p artifacts
-      - run: npm run npm:pack:check
+      - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css,npm/wake
       - run: npm pack ./npm/wake --ignore-scripts --pack-destination artifacts
@@ -263,7 +266,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm ci --ignore-scripts
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - uses: actions/download-artifact@v4
         with:
           pattern: npm-*
@@ -376,6 +380,11 @@ jobs:
             browser_evidence: exact-major-smoke
             browser_major: 150
     runs-on: ${{ matrix.runner }}
+    env:
+      WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts
+      WAKE_NPM_PLATFORM: ${{ matrix.platform }}
+      WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer
+      WAKE_NPM_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -387,62 +396,12 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - name: Clean install this build's local tarballs
-        shell: bash
-        env:
-          WAKE_VERSION: ${{ needs.verify.outputs.version }}
-          PLATFORM_PACKAGE: '@crab-dev/wake-${{ matrix.platform }}'
-          PLATFORM_ARCHIVE: 'crab-dev-wake-${{ matrix.platform }}-${{ needs.verify.outputs.version }}.tgz'
-        run: |
-          set -euo pipefail
-          wake_archive="$GITHUB_WORKSPACE/artifacts/crab-dev-wake-${WAKE_VERSION}.tgz"
-          css_archive="$GITHUB_WORKSPACE/artifacts/crab-dev-css-${WAKE_VERSION}.tgz"
-          platform_archive="$GITHUB_WORKSPACE/artifacts/${PLATFORM_ARCHIVE}"
-          test -f "$wake_archive"
-          test -f "$css_archive"
-          test -f "$platform_archive"
-          mkdir local-smoke
-          cd local-smoke
-          npm init -y >/dev/null
-          npm install \
-            --ignore-scripts \
-            --omit=optional \
-            --no-audit \
-            --no-fund \
-            --package-lock=false \
-            "$wake_archive" \
-            "$css_archive" \
-            "$platform_archive" \
-            'react@19.2.8' \
-            'react-dom@19.2.8'
-          node - "$WAKE_VERSION" "$PLATFORM_PACKAGE" "$PLATFORM_ARCHIVE" <<'NODE'
-          const { readFileSync } = require('node:fs')
-          const { join } = require('node:path')
-          const [version, platformPackage, platformArchive] = process.argv.slice(2)
-          const expected = new Map([
-            ['@crab-dev/wake', `crab-dev-wake-${version}.tgz`],
-            ['@crab-dev/css', `crab-dev-css-${version}.tgz`],
-            [platformPackage, platformArchive],
-          ])
-          const rootManifest = JSON.parse(readFileSync('package.json', 'utf8'))
-          for (const [name, archive] of expected) {
-            const requested = rootManifest.dependencies?.[name]
-            if (typeof requested !== 'string'
-              || !requested.startsWith('file:')
-              || !requested.replaceAll('\\', '/').endsWith(archive)) {
-              throw new Error(`${name} was not installed from this build's ${archive}`)
-            }
-            const installed = JSON.parse(readFileSync(join('node_modules', name, 'package.json'), 'utf8'))
-            if (installed.name !== name || installed.version !== version) {
-              throw new Error(`${name} resolved to ${installed.name}@${installed.version}, expected ${name}@${version}`)
-            }
-          }
-          NODE
+        run: node scripts/check-npm-consumer.mjs
       - name: Wake Test CLI, runTests and TestContext smoke
         shell: bash
         run: |
           set -euo pipefail
-          cd local-smoke
-          node -e "require('node:fs').writeFileSync('smoke.test.mjs',\"import {test,expect} from '@crab-dev/wake/test';test('local tarball host',()=>expect(42).toBe(42))\\n\")"
+          cd "$WAKE_NPM_PROJECT"
           npx --no-install wake test smoke.test.mjs --serial
           node <<'NODE'
           const { createTestContext, runTests } = require('@crab-dev/wake')
@@ -544,7 +503,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd local-smoke
+          cd "$WAKE_NPM_PROJECT"
           node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('local browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('local-ready')})\\n\")"
           npx --no-install wake test visual.browser.test.mjs \
             --serial \

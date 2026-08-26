@@ -4,7 +4,7 @@
 //!
 //! 1. **虚拟路径**：先经 [`resolve_virtual`] 把 `.yarn/__virtual__/…` 映射回真实物理路径；
 //! 2. **zip 归档**：物理路径若含 `*.zip/` 段，则把该段之前当作归档文件、之后当作内部条目，
-//!    经 [`ZipArchive`](wake_common::zip::ZipArchive) 读取 stored 原始字节。
+//!    经 [`ZipArchive`](wake_common::zip::ZipArchive) 读取 stored/DEFLATE 字节。
 //!
 //! 这是整个 PnP 支持的**核心接缝**——一旦文件访问 zip 感知，[`crate::Resolver`] 的
 //! `is_file`/`is_dir` 探测、bundler 的源码读取、codegen 全都无需改动即可命中 zip 内文件
@@ -54,6 +54,11 @@ impl PnpFileSystem {
     pub fn watch_path(&self, path: &Path) -> PathBuf {
         let physical = self.physical(path);
         split_zip(&physical).map_or(physical, |(archive, _)| archive)
+    }
+
+    /// 清除 archive 级缓存；PnP 清单或 lock 变化后下一 generation 重新打开归档。
+    pub fn clear_cache(&self) {
+        self.archives.lock().unwrap().clear();
     }
 
     /// 打开（或复用缓存）一个 zip 归档。
@@ -110,7 +115,7 @@ impl FileSystem for PnpFileSystem {
         match split_zip(&phys) {
             Some((zip, inner)) => {
                 let arc = self.open_archive(&zip)?;
-                arc.read(&inner).map(<[u8]>::to_vec).ok_or_else(|| {
+                arc.read(&inner)?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("{}!{inner}", zip.display()),

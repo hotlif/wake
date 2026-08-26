@@ -10,10 +10,13 @@ use std::sync::Mutex;
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use wake_common::{FileSystem, FxHashMap, fs::normalize};
 
+mod environment;
 pub mod pnp;
 mod pnpfs;
 
-pub use pnp::{PnpError, PnpManifest};
+pub use environment::ResolutionEnvironment;
+use environment::{PnpRegistry, PnpRoute};
+pub use pnp::{PnpError, PnpLoadError, PnpManifest};
 pub use pnpfs::PnpFileSystem;
 
 /// 一份 npm 包内容的逻辑身份。普通 registry 包按 `name@version` 扁平去重；
@@ -66,20 +69,9 @@ pub struct ResolutionProfile {
     pub main_fields: Vec<String>,
 }
 
-type ResolutionCache = FxHashMap<PathBuf, FxHashMap<ResolutionKey, Option<PathBuf>>>;
+type ResolutionCache =
+    FxHashMap<PathBuf, FxHashMap<ResolutionKey, Result<PathBuf, ResolveErrorKind>>>;
 type PackageRootCache = FxHashMap<PathBuf, FxHashMap<String, Arc<[PathBuf]>>>;
-
-/// 一条只在 Yarn PnP 依赖边界错误时生效的定向 fallback。
-///
-/// 当 `issuer_package_prefix` 命中导入方包名、导入的裸包名等于 `dependency`，
-/// 且 issuer 自身及 Yarn 顶层 fallback 都因未声明或未满足 peer 而失败时，
-/// 改从 `provider_issuer` 所属 locator 的依赖图中解析。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PnpDependencyFallback {
-    pub issuer_package_prefix: String,
-    pub dependency: String,
-    pub provider_issuer: PathBuf,
-}
 
 /// 解析选项。
 #[derive(Clone, Debug)]
@@ -94,9 +86,6 @@ pub struct ResolveOptions {
     /// 匹配规则：说明符 == 前缀 或以 `前缀/` 开头；命中最长前缀，重写后走文件/目录解析。
     /// 保持既定行为 webpack `resolve.alias`（WAKE-COMPATIBILITY §H）。默认空 → 行为与接入前逐字节一致。
     pub alias: Vec<(String, PathBuf)>,
-    /// 只在 PnP `Undeclared`/`UnfulfilledPeer` 上应用的 issuer-scoped 依赖 fallback。
-    /// 普通 `node_modules` 解析忽略此项。
-    pub pnp_dependency_fallbacks: Vec<PnpDependencyFallback>,
 }
 
 impl Default for ResolveOptions {
@@ -114,7 +103,6 @@ impl Default for ResolveOptions {
                 .map(|value| value.to_string())
                 .collect(),
             alias: Vec::new(),
-            pnp_dependency_fallbacks: Vec::new(),
         }
     }
 }
@@ -249,13 +237,25 @@ impl<'de> Deserialize<'de> for OrderedJsonValue {
 
 /// 解析失败。
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveErrorKind {
+    NotFound,
+    PnpManifest(PnpLoadError),
+    PnpDependency(PnpError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveError {
     pub specifier: String,
     pub from: PathBuf,
+    kind: ResolveErrorKind,
     witnesses: Vec<PathBuf>,
 }
 
 impl ResolveError {
+    pub fn kind(&self) -> &ResolveErrorKind {
+        &self.kind
+    }
+
     /// Logical filesystem locations whose mutation may make this exact resolution succeed.
     ///
     /// These are resolver-owned candidates, not diagnostics guessed by a caller. A PnP-aware
@@ -268,12 +268,21 @@ impl ResolveError {
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "无法从 `{}` 解析模块 `{}`",
-            self.from.display(),
-            self.specifier
-        )
+        match &self.kind {
+            ResolveErrorKind::NotFound => write!(
+                f,
+                "无法从 `{}` 解析模块 `{}`",
+                self.from.display(),
+                self.specifier
+            ),
+            ResolveErrorKind::PnpManifest(error) => write!(f, "{error}"),
+            ResolveErrorKind::PnpDependency(error) => write!(
+                f,
+                "Yarn PnP 拒绝从 `{}` 解析 `{}`：{error}",
+                self.from.display(),
+                self.specifier
+            ),
+        }
     }
 }
 
@@ -295,6 +304,8 @@ pub struct Resolver {
     package_roots: Mutex<PackageRootCache>,
     /// Yarn PnP 清单。`Some` 时裸说明符走 PnP 依赖图（不走 `node_modules` 上溯）。
     pnp: Option<Arc<PnpManifest>>,
+    /// `ResolutionEnvironment` 所有的按 issuer registry；支持嵌套 PnP 根与重新加载。
+    pnp_registry: Option<Arc<PnpRegistry>>,
 }
 
 impl Resolver {
@@ -311,6 +322,7 @@ impl Resolver {
             module_identities: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
+            pnp_registry: None,
         }
     }
 
@@ -337,6 +349,24 @@ impl Resolver {
             module_identities: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: Some(manifest),
+            pnp_registry: None,
+        }
+    }
+
+    pub(crate) fn with_registry(
+        fs: Arc<dyn FileSystem>,
+        registry: Arc<PnpRegistry>,
+        options: ResolveOptions,
+    ) -> Resolver {
+        Resolver {
+            fs,
+            options,
+            cache: Mutex::new(FxHashMap::default()),
+            package_configs: Mutex::new(FxHashMap::default()),
+            module_identities: Mutex::new(FxHashMap::default()),
+            package_roots: Mutex::new(FxHashMap::default()),
+            pnp: None,
+            pnp_registry: Some(registry),
         }
     }
 
@@ -392,7 +422,7 @@ impl Resolver {
         // 先取 cache（锁瞬间释放：`.cloned()` 拷出 Option 后 guard 即析构）——**关键**是别把锁
         // 持到 `resolve_uncached` 的 FS 探测期间，否则并行退化为串行。
         if let Some(resolved) = cached {
-            return resolved.ok_or_else(|| self.err(specifier, from_dir));
+            return resolved.map_err(|kind| self.err(specifier, from_dir, kind));
         }
         // 未命中：昂贵的 FS 探测在锁外进行（并行的收益全在这里）。两个线程同 key 竞争时都会算一遍
         // 再各自 insert——幂等无害，换取零锁争用。
@@ -403,7 +433,7 @@ impl Resolver {
             .entry(from_dir.to_path_buf())
             .or_default()
             .insert(key, resolved.clone());
-        resolved.ok_or_else(|| self.err(specifier, from_dir))
+        resolved.map_err(|kind| self.err(specifier, from_dir, kind))
     }
 
     /// 同时返回物理路径和按 npm 包名、版本、子路径归一后的逻辑身份。
@@ -439,6 +469,35 @@ impl Resolver {
         let path = self.resolve_with_profile(specifier, from_dir, profile)?;
         let identity = self.module_identity(&path);
         Ok(ResolvedModule { path, identity })
+    }
+
+    /// 解析一个包名到未限定包根，供 token/docgen 等读取包内非入口元数据。
+    pub fn resolve_package_root(
+        &self,
+        package: &str,
+        issuer_dir: &Path,
+    ) -> Result<PathBuf, ResolveError> {
+        let kind = if !is_valid_bare_package_specifier(package)
+            || !split_package_ref(package).1.is_empty()
+        {
+            Err(ResolveErrorKind::NotFound)
+        } else {
+            match self
+                .pnp_route(issuer_dir)
+                .map_err(ResolveErrorKind::PnpManifest)
+            {
+                Ok(PnpRoute::Managed(manifest)) => manifest
+                    .resolve_bare(package, issuer_dir)
+                    .map_err(ResolveErrorKind::PnpDependency),
+                Ok(PnpRoute::Classic | PnpRoute::NoManifest) => self
+                    .package_roots(package, issuer_dir)
+                    .first()
+                    .cloned()
+                    .ok_or(ResolveErrorKind::NotFound),
+                Err(error) => Err(error),
+            }
+        };
+        kind.map_err(|kind| self.err(package, issuer_dir, kind))
     }
 
     /// 将一个已解析文件归一为逻辑模块身份。
@@ -491,17 +550,20 @@ impl Resolver {
         self.package_roots.lock().unwrap().clear();
     }
 
-    fn err(&self, specifier: &str, from_dir: &Path) -> ResolveError {
+    fn err(&self, specifier: &str, from_dir: &Path, kind: ResolveErrorKind) -> ResolveError {
         ResolveError {
             specifier: specifier.to_string(),
             from: from_dir.to_path_buf(),
+            kind,
             witnesses: self.resolution_witnesses(specifier, from_dir),
         }
     }
 
     fn resolution_witnesses(&self, specifier: &str, from_dir: &Path) -> Vec<PathBuf> {
         let mut witnesses = std::collections::BTreeSet::from([normalize(from_dir)]);
-        if let Some(aliased) = self.apply_alias(specifier) {
+        if !is_valid_bare_package_specifier(specifier)
+            && let Some(aliased) = self.apply_alias(specifier)
+        {
             witnesses.insert(aliased.clone());
             if let Some(parent) = aliased.parent() {
                 witnesses.insert(parent.to_path_buf());
@@ -527,8 +589,11 @@ impl Resolver {
         }
 
         let (package, subpath) = split_package_ref(specifier);
-        if let Some(pnp) = &self.pnp {
-            witnesses.insert(pnp.root().to_path_buf());
+        let route = self.pnp_route(from_dir);
+        if let Ok(PnpRoute::Managed(pnp)) = route {
+            witnesses.insert(pnp.root().join(".pnp.cjs"));
+            witnesses.insert(pnp.root().join(".pnp.data.json"));
+            witnesses.insert(pnp.root().join("yarn.lock"));
             if let Ok(package_root) = pnp.resolve_bare(package, from_dir) {
                 let candidate = if subpath.is_empty() {
                     package_root
@@ -540,6 +605,10 @@ impl Resolver {
                 }
                 witnesses.insert(candidate);
             }
+            return witnesses.into_iter().collect();
+        }
+        if let Err(error) = route {
+            witnesses.insert(error.path().to_path_buf());
             return witnesses.into_iter().collect();
         }
 
@@ -565,11 +634,7 @@ impl Resolver {
         specifier: &str,
         from_dir: &Path,
         profile: &ResolutionProfile,
-    ) -> Option<PathBuf> {
-        // 别名优先：命中则重写为绝对目标后走文件/目录解析（扩展名补全 / index / package.json）。
-        if let Some(aliased) = self.apply_alias(specifier) {
-            return self.resolve_as_file_or_dir(&aliased);
-        }
+    ) -> Result<PathBuf, ResolveErrorKind> {
         let specifier_path = Path::new(specifier);
         if specifier.starts_with("./")
             || specifier.starts_with("../")
@@ -580,40 +645,58 @@ impl Resolver {
             } else {
                 normalize(&from_dir.join(specifier))
             };
-            self.resolve_as_file_or_dir(&base)
-        } else if let Some(pnp) = &self.pnp {
-            // PnP 先定位包根，再由统一包入口逻辑处理 exports 与子路径。
-            let (package, subpath) = split_package_ref(specifier);
-            let package_root = match pnp.resolve_bare(package, from_dir) {
-                Ok(root) => root,
-                Err(pnp::PnpError::Undeclared | pnp::PnpError::UnfulfilledPeer) => {
-                    self.resolve_pnp_dependency_fallback(pnp, package, from_dir)?
-                }
-                Err(_) => return None,
-            };
-            self.resolve_package(&package_root, subpath, profile)
-        } else {
-            self.resolve_node_modules(specifier, from_dir, profile)
+            return self
+                .resolve_as_file_or_dir(&base)
+                .ok_or(ResolveErrorKind::NotFound);
         }
+
+        if is_valid_bare_package_specifier(specifier) {
+            match self
+                .pnp_route(from_dir)
+                .map_err(ResolveErrorKind::PnpManifest)?
+            {
+                PnpRoute::Managed(pnp) => {
+                    let (package, subpath) = split_package_ref(specifier);
+                    let package_root = pnp
+                        .resolve_bare(package, from_dir)
+                        .map_err(ResolveErrorKind::PnpDependency)?;
+                    return self
+                        .resolve_package(&package_root, subpath, profile)
+                        .ok_or(ResolveErrorKind::NotFound);
+                }
+                // Yarn 的 ignored / unmanaged 结果正式选择经典 Node 解析。
+                PnpRoute::Classic => {
+                    return self
+                        .resolve_node_modules(specifier, from_dir, profile)
+                        .ok_or(ResolveErrorKind::NotFound);
+                }
+                PnpRoute::NoManifest => {}
+            }
+        }
+
+        // 只有未受 PnP 管理的包，或不构成 npm 包名的 Wake 路径 alias，才能命中 alias。
+        if let Some(aliased) = self.apply_alias(specifier) {
+            return self
+                .resolve_as_file_or_dir(&aliased)
+                .ok_or(ResolveErrorKind::NotFound);
+        }
+
+        self.resolve_node_modules(specifier, from_dir, profile)
+            .ok_or(ResolveErrorKind::NotFound)
     }
 
-    /// 严格限定的 PnP 依赖 fallback。调用方只会在 issuer 正常解析与
-    /// Yarn 顶层 fallback 都返回依赖边界错误后进入此逻辑。
-    fn resolve_pnp_dependency_fallback(
-        &self,
-        pnp: &PnpManifest,
-        dependency: &str,
-        issuer_dir: &Path,
-    ) -> Option<PathBuf> {
-        let issuer_package = pnp.issuer_package_name(issuer_dir).ok()??;
-        self.options
-            .pnp_dependency_fallbacks
-            .iter()
-            .find(|fallback| {
-                fallback.dependency == dependency
-                    && issuer_package.starts_with(&fallback.issuer_package_prefix)
-            })
-            .and_then(|fallback| pnp.resolve_bare(dependency, &fallback.provider_issuer).ok())
+    fn pnp_route(&self, from_dir: &Path) -> Result<PnpRoute, PnpLoadError> {
+        if let Some(registry) = &self.pnp_registry {
+            return registry.route(from_dir);
+        }
+        let Some(manifest) = &self.pnp else {
+            return Ok(PnpRoute::NoManifest);
+        };
+        if manifest.is_ignored(from_dir) || !manifest.owns_issuer(from_dir) {
+            Ok(PnpRoute::Classic)
+        } else {
+            Ok(PnpRoute::Managed(Arc::clone(manifest)))
+        }
     }
 
     /// 别名匹配：说明符 == 前缀 或以 `前缀/` 开头 → 重写为 `目标 [+ 余下子路径]`（命中最长前缀）。
@@ -968,6 +1051,30 @@ fn split_package_ref(specifier: &str) -> (&str, &str) {
     }
 }
 
+/// 是否为 Yarn/Node 应作为 npm 包处理的裸说明符。
+///
+/// `@/`、`@@/`、`@@@/` 等 Wake 路径前缀故意返回 false，从而保留 alias；
+/// `react`、`react/jsx-runtime`、`@scope/pkg/subpath` 返回 true，使 PnP 先于 alias。
+fn is_valid_bare_package_specifier(specifier: &str) -> bool {
+    fn valid_part(part: &str) -> bool {
+        !part.is_empty()
+            && !part.starts_with(['.', '_'])
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }
+
+    let (package, _) = split_package_ref(specifier);
+    if let Some(scoped) = package.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return false;
+        };
+        valid_part(scope) && valid_part(name)
+    } else {
+        valid_part(package)
+    }
+}
+
 /// 拆分裸说明符为 (包名, 子路径)。处理 scoped 包 `@scope/name/sub`。
 pub(crate) fn split_package(specifier: &str) -> (String, String) {
     let (package, subpath) = split_package_ref(specifier);
@@ -1290,6 +1397,10 @@ mod tests {
     fn pnp_packages_use_exports_from_the_package_root() {
         let fs = MemoryFileSystem::new();
         fs.insert(
+            "project/.pnp.cjs",
+            "module.exports = require('./.pnp.data.json');",
+        );
+        fs.insert(
             "project/.pnp.data.json",
             r#"{
                 "enableTopLevelFallback": true,
@@ -1329,6 +1440,10 @@ mod tests {
     fn failed_pnp_exports_keep_resolver_owned_manifest_and_package_witnesses() {
         let fs = MemoryFileSystem::new();
         fs.insert(
+            "project/.pnp.cjs",
+            "module.exports = require('./.pnp.data.json');",
+        );
+        fs.insert(
             "project/.pnp.data.json",
             r#"{
                 "packageRegistryData": [
@@ -1356,7 +1471,11 @@ mod tests {
             .resolve("modern/private", Path::new("project/src"))
             .unwrap_err();
 
-        assert!(error.witnesses().contains(&PathBuf::from("project")));
+        assert!(
+            error
+                .witnesses()
+                .contains(&PathBuf::from("project/.pnp.cjs"))
+        );
         assert!(
             error
                 .witnesses()
@@ -1369,133 +1488,58 @@ mod tests {
         );
     }
 
-    fn pnp_scoped_fallback_resolver(
-        component_dependency: Option<Option<&str>>,
-        provider_has_dependency: bool,
-        enable_top_level_fallback: bool,
-        top_level_dependency: Option<&str>,
-        alias: Vec<(String, PathBuf)>,
-    ) -> Resolver {
-        let mut top_dependencies = vec![
-            serde_json::json!(["@crab-dev/wake", "npm:0.1.16"]),
-            serde_json::json!(["@crab-dev/rc-button", "npm:1.0.0"]),
-        ];
-        if let Some(reference) = top_level_dependency {
-            top_dependencies.push(serde_json::json!(["@crab-dev/css", reference]));
-        }
-
-        let mut wake_dependencies = vec![serde_json::json!(["@crab-dev/wake", "npm:0.1.16"])];
-        if provider_has_dependency {
-            wake_dependencies.push(serde_json::json!(["@crab-dev/css", "npm:1.0.0"]));
-        }
-
+    fn pnp_authoritative_resolver(component_declares_css: bool) -> Resolver {
         let mut component_dependencies =
             vec![serde_json::json!(["@crab-dev/rc-button", "npm:1.0.0"])];
-        match component_dependency {
-            Some(Some(reference)) => {
-                component_dependencies.push(serde_json::json!(["@crab-dev/css", reference]))
-            }
-            Some(None) => component_dependencies.push(serde_json::json!(["@crab-dev/css", null])),
-            None => {}
+        if component_declares_css {
+            component_dependencies.push(serde_json::json!(["@crab-dev/css", "npm:2.0.0"]));
         }
-
         let manifest_value = serde_json::json!({
-            "enableTopLevelFallback": enable_top_level_fallback,
-            "fallbackExclusionList": [],
-            "fallbackPool": [],
+            "enableTopLevelFallback": false,
             "packageRegistryData": [
                 [null, [[null, {
                     "packageLocation": "./",
-                    "packageDependencies": top_dependencies,
-                    "linkType": "SOFT"
-                }]]],
-                ["@crab-dev/wake", [["npm:0.1.16", {
-                    "packageLocation": "../cache/wake/node_modules/@crab-dev/wake/",
-                    "packageDependencies": wake_dependencies,
-                    "linkType": "HARD"
+                    "packageDependencies": [["@crab-dev/rc-button", "npm:1.0.0"]]
                 }]]],
                 ["@crab-dev/rc-button", [["npm:1.0.0", {
                     "packageLocation": "../cache/button/node_modules/@crab-dev/rc-button/",
-                    "packageDependencies": component_dependencies,
-                    "linkType": "HARD"
+                    "packageDependencies": component_dependencies
                 }]]],
-                ["@crab-dev/css", [
-                    ["npm:1.0.0", {
-                        "packageLocation": "../cache/crab-css-v1/node_modules/@crab-dev/css/",
-                        "packageDependencies": [["@crab-dev/css", "npm:1.0.0"]],
-                        "linkType": "HARD"
-                    }],
-                    ["npm:2.0.0", {
-                        "packageLocation": "../cache/crab-css-v2/node_modules/@crab-dev/css/",
-                        "packageDependencies": [["@crab-dev/css", "npm:2.0.0"]],
-                        "linkType": "HARD"
-                    }]
-                ]]
+                ["@crab-dev/css", [["npm:2.0.0", {
+                    "packageLocation": "../cache/css/node_modules/@crab-dev/css/",
+                    "packageDependencies": [["@crab-dev/css", "npm:2.0.0"]]
+                }]]]
             ]
         });
-
         let fs = MemoryFileSystem::new();
         fs.insert(
-            "project/.pnp.data.json",
-            manifest_value.to_string().as_str(),
+            "project/.pnp.cjs",
+            "module.exports = require('./.pnp.data.json');",
         );
-        fs.insert("project/src/index.js", "// project");
+        fs.insert("project/.pnp.data.json", manifest_value.to_string());
         fs.insert(
-            "cache/wake/node_modules/@crab-dev/wake/package.json",
-            r#"{"name":"@crab-dev/wake","main":"index.js"}"#,
+            "cache/css/node_modules/@crab-dev/css/package.json",
+            r#"{"exports":{".":"./index.js"}}"#,
         );
-        fs.insert("cache/wake/node_modules/@crab-dev/wake/index.js", "// wake");
-        fs.insert(
-            "cache/button/node_modules/@crab-dev/rc-button/package.json",
-            r#"{"name":"@crab-dev/rc-button","main":"index.js"}"#,
-        );
-        fs.insert(
-            "cache/button/node_modules/@crab-dev/rc-button/index.js",
-            "// button",
-        );
-        fs.insert(
-            "cache/crab-css-v1/node_modules/@crab-dev/css/package.json",
-            r#"{"name":"@crab-dev/css","exports":{".":"./index.js","./private":"./private.js"}}"#,
-        );
-        fs.insert(
-            "cache/crab-css-v1/node_modules/@crab-dev/css/index.js",
-            "// provider v1",
-        );
-        fs.insert(
-            "cache/crab-css-v1/node_modules/@crab-dev/css/private.js",
-            "// provider private",
-        );
-        fs.insert(
-            "cache/crab-css-v2/node_modules/@crab-dev/css/package.json",
-            r#"{"name":"@crab-dev/css","exports":{".":"./index.js"}}"#,
-        );
-        fs.insert(
-            "cache/crab-css-v2/node_modules/@crab-dev/css/index.js",
-            "// component v2",
-        );
+        fs.insert("cache/css/node_modules/@crab-dev/css/index.js", "// css");
         fs.insert("alias/crab-css.js", "// alias");
-
         let manifest = PnpManifest::load(&fs, Path::new("project")).unwrap();
         Resolver::with_pnp_options(
             Arc::new(fs),
             Arc::new(manifest),
             ResolveOptions {
-                alias,
-                pnp_dependency_fallbacks: vec![PnpDependencyFallback {
-                    issuer_package_prefix: "@crab-dev/rc-".to_string(),
-                    dependency: "@crab-dev/css".to_string(),
-                    provider_issuer: PathBuf::from(
-                        "cache/wake/node_modules/@crab-dev/wake/internal",
-                    ),
-                }],
+                alias: vec![(
+                    "@crab-dev/css".to_string(),
+                    PathBuf::from("alias/crab-css.js"),
+                )],
                 ..ResolveOptions::default()
             },
         )
     }
 
     #[test]
-    fn pnp_scoped_fallback_resolves_undeclared_dependency_from_provider() {
-        let resolver = pnp_scoped_fallback_resolver(None, true, false, None, Vec::new());
+    fn pnp_dependency_wins_over_valid_bare_package_alias() {
+        let resolver = pnp_authoritative_resolver(true);
         assert_eq!(
             resolver
                 .resolve(
@@ -1503,111 +1547,22 @@ mod tests {
                     Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
                 )
                 .unwrap(),
-            PathBuf::from("cache/crab-css-v1/node_modules/@crab-dev/css/index.js")
+            PathBuf::from("cache/css/node_modules/@crab-dev/css/index.js")
         );
     }
 
     #[test]
-    fn pnp_scoped_fallback_resolves_unfulfilled_peer_from_provider() {
-        let resolver = pnp_scoped_fallback_resolver(Some(None), true, false, None, Vec::new());
+    fn pnp_rejection_is_not_overridden_by_alias_or_components_bridge() {
+        let resolver = pnp_authoritative_resolver(false);
+        let error = resolver
+            .resolve(
+                "@crab-dev/css",
+                Path::new("cache/button/node_modules/@crab-dev/rc-button/esm"),
+            )
+            .unwrap_err();
         assert_eq!(
-            resolver
-                .resolve(
-                    "@crab-dev/css",
-                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
-                )
-                .unwrap(),
-            PathBuf::from("cache/crab-css-v1/node_modules/@crab-dev/css/index.js")
-        );
-    }
-
-    #[test]
-    fn pnp_issuer_dependency_wins_over_scoped_fallback() {
-        let resolver =
-            pnp_scoped_fallback_resolver(Some(Some("npm:2.0.0")), true, false, None, Vec::new());
-        assert_eq!(
-            resolver
-                .resolve(
-                    "@crab-dev/css",
-                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
-                )
-                .unwrap(),
-            PathBuf::from("cache/crab-css-v2/node_modules/@crab-dev/css/index.js")
-        );
-    }
-
-    #[test]
-    fn pnp_top_level_fallback_wins_over_scoped_fallback() {
-        let resolver =
-            pnp_scoped_fallback_resolver(None, true, true, Some("npm:2.0.0"), Vec::new());
-        assert_eq!(
-            resolver
-                .resolve(
-                    "@crab-dev/css",
-                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
-                )
-                .unwrap(),
-            PathBuf::from("cache/crab-css-v2/node_modules/@crab-dev/css/index.js")
-        );
-    }
-
-    #[test]
-    fn pnp_scoped_fallback_does_not_apply_to_project_sources() {
-        let resolver = pnp_scoped_fallback_resolver(None, true, false, None, Vec::new());
-        assert!(
-            resolver
-                .resolve("@crab-dev/css", Path::new("project/src"))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn pnp_scoped_fallback_fails_when_provider_does_not_declare_dependency() {
-        let resolver = pnp_scoped_fallback_resolver(None, false, false, None, Vec::new());
-        assert!(
-            resolver
-                .resolve(
-                    "@crab-dev/css",
-                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn pnp_alias_wins_over_normal_and_scoped_dependency_resolution() {
-        let resolver = pnp_scoped_fallback_resolver(
-            Some(Some("npm:2.0.0")),
-            true,
-            false,
-            None,
-            vec![(
-                "@crab-dev/css".to_string(),
-                PathBuf::from("alias/crab-css.js"),
-            )],
-        );
-        assert_eq!(
-            resolver
-                .resolve(
-                    "@crab-dev/css",
-                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
-                )
-                .unwrap(),
-            PathBuf::from("alias/crab-css.js")
-        );
-    }
-
-    #[test]
-    fn pnp_invalid_export_does_not_retry_scoped_fallback() {
-        let resolver =
-            pnp_scoped_fallback_resolver(Some(Some("npm:2.0.0")), true, false, None, Vec::new());
-        assert!(
-            resolver
-                .resolve(
-                    "@crab-dev/css/private",
-                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm")
-                )
-                .is_err()
+            error.kind(),
+            &ResolveErrorKind::PnpDependency(PnpError::Undeclared)
         );
     }
 
@@ -1646,8 +1601,16 @@ mod tests {
     #[test]
     fn not_found_errors() {
         let r = resolver(&[("a.js", "x")]);
-        assert!(r.resolve("./missing", Path::new(".")).is_err());
-        assert!(r.resolve("nonexistent-pkg", Path::new(".")).is_err());
+        assert_eq!(
+            r.resolve("./missing", Path::new(".")).unwrap_err().kind(),
+            &ResolveErrorKind::NotFound
+        );
+        assert_eq!(
+            r.resolve("nonexistent-pkg", Path::new("."))
+                .unwrap_err()
+                .kind(),
+            &ResolveErrorKind::NotFound
+        );
     }
 
     #[test]

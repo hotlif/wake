@@ -1,11 +1,12 @@
 {
   "name": "wake-workspace",
   "private": true,
-  "version": "0.1.22",
+  "version": "0.1.23",
   "type": "module",
+  "packageManager": "yarn@4.16.0",
   "workspaces": [
-    "npm/css",
-    "npm/wake"
+    "npm/*",
+    "editors/vscode-css"
   ],
   "scripts": {
     "architecture:check": "node scripts/check-architecture.mjs",
@@ -15,25 +16,27 @@
     "docs:dev": "cargo run -q -p wake_cli -- docs dev .",
     "docs:build": "cargo run -q -p wake_cli -- docs build .",
     "docs:check": "node scripts/check-docs.mjs",
-    "native:build": "cargo build -p wake_test_host -p wake_cli --release --locked --offline && napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts -- --locked --offline && node scripts/stage-test-host.mjs",
-    "npm:test": "npm run npm:test:wake && npm run npm:test:css",
-    "npm:test:wake": "wake test \"^npm/wake/test/(cli|components-state|console|terminal)\\.test\\.mjs$\" && npm run npm:test:wake:addon",
+    "native:build": "cargo build -p wake_test_host -p wake_cli --release --locked --offline && yarn exec napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts -- --locked --offline && node scripts/stage-test-host.mjs",
+    "npm:test": "yarn npm:test:wake && yarn npm:test:css",
+    "npm:test:wake": "wake test \"^npm/wake/test/(cli|components-state|console|terminal)\\.test\\.mjs$\" && yarn npm:test:wake:addon",
     "npm:test:wake:addon": "node --test npm/wake/test/api.test.mjs npm/css/test/realm.node.mjs",
-    "npm:test:css": "npm test --workspace @crab-dev/css",
-    "npm:typecheck": "npm run npm:typecheck:wake && npm run npm:typecheck:css",
-    "npm:typecheck:wake": "tsc -p npm/wake/test/tsconfig.json",
-    "npm:typecheck:css": "npm run typecheck --workspace @crab-dev/css",
-    "typescript:7:check": "node scripts/check-typescript-7.mjs",
+    "npm:test:css": "yarn workspace @crab-dev/css test",
+    "npm:typecheck": "yarn npm:typecheck:wake && yarn npm:typecheck:css",
+    "npm:typecheck:wake": "yarn exec pnpify tsc -p npm/wake/test/tsconfig.json",
+    "npm:typecheck:css": "yarn workspace @crab-dev/css typecheck",
+    "typescript:7:check": "yarn exec pnpify node scripts/check-typescript-7.mjs",
     "test262:es2024": "node scripts/run-test262.mjs",
     "npm:pack:check": "node scripts/check-npm-packs.mjs",
-    "npm:lock:check": "node scripts/check-npm-lock.mjs",
+    "npm:consumer:check": "node scripts/check-npm-consumer.mjs",
+    "pnp:conformance:check": "node scripts/check-pnp-conformance.mjs",
+    "yarn:lock:check": "node scripts/check-yarn-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
-    "vscode:css:check": "npm run check --prefix editors/vscode-css",
+    "vscode:css:check": "yarn workspace crab-css check",
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {
-    "@crab-dev/css": "0.1.22",
+    "@crab-dev/css": "0.1.23",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-card": "^0.0.2",
@@ -54,14 +57,8 @@
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
-  "optionalDependencies": {
-    "@crab-dev/wake-darwin-arm64": "file:npm/wake-darwin-arm64",
-    "@crab-dev/wake-darwin-x64": "file:npm/wake-darwin-x64",
-    "@crab-dev/wake-linux-arm64-gnu": "file:npm/wake-linux-arm64-gnu",
-    "@crab-dev/wake-linux-x64-gnu": "file:npm/wake-linux-x64-gnu",
-    "@crab-dev/wake-win32-x64-msvc": "file:npm/wake-win32-x64-msvc"
-  },
   "devDependencies": {
+    "@crab-dev/wake": "workspace:*",
     "@napi-rs/cli": "3.7.4",
     "@testing-library/dom": "10.4.1",
     "@testing-library/jest-dom": "7.0.0",
@@ -70,8 +67,39 @@
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "@yarnpkg/parsers": "3.1.0",
+    "@yarnpkg/pnpify": "4.1.7",
+    "buffer-image-size": "0.6.4",
     "corepack": "0.34.6",
+    "csstype": "3.2.3",
+    "entities": "7.0.1",
     "happy-dom": "20.11.6",
-    "typescript": "^7.0.2"
+    "typescript": "6.0.2",
+    "whatwg-mimetype": "3.0.0",
+    "ws": "8.21.3"
+  },
+  "dependenciesMeta": {
+    "@types/react": {
+      "unplugged": true
+    },
+    "buffer-image-size": {
+      "unplugged": true
+    },
+    "csstype": {
+      "unplugged": true
+    },
+    "entities": {
+      "unplugged": true
+    },
+    "happy-dom": {
+      "unplugged": true
+    },
+    "whatwg-mimetype": {
+      "unplugged": true
+    },
+    "ws": {
+      "unplugged": true
+    }
   }
 }

@@ -1,7 +1,7 @@
 //! # Yarn PnP（Plug'n'Play）解析
 //!
 //! Yarn Berry 的 PnP 模式**不铺 `node_modules`**：所有包由一份 `.pnp.cjs` 里内嵌的依赖图直接定位，
-//! 包体以**无压缩 zip**（见 [`wake_common::zip`]）留在全局缓存。本模块负责：
+//! 包体位于 Yarn zip 缓存（见 [`wake_common::zip`]）。本模块负责：
 //!
 //! 1. **提取 + 解析** `.pnp.cjs` 内嵌的 `RAW_RUNTIME_STATE` JSON（或旁边的 `.pnp.data.json`）。
 //! 2. **PnP 解析算法**：给定 issuer（导入方目录）与裸说明符，
@@ -16,6 +16,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use fancy_regex::Regex;
 use wake_common::{FileSystem, FxHashMap, FxHashSet, fs::normalize};
 
 use crate::split_package;
@@ -45,6 +46,8 @@ struct PackageInfo {
 /// 一份解析好的 PnP 清单。
 pub struct PnpManifest {
     root: PathBuf,
+    ignore_pattern: Option<Regex>,
+    dependency_tree_roots: FxHashSet<Locator>,
     enable_top_level_fallback: bool,
     /// 被排除出「顶层 fallback」的 issuer locator 集合。
     fallback_exclusion: FxHashSet<Locator>,
@@ -52,11 +55,49 @@ pub struct PnpManifest {
     fallback_pool: FxHashMap<String, Option<DepTarget>>,
     packages: FxHashMap<Locator, PackageInfo>,
     /// `findPackageLocator` 用：（归一化位置, locator），按最长前缀匹配；已剔除 discardFromLookup。
+    /// Yarn hydration 对同位置 locator 采用后写覆盖，故每个位置只保留一个 locator。
     locations: Vec<(PathBuf, Locator)>,
 }
 
+/// PnP 清单无法加载的结构化原因。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PnpLoadError {
+    path: PathBuf,
+    reason: String,
+}
+
+impl PnpLoadError {
+    fn new(path: PathBuf, reason: impl Into<String>) -> Self {
+        Self {
+            path,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for PnpLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "无法加载 Yarn PnP 清单 `{}`：{}",
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for PnpLoadError {}
+
 /// PnP 解析失败原因。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PnpError {
     /// issuer 不属于任何已知包（不该发生，除非 issuer 在项目外）。
     IssuerNotFound,
@@ -66,9 +107,20 @@ pub enum PnpError {
     UnfulfilledPeer,
     /// 目标 locator 在清单中缺失（清单不一致）。
     MissingPackage,
-    /// issuer 的物理位置同时对应多个 locator，且它们将当前依赖解析到不同目标。
-    AmbiguousIssuer,
 }
+
+impl std::fmt::Display for PnpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IssuerNotFound => "issuer 不属于 Yarn dependency tree",
+            Self::Undeclared => "issuer 未声明该依赖",
+            Self::UnfulfilledPeer => "peer dependency 未满足",
+            Self::MissingPackage => "依赖 locator 在 PnP 清单中缺失",
+        })
+    }
+}
+
+impl std::error::Error for PnpError {}
 
 impl PnpManifest {
     /// Return the normalized project root that owns this manifest.
@@ -86,42 +138,114 @@ impl PnpManifest {
     pub fn discover_root(fs: &dyn FileSystem, start_dir: &Path) -> Option<PathBuf> {
         let mut dir = normalize(start_dir);
         loop {
-            if fs.is_file(&dir.join(".pnp.cjs")) || fs.is_file(&dir.join(".pnp.data.json")) {
+            if fs.is_file(&dir.join(".pnp.cjs")) {
                 return Some(dir);
             }
             if !dir.pop() {
-                return (fs.is_file(Path::new(".pnp.cjs"))
-                    || fs.is_file(Path::new(".pnp.data.json")))
-                .then(PathBuf::new);
+                return fs.is_file(Path::new(".pnp.cjs")).then(PathBuf::new);
             }
         }
     }
 
-    /// 若 `dir`（含各祖先目录）存在 `.pnp.cjs`/`.pnp.data.json`，加载并返回（清单, pnp_root 相对 cwd 路径）。
+    /// 若 `dir`（含各祖先目录）存在 `.pnp.cjs`，加载其内联或匹配的外部 runtime state。
     ///
     /// `start_dir` 应为入口文件所在目录（相对 cwd）。逐级上溯查找。
-    pub fn discover(fs: &dyn FileSystem, start_dir: &Path) -> Option<PnpManifest> {
-        let root = PnpManifest::discover_root(fs, start_dir)?;
-        PnpManifest::load(fs, &root)
+    pub fn discover(
+        fs: &dyn FileSystem,
+        start_dir: &Path,
+    ) -> Result<Option<PnpManifest>, PnpLoadError> {
+        let Some(root) = PnpManifest::discover_root(fs, start_dir) else {
+            return Ok(None);
+        };
+        PnpManifest::load(fs, &root).map(Some)
     }
 
     /// 从 `pnp_root` 目录（相对 cwd）加载清单。
-    pub fn load(fs: &dyn FileSystem, pnp_root: &Path) -> Option<PnpManifest> {
-        // 优先 `.pnp.data.json`（纯 JSON，较新 Yarn 可选产出）；否则从 `.pnp.cjs` 提取内嵌 JSON。
-        let json = {
-            let data_path = pnp_root.join(".pnp.data.json");
-            if let Ok(s) = fs.read_to_string(&data_path) {
-                s
-            } else {
-                let cjs = fs.read_to_string(&pnp_root.join(".pnp.cjs")).ok()?;
-                extract_pnp_data(&cjs)?
+    pub fn load(fs: &dyn FileSystem, pnp_root: &Path) -> Result<PnpManifest, PnpLoadError> {
+        let loader_path = normalize(&pnp_root.join(".pnp.cjs"));
+        let loader = fs.read_to_string(&loader_path).map_err(|error| {
+            PnpLoadError::new(loader_path.clone(), format!("loader 不可读：{error}"))
+        })?;
+
+        // 内联 loader 必须读取自身的 RAW_RUNTIME_STATE。非内联 loader 才读取相邻 data；
+        // 孤立 `.pnp.data.json` 从不激活 PnP。
+        let (json, manifest_path) = match extract_pnp_data(&loader).and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .map(|_| json)
+        }) {
+            Some(json) => (json, loader_path),
+            None if loader.contains(".pnp.data.json") => {
+                let data_path = normalize(&pnp_root.join(".pnp.data.json"));
+                let json = fs.read_to_string(&data_path).map_err(|error| {
+                    PnpLoadError::new(data_path.clone(), format!("data 不可读：{error}"))
+                })?;
+                (json, data_path)
+            }
+            None => {
+                return Err(PnpLoadError::new(
+                    loader_path,
+                    "既不包含有效 RAW_RUNTIME_STATE，也未引用 .pnp.data.json",
+                ));
             }
         };
-        let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
+            PnpLoadError::new(manifest_path.clone(), format!("JSON 无效：{error}"))
+        })?;
+        if let Some(pattern) = value
+            .get("ignorePatternData")
+            .and_then(serde_json::Value::as_str)
+        {
+            Regex::new(pattern).map_err(|error| {
+                PnpLoadError::new(
+                    manifest_path.clone(),
+                    format!("ignorePatternData 不受支持：{error}"),
+                )
+            })?;
+        }
         PnpManifest::from_value(&value, pnp_root)
+            .ok_or_else(|| PnpLoadError::new(manifest_path, "缺少或损坏 packageRegistryData"))
     }
 
     fn from_value(v: &serde_json::Value, pnp_root: &Path) -> Option<PnpManifest> {
+        let ignore_pattern = match v.get("ignorePatternData") {
+            Some(serde_json::Value::String(pattern)) => Regex::new(pattern).ok(),
+            Some(serde_json::Value::Null) | None => None,
+            Some(_) => return None,
+        };
+
+        let mut dependency_tree_roots = FxHashSet::default();
+        if let Some(roots) = v
+            .get("dependencyTreeRoots")
+            .and_then(serde_json::Value::as_array)
+        {
+            for root in roots {
+                let locator = if let Some(pair) = root.as_array() {
+                    Locator {
+                        ident: pair
+                            .first()
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        reference: pair
+                            .get(1)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    }
+                } else {
+                    Locator {
+                        ident: root
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        reference: root
+                            .get("reference")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    }
+                };
+                dependency_tree_roots.insert(locator);
+            }
+        }
         let enable_top_level_fallback = v
             .get("enableTopLevelFallback")
             .and_then(|b| b.as_bool())
@@ -154,7 +278,7 @@ impl PnpManifest {
 
         // packageRegistryData: [[ident|null, [[ref|null, info], ...]], ...]
         let mut packages: FxHashMap<Locator, PackageInfo> = FxHashMap::default();
-        let mut locations: Vec<(PathBuf, Locator)> = Vec::new();
+        let mut locations_by_path: FxHashMap<PathBuf, Locator> = FxHashMap::default();
         let registry = v.get("packageRegistryData")?.as_array()?;
         for ident_entry in registry {
             let pair = ident_entry.as_array()?;
@@ -180,7 +304,8 @@ impl PnpManifest {
                     reference: reference.clone(),
                 };
                 if !discard {
-                    locations.push((location.clone(), locator.clone()));
+                    // 与 Yarn hydrateRuntimeState 保持一致：相同 packageLocation 后写覆盖。
+                    locations_by_path.insert(location.clone(), locator.clone());
                 }
                 packages.insert(
                     locator,
@@ -192,8 +317,8 @@ impl PnpManifest {
             }
         }
 
-        // 最长前缀优先。同一物理位置的 locator 必须保留为候选集，不能在这里
-        // 任意优先 virtual/base；实际取舍取决于当前要解析的依赖。
+        let mut locations: Vec<_> = locations_by_path.into_iter().collect();
+        // 最长前缀优先；同位置 locator 已按 Yarn hydration 语义收敛为一个。
         locations.sort_by(|a, b| {
             b.0.components()
                 .count()
@@ -203,6 +328,8 @@ impl PnpManifest {
 
         Some(PnpManifest {
             root: normalize(pnp_root),
+            ignore_pattern,
+            dependency_tree_roots,
             enable_top_level_fallback,
             fallback_exclusion,
             fallback_pool,
@@ -211,41 +338,33 @@ impl PnpManifest {
         })
     }
 
-    /// 找 issuer 所属的所有 locator：只保留最长位置前缀下的同路径候选。
-    ///
-    /// Yarn 的 unplugged 包可能让 base/virtual locator 共用一个 `packageLocation`。
-    /// 候选不能靠清单顺序或 virtual 标记决胜，必须结合当前依赖消歧。
-    fn find_package_locators(&self, issuer_dir: &Path) -> Vec<&Locator> {
+    fn find_package_locator(&self, issuer_dir: &Path) -> Option<&Locator> {
         let issuer = normalize(issuer_dir);
-        let Some((matched_location, _)) = self
-            .locations
-            .iter()
-            .find(|(loc, _)| path_has_prefix(&issuer, loc))
-        else {
-            return Vec::new();
-        };
         self.locations
             .iter()
-            .filter(|(location, _)| location == matched_location)
+            .find(|(location, _)| path_has_prefix(&issuer, location))
             .map(|(_, locator)| locator)
-            .collect()
     }
 
-    /// 返回 issuer 候选集一致的包名，供上层做严格限定的依赖 fallback。
-    pub fn issuer_package_name(&self, issuer_dir: &Path) -> Result<Option<&str>, PnpError> {
-        let locators = self.find_package_locators(issuer_dir);
-        let Some(first) = locators.first() else {
-            return Err(PnpError::IssuerNotFound);
+    /// Yarn `ignorePatternData` 命中的 issuer 必须走经典 Node 解析。
+    pub fn is_ignored(&self, issuer_dir: &Path) -> bool {
+        let issuer_dir = normalize(issuer_dir);
+        let Ok(relative) = issuer_dir.strip_prefix(&self.root) else {
+            return false;
         };
-        let ident = first.ident.as_deref();
-        if locators
-            .iter()
-            .all(|locator| locator.ident.as_deref() == ident)
-        {
-            Ok(ident)
-        } else {
-            Err(PnpError::AmbiguousIssuer)
-        }
+        let portable = relative.to_string_lossy().replace('\\', "/");
+        self.ignore_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(&portable).unwrap_or(false))
+    }
+
+    /// issuer 是否属于此 PnP dependency tree。未知 issuer 按 Yarn 规范走经典解析。
+    pub fn owns_issuer(&self, issuer_dir: &Path) -> bool {
+        self.find_package_locator(issuer_dir).is_some()
+    }
+
+    pub fn dependency_tree_roots(&self) -> impl Iterator<Item = &Locator> {
+        self.dependency_tree_roots.iter()
     }
 
     /// 解析裸说明符到「未限定」路径（相对 cwd；可能虚拟 / 指向 zip）。
@@ -253,50 +372,17 @@ impl PnpManifest {
     /// 返回的路径需再经 [`crate::Resolver`] 的文件/目录解析补 main/index/扩展名。
     pub fn resolve_bare(&self, specifier: &str, issuer_dir: &Path) -> Result<PathBuf, PnpError> {
         let (ident, subpath) = split_package(specifier);
-        let issuer_locators = self.find_package_locators(issuer_dir);
-        if issuer_locators.is_empty() {
-            return Err(PnpError::IssuerNotFound);
-        }
-
-        // 先在全部候选中尝试 issuer 自身的直接依赖。只要有直接依赖成功，
-        // 就不应让另一候选的顶层 fallback 改变结果。
-        let mut direct_failures = Vec::new();
-        let mut resolved_target = None;
-        for issuer_locator in &issuer_locators {
-            match self.resolve_direct_dependency_locator(issuer_locator, &ident) {
-                Ok(target_locator) => merge_resolved_target(&mut resolved_target, target_locator)?,
-                Err(error) => direct_failures.push((*issuer_locator, error)),
-            }
-        }
-        if let Some(target_locator) = resolved_target {
-            return self.unqualified_path(&target_locator, &subpath);
-        }
-
-        // 所有直接依赖都失败后，再逐候选尝试 Yarn 顶层 fallback。
-        // `MissingPackage`/`IssuerNotFound` 表示清单损坏而非依赖边界；绝不能用顶层
-        // 同名包掩盖。只有未声明依赖和未满足 peer 符合 Yarn fallback 语义。
-        if direct_failures
-            .iter()
-            .any(|(_, error)| !matches!(error, PnpError::Undeclared | PnpError::UnfulfilledPeer))
-        {
-            return Err(direct_failures
-                .into_iter()
-                .map(|(_, error)| error)
-                .fold(PnpError::Undeclared, preferred_failure));
-        }
-        let mut fallback_target = None;
-        let mut failure = PnpError::Undeclared;
-        for (issuer_locator, direct_error) in direct_failures {
-            let result = self
+        let issuer_locator = self
+            .find_package_locator(issuer_dir)
+            .ok_or(PnpError::IssuerNotFound)?;
+        let target_locator = match self.resolve_direct_dependency_locator(issuer_locator, &ident) {
+            Ok(locator) => locator,
+            Err(error @ (PnpError::Undeclared | PnpError::UnfulfilledPeer)) => self
                 .fallback_lookup(issuer_locator, &ident)
-                .ok_or(direct_error)
-                .and_then(|target| self.locator_for_target(target));
-            match result {
-                Ok(target_locator) => merge_resolved_target(&mut fallback_target, target_locator)?,
-                Err(error) => failure = preferred_failure(failure, error),
-            }
-        }
-        let target_locator = fallback_target.ok_or(failure)?;
+                .ok_or(error)
+                .and_then(|target| self.locator_for_target(target))?,
+            Err(error) => return Err(error),
+        };
         self.unqualified_path(&target_locator, &subpath)
     }
 
@@ -364,38 +450,6 @@ impl PnpManifest {
             return Some(t);
         }
         None
-    }
-}
-
-fn merge_resolved_target(
-    resolved: &mut Option<Locator>,
-    candidate: Locator,
-) -> Result<(), PnpError> {
-    match resolved {
-        Some(previous) if previous != &candidate => Err(PnpError::AmbiguousIssuer),
-        Some(_) => Ok(()),
-        None => {
-            *resolved = Some(candidate);
-            Ok(())
-        }
-    }
-}
-
-/// 多个同路径 locator 都失败时，保留最能描述清单问题的错误。
-fn preferred_failure(current: PnpError, candidate: PnpError) -> PnpError {
-    fn rank(error: &PnpError) -> u8 {
-        match error {
-            PnpError::IssuerNotFound => 0,
-            PnpError::Undeclared => 1,
-            PnpError::UnfulfilledPeer => 2,
-            PnpError::MissingPackage => 3,
-            PnpError::AmbiguousIssuer => 4,
-        }
-    }
-    if rank(&candidate) > rank(&current) {
-        candidate
-    } else {
-        current
     }
 }
 
@@ -562,7 +616,7 @@ mod tests {
     use wake_common::MemoryFileSystem;
 
     #[test]
-    fn discovers_data_only_pnp_roots() {
+    fn data_only_does_not_activate_pnp() {
         let fs = MemoryFileSystem::new();
         fs.insert(
             "project/.pnp.data.json",
@@ -576,9 +630,13 @@ mod tests {
         );
         assert_eq!(
             PnpManifest::discover_root(&fs, Path::new("project/src")),
-            Some(PathBuf::from("project"))
+            None
         );
-        assert!(PnpManifest::discover(&fs, Path::new("project/src")).is_some());
+        assert!(
+            PnpManifest::discover(&fs, Path::new("project/src"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -855,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_location_virtual_locators_with_different_targets_are_ambiguous() {
+    fn shared_location_uses_yarn_last_locator_wins_semantics() {
         let manifest = shared_location_manifest(serde_json::json!([
             wake_instance("file:../wake", None),
             wake_instance("virtual:first#file:../wake", Some("npm:1.0.0")),
@@ -863,11 +921,13 @@ mod tests {
         ]));
 
         assert_eq!(
-            manifest.resolve_bare(
-                "ui",
-                Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
-            ),
-            Err(PnpError::AmbiguousIssuer)
+            manifest
+                .resolve_bare(
+                    "ui",
+                    Path::new(".yarn/unplugged/wake/node_modules/wake/internal")
+                )
+                .unwrap(),
+            PathBuf::from("../../cache/ui-v2/node_modules/ui")
         );
     }
 

@@ -16,7 +16,7 @@
 10. [CRAB_UI_INTEGRATION.md](CRAB_UI_INTEGRATION.md)：UI 组件的文档站适配、迁移桥和 PnP 验证。
 11. [decisions/](decisions/)：架构决策历史、替代关系、证据和删除计划。
 
-可执行 crate 边界以 [architecture-boundaries.json](architecture-boundaries.json) 为唯一事实来源，通过 `npm run architecture:check` 校验；叙述性文档只解释边界意图，不复制规则。
+可执行 crate 边界以 [architecture-boundaries.json](architecture-boundaries.json) 为唯一事实来源，通过 `corepack yarn architecture:check` 校验；叙述性文档只解释边界意图，不复制规则。
 
 ## 文档边界
 
@@ -28,9 +28,9 @@
 ## 更新规则
 
 - 修改公开 Node API 时同步更新 `npm/wake/index.d.ts`、测试和用户 API 参考。
-- 修改 CLI 或配置字段时同步更新 CLI/配置参考并运行 `npm run docs:check`。
+- 修改 CLI 或配置字段时同步更新 CLI/配置参考并运行 `corepack yarn docs:check`。
 - 修改 crate 边界、缓存身份、并发协议或发布矩阵时同步更新对应工程文档。
-- 修改机器边界时必须引用一份 `proposed` 或 `accepted` ADR，并运行 `npm run architecture:check`。
+- 修改机器边界时必须引用一份 `proposed` 或 `accepted` ADR，并运行 `corepack yarn architecture:check`。
 - 性能结论必须包含命令、提交、工具链和环境；没有可复现数据时只描述方法。
 - `AUDIT.md` 只记录可由源码、测试或命令复现的事实，推断必须显式标注。
 

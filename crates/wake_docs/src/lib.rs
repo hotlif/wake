@@ -489,8 +489,8 @@ pub fn generate_with_mode(
         generated_dir: generated_dir.clone(),
         entry: generated_dir.join(entry_relative),
         aliases: vec![
-            ("@wake/docs".to_string(), generated_dir),
-            ("@wake/docs-project".to_string(), root),
+            ("@@wake/docs".to_string(), generated_dir),
+            ("@@wake/docs-project".to_string(), root),
         ],
         watch_roots,
         routes,
@@ -600,7 +600,7 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
     let rewritten_esm = rewrite_relative_imports(root, path, &esm);
     let meta_json = serde_json::to_string(&route).expect("serializable route");
     let mut module = format!(
-        "import {{ MdxPage, Demo, Demos, API, CodeBlock }} from \"@wake/docs/runtime/app.tsx\";\n{rewritten_esm}\nexport const __wakeMeta = {meta_json};\nexport default function WakeMdxContent() {{\n  return <MdxPage meta={{__wakeMeta}}>\n{body}  </MdxPage>;\n}}\n"
+        "import {{ MdxPage, Demo, Demos, API, CodeBlock }} from \"@@wake/docs/runtime/app.tsx\";\n{rewritten_esm}\nexport const __wakeMeta = {meta_json};\nexport default function WakeMdxContent() {{\n  return <MdxPage meta={{__wakeMeta}}>\n{body}  </MdxPage>;\n}}\n"
     );
     let map_name = path
         .with_extension("tsx.map")
@@ -1018,7 +1018,7 @@ fn compile_demos(
             warnings,
             source,
             source_module,
-            import_path: format!("@wake/docs-project/{id}"),
+            import_path: format!("@@wake/docs-project/{id}"),
         });
     }
     demos.sort_by(|left, right| {
@@ -1485,7 +1485,7 @@ fn render_registry(
             .with_extension("tsx");
         let meta = serde_json::to_string(&page.route).expect("serializable route");
         output.push_str(&format!(
-            "  {{ ...{meta}, load: () => import(\"@wake/docs/pages/{}\") }},\n",
+            "  {{ ...{meta}, load: () => import(\"@@wake/docs/pages/{}\") }},\n",
             slash_path(relative)
         ));
     }
@@ -1502,7 +1502,7 @@ fn render_registry(
         }))
         .expect("serializable demo metadata");
         output.push_str(&format!(
-            "  {{ ...{metadata}, load: () => import({}), loadSource: () => import(\"@wake/docs/demo-source/{}\") }},\n",
+            "  {{ ...{metadata}, load: () => import({}), loadSource: () => import(\"@@wake/docs/demo-source/{}\") }},\n",
             js_string(&demo.import_path),
             demo.source_module
         ));
@@ -2659,7 +2659,7 @@ fn rewrite_relative_imports(root: &Path, page: &Path, esm: &str) -> String {
             let resolved = normalize_path(&page.parent().unwrap_or(root).join(&captures[2]));
             if let Ok(relative) = resolved.strip_prefix(root) {
                 format!(
-                    "{}@wake/docs-project/{}{}",
+                    "{}@@wake/docs-project/{}{}",
                     &captures[1],
                     slash_path(relative),
                     &captures[3]
@@ -3170,7 +3170,7 @@ fn root_relative_alias(root: &Path, path: &Path) -> Result<String, DocsError> {
     let relative = normalized.strip_prefix(root).map_err(|_| {
         DocsError::InvalidConfig(format!("`{}` must be inside project root", path.display()))
     })?;
-    Ok(format!("@wake/docs-project/{}", slash_path(relative)))
+    Ok(format!("@@wake/docs-project/{}", slash_path(relative)))
 }
 
 fn absolute_from(root: &Path, path: &Path) -> PathBuf {
@@ -3374,7 +3374,7 @@ mod tests {
             generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
         assert!(page.contains(r#"import \"./styles.css\";"#));
-        assert!(!page.contains("@wake/docs-project/docs/styles.css"));
+        assert!(!page.contains("@@wake/docs-project/docs/styles.css"));
     }
 
     #[test]
@@ -3426,7 +3426,7 @@ import Badge from "../src/badge.tsx"
         assert_eq!(generated.routes.len(), 1);
         assert_eq!(generated.routes[0].slug, "/button");
         let page = fs::read_to_string(generated.generated_dir.join("pages/button.tsx")).unwrap();
-        assert!(page.contains("@wake/docs-project/src/badge.tsx"));
+        assert!(page.contains("@@wake/docs-project/src/badge.tsx"));
         assert!(page.contains("<table>"));
         assert!(page.contains("<Badge>{1 + 1}</Badge>"));
         assert!(page.contains("__wakePage"));
@@ -3960,7 +3960,7 @@ pages = ["build"]
         )
         .unwrap();
         assert!(explicit.contains(
-            r#"export { default as Preview } from "@wake/docs-project/docs/preview.tsx";"#
+            r#"export { default as Preview } from "@@wake/docs-project/docs/preview.tsx";"#
         ));
         assert!(!explicit.contains("demo-default-preview"));
     }

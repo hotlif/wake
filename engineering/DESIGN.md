@@ -56,7 +56,15 @@ Codegen 直接写字符串并根据优先级补括号。Source Map 记录生成�
 
 ## 5.1 Resolver
 
-Resolver 支持相对路径、node_modules、package exports、alias、workspace 和 Yarn PnP zip。Components 模式可配置按 issuer 包名、目标依赖和 provider issuer 限定的 PnP fallback；它只处理未声明依赖或未满足 peer，不绕过 alias、正常依赖、顶层 fallback 或 exports 错误。同一物理路径对应多个 PnP locator 时，依赖目标必须唯一或等价，否则报告歧义。缓存按解析上下文隔离；结构性文件变化需要清理相关命中与 miss。
+`ResolutionEnvironment` 是唯一解析所有者，统一持有基础/PnP/zip 文件系统、按 issuer 发现的最近 PnP
+根、经典 Node 后端、Resolver 与成功/失败缓存。`.pnp.cjs` 存在即启用 PnP；非内联 loader 读取匹配 data，损坏清单返回
+`PnpManifest` 诊断且禁止命中 `node_modules`。有效 npm 裸包在受管理 issuer 中先于 Wake alias，并由
+Yarn locator、alias dependency、peer/virtual/unplugged 与 fallback 的成功或拒绝最终裁决；非 npm 包名的
+Wake 路径 alias 保留。ignore pattern 或 unmanaged issuer 执行 Yarn 指定的经典 Node 解析，无 PnP 根
+时使用普通 Wake alias/node_modules 行为。npm 的 nested/scoped/workspace/subpath/exports 均由已安装
+文件树解析；`package-lock.json` 不被求解，但其变化会失效解析和模块拓扑。zip 支持 STORE 与 DEFLATE；
+PnP 清单、data 或 lock 变化会清除清单、解析和模块拓扑缓存。Components 不拥有 resolver fallback，旧归档元数据由 Yarn
+`packageExtensions` 声明。
 
 ## 5.2 Scan
 

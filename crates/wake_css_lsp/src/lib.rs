@@ -18,7 +18,7 @@ use wake_css_language::{
     CompletionKind as CssCompletionKind, HostLanguage, LanguageDiagnostic, LanguageDocument,
     LanguageSeverity, SemanticKind, TextEdit as CssTextEdit,
 };
-use wake_resolver::{PnpFileSystem, PnpManifest, Resolver};
+use wake_resolver::{ResolutionEnvironment, ResolveErrorKind, Resolver};
 
 const LIVE_DEBOUNCE: Duration = Duration::from_millis(150);
 const CLOSED_CACHE_ENTRIES: usize = 512;
@@ -174,13 +174,12 @@ impl DependencyCache {
 
 struct ResolverContext {
     fs: Arc<dyn FileSystem>,
-    resolver: Resolver,
+    resolver: Arc<Resolver>,
+    environment: ResolutionEnvironment,
 }
 
 struct WorkspaceAnalyzer {
-    os_fs: Arc<dyn FileSystem>,
-    default_context: Arc<ResolverContext>,
-    pnp_contexts: Mutex<HashMap<PathBuf, Arc<ResolverContext>>>,
+    context: Arc<ResolverContext>,
     cache: Mutex<DependencyCache>,
     reverse_imports: Mutex<HashMap<PathBuf, HashSet<PathBuf>>>,
 }
@@ -188,13 +187,13 @@ struct WorkspaceAnalyzer {
 impl WorkspaceAnalyzer {
     fn new() -> Self {
         let os_fs: Arc<dyn FileSystem> = Arc::new(OsFileSystem);
+        let environment = ResolutionEnvironment::new(os_fs);
         Self {
-            default_context: Arc::new(ResolverContext {
-                fs: Arc::clone(&os_fs),
-                resolver: Resolver::new(Arc::clone(&os_fs)),
+            context: Arc::new(ResolverContext {
+                fs: environment.file_system(),
+                resolver: environment.resolver(),
+                environment,
             }),
-            os_fs,
-            pnp_contexts: Mutex::new(HashMap::new()),
             cache: Mutex::new(DependencyCache::default()),
             reverse_imports: Mutex::new(HashMap::new()),
         }
@@ -205,35 +204,23 @@ impl WorkspaceAnalyzer {
         path: &Path,
         document: &LanguageDocument,
         open: &HashMap<PathBuf, Arc<LanguageDocument>>,
-    ) -> Scope {
+    ) -> (Scope, Vec<LanguageDiagnostic>) {
         let context = self.resolver_context(path);
-        self.imported_scope_inner(path, document, open, &context, &mut HashSet::new(), 0)
+        let mut diagnostics = Vec::new();
+        let scope = self.imported_scope_inner(
+            path,
+            document,
+            open,
+            &context,
+            &mut HashSet::new(),
+            &mut diagnostics,
+            0,
+        );
+        (scope, diagnostics)
     }
 
-    fn resolver_context(&self, path: &Path) -> Arc<ResolverContext> {
-        let from_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let Some(root) = PnpManifest::discover_root(self.os_fs.as_ref(), from_dir) else {
-            return Arc::clone(&self.default_context);
-        };
-        if let Some(context) = self
-            .pnp_contexts
-            .lock()
-            .expect("PnP resolver context lock")
-            .get(&root)
-            .cloned()
-        {
-            return context;
-        }
-        let Some(manifest) = PnpManifest::load(self.os_fs.as_ref(), &root) else {
-            return Arc::clone(&self.default_context);
-        };
-        let fs: Arc<dyn FileSystem> = Arc::new(PnpFileSystem::new(Arc::clone(&self.os_fs)));
-        let context = Arc::new(ResolverContext {
-            resolver: Resolver::with_pnp(Arc::clone(&fs), Arc::new(manifest)),
-            fs,
-        });
-        let mut contexts = self.pnp_contexts.lock().expect("PnP resolver context lock");
-        Arc::clone(contexts.entry(root).or_insert(context))
+    fn resolver_context(&self, _path: &Path) -> Arc<ResolverContext> {
+        Arc::clone(&self.context)
     }
 
     fn imported_scope_inner(
@@ -243,6 +230,7 @@ impl WorkspaceAnalyzer {
         open: &HashMap<PathBuf, Arc<LanguageDocument>>,
         context: &ResolverContext,
         visiting: &mut HashSet<PathBuf>,
+        diagnostics: &mut Vec<LanguageDiagnostic>,
         depth: usize,
     ) -> Scope {
         if depth >= CLOSED_CACHE_ENTRIES || !visiting.insert(path.to_path_buf()) {
@@ -254,8 +242,24 @@ impl WorkspaceAnalyzer {
             if import.specifier == "@crab-dev/css" || import.imported == "*" {
                 continue;
             }
-            let Ok(dependency_path) = context.resolver.resolve(&import.specifier, from_dir) else {
-                continue;
+            let dependency_path = match context.resolver.resolve(&import.specifier, from_dir) {
+                Ok(path) => path,
+                Err(error) => {
+                    if !matches!(error.kind(), ResolveErrorKind::NotFound) {
+                        diagnostics.push(LanguageDiagnostic {
+                            span: Span::DUMMY,
+                            severity: LanguageSeverity::Error,
+                            code: match error.kind() {
+                                ResolveErrorKind::PnpManifest(_) => "WAKE_PNP_MANIFEST",
+                                ResolveErrorKind::PnpDependency(_) => "WAKE_PNP_DEPENDENCY",
+                                ResolveErrorKind::NotFound => unreachable!(),
+                            }
+                            .to_string(),
+                            message: error.to_string(),
+                        });
+                    }
+                    continue;
+                }
             };
             self.reverse_imports
                 .lock()
@@ -276,6 +280,7 @@ impl WorkspaceAnalyzer {
                 open,
                 context,
                 visiting,
+                diagnostics,
                 depth + 1,
             );
             let exports = dependency.static_exports(&dependency_scope);
@@ -338,12 +343,11 @@ impl WorkspaceAnalyzer {
         let pnp_manifest_changed = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, ".pnp.cjs" | ".pnp.data.json"));
+            .is_some_and(|name| matches!(name, ".pnp.cjs" | ".pnp.data.json" | "yarn.lock"));
         if pnp_manifest_changed {
-            self.pnp_contexts
-                .lock()
-                .expect("PnP resolver context lock")
-                .clear();
+            self.context
+                .environment
+                .invalidate_paths(std::iter::once(path));
             self.cache.lock().expect("dependency cache lock").clear();
         } else {
             self.cache
@@ -500,8 +504,9 @@ impl Backend {
             let mut diagnostics = tokio::task::spawn_blocking(move || {
                 let mut diagnostics = analysis_for_task.diagnostics().to_vec();
                 if compatible {
-                    let imported =
+                    let (imported, resolution_diagnostics) =
                         workspace.imported_scope(&path_for_task, &analysis_for_task, &open);
+                    diagnostics.extend(resolution_diagnostics);
                     diagnostics.extend(
                         analysis_for_task
                             .compiler_diagnostics(&path_for_task.to_string_lossy(), &imported),
@@ -1366,7 +1371,9 @@ mod tests {
         ));
         let workspace = WorkspaceAnalyzer::new();
         let open = HashMap::from([(component.clone(), Arc::clone(&document))]);
-        let imported = workspace.imported_scope(&component, &document, &open);
+        let (imported, resolution_diagnostics) =
+            workspace.imported_scope(&component, &document, &open);
+        assert!(resolution_diagnostics.is_empty());
         assert_eq!(
             imported.get("color"),
             Some(&StaticValue::Str("red".to_string()))
@@ -1391,7 +1398,11 @@ mod tests {
         let spin = root.join("packages/spin");
         std::fs::create_dir_all(button.join("src")).unwrap();
         std::fs::create_dir_all(spin.join("esm")).unwrap();
-        std::fs::write(root.join(".pnp.cjs"), "").unwrap();
+        std::fs::write(
+            root.join(".pnp.cjs"),
+            "module.exports = require('./.pnp.data.json');",
+        )
+        .unwrap();
         std::fs::write(
             root.join(".pnp.data.json"),
             r#"{
@@ -1455,7 +1466,9 @@ mod tests {
             "defineTokens export must be frozen: {exports:?}"
         );
         let open = HashMap::from([(component.clone(), Arc::clone(&document))]);
-        let imported = workspace.imported_scope(&component, &document, &open);
+        let (imported, resolution_diagnostics) =
+            workspace.imported_scope(&component, &document, &open);
+        assert!(resolution_diagnostics.is_empty());
         assert!(
             matches!(imported.get("spinVars"), Some(StaticValue::Frozen(_))),
             "PnP workspace export must enter the compiler scope: {imported:?}"
@@ -1466,14 +1479,38 @@ mod tests {
                 .is_empty(),
             "PnP workspace static interpolation must not be reported as dynamic"
         );
-        assert_eq!(
-            workspace
-                .pnp_contexts
-                .lock()
-                .expect("PnP resolver context lock")
-                .len(),
-            1
-        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn broken_pnp_manifest_is_reported_instead_of_using_the_default_resolver() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("wake-css-lsp-broken-pnp-{unique}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".pnp.cjs"), "module.exports = {").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/ghost")).unwrap();
+        std::fs::write(
+            root.join("node_modules/ghost/index.js"),
+            "export const color = 'red';",
+        )
+        .unwrap();
+        let component = root.join("src/component.ts");
+        let source = "import { color } from 'ghost'; export const value = color;";
+        std::fs::write(&component, source).unwrap();
+        let document = Arc::new(LanguageDocument::analyze(
+            component.to_string_lossy(),
+            source,
+            HostLanguage::TypeScript,
+        ));
+        let workspace = WorkspaceAnalyzer::new();
+        let open = HashMap::from([(component.clone(), Arc::clone(&document))]);
+        let (_, diagnostics) = workspace.imported_scope(&component, &document, &open);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "WAKE_PNP_MANIFEST");
+        assert!(diagnostics[0].message.contains(".pnp.cjs"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

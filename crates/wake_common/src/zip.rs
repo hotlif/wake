@@ -1,20 +1,18 @@
-//! # 极简 ZIP 归档读取器（仅 stored/无压缩）
+//! # Yarn PnP ZIP 归档读取器（stored + DEFLATE）
 //!
-//! 为支持 Yarn PnP 的 zip-backed 缓存而生（DESIGN §5.1 扩展）。Yarn Berry 把每个包**无压缩地**
-//! （compression method 0 = stored）打进 `*.zip`，以便 mmap/零解压读取。因此这里**只需**解析
-//! ZIP 目录结构、按偏移取原始字节，**不需要 DEFLATE 解压器**——契合自研内核 + 依赖白名单路线
-//! （零新依赖，纯 std）。
+//! 为支持 Yarn PnP 的 zip-backed 缓存而生（DESIGN §5.1 扩展）。Yarn `compressionLevel`
+//! 可生成 stored（method 0）或 DEFLATE（method 8）条目；两者都必须透明读取。
 //!
-//! 若遇到 method != 0（deflate）或 ZIP64 归档，返回错误而非静默出错——Yarn 缓存不会命中这些，
-//! 但显式拒绝好过产出损坏字节。
+//! 若遇到 Yarn 不会生成的其他压缩算法或 ZIP64 归档，返回错误而非静默出错。
 //!
 //! ## 布局速览
 //! - **EOCD**（End Of Central Directory，签名 `50 4B 05 06`）：从文件尾反扫定位，给出中央目录偏移/条目数。
 //! - **中央目录头**（`50 4B 01 02`）：每条目的文件名、压缩方式、（未压缩）大小、local header 偏移。
 //! - **local file header**（`50 4B 03 04`）：数据前的头，数据始于 `local_off + 30 + 名长 + extra 长`。
 
-use std::io;
+use std::io::{self, Read};
 
+use flate2::read::DeflateDecoder;
 use rustc_hash::FxHashMap;
 
 /// 一条归档条目的定位信息。
@@ -22,7 +20,9 @@ use rustc_hash::FxHashMap;
 struct Entry {
     /// local file header 在归档中的字节偏移。
     local_header_offset: u32,
-    /// 未压缩大小（stored 下 == 压缩大小）。
+    compression_method: u16,
+    compressed_size: u32,
+    /// 未压缩大小。
     size: u32,
 }
 
@@ -64,6 +64,7 @@ impl ZipArchive {
                 return Err(corrupt("中央目录头签名不符"));
             }
             let method = read_u16(&bytes, off + 10).ok_or_else(|| corrupt("头截断"))?;
+            let compressed_size = read_u32(&bytes, off + 20).ok_or_else(|| corrupt("头截断"))?;
             let size = read_u32(&bytes, off + 24).ok_or_else(|| corrupt("头截断"))?;
             let name_len = read_u16(&bytes, off + 28).ok_or_else(|| corrupt("头截断"))? as usize;
             let extra_len = read_u16(&bytes, off + 30).ok_or_else(|| corrupt("头截断"))? as usize;
@@ -74,21 +75,22 @@ impl ZipArchive {
                 .get(name_start..name_start + name_len)
                 .ok_or_else(|| corrupt("文件名截断"))?;
             let name = String::from_utf8_lossy(name_bytes).into_owned();
-            // stored(0) 才支持；deflate 等直接拒绝（Yarn 缓存全 stored，不会命中）。
-            // 目录条目（size 0、名以 `/` 结尾）压缩方式恒为 0，不受影响。
-            if method != 0 {
+            // Yarn compressionLevel 0..9 只会生成 stored(0) 或 DEFLATE(8)。
+            if !matches!(method, 0 | 8) {
                 return Err(corrupt(&format!(
-                    "不支持的压缩方式 {method}（仅 stored）：{name}"
+                    "不支持的压缩方式 {method}（仅 stored/DEFLATE）：{name}"
                 )));
             }
             // ZIP64 哨兵：偏移/大小为全 1 表示真值在 extra 区——Yarn 缓存不会触及，显式拒绝。
-            if local_off == 0xFFFF_FFFF || size == 0xFFFF_FFFF {
+            if local_off == 0xFFFF_FFFF || compressed_size == 0xFFFF_FFFF || size == 0xFFFF_FFFF {
                 return Err(corrupt("不支持 ZIP64 归档"));
             }
             entries.insert(
                 normalize_entry(&name),
                 Entry {
                     local_header_offset: local_off,
+                    compression_method: method,
+                    compressed_size,
                     size,
                 },
             );
@@ -97,20 +99,51 @@ impl ZipArchive {
         Ok(ZipArchive { bytes, entries })
     }
 
-    /// 读取一个内部文件为原始字节切片（不拷贝）。目录 / 不存在 → `None`。
-    pub fn read(&self, inner: &str) -> Option<&[u8]> {
+    /// 读取一个内部文件。目录 / 不存在 → `Ok(None)`；损坏条目返回错误。
+    pub fn read(&self, inner: &str) -> io::Result<Option<Vec<u8>>> {
         let key = normalize_entry(inner);
         if key.ends_with('/') {
-            return None; // 目录不可读为文件
+            return Ok(None); // 目录不可读为文件
         }
-        let e = self.entries.get(&key)?;
+        let Some(e) = self.entries.get(&key) else {
+            return Ok(None);
+        };
         let lo = e.local_header_offset as usize;
+        if read_u32(&self.bytes, lo) != Some(0x0403_4b50) {
+            return Err(corrupt("local file header 签名不符"));
+        }
         // local header 固定 30 字节，随后是文件名与 extra；数据在其后。
         // 中央目录的名长/extra 长可能与 local header 不同（extra 常不同），故必须读 local header 自身的两个长度。
-        let name_len = read_u16(&self.bytes, lo + 26)? as usize;
-        let extra_len = read_u16(&self.bytes, lo + 28)? as usize;
+        let name_len =
+            read_u16(&self.bytes, lo + 26).ok_or_else(|| corrupt("local header 截断"))? as usize;
+        let extra_len =
+            read_u16(&self.bytes, lo + 28).ok_or_else(|| corrupt("local header 截断"))? as usize;
         let data_start = lo + 30 + name_len + extra_len;
-        self.bytes.get(data_start..data_start + e.size as usize)
+        let compressed = self
+            .bytes
+            .get(data_start..data_start + e.compressed_size as usize)
+            .ok_or_else(|| corrupt("条目数据截断"))?;
+        let data = match e.compression_method {
+            0 => {
+                if e.compressed_size != e.size {
+                    return Err(corrupt("stored 条目压缩与未压缩大小不一致"));
+                }
+                compressed.to_vec()
+            }
+            8 => {
+                let mut decoder = DeflateDecoder::new(compressed);
+                let mut output = Vec::with_capacity(e.size as usize);
+                decoder
+                    .read_to_end(&mut output)
+                    .map_err(|error| corrupt(&format!("DEFLATE 解压失败：{error}")))?;
+                if output.len() != e.size as usize {
+                    return Err(corrupt("DEFLATE 解压后大小不符"));
+                }
+                output
+            }
+            _ => unreachable!("unsupported compression rejected during parse"),
+        };
+        Ok(Some(data))
     }
 
     /// 该内部路径是否为一个文件条目。
@@ -202,6 +235,8 @@ fn find_eocd(bytes: &[u8]) -> io::Result<(u32, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::DeflateEncoder};
+    use std::io::Write;
 
     /// 手工构造一个含两个 stored 条目 + 一个目录条目的最小 zip。
     fn tiny_zip() -> Vec<u8> {
@@ -280,12 +315,68 @@ mod tests {
     #[test]
     fn reads_stored_entries() {
         let z = ZipArchive::parse(tiny_zip()).unwrap();
-        assert_eq!(z.read("a.txt"), Some(&b"hello"[..]));
-        assert_eq!(z.read("d/b.txt"), Some(&b"hi"[..]));
-        assert_eq!(z.read("missing.txt"), None);
+        assert_eq!(z.read("a.txt").unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(z.read("d/b.txt").unwrap(), Some(b"hi".to_vec()));
+        assert_eq!(z.read("missing.txt").unwrap(), None);
         // 目录不可读为文件。
-        assert_eq!(z.read("d/"), None);
-        assert_eq!(z.read("d"), None);
+        assert_eq!(z.read("d/").unwrap(), None);
+        assert_eq!(z.read("d").unwrap(), None);
+    }
+
+    fn one_entry_zip(method: u16, name: &str, original: &[u8], compressed: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&method.to_le_bytes());
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(compressed);
+
+        let cd_start = buf.len() as u32;
+        buf.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&method.to_le_bytes());
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        let cd_size = buf.len() as u32 - cd_start;
+
+        buf.extend_from_slice(&EOCD_SIG.to_le_bytes());
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&[0; 2]);
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&cd_size.to_le_bytes());
+        buf.extend_from_slice(&cd_start.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn reads_deflate_entries() {
+        let original = b"Yarn compressionLevel 9 works for Wake PnP";
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let z = ZipArchive::parse(one_entry_zip(8, "pkg/index.js", original, &compressed)).unwrap();
+        assert_eq!(z.read("pkg/index.js").unwrap(), Some(original.to_vec()));
     }
 
     #[test]

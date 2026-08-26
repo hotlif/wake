@@ -27,8 +27,8 @@ import {
   Tree,
   type TreeNode,
 } from "@crab-dev/wake/internal/components-runtime";
-import { demos } from "@wake/docs/registry.ts";
-import { siteConfig } from "@wake/docs/config.tsx";
+import { demos } from "@@wake/docs/registry.ts";
+import { siteConfig } from "@@wake/docs/config.tsx";
 import { applyLocationArgs, equalValue, locationHash, readLocationHash } from "./components-state.mjs";
 
 type DemoRecord = (typeof demos)[number];

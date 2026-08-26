@@ -18,7 +18,7 @@ use wake_ecma_codegen::{
 use wake_ecma_minify::MinifyCtx;
 use wake_ecma_parser::{ParseOutput, parse};
 use wake_ecma_semantic::{DeclKind, analyze};
-use wake_resolver::{ModuleIdentity, PnpFileSystem, PnpManifest, ResolveOptions, Resolver};
+use wake_resolver::{ModuleIdentity, ResolutionEnvironment, ResolveOptions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LibraryDependencyTarget {
@@ -123,16 +123,9 @@ impl LibraryGraph {
         }
 
         let os: Arc<dyn FileSystem> = Arc::new(OsFileSystem);
-        let pnp = PnpManifest::discover(os.as_ref(), &root);
-        let (fs, resolver): (Arc<dyn FileSystem>, Resolver) = if let Some(manifest) = pnp {
-            let fs: Arc<dyn FileSystem> = Arc::new(PnpFileSystem::new(os));
-            let resolver =
-                Resolver::with_pnp_options(Arc::clone(&fs), Arc::new(manifest), options.resolve);
-            (fs, resolver)
-        } else {
-            let resolver = Resolver::with_options(Arc::clone(&os), options.resolve);
-            (os, resolver)
-        };
+        let environment = ResolutionEnvironment::with_options(os, options.resolve);
+        let fs = environment.file_system();
+        let resolver = environment.resolver();
 
         let analysis_packages: FxHashSet<String> = options.analysis_packages.into_iter().collect();
         let interner = Interner::new();

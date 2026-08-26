@@ -1,6 +1,6 @@
 //! 打包器测试：结构断言 + node 端到端执行（3.6）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use wake_common::{MemoryFileSystem, OsFileSystem};
@@ -5037,6 +5037,57 @@ fn pnp_project_resolves_via_manifest() {
     // index + dep-a + dep-c + dep-b/sub = 4 模块（全部经 PnP 依赖图定位，无 node_modules）。
     assert_eq!(out.module_count, 4, "应打包 4 个模块");
     assert!(out.bundle.contains("__wake_require__"));
+}
+
+#[test]
+fn npm_package_lock_change_recovers_and_reloads_classic_topology() {
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "project/src/index.js",
+            "import value from 'installed'; export const result = value;",
+        ),
+        ("project/package-lock.json", "{ deliberately malformed"),
+    ]));
+    let mut bundler = IncrementalBundler::new(fs.clone());
+    bundler.enable_load_cache();
+
+    let missing = bundler.build(Path::new("project/src/index.js"));
+    assert!(missing.has_errors(), "the package is not installed yet");
+    assert!(!bundler.is_pnp(), "package-lock.json must not activate PnP");
+
+    fs.insert(
+        "project/node_modules/installed/package.json",
+        r#"{"main":"v1.js"}"#,
+    );
+    fs.insert(
+        "project/node_modules/installed/v1.js",
+        "export default 'NPM_VERSION_ONE';",
+    );
+    fs.insert(
+        "project/node_modules/installed/v2.js",
+        "export default 'NPM_VERSION_TWO';",
+    );
+    fs.insert("project/package-lock.json", r#"{"lockfileVersion":3}"#);
+    bundler.invalidate_paths(&[PathBuf::from("project/package-lock.json")], false);
+
+    let installed = bundler.build(Path::new("project/src/index.js"));
+    assert!(!installed.has_errors(), "{:?}", installed.diagnostics);
+    assert!(installed.bundle.contains("NPM_VERSION_ONE"));
+
+    fs.insert(
+        "project/node_modules/installed/package.json",
+        r#"{"main":"v2.js"}"#,
+    );
+    fs.insert(
+        "project/package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{"node_modules/installed":{"version":"2.0.0"}}}"#,
+    );
+    bundler.invalidate_paths(&[PathBuf::from("project/package-lock.json")], false);
+
+    let switched = bundler.build(Path::new("project/src/index.js"));
+    assert!(!switched.has_errors(), "{:?}", switched.diagnostics);
+    assert!(switched.bundle.contains("NPM_VERSION_TWO"));
+    assert!(!switched.bundle.contains("NPM_VERSION_ONE"));
 }
 
 #[test]

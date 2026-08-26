@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-const NPM_CI_HINT: &str =
-    "run `npm ci` from the Wake workspace root; build.rs never downloads JavaScript packages";
+const YARN_INSTALL_HINT: &str = "run `yarn install --immutable --check-cache` from the Wake workspace root; build.rs never downloads JavaScript packages";
 
 struct PackageSpec {
     name: &'static str,
@@ -60,11 +60,16 @@ fn generate() -> Result<(), String> {
             manifest.display()
         )
     })?;
-    let node_modules = workspace.join("node_modules");
+    let package_roots = resolve_package_roots(workspace)?;
     let mut files = BTreeMap::new();
 
     for package in PACKAGES {
-        let root = node_modules.join(package.name);
+        let root = package_roots.get(package.name).ok_or_else(|| {
+            format!(
+                "PnP helper did not return {}@{}; {YARN_INSTALL_HINT}",
+                package.name, package.version
+            )
+        })?;
         validate_package(&root, package)?;
         for (relative_root, key_prefix) in package.embedded_roots {
             let source_root = root.join(relative_root);
@@ -101,12 +106,57 @@ fn generate() -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_package_roots(workspace: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    let helper = workspace.join("scripts/resolve-embedded-packages.mjs");
+    println!("cargo:rerun-if-changed={}", helper.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace.join(".pnp.cjs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace.join(".pnp.data.json").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace.join("yarn.lock").display()
+    );
+    let node = env::var_os("NODE").unwrap_or_else(|| "node".into());
+    let mut command = Command::new(node);
+    command.arg(&helper);
+    for package in PACKAGES {
+        command.arg(package.name).arg(package.version);
+    }
+    let output = command.output().map_err(|error| {
+        format!(
+            "could not run PnP package helper {} ({error}); {YARN_INSTALL_HINT}",
+            helper.display()
+        )
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "PnP package helper failed: {}; {YARN_INSTALL_HINT}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("PnP package helper emitted invalid UTF-8: {error}"))?;
+    let mut roots = BTreeMap::new();
+    for line in stdout.lines() {
+        let (name, root) = line
+            .split_once('\t')
+            .ok_or_else(|| format!("invalid PnP package helper output: {line:?}"))?;
+        roots.insert(name.to_string(), PathBuf::from(root));
+    }
+    Ok(roots)
+}
+
 fn validate_package(root: &Path, expected: &PackageSpec) -> Result<(), String> {
     let metadata_path = root.join("package.json");
     println!("cargo:rerun-if-changed={}", metadata_path.display());
     let metadata = fs::read_to_string(&metadata_path).map_err(|error| {
         format!(
-            "Wake requires npm package {}@{} at {} ({error}); {NPM_CI_HINT}",
+            "Wake requires Yarn PnP package {}@{} at {} ({error}); {YARN_INSTALL_HINT}",
             expected.name,
             expected.version,
             metadata_path.display()
@@ -114,19 +164,19 @@ fn validate_package(root: &Path, expected: &PackageSpec) -> Result<(), String> {
     })?;
     let name = json_string_field(&metadata, "name").ok_or_else(|| {
         format!(
-            "{} does not contain a string `name`; {NPM_CI_HINT}",
+            "{} does not contain a string `name`; {YARN_INSTALL_HINT}",
             metadata_path.display()
         )
     })?;
     let version = json_string_field(&metadata, "version").ok_or_else(|| {
         format!(
-            "{} does not contain a string `version`; {NPM_CI_HINT}",
+            "{} does not contain a string `version`; {YARN_INSTALL_HINT}",
             metadata_path.display()
         )
     })?;
     if name != expected.name || version != expected.version {
         return Err(format!(
-            "Wake expected npm package {}@{} at {}, found {name}@{version}; {NPM_CI_HINT}",
+            "Wake expected Yarn PnP package {}@{} at {}, found {name}@{version}; {YARN_INSTALL_HINT}",
             expected.name,
             expected.version,
             metadata_path.display()
@@ -177,7 +227,7 @@ fn collect_javascript(
 ) -> Result<(), String> {
     let entries = fs::read_dir(directory).map_err(|error| {
         format!(
-            "could not read JavaScript package directory {} ({error}); {NPM_CI_HINT}",
+            "could not read JavaScript package directory {} ({error}); {YARN_INSTALL_HINT}",
             directory.display()
         )
     })?;

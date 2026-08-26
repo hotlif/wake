@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { parseSyml } from '@yarnpkg/parsers'
 
 const scriptPath = fileURLToPath(import.meta.url)
 const defaultRepoRoot = resolve(dirname(scriptPath), '..')
@@ -294,25 +295,13 @@ export function validateCargoManifestSources({ manifests, workspacePaths, repoRo
   return errors
 }
 
-function npmPackageName(lockPath) {
-  const marker = 'node_modules/'
-  const start = lockPath.lastIndexOf(marker)
-  if (start < 0) return null
-  return lockPath.slice(start + marker.length)
-}
-
-function npmTarball(origin, name, version) {
-  const packageName = name.split('/').at(-1)
-  return `${origin.endsWith('/') ? origin : `${origin}/`}${name}/-/${packageName}-${version}.tgz`
-}
-
 function workspacePatterns(manifest) {
   if (Array.isArray(manifest.workspaces)) return manifest.workspaces
   if (Array.isArray(manifest.workspaces?.packages)) return manifest.workspaces.packages
   return []
 }
 
-export function validateNpmProvenance({
+export function validateYarnProvenance({
   lock,
   rootManifest,
   workspaceManifests,
@@ -320,124 +309,91 @@ export function validateNpmProvenance({
   policy,
 }) {
   const errors = []
-  const internalOptionalPackages = new Map(
-    Object.entries(policy.internalOptionalPackages ?? {})
+  const internalWorkspacePackages = new Map(
+    Object.entries(policy.internalWorkspacePackages ?? {})
       .map(([name, configuredPath]) => [name, repositoryPath(configuredPath)]),
   )
-  if (lock.lockfileVersion !== policy.lockfileVersion) {
-    errors.push(`[dependency-provenance:npm-lock] package-lock.json version must be ${policy.lockfileVersion}; found ${lock.lockfileVersion}`)
+  if (lock.__metadata?.version !== String(policy.lockfileVersion)) {
+    errors.push(`[dependency-provenance:yarn-lock] yarn.lock version must be ${policy.lockfileVersion}; found ${lock.__metadata?.version ?? 'missing'}`)
   }
-  if (lock.requires !== true) {
-    errors.push('[dependency-provenance:npm-lock] package-lock.json must set requires=true')
+  if (rootManifest.packageManager !== policy.packageManager) {
+    errors.push(`[dependency-provenance:yarn-manager] package.json packageManager must be ${policy.packageManager}; found ${rootManifest.packageManager ?? 'missing'}`)
   }
 
   const manifests = new Map([['', rootManifest], ...workspaceManifests])
   for (const [manifestPath, manifest] of manifests) {
     for (const field of npmDependencyFields) {
       for (const [name, locator] of Object.entries(manifest[field] ?? {})) {
-        const internalOptionalPath = internalOptionalPackages.get(name)
-        const isOwnedInternalOptional = (
-          manifestPath === ''
-          && field === 'optionalDependencies'
-          && locator === `file:${internalOptionalPath}`
-        )
-        if (
-          !isOwnedInternalOptional
-          && (/^(?:file|link|workspace|git(?:\+[^:]*)?|https?):/i.test(locator) || /^git@/i.test(locator))
-        ) {
-          errors.push(`[dependency-provenance:npm-source] ${manifestPath || 'package.json'} ${field}.${name} uses non-registry locator ${locator}`)
+        if (/^(?:file|link|portal|git(?:\+[^:]*)?|https?):/i.test(locator) || /^git@/i.test(locator)) {
+          errors.push(`[dependency-provenance:yarn-source] ${manifestPath || 'package.json'} ${field}.${name} uses a forbidden source locator ${locator}`)
+        }
+        if (locator.startsWith('workspace:') && ![...workspaceManifests.values()].some((workspace) => workspace.name === name)) {
+          errors.push(`[dependency-provenance:yarn-workspace] ${manifestPath || 'package.json'} ${field}.${name} points to an undeclared workspace`)
         }
       }
     }
   }
 
-  const expectedLinks = new Map()
+  const workspaceNames = new Set()
   for (const [workspacePath, manifest] of workspaceManifests) {
     if (!manifest.name) {
-      errors.push(`[dependency-provenance:npm-workspace] ${workspacePath}/package.json is missing name`)
+      errors.push(`[dependency-provenance:yarn-workspace] ${workspacePath}/package.json is missing name`)
       continue
     }
-    expectedLinks.set(`node_modules/${manifest.name}`, workspacePath)
-    const lockedWorkspace = lock.packages?.[workspacePath]
-    if (lockedWorkspace?.name !== manifest.name || lockedWorkspace?.version !== manifest.version) {
-      errors.push(`[dependency-provenance:npm-workspace] package-lock entry ${workspacePath} does not match ${manifest.name}@${manifest.version}`)
+    workspaceNames.add(manifest.name)
+    const lockedWorkspace = Object.values(lock).find((entry) => entry?.resolution === `${manifest.name}@workspace:${workspacePath}`)
+    if (!lockedWorkspace || lockedWorkspace.linkType !== 'soft') {
+      errors.push(`[dependency-provenance:yarn-workspace] yarn.lock is missing ${manifest.name}@workspace:${workspacePath}`)
     }
   }
 
   const mainWorkspace = [...workspaceManifests]
     .find(([, manifest]) => manifest.name === '@crab-dev/wake')
-  const expectedInternalLinks = new Map()
-  for (const [name, manifestPath] of internalOptionalPackages) {
+  for (const [name, manifestPath] of internalWorkspacePackages) {
     const internalManifest = internalManifests.get(manifestPath)
     if (
       !internalManifest ||
       internalManifest.name !== name ||
       !exactSemver(internalManifest.version ?? '')
     ) {
-      errors.push(`[dependency-provenance:npm-internal-optional] ${manifestPath}/package.json must define ${name} at one exact version`)
+      errors.push(`[dependency-provenance:yarn-internal-workspace] ${manifestPath}/package.json must define ${name} at one exact version`)
       continue
     }
     if (!mainWorkspace) {
-      errors.push('[dependency-provenance:npm-internal-optional] @crab-dev/wake must be a declared workspace')
+      errors.push('[dependency-provenance:yarn-internal-workspace] @crab-dev/wake must be a declared workspace')
       continue
     }
     const [mainWorkspacePath, mainManifest] = mainWorkspace
     const requested = mainManifest.optionalDependencies?.[name]
     if (requested !== internalManifest.version) {
-      errors.push(`[dependency-provenance:npm-internal-optional] ${mainWorkspacePath}/package.json optionalDependencies.${name} must equal internal ${internalManifest.version}; found ${requested ?? 'missing'}`)
+      errors.push(`[dependency-provenance:yarn-internal-workspace] ${mainWorkspacePath}/package.json optionalDependencies.${name} must equal internal ${internalManifest.version}; found ${requested ?? 'missing'}`)
     }
-    const rootLocator = rootManifest.optionalDependencies?.[name]
-    if (rootLocator !== `file:${manifestPath}`) {
-      errors.push(`[dependency-provenance:npm-internal-optional] package.json optionalDependencies.${name} must equal file:${manifestPath}; found ${rootLocator ?? 'missing'}`)
+    if (Object.hasOwn(rootManifest.optionalDependencies ?? {}, name)) {
+      errors.push(`[dependency-provenance:yarn-internal-workspace] package.json must not contain the retired file: bridge for ${name}`)
     }
-    const lockedInternal = lock.packages?.[manifestPath]
-    if (
-      lockedInternal?.name !== name
-      || lockedInternal?.version !== internalManifest.version
-      || lockedInternal?.optional !== true
-    ) {
-      errors.push(`[dependency-provenance:npm-internal-optional] package-lock entry ${manifestPath} must match optional ${name}@${internalManifest.version}`)
+    if (!workspaceNames.has(name)) {
+      errors.push(`[dependency-provenance:yarn-internal-workspace] ${name} must be a declared workspace`)
     }
-    expectedInternalLinks.set(`node_modules/${name}`, {
-      name,
-      manifestPath,
-    })
   }
 
-  const seenLinks = new Set()
-  const origins = policy.allowedRegistryOrigins ?? []
-  for (const [lockPath, pkg] of Object.entries(lock.packages ?? {})) {
-    if (!lockPath.includes('node_modules/')) continue
-    if (pkg.link === true) {
-      seenLinks.add(lockPath)
-      const expected = expectedLinks.get(lockPath)
-        ?? expectedInternalLinks.get(lockPath)?.manifestPath
-      if (!expected || repositoryPath(pkg.resolved ?? '') !== expected) {
-        errors.push(`[dependency-provenance:npm-link] ${lockPath} must resolve to a declared workspace or internal optional package; found ${pkg.resolved ?? 'missing'}`)
-      }
+  for (const [descriptor, entry] of Object.entries(lock)) {
+    if (descriptor === '__metadata') continue
+    if (!entry || typeof entry !== 'object') {
+      errors.push(`[dependency-provenance:yarn-lock] ${descriptor} is not a valid lock entry`)
       continue
     }
-    const name = npmPackageName(lockPath)
-    if (!name || !exactSemver(pkg.version ?? '')) {
-      errors.push(`[dependency-provenance:npm-lock] ${lockPath} must have an exact SemVer version; found ${pkg.version ?? 'missing'}`)
+    if (entry.resolution?.includes('@workspace:')) {
+      if (entry.linkType !== 'soft') errors.push(`[dependency-provenance:yarn-workspace] ${descriptor} must be a soft workspace locator`)
       continue
     }
-    const origin = origins.find((candidate) => pkg.resolved === npmTarball(candidate, name, pkg.version))
-    if (!origin) {
-      errors.push(`[dependency-provenance:npm-lock] ${lockPath}@${pkg.version} must resolve to its canonical npm registry tarball; found ${pkg.resolved ?? 'missing'}`)
+    if (!exactSemver(entry.version ?? '')) {
+      errors.push(`[dependency-provenance:yarn-lock] ${descriptor} must resolve to an exact SemVer; found ${entry.version ?? 'missing'}`)
     }
-    if (!canonicalSha512(pkg.integrity)) {
-      errors.push(`[dependency-provenance:npm-lock] ${lockPath}@${pkg.version} must carry one canonical SHA-512 integrity`)
+    if (!entry.resolution?.includes('@npm:') && !entry.resolution?.includes('@patch:')) {
+      errors.push(`[dependency-provenance:yarn-resolution] ${descriptor} must use an npm or audited builtin patch resolution; found ${entry.resolution ?? 'missing'}`)
     }
-  }
-  for (const [lockPath, target] of expectedLinks) {
-    if (!seenLinks.has(lockPath)) {
-      errors.push(`[dependency-provenance:npm-link] ${lockPath} -> ${target} is missing from package-lock.json`)
-    }
-  }
-  for (const [lockPath, internal] of expectedInternalLinks) {
-    if (!seenLinks.has(lockPath)) {
-      errors.push(`[dependency-provenance:npm-internal-optional] ${lockPath} must link to ${internal.manifestPath} for ${internal.name}`)
+    if (!entry.conditions && !/^10c0\/[0-9a-f]{128}$/.test(entry.checksum ?? '')) {
+      errors.push(`[dependency-provenance:yarn-checksum] ${descriptor} must carry one canonical Yarn checksum`)
     }
   }
 
@@ -449,16 +405,16 @@ export function validateNpmProvenance({
       }
     }
     if (declarations.length === 0) {
-      errors.push(`[dependency-provenance:npm-pin] no install-bearing manifest pins ${name}@${version}`)
+      errors.push(`[dependency-provenance:yarn-pin] no install-bearing manifest pins ${name}@${version}`)
     }
     for (const [manifestPath, field, locator] of declarations) {
       if (locator !== version) {
-        errors.push(`[dependency-provenance:npm-pin] ${manifestPath} ${field}.${name} must equal ${version}; found ${locator}`)
+        errors.push(`[dependency-provenance:yarn-pin] ${manifestPath} ${field}.${name} must equal ${version}; found ${locator}`)
       }
     }
-    const locked = lock.packages?.[`node_modules/${name}`]
-    if (locked?.version !== version) {
-      errors.push(`[dependency-provenance:npm-pin] package-lock must pin ${name}@${version}; found ${locked?.version ?? 'missing'}`)
+    const locked = Object.values(lock).find((entry) => entry?.resolution === `${name}@npm:${version}`)
+    if (!locked) {
+      errors.push(`[dependency-provenance:yarn-pin] yarn.lock must pin ${name}@npm:${version}`)
     }
   }
   return errors
@@ -609,21 +565,24 @@ export function validatePolicy({ policy, packages, adrRecords, policyPath = 'eng
     if (provenance.cargo?.pathDependencies !== 'workspace-members-only') {
       errors.push(`${policyPath}: dependencyProvenance.cargo.pathDependencies must be workspace-members-only`)
     }
-    if (!Array.isArray(provenance.npm?.allowedRegistryOrigins) || provenance.npm.allowedRegistryOrigins.length !== 1) {
-      errors.push(`${policyPath}: dependencyProvenance.npm must declare exactly one registry origin`)
+    if (!Array.isArray(provenance.yarn?.allowedResolutionProtocols) || !provenance.yarn.allowedResolutionProtocols.includes('npm:')) {
+      errors.push(`${policyPath}: dependencyProvenance.yarn must allow npm: resolutions`)
     }
-    if (provenance.npm?.workspaceLinks !== 'declared-workspaces-only') {
-      errors.push(`${policyPath}: dependencyProvenance.npm.workspaceLinks must be declared-workspaces-only`)
+    if (provenance.yarn?.workspaceLocators !== 'declared-workspaces-only') {
+      errors.push(`${policyPath}: dependencyProvenance.yarn.workspaceLocators must be declared-workspaces-only`)
     }
-    if (typeof provenance.npm?.decision === 'string') decisionPaths.add(provenance.npm.decision)
-    else errors.push(`${policyPath}: dependencyProvenance.npm.decision must reference an ADR`)
+    if (provenance.yarn?.packageManager !== 'yarn@4.16.0') {
+      errors.push(`${policyPath}: dependencyProvenance.yarn.packageManager must be yarn@4.16.0`)
+    }
+    if (typeof provenance.yarn?.decision === 'string') decisionPaths.add(provenance.yarn.decision)
+    else errors.push(`${policyPath}: dependencyProvenance.yarn.decision must reference an ADR`)
     if (
-      !provenance.npm?.internalOptionalPackages ||
-      typeof provenance.npm.internalOptionalPackages !== 'object' ||
-      Array.isArray(provenance.npm.internalOptionalPackages) ||
-      Object.keys(provenance.npm.internalOptionalPackages).length === 0
+      !provenance.yarn?.internalWorkspacePackages ||
+      typeof provenance.yarn.internalWorkspacePackages !== 'object' ||
+      Array.isArray(provenance.yarn.internalWorkspacePackages) ||
+      Object.keys(provenance.yarn.internalWorkspacePackages).length === 0
     ) {
-      errors.push(`${policyPath}: dependencyProvenance.npm.internalOptionalPackages must be a non-empty object`)
+      errors.push(`${policyPath}: dependencyProvenance.yarn.internalWorkspacePackages must be a non-empty object`)
     }
     for (const [dependency, owners] of Object.entries(provenance.cargo?.exclusiveOwners ?? {})) {
       if (!Array.isArray(owners) || owners.length === 0) {
@@ -799,16 +758,16 @@ function npmWorkspaces({ repoRoot, rootManifest, files, errors }) {
   return workspaces
 }
 
-export function checkNpmRepository(
+export function checkYarnRepository(
   repoRoot = defaultRepoRoot,
   { policy: providedPolicy, files: providedFiles } = {},
 ) {
   const errors = []
   const policy = providedPolicy
     ?? readJson(join(repoRoot, 'engineering', 'architecture-boundaries.json'), errors)
-  const npmPolicy = policy?.dependencyProvenance?.npm
-  if (!npmPolicy) {
-    errors.push('engineering/architecture-boundaries.json: dependencyProvenance.npm is required')
+  const yarnPolicy = policy?.dependencyProvenance?.yarn
+  if (!yarnPolicy) {
+    errors.push('engineering/architecture-boundaries.json: dependencyProvenance.yarn is required')
     return errors
   }
   let files = providedFiles
@@ -820,23 +779,28 @@ export function checkNpmRepository(
       return errors
     }
   }
-  const rootManifest = readJson(join(repoRoot, npmPolicy.manifest), errors)
-  const npmLock = readJson(join(repoRoot, npmPolicy.lockfile), errors)
-  if (!rootManifest || !npmLock) return errors
+  const rootManifest = readJson(join(repoRoot, yarnPolicy.manifest), errors)
+  let yarnLock = null
+  try {
+    yarnLock = parseSyml(readFileSync(join(repoRoot, yarnPolicy.lockfile), 'utf8'))
+  } catch (error) {
+    errors.push(`${yarnPolicy.lockfile}: ${error.message}`)
+  }
+  if (!rootManifest || !yarnLock) return errors
 
   const workspaceManifests = npmWorkspaces({ repoRoot, rootManifest, files, errors })
   const internalManifests = new Map()
-  for (const configuredPath of Object.values(npmPolicy.internalOptionalPackages ?? {})) {
+  for (const configuredPath of Object.values(yarnPolicy.internalWorkspacePackages ?? {})) {
     const manifestPath = repositoryPath(configuredPath)
     const manifest = readJson(join(repoRoot, manifestPath, 'package.json'), errors)
     if (manifest) internalManifests.set(manifestPath, manifest)
   }
-  errors.push(...validateNpmProvenance({
-    lock: npmLock,
+  errors.push(...validateYarnProvenance({
+    lock: yarnLock,
     rootManifest,
     workspaceManifests,
     internalManifests,
-    policy: npmPolicy,
+    policy: yarnPolicy,
   }))
   return errors
 }
@@ -922,7 +886,7 @@ export function checkRepository(repoRoot = defaultRepoRoot) {
             repoRoot,
           }))
 
-          errors.push(...checkNpmRepository(repoRoot, { policy, files }))
+          errors.push(...checkYarnRepository(repoRoot, { policy, files }))
         }
       }
     }

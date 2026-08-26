@@ -56,10 +56,10 @@ for (const [name, dependencyVersion] of Object.entries(
   }
 }
 
-const npmCommand = process.platform === 'win32' ? process.execPath : 'npm'
-const npmPrefix = process.platform === 'win32'
-  ? [process.env.npm_execpath || (() => { throw new Error('npm_execpath is required on Windows') })()]
-  : []
+// `npm pack` is intentionally a publication-consumer compatibility check. When this script is
+// launched by Yarn, npm_execpath points at Yarn and must not be reused as though it were npm.
+const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+const npmPrefix = []
 
 for (const { directory, value: packageManifest } of manifests) {
   const isWake = directory === wakePackageDir
@@ -74,6 +74,7 @@ for (const { directory, value: packageManifest } of manifests) {
     {
       cwd: resolve(root, directory),
       encoding: 'utf8',
+      shell: process.platform === 'win32',
     },
   )
   const [pack] = JSON.parse(output)

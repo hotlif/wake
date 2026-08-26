@@ -4,6 +4,7 @@
   "displayName": "Crab CSS",
   "description": "CSS language intelligence for @crab-dev/css tagged templates.",
   "version": "0.1.3",
+  "packageManager": "yarn@4.16.0",
   "publisher": "crab-dev",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -111,10 +112,10 @@
   },
   "scripts": {
     "clean": "node scripts/clean.mjs",
-    "compile": "node scripts/clean.mjs && tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
-    "check": "npm run compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs",
-    "package:vsix": "npm run compile && node scripts/package-vsix.mjs",
-    "test:extension": "npm run compile && node test/run-extension-host.mjs",
+    "compile": "node scripts/clean.mjs && yarn exec pnpify tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
+    "check": "yarn compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs",
+    "package:vsix": "yarn compile && node scripts/package-vsix.mjs",
+    "test:extension": "yarn compile && node test/run-extension-host.mjs",
     "update:css-data": "node scripts/update-css-data.mjs"
   },
   "dependencies": {
@@ -125,7 +126,8 @@
     "@types/vscode": "1.96.0",
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "3.9.2",
-    "typescript": "7.0.2",
+    "@yarnpkg/pnpify": "4.1.7",
+    "typescript": "6.0.2",
     "vscode-css-languageservice": "6.3.10"
   }
 }

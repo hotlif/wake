@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 node_modules
+.pnp.*
+.yarn/cache
+.yarn/install-state.gz
 .wake
 .yarn
 # criterion / bench 输出

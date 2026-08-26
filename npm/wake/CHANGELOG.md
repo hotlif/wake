@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.23
+
+- Made Yarn 4.16 PnP authoritative for package visibility, alias dependencies, peer/virtual packages,
+  ignore patterns, nested roots, compressed zip archives, watch invalidation, and structured resolver
+  diagnostics; PnP rejection can no longer be overridden by Wake aliases, `node_modules`, or the
+  retired Components fallback.
+- Migrated the source repository and VS Code editor to one strict Yarn PnP workspace/lock, with
+  PnP-aware embedded dependency and maintenance tooling plus differential `pnpapi` conformance gates.
+- Kept npm `node_modules` projects as a first-class resolver contract, including workspace links and
+  package-lock watch invalidation, and added blocking Windows/Linux Node 22.14/26 `npm ci` consumer
+  gates built exclusively from the current local tarballs.
+- Moved private Wake Docs generated imports to a non-package alias namespace so Yarn PnP remains
+  authoritative for valid bare package names without intercepting internal runtime modules.
+
 ## 0.1.22
 
 - Added the experimental Wake-native, React-first `wake test` system, `runTests()` and `TestContext`

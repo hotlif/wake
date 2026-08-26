@@ -50,7 +50,9 @@ Workspace dependency resolution follows the nearest project context. Node-style 
 ordinary filesystem resolver; Yarn Plug'n'Play projects discovered through `.pnp.cjs` use the PnP
 manifest and PnP filesystem, including content-addressed zip entries. Both paths feed resolved
 modules into the same compiler static-export collector, so `defineTokens` provenance and
-`CRAB_CSS_*` diagnostics cannot diverge between build and editor analysis.
+`CRAB_CSS_*` diagnostics cannot diverge between build and editor analysis. A broken PnP loader or
+undeclared dependency is published as `WAKE_PNP_MANIFEST` or `WAKE_PNP_DEPENDENCY`; the LSP never
+silently substitutes its default resolver.
 
 ## Configuration
 
@@ -81,8 +83,8 @@ From the repository root:
 ```bash
 cargo test -p wake_css_language -p wake_css_lsp
 cargo clippy -p wake_css_language -p wake_css_lsp --all-targets -- -D warnings
-npm ci --ignore-scripts --prefix editors/vscode-css
-WAKE_BIN=/absolute/path/to/target/release/wake npm run vscode:css:check
+corepack yarn install --immutable --check-cache
+WAKE_BIN=/absolute/path/to/target/release/wake corepack yarn vscode:css:check
 ```
 
 Follow the registry, Rusty V8 and locked/offline preparation recipe in

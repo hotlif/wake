@@ -6,7 +6,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'package.json'
-      - 'package-lock.json'
+      - 'yarn.lock'
+      - '.yarnrc.yml'
       - 'crates/wake_common/**'
       - 'crates/wake_resolver/**'
       - 'crates/wake_bundler/**'
@@ -18,7 +19,7 @@ on:
       - 'crates/wake_js_runtime/**'
       - 'crates/wake_test*/**'
       - 'npm/wake/**'
-      - 'scripts/check-npm-lock.mjs'
+      - 'scripts/check-yarn-lock.mjs'
       - 'scripts/check-release-coverage.mjs'
       - 'scripts/native-package-contract.mjs'
       - 'scripts/prepare-rusty-v8.mjs'
@@ -38,7 +39,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'package.json'
-      - 'package-lock.json'
+      - 'yarn.lock'
+      - '.yarnrc.yml'
       - 'crates/wake_common/**'
       - 'crates/wake_resolver/**'
       - 'crates/wake_bundler/**'
@@ -50,7 +52,7 @@ on:
       - 'crates/wake_js_runtime/**'
       - 'crates/wake_test*/**'
       - 'npm/wake/**'
-      - 'scripts/check-npm-lock.mjs'
+      - 'scripts/check-yarn-lock.mjs'
       - 'scripts/check-release-coverage.mjs'
       - 'scripts/native-package-contract.mjs'
       - 'scripts/prepare-rusty-v8.mjs'
@@ -84,10 +86,6 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            editors/vscode-css/package-lock.json
       - name: Verify extension release version
         id: extension-version
         shell: bash
@@ -100,19 +98,19 @@ jobs:
           if [ "$REF_TYPE" = 'tag' ]; then
             test "$REF_NAME" = "vscode-css-v${version}"
           fi
-      - run: npm run npm:lock:check
-      - run: npm ci --ignore-scripts
-      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn yarn:lock:check
       - run: cargo fetch --locked
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - run: cargo build --release -p wake_test_host -p wake_cli --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
-      - run: npm run release:check
-      - run: npm run vscode:css:check
+      - run: corepack yarn release:check
+      - run: corepack yarn vscode:css:check
         env:
           WAKE_BIN: ${{ github.workspace }}/target/release/wake
-      - run: npm run update:css-data --prefix editors/vscode-css
+      - run: corepack yarn workspace crab-css update:css-data
       - run: git diff --exit-code -- crates/wake_css_language/data/css-facts.json
       - run: cargo test -p wake_css_language -p wake_css_lsp -p wake_css_in_js --locked --offline
         env:
@@ -120,7 +118,7 @@ jobs:
       - run: cargo clippy -p wake_css_language -p wake_css_lsp --all-targets --locked --offline -- -D warnings
         env:
           CARGO_NET_OFFLINE: "true"
-      - run: npm run architecture:check
+      - run: corepack yarn architecture:check
 
   extension-host:
     needs: verify
@@ -131,16 +129,15 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: editors/vscode-css/package-lock.json
-      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: cargo build --release -p wake_css_lsp -p wake_cli --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
       - run: mkdir -p editors/vscode-css/server
       - run: cp target/release/wake-css-language-server editors/vscode-css/server/wake-css-language-server
-      - run: xvfb-run -a npm run test:extension --prefix editors/vscode-css
+      - run: xvfb-run -a corepack yarn workspace crab-css test:extension
         env:
           VSCODE_TEST_VERSION: 1.96.4
           WAKE_BIN: ${{ github.workspace }}/target/release/wake
@@ -175,18 +172,17 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: editors/vscode-css/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
           key: vscode-css-${{ matrix.rust_target }}
-      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target ${{ matrix.rust_target }}
       - run: cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
       - run: >-
-          npm run package:vsix --prefix editors/vscode-css --
+          corepack yarn workspace crab-css package:vsix
           --target ${{ matrix.vsce_target }}
           --binary ${{ github.workspace }}/${{ matrix.binary }}
           --out ${{ github.workspace }}/artifacts
@@ -227,9 +223,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: editors/vscode-css/package-lock.json
-      - run: npm ci --ignore-scripts --prefix editors/vscode-css
+      - run: npm install --global corepack@0.34.6
+      - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target ${{ matrix.rust_target }}
       - run: cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline
         env:
@@ -243,7 +238,7 @@ jobs:
         shell: bash
         run: |
           export WAKE_BIN="$PWD/${{ matrix.wake_binary }}"
-          npm run package:vsix --prefix editors/vscode-css -- \
+          corepack yarn workspace crab-css package:vsix \
             --target ${{ matrix.vsce_target }} \
             --binary "$PWD/${{ matrix.binary }}" \
             --out "$PWD/artifacts"

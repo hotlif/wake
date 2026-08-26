@@ -18,9 +18,8 @@ Yarn PnP 则会将其暴露。
 仅对不可变的已发布组件归档：当源码是经验证的 `@crab-dev/rc-*` 包公共 ESM 或 CommonJS 入口时，
 加载器才把旧运行时说明符重写为 `@crab-dev/css`。应用源码、其他第三方包和组件内部永不重写。
 
-只有当某个 `@crab-dev/rc-*` 发起方的常规 Yarn PnP 解析因未声明依赖或未满足 peer 而失败时，
-组件模式才能从 Wake 包提供 `@crab-dev/css` 和 `lucide-react`。发起方声明的依赖、Yarn 顶层回退和
-用户别名仍有更高优先级。此桥接用于修复不完整元数据，而不是增加第二套 CSS API。
+旧发布组件缺失的 `@crab-dev/css`、Lucide 与 React 元数据由安装所有者通过 Yarn
+`packageExtensions` 显式补齐；Wake resolver 不拥有 Components 私有 fallback。
 
 ## Invariants
 
@@ -29,7 +28,7 @@ Yarn PnP 则会将其暴露。
 - 加载器重写仅限于经验证的公共 `@crab-dev/rc-*` 入口。
 - 动态值通过已记录的 CSS 自定义属性边界传递。
 - 抽取出的 CSS 仍由输出分块拥有，并在其惰性 JavaScript 之前加载。
-- PnP 回退受发起方、依赖和错误范围约束，不能影响应用源码。
+- PnP 依赖可见性完全由 Yarn 清单决定，Components 不能覆盖 Yarn 的成功或拒绝。
 - 包、锁文件、版本、打包和发布门禁均包含 `@crab-dev/css`。
 
 ## Evidence
@@ -46,8 +45,8 @@ Yarn PnP 则会将其暴露。
 ## Consequences
 
 使用方只获得一个带类型的运行时和一个编译时契约。使用旧导入的应用项目会按常规解析失败，或仍作为
-普通 JavaScript 处理，而不会被静默迁移。有界的加载器和 PnP 桥接增加了临时组件集成逻辑，但会保留
-声明正确的组件所选择的依赖版本。
+普通 JavaScript 处理，而不会被静默迁移。Yarn `packageExtensions` 会补齐已知旧归档的元数据，同时
+保留声明正确的组件所选择的依赖版本。
 
 ## Validation
 
@@ -64,6 +63,6 @@ None.
 ## Removal plan
 
 重新发布所有受支持的 `@crab-dev/rc-*` 包，使其直接导入 `@crab-dev/css`，并完整声明
-`@crab-dev/css` 和 `lucide-react` 元数据。常规及隔离 PnP 夹具无需迁移即可成功后，删除
-`migrate_crab_component_css_runtime`、`PnpDependencyFallback`、
-`components_pnp_dependency_fallbacks`、相关测试及本决策的临时部分。单一公共 CSS 包决策继续有效。
+`@crab-dev/css`、Lucide 与 React 元数据。`PnpDependencyFallback` 及 Components resolver 接线已由
+[ADR 0022](0022-yarn-pnp-ownership.md) 删除；待旧归档退出支持范围后删除对应 `packageExtensions`。
+单一公共 CSS 包决策继续有效。

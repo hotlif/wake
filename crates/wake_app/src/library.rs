@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wake_bundler::library::{LibraryGraph, LibraryGraphOptions, PreserveModuleFormat};
 use wake_common::{FileSystem, OsFileSystem};
-use wake_resolver::{PnpFileSystem, PnpManifest};
+use wake_resolver::ResolutionEnvironment;
 
 use super::{
     CancellationToken, OutputFile, ProjectOptions, WakeError, absolute_from, atomic_write,
@@ -134,23 +134,19 @@ struct GlobalTokens {
 
 struct TokenLoader {
     fs: Arc<dyn FileSystem>,
-    pnp: Option<PnpManifest>,
+    environment: ResolutionEnvironment,
     memo: HashMap<PathBuf, TokenSource>,
     stack: Vec<PathBuf>,
 }
 
 impl TokenLoader {
-    fn new(root: &Path) -> Self {
+    fn new(_root: &Path) -> Self {
         let os: Arc<dyn FileSystem> = Arc::new(OsFileSystem);
-        let pnp = PnpManifest::discover(os.as_ref(), root);
-        let fs: Arc<dyn FileSystem> = if pnp.is_some() {
-            Arc::new(PnpFileSystem::new(os))
-        } else {
-            os
-        };
+        let environment = ResolutionEnvironment::new(os);
+        let fs = environment.file_system();
         Self {
             fs,
-            pnp,
+            environment,
             memo: HashMap::new(),
             stack: Vec::new(),
         }
@@ -229,34 +225,16 @@ impl TokenLoader {
     }
 
     fn resolve_package_root(&self, package: &str, issuer: &Path) -> Result<PathBuf, WakeError> {
-        if let Some(manifest) = &self.pnp {
-            return manifest.resolve_bare(package, issuer).map_err(|error| {
+        self.environment
+            .resolver()
+            .resolve_package_root(package, issuer)
+            .map_err(|error| {
                 WakeError::new(
                     "WAKE_TOKEN_IMPORT",
-                    format!("cannot resolve token package `{package}`: {error:?}"),
+                    format!("cannot resolve token package `{package}`: {error}"),
                 )
                 .at(issuer)
-            });
-        }
-
-        let package_path = package.split('/').fold(PathBuf::new(), |mut path, part| {
-            path.push(part);
-            path
-        });
-        for ancestor in issuer.ancestors() {
-            let candidate = ancestor.join("node_modules").join(&package_path);
-            if self.fs.is_file(&candidate.join("package.json")) {
-                return Ok(candidate);
-            }
-        }
-        Err(WakeError::new(
-            "WAKE_TOKEN_IMPORT",
-            format!(
-                "cannot resolve token package `{package}` from {}",
-                issuer.display()
-            ),
-        )
-        .at(issuer))
+            })
     }
 }
 
@@ -1206,10 +1184,7 @@ border = "1px solid $ref(color.primary)"
     #[test]
     fn resolves_imported_tokens_through_yarn_pnp_data() {
         let fixture = Fixture::new();
-        fixture.write(
-            ".pnp.cjs",
-            "// discovery marker; data lives beside this file",
-        );
+        fixture.write(".pnp.cjs", "module.exports = require('./.pnp.data.json');");
         fixture.write(
             ".pnp.data.json",
             r#"{

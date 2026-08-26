@@ -93,8 +93,8 @@ Git 或根目录不在工作树中时返回 `WAKE_TEST_DISCOVERY`；Wake 不猜�
   的依赖必须终止于单独打包的 `wake_test_host`。
 - 只有 `wake_ecma_vm` 可直接依赖 `deno_core`；引擎句柄绝不越过其公共边界。
 - 第三方 Rust/JavaScript 源码或二进制文件绝不复制进仓库。Rust 依赖通过 `Cargo.lock` 从 crates.io
-  解析；JavaScript 依赖通过 `package-lock.json` 从 npm 注册表解析。正式构建步骤在单独完成校验和验证
-  的依赖或产物准备后必须锁定且离线。
+  解析；JavaScript 依赖按 [ADR 0022](0022-yarn-pnp-ownership.md) 通过 Yarn lock/PnP 解析。正式构建步骤
+  在单独完成 checksum 验证的依赖或产物准备后必须锁定且离线。
 - `wake_test_browser` 可被 `wake_test` 使用，但不能反向依赖它或实现框架语义。
 - 每个套件拥有一个隔离 realm/模块注册表或 BrowserContext/页面。DOM 节点、V8 句柄、CDP 会话标识、
   进程内 atom 及 arena 引用都不得进入 IPC 或持久化。

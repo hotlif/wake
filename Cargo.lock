@@ -1329,6 +1329,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
+name = "fancy-regex"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "476de73bddf2ef8490aa4ee8f1cf40b430bf1d56c48c22080e5186952cd580e6"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1345,6 +1356,16 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
 
 [[package]]
 name = "fluent-uri"
@@ -2265,6 +2286,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
+ "simd-adler32",
 ]
 
 [[package]]
@@ -3363,6 +3385,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4141,7 +4169,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "wake_app"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "getrandom 0.3.4",
  "regex",
@@ -4164,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "wake_bundler"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "criterion",
  "crossbeam-utils",
@@ -4188,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "wake_cache"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "wake_common",
  "wake_turbo",
@@ -4196,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "wake_cli"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -4220,16 +4248,17 @@ dependencies = [
 
 [[package]]
 name = "wake_common"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "criterion",
+ "flate2",
  "insta",
  "rustc-hash 2.1.3",
 ]
 
 [[package]]
 name = "wake_config"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "browserslist-rs",
  "serde",
@@ -4239,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "cssparser",
  "wake_common",
@@ -4247,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_in_js"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "wake_common",
  "wake_css",
@@ -4258,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_language"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "serde",
  "serde_json",
@@ -4272,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_lsp"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "serde",
  "serde_json",
@@ -4286,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "wake_dev_server"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "actix-web",
  "actix-ws",
@@ -4304,7 +4333,7 @@ dependencies = [
 
 [[package]]
 name = "wake_docs"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "markdown",
  "regex",
@@ -4316,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_ast"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "bumpalo",
  "wake_common",
@@ -4324,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_codegen"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "insta",
  "wake_common",
@@ -4335,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_lexer"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "criterion",
  "insta",
@@ -4345,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_minify"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "insta",
  "wake_common",
@@ -4356,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_parser"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "bumpalo",
  "criterion",
@@ -4370,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_semantic"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
@@ -4379,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_transform"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "bumpalo",
  "wake_common",
@@ -4388,7 +4417,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_vm"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -4401,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "wake_graph"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
@@ -4409,11 +4438,11 @@ dependencies = [
 
 [[package]]
 name = "wake_html"
-version = "0.1.22"
+version = "0.1.23"
 
 [[package]]
 name = "wake_js_runtime"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "serde",
  "serde_json",
@@ -4429,7 +4458,7 @@ dependencies = [
 
 [[package]]
 name = "wake_node"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "napi",
  "napi-build",
@@ -4447,9 +4476,10 @@ dependencies = [
 
 [[package]]
 name = "wake_resolver"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "criterion",
+ "fancy-regex",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
@@ -4458,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "wake_scan"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "regex",
  "serde_json",
@@ -4467,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "base64 0.22.1",
  "regex",
@@ -4484,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test_browser"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4495,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test_contract"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "serde",
  "serde_json",
@@ -4503,7 +4533,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test_host"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "notify",
  "serde_json",
@@ -4514,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "wake_tsdoc"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "regex",
  "serde",
@@ -4522,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "wake_turbo"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "criterion",
  "crossbeam-deque",
@@ -4535,7 +4565,7 @@ dependencies = [
 
 [[package]]
 name = "wake_turbo_macros"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "proc-macro2",
  "quote",

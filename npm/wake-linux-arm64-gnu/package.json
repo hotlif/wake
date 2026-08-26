@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/wake-linux-arm64-gnu",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Wake native binary for linux arm64",
   "license": "MIT OR Apache-2.0",
   "repository": {

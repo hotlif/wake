@@ -1,6 +1,6 @@
 import React, { Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
-import { apiDocs, demos, pages } from "@wake/docs/registry.ts";
-import { Preview, siteConfig } from "@wake/docs/config.tsx";
+import { apiDocs, demos, pages } from "@@wake/docs/registry.ts";
+import { Preview, siteConfig } from "@@wake/docs/config.tsx";
 
 type Theme = "light" | "dark" | "system";
 type ResolvedTheme = "light" | "dark";

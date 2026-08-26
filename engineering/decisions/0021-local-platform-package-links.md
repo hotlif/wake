@@ -1,7 +1,8 @@
 # ADR 0021: 用根级本地链接拥有平台 optional 包
 
-- Status: accepted
+- Status: superseded
 - Date: 2026-08-26
+- Superseded by: [ADR 0022](0022-yarn-pnp-ownership.md)
 
 ## Context
 
@@ -67,6 +68,8 @@ npm 11 因而曾在 `package-lock.json` 中为它们写入只有 `optional: true
 ## Supersedes
 
 None.
+
+本决策已由 [ADR 0022](0022-yarn-pnp-ownership.md) 替代；根 `file:` bridge 与 npm lock 已删除。
 
 ## Removal plan
 

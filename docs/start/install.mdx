@@ -14,12 +14,12 @@ status = "stable"
 ## 前置条件
 
 - Node.js `>=22.14 <27`；
-- npm；
+- npm，或通过 Corepack 使用 Yarn 4；
 - 一个包含 `package.json` 的项目目录。
 
 Rust 只用于参与 Wake 自身开发，业务项目无需安装 Rust。
 
-## 安装依赖
+## 使用 npm 安装
 
 ```bash
 npm install react react-dom
@@ -28,10 +28,22 @@ npm install --save-dev @crab-dev/wake typescript @types/react @types/react-dom
 
 为团队项目提交 `package-lock.json`，并让 CI 使用 `npm ci`。
 
+## 使用 Yarn Plug'n'Play 安装
+
+```bash
+corepack yarn add react react-dom
+corepack yarn add --dev @crab-dev/wake typescript @types/react @types/react-dom
+```
+
+提交 `yarn.lock` 与 `.yarnrc.yml`，并让 CI 使用 `corepack yarn install --immutable`。项目存在
+`.pnp.cjs` 时，Wake 以 Yarn 的 locator、依赖可见性、peer/virtual 和 ignore 结果为准；Yarn 拒绝的
+未声明依赖不会退回偶然存在的 `node_modules`。
+
 ## 验证安装
 
 ```bash
 npx wake --version
+# Yarn PnP 项目也可运行：corepack yarn wake --version
 ```
 
 命令应输出与 `package.json` 中 `@crab-dev/wake` 一致的版本。
@@ -41,6 +53,7 @@ npx wake --version
 - 找不到 `wake`：使用 `npx wake` 或 npm script，不依赖全局安装。
 - React 18 被拒绝：将 `react` 和 `react-dom` 一起升级到 19。
 - 原生包缺失：删除不完整的安装目录后重新运行 `npm ci`。
+- Yarn PnP 清单损坏：重新运行 `corepack yarn install --immutable`；Wake 不会静默改用 `node_modules`。
 
 ## 下一步
 

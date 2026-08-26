@@ -21,7 +21,7 @@ mod session;
 pub use incremental::IncrementalBundler;
 pub use session::{BuildOptions, BuildRequest, BuildSession};
 // 供 CLI 组装别名而无需直接依赖 wake_resolver。
-pub use wake_resolver::{PnpDependencyFallback, ResolveOptions};
+pub use wake_resolver::ResolveOptions;
 
 /// Bundle 宿主平台。浏览器保持历史行为；Node 自动外置内置模块并启用 Node 条件导出。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

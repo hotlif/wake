@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 rustc-hash.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

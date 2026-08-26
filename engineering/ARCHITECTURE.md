@@ -25,7 +25,8 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 
 ### 2.2 解析、图与资源层
 
-- `wake_resolver`：Node 风格包解析、alias、package exports、Yarn PnP 与 zip 文件系统。
+- `wake_resolver`：`ResolutionEnvironment` 统一拥有经典 Node/`node_modules`/alias/package exports 与
+  按 issuer 的 Yarn PnP registry、virtual/unplugged 路径、STORE/DEFLATE zip 文件系统和结构失效缓存。
 - `wake_graph`：模块和绑定活跃性、Tree Shaking 所需图分析。
 - `wake_css`、`wake_css_in_js`、`wake_html`：非 JavaScript 内容和 HTML 外壳。
 - `wake_css_language`：`@crab-dev/css` 模板发现、虚拟 CSS、宿主映射和无文件系统编辑分析；构建诊断仍由 `wake_css_in_js` 拥有。
@@ -98,9 +99,13 @@ wake_test_contract → wake_app → cli / node binding
 11. 每个测试 suite 独占 V8 realm/module registry/Window/Document，或独占 Chromium BrowserContext/page。测试在同一 DOM 内顺序执行，suite 才能跨隔离环境并行。
 12. CLI 和 Node 请求经 `wake_app` 进入唯一持久 `wake_test_host` session；protocol v3 schema 与 frame codec 由 `wake_test_contract` 拥有，host 拥有 transport。协议必须带随机令牌，并在完成、失败、取消或崩溃后关闭 VM、页面、端口和子进程。
 13. 仓库不保存第三方源码、原生二进制或归档副本。Rust 第三方依赖只由 crates.io 与
-    `Cargo.lock` 的 source/checksum 固定；JavaScript 第三方依赖只由 npm registry 与
-    `package-lock.json` 的 resolved/integrity 固定。依赖或 Rusty V8 归档的获取是显式预取步骤，
-    正式 Cargo build 使用 locked/offline 输入，`build.rs` 与 npm lifecycle 不下载。
+    `Cargo.lock` 固定；JavaScript 第三方依赖只由 Yarn 4.16 `yarn.lock` locator/checksum 与 PnP
+    registry 固定。源码安装使用 `yarn install --immutable --check-cache`，不生成 `node_modules`；
+    正式 Cargo build 使用 locked/offline 输入，`build.rs` 与依赖 lifecycle 不下载。
+14. `.pnp.cjs` 是 PnP 唯一激活标志。受管理的有效裸包由 Yarn 成功或拒绝最终裁决，Wake alias 与
+    Components 不能覆盖；ignore/unmanaged issuer 按 Yarn 指示执行经典 Node 解析。所有消费者只通过
+    `ResolutionEnvironment` 访问解析状态并传播结构化诊断。没有 PnP 根的 npm 项目以实际
+    `node_modules` 文件树为权威；`package-lock.json` 只触发结构失效，不参与运行时依赖求解。
 
 上述依赖方向与来源规则的唯一机器事实来源是
 [architecture-boundaries.json](architecture-boundaries.json)；叙述文档不维护第二份 allowlist。

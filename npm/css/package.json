@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/css",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Type-safe, zero-runtime CSS authoring for Wake",
   "keywords": [
     "css",
@@ -41,11 +41,12 @@
   },
   "scripts": {
     "test": "wake test test/runtime.test.mjs",
-    "typecheck": "tsc -p test/tsconfig.json",
+    "typecheck": "yarn exec pnpify tsc -p test/tsconfig.json",
     "pack:check": "npm pack --dry-run"
   },
   "devDependencies": {
-    "typescript": "^7.0.2"
+    "@yarnpkg/pnpify": "4.1.7",
+    "typescript": "6.0.2"
   },
   "publishConfig": {
     "access": "public",

@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { parseSyml } from '@yarnpkg/parsers'
+
+const require = createRequire(import.meta.url)
+const pnpapi = require('pnpapi')
 
 export const MEBIBYTE = 1024 * 1024
 export const PLATFORM_PACKED_WARNING = 56 * MEBIBYTE
@@ -114,7 +120,7 @@ export function platformContract(packageName) {
 export function readEngineProvenance(root, contract) {
   const cargoLock = readFileSync(resolve(root, 'Cargo.lock'), 'utf8')
   const packageManifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
-  const packageLock = JSON.parse(readFileSync(resolve(root, 'package-lock.json'), 'utf8'))
+  const yarnLock = parseSyml(readFileSync(resolve(root, 'yarn.lock'), 'utf8'))
   const testRuntimeSources = JSON.parse(
     readFileSync(resolve(root, TEST_RUNTIME_SOURCES), 'utf8'),
   )
@@ -173,13 +179,14 @@ export function readEngineProvenance(root, contract) {
     .map((source) => {
       const requested = packageManifest.dependencies?.[source.name] ??
         packageManifest.devDependencies?.[source.name]
-      const locked = packageLock.packages?.[`node_modules/${source.name}`]
+      const locked = Object.values(yarnLock).find((entry) => (
+        entry?.resolution === `${source.name}@npm:${source.version}`
+      ))
       if (
         locked?.version !== source.version ||
-        locked?.resolved !== source.tarball ||
-        locked?.integrity !== source.integrity
+        !/^10c0\/[0-9a-f]{128}$/.test(locked?.checksum ?? '')
       ) {
-        throw new Error(`${source.name} must come from the checksummed npm package-lock entry`)
+        throw new Error(`${source.name} must come from the checksummed Yarn npm resolution`)
       }
       if (source.name === 'happy-dom' && requested !== source.version) {
         throw new Error(`happy-dom must be exactly pinned to ${source.version} in package.json`)
@@ -564,13 +571,16 @@ export function createThirdPartyLicenses(root, engine) {
     if (!dependency.licenseFile) {
       throw new Error(`${dependency.name} provenance must declare its npm license file`)
     }
-    const licensePath = resolve(root, 'node_modules', dependency.name, dependency.licenseFile)
+    const licensePath = pnpapi.resolveToUnqualified(
+      `${dependency.name}/${dependency.licenseFile}`,
+      fileURLToPath(import.meta.url),
+    )
     let license
     try {
       license = readFileSync(licensePath, 'utf8').replaceAll('\r\n', '\n').trim()
     } catch (error) {
       throw new Error(
-        `Unable to read npm-installed license ${licensePath}; run npm ci before staging (${error.message})`,
+        `Unable to read Yarn PnP license ${licensePath}; run yarn install --immutable --check-cache before staging (${error.message})`,
       )
     }
     return `${dependency.name} ${dependency.version} — ${dependency.license}

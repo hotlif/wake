@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,7 +25,7 @@ const target = args.get('--target')
 const binary = args.get('--binary')
 const output = resolve(args.get('--out') ?? join(extensionRoot, 'artifacts'))
 if (!target || !supportedTargets.has(target) || !binary) {
-  throw new Error('usage: npm run package:vsix -- --target <target> --binary <path> [--out <directory>]')
+  throw new Error('usage: yarn package:vsix --target <target> --binary <path> [--out <directory>]')
 }
 
 const serverDirectory = join(extensionRoot, 'server')
@@ -41,8 +42,10 @@ if (!target.startsWith('win32')) chmodSync(stagedBinary, 0o755)
 mkdirSync(output, { recursive: true })
 
 const archive = join(output, `crab-css-${target}-${extensionManifest.version}.vsix`)
+const require = createRequire(import.meta.url)
+const vsce = require.resolve('@vscode/vsce/vsce')
 execFileSync(process.execPath, [
-  join(extensionRoot, 'node_modules', '@vscode', 'vsce', 'vsce'),
+  vsce,
   'package',
   '--target',
   target,
