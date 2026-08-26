@@ -28,7 +28,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: corepack yarn yarn:lock:check
       - run: corepack yarn pnp:conformance:check
@@ -103,7 +103,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - name: Fetch locked Rust dependencies
         # napi build runs offline cargo metadata for the complete locked graph.
@@ -180,7 +180,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - name: Fetch locked Rust dependencies
         # napi build runs offline cargo metadata for the complete locked graph.
@@ -240,7 +240,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: mkdir -p artifacts
       - run: corepack yarn npm:pack:check
@@ -266,7 +266,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - uses: actions/download-artifact@v4
         with:

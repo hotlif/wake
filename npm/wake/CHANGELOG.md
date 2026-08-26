@@ -15,6 +15,8 @@
   authoritative for valid bare package names without intercepting internal runtime modules.
 - Kept absolute issuers outside a PnP root on classic npm resolution, and made Wake Test resolve
   React package metadata through the same issuer-owned PnP/npm environment as executable modules.
+- Made the pinned Corepack bootstrap overwrite preinstalled Windows shims consistently across CI,
+  release, and VS Code workflows.
 
 ## 0.1.22
 

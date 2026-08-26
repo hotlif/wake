@@ -98,7 +98,7 @@ jobs:
           if [ "$REF_TYPE" = 'tag' ]; then
             test "$REF_NAME" = "vscode-css-v${version}"
           fi
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: corepack yarn yarn:lock:check
       - run: cargo fetch --locked
@@ -129,7 +129,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: cargo build --release -p wake_css_lsp -p wake_cli --locked --offline
@@ -175,7 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: vscode-css-${{ matrix.rust_target }}
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target ${{ matrix.rust_target }}
       - run: cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline
@@ -223,7 +223,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target ${{ matrix.rust_target }}
       - run: cargo build --release -p wake_css_lsp -p wake_cli --target ${{ matrix.rust_target }} --locked --offline

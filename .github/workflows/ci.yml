@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 24
       - uses: dtolnay/rust-toolchain@1.95.0
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: corepack yarn yarn:lock:check
       - run: corepack yarn pnp:conformance:check
@@ -52,7 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: npm-package-${{ matrix.target }}
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       # napi build evaluates the complete locked Cargo graph before its offline build.
       - run: cargo fetch --locked
@@ -125,7 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: architecture
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       # The architecture checker runs `cargo tree --target all --offline`; fetch the
       # complete locked graph before preparing only the Linux rusty_v8 archive.
@@ -161,7 +161,7 @@ jobs:
         with:
           node-version: 24
       - uses: Swatinem/rust-cache@v2
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
@@ -188,7 +188,7 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target ${{ matrix.target }}
       - run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.target }}
@@ -209,7 +209,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test262-es2024
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
@@ -260,7 +260,7 @@ jobs:
         if: matrix.browser_evidence != 'unavailable'
         with:
           key: browser-${{ matrix.target }}
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: corepack yarn browser:conformance:test
       - name: Record reviewed browser unavailability
@@ -342,7 +342,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: corepack yarn typescript:7:check
 
@@ -390,7 +390,7 @@ jobs:
         with:
           node-version: 24
       - uses: Swatinem/rust-cache@v2
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
@@ -416,7 +416,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: docs
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: corepack yarn docs:check
       - run: corepack yarn docs:build
@@ -434,7 +434,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: css
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       - run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
@@ -465,7 +465,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: node-${{ matrix.node }}
-      - run: npm install --global corepack@0.34.6
+      - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
       # napi build invokes offline cargo metadata across the complete locked graph.
       - run: cargo fetch --locked
