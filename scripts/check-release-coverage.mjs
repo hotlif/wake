@@ -339,6 +339,8 @@ requireBrowserMatrix('release-npm.yml smoke', registrySmokeJob.source, {
 requireJobMarkers('ci browser-conformance', ciBrowserJob, [
   "matrix.browser_evidence == 'unavailable'",
   "matrix.browser_evidence != 'unavailable'",
+  'cargo test --locked --offline -p wake_test_browser --lib -- --ignored --nocapture --test-threads=1',
+  'cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture --test-threads=1',
   '--identity "$identity" > "$RUNNER_TEMP/wake-browser-evidence.json"',
   '--unavailable true > "$RUNNER_TEMP/wake-browser-evidence.json"',
   'browser-evidence-ci-${{ matrix.target }}',

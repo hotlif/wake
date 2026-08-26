@@ -197,12 +197,12 @@ jobs:
           CARGO_NET_OFFLINE: "true"
       - name: CDP transport against the installed system browser
         if: matrix.browser_evidence != 'unavailable'
-        run: cargo test --locked --offline -p wake_test_browser --lib -- --ignored --nocapture
+        run: cargo test --locked --offline -p wake_test_browser --lib -- --ignored --nocapture --test-threads=1
         env:
           CARGO_NET_OFFLINE: "true"
       - name: React, input, source-map and screenshot conformance
         if: matrix.browser_evidence != 'unavailable'
-        run: cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture
+        run: cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture --test-threads=1
         env:
           CARGO_NET_OFFLINE: "true"
       - name: Browser TSX V8 coverage reports and thresholds
