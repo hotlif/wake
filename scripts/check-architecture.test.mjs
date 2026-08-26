@@ -21,6 +21,7 @@ const activeAdrRecords = new Map([
   ['0003-compiler-and-shell-boundaries.md', { status: 'proposed' }],
   ['0010-shared-css-syntax-tree.md', { status: 'accepted' }],
   ['0020-react-browser-test-runtime.md', { status: 'proposed' }],
+  ['0021-local-platform-package-links.md', { status: 'accepted' }],
 ])
 
 const publicTestContractFiles = [
@@ -394,9 +395,10 @@ function policy(overrides = {}) {
         pathDependencies: 'workspace-members-only',
       },
       npm: {
+        decision: 'engineering/decisions/0021-local-platform-package-links.md',
         allowedRegistryOrigins: ['https://registry.npmjs.org/'],
         workspaceLinks: 'declared-workspaces-only',
-        internalOptionalPlaceholders: {
+        internalOptionalPackages: {
           '@crab-dev/wake-win32-x64-msvc': 'npm/wake-win32-x64-msvc',
         },
       },
@@ -738,10 +740,13 @@ function npmFixture() {
   }
 }
 
-function npmPlaceholderFixture() {
+function npmInternalOptionalFixture() {
   const fixture = npmFixture()
   const name = '@crab-dev/wake-win32-x64-msvc'
   const manifestPath = 'npm/wake-win32-x64-msvc'
+  fixture.rootManifest.optionalDependencies = {
+    [name]: `file:${manifestPath}`,
+  }
   fixture.workspaceManifests.get('npm/wake').optionalDependencies = {
     [name]: '0.1.0',
   }
@@ -751,8 +756,18 @@ function npmPlaceholderFixture() {
     os: ['win32'],
     cpu: ['x64'],
   }]])
-  fixture.policy.internalOptionalPlaceholders = { [name]: manifestPath }
-  fixture.lock.packages[`npm/wake/node_modules/${name}`] = { optional: true }
+  fixture.policy.internalOptionalPackages = { [name]: manifestPath }
+  fixture.lock.packages[`node_modules/${name}`] = {
+    resolved: manifestPath,
+    link: true,
+  }
+  fixture.lock.packages[manifestPath] = {
+    name,
+    version: '0.1.0',
+    optional: true,
+    os: ['win32'],
+    cpu: ['x64'],
+  }
   return fixture
 }
 
@@ -760,27 +775,45 @@ test('npm provenance allows manifest ranges while the lock owns exact registry a
   assert.deepEqual(validateNpmProvenance(npmFixture()), [])
 })
 
-test('npm provenance allows only exact internal prerelease optional placeholders', () => {
-  assert.deepEqual(validateNpmProvenance(npmPlaceholderFixture()), [])
+test('npm provenance owns internal optional packages through root-local links', () => {
+  assert.deepEqual(validateNpmProvenance(npmInternalOptionalFixture()), [])
 
-  const materialized = npmPlaceholderFixture()
-  materialized.lock.packages['npm/wake/node_modules/@crab-dev/wake-win32-x64-msvc'].version = '0.1.0'
-  assert(validateNpmProvenance(materialized).some((error) => error.includes('optional-only')))
-
-  const mismatchedPin = npmPlaceholderFixture()
+  const mismatchedPin = npmInternalOptionalFixture()
   mismatchedPin.workspaceManifests.get('npm/wake').optionalDependencies[
     '@crab-dev/wake-win32-x64-msvc'
   ] = '0.1.1'
   assert(validateNpmProvenance(mismatchedPin).some((error) => error.includes('must equal internal')))
 
-  const wrongPath = npmPlaceholderFixture()
-  wrongPath.lock.packages['node_modules/@crab-dev/wake-win32-x64-msvc'] = { optional: true }
-  delete wrongPath.lock.packages['npm/wake/node_modules/@crab-dev/wake-win32-x64-msvc']
-  const wrongPathErrors = validateNpmProvenance(wrongPath)
-  assert(wrongPathErrors.some((error) => error.includes('exact SemVer')))
-  assert(wrongPathErrors.some((error) => error.includes('is missing from package-lock.json')))
+  const wrongRootLocator = npmInternalOptionalFixture()
+  wrongRootLocator.rootManifest.optionalDependencies[
+    '@crab-dev/wake-win32-x64-msvc'
+  ] = '0.1.0'
+  assert(validateNpmProvenance(wrongRootLocator)
+    .some((error) => error.includes('must equal file:npm/wake-win32-x64-msvc')))
 
-  const missingManifest = npmPlaceholderFixture()
+  const registryBacked = npmInternalOptionalFixture()
+  registryBacked.lock.packages['node_modules/@crab-dev/wake-win32-x64-msvc'] = {
+    version: '0.1.0',
+    resolved: 'https://registry.npmjs.org/@crab-dev/wake-win32-x64-msvc/-/wake-win32-x64-msvc-0.1.0.tgz',
+    integrity: npmIntegrity,
+    optional: true,
+  }
+  assert(validateNpmProvenance(registryBacked)
+    .some((error) => error.includes('must link to npm/wake-win32-x64-msvc')))
+
+  const legacyPlaceholder = npmInternalOptionalFixture()
+  legacyPlaceholder.lock.packages[
+    'npm/wake/node_modules/@crab-dev/wake-win32-x64-msvc'
+  ] = { optional: true }
+  assert(validateNpmProvenance(legacyPlaceholder)
+    .some((error) => error.includes('must have an exact SemVer version; found missing')))
+
+  const mismatchedLocalLock = npmInternalOptionalFixture()
+  mismatchedLocalLock.lock.packages['npm/wake-win32-x64-msvc'].version = '0.1.1'
+  assert(validateNpmProvenance(mismatchedLocalLock)
+    .some((error) => error.includes('must match optional')))
+
+  const missingManifest = npmInternalOptionalFixture()
   missingManifest.internalManifests.clear()
   assert(validateNpmProvenance(missingManifest).some((error) => error.includes('must define')))
 })

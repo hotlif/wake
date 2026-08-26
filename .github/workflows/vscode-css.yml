@@ -18,6 +18,7 @@ on:
       - 'crates/wake_js_runtime/**'
       - 'crates/wake_test*/**'
       - 'npm/wake/**'
+      - 'scripts/check-npm-lock.mjs'
       - 'scripts/check-release-coverage.mjs'
       - 'scripts/native-package-contract.mjs'
       - 'scripts/prepare-rusty-v8.mjs'
@@ -49,6 +50,7 @@ on:
       - 'crates/wake_js_runtime/**'
       - 'crates/wake_test*/**'
       - 'npm/wake/**'
+      - 'scripts/check-npm-lock.mjs'
       - 'scripts/check-release-coverage.mjs'
       - 'scripts/native-package-contract.mjs'
       - 'scripts/prepare-rusty-v8.mjs'
@@ -98,6 +100,7 @@ jobs:
           if [ "$REF_TYPE" = 'tag' ]; then
             test "$REF_NAME" = "vscode-css-v${version}"
           fi
+      - run: npm run npm:lock:check
       - run: npm ci --ignore-scripts
       - run: npm ci --ignore-scripts --prefix editors/vscode-css
       - run: cargo fetch --locked

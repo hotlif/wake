@@ -37,6 +37,7 @@
       }
     },
     "npm": {
+      "decision": "engineering/decisions/0021-local-platform-package-links.md",
       "manifest": "package.json",
       "lockfile": "package-lock.json",
       "lockfileVersion": 3,
@@ -45,7 +46,7 @@
       ],
       "registryIntegrity": "sha512",
       "workspaceLinks": "declared-workspaces-only",
-      "internalOptionalPlaceholders": {
+      "internalOptionalPackages": {
         "@crab-dev/wake-darwin-arm64": "npm/wake-darwin-arm64",
         "@crab-dev/wake-darwin-x64": "npm/wake-darwin-x64",
         "@crab-dev/wake-linux-arm64-gnu": "npm/wake-linux-arm64-gnu",

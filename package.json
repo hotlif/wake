@@ -26,6 +26,7 @@
     "typescript:7:check": "node scripts/check-typescript-7.mjs",
     "test262:es2024": "node scripts/run-test262.mjs",
     "npm:pack:check": "node scripts/check-npm-packs.mjs",
+    "npm:lock:check": "node scripts/check-npm-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
     "vscode:css:check": "npm run check --prefix editors/vscode-css",
@@ -52,6 +53,13 @@
     "lucide-react": "^1.23.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"
+  },
+  "optionalDependencies": {
+    "@crab-dev/wake-darwin-arm64": "file:npm/wake-darwin-arm64",
+    "@crab-dev/wake-darwin-x64": "file:npm/wake-darwin-x64",
+    "@crab-dev/wake-linux-arm64-gnu": "file:npm/wake-linux-arm64-gnu",
+    "@crab-dev/wake-linux-x64-gnu": "file:npm/wake-linux-x64-gnu",
+    "@crab-dev/wake-win32-x64-msvc": "file:npm/wake-win32-x64-msvc"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.4",

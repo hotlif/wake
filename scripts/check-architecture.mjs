@@ -320,6 +320,10 @@ export function validateNpmProvenance({
   policy,
 }) {
   const errors = []
+  const internalOptionalPackages = new Map(
+    Object.entries(policy.internalOptionalPackages ?? {})
+      .map(([name, configuredPath]) => [name, repositoryPath(configuredPath)]),
+  )
   if (lock.lockfileVersion !== policy.lockfileVersion) {
     errors.push(`[dependency-provenance:npm-lock] package-lock.json version must be ${policy.lockfileVersion}; found ${lock.lockfileVersion}`)
   }
@@ -331,7 +335,16 @@ export function validateNpmProvenance({
   for (const [manifestPath, manifest] of manifests) {
     for (const field of npmDependencyFields) {
       for (const [name, locator] of Object.entries(manifest[field] ?? {})) {
-        if (/^(?:file|link|workspace|git(?:\+[^:]*)?|https?):/i.test(locator) || /^git@/i.test(locator)) {
+        const internalOptionalPath = internalOptionalPackages.get(name)
+        const isOwnedInternalOptional = (
+          manifestPath === ''
+          && field === 'optionalDependencies'
+          && locator === `file:${internalOptionalPath}`
+        )
+        if (
+          !isOwnedInternalOptional
+          && (/^(?:file|link|workspace|git(?:\+[^:]*)?|https?):/i.test(locator) || /^git@/i.test(locator))
+        ) {
           errors.push(`[dependency-provenance:npm-source] ${manifestPath || 'package.json'} ${field}.${name} uses non-registry locator ${locator}`)
         }
       }
@@ -353,52 +366,54 @@ export function validateNpmProvenance({
 
   const mainWorkspace = [...workspaceManifests]
     .find(([, manifest]) => manifest.name === '@crab-dev/wake')
-  const expectedPlaceholders = new Map()
-  for (const [name, configuredPath] of Object.entries(policy.internalOptionalPlaceholders ?? {})) {
-    const manifestPath = repositoryPath(configuredPath)
+  const expectedInternalLinks = new Map()
+  for (const [name, manifestPath] of internalOptionalPackages) {
     const internalManifest = internalManifests.get(manifestPath)
     if (
       !internalManifest ||
       internalManifest.name !== name ||
       !exactSemver(internalManifest.version ?? '')
     ) {
-      errors.push(`[dependency-provenance:npm-placeholder] ${manifestPath}/package.json must define ${name} at one exact version`)
+      errors.push(`[dependency-provenance:npm-internal-optional] ${manifestPath}/package.json must define ${name} at one exact version`)
       continue
     }
     if (!mainWorkspace) {
-      errors.push('[dependency-provenance:npm-placeholder] @crab-dev/wake must be a declared workspace')
+      errors.push('[dependency-provenance:npm-internal-optional] @crab-dev/wake must be a declared workspace')
       continue
     }
     const [mainWorkspacePath, mainManifest] = mainWorkspace
     const requested = mainManifest.optionalDependencies?.[name]
     if (requested !== internalManifest.version) {
-      errors.push(`[dependency-provenance:npm-placeholder] ${mainWorkspacePath}/package.json optionalDependencies.${name} must equal internal ${internalManifest.version}; found ${requested ?? 'missing'}`)
+      errors.push(`[dependency-provenance:npm-internal-optional] ${mainWorkspacePath}/package.json optionalDependencies.${name} must equal internal ${internalManifest.version}; found ${requested ?? 'missing'}`)
     }
-    expectedPlaceholders.set(`${mainWorkspacePath}/node_modules/${name}`, {
+    const rootLocator = rootManifest.optionalDependencies?.[name]
+    if (rootLocator !== `file:${manifestPath}`) {
+      errors.push(`[dependency-provenance:npm-internal-optional] package.json optionalDependencies.${name} must equal file:${manifestPath}; found ${rootLocator ?? 'missing'}`)
+    }
+    const lockedInternal = lock.packages?.[manifestPath]
+    if (
+      lockedInternal?.name !== name
+      || lockedInternal?.version !== internalManifest.version
+      || lockedInternal?.optional !== true
+    ) {
+      errors.push(`[dependency-provenance:npm-internal-optional] package-lock entry ${manifestPath} must match optional ${name}@${internalManifest.version}`)
+    }
+    expectedInternalLinks.set(`node_modules/${name}`, {
       name,
       manifestPath,
     })
   }
 
   const seenLinks = new Set()
-  const seenPlaceholders = new Set()
   const origins = policy.allowedRegistryOrigins ?? []
   for (const [lockPath, pkg] of Object.entries(lock.packages ?? {})) {
     if (!lockPath.includes('node_modules/')) continue
     if (pkg.link === true) {
       seenLinks.add(lockPath)
       const expected = expectedLinks.get(lockPath)
+        ?? expectedInternalLinks.get(lockPath)?.manifestPath
       if (!expected || repositoryPath(pkg.resolved ?? '') !== expected) {
-        errors.push(`[dependency-provenance:npm-link] ${lockPath} must resolve to a declared workspace; found ${pkg.resolved ?? 'missing'}`)
-      }
-      continue
-    }
-    const placeholder = expectedPlaceholders.get(lockPath)
-    if (placeholder) {
-      seenPlaceholders.add(lockPath)
-      const keys = Object.keys(pkg).sort()
-      if (keys.length !== 1 || keys[0] !== 'optional' || pkg.optional !== true) {
-        errors.push(`[dependency-provenance:npm-placeholder] ${lockPath} must be an unresolved optional-only prerelease placeholder`)
+        errors.push(`[dependency-provenance:npm-link] ${lockPath} must resolve to a declared workspace or internal optional package; found ${pkg.resolved ?? 'missing'}`)
       }
       continue
     }
@@ -420,9 +435,9 @@ export function validateNpmProvenance({
       errors.push(`[dependency-provenance:npm-link] ${lockPath} -> ${target} is missing from package-lock.json`)
     }
   }
-  for (const [lockPath, placeholder] of expectedPlaceholders) {
-    if (!seenPlaceholders.has(lockPath)) {
-      errors.push(`[dependency-provenance:npm-placeholder] ${lockPath} for ${placeholder.name} (${placeholder.manifestPath}) is missing from package-lock.json`)
+  for (const [lockPath, internal] of expectedInternalLinks) {
+    if (!seenLinks.has(lockPath)) {
+      errors.push(`[dependency-provenance:npm-internal-optional] ${lockPath} must link to ${internal.manifestPath} for ${internal.name}`)
     }
   }
 
@@ -600,13 +615,15 @@ export function validatePolicy({ policy, packages, adrRecords, policyPath = 'eng
     if (provenance.npm?.workspaceLinks !== 'declared-workspaces-only') {
       errors.push(`${policyPath}: dependencyProvenance.npm.workspaceLinks must be declared-workspaces-only`)
     }
+    if (typeof provenance.npm?.decision === 'string') decisionPaths.add(provenance.npm.decision)
+    else errors.push(`${policyPath}: dependencyProvenance.npm.decision must reference an ADR`)
     if (
-      !provenance.npm?.internalOptionalPlaceholders ||
-      typeof provenance.npm.internalOptionalPlaceholders !== 'object' ||
-      Array.isArray(provenance.npm.internalOptionalPlaceholders) ||
-      Object.keys(provenance.npm.internalOptionalPlaceholders).length === 0
+      !provenance.npm?.internalOptionalPackages ||
+      typeof provenance.npm.internalOptionalPackages !== 'object' ||
+      Array.isArray(provenance.npm.internalOptionalPackages) ||
+      Object.keys(provenance.npm.internalOptionalPackages).length === 0
     ) {
-      errors.push(`${policyPath}: dependencyProvenance.npm.internalOptionalPlaceholders must be a non-empty object`)
+      errors.push(`${policyPath}: dependencyProvenance.npm.internalOptionalPackages must be a non-empty object`)
     }
     for (const [dependency, owners] of Object.entries(provenance.cargo?.exclusiveOwners ?? {})) {
       if (!Array.isArray(owners) || owners.length === 0) {
@@ -782,6 +799,48 @@ function npmWorkspaces({ repoRoot, rootManifest, files, errors }) {
   return workspaces
 }
 
+export function checkNpmRepository(
+  repoRoot = defaultRepoRoot,
+  { policy: providedPolicy, files: providedFiles } = {},
+) {
+  const errors = []
+  const policy = providedPolicy
+    ?? readJson(join(repoRoot, 'engineering', 'architecture-boundaries.json'), errors)
+  const npmPolicy = policy?.dependencyProvenance?.npm
+  if (!npmPolicy) {
+    errors.push('engineering/architecture-boundaries.json: dependencyProvenance.npm is required')
+    return errors
+  }
+  let files = providedFiles
+  if (!files) {
+    try {
+      files = repositoryFiles(repoRoot)
+    } catch (error) {
+      errors.push(`git ls-files failed: ${error.message}`)
+      return errors
+    }
+  }
+  const rootManifest = readJson(join(repoRoot, npmPolicy.manifest), errors)
+  const npmLock = readJson(join(repoRoot, npmPolicy.lockfile), errors)
+  if (!rootManifest || !npmLock) return errors
+
+  const workspaceManifests = npmWorkspaces({ repoRoot, rootManifest, files, errors })
+  const internalManifests = new Map()
+  for (const configuredPath of Object.values(npmPolicy.internalOptionalPackages ?? {})) {
+    const manifestPath = repositoryPath(configuredPath)
+    const manifest = readJson(join(repoRoot, manifestPath, 'package.json'), errors)
+    if (manifest) internalManifests.set(manifestPath, manifest)
+  }
+  errors.push(...validateNpmProvenance({
+    lock: npmLock,
+    rootManifest,
+    workspaceManifests,
+    internalManifests,
+    policy: npmPolicy,
+  }))
+  return errors
+}
+
 function repositorySources(repoRoot, files, provenance) {
   const required = new Set((provenance.networkFreeBuild?.offlineCargoBuildFiles ?? []).map(repositoryPath))
   for (const path of files) {
@@ -863,28 +922,7 @@ export function checkRepository(repoRoot = defaultRepoRoot) {
             repoRoot,
           }))
 
-          const npmManifestPath = join(repoRoot, provenance.npm.manifest)
-          const npmLockPath = join(repoRoot, provenance.npm.lockfile)
-          const rootManifest = readJson(npmManifestPath, errors)
-          const npmLock = readJson(npmLockPath, errors)
-          if (rootManifest && npmLock) {
-            const workspaceManifests = npmWorkspaces({ repoRoot, rootManifest, files, errors })
-            const internalManifests = new Map()
-            for (const configuredPath of Object.values(
-              provenance.npm.internalOptionalPlaceholders ?? {},
-            )) {
-              const manifestPath = repositoryPath(configuredPath)
-              const manifest = readJson(join(repoRoot, manifestPath, 'package.json'), errors)
-              if (manifest) internalManifests.set(manifestPath, manifest)
-            }
-            errors.push(...validateNpmProvenance({
-              lock: npmLock,
-              rootManifest,
-              workspaceManifests,
-              internalManifests,
-              policy: provenance.npm,
-            }))
-          }
+          errors.push(...checkNpmRepository(repoRoot, { policy, files }))
         }
       }
     }

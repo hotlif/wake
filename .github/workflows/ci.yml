@@ -13,8 +13,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  npm-lock:
+    name: npm lock provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm run npm:lock:check
+
   architecture:
     name: architecture boundaries
+    needs: npm-lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +61,7 @@ jobs:
 
   clippy:
     name: clippy -D warnings
+    needs: npm-lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +82,7 @@ jobs:
 
   test:
     name: test
+    needs: npm-lock
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -95,6 +108,7 @@ jobs:
 
   test262-es2024:
     name: selected Test262 ES2024 / embedded V8
+    needs: npm-lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -114,6 +128,7 @@ jobs:
 
   browser-conformance:
     name: Browser evidence / ${{ matrix.target }} / ${{ matrix.browser_evidence }}
+    needs: npm-lock
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -225,6 +240,7 @@ jobs:
 
   typescript-7:
     name: TypeScript 7 compatibility / ${{ matrix.os }}
+    needs: npm-lock
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -274,6 +290,7 @@ jobs:
 
   bench-smoke:
     name: performance invariants + benches compile
+    needs: npm-lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -297,6 +314,7 @@ jobs:
 
   docs:
     name: documentation
+    needs: npm-lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -314,6 +332,7 @@ jobs:
 
   css:
     name: css package
+    needs: npm-lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -340,6 +359,7 @@ jobs:
 
   node:
     name: node ${{ matrix.node }} / win32-x64
+    needs: npm-lock
     runs-on: windows-latest
     strategy:
       fail-fast: false

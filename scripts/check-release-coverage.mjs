@@ -19,6 +19,7 @@ const vscodeWorkflow = readFileSync(
 )
 
 const releaseJobs = [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
+const ciJobs = [...ciWorkflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
 const vscodeJobs = [...vscodeWorkflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
 function releaseJob(name) {
   const matches = releaseJobs.filter((match) => match[1] === name)
@@ -29,6 +30,17 @@ function releaseJob(name) {
   const index = releaseJobs.indexOf(match)
   const end = releaseJobs[index + 1]?.index ?? workflow.length
   return { index: match.index, source: workflow.slice(match.index, end) }
+}
+
+function ciJob(name) {
+  const matches = ciJobs.filter((match) => match[1] === name)
+  if (matches.length !== 1) {
+    throw new Error(`ci.yml must define exactly one ${name} job; found ${matches.length}`)
+  }
+  const match = matches[0]
+  const index = ciJobs.indexOf(match)
+  const end = ciJobs[index + 1]?.index ?? ciWorkflow.length
+  return { index: match.index, source: ciWorkflow.slice(match.index, end) }
 }
 
 function vscodeJob(name) {
@@ -153,6 +165,7 @@ const auditTarballsJob = releaseJob('audit-tarballs')
 const prepublishSmokeJob = releaseJob('prepublish-smoke')
 const publishJob = releaseJob('publish')
 const registrySmokeJob = releaseJob('smoke')
+const ciNpmLockJob = ciJob('npm-lock')
 const ciBrowserJobMatch = ciWorkflow.match(
   /^  browser-conformance:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:\r?$)/m,
 )
@@ -169,6 +182,43 @@ if (!(auditTarballsJob.index < prepublishSmokeJob.index
   && prepublishSmokeJob.index < publishJob.index)) {
   throw new Error('local tarball smoke must run after audit-tarballs and before publish')
 }
+let npmLockMarkerIndex = -1
+for (const marker of [
+  'actions/checkout@v4',
+  'actions/setup-node@v6',
+  'node-version: 24',
+  'npm run npm:lock:check',
+]) {
+  const index = ciNpmLockJob.source.indexOf(marker)
+  if (index <= npmLockMarkerIndex) {
+    throw new Error(`ci.yml npm-lock job must order ${marker} after its preceding gate`)
+  }
+  npmLockMarkerIndex = index
+}
+if (ciNpmLockJob.source.includes('npm ci')) {
+  throw new Error('ci.yml npm-lock job must validate the lock before clean install')
+}
+for (const name of [
+  'architecture',
+  'clippy',
+  'test',
+  'test262-es2024',
+  'browser-conformance',
+  'typescript-7',
+  'bench-smoke',
+  'docs',
+  'css',
+  'node',
+]) {
+  if (!ciJob(name).source.includes('needs: npm-lock')) {
+    throw new Error(`ci.yml ${name} job must depend on npm-lock before clean install`)
+  }
+}
+requireOrderedJobMarkers('verify', verifyJob.source, [
+  'actions/setup-node@v6',
+  'npm run npm:lock:check',
+  'npm ci --ignore-scripts',
+])
 requireOrderedJobMarkers('audit-tarballs', auditTarballsJob.source, [
   'actions/setup-node@v6',
   'node-version: 24',
@@ -444,6 +494,7 @@ if (extensionManifest.private !== true) {
 
 const vscodeVerifyJob = vscodeJob('verify')
 const vscodeVerifyMarkers = [
+  'npm run npm:lock:check',
   'npm ci --ignore-scripts',
   'npm ci --ignore-scripts --prefix editors/vscode-css',
   'cargo fetch --locked',
@@ -463,6 +514,9 @@ for (const marker of [
   if (!vscodeVerifyJob.source.includes(marker)) {
     throw new Error(`vscode-css.yml verify job is missing contract marker ${marker}`)
   }
+}
+if (!vscodeWorkflow.includes("'scripts/check-npm-lock.mjs'")) {
+  throw new Error('vscode-css.yml must run when the npm lock preflight changes')
 }
 for (const forbidden of ['npm run native:build', 'napi build', 'stage-test-host']) {
   if (vscodeVerifyJob.source.includes(forbidden)) {

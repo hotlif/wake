@@ -30,6 +30,7 @@ const publishedDirectories = [
   'npm/wake-darwin-arm64',
 ]
 const manifests = new Map()
+const manifestDirectories = new Map()
 const dependencyFields = [
   'dependencies',
   'devDependencies',
@@ -43,6 +44,7 @@ for (const directory of ['.', ...publishedDirectories]) {
     readFileSync(resolve(root, directory, 'package.json'), 'utf8'),
   )
   manifests.set(manifest.name, manifest)
+  manifestDirectories.set(manifest.name, directory)
   if (manifest.version !== cargoVersion) {
     throw new Error(
       `${manifest.name}@${manifest.version} does not match Cargo ${cargoVersion}`,
@@ -238,11 +240,24 @@ if (JSON.stringify(optionalNames) !== JSON.stringify(platformNames)) {
     `${mainManifest.name} optional platform packages must be exactly: ${platformNames.join(', ')}`,
   )
 }
+const localOptionalNames = Object.keys(workspaceManifest.optionalDependencies ?? {}).sort()
+if (JSON.stringify(localOptionalNames) !== JSON.stringify(platformNames)) {
+  throw new Error(
+    `${workspaceManifest.name} local optional platform packages must be exactly: ${platformNames.join(', ')}`,
+  )
+}
 for (const platformName of platformNames) {
   const pinnedVersion = mainManifest.optionalDependencies[platformName]
   if (pinnedVersion !== cargoVersion) {
     throw new Error(
       `${mainManifest.name} must pin ${platformName} to ${cargoVersion}; found ${pinnedVersion ?? 'missing'}`,
+    )
+  }
+  const expectedLocal = `file:${manifestDirectories.get(platformName)}`
+  const localLocator = workspaceManifest.optionalDependencies[platformName]
+  if (localLocator !== expectedLocal) {
+    throw new Error(
+      `${workspaceManifest.name} must link ${platformName} to ${expectedLocal}; found ${localLocator ?? 'missing'}`,
     )
   }
 }
