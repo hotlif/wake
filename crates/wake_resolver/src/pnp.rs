@@ -142,7 +142,7 @@ impl PnpManifest {
                 return Some(dir);
             }
             if !dir.pop() {
-                return fs.is_file(Path::new(".pnp.cjs")).then(PathBuf::new);
+                return None;
             }
         }
     }

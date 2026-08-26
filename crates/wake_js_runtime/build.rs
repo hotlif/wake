@@ -70,7 +70,7 @@ fn generate() -> Result<(), String> {
                 package.name, package.version
             )
         })?;
-        validate_package(&root, package)?;
+        validate_package(root, package)?;
         for (relative_root, key_prefix) in package.embedded_roots {
             let source_root = root.join(relative_root);
             println!("cargo:rerun-if-changed={}", source_root.display());

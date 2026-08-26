@@ -477,6 +477,71 @@ pub struct ModuleGraphManifest {
     pub opaque_dependencies: bool,
 }
 
+/// Package metadata resolved through the same Yarn PnP/npm environment as executable modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPackageManifest {
+    pub path: PathBuf,
+    pub version: String,
+}
+
+/// Resolve package metadata from an importer without bypassing Yarn PnP visibility.
+pub fn resolve_package_manifest(
+    importer: &Path,
+    package: &str,
+) -> Result<ResolvedPackageManifest, RuntimeError> {
+    let context = ModuleResolutionContext::new(importer)?;
+    let issuer = importer.parent().unwrap_or_else(|| Path::new("."));
+    let root = context
+        .resolver
+        .resolve_package_root(package, issuer)
+        .map_err(|error| {
+            context.wrap_error_for_path(
+                RuntimeError::Resolve {
+                    path: importer.to_path_buf(),
+                    specifier: package.to_string(),
+                    reason: Some(error.to_string()),
+                },
+                importer,
+            )
+        })?;
+    let path = root.join("package.json");
+    let source = context.read_to_string(&path).map_err(|error| {
+        context.wrap_error_for_path(
+            RuntimeError::Io {
+                path: path.clone(),
+                message: error.to_string(),
+            },
+            &path,
+        )
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(&source).map_err(|error| {
+        context.wrap_error_for_path(
+            RuntimeError::Parse {
+                path: path.clone(),
+                messages: vec![format!("invalid package metadata: {error}")],
+            },
+            &path,
+        )
+    })?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| {
+            context.wrap_error_for_path(
+                RuntimeError::Parse {
+                    path: path.clone(),
+                    messages: vec!["package metadata has no version".to_string()],
+                },
+                &path,
+            )
+        })?;
+    Ok(ResolvedPackageManifest {
+        path,
+        version: version.to_string(),
+    })
+}
+
 /// A compiled module graph whose transpiled modules can be emitted into a fresh realm repeatedly.
 #[derive(Debug, Clone)]
 pub struct CompiledCommonJsModuleGraph {
@@ -2287,6 +2352,49 @@ mod tests {
             .unwrap_err();
         assert!(canceller.join().unwrap());
         assert!(matches!(error, RuntimeError::Vm(error) if error.is_termination()));
+    }
+
+    #[test]
+    fn package_manifest_resolution_uses_yarn_pnp_for_nested_issuers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let package = fixture.path().join(".yarn/cache/react/node_modules/react");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"react","version":"19.2.8"}"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.path().join(".pnp.cjs"),
+            "module.exports = require('./.pnp.data.json');",
+        )
+        .unwrap();
+        fs::write(
+            fixture.path().join(".pnp.data.json"),
+            serde_json::json!({
+                "enableTopLevelFallback": false,
+                "dependencyTreeRoots": [[null, null]],
+                "packageRegistryData": [
+                    [null, [[null, {
+                        "packageLocation": "./",
+                        "packageDependencies": [["react", "npm:19.2.8"]],
+                    }]]],
+                    ["react", [["npm:19.2.8", {
+                        "packageLocation": "./.yarn/cache/react/node_modules/react/",
+                        "packageDependencies": [["react", "npm:19.2.8"]],
+                    }]]],
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let issuer = fixture.path().join("target/nested/react.test.ts");
+        fs::create_dir_all(issuer.parent().unwrap()).unwrap();
+        fs::write(&issuer, "import React from 'react'").unwrap();
+
+        let metadata = resolve_package_manifest(&issuer, "react").unwrap();
+        assert_eq!(metadata.version, "19.2.8");
+        assert_eq!(metadata.path, package.join("package.json"));
     }
 
     #[test]

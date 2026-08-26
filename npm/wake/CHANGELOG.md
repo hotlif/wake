@@ -13,6 +13,8 @@
   gates built exclusively from the current local tarballs.
 - Moved private Wake Docs generated imports to a non-package alias namespace so Yarn PnP remains
   authoritative for valid bare package names without intercepting internal runtime modules.
+- Kept absolute issuers outside a PnP root on classic npm resolution, and made Wake Test resolve
+  React package metadata through the same issuer-owned PnP/npm environment as executable modules.
 
 ## 0.1.22
 

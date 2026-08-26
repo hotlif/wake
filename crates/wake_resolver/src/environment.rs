@@ -303,6 +303,25 @@ mod tests {
     }
 
     #[test]
+    fn absolute_issuer_outside_the_cwd_pnp_tree_stays_classic() {
+        let fs = Arc::new(MemoryFileSystem::new());
+        external_loader(&fs, "", manifest("cache/ghost/node_modules/ghost/", None));
+        let base: Arc<dyn FileSystem> = fs;
+        let environment = ResolutionEnvironment::new(base);
+        let issuer = std::env::temp_dir().join("wake-unmanaged-issuer/src");
+
+        assert!(!environment.has_pnp_root(&issuer));
+        assert_eq!(
+            environment
+                .resolver()
+                .resolve("ghost", &issuer)
+                .unwrap_err()
+                .kind(),
+            &ResolveErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn pnp_preserves_non_package_wake_internal_aliases() {
         let fs = Arc::new(MemoryFileSystem::new());
         external_loader(

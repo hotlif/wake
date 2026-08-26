@@ -247,13 +247,13 @@ pub enum ResolveErrorKind {
 pub struct ResolveError {
     pub specifier: String,
     pub from: PathBuf,
-    kind: ResolveErrorKind,
+    kind: Box<ResolveErrorKind>,
     witnesses: Vec<PathBuf>,
 }
 
 impl ResolveError {
     pub fn kind(&self) -> &ResolveErrorKind {
-        &self.kind
+        self.kind.as_ref()
     }
 
     /// Logical filesystem locations whose mutation may make this exact resolution succeed.
@@ -268,7 +268,7 @@ impl ResolveError {
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.kind {
+        match self.kind.as_ref() {
             ResolveErrorKind::NotFound => write!(
                 f,
                 "无法从 `{}` 解析模块 `{}`",
@@ -554,7 +554,7 @@ impl Resolver {
         ResolveError {
             specifier: specifier.to_string(),
             from: from_dir.to_path_buf(),
-            kind,
+            kind: Box::new(kind),
             witnesses: self.resolution_witnesses(specifier, from_dir),
         }
     }

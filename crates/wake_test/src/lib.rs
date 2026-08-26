@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use wake_common::SourceFile;
 use wake_js_runtime::{
     CompiledCommonJsGraphScript, CompiledCommonJsModuleGraph, JsRuntime, RuntimeError,
-    compile_commonjs_module_graph, emit_commonjs_graph_script,
+    compile_commonjs_module_graph, emit_commonjs_graph_script, resolve_package_manifest,
 };
 use wake_test_browser::{
     BrowserCancellationToken, BrowserDriver, BrowserError, BrowserKind, BrowserLaunchOptions,
@@ -5056,50 +5056,16 @@ fn structured_failure(
 
 fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> {
     fn manifest(importer: &Path, package: &str) -> Result<(PathBuf, String), TestError> {
-        let mut directory = importer.parent();
-        while let Some(current) = directory {
-            let path = current
-                .join("node_modules")
-                .join(package)
-                .join("package.json");
-            if path.is_file() {
-                let source = fs::read_to_string(&path).map_err(|error| {
-                    TestError::new(
-                        "WAKE_TEST_REACT_VERSION",
-                        format!("could not read {package} package metadata: {error}"),
-                    )
-                    .at(&path)
-                })?;
-                let value =
-                    serde_json::from_str::<serde_json::Value>(&source).map_err(|error| {
-                        TestError::new(
-                            "WAKE_TEST_REACT_VERSION",
-                            format!("invalid {package} package metadata: {error}"),
-                        )
-                        .at(&path)
-                    })?;
-                let version = value
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        TestError::new(
-                            "WAKE_TEST_REACT_VERSION",
-                            format!("{package} package metadata has no version"),
-                        )
-                        .at(&path)
-                    })?;
-                return Ok((path, version.to_string()));
-            }
-            directory = current.parent();
-        }
-        Err(TestError::new(
-            "WAKE_TEST_REACT_VERSION",
-            format!(
-                "{package} is required by @crab-dev/wake/test/react; install matching react and react-dom >=19.2.8 <19.3.0"
-            ),
-        )
-        .at(importer))
+        let metadata = resolve_package_manifest(importer, package).map_err(|error| {
+            TestError::new(
+                "WAKE_TEST_REACT_VERSION",
+                format!(
+                    "{package} is required by @crab-dev/wake/test/react; install matching react and react-dom >=19.2.8 <19.3.0 ({error})"
+                ),
+            )
+            .at(importer)
+        })?;
+        Ok((metadata.path, metadata.version))
     }
 
     fn supported(version: &str) -> bool {
@@ -5113,15 +5079,7 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
 
     let (react_manifest, react) = manifest(importer, "react")?;
     let (react_dom_manifest, react_dom) = manifest(importer, "react-dom")?;
-    let react_project = react_manifest
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    let react_dom_project = react_dom_manifest
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    if react != react_dom || react_project != react_dom_project || !supported(&react) {
+    if react != react_dom || !supported(&react) {
         return Err(TestError::new(
             "WAKE_TEST_REACT_VERSION",
             format!(
