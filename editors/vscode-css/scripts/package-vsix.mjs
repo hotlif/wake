@@ -47,6 +47,7 @@ const vsce = require.resolve('@vscode/vsce/vsce')
 execFileSync(process.execPath, [
   vsce,
   'package',
+  '--no-dependencies',
   '--target',
   target,
   '--out',

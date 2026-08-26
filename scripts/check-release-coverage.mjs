@@ -21,6 +21,7 @@ const vscodeWorkflow = readFileSync(
   resolve(root, '.github/workflows/vscode-css.yml'),
   'utf8',
 )
+const yarnConfig = readFileSync(resolve(root, '.yarnrc.yml'), 'utf8')
 
 const releaseJobs = [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
 const ciJobs = [...ciWorkflow.matchAll(/^  ([a-zA-Z0-9_-]+):\r?$/gm)]
@@ -753,6 +754,19 @@ const packageScript = readFileSync(
 )
 if (!packageScript.includes('extensionManifest.version')) {
   throw new Error('VSIX archive names must use the extension manifest version')
+}
+if (!packageScript.includes("'--no-dependencies'")) {
+  throw new Error('Bundled VSIX packaging must disable dependency collection under Yarn PnP')
+}
+for (const marker of [
+  '"@secretlint/resolver@10.2.2":',
+  '"@secretlint/secretlint-formatter-sarif": "10.2.2"',
+  '"@secretlint/secretlint-rule-no-dotenv": "10.2.2"',
+  '"@secretlint/secretlint-rule-preset-recommend": "10.2.2"',
+]) {
+  if (!yarnConfig.includes(marker)) {
+    throw new Error(`Yarn PnP must extend VSCE's dynamic Secretlint resolver with ${marker}`)
+  }
 }
 
 console.log(

@@ -260,6 +260,7 @@ test('architecture CI fetches the complete lock graph before its offline target-
 
 test('Node CI stages the complete local platform package before testing and packing', () => {
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   const nodeJobStart = ci.search(/\r?\n  node:\r?\n/)
   assert.notEqual(nodeJobStart, -1)
   const nodeJob = ci.slice(nodeJobStart)
@@ -280,6 +281,10 @@ test('Node CI stages the complete local platform package before testing and pack
   }
   assert.doesNotMatch(nodeJob, /cargo fetch --locked --target/)
   assert.doesNotMatch(nodeJob, /Copy-Item .*\.node/)
+  assert.equal(
+    manifest.scripts['npm:test:wake'],
+    'wake test npm/wake/test/cli.test.mjs npm/wake/test/components-state.test.mjs npm/wake/test/console.test.mjs npm/wake/test/terminal.test.mjs && yarn npm:test:wake:addon',
+  )
 })
 
 test('npm consumers are built from local tarballs and tested outside the PnP source tree', () => {
@@ -335,6 +340,7 @@ test('npm consumers are built from local tarballs and tested outside the PnP sou
 
 test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host', () => {
   const workflow = readFileSync(new URL('../.github/workflows/vscode-css.yml', import.meta.url), 'utf8')
+  const yarnConfig = readFileSync(new URL('../.yarnrc.yml', import.meta.url), 'utf8')
   const architecturePolicy = JSON.parse(
     readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'),
   )
@@ -353,6 +359,10 @@ test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host
     new URL('../editors/vscode-css/scripts/wake-binary.mjs', import.meta.url),
     'utf8',
   )
+  const packageScript = readFileSync(
+    new URL('../editors/vscode-css/scripts/package-vsix.mjs', import.meta.url),
+    'utf8',
+  )
   assert.equal(
     manifest.scripts.check,
     'yarn compile && node scripts/run-wake-tests.mjs test/manifest.test.mjs',
@@ -365,6 +375,11 @@ test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host
   assert.match(binaryResolver, /isAbsolute\(wakeBinary\)/)
   assert.match(build, /spawnSync\(wakeBinary, args/)
   assert.match(launcher, /spawnSync\(wakeBinary, \['test', \.\.\.testFiles, '--serial'\]/)
+  assert.match(packageScript, /'--no-dependencies'/)
+  assert.match(yarnConfig, /"@secretlint\/resolver@10\.2\.2":/)
+  assert.match(yarnConfig, /"@secretlint\/secretlint-formatter-sarif": "10\.2\.2"/)
+  assert.match(yarnConfig, /"@secretlint\/secretlint-rule-no-dotenv": "10\.2\.2"/)
+  assert.match(yarnConfig, /"@secretlint\/secretlint-rule-preset-recommend": "10\.2\.2"/)
   for (const source of [manifest.scripts.check, build, launcher, binaryResolver]) {
     assert.doesNotMatch(source, /npm\/wake\/bin\/wake\.mjs|node_modules|releaseBinary|['"]cargo['"]|https?:\/\//)
   }

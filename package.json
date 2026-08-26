@@ -18,7 +18,7 @@
     "docs:check": "node scripts/check-docs.mjs",
     "native:build": "cargo build -p wake_test_host -p wake_cli --release --locked --offline && yarn exec napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts -- --locked --offline && node scripts/stage-test-host.mjs",
     "npm:test": "yarn npm:test:wake && yarn npm:test:css",
-    "npm:test:wake": "wake test \"^npm/wake/test/(cli|components-state|console|terminal)\\.test\\.mjs$\" && yarn npm:test:wake:addon",
+    "npm:test:wake": "wake test npm/wake/test/cli.test.mjs npm/wake/test/components-state.test.mjs npm/wake/test/console.test.mjs npm/wake/test/terminal.test.mjs && yarn npm:test:wake:addon",
     "npm:test:wake:addon": "node --test npm/wake/test/api.test.mjs npm/css/test/realm.node.mjs",
     "npm:test:css": "yarn workspace @crab-dev/css test",
     "npm:typecheck": "yarn npm:typecheck:wake && yarn npm:typecheck:css",

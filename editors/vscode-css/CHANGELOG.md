@@ -2,6 +2,8 @@
 
 ## 0.1.3
 
+- Made Yarn PnP VSIX packaging expose VSCE's dynamic Secretlint rules to their actual resolver
+  and exclude bundled runtime dependencies from dependency collection.
 - Made automatic property-value suggestions reliable across VS Code hosts by synchronizing the
   completion edit's document update with its following cursor movement while rejecting stale or
   user-moved selections.

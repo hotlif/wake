@@ -525,7 +525,6 @@ function onceMatching(emitter, eventName, predicate, timeoutMs = 10_000) {
         `Timed out waiting for matching ${eventName} event; observed ${JSON.stringify(unmatched)}`,
       ))
     }, timeoutMs)
-    timeout.unref()
 
     const onEvent = (event) => {
       if (!predicate(event)) {
@@ -623,9 +622,7 @@ test('dev diagnostics preserve native source locations', async () => {
   await new Promise((resolve) => reservation.close(resolve))
   const server = await startDevServer({ cwd, port })
   try {
-    const [diagnostic] = await once(server, 'diagnostic', {
-      signal: AbortSignal.timeout(10_000),
-    })
+    const diagnostic = await onceMatching(server, 'diagnostic', () => true)
     assert.equal(diagnostic.severity, 'error')
     assert.equal(diagnostic.location.line, 3)
     assert.equal(diagnostic.location.lineText, 'const broken = ;')

@@ -1767,7 +1767,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@secretlint/secretlint-formatter-sarif@npm:^10.1.2":
+"@secretlint/secretlint-formatter-sarif@npm:10.2.2, @secretlint/secretlint-formatter-sarif@npm:^10.1.2":
   version: 10.2.2
   resolution: "@secretlint/secretlint-formatter-sarif@npm:10.2.2"
   dependencies:
@@ -1776,7 +1776,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@secretlint/secretlint-rule-no-dotenv@npm:^10.1.2":
+"@secretlint/secretlint-rule-no-dotenv@npm:10.2.2, @secretlint/secretlint-rule-no-dotenv@npm:^10.1.2":
   version: 10.2.2
   resolution: "@secretlint/secretlint-rule-no-dotenv@npm:10.2.2"
   dependencies:
@@ -1785,7 +1785,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@secretlint/secretlint-rule-preset-recommend@npm:^10.1.2":
+"@secretlint/secretlint-rule-preset-recommend@npm:10.2.2, @secretlint/secretlint-rule-preset-recommend@npm:^10.1.2":
   version: 10.2.2
   resolution: "@secretlint/secretlint-rule-preset-recommend@npm:10.2.2"
   checksum: 10c0/41f0e471bc906aade6c188d728cf18e64a70eb21cd0432299532111da4a9187e3fa6e70b1abb7f9845ef6aa7927e82e72f4bbc47306734c4911f2170a22e888e
