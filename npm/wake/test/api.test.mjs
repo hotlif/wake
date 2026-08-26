@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -41,7 +41,12 @@ const packageVersion = JSON.parse(
 const contexts = []
 
 async function assertSameExistingPath(actual, expected) {
-  assert.equal(await realpath(actual), await realpath(expected))
+  const [actualStats, expectedStats] = await Promise.all([
+    stat(actual, { bigint: true }),
+    stat(expected, { bigint: true }),
+  ])
+  assert.equal(actualStats.dev, expectedStats.dev)
+  assert.equal(actualStats.ino, expectedStats.ino)
 }
 
 function loadBuiltNative() {
