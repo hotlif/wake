@@ -2,9 +2,12 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'
 import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const root = resolve(import.meta.dirname, '..')
 const cli = resolve(root, 'npm/wake/bin/wake.mjs')
+const pnpRequire = resolve(root, '.pnp.cjs')
+const pnpLoader = pathToFileURL(resolve(root, '.pnp.loader.mjs')).href
 const expectedVersion = JSON.parse(
   readFileSync(resolve(root, 'npm/wake/package.json'), 'utf8'),
 ).version
@@ -12,7 +15,14 @@ const samples = []
 
 for (let index = 0; index < 5; index += 1) {
   const started = performance.now()
-  const result = spawnSync(process.execPath, [cli, '--version'], {
+  const result = spawnSync(process.execPath, [
+    '--require',
+    pnpRequire,
+    '--experimental-loader',
+    pnpLoader,
+    cli,
+    '--version',
+  ], {
     cwd: root,
     env: process.env,
     encoding: 'utf8',

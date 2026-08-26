@@ -133,7 +133,7 @@ impl Default for BrowserLaunchOptions {
             locale: "en-US".to_string(),
             timezone: "UTC".to_string(),
             color_scheme: "light".to_string(),
-            launch_timeout_ms: 15_000,
+            launch_timeout_ms: 30_000,
         }
     }
 }

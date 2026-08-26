@@ -261,6 +261,7 @@ test('architecture CI fetches the complete lock graph before its offline target-
 test('Node CI stages the complete local platform package before testing and packing', () => {
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const startupCheck = readFileSync(new URL('./check-startup.mjs', import.meta.url), 'utf8')
   const nodeJobStart = ci.search(/\r?\n  node:\r?\n/)
   assert.notEqual(nodeJobStart, -1)
   const nodeJob = ci.slice(nodeJobStart)
@@ -285,6 +286,9 @@ test('Node CI stages the complete local platform package before testing and pack
     manifest.scripts['npm:test:wake'],
     'wake test npm/wake/test/cli.test.mjs npm/wake/test/components-state.test.mjs npm/wake/test/console.test.mjs npm/wake/test/terminal.test.mjs && yarn npm:test:wake:addon',
   )
+  for (const marker of ['.pnp.cjs', '.pnp.loader.mjs', 'pathToFileURL', "'--experimental-loader'"]) {
+    assert.match(startupCheck, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  }
 })
 
 test('npm consumers are built from local tarballs and tested outside the PnP source tree', () => {
