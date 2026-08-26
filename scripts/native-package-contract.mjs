@@ -3,10 +3,12 @@ import { readFileSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseSyml } from '@yarnpkg/parsers'
 
 const require = createRequire(import.meta.url)
-const pnpapi = require('pnpapi')
+const workspaceRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
+const pnpapi = require(resolve(workspaceRoot, '.pnp.cjs'))
+pnpapi.setup()
+const { parseSyml } = require('@yarnpkg/parsers')
 
 export const MEBIBYTE = 1024 * 1024
 export const PLATFORM_PACKED_WARNING = 56 * MEBIBYTE

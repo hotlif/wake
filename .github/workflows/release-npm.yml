@@ -383,7 +383,6 @@ jobs:
     env:
       WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts
       WAKE_NPM_PLATFORM: ${{ matrix.platform }}
-      WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer
       WAKE_NPM_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -395,6 +394,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
+      - name: Select external npm consumer project
+        shell: bash
+        run: printf 'WAKE_NPM_PROJECT=%s\n' "$RUNNER_TEMP/wake-npm-consumer" >> "$GITHUB_ENV"
       - name: Clean install this build's local tarballs
         run: node scripts/check-npm-consumer.mjs
       - name: Wake Test CLI, runTests and TestContext smoke
