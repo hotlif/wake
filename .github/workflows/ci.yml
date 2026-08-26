@@ -70,6 +70,8 @@ jobs:
       - run: npm pack ./npm/wake --ignore-scripts --pack-destination artifacts
       - run: npm pack ./npm/css --ignore-scripts --pack-destination artifacts
       - run: npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts
+      - name: Pack non-host platform metadata for npm lock generation
+        run: node scripts/pack-npm-lock-platforms.mjs --artifacts artifacts --exclude ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
         with:
           name: npm-consumer-${{ matrix.platform }}

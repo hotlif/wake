@@ -404,7 +404,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WAKE_NPM_PROJECT"
-          npx --no-install wake test smoke.test.mjs --serial
+          node node_modules/@crab-dev/wake/bin/wake.mjs test smoke.test.mjs --serial
           node <<'NODE'
           const { createTestContext, runTests } = require('@crab-dev/wake')
           async function main() {
@@ -507,7 +507,7 @@ jobs:
           set -euo pipefail
           cd "$WAKE_NPM_PROJECT"
           node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('local browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('local-ready')})\\n\")"
-          npx --no-install wake test visual.browser.test.mjs \
+          node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs \
             --serial \
             --browser-path "$WAKE_RELEASE_BROWSER_PATH" \
             --reporter json \
@@ -515,7 +515,7 @@ jobs:
           node "$GITHUB_WORKSPACE/scripts/check-system-browser-conformance.mjs" \
             --target "${{ matrix.platform }}" \
             --result browser-result.json > "$RUNNER_TEMP/wake-browser-evidence.json"
-          npx --no-install wake test visual.browser.test.mjs --serial --browser-path "$WAKE_RELEASE_BROWSER_PATH"
+          node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs --serial --browser-path "$WAKE_RELEASE_BROWSER_PATH"
       - name: Record reviewed browser unavailability
         if: matrix.node == '24' && matrix.browser_evidence == 'unavailable'
         shell: bash

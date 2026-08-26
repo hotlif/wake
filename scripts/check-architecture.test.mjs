@@ -306,6 +306,7 @@ test('npm consumers are built from local tarballs and tested outside the PnP sou
     'npm pack ./npm/wake --ignore-scripts --pack-destination artifacts',
     'npm pack ./npm/css --ignore-scripts --pack-destination artifacts',
     'npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts',
+    'node scripts/pack-npm-lock-platforms.mjs --artifacts artifacts --exclude ${{ matrix.platform }}',
   ]) assert.match(artifactJob, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
 
   assert.match(consumerJob, /needs: npm-package-artifacts/)
@@ -316,7 +317,8 @@ test('npm consumers are built from local tarballs and tested outside the PnP sou
   assert.doesNotMatch(consumerJob, /corepack|yarn install|cargo |npm pack|WAKE_NATIVE_PATH/)
 
   assert.match(consumer, /\['install', '--package-lock-only'/)
-  assert.match(consumer, /\['ci', \.\.\.installArguments\]/)
+  assert.match(consumer, /\['ci', \.\.\.ciArguments\]/)
+  assert.match(consumer, /optionalPlatformArchives/)
   assert.match(consumer, /assertNoPnpAncestor\(project\)/)
   assert.match(consumer, /WAKE_NPM_WORKSPACE_CLASSIC/)
   assert.match(consumer, /node_modules\/wake-npm-consumer-shared/)

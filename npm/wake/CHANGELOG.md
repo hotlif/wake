@@ -17,6 +17,9 @@
   React package metadata through the same issuer-owned PnP/npm environment as executable modules.
 - Made the pinned Corepack bootstrap overwrite preinstalled Windows shims consistently across CI,
   release, and VS Code workflows.
+- Made npm 11/12 consumer locks include every optional platform locator from local artifacts before
+  `npm ci --omit=optional`, while still loading only the matching native package at runtime, and
+  invoke the installed CLI without the removed `npx --no-install` behavior.
 
 ## 0.1.22
 

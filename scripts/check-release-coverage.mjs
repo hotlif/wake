@@ -226,6 +226,7 @@ for (const marker of [
   'npm pack ./npm/wake --ignore-scripts --pack-destination artifacts',
   'npm pack ./npm/css --ignore-scripts --pack-destination artifacts',
   'npm pack ./npm/${{ matrix.package_dir }} --ignore-scripts --pack-destination artifacts',
+  'node scripts/pack-npm-lock-platforms.mjs --artifacts artifacts --exclude ${{ matrix.platform }}',
   'name: npm-consumer-${{ matrix.platform }}',
 ]) {
   const index = ciNpmPackageArtifactsJob.source.indexOf(marker)
@@ -271,12 +272,14 @@ for (const forbidden of ['corepack', 'yarn install', 'cargo ', 'npm pack', 'WAKE
 }
 for (const marker of [
   "['install', '--package-lock-only'",
-  "['ci', ...installArguments]",
+  "['ci', ...ciArguments]",
+  'optionalPlatformArchives',
   'assertNoPnpAncestor(project)',
   "join(project, 'node_modules')",
   'WAKE_NPM_WORKSPACE_CLASSIC',
-  "['--no-install', 'wake', '--version']",
-  "['--no-install', 'wake', 'test'",
+  "join(project, 'node_modules', '@crab-dev', 'wake', 'bin', 'wake.mjs')",
+  "[wakeCli, '--version']",
+  "[wakeCli, 'test'",
 ]) {
   if (!npmConsumerScript.includes(marker)) {
     throw new Error(`check-npm-consumer.mjs is missing contract marker ${marker}`)
@@ -365,7 +368,7 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   'node scripts/check-npm-consumer.mjs',
   'Wake Test CLI, runTests and TestContext smoke',
   'cd "$WAKE_NPM_PROJECT"',
-  'npx --no-install wake test smoke.test.mjs --serial',
+  'node node_modules/@crab-dev/wake/bin/wake.mjs test smoke.test.mjs --serial',
   'runTests(options)',
   'createTestContext(options)',
   'context.startWatch()',

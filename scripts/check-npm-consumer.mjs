@@ -14,7 +14,6 @@ import { dirname, join, relative, resolve } from 'node:path'
 
 const repositoryRoot = resolve(import.meta.dirname, '..')
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-const npxCommand = process.platform === 'win32' ? 'npx.cmd' : 'npx'
 const childEnvironment = { ...process.env }
 delete childEnvironment.NODE_OPTIONS
 delete childEnvironment.npm_execpath
@@ -26,6 +25,13 @@ const hostPlatforms = new Map([
   ['darwin-x64', 'darwin-x64'],
   ['darwin-arm64', 'darwin-arm64'],
 ])
+const releasePlatforms = [
+  'win32-x64-msvc',
+  'linux-x64-gnu',
+  'linux-arm64-gnu',
+  'darwin-x64',
+  'darwin-arm64',
+]
 
 function parseArguments(values) {
   const supported = new Set(['artifacts', 'platform', 'project', 'version'])
@@ -154,6 +160,19 @@ const archives = Object.fromEntries(
   }),
 )
 const platformPackage = `@crab-dev/wake-${platform}`
+const optionalPlatformArchives = new Map(
+  releasePlatforms
+    .filter((candidate) => candidate !== platform)
+    .map((candidate) => {
+      const name = `@crab-dev/wake-${candidate}`
+      const archiveName = `crab-dev-wake-${candidate}-${version}.tgz`
+      const archive = join(artifacts, archiveName)
+      if (!existsSync(archive) || !statSync(archive).isFile()) {
+        throw new Error(`Missing npm lock metadata archive ${archive}`)
+      }
+      return [name, { archive, archiveName }]
+    }),
+)
 const dependencies = {
   '@crab-dev/css': fileDependency(project, archives.css),
   '@crab-dev/wake': fileDependency(project, archives.wake),
@@ -161,6 +180,9 @@ const dependencies = {
   react: '19.2.8',
   'react-dom': '19.2.8',
 }
+const optionalDependencies = Object.fromEntries(
+  [...optionalPlatformArchives].map(([name, value]) => [name, fileDependency(project, value.archive)]),
+)
 
 mkdirSync(join(project, 'packages/app/src'), { recursive: true })
 mkdirSync(join(project, 'packages/shared'), { recursive: true })
@@ -172,6 +194,7 @@ writeFileSync(join(project, 'package.json'), `${JSON.stringify({
   workspaces: ['packages/*'],
   scripts: { 'wake-build': 'wake build' },
   dependencies,
+  optionalDependencies,
 }, null, 2)}\n`)
 writeFileSync(join(project, 'packages/app/package.json'), `${JSON.stringify({
   name: 'wake-npm-consumer-app',
@@ -203,7 +226,8 @@ writeFileSync(
   "import { test, expect } from '@crab-dev/wake/test'; test('npm consumer host', () => expect(42).toBe(42));\n",
 )
 
-const installArguments = ['--ignore-scripts', '--omit=optional', '--no-audit', '--no-fund']
+const installArguments = ['--ignore-scripts', '--no-audit', '--no-fund']
+const ciArguments = [...installArguments, '--omit=optional']
 run(npmCommand, ['install', '--package-lock-only', ...installArguments], project)
 if (!existsSync(join(project, 'package-lock.json'))) {
   throw new Error('npm install --package-lock-only did not create package-lock.json')
@@ -211,7 +235,7 @@ if (!existsSync(join(project, 'package-lock.json'))) {
 if (existsSync(join(project, 'node_modules'))) {
   throw new Error('package-lock-only unexpectedly created node_modules before npm ci')
 }
-run(npmCommand, ['ci', ...installArguments], project)
+run(npmCommand, ['ci', ...ciArguments], project)
 
 if (existsSync(join(project, '.pnp.cjs'))) {
   throw new Error('npm consumer unexpectedly generated .pnp.cjs')
@@ -239,6 +263,26 @@ for (const [name, archiveName] of expectedPackages) {
     throw new Error(`${name} installed as ${installed.name}@${installed.version}; expected ${name}@${version}`)
   }
 }
+for (const [name, { archiveName }] of optionalPlatformArchives) {
+  assertArchiveSource(
+    projectManifest.optionalDependencies?.[name],
+    archiveName,
+    `package.json optional ${name}`,
+  )
+  assertArchiveSource(
+    lockedRoot.optionalDependencies?.[name],
+    archiveName,
+    `package-lock.json optional ${name}`,
+  )
+  const locked = packageLock.packages?.[`node_modules/${name}`]
+  if (!locked || locked.version !== version || locked.optional !== true) {
+    throw new Error(`${name} must be locked as optional ${version}; found ${JSON.stringify(locked)}`)
+  }
+  assertArchiveSource(locked.resolved, archiveName, `package-lock.json resolved ${name}`)
+  if (existsSync(join(project, 'node_modules', name))) {
+    throw new Error(`npm ci --omit=optional unexpectedly installed non-host package ${name}`)
+  }
+}
 
 const workspaceLink = realpathSync(join(project, 'node_modules/wake-npm-consumer-shared'))
 const workspaceSource = realpathSync(join(project, 'packages/shared'))
@@ -247,7 +291,9 @@ if (normalizeCase(workspaceLink) !== normalizeCase(workspaceSource)) {
   throw new Error(`npm workspace link points to ${workspaceLink}; expected ${workspaceSource}`)
 }
 
-run(npxCommand, ['--no-install', 'wake', '--version'], project)
+const wakeCli = join(project, 'node_modules', '@crab-dev', 'wake', 'bin', 'wake.mjs')
+if (!existsSync(wakeCli)) throw new Error(`Missing installed Wake CLI ${wakeCli}`)
+run(process.execPath, [wakeCli, '--version'], project)
 run(process.execPath, ['-e', [
   "const wake=require('@crab-dev/wake')",
   "const css=require('@crab-dev/css')",
@@ -275,6 +321,6 @@ run(process.execPath, ['--input-type=module', '-e', [
   "const result=await build({cwd:process.cwd()})",
   "if(!result.success)throw new Error(JSON.stringify(result))",
 ].join(';')], project)
-run(npxCommand, ['--no-install', 'wake', 'test', 'smoke.test.mjs', '--serial'], project)
+run(process.execPath, [wakeCli, 'test', 'smoke.test.mjs', '--serial'], project)
 
 console.log(`npm consumer verified ${platform} at ${project}`)
