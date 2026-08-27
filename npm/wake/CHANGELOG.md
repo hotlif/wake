@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.24
+
+- Added Activity, Recent Problems, and Changes views to the interactive `wake dev` and `wake docs dev`
+  dashboards, with keyboard view switching, independent scrolling, unread counters, explicit empty
+  states, failed workspace names, and richer rebuild batches.
+- Preserved structured diagnostics in both Rust and npm terminal implementations so errors include
+  severity, codes, locations, source snippets, and notes; warnings no longer incorrectly switch the
+  dashboard to `ERROR`.
+- Added a shared terminal dashboard contract fixture and synchronized Rust/npm coverage for severity,
+  workspace failures, Unicode and multiline diagnostics, view navigation, clearing, and small-terminal
+  rendering.
+
 ## 0.1.23
 
 - Made Yarn 4.16 PnP authoritative for package visibility, alias dependencies, peer/virtual packages,

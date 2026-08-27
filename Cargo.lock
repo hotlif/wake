@@ -4169,7 +4169,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "wake_app"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "getrandom 0.3.4",
  "regex",
@@ -4192,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "wake_bundler"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "criterion",
  "crossbeam-utils",
@@ -4216,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "wake_cache"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "wake_common",
  "wake_turbo",
@@ -4224,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "wake_cli"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "wake_common"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "criterion",
  "flate2",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "wake_config"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "browserslist-rs",
  "serde",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "cssparser",
  "wake_common",
@@ -4276,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_in_js"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "wake_common",
  "wake_css",
@@ -4287,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_language"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde",
  "serde_json",
@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "wake_css_lsp"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde",
  "serde_json",
@@ -4315,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "wake_dev_server"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "actix-web",
  "actix-ws",
@@ -4333,7 +4333,7 @@ dependencies = [
 
 [[package]]
 name = "wake_docs"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "markdown",
  "regex",
@@ -4345,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_ast"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "bumpalo",
  "wake_common",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_codegen"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "insta",
  "wake_common",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_lexer"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "criterion",
  "insta",
@@ -4374,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_minify"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "insta",
  "wake_common",
@@ -4385,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_parser"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "bumpalo",
  "criterion",
@@ -4399,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_semantic"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_transform"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "bumpalo",
  "wake_common",
@@ -4417,7 +4417,7 @@ dependencies = [
 
 [[package]]
 name = "wake_ecma_vm"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -4430,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "wake_graph"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "wake_common",
  "wake_ecma_ast",
@@ -4438,11 +4438,11 @@ dependencies = [
 
 [[package]]
 name = "wake_html"
-version = "0.1.23"
+version = "0.1.24"
 
 [[package]]
 name = "wake_js_runtime"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde",
  "serde_json",
@@ -4458,7 +4458,7 @@ dependencies = [
 
 [[package]]
 name = "wake_node"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "napi",
  "napi-build",
@@ -4476,7 +4476,7 @@ dependencies = [
 
 [[package]]
 name = "wake_resolver"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "criterion",
  "fancy-regex",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "wake_scan"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "regex",
  "serde_json",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "base64 0.22.1",
  "regex",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test_browser"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test_contract"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde",
  "serde_json",
@@ -4533,7 +4533,7 @@ dependencies = [
 
 [[package]]
 name = "wake_test_host"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "notify",
  "serde_json",
@@ -4544,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "wake_tsdoc"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "regex",
  "serde",
@@ -4552,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "wake_turbo"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "criterion",
  "crossbeam-deque",
@@ -4565,7 +4565,7 @@ dependencies = [
 
 [[package]]
 name = "wake_turbo_macros"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "proc-macro2",
  "quote",
