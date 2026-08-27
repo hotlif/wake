@@ -1338,7 +1338,7 @@ fn cmd_build_watch(
 
     match context.rebuild(Vec::new(), wake_app::CancellationToken::default()) {
         Ok(result) => {
-            state.built(metrics_from_result(&result), true);
+            state.built(metrics_from_result(&result), true, None, None);
             if let Some(active) = dashboard.as_mut() {
                 let _ = active.draw(&state);
             } else {
@@ -1482,7 +1482,14 @@ fn cmd_build_watch(
         }
         changed.sort();
         changed.dedup();
-        state.rebuilding(changed.len());
+        state.rebuilding(
+            changed
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            None,
+            None,
+        );
         if let Some(active) = dashboard.as_mut() {
             let _ = active.draw(&state);
         } else {
@@ -1492,7 +1499,7 @@ fn cmd_build_watch(
         match context.rebuild(changed, wake_app::CancellationToken::default()) {
             Ok(result) => {
                 let metrics = metrics_from_result(&result);
-                state.built(metrics, false);
+                state.built(metrics, false, None, None);
                 if dashboard.is_none() {
                     ui.rebuilt(metrics, false);
                 }
@@ -1502,7 +1509,7 @@ fn cmd_build_watch(
                     state.error(format!("[{}] {}", error.code, error.message));
                 } else {
                     for diagnostic in &error.diagnostics {
-                        state.error(format_diagnostic_plain(diagnostic));
+                        state.diagnostic(diagnostic.clone(), format_diagnostic_plain(diagnostic));
                     }
                 }
                 if dashboard.is_none() {
@@ -1818,10 +1825,15 @@ fn apply_server_events(
 ) {
     for event in server.drain_events() {
         match event {
-            wake_app::DevServerEvent::RebuildStart { changed_paths, .. } => {
-                state.rebuilding(changed_paths.len());
+            wake_app::DevServerEvent::RebuildStart {
+                changed_paths,
+                workspace,
+                base_path,
+            } => {
+                let changed = changed_paths.len();
+                state.rebuilding(changed_paths, workspace, base_path);
                 if let Some(ui) = plain_ui {
-                    ui.rebuild_start(changed_paths.len());
+                    ui.rebuild_start(changed);
                 }
             }
             wake_app::DevServerEvent::Rebuilt {
@@ -1832,7 +1844,8 @@ fn apply_server_events(
                 chunks,
                 assets,
                 duration_ms,
-                ..
+                workspace,
+                base_path,
             } => {
                 let metrics = BuildMetrics {
                     modules,
@@ -1842,13 +1855,13 @@ fn apply_server_events(
                     assets,
                     duration_ms,
                 };
-                state.built(metrics, initial);
+                state.built(metrics, initial, workspace, base_path);
                 if let Some(ui) = plain_ui {
                     ui.rebuilt(metrics, initial);
                 }
             }
             wake_app::DevServerEvent::Diagnostic { diagnostic } => {
-                state.error(format_diagnostic_plain(&diagnostic));
+                state.diagnostic(diagnostic.clone(), format_diagnostic_plain(&diagnostic));
                 if let Some(ui) = plain_ui {
                     ui.diagnostic(&diagnostic);
                 }
@@ -1858,8 +1871,8 @@ fn apply_server_events(
                 loaded,
                 failed,
                 current,
-                ..
-            } => state.workspace_state(total, loaded, failed, current),
+                failed_names,
+            } => state.workspace_state(total, loaded, failed, current, failed_names),
             wake_app::DevServerEvent::Closed => state.stopped(),
         }
     }

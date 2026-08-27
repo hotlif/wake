@@ -55,4 +55,8 @@ test('terminal decoder handles fragmented paste and combined SGR mouse events', 
       { type: 'mouse', kind: 'up', button: 'left', x: 4, y: 2 },
     ],
   )
+  assert.deepEqual(decoder.push(Buffer.from('\t\x1b[Z')), [
+    { type: 'key', key: 'tab' },
+    { type: 'key', key: 'shift-tab' },
+  ])
 })

@@ -27,3 +27,13 @@ wake docs build [ROOT] [--outdir DIR] [--base PATH] [--mode site|components]
 总是构建全部工作台，并在全部成功后事务式发布；开发服务器在同一端口按挂载路径提供
 站点和工作台，`lazy` 工作区直到第一次请求才打包。显式 `--mode components` 仍只运行当前
 项目的 standalone 工作台，不执行聚合发现。
+
+## 开发控制台
+
+交互式终端中的 `docs dev` 默认启用全屏控制台，也可以用 `--ui plain` 强制输出流式日志。控制台的
+`Activity`、`Recent Problems` 和 `Changes` 视图分别展示事件时间线、带源码位置的近期诊断，以及
+按 workspace/base path 归属的重建批次。失败的聚合工作区会直接列出名称。
+
+使用 `Tab` / `Shift+Tab` 切换视图，`PageUp` / `PageDown` 滚动，`Ctrl+End` 返回最新事件。
+`Recent Problems` 是有界的进程内历史，不表示问题当前仍未解决；输入 `clear` 会清空三个视图，
+但不会清除本地地址、最新构建指标或工作区加载状态。

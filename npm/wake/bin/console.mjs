@@ -186,7 +186,7 @@ const KEY_SEQUENCES = new Map([
   ['\x1b[H', 'home'], ['\x1b[F', 'end'], ['\x1b[1~', 'home'], ['\x1b[4~', 'end'],
   ['\x1bOH', 'home'], ['\x1bOF', 'end'],
   ['\x1b[3~', 'delete'], ['\x1b[5~', 'pageup'], ['\x1b[6~', 'pagedown'],
-  ['\x1b[1;5F', 'ctrl-end'],
+  ['\x1b[1;5F', 'ctrl-end'], ['\x1b[Z', 'shift-tab'],
 ])
 
 export class TerminalInputDecoder {
@@ -238,7 +238,7 @@ export class TerminalInputDecoder {
       this.buffer = this.buffer.slice(value.length)
       const control = {
         '\u0003': 'ctrl-c', '\u0019': 'ctrl-y', '\u0016': 'ctrl-v', '\r': 'enter', '\n': 'enter',
-        '\u007f': 'backspace', '\u0008': 'backspace', '\u001b': 'escape',
+        '\u0009': 'tab', '\u007f': 'backspace', '\u0008': 'backspace', '\u001b': 'escape',
       }[value]
       events.push(control ? { type: 'key', key: control } : { type: 'text', value })
     }

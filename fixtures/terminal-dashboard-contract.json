@@ -1,0 +1,73 @@
+{
+  "events": [
+    {
+      "type": "rebuildStart",
+      "changedPaths": ["src/你好.tsx", "docs/guide.mdx"],
+      "workspace": "rc-alpha",
+      "basePath": "/components/rc-alpha/"
+    },
+    {
+      "type": "rebuilt",
+      "initial": false,
+      "modules": 24,
+      "updatedModules": 2,
+      "cachedModules": 22,
+      "chunks": 3,
+      "assets": 1,
+      "durationMs": 18,
+      "workspace": "rc-alpha",
+      "basePath": "/components/rc-alpha/"
+    },
+    {
+      "type": "diagnostic",
+      "diagnostic": {
+        "severity": "warning",
+        "code": "WAKE_DOCS",
+        "message": "Missing summary",
+        "path": "docs/你好.mdx"
+      }
+    },
+    {
+      "type": "diagnostic",
+      "diagnostic": {
+        "severity": "note",
+        "message": "Using the generated fallback title"
+      }
+    },
+    {
+      "type": "diagnostic",
+      "diagnostic": {
+        "severity": "error",
+        "code": "WAKE_PARSE",
+        "message": "Unexpected token",
+        "path": "src/你好.tsx",
+        "location": {
+          "line": 12,
+          "column": 8,
+          "endLine": 12,
+          "endColumn": 9,
+          "lineText": "const value = ;",
+          "label": "expected expression"
+        },
+        "notes": ["remove the incomplete declaration"]
+      }
+    },
+    {
+      "type": "workspaceState",
+      "total": 3,
+      "loaded": 1,
+      "failed": 1,
+      "current": "rc-gamma",
+      "failedNames": ["rc-beta"]
+    }
+  ],
+  "expected": {
+    "status": "error",
+    "activityCount": 7,
+    "problemCount": 3,
+    "problemSeverities": ["warning", "note", "error"],
+    "changeCount": 1,
+    "changePathCount": 2,
+    "failedNames": ["rc-beta"]
+  }
+}

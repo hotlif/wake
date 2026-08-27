@@ -20,3 +20,14 @@ wake dev [ROOT] [--entry FILE] [--port PORT]
 | `--port` | `5173` | HTTP 与 HMR 监听端口 |
 
 host、自动打开和 API 代理来自 `[dev_server]`。命令常驻直到收到关闭信号；端口已占用时启动失败，不会自动选择随机端口。
+
+## 交互式终端
+
+在交互式终端中，`--ui auto` 默认显示全屏控制台；可用 `--ui plain` 强制使用流式日志，或用
+`--ui tui` 要求全屏模式。主区域提供 `Activity`、`Recent Problems` 和 `Changes` 三个视图：
+
+- `Tab` / `Shift+Tab` 切换视图；
+- `PageUp` / `PageDown` 滚动当前视图，`Ctrl+End` 返回最新事件；
+- `Recent Problems` 保留本次进程中的近期诊断，并不表示问题当前仍然存在；
+- `Changes` 显示触发重建的文件、构建耗时、更新模块和缓存命中；
+- 输入 `help` 查看命令，`clear` 清空三个视图的历史但保留服务器地址和当前构建状态。

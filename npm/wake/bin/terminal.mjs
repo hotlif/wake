@@ -12,6 +12,9 @@ const RESET = '\x1b[0m'
 const BOLD = '\x1b[1m'
 const DIM = '\x1b[2m'
 const MAX_ACTIVITY = 200
+const MAX_PROBLEMS = 100
+const MAX_CHANGES = 50
+const VIEWS = ['activity', 'problems', 'changes']
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧']
 const OPTIONAL_CLIPBOARD_MODULE = 'clip' + 'boardy'
 const OPTIONAL_OPEN_MODULE = 'op' + 'en'
@@ -258,12 +261,93 @@ export function observeServer(server, ui, output = console) {
 }
 
 function pushActivity(state, level, message) {
+  const before = activityRowCount(state)
   if (state.activity.length === MAX_ACTIVITY) state.activity.shift()
   state.activity.push({
     elapsedMs: Date.now() - state.startedAt,
     level,
     message: String(message),
   })
+  noteViewUpdate(state, 'activity', before, activityRowCount(state))
+}
+
+function diagnosticLevel(severity) {
+  if (String(severity).toLowerCase() === 'error') return 'error'
+  if (String(severity).toLowerCase() === 'warning') return 'warning'
+  return 'info'
+}
+
+function pushProblem(state, diagnostic, rendered) {
+  const before = problemRowCount(state)
+  if (state.problems.length === MAX_PROBLEMS) state.problems.shift()
+  state.problems.push({
+    elapsedMs: Date.now() - state.startedAt,
+    diagnostic,
+    rendered,
+  })
+  noteViewUpdate(state, 'problems', before, problemRowCount(state))
+}
+
+function pushChange(state, event) {
+  const before = changeRowCount(state)
+  if (state.changes.length === MAX_CHANGES) state.changes.shift()
+  state.changes.push({
+    elapsedMs: Date.now() - state.startedAt,
+    changedPaths: [...(event.changedPaths || [])],
+    workspace: event.workspace,
+    basePath: event.basePath,
+    metrics: undefined,
+  })
+  noteViewUpdate(state, 'changes', before, changeRowCount(state))
+}
+
+function completeChange(state, event) {
+  if (event.initial) return
+  const before = changeRowCount(state)
+  let change
+  for (let index = state.changes.length - 1; index >= 0; index -= 1) {
+    const candidate = state.changes[index]
+    if (!candidate.metrics
+      && candidate.workspace === event.workspace
+      && candidate.basePath === event.basePath) {
+      change = candidate
+      break
+    }
+  }
+  const metrics = {
+    modules: event.modules,
+    updatedModules: event.updatedModules,
+    cachedModules: event.cachedModules,
+    chunks: event.chunks,
+    assets: event.assets,
+    durationMs: event.durationMs,
+  }
+  if (change) change.metrics = metrics
+  else {
+    if (state.changes.length === MAX_CHANGES) state.changes.shift()
+    state.changes.push({
+      elapsedMs: Date.now() - state.startedAt,
+      changedPaths: [],
+      workspace: event.workspace,
+      basePath: event.basePath,
+      metrics,
+    })
+  }
+  noteViewUpdate(state, 'changes', before, changeRowCount(state))
+}
+
+function noteViewUpdate(state, view, before, after) {
+  const scroll = state.scroll[view]
+  if (scroll.fromBottom === 0) return
+  scroll.fromBottom = Math.max(0, scroll.fromBottom + after - before)
+  scroll.unread += 1
+}
+
+function clearDashboardHistory(state) {
+  state.activity.length = 0
+  state.problems.length = 0
+  state.changes.length = 0
+  for (const view of VIEWS) state.scroll[view] = { fromBottom: 0, unread: 0 }
 }
 
 export function createDashboardState({
@@ -283,8 +367,11 @@ export function createDashboardState({
     rebuilds: 0,
     startedAt: Date.now(),
     activity: [],
+    problems: [],
+    changes: [],
     workspaceState: undefined,
-    scrollFromBottom: 0,
+    view: 'activity',
+    scroll: Object.fromEntries(VIEWS.map((view) => [view, { fromBottom: 0, unread: 0 }])),
   }
   pushActivity(state, 'info', 'Starting Wake…')
   return state
@@ -294,6 +381,7 @@ export function applyDashboardEvent(state, event) {
   if (event.type === 'rebuildStart') {
     const count = event.changedPaths?.length || 0
     state.status = 'rebuilding'
+    pushChange(state, event)
     pushActivity(
       state,
       'warning',
@@ -314,6 +402,7 @@ export function applyDashboardEvent(state, event) {
       durationMs: event.durationMs,
     }
     if (!event.initial) state.rebuilds += 1
+    completeChange(state, event)
     pushActivity(
       state,
       'success',
@@ -322,8 +411,11 @@ export function applyDashboardEvent(state, event) {
         : `Updated ${moduleCount(event.updatedModules)} · ${cacheHitCount(event.cachedModules)} in ${humanDuration(event.durationMs)}`,
     )
   } else if (event.type === 'diagnostic') {
-    state.status = 'error'
-    pushActivity(state, 'error', formatDiagnostic(createUi(false), event.diagnostic).join('\n'))
+    const level = diagnosticLevel(event.diagnostic?.severity)
+    if (level === 'error') state.status = 'error'
+    const rendered = formatDiagnostic(createUi(false), event.diagnostic).join('\n')
+    pushProblem(state, event.diagnostic, rendered)
+    pushActivity(state, level, rendered)
   } else if (event.type === 'workspaceState') {
     state.workspaceState = {
       total: event.total,
@@ -428,14 +520,56 @@ function metricsText(state) {
   return `BUILD   ${metrics.modules} modules · ${metrics.chunks} chunks · ${metrics.assets} assets · ${humanDuration(metrics.durationMs)}`
 }
 
-function activityRows(state, available) {
-  const rows = state.activity.flatMap((item) => {
-    const symbol = { info: '·', success: '✓', warning: '↻', error: '✗' }[item.level]
-    return String(item.message).split('\n').map((line, index) => index === 0
-      ? `${elapsedStamp(item.elapsedMs)}  ${symbol} ${line}`
-      : `          ${line}`)
+function eventRows(elapsedMs, level, message) {
+  const symbol = { info: '·', success: '✓', warning: '⚠', error: '✗' }[level]
+  return String(message).split('\n').map((line, index) => index === 0
+    ? `${elapsedStamp(elapsedMs)}  ${symbol} ${line}`
+    : `          ${line}`)
+}
+
+function activityRows(state) {
+  return state.activity.flatMap((item) => eventRows(item.elapsedMs, item.level, item.message))
+}
+
+function problemRows(state) {
+  return state.problems.flatMap((problem) => eventRows(
+    problem.elapsedMs,
+    diagnosticLevel(problem.diagnostic?.severity),
+    problem.rendered,
+  ))
+}
+
+function changeRows(state) {
+  return state.changes.flatMap((change) => {
+    const target = change.workspace && change.basePath
+      ? `${change.workspace} · ${change.basePath}`
+      : change.workspace || change.basePath || 'project'
+    const rows = [`${elapsedStamp(change.elapsedMs)}  ↻ ${target}`]
+    if (change.changedPaths.length === 0) rows.push('          Changed files unavailable')
+    else rows.push(...change.changedPaths.map((path) => `          ${path}`))
+    rows.push(change.metrics
+      ? `          ✓ ${change.metrics.updatedModules} updated · ${change.metrics.cachedModules} cache hits · ${humanDuration(change.metrics.durationMs)}`
+      : '          … rebuilding…')
+    return rows
   })
-  const end = Math.max(0, rows.length - state.scrollFromBottom)
+}
+
+function emptyViewRows(view) {
+  if (view === 'problems') return ['No recent problems', 'Warnings and errors will appear here with source context.']
+  if (view === 'changes') return ['No rebuilds yet', 'Edit a file to trigger a rebuild.']
+  return ['No activity yet', 'Wake events will appear here.']
+}
+
+function allViewRows(state, view = state.view) {
+  if (view === 'problems') return problemRows(state)
+  if (view === 'changes') return changeRows(state)
+  return activityRows(state)
+}
+
+function visibleViewRows(state, available) {
+  let rows = allViewRows(state)
+  if (rows.length === 0) rows = emptyViewRows(state.view)
+  const end = Math.max(0, rows.length - state.scroll[state.view].fromBottom)
   const start = Math.max(0, end - Math.max(1, available))
   return rows.slice(start, end)
 }
@@ -444,12 +578,55 @@ function workspaceText(state) {
   const workspaces = state.workspaceState
   if (!workspaces) return undefined
   const current = workspaces.current ? ` · loading ${workspaces.current}` : ''
-  const failed = workspaces.failed ? ` · ${workspaces.failed} failed` : ''
+  const failedNames = workspaces.failedNames?.length ? `: ${workspaces.failedNames.join(', ')}` : ''
+  const failed = workspaces.failed ? ` · ${workspaces.failed} failed${failedNames}` : ''
   return `WORKSPACES  ${workspaces.loaded}/${workspaces.total} loaded${failed}${current}`
 }
 
 function activityRowCount(state) {
   return state.activity.reduce((count, item) => count + String(item.message).split('\n').length, 0)
+}
+
+function problemRowCount(state) {
+  return state.problems.reduce((count, problem) => count + String(problem.rendered).split('\n').length, 0)
+}
+
+function changeRowCount(state) {
+  return state.changes.reduce((count, change) => count + Math.max(1, change.changedPaths.length) + 2, 0)
+}
+
+function viewRowCount(state) {
+  if (state.view === 'problems') return problemRowCount(state)
+  if (state.view === 'changes') return changeRowCount(state)
+  return activityRowCount(state)
+}
+
+function viewTitle(state) {
+  return VIEWS.map((view) => {
+    const label = view === 'activity'
+      ? 'ACTIVITY'
+      : view === 'problems'
+        ? `RECENT PROBLEMS ${state.problems.length}`
+        : `CHANGES ${state.changes.length}`
+    const unread = state.scroll[view].unread ? ` +${state.scroll[view].unread}` : ''
+    return state.view === view ? `[${label}${unread}]` : `${label}${unread}`
+  }).join(' · ')
+}
+
+function cycleView(state, direction) {
+  const index = VIEWS.indexOf(state.view)
+  state.view = VIEWS[(index + direction + VIEWS.length) % VIEWS.length]
+}
+
+function scrollView(state, amount) {
+  const scroll = state.scroll[state.view]
+  const maximum = Math.max(0, viewRowCount(state) - 1)
+  scroll.fromBottom = Math.max(0, Math.min(maximum, scroll.fromBottom + amount))
+  if (scroll.fromBottom === 0) scroll.unread = 0
+}
+
+function scrollViewToBottom(state) {
+  state.scroll[state.view] = { fromBottom: 0, unread: 0 }
 }
 
 function plainFrame(state, width, height, editor = new InputEditor(), notice) {
@@ -462,13 +639,13 @@ function plainFrame(state, width, height, editor = new InputEditor(), notice) {
   let activityHeight
 
   if (width < 60 || height < 14) {
-    const latest = String(state.activity.at(-1)?.message || 'Starting Wake…').split('\n')
+    const latest = String(state.problems.at(-1)?.rendered || state.activity.at(-1)?.message || 'Starting Wake…').split('\n')
     fixed = [topBorder(state, width), boxLine(header, width)]
     const diagnosticRows = latest.length > 1
     for (const line of latest.slice(0, Math.max(1, height - (diagnosticRows ? 5 : 6)))) {
       fixed.push(boxLine(line, width))
     }
-    if (!diagnosticRows) fixed.push(boxLine('Resize for details · type help for commands', width))
+    if (!diagnosticRows) fixed.push(boxLine('Resize for views · type help for commands', width))
     activityHeight = 0
   } else if (width < 80 || height < 20) {
     fixed = [
@@ -476,7 +653,7 @@ function plainFrame(state, width, height, editor = new InputEditor(), notice) {
       boxLine(header, width),
       boxLine(`${state.endpointLabel}  ${endpoint}`, width),
       boxLine(metricsText(state), width),
-      separator(width, 'ACTIVITY'),
+      separator(width, viewTitle(state)),
     ]
     if (workspaceText(state)) fixed.splice(-1, 0, boxLine(workspaceText(state), width))
     activityHeight = Math.max(1, height - fixed.length - 2)
@@ -490,20 +667,20 @@ function plainFrame(state, width, height, editor = new InputEditor(), notice) {
       boxLine(`MODE    ${state.watchLabel}`, width),
       separator(width),
       boxLine(metricsText(state), width),
-      separator(width, 'ACTIVITY'),
+      separator(width, viewTitle(state)),
     ]
     if (workspaceText(state)) fixed.splice(-1, 0, boxLine(workspaceText(state), width))
     activityHeight = Math.max(1, height - fixed.length - 2)
   }
 
-  for (const row of activityRows(state, activityHeight)) fixed.push(boxLine(row, width))
+  for (const row of visibleViewRows(state, activityHeight)) fixed.push(boxLine(row, width))
   while (fixed.length < height - 3) fixed.push(boxLine('', width))
   fixed.splice(Math.max(0, height - 3))
   const visible = editor.visible(Math.max(0, width - 6))
   fixed.push(boxLine(
     notice
       ? `${notice.error ? '✗' : '✓'} ${notice.message}`
-      : 'Enter command · PgUp/PgDn logs · drag to copy · Ctrl-C quit',
+      : 'Tab views · PgUp/PgDn scroll · Enter command · drag copy · Ctrl-C quit',
     width,
   ))
   fixed.push(boxLine(`› ${visible.text}`, width))
@@ -517,7 +694,7 @@ function colorizeLine(line, ui) {
   value = value.replace('WAKE', ui.brand('WAKE'))
   value = value.replace(/(✓|■)/, (match) => ui.ok(match))
   value = value.replace(/(✗)/, (match) => ui.error(match))
-  value = value.replace(/(↻|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|◌)/, (match) => ui.warn(match))
+  value = value.replace(/(⚠|↻|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|◌)/, (match) => ui.warn(match))
   value = value.replace(/(https?:\/\/\S+)/, (match) => ui.accent(match))
   return value
 }
@@ -640,9 +817,8 @@ export function createDashboardSession(
     if (result.error) pushActivity(state, 'warning', result.error)
     else if (result.command === 'help') pushActivity(state, 'info', 'Commands: help · clear · open · quit (a leading / is optional)')
     else if (result.command === 'clear') {
-      state.activity.length = 0
-      state.scrollFromBottom = 0
-      setNotice('Activity cleared')
+      clearDashboardHistory(state)
+      setNotice('Dashboard history cleared')
     } else if (result.command === 'open') {
       if (!/^https?:\/\//u.test(state.endpoint)) pushActivity(state, 'warning', 'No development-server URL is available to open')
       else {
@@ -679,25 +855,27 @@ export function createDashboardSession(
           selection = undefined
         }
       } else if (event.kind === 'down' && event.button === 'right' && position.y === inputY) await pasteClipboard()
-      else if (event.kind === 'scroll-up') state.scrollFromBottom = Math.max(0, Math.min(activityRowCount(state) - 1, state.scrollFromBottom + 3))
-      else if (event.kind === 'scroll-down') state.scrollFromBottom = Math.max(0, state.scrollFromBottom - 3)
+      else if (event.kind === 'scroll-up') scrollView(state, 3)
+      else if (event.kind === 'scroll-down') scrollView(state, -3)
     } else if (event.type === 'key') {
       if (event.key === 'ctrl-c') requestExit('SIGINT')
       else if (event.key === 'ctrl-y') lastSelection ? await copyText(lastSelection) : setNotice('No selected text to copy', true)
       else if (event.key === 'ctrl-v') await pasteClipboard()
       else if (event.key === 'enter') await submit()
+      else if (event.key === 'tab') { cycleView(state, 1); selection = undefined }
+      else if (event.key === 'shift-tab') { cycleView(state, -1); selection = undefined }
       else if (event.key === 'escape') { editor.clear(); selection = undefined }
       else if (event.key === 'left') editor.moveLeft()
       else if (event.key === 'right') editor.moveRight()
       else if (event.key === 'home') editor.moveHome()
       else if (event.key === 'end') editor.moveEnd()
-      else if (event.key === 'ctrl-end') state.scrollFromBottom = 0
+      else if (event.key === 'ctrl-end') scrollViewToBottom(state)
       else if (event.key === 'backspace') editor.backspace()
       else if (event.key === 'delete') editor.delete()
       else if (event.key === 'up') editor.historyPrevious()
       else if (event.key === 'down') editor.historyNext()
-      else if (event.key === 'pageup') state.scrollFromBottom = Math.max(0, Math.min(activityRowCount(state) - 1, state.scrollFromBottom + 10))
-      else if (event.key === 'pagedown') state.scrollFromBottom = Math.max(0, state.scrollFromBottom - 10)
+      else if (event.key === 'pageup') scrollView(state, 10)
+      else if (event.key === 'pagedown') scrollView(state, -10)
     }
     draw()
   }

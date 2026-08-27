@@ -24,6 +24,10 @@ const diagnosticContract = JSON.parse(readFileSync(
   new URL('../../../fixtures/terminal-diagnostic-contract.json', import.meta.url),
   'utf8',
 ))
+const dashboardContract = JSON.parse(readFileSync(
+  new URL('../../../fixtures/terminal-dashboard-contract.json', import.meta.url),
+  'utf8',
+))
 
 test('terminal capability detection follows tty, NO_COLOR, and TERM', () => {
   assert.equal(supportsColor({ isTTY: true }, {}), true)
@@ -123,8 +127,13 @@ test('dashboard renders full, compact, and minimal states', () => {
   assert.match(full, /WORKSPACES  1\/2 loaded · loading rc-alpha/)
   assert.match(full, /ACTIVITY/)
   assert.match(compact, /READY/)
-  assert.match(minimal, /Resize for details/)
+  assert.match(minimal, /Resize for views/)
   assert.doesNotMatch(full, /\x1b\[/)
+
+  state.view = 'problems'
+  assert.match(renderDashboard(state, 90, 24, createUi(false)), /No recent problems/)
+  state.view = 'changes'
+  assert.match(renderDashboard(state, 90, 24, createUi(false)), /Edit a file to trigger a rebuild/)
 })
 
 test('dashboard activity history is bounded and tracks rebuilds', () => {
@@ -148,6 +157,63 @@ test('dashboard activity history is bounded and tracks rebuilds', () => {
   })
   assert.equal(state.rebuilds, 1)
   assert.match(state.activity.at(-1).message, /0 cache hits/)
+})
+
+test('shared dashboard contract preserves structured problems, changes, and workspaces', () => {
+  const state = createDashboardState({ command: 'docs dev' })
+  for (const event of dashboardContract.events) applyDashboardEvent(state, event)
+
+  assert.equal(state.status, dashboardContract.expected.status)
+  assert.equal(state.activity.length, dashboardContract.expected.activityCount)
+  assert.equal(state.problems.length, dashboardContract.expected.problemCount)
+  assert.deepEqual(
+    state.problems.map((problem) => problem.diagnostic.severity),
+    dashboardContract.expected.problemSeverities,
+  )
+  assert.equal(state.changes.length, dashboardContract.expected.changeCount)
+  assert.equal(state.changes[0].changedPaths.length, dashboardContract.expected.changePathCount)
+  assert.equal(state.changes[0].metrics.durationMs, 18)
+  assert.deepEqual(state.workspaceState.failedNames, dashboardContract.expected.failedNames)
+
+  state.view = 'problems'
+  const problems = renderDashboard(state, 120, 26, createUi(false))
+  assert.match(problems, /\[RECENT PROBLEMS 3\]/)
+  assert.match(problems, /WARNING \[WAKE_DOCS\]: Missing summary/)
+  assert.match(problems, /src\/你好\.tsx:12:8/)
+
+  state.view = 'changes'
+  const changes = renderDashboard(state, 120, 26, createUi(false))
+  assert.match(changes, /\[CHANGES 1\]/)
+  assert.match(changes, /rc-alpha · \/components\/rc-alpha\//)
+  assert.match(changes, /src\/你好\.tsx/)
+  assert.match(changes, /2 updated · 22 cache hits · 18ms/)
+  assert.match(changes, /1 failed: rc-beta/)
+})
+
+test('diagnostic severity only moves the dashboard to error for errors', () => {
+  const state = createDashboardState({ command: 'dev' })
+  applyDashboardEvent(state, { type: 'rebuilt', initial: true, modules: 1, durationMs: 1 })
+  for (const severity of ['warning', 'note', 'help']) {
+    applyDashboardEvent(state, { type: 'diagnostic', diagnostic: { severity, message: severity } })
+    assert.equal(state.status, 'ready')
+  }
+  assert.deepEqual(state.activity.slice(-3).map((item) => item.level), ['warning', 'info', 'info'])
+  applyDashboardEvent(state, { type: 'diagnostic', diagnostic: { severity: 'error', message: 'broken' } })
+  assert.equal(state.status, 'error')
+})
+
+test('view scroll positions and unread counts are independent', () => {
+  const state = createDashboardState({ command: 'dev' })
+  state.scroll.activity.fromBottom = 1
+  applyDashboardEvent(state, { type: 'diagnostic', diagnostic: { severity: 'warning', message: 'warning' } })
+  assert.equal(state.scroll.activity.unread, 1)
+  assert.ok(state.scroll.activity.fromBottom > 1)
+  assert.deepEqual(state.scroll.problems, { fromBottom: 0, unread: 0 })
+
+  state.scroll.problems.fromBottom = 1
+  applyDashboardEvent(state, { type: 'diagnostic', diagnostic: { severity: 'note', message: 'note' } })
+  assert.equal(state.scroll.problems.unread, 1)
+  assert.equal(state.scroll.changes.unread, 0)
 })
 
 test('plain server activity reports rebuilds and diagnostics to stderr', () => {
@@ -269,5 +335,35 @@ test('dashboard session accepts commands, mouse copy, and clipboard paste', asyn
   input.emit('data', Buffer.from('\x1b[<2;5;19M\r'))
   await new Promise((resolve) => setImmediate(resolve))
   assert.match(state.activity.at(-1).message, /Commands:/)
+
+  applyDashboardEvent(state, dashboardContract.events[0])
+  applyDashboardEvent(state, dashboardContract.events[2])
+  applyDashboardEvent(state, {
+    type: 'rebuilt',
+    initial: true,
+    modules: 5,
+    updatedModules: 5,
+    cachedModules: 0,
+    chunks: 1,
+    assets: 0,
+    durationMs: 4,
+  })
+  const endpoint = state.endpoint
+  const metrics = state.metrics
+  input.emit('data', Buffer.from('\t'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(state.view, 'problems')
+  state.scroll.problems = { fromBottom: 1, unread: 2 }
+  input.emit('data', Buffer.from('\x1b[1;5F'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(state.scroll.problems, { fromBottom: 0, unread: 0 })
+  input.emit('data', Buffer.from('clear\r'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(state.activity.length, 0)
+  assert.equal(state.problems.length, 0)
+  assert.equal(state.changes.length, 0)
+  assert.equal(state.endpoint, endpoint)
+  assert.equal(state.metrics, metrics)
+  assert.equal(state.metrics.modules, 5)
   session.close()
 })
