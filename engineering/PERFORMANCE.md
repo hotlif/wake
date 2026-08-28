@@ -71,7 +71,7 @@ npm run generate
 npm run bench
 ```
 
-`npm run compare` 可重复比较已生成输入。跨工具比较必须确认双方使用相同模式、source map、minify、缓存和输出清理策略；否则只能作为探索数据。
+`npm run bench` 和 `npm run compare` 共用同一 runner，对 Wake、Vite 和 webpack 执行正确性校验、纯构建墙钟、峰值内存和产物大小比较。跨工具比较必须确认各方使用相同模式、source map、minify、缓存和输出清理策略；否则只能作为探索数据。
 
 # 4. 启动与 npm 开销
 

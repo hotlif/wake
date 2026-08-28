@@ -2,11 +2,13 @@
   "scripts": {
     "generate": "node generate.mjs",
     "build:wake": "cargo run -r -p wake_cli -- build input/entry.js --outdir dist-wake",
+    "build:vite": "vite build --config vite.config.mjs",
     "build:webpack": "webpack --config webpack.config.mjs",
-    "compare": "node compare.mjs",
+    "compare": "node run.mjs",
     "bench": "node run.mjs"
   },
   "devDependencies": {
+    "vite": "^8.2.2",
     "webpack-cli": "^7.2.1"
   }
 }
