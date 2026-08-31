@@ -15,11 +15,17 @@ use wake_ecma_minify::{OptimizeInput, OptimizeStats, optimize};
 use wake_ecma_parser::parse;
 
 #[derive(Clone, Copy)]
+enum NodeExpectation {
+    Return,
+    ExplicitResourceManagement(&'static str),
+}
+
+#[derive(Clone, Copy)]
 struct AcceptanceCase {
     name: &'static str,
     source_type: SourceType,
     source: &'static str,
-    node_returns: bool,
+    node_expectation: NodeExpectation,
 }
 
 fn acceptance_cases() -> Vec<AcceptanceCase> {
@@ -47,7 +53,7 @@ while(loop<2){loop++}
 do{loop--}while(loop>1);
 globalThis.__wake_result={total,loop,events};
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "closure-tdz-eval-with",
@@ -64,7 +70,7 @@ function withScope(object){let visible=1;with(object){visible+=2}return [visible
 const object={visible:5};
 globalThis.__wake_result={closure:closure(2)(4),temporalDeadZone,dynamic:dynamic(),unrelated:unrelated(),withScope:withScope(object),events};
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "bigint-nan-negative-zero-optional-chain",
@@ -77,7 +83,7 @@ const negativeZero=-0;
 const notANumber=0/0;
 globalThis.__wake_result={bigint:(4n+5n).toString(),mixedBigInt,negativeZero:Object.is(negativeZero,-0),notANumber:Number.isNaN(notANumber),optional:[object?.nested?.value,object.nil?.value]};
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "classes-and-private-names",
@@ -92,7 +98,7 @@ class Counter{
 const counter=new Counter();
 globalThis.__wake_result=[counter.increment(),counter.increment(),Counter.seed()];
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "async-await-generator-yield",
@@ -102,7 +108,7 @@ function* values(){yield 1;yield* [2,3]}
 async function work(){const collected=[...values()];console.log(collected.join(","));const awaited=await Promise.resolve(4);return {collected,awaited}}
 globalThis.__wake_result=work();
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "explicit-resource-management",
@@ -115,9 +121,11 @@ const events=[];
 }
 globalThis.__wake_result=events;
 "#,
-            // Node 22 does not parse `using`; both typed outputs must still fail with the same
-            // SyntaxError. Parser/codegen round-trip coverage remains unconditional.
-            node_returns: false,
+            // Older Node versions reject `using`, while newer versions execute it natively.
+            // Parser/codegen round-trip and readable/optimized equivalence remain unconditional.
+            node_expectation: NodeExpectation::ExplicitResourceManagement(
+                r#"{"kind":"return","value":[7,"disposed"],"logs":[["disposed"]]}"#,
+            ),
         },
         AcceptanceCase {
             name: "typescript-lowering",
@@ -131,7 +139,7 @@ const answer:Result=read(current!);
 console.log(answer);
 globalThis.__wake_result=answer;
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "jsx-lowering",
@@ -142,7 +150,7 @@ const view=<section id="card"><span>{label}</span><b>done</b></section>;
 console.log(view.type);
 globalThis.__wake_result=[view.type,view.props.id,view.props.children[0].props.children];
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
         AcceptanceCase {
             name: "tsx-lowering",
@@ -154,7 +162,7 @@ const view=View({title:"typed"});
 console.log(view.type);
 globalThis.__wake_result=[view.type,view.props.children.type,view.props.children.props.children];
 "#,
-            node_returns: true,
+            node_expectation: NodeExpectation::Return,
         },
     ]
 }
@@ -228,6 +236,16 @@ fn node_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+fn node_supports_explicit_resource_management() -> bool {
+    Command::new("node")
+        .arg("-e")
+        .arg(
+            r#"const vm=require("vm");vm.runInNewContext("{using resource={[Symbol.dispose](){}};}");"#,
+        )
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 fn hex_source(source: &str) -> String {
     use std::fmt::Write as _;
 
@@ -288,6 +306,8 @@ try{{
 #[test]
 fn typed_pipeline_corpus_reparses_maps_inertly_and_matches_readable_runtime() {
     let run_node = node_available();
+    let node_supports_explicit_resource_management =
+        run_node && node_supports_explicit_resource_management();
     for case in acceptance_cases() {
         let build = build_typed(case.source, case.source_type);
         assert_eq!(
@@ -310,20 +330,30 @@ fn typed_pipeline_corpus_reparses_maps_inertly_and_matches_readable_runtime() {
                 "{} changed return/exception/log behavior\nreadable JS:\n{}\noptimized JS:\n{}",
                 case.name, build.readable, build.optimized
             );
-            if case.node_returns {
-                assert!(
+            match case.node_expectation {
+                NodeExpectation::Return => assert!(
                     optimized.contains("\"kind\":\"return\""),
                     "{} did not return in Node: {optimized}\nreadable JS:\n{}\noptimized JS:\n{}",
                     case.name,
                     build.readable,
                     build.optimized
-                );
-            } else {
-                assert!(
-                    optimized.contains("\"kind\":\"throw\"") && optimized.contains("SyntaxError"),
-                    "{} should expose the engine's unsupported-syntax exception: {optimized}",
-                    case.name
-                );
+                ),
+                NodeExpectation::ExplicitResourceManagement(expected_return) => {
+                    if node_supports_explicit_resource_management {
+                        assert_eq!(
+                            optimized, expected_return,
+                            "{} returned an unexpected value",
+                            case.name
+                        );
+                    } else {
+                        assert!(
+                            optimized.contains("\"kind\":\"throw\"")
+                                && optimized.contains("SyntaxError"),
+                            "{} should expose the engine's unsupported-syntax exception: {optimized}",
+                            case.name
+                        );
+                    }
+                }
             }
         }
     }
