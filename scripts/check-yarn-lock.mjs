@@ -35,7 +35,7 @@ for (const suffix of componentExtensions) {
   const selector = `@crab-dev/rc-${suffix}@*`
   const dependencies = yarnrc.packageExtensions?.[selector]?.dependencies
   for (const [name, version] of Object.entries({
-    '@crab-dev/css': '0.1.24',
+    '@crab-dev/css': '0.1.25',
     '@types/react': '^19.2.18',
     'lucide-react': '^1.23.0',
     react: '19.2.8',

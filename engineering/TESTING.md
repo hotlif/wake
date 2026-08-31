@@ -1,6 +1,6 @@
 # Wake 测试与质量门禁
 
-本文描述 v0.1.24 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `corepack yarn native:build`。
+本文描述 v0.1.25 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `corepack yarn native:build`。
 
 # 1. 本地最小门禁
 

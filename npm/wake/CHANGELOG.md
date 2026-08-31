@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.25
+
+- Replaced the legacy minifier with an owned typed optimizer and structural module/codegen pipeline,
+  including explicit fixed-point passes, deterministic mangling, and source-map fences for generated
+  code.
+- Added one-shot cold-build execution, resolver path compression, and linker-proven request/export
+  liveness so the 2,000-module production benchmark builds faster than Vite without using a cache.
+- Improved minified bundle size through barrel compaction, discarded static requests, export getter
+  compaction, and cross-module dead-code elimination while preserving runtime checksums and module
+  semantics.
+- Kept minification compatible with source maps, decorators, TypeScript/TSX, CommonJS/ESM interop,
+  coverage, and test diagnostics, and made test module-graph preparation promptly cancellable.
+
 ## 0.1.24
 
 - Added Activity, Recent Problems, and Changes views to the interactive `wake dev` and `wake docs dev`
