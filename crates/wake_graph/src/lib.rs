@@ -445,11 +445,17 @@ fn collect_refs_class(c: &wake_ecma_ast::Class, out: &mut FxHashSet<Atom>) {
     out.extend(rc.refs);
 }
 
-/// 绑定级活跃性 mark-sweep 的结果：`All` = 全保留（不 shake）；`Names` = 仅这些导出活。
+/// 绑定级活跃性 mark-sweep 的结果。`retained` keeps declaration bindings alive, while
+/// `observed` is the exact set of public keys requested across the module boundary. They differ
+/// when a declaration is used internally or one binding is exposed through multiple aliases.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveResult {
     All,
-    Names(FxHashSet<Atom>),
+    Names {
+        retained: FxHashSet<Atom>,
+        observed: FxHashSet<Atom>,
+        preserve_export_star: bool,
+    },
 }
 
 /// 每模块的活跃性索引（mark-sweep 的工作视图，借用 [`ModuleLiveness`]）。
@@ -717,6 +723,8 @@ pub fn compute_live_keep(
         let live_m = live.get(&m);
         let consumed_m = consumed.get(&m);
         let mut names: FxHashSet<Atom> = FxHashSet::default();
+        let observed = consumed_m.cloned().unwrap_or_default();
+        let mut preserve_export_star = false;
         // 本地导出：局部绑定活 → 保留导出行；非门控恒保留。
         for (name, local) in &ml.exports {
             let keep = match local {
@@ -738,7 +746,32 @@ pub fn compute_live_keep(
                 names.insert(*exported);
             }
         }
-        out.insert(m, LiveResult::Names(names));
+        // A named request resolved through `export *` still needs the barrel's runtime forwarding
+        // even though the public name has no module-local declaration SymbolId. Preserve that name
+        // in the module-boundary proof; otherwise an empty local keep set is indistinguishable from
+        // a side-effect-only barrel and codegen may erase the forwarding object.
+        if let (Some(mi), Some(consumed_m)) = (idx.get(&m), consumed_m) {
+            for &name in consumed_m {
+                if !mi.provides.contains(&name)
+                    && mi
+                        .splat_targets
+                        .iter()
+                        .copied()
+                        .any(|target| resolves_export(&idx, target, name, &mut closure_memo))
+                {
+                    names.insert(name);
+                    preserve_export_star = true;
+                }
+            }
+        }
+        out.insert(
+            m,
+            LiveResult::Names {
+                retained: names,
+                observed,
+                preserve_export_star,
+            },
+        );
     }
     out
 }
@@ -814,11 +847,15 @@ mod tests {
 
         assert_eq!(keep[&0], LiveResult::All, "entry 全保留");
         match &keep[&1] {
-            LiveResult::Names(s) => assert!(!s.contains(&create), "createElement 应死"),
+            LiveResult::Names { retained, .. } => {
+                assert!(!retained.contains(&create), "createElement 应死")
+            }
             _ => panic!("m1 不应 All"),
         }
         match &keep[&2] {
-            LiveResult::Names(s) => assert!(!s.contains(&use_state), "useState 应死"),
+            LiveResult::Names { retained, .. } => {
+                assert!(!retained.contains(&use_state), "useState 应死")
+            }
             _ => panic!("m2 不应 All"),
         }
     }
@@ -859,12 +896,51 @@ mod tests {
         };
         let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
 
-        if let LiveResult::Names(s) = &keep[&2] {
-            assert!(s.contains(&use_state), "useState 应活(entry 用了)");
+        if let LiveResult::Names { retained, .. } = &keep[&2] {
+            assert!(retained.contains(&use_state), "useState 应活(entry 用了)");
         }
-        if let LiveResult::Names(s) = &keep[&1] {
-            assert!(s.contains(&create), "createElement 应活(useState 传递引用)")
+        if let LiveResult::Names { retained, .. } = &keep[&1] {
+            assert!(
+                retained.contains(&create),
+                "createElement 应活(useState 传递引用)"
+            )
         }
+    }
+
+    #[test]
+    fn liveness_separates_retained_binding_aliases_from_observed_public_names() {
+        let it = Interner::new();
+        let value = it.intern("value");
+        let kept = it.intern("kept");
+        let dead_alias = it.intern("deadAlias");
+        let imported = it.intern("imported");
+
+        let library = ModuleLiveness {
+            decls: vec![(value, FxHashSet::default())],
+            exports: vec![(kept, Some(value)), (dead_alias, Some(value))],
+            ..Default::default()
+        };
+        let mut entry = ModuleLiveness::default();
+        entry.named_imports.push(named(imported, "library", kept));
+        entry.root_refs.insert(imported);
+
+        let mut mods: FxHashMap<u32, &ModuleLiveness> = FxHashMap::default();
+        mods.insert(0, &entry);
+        mods.insert(1, &library);
+        let resolve = |_module: u32, specifier: &str| (specifier == "library").then_some(1);
+        let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
+
+        let LiveResult::Names {
+            retained,
+            observed,
+            preserve_export_star,
+        } = &keep[&1]
+        else {
+            panic!("library should retain exact liveness")
+        };
+        assert_eq!(retained, &FxHashSet::from_iter([kept, dead_alias]));
+        assert_eq!(observed, &FxHashSet::from_iter([kept]));
+        assert!(!preserve_export_star);
     }
 
     #[test]
@@ -914,7 +990,9 @@ mod tests {
         let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
 
         match &keep[&3] {
-            LiveResult::Names(names) => {
+            LiveResult::Names {
+                retained: names, ..
+            } => {
                 assert!(
                     names.contains(&default),
                     "icon default export should be live"
@@ -1000,12 +1078,28 @@ mod tests {
         };
         let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
 
+        let LiveResult::Names {
+            retained: barrel_names,
+            observed,
+            preserve_export_star,
+        } = &keep[&1]
+        else {
+            panic!("barrel 应保持精确名级活跃性，而不是退化为 All")
+        };
+        assert_eq!(
+            barrel_names,
+            &FxHashSet::from_iter([fa]),
+            "barrel 必须且只需保留 fa 的 export-star 转发"
+        );
+        assert_eq!(observed, &FxHashSet::from_iter([fa]));
+        assert!(*preserve_export_star);
+
         match &keep[&2] {
-            LiveResult::Names(s) => assert!(s.contains(&fa), "a.fa 应活"),
+            LiveResult::Names { retained, .. } => assert!(retained.contains(&fa), "a.fa 应活"),
             LiveResult::All => {} // All 也可接受
         }
         match &keep[&3] {
-            LiveResult::Names(s) => assert!(!s.contains(&fb), "b.fb 应死"),
+            LiveResult::Names { retained, .. } => assert!(!retained.contains(&fb), "b.fb 应死"),
             LiveResult::All => panic!("b 不应被整体 All（名级解析应只命中 a）"),
         }
     }

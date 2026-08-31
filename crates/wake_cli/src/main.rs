@@ -46,7 +46,7 @@ enum Command {
         /// Watch source files and rebuild continuously.
         #[arg(long)]
         watch: bool,
-        /// Emit source maps (disables minification and code splitting).
+        /// Emit source maps (compatible with minification; code splitting remains separately configured).
         #[arg(long)]
         sourcemap: bool,
     },

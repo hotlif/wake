@@ -9,7 +9,7 @@
 //! 覆盖：作用域层级（module/function/block/catch）、var/function 提升（hoisting）、
 //! let/const/class 块级绑定、参数/导入/catch 绑定、标识符引用解析（解析不到 = 全局/未声明）。
 
-use wake_common::{Atom, FxHashMap, Span};
+use wake_common::{Atom, FxHashMap, FxHashSet, Span};
 use wake_ecma_ast::*;
 
 /// 作用域 id（`scopes` 索引）。
@@ -61,6 +61,21 @@ pub struct Symbol {
     pub span: Span,
 }
 
+/// One concrete declaration occurrence and the stable symbol it contributes to.
+///
+/// [`Symbol::span`] is the canonical declaration location.  JavaScript permits the same `var` or
+/// function binding to be declared more than once, however, and parser transforms can preserve
+/// each occurrence at a different source anchor.  Consumers which attach semantic identity to an
+/// owned syntax tree must therefore use this occurrence table instead of guessing that every
+/// declaration has the canonical span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindingOccurrence {
+    pub name: Atom,
+    pub span: Span,
+    pub scope: ScopeId,
+    pub symbol: SymbolId,
+}
+
 #[derive(Debug)]
 pub struct Reference {
     pub name: Atom,
@@ -75,6 +90,7 @@ pub struct Reference {
 pub struct SemanticModel {
     pub scopes: Vec<Scope>,
     pub symbols: Vec<Symbol>,
+    pub binding_occurrences: Vec<BindingOccurrence>,
     pub references: Vec<Reference>,
 }
 
@@ -106,6 +122,8 @@ pub fn analyze(program: &Program) -> SemanticModel {
     let mut r = Resolver {
         scopes: Vec::new(),
         symbols: Vec::new(),
+        binding_occurrences: Vec::new(),
+        binding_occurrence_keys: FxHashSet::default(),
         references: Vec::new(),
         stack: Vec::new(),
     };
@@ -124,6 +142,7 @@ pub fn analyze(program: &Program) -> SemanticModel {
     SemanticModel {
         scopes: r.scopes,
         symbols: r.symbols,
+        binding_occurrences: r.binding_occurrences,
         references: r.references,
     }
 }
@@ -131,6 +150,8 @@ pub fn analyze(program: &Program) -> SemanticModel {
 struct Resolver {
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
+    binding_occurrences: Vec<BindingOccurrence>,
+    binding_occurrence_keys: FxHashSet<(Atom, Span, ScopeId, SymbolId)>,
     references: Vec<Reference>,
     stack: Vec<ScopeId>,
 }
@@ -176,20 +197,33 @@ impl Resolver {
 
     fn declare(&mut self, scope: ScopeId, name: Atom, decl_kind: DeclKind, span: Span) -> SymbolId {
         // 已存在同名绑定（如 var 重复声明）时复用，避免重复。
-        if let Some(&existing) = self.scopes[scope as usize].bindings.get(&name)
+        let symbol = if let Some(&existing) = self.scopes[scope as usize].bindings.get(&name)
             && self.symbols[existing as usize].decl_kind == decl_kind
         {
-            return existing;
+            existing
+        } else {
+            let id = self.symbols.len() as SymbolId;
+            self.symbols.push(Symbol {
+                name,
+                decl_kind,
+                scope,
+                span,
+            });
+            self.scopes[scope as usize].bindings.insert(name, id);
+            id
+        };
+        if self
+            .binding_occurrence_keys
+            .insert((name, span, scope, symbol))
+        {
+            self.binding_occurrences.push(BindingOccurrence {
+                name,
+                span,
+                scope,
+                symbol,
+            });
         }
-        let id = self.symbols.len() as SymbolId;
-        self.symbols.push(Symbol {
-            name,
-            decl_kind,
-            scope,
-            span,
-        });
-        self.scopes[scope as usize].bindings.insert(name, id);
-        id
+        symbol
     }
 
     fn reference(&mut self, name: Atom, span: Span) {

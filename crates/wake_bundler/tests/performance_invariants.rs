@@ -8,7 +8,7 @@ use wake_common::MemoryFileSystem;
 /// avoidance rather than wall-clock milliseconds, which are too noisy on shared CI runners.
 #[test]
 fn edit_one_keeps_scan_link_and_codegen_work_local() {
-    const MODULES: usize = 512;
+    const MODULES: usize = 2_000;
     let mut files = Vec::with_capacity(MODULES);
     for id in 0..MODULES {
         let left = id * 2 + 1;

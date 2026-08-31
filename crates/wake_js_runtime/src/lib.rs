@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use wake_common::{FileSystem, Interner, OsFileSystem};
 use wake_ecma_ast::SourceType;
 use wake_ecma_codegen::{
-    ModuleMappings, ModuleSpecifierKind, ModuleSpecifierRewriter, PreserveModuleFormat,
+    ConstVal, ModuleMappings, ModuleSpecifierKind, ModuleSpecifierRewriter, OptimizeInput,
+    PreserveModuleFormat, ValidatedDefine, codegen_preserved_optimized_with_map, optimize,
 };
 use wake_ecma_parser::{ParseOptions, parse_with};
 use wake_ecma_vm::{ScriptSource, Vm, VmError, VmHandle, VmOptions};
@@ -262,29 +263,30 @@ fn transpile_module_with_mappings(
     } else {
         format!("file:///{filename}")
     };
-    let directory_literal =
-        serde_json::to_string(&directory).expect("import.meta dirname is a string");
-    let filename_literal =
-        serde_json::to_string(&filename).expect("import.meta filename is a string");
-    let url_literal = serde_json::to_string(&url).expect("import.meta URL is a string");
-    let defines = [
-        ("import.meta.dirname", directory_literal.as_str()),
-        ("import.meta.filename", filename_literal.as_str()),
-        ("import.meta.url", url_literal.as_str()),
+    let defines = vec![
+        ValidatedDefine::primitive("import.meta.dirname", ConstVal::Str(directory)),
+        ValidatedDefine::primitive("import.meta.filename", ConstVal::Str(filename)),
+        ValidatedDefine::primitive("import.meta.url", ConstVal::Str(url)),
     ];
-    let (code, mut mappings) = parsed.module.with_ast(|program| {
-        wake_ecma_codegen::codegen_preserved_module_mangled_with_map(
-            program,
+    let (code, mut mappings) = {
+        let mut input = OptimizeInput::new(&rewritten_source);
+        input.minify = false;
+        input.set_preserve_commonjs(true);
+        input.defines = defines;
+        input.module_name = Some(module_id(path));
+        let optimized = optimize(parsed.module.clone(), &interner, &input).map_err(|error| {
+            RuntimeError::Parse {
+                path: path.to_path_buf(),
+                messages: vec![error.to_string()],
+            }
+        })?;
+        codegen_preserved_optimized_with_map(
+            &optimized,
             &interner,
             PreserveModuleFormat::CommonJs,
             &PreserveSpecifiers,
-            &defines,
-            false,
-            None,
-            None,
-            false,
         )
-    });
+    };
     for mapping in &mut mappings.mappings {
         mapping.src_offset =
             u32::try_from(rewrite_map.original_offset(mapping.src_offset as usize))
@@ -382,6 +384,12 @@ pub struct CommonJsSourceMapping {
     original_byte_offset: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommonJsSourceMappingSegment {
+    generated_utf16_offset: usize,
+    original_byte_offset: Option<u32>,
+}
+
 impl CommonJsSourceMapping {
     pub fn generated_line(&self) -> u32 {
         self.generated_line
@@ -410,6 +418,7 @@ pub struct CommonJsModuleScriptLayout {
     source_path: PathBuf,
     original_source: String,
     source_mappings: Vec<CommonJsSourceMapping>,
+    source_mapping_segments: Vec<CommonJsSourceMappingSegment>,
     definition: GeneratedScriptRange,
     body: GeneratedScriptRange,
     synthetic: bool,
@@ -580,7 +589,7 @@ impl CommonJsModuleScriptLayout {
     /// Map a UTF-16 offset local to the generated body back to an original UTF-8 byte offset.
     ///
     /// Source-map segments apply from their generated anchor up to the next anchor. Generated
-    /// prefixes before the first owned anchor remain intentionally unmapped.
+    /// prefixes and codegen-fenced synthetic spans remain intentionally unmapped.
     pub fn original_byte_offset_for_body_utf16_offset(
         &self,
         generated_utf16_offset: usize,
@@ -589,10 +598,10 @@ impl CommonJsModuleScriptLayout {
             return None;
         }
         let mapping_index = self
-            .source_mappings
+            .source_mapping_segments
             .partition_point(|mapping| mapping.generated_utf16_offset <= generated_utf16_offset)
             .checked_sub(1)?;
-        Some(self.source_mappings[mapping_index].original_byte_offset)
+        self.source_mapping_segments[mapping_index].original_byte_offset
     }
 
     /// Return the complete `__wakeDefineModule` statement range, including its factory wrapper.
@@ -749,27 +758,35 @@ pub fn emit_commonjs_graph_script(
         push_script_fragment(&mut script, &mut utf16_offset, &suffix);
         let generated_line_starts = generated_utf16_line_starts(&module.code);
         let generated_utf16_len = module.code.encode_utf16().count();
-        let source_mappings = module
-            .mappings
-            .mappings
-            .iter()
-            .filter_map(|mapping| {
-                let generated_utf16_offset = *generated_line_starts
-                    .get(mapping.gen_line as usize)?
-                    + mapping.gen_col as usize;
-                (generated_utf16_offset <= generated_utf16_len).then_some(CommonJsSourceMapping {
+        let mut source_mappings = Vec::new();
+        let mut source_mapping_segments = Vec::new();
+        for mapping in &module.mappings.mappings {
+            let Some(line_start) = generated_line_starts.get(mapping.gen_line as usize) else {
+                continue;
+            };
+            let generated_utf16_offset = *line_start + mapping.gen_col as usize;
+            if generated_utf16_offset > generated_utf16_len {
+                continue;
+            }
+            source_mapping_segments.push(CommonJsSourceMappingSegment {
+                generated_utf16_offset,
+                original_byte_offset: (!mapping.is_unmapped).then_some(mapping.src_offset),
+            });
+            if !mapping.is_unmapped {
+                source_mappings.push(CommonJsSourceMapping {
                     generated_line: mapping.gen_line,
                     generated_utf16_column: mapping.gen_col,
                     generated_utf16_offset,
                     original_byte_offset: mapping.src_offset,
-                })
-            })
-            .collect();
+                });
+            }
+        }
         mappings.push(CommonJsModuleScriptLayout {
             id: module.id.clone(),
             source_path: module.source_path.clone(),
             original_source: module.original_source.clone(),
             source_mappings,
+            source_mapping_segments,
             definition: GeneratedScriptRange {
                 utf16_start: definition_start,
                 utf16_end: utf16_offset,
@@ -2195,6 +2212,26 @@ mod tests {
             entry_layout.original_byte_offset_for_body_utf16_offset(0),
             None,
             "the generated CommonJS prologue must not borrow the first user source location"
+        );
+        assert!(
+            entry_layout
+                .source_mappings()
+                .first()
+                .is_some_and(|mapping| mapping.generated_utf16_offset() > 0),
+            "unmapped CommonJS fences must not be exposed as user-source anchors"
+        );
+        let internal_fence = entry_layout
+            .source_mapping_segments
+            .iter()
+            .find(|segment| {
+                segment.generated_utf16_offset > 0 && segment.original_byte_offset.is_none()
+            })
+            .expect("typed codegen must retain an internal synthetic fence");
+        assert_eq!(
+            entry_layout
+                .original_byte_offset_for_body_utf16_offset(internal_fence.generated_utf16_offset),
+            None,
+            "synthetic spans between user anchors must remain unmapped"
         );
         let choose_mapping = entry_layout
             .source_mappings()

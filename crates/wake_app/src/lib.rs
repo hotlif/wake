@@ -1437,7 +1437,12 @@ fn execute_build(
     let started = Instant::now();
     let prepared = prepare_build(&options)?;
     cancellation.check()?;
-    let mut bundler = create_bundler(&prepared, &options, project_defaults)?;
+    let lifetime = if options.cache {
+        BundlerLifetime::Session
+    } else {
+        BundlerLifetime::OneShot
+    };
+    let mut bundler = create_bundler(&prepared, &options, project_defaults, lifetime)?;
     let output = bundler.build(&prepared.entry);
     cancellation.check()?;
     finish_output(
@@ -1461,7 +1466,12 @@ fn execute_bundle(
         write: false,
         ..BuildOptions::default()
     })?;
-    let mut bundler = create_bundle_bundler(&prepared, &options)?;
+    let lifetime = if options.cache {
+        BundlerLifetime::Session
+    } else {
+        BundlerLifetime::OneShot
+    };
+    let mut bundler = create_bundle_bundler(&prepared, &options, lifetime)?;
     let output = bundler.build(&prepared.entry);
     cancellation.check()?;
     finish_bundle(
@@ -1487,12 +1497,6 @@ fn resolve_bundle_options(options: BundleOptions) -> Result<ResolvedBundleOption
         return Err(WakeError::new(
             "WAKE_CONFIG",
             "supported bundle combinations are browser+iife and node+cjs",
-        ));
-    }
-    if options.minify && options.source_map {
-        return Err(WakeError::new(
-            "WAKE_CONFIG",
-            "bundle minify and sourceMap cannot be enabled together",
         ));
     }
     if platform == BuildPlatform::Browser && options.target.is_some() {
@@ -1667,12 +1671,22 @@ fn prepare_aliases_and_scans(
     Ok(aliases)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BundlerLifetime {
+    OneShot,
+    Session,
+}
+
 fn create_bundler(
     prepared: &PreparedBuild,
     options: &BuildOptions,
     project_defaults: bool,
+    lifetime: BundlerLifetime,
 ) -> Result<IncrementalBundler, WakeError> {
-    let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
+    let mut bundler = match lifetime {
+        BundlerLifetime::OneShot => IncrementalBundler::new_one_shot(Arc::new(OsFileSystem)),
+        BundlerLifetime::Session => IncrementalBundler::new(Arc::new(OsFileSystem)),
+    };
     bundler.set_project_root(prepared.root.clone());
     bundler.set_resolve_options(ResolveOptions {
         alias: prepared.aliases.clone(),
@@ -1698,12 +1712,10 @@ fn create_bundler(
         bundler.enable_css_extraction();
         bundler.enable_dead_module_elimination();
         bundler.enable_tree_shaking();
+        bundler.enable_minify();
+        bundler.enable_code_splitting();
         if options.source_map {
             bundler.enable_sourcemap();
-        } else {
-            bundler.enable_minify();
-            bundler.enable_mangle();
-            bundler.enable_code_splitting();
         }
     } else if options.source_map {
         bundler.enable_sourcemap();
@@ -1720,8 +1732,12 @@ fn create_bundler(
 fn create_bundle_bundler(
     prepared: &PreparedBuild,
     options: &ResolvedBundleOptions,
+    lifetime: BundlerLifetime,
 ) -> Result<IncrementalBundler, WakeError> {
-    let mut bundler = IncrementalBundler::new(Arc::new(OsFileSystem));
+    let mut bundler = match lifetime {
+        BundlerLifetime::OneShot => IncrementalBundler::new_one_shot(Arc::new(OsFileSystem)),
+        BundlerLifetime::Session => IncrementalBundler::new(Arc::new(OsFileSystem)),
+    };
     bundler
         .set_project_root(prepared.root.clone())
         .set_resolve_options(ResolveOptions {
@@ -1773,7 +1789,6 @@ fn create_bundle_bundler(
     if options.minify {
         bundler
             .enable_minify()
-            .enable_mangle()
             .enable_tree_shaking()
             .enable_dead_module_elimination();
     }
@@ -1814,6 +1829,7 @@ fn create_session(
         prepared,
         options,
         project_defaults,
+        BundlerLifetime::Session,
     )?))
 }
 
@@ -2991,7 +3007,12 @@ fn build_docs_leaf(
         write: true,
         ..BuildOptions::default()
     };
-    let mut bundler = create_bundler(&prepared, &build_options, true)?;
+    let lifetime = if build_options.cache {
+        BundlerLifetime::Session
+    } else {
+        BundlerLifetime::OneShot
+    };
+    let mut bundler = create_bundler(&prepared, &build_options, true, lifetime)?;
     bundler.set_entry_chunk_name("entry");
     let output = bundler.build(&prepared.entry);
     cancellation.check()?;
@@ -5286,6 +5307,54 @@ base_path = "/components/{name}/workbench/"
     }
 
     #[test]
+    fn bundle_minify_with_source_map_is_returned_and_written() {
+        let fixture = Fixture::new("bundle-minified-source-map");
+        fixture.write(
+            "src/index.js",
+            "function compute(descriptiveParameter) { const foldedValue = 1 + 2; return descriptiveParameter + foldedValue; } export const value = compute(4);",
+        );
+
+        let memory = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                minify: true,
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(memory.source_map.is_some());
+        assert!(
+            !memory.code.contains("descriptiveParameter"),
+            "{}",
+            memory.code
+        );
+        assert!(!memory.code.contains("sourceMappingURL="));
+
+        let written = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("src/index.js")),
+                outfile: Some(PathBuf::from("artifacts/minified.js")),
+                minify: true,
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(written.source_map.is_some());
+        assert!(
+            written
+                .code
+                .ends_with("//# sourceMappingURL=minified.js.map\n")
+        );
+        assert!(fixture.0.join("artifacts/minified.js.map").is_file());
+    }
+
+    #[test]
     fn bundle_option_validation_is_owned_by_the_application_layer() {
         let fixture = Fixture::new("bundle-validation");
         let invalid_pair = bundle(
@@ -5299,18 +5368,6 @@ base_path = "/components/{name}/workbench/"
         )
         .unwrap_err();
         assert_eq!(invalid_pair.code, "WAKE_CONFIG");
-
-        let incompatible = bundle(
-            BundleOptions {
-                project: fixture.project(),
-                minify: true,
-                source_map: true,
-                ..BundleOptions::default()
-            },
-            &CancellationToken::default(),
-        )
-        .unwrap_err();
-        assert_eq!(incompatible.code, "WAKE_CONFIG");
 
         for external in ["./local", "pkg/*", "pkg name", "@scope", "pkg/subpath"] {
             let error = bundle(

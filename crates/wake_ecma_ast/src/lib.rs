@@ -21,6 +21,7 @@ pub mod stmt;
 pub mod visit;
 
 mod hash;
+mod owned_clone;
 
 pub use expr::*;
 pub use holder::ModuleAst;
@@ -165,3 +166,4 @@ pub fn build_sample<'a>(
 
 /// 结构指纹（不含指针地址，DESIGN §10.4）。见 [`hash::structure_hash`]。
 pub use hash::structure_hash;
+pub use owned_clone::{clone_program_owned, clone_program_owned_with_source};

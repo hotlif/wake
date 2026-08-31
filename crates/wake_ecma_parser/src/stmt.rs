@@ -69,16 +69,18 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.parse_import_declaration(lo)
             }
             TokenKind::Keyword(Keyword::Export) => self.parse_export(lo),
-            // TS：装饰器 `@dec class C {}` / `@dec export class ..`。装饰器被消费（当前不应用其
-            // 运行时语义，见 ts.rs `skip_decorators` 说明）；随后解析被装饰的声明。
-            // 装饰器 `@dec class C {}`（TC39 Stage-3）：解析后转交给被装饰的类。
+            // 装饰器 `@dec class C {}` / `@dec export class C {}`（TC39 Stage-3）：解析后
+            // 显式转交给被装饰的类，不能在越过 `export` 时丢失。
             TokenKind::At if self.ts => {
                 let decs = self.parse_decorators();
                 if self.at_keyword(Keyword::Class) {
                     let clo = self.start();
                     Statement::ClassDeclaration(self.parse_class_with_decorators(clo, decs))
+                } else if self.at_keyword(Keyword::Export) {
+                    let export_lo = self.start();
+                    self.parse_export_with_decorators(export_lo, Some(decs))
                 } else {
-                    // `@dec export class ..` 等：装饰器已消费，继续解析后续声明。
+                    self.error_expected("被装饰的 class 声明");
                     self.parse_statement()
                 }
             }
@@ -1160,11 +1162,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 构造 `this.name = name;` 语句。
     ///
-    /// 属性名与右值标识符复用参数在源码中的真实 span（`name_span`），使它们与源码里对同名
-    /// 属性 / 同一参数的其它访问在 prop-mangle / identifier-mangle 侧表中被一致处理；否则若
-    /// 用 `Span::DUMMY`，多个参数属性会在按 span 索引的侧表上互相碰撞（last-write-wins），
-    /// 且与源码访问的重命名不一致。外层 Member/Assign/Statement 仍用 DUMMY（codegen 对
-    /// DUMMY 语句/表达式一律原样发射，不参与语句级合并与常量折叠）。
+    /// 属性名与右值标识符复用参数在源码中的真实 span（`name_span`），让 lowering 为两个独立
+    /// `NodeId` 保留同一源码来源，并让右值按初始语义模型绑定到参数的 `SymbolId`。Span 只表示
+    /// 来源，不再是优化或改名键。外层 Member/Assign/Statement 使用 DUMMY，进入 typed IR 后作为
+    /// 明确的 synthetic origin 发射。
     fn this_assign_stmt(&self, name: wake_common::Atom, name_span: Span) -> Statement<'a> {
         let member = Expression::Member(self.alloc(MemberExpression {
             span: Span::DUMMY,
@@ -1954,7 +1955,29 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     fn parse_export(&mut self, lo: u32) -> Statement<'a> {
+        self.parse_export_with_decorators(lo, None)
+    }
+
+    fn parse_export_with_decorators(
+        &mut self,
+        lo: u32,
+        mut class_decorators: Option<wake_ecma_ast::AVec<'a, Expression<'a>>>,
+    ) -> Statement<'a> {
         self.bump(); // export
+
+        // Decorators before `export` may target only the exported class. Diagnose other export
+        // forms instead of silently consuming and discarding their decorator expressions.
+        if class_decorators.is_some()
+            && !self.at_keyword(Keyword::Class)
+            && !(self.at_keyword(Keyword::Default)
+                && self.peek().kind == TokenKind::Keyword(Keyword::Class))
+            && !(self.ts
+                && self.at_contextual("abstract")
+                && self.peek().kind == TokenKind::Keyword(Keyword::Class))
+        {
+            self.error_expected("被装饰的 class 导出");
+            class_decorators = None;
+        }
 
         // TS：`export = expr;`（CommonJS 整体导出）→ `module.exports = expr;`，对齐 tsc 的
         // commonjs emit。wake 的模块包装器签名就是 `function(module, exports, __wake_require__)`，
@@ -2008,7 +2031,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.bump();
                 ExportDefaultKind::Function(self.parse_function(self.start(), true))
             } else if self.at_keyword(Keyword::Class) {
-                ExportDefaultKind::Class(self.parse_class(self.start()))
+                let class_lo = self.start();
+                let class = if let Some(decorators) = class_decorators.take() {
+                    self.parse_class_with_decorators(class_lo, decorators)
+                } else {
+                    self.parse_class(class_lo)
+                };
+                ExportDefaultKind::Class(class)
             } else {
                 let e = self.with_allow_in(true, |p| p.parse_assignment_expression());
                 self.semicolon();
@@ -2110,7 +2139,18 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
 
         // export <declaration>
-        let declaration = self.parse_statement();
+        let declaration = if let Some(decorators) = class_decorators.take() {
+            if self.ts
+                && self.at_contextual("abstract")
+                && self.peek().kind == TokenKind::Keyword(Keyword::Class)
+            {
+                self.bump(); // abstract
+            }
+            let class_lo = self.start();
+            Statement::ClassDeclaration(self.parse_class_with_decorators(class_lo, decorators))
+        } else {
+            self.parse_statement()
+        };
         if self.ts && matches!(declaration, Statement::Empty(_)) {
             return declaration;
         }
@@ -2173,7 +2213,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 }
 
 /// 参数属性名：简单标识符参数（含带默认值 `private x = 1`）的名字；解构参数不作参数属性。
-/// 参数属性的名字 + 其在源码中的真实 span（用于注入 `this.x = x` 时保持 mangle 一致性）。
+/// 参数属性的名字 + 其在源码中的真实 span（用于为注入的 `this.x = x` 保留来源与绑定）。
 fn param_prop_name(pat: &Pattern) -> Option<(wake_common::Atom, Span)> {
     match pat {
         Pattern::Ident(id) => Some((id.name, id.span)),

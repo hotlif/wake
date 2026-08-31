@@ -1,13 +1,16 @@
 //! wake_cache — wake_turbo 任务图与产物的**持久化层**（DESIGN §10.3 / PLAN §7.1）。
 //!
-//! 目标：让一个**全新进程**的冷构建跳过未变模块的源码读取、parse 与 codegen——把三类数据落盘：
+//! 目标：让一个**全新进程**的冷构建跳过未变模块的源码读取、parse、optimize 与 body emit——把五类数据落盘：
 //!
 //! - **路径快照**：`path → (mtime, size, content_key, source)`，元数据命中时只 stat 一次。
 //!   源码从单个缓存文件恢复，避免 Windows 对数千个小文件逐个触盘。
 //! - **模块摘要**（`ModuleSummary`）：`content_key → (deps, uses, 顶层 await 标志)`。`content_key = hash(源类型 ‖ 源文本)`。
 //!   有它就能不 parse 直接建依赖图、算 Tree Shaking 保留集。
-//! - **codegen 产物**（`body`）：`(content_key, linker_key) → String`。`linker_key = hash(依赖 id 映射 ‖ keep ‖ dyn_chunks)`。
-//!   两键都命中 → 该模块 parse 与 codegen 全跳过，直接取缓存体拼接。
+//! - **优化事实**（`retained_module_ids`）：以不含最终 chunk 编号的 optimizer key 存储；驱动先
+//!   收敛这些边并重新规划 chunk，再形成 body key。
+//! - **codegen 产物**（`body`）：`(content_key, optimizer_key, final_layout_key) → String`。
+//! - **source-map 映射事实**（`mappings`）：与 `body` 使用相同产物键但独立存取；body 发射始终
+//!   记录并持久化它们，因此之后启用 source map 不需要重新 parse、optimize 或 emit body。
 //!
 //! **健壮性**：值全是 `String`/`Vec`/整数——**绝不落 `ModuleAst`（自引用 arena）也绝不落 `Atom`**
 //! （interner id 跨进程无意义；说明符已在此前解成 `String`）。这正是 PLAN「Atom 不落盘」的落地。
@@ -25,7 +28,7 @@ use std::sync::Arc;
 /// 缓存文件魔数。
 const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 10;
 
 /// Persistent caches are an optimization, so bounded retention is preferable to allowing edited
 /// content versions to grow without limit for the lifetime of a project. The limits are deliberately
@@ -116,6 +119,37 @@ pub struct CachedSource {
     pub source: Arc<str>,
 }
 
+/// One module-local source-map segment. Keeping only integers across the persistent-cache
+/// boundary avoids coupling `wake_cache` to the ECMAScript code generator while still allowing
+/// the bundler to reconstruct its `ModuleMappings` value without reparsing or regenerating code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedMapping {
+    pub gen_line: u32,
+    pub gen_col: u32,
+    pub src_index: u32,
+    pub src_offset: u32,
+    /// `u32` index into [`CachedModuleMappings::names`] when the segment carries an original name.
+    pub name_index: Option<u32>,
+    /// Source Map V3 one-field generated-only segment.
+    pub is_unmapped: bool,
+}
+
+/// One proof-carrying generated request range stored with its byte-identical module body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedDiscardedStaticRequest {
+    pub start: u32,
+    pub end: u32,
+    pub target_module_id: u32,
+}
+
+/// Complete module-local emission metadata stored independently from the JavaScript body.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedModuleMappings {
+    pub mappings: Vec<CachedMapping>,
+    pub names: Vec<String>,
+    pub discarded_static_requests: Vec<CachedDiscardedStaticRequest>,
+}
+
 #[derive(Clone, Debug)]
 struct PathEntry {
     variant: u64,
@@ -131,9 +165,18 @@ pub struct BuildCache {
     /// codegen 产物体。存 `Arc<String>`：命中返回引用计数自增而非整体拷贝，
     /// 与 bundler 拼接侧的 `Arc<String>` 同构，消除全命中路径的两次全 bundle memcpy。
     bodies: HashMap<u128, Arc<String>>,
+    /// Optimizer-reported internal dependency targets. These stable numeric IDs are sorted and
+    /// deduplicated by the bundler before crossing the persistent boundary.
+    retained_module_ids: HashMap<u128, Arc<Vec<u32>>>,
+    /// Source-map mapping facts are cached independently from JavaScript bodies. New body entries
+    /// are committed atomically with their facts; schema 10 naturally misses legacy entries which
+    /// lack generated request-range metadata.
+    mappings: HashMap<u128, Arc<CachedModuleMappings>>,
     /// 命中计数（诊断/测试用）。
     pub summary_hits: u64,
     pub body_hits: u64,
+    pub retained_dependency_hits: u64,
+    pub mapping_hits: u64,
     /// Session-local recency. These maps are intentionally not serialized: every entry used by a
     /// fresh build is touched before the next store, while untouched entries are precisely the best
     /// eviction candidates from the previous process.
@@ -141,6 +184,8 @@ pub struct BuildCache {
     path_access: HashMap<PathBuf, u64>,
     summary_access: HashMap<u64, u64>,
     body_access: HashMap<u128, u64>,
+    retained_dependency_access: HashMap<u128, u64>,
+    mapping_access: HashMap<u128, u64>,
     /// 本次构建是否往缓存写过新条目。全命中（未变）时为 `false` → 跳过落盘，
     /// 免掉「重写 = 缓存体量」大小的磁盘 I/O（缓存文件常和 bundle 一样大）。
     dirty: bool,
@@ -285,8 +330,62 @@ impl BuildCache {
         }
     }
 
+    /// Query optimizer-owned internal dependency edges by optimizer key (independent of body
+    /// layout and source-map requests).
+    pub fn retained_module_ids(&mut self, key: u128) -> Option<Arc<Vec<u32>>> {
+        let ids = self.retained_module_ids.get(&key).cloned();
+        if ids.is_some() {
+            self.retained_dependency_hits += 1;
+            let access = self.next_access();
+            self.retained_dependency_access.insert(key, access);
+        }
+        ids
+    }
+
+    pub fn put_retained_module_ids(&mut self, key: u128, ids: Arc<Vec<u32>>) {
+        debug_assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        let access = self.next_access();
+        self.retained_dependency_access.insert(key, access);
+        if self
+            .retained_module_ids
+            .get(&key)
+            .is_none_or(|current| current.as_ref() != ids.as_ref())
+        {
+            self.retained_module_ids.insert(key, ids);
+            self.dirty = true;
+        }
+    }
+
+    /// Query module-local source-map segments independently of the JavaScript body.
+    pub fn mappings(&mut self, key: u128) -> Option<Arc<CachedModuleMappings>> {
+        let mappings = self.mappings.get(&key).cloned();
+        if mappings.is_some() {
+            self.mapping_hits += 1;
+            let access = self.next_access();
+            self.mapping_access.insert(key, access);
+        }
+        mappings
+    }
+
+    pub fn put_mappings(&mut self, key: u128, mappings: Arc<CachedModuleMappings>) {
+        let access = self.next_access();
+        self.mapping_access.insert(key, access);
+        if self
+            .mappings
+            .get(&key)
+            .is_none_or(|current| current.as_ref() != mappings.as_ref())
+        {
+            self.mappings.insert(key, mappings);
+            self.dirty = true;
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.summaries.is_empty() && self.bodies.is_empty()
+        self.paths.is_empty()
+            && self.summaries.is_empty()
+            && self.bodies.is_empty()
+            && self.retained_module_ids.is_empty()
+            && self.mappings.is_empty()
     }
 
     fn next_access(&mut self) -> u64 {
@@ -301,7 +400,21 @@ impl BuildCache {
             .map(|(path, entry)| path.to_string_lossy().len() + entry.cached.source.len() + 64);
         let summaries = self.summaries.values().map(summary_estimated_size);
         let bodies = self.bodies.values().map(|body| body.len() + 32);
-        paths.chain(summaries).chain(bodies).sum::<usize>() + 64
+        let retained_module_ids = self
+            .retained_module_ids
+            .values()
+            .map(|ids| ids.len() * std::mem::size_of::<u32>() + 32);
+        let mappings = self
+            .mappings
+            .values()
+            .map(|mappings| cached_mappings_estimated_size(mappings));
+        paths
+            .chain(summaries)
+            .chain(bodies)
+            .chain(retained_module_ids)
+            .chain(mappings)
+            .sum::<usize>()
+            + 64
     }
 
     /// Retain the most recently used entries under a combined entry and byte budget. Eviction only
@@ -313,10 +426,17 @@ impl BuildCache {
             Path(PathBuf),
             Summary(u64),
             Body(u128),
+            RetainedDependencies(u128),
+            Mapping(u128),
         }
 
-        let mut candidates =
-            Vec::with_capacity(self.paths.len() + self.summaries.len() + self.bodies.len());
+        let mut candidates = Vec::with_capacity(
+            self.paths.len()
+                + self.summaries.len()
+                + self.bodies.len()
+                + self.retained_module_ids.len()
+                + self.mappings.len(),
+        );
         candidates.extend(self.paths.keys().map(|key| {
             (
                 self.path_access.get(key).copied().unwrap_or(0),
@@ -335,6 +455,21 @@ impl BuildCache {
                 Key::Body(key),
             )
         }));
+        candidates.extend(self.retained_module_ids.keys().map(|&key| {
+            (
+                self.retained_dependency_access
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0),
+                Key::RetainedDependencies(key),
+            )
+        }));
+        candidates.extend(self.mappings.keys().map(|&key| {
+            (
+                self.mapping_access.get(&key).copied().unwrap_or(0),
+                Key::Mapping(key),
+            )
+        }));
         // Oldest first. Tie-breakers do not affect correctness; stable key ordering makes retained
         // contents deterministic for a fixed cache state.
         candidates.sort_by(|left, right| {
@@ -344,8 +479,14 @@ impl BuildCache {
                     (Key::Path(a), Key::Path(b)) => a.cmp(b),
                     (Key::Summary(a), Key::Summary(b)) => a.cmp(b),
                     (Key::Body(a), Key::Body(b)) => a.cmp(b),
+                    (Key::RetainedDependencies(a), Key::RetainedDependencies(b)) => a.cmp(b),
+                    (Key::Mapping(a), Key::Mapping(b)) => a.cmp(b),
                     (Key::Path(_), _) => std::cmp::Ordering::Less,
-                    (Key::Summary(_), Key::Body(_)) => std::cmp::Ordering::Less,
+                    (Key::Summary(_), _) => std::cmp::Ordering::Less,
+                    (Key::Body(_), Key::RetainedDependencies(_) | Key::Mapping(_)) => {
+                        std::cmp::Ordering::Less
+                    }
+                    (Key::RetainedDependencies(_), Key::Mapping(_)) => std::cmp::Ordering::Less,
                     _ => std::cmp::Ordering::Greater,
                 })
         });
@@ -372,6 +513,18 @@ impl BuildCache {
                 Key::Body(key) => {
                     self.body_access.remove(&key);
                     self.bodies.remove(&key).map(|entry| entry.len() + 32)
+                }
+                Key::RetainedDependencies(key) => {
+                    self.retained_dependency_access.remove(&key);
+                    self.retained_module_ids
+                        .remove(&key)
+                        .map(|entry| entry.len() * std::mem::size_of::<u32>() + 32)
+                }
+                Key::Mapping(key) => {
+                    self.mapping_access.remove(&key);
+                    self.mappings
+                        .remove(&key)
+                        .map(|entry| cached_mappings_estimated_size(&entry))
                 }
             };
             if let Some(removed) = removed {
@@ -429,6 +582,39 @@ impl BuildCache {
         for (k, body) in &self.bodies {
             put_u128(&mut b, *k);
             put_str(&mut b, body);
+        }
+        // optimizer-owned retained internal dependency targets
+        put_u32(&mut b, self.retained_module_ids.len() as u32);
+        for (key, ids) in &self.retained_module_ids {
+            put_u128(&mut b, *key);
+            put_u32(&mut b, ids.len() as u32);
+            for id in ids.iter() {
+                put_u32(&mut b, *id);
+            }
+        }
+        // source maps (kept separate so body-only builds do not require map entries)
+        put_u32(&mut b, self.mappings.len() as u32);
+        for (key, mappings) in &self.mappings {
+            put_u128(&mut b, *key);
+            put_u32(&mut b, mappings.mappings.len() as u32);
+            for mapping in &mappings.mappings {
+                put_u32(&mut b, mapping.gen_line);
+                put_u32(&mut b, mapping.gen_col);
+                put_u32(&mut b, mapping.src_index);
+                put_u32(&mut b, mapping.src_offset);
+                put_u32(&mut b, mapping.name_index.unwrap_or(u32::MAX));
+                b.push(mapping.is_unmapped as u8);
+            }
+            put_u32(&mut b, mappings.names.len() as u32);
+            for name in &mappings.names {
+                put_str(&mut b, name);
+            }
+            put_u32(&mut b, mappings.discarded_static_requests.len() as u32);
+            for request in &mappings.discarded_static_requests {
+                put_u32(&mut b, request.start);
+                put_u32(&mut b, request.end);
+                put_u32(&mut b, request.target_module_id);
+            }
         }
         b
     }
@@ -521,6 +707,78 @@ impl BuildCache {
             let body = c.str()?;
             cache.bodies.insert(key, Arc::new(body));
         }
+        let n_retained_dependency_entries = c.u32()?;
+        for _ in 0..n_retained_dependency_entries {
+            let key = c.u128()?;
+            let count = c.u32()?;
+            let mut ids = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                ids.push(c.u32()?);
+            }
+            if !ids.windows(2).all(|pair| pair[0] < pair[1]) {
+                return None;
+            }
+            cache.retained_module_ids.insert(key, Arc::new(ids));
+        }
+        let n_mapping_entries = c.u32()?;
+        for _ in 0..n_mapping_entries {
+            let key = c.u128()?;
+            let count = c.u32()?;
+            let mut mappings = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                mappings.push(CachedMapping {
+                    gen_line: c.u32()?,
+                    gen_col: c.u32()?,
+                    src_index: c.u32()?,
+                    src_offset: c.u32()?,
+                    name_index: match c.u32()? {
+                        u32::MAX => None,
+                        index => Some(index),
+                    },
+                    is_unmapped: c.u8()? != 0,
+                });
+            }
+            let name_count = c.u32()?;
+            let mut names = Vec::with_capacity(name_count as usize);
+            for _ in 0..name_count {
+                names.push(c.str()?);
+            }
+            let request_count = c.u32()?;
+            let mut discarded_static_requests = Vec::with_capacity(request_count as usize);
+            for _ in 0..request_count {
+                discarded_static_requests.push(CachedDiscardedStaticRequest {
+                    start: c.u32()?,
+                    end: c.u32()?,
+                    target_module_id: c.u32()?,
+                });
+            }
+            if mappings.iter().any(|mapping| {
+                (!mapping.is_unmapped
+                    && mapping
+                        .name_index
+                        .is_some_and(|index| index as usize >= names.len()))
+                    || (mapping.is_unmapped && mapping.name_index.is_some())
+            }) {
+                return None;
+            }
+            if discarded_static_requests
+                .windows(2)
+                .any(|pair| pair[0].end > pair[1].start)
+                || discarded_static_requests
+                    .iter()
+                    .any(|request| request.start >= request.end)
+            {
+                return None;
+            }
+            cache.mappings.insert(
+                key,
+                Arc::new(CachedModuleMappings {
+                    mappings,
+                    names,
+                    discarded_static_requests,
+                }),
+            );
+        }
         Some(cache)
     }
 }
@@ -579,6 +837,15 @@ fn summary_estimated_size(summary: &ModuleSummary) -> usize {
             .map(|(name, local)| name.len() + local.as_ref().map_or(0, String::len))
             .sum::<usize>();
     deps + uses + liveness_strings + 128
+}
+
+fn cached_mappings_estimated_size(mappings: &CachedModuleMappings) -> usize {
+    mappings.mappings.len() * std::mem::size_of::<CachedMapping>()
+        + mappings.names.iter().map(String::len).sum::<usize>()
+        + mappings.names.len() * std::mem::size_of::<String>()
+        + mappings.discarded_static_requests.len()
+            * std::mem::size_of::<CachedDiscardedStaticRequest>()
+        + 32
 }
 
 // —— 写原语 ——
@@ -765,6 +1032,39 @@ mod tests {
             0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
             Arc::new("exports.x = 1;".to_string()),
         );
+        c.put_retained_module_ids(
+            0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
+            Arc::new(vec![2, 9]),
+        );
+        c.put_mappings(
+            0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
+            Arc::new(CachedModuleMappings {
+                mappings: vec![
+                    CachedMapping {
+                        gen_line: 1,
+                        gen_col: 2,
+                        src_index: 0,
+                        src_offset: 7,
+                        name_index: Some(0),
+                        is_unmapped: false,
+                    },
+                    CachedMapping {
+                        gen_line: 1,
+                        gen_col: 9,
+                        src_index: 0,
+                        src_offset: 0,
+                        name_index: None,
+                        is_unmapped: true,
+                    },
+                ],
+                names: vec!["descriptiveName".into()],
+                discarded_static_requests: vec![CachedDiscardedStaticRequest {
+                    start: 0,
+                    end: 7,
+                    target_module_id: 9,
+                }],
+            }),
+        );
         c.put_source(
             Path::new("src/index.js"),
             FileStamp {
@@ -787,6 +1087,19 @@ mod tests {
             back.summary(0xDEAD_BEEF).unwrap().deps[0].specifier,
             "./a.js"
         );
+        assert_eq!(
+            back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+                .expect("cached mappings")
+                .mappings[1],
+            CachedMapping {
+                gen_line: 1,
+                gen_col: 9,
+                src_index: 0,
+                src_offset: 0,
+                name_index: None,
+                is_unmapped: true,
+            }
+        );
         assert_eq!(back.summary(0xDEAD_BEEF).unwrap().uses[0].names.len(), 2);
         assert!(back.summary(0xDEAD_BEEF).unwrap().has_top_level_await);
         assert_eq!(
@@ -800,6 +1113,43 @@ mod tests {
             Some("exports.x = 1;")
         );
         assert!(back.body(0).is_none());
+        assert_eq!(
+            back.retained_module_ids(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+                .expect("cached retained dependencies")
+                .as_slice(),
+            [2, 9]
+        );
+        assert!(back.retained_module_ids(0).is_none());
+        assert_eq!(
+            back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+                .expect("cached mappings")
+                .mappings[0],
+            CachedMapping {
+                gen_line: 1,
+                gen_col: 2,
+                src_index: 0,
+                src_offset: 7,
+                name_index: Some(0),
+                is_unmapped: false,
+            }
+        );
+        assert_eq!(
+            back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+                .expect("cached mappings")
+                .names,
+            ["descriptiveName"]
+        );
+        assert_eq!(
+            back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+                .expect("cached mappings")
+                .discarded_static_requests,
+            [CachedDiscardedStaticRequest {
+                start: 0,
+                end: 7,
+                target_module_id: 9,
+            }]
+        );
+        assert!(back.mappings(0).is_none());
         let source = back
             .cached_source(Path::new("src/index.js"), 7)
             .expect("path source");
@@ -887,6 +1237,52 @@ mod tests {
         assert_eq!(cache.bodies.len(), 2);
         assert!(cache.bodies.contains_key(&0));
         assert!(cache.bodies.contains_key(&5));
+    }
+
+    #[test]
+    fn body_dependency_edges_and_source_map_entries_are_independent() {
+        let mut cache = BuildCache::new();
+        cache.put_body(7, Arc::new("body".into()));
+        assert!(cache.body(7).is_some());
+        assert!(cache.retained_module_ids(7).is_none());
+        assert!(cache.mappings(7).is_none());
+
+        cache.put_retained_module_ids(7, Arc::new(vec![2, 11]));
+        assert_eq!(
+            cache.retained_module_ids(7).expect("edges").as_slice(),
+            [2, 11]
+        );
+
+        cache.put_mappings(
+            7,
+            Arc::new(CachedModuleMappings {
+                mappings: vec![
+                    CachedMapping {
+                        gen_line: 0,
+                        gen_col: 1,
+                        src_index: 0,
+                        src_offset: 2,
+                        name_index: Some(0),
+                        is_unmapped: false,
+                    },
+                    CachedMapping {
+                        gen_line: 0,
+                        gen_col: 4,
+                        src_index: 0,
+                        src_offset: 5,
+                        name_index: None,
+                        is_unmapped: true,
+                    },
+                ],
+                names: vec!["original".into()],
+                discarded_static_requests: Vec::new(),
+            }),
+        );
+        assert!(cache.body(7).is_some());
+        let mappings = cache.mappings(7).expect("map");
+        assert_eq!(mappings.mappings.len(), 2);
+        assert_eq!(mappings.mappings[1].name_index, None);
+        assert_eq!(mappings.names, ["original"]);
     }
 
     #[test]

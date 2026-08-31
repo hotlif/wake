@@ -9,7 +9,8 @@
 //!
 //! ## 并发模型（DESIGN §10.3「revision 串行写、读并行」）
 //!
-//! - **自研分片 slot 表** [`Sharded`]：按 `TaskId` 分 16 片，每片一把 `Mutex<FxHashMap>`。
+//! - **自研分片 slot 表** [`Sharded`]：按 `TaskId` 分 128 片，每片一把 cache-padded
+//!   `Mutex<FxHashMap>`。
 //!   所有分片操作 **lock → 取值 → 立即释放**，绝不持分片锁递归（否则同片重入死锁）。
 //! - **single-flight** = per-task 执行锁（`Arc<Mutex<()>>`）：多线程请求同一 task 时序列化，
 //!   只执行一次；深校验递归时「持父锁 → 拿子锁」，**无环依赖下遵循 DAG 偏序，不死锁**。
@@ -30,6 +31,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crossbeam_utils::CachePadded;
 use wake_common::{FxHashMap, Hash64};
 
 #[cfg(not(loom))]
@@ -43,20 +45,21 @@ type AnyValue = Arc<dyn Any + Send + Sync>;
 type Recompute = Arc<dyn Fn() -> (AnyValue, Hash64) + Send + Sync>;
 
 /// 分片数（2 的幂，便于按位取模）。
-const SHARD_COUNT: usize = 16;
+const SHARD_COUNT: usize = 128;
+type Shard<V> = CachePadded<Mutex<FxHashMap<TaskId, V>>>;
 
 /// 自研分片并发表：按 `TaskId` 分片，每片独立 `Mutex`。热路径无全局锁。
 ///
 /// **纪律**：每个方法内 lock → 操作 → 返回前释放，绝不在持分片锁时递归到本表
 /// （同片重入 = 死锁）。跨 task 的递归串行化交给 per-task 执行锁（见 [`Engine`]）。
 struct Sharded<V> {
-    shards: Box<[Mutex<FxHashMap<TaskId, V>>]>,
+    shards: Box<[Shard<V>]>,
 }
 
 impl<V> Sharded<V> {
     fn new() -> Sharded<V> {
         let shards = (0..SHARD_COUNT)
-            .map(|_| Mutex::new(FxHashMap::default()))
+            .map(|_| CachePadded::new(Mutex::new(FxHashMap::default())))
             .collect();
         Sharded { shards }
     }
@@ -141,6 +144,13 @@ pub struct Engine {
     /// 增量开关：false = 「无增量纯并行」降级模式（禁跨 revision 复用，每次变更全量重算，
     /// 但保留本 revision 内 single-flight 去重 + 并行）。DESIGN §6 的降级预案，Gate-2 验收项。
     incremental: AtomicBool,
+    /// 单次构建模式：任务值仍通过 `Vc` 槽位跨阶段传递，但进程内不会发生 input 更新或第二个
+    /// generation，因此跳过输出指纹、重算器和依赖边。per-task 锁仍保留，重复并发请求继续
+    /// single-flight。该模式必须在创建引擎时确定；第一条派生 query 发布后输入即被冻结。
+    one_shot: bool,
+    /// One-shot 输入可在任务图启动前完成最后一次组装；第一条派生 query 发布此标志后，
+    /// [`Engine::set_input`] 必须拒绝更新，否则已物化且没有依赖边的任务会静默陈旧。
+    query_started: AtomicBool,
 }
 
 thread_local! {
@@ -208,6 +218,10 @@ fn record_dependency(raw: RawVc) {
 
 impl Engine {
     pub fn new() -> Engine {
+        Self::with_mode(false)
+    }
+
+    fn with_mode(one_shot: bool) -> Engine {
         Engine {
             revision: AtomicU64::new(1),
             inputs: RwLock::new(Vec::new()),
@@ -215,8 +229,20 @@ impl Engine {
             recomputers: Sharded::new(),
             task_locks: Sharded::new(),
             exec_count: AtomicU64::new(0),
-            incremental: AtomicBool::new(true),
+            incremental: AtomicBool::new(!one_shot),
+            one_shot,
+            query_started: AtomicBool::new(false),
         }
+    }
+
+    /// 创建单 generation 的瞬态引擎。
+    ///
+    /// 适合 CLI 冷构建这类“输入在首条 query 前完成组装、所有输出消费完即退出”的调用方。它保留 `Vc`
+    /// 类型边界与并发 single-flight，但不计算没有消费者的红绿指纹，也不保存重算闭包/依赖边。
+    /// watch、dev server 或任何会在 query 后调用 [`Engine::set_input`] 的宿主必须使用
+    /// [`Engine::new`]。
+    pub fn new_one_shot() -> Engine {
+        Self::with_mode(true)
     }
 
     /// 「无增量纯并行」降级模式的引擎（DESIGN §6 降级预案）。等价 [`Engine::new`] 后
@@ -230,6 +256,7 @@ impl Engine {
     /// 运行时切换增量模式。`false` 进入「无增量纯并行」（引擎出问题时的降级开关）：
     /// 禁用跨 revision 复用与早期截断，每次变更全量重算，但仍保留 single-flight 去重 + 并行。
     pub fn set_incremental(&self, on: bool) {
+        assert!(!self.one_shot, "wake_turbo: one-shot 引擎不能切换增量模式");
         self.incremental.store(on, Ordering::Relaxed);
     }
 
@@ -279,7 +306,11 @@ impl Engine {
 
     /// 新建一个输入 cell，返回其句柄。
     pub fn new_input<T: TaskOutput>(&self, value: T) -> Vc<T> {
-        let fingerprint = value.fingerprint();
+        let fingerprint = if self.one_shot {
+            0
+        } else {
+            value.fingerprint()
+        };
         let now = self.revision.load(Ordering::Acquire);
         let mut inputs = self.inputs.write().unwrap();
         let idx = inputs.len() as u32;
@@ -291,13 +322,28 @@ impl Engine {
         Vc::from_raw(RawVc::Input(idx))
     }
 
-    /// 写入一个输入 cell。**指纹确实变化时**才 +1 revision 并记 `changed_at`（输入级早期截断）。
+    /// 写入一个输入 cell。普通引擎仅在**指纹确实变化时**才 +1 revision 并记 `changed_at`
+    /// （输入级早期截断）。One-shot 引擎允许在第一条派生 query 前组装输入，随后永久冻结。
     /// 并发模型下应在「无并行 query」阶段调用（一批变更后再统一重算）。
     pub fn set_input<T: TaskOutput>(&self, vc: Vc<T>, value: T) {
         let RawVc::Input(i) = vc.raw() else {
             panic!("wake_turbo: set_input 只能用于输入 cell");
         };
         let i = i as usize;
+        if self.one_shot {
+            if self.query_started.load(Ordering::Acquire) {
+                panic!("wake_turbo: one-shot 引擎在派生 query 开始后不可更新输入");
+            }
+            let mut inputs = self.inputs.write().unwrap();
+            // 与 query 发布形成冻结边界：若两者竞争，query 要么看到本次更新，要么本次更新
+            // 明确失败，不能在没有依赖边的情况下留下陈旧任务值。
+            if self.query_started.load(Ordering::Acquire) {
+                drop(inputs);
+                panic!("wake_turbo: one-shot 引擎在派生 query 开始后不可更新输入");
+            }
+            inputs[i].value = Arc::new(value);
+            return;
+        }
         let fingerprint = value.fingerprint();
         let mut inputs = self.inputs.write().unwrap();
         if inputs[i].fingerprint != fingerprint {
@@ -312,6 +358,12 @@ impl Engine {
 
     fn read_vc<T: TaskOutput>(&self, vc: Vc<T>) -> Arc<T> {
         let raw = vc.raw();
+        if self.one_shot {
+            return self
+                .value_of(raw)
+                .downcast::<T>()
+                .expect("wake_turbo: Vc 读取类型与存储值不匹配");
+        }
         record_dependency(raw);
         self.ensure(raw);
         self.value_of(raw)
@@ -324,6 +376,18 @@ impl Engine {
         id: TaskId,
         compute: impl Fn() -> T + Send + Sync + 'static,
     ) -> Vc<T> {
+        if self.one_shot {
+            if !self.query_started.load(Ordering::Acquire) {
+                // Holding the input read lock makes publication atomic with respect to
+                // `set_input`'s write-locked recheck. Whichever side acquires the lock first wins:
+                // the query observes the completed update, or the setter observes the freeze and
+                // fails before changing the slot. Later queries take only the atomic fast path.
+                let inputs = self.inputs.read().unwrap();
+                self.query_started.store(true, Ordering::Release);
+                drop(inputs);
+            }
+            return self.query_one_shot(id, compute);
+        }
         record_dependency(RawVc::Task(id));
         // 幂等注册重算器：同一 TaskId 计算逻辑恒定（TaskId = 函数+参数指纹），只注册一次。
         self.recomputers.ensure_with(id, || {
@@ -335,6 +399,48 @@ impl Engine {
         });
         self.ensure_green(id);
         Vc::from_raw(RawVc::Task(id))
+    }
+
+    /// 瞬态任务只物化一次值。没有后续 generation，故 `fingerprint/deps/recomputer` 均无消费者；
+    /// 保留与普通路径相同的循环检测和 per-task single-flight，确保并发语义不分叉。
+    fn query_one_shot<T: TaskOutput>(
+        &self,
+        id: TaskId,
+        compute: impl Fn() -> T + Send + Sync + 'static,
+    ) -> Vc<T> {
+        let vc = Vc::from_raw(RawVc::Task(id));
+        if self.memos.with(id, |memo| memo.is_some()) {
+            return vc;
+        }
+        if ACTIVE.with(|active| active.borrow().contains(&id)) {
+            let path = ACTIVE.with(|active| active.borrow().clone());
+            panic!("wake_turbo: 检测到循环依赖——任务 {id:?} 在本线程处理链 {path:?} 中被再次请求");
+        }
+
+        let lock = self
+            .task_locks
+            .get_or_insert_with(id, || Arc::new(Mutex::new(())));
+        let _lock = lock.lock().unwrap();
+        if self.memos.with(id, |memo| memo.is_some()) {
+            return vc;
+        }
+
+        ACTIVE.with(|active| active.borrow_mut().push(id));
+        let _active = ActiveGuard;
+        self.exec_count.fetch_add(1, Ordering::Relaxed);
+        let value = Arc::new(compute()) as AnyValue;
+        let now = self.revision.load(Ordering::Acquire);
+        self.memos.insert(
+            id,
+            Memo {
+                value,
+                fingerprint: 0,
+                verified_at: now,
+                changed_at: now,
+                deps: Vec::new(),
+            },
+        );
+        vc
     }
 
     // —— 红绿校验（对齐 spike `verify_value`，加 single-flight）——

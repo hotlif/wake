@@ -122,6 +122,17 @@ mod tests {
     }
 
     #[test]
+    fn radix_prefix_requires_at_least_one_digit() {
+        for source in ["0x", "0X", "0o", "0O", "0b", "0B"] {
+            let (tokens, diagnostics) = tokenize(source);
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.is_error()),
+                "a bare radix prefix is not a JavaScript numeric literal: {source:?}; {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
     fn strings_and_templates() {
         use TokenKind::*;
         assert_eq!(kinds(r#""hello""#), vec![Str]);

@@ -518,17 +518,26 @@ impl<'a> Lexer<'a> {
             match self.peek_at(1) {
                 Some(b'x') | Some(b'X') => {
                     self.pos += 2;
-                    self.scan_radix_digits(lo, |b| b.is_ascii_hexdigit());
+                    if !self.scan_radix_digits(lo, |b| b.is_ascii_hexdigit()) {
+                        self.error(self.span_from(lo), "进制前缀后缺少数字");
+                        return TokenKind::Error;
+                    }
                     return self.finish_number(lo, true);
                 }
                 Some(b'o') | Some(b'O') => {
                     self.pos += 2;
-                    self.scan_radix_digits(lo, |b| (b'0'..=b'7').contains(&b));
+                    if !self.scan_radix_digits(lo, |b| (b'0'..=b'7').contains(&b)) {
+                        self.error(self.span_from(lo), "进制前缀后缺少数字");
+                        return TokenKind::Error;
+                    }
                     return self.finish_number(lo, true);
                 }
                 Some(b'b') | Some(b'B') => {
                     self.pos += 2;
-                    self.scan_radix_digits(lo, |b| b == b'0' || b == b'1');
+                    if !self.scan_radix_digits(lo, |b| b == b'0' || b == b'1') {
+                        self.error(self.span_from(lo), "进制前缀后缺少数字");
+                        return TokenKind::Error;
+                    }
                     return self.finish_number(lo, true);
                 }
                 _ => {}
@@ -584,11 +593,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_decimal_digits(&mut self) {
-        self.scan_radix_digits(self.pos, |b| b.is_ascii_digit());
+        let _ = self.scan_radix_digits(self.pos, |b| b.is_ascii_digit());
     }
 
     /// 扫描某进制的数字序列，允许合法位置的数字分隔符 `_`。
-    fn scan_radix_digits(&mut self, lo: usize, is_digit: impl Fn(u8) -> bool) {
+    /// 返回是否至少消费了一个真实数字（分隔符不计）。
+    fn scan_radix_digits(&mut self, lo: usize, is_digit: impl Fn(u8) -> bool) -> bool {
         let mut last_was_sep = false;
         let mut any = false;
         while let Some(b) = self.peek() {
@@ -609,6 +619,7 @@ impl<'a> Lexer<'a> {
         if last_was_sep {
             self.error(self.span_from(lo), "数字不能以分隔符 `_` 结尾");
         }
+        any
     }
 
     // ==================================================================

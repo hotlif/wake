@@ -74,7 +74,8 @@ Gate-3 当前含义：同步与增量路径能构建 fixture，缓存命中不�
 
 # 4. Transform 与 Source Map
 
-TypeScript、JSX、浏览器目标转换和精确 Source Map 已进入应用层。`--sourcemap` 使用保守生产选项保证映射准确。
+TypeScript、JSX、浏览器目标转换和精确 Source Map 已进入应用层。`--sourcemap` 可与生产压缩和代码
+分割同时启用；映射采集不改变不含 trailer 的 JavaScript payload。
 
 # 5. Dev Server 与 HMR
 

@@ -1493,6 +1493,17 @@ struct GraphSourceMapper<'a> {
     generated_lines: Vec<GeneratedScriptLine>,
 }
 
+#[derive(Clone, Copy)]
+enum StackAnchorBias {
+    /// Use the active source-map segment. When V8 reports the synthetic call parenthesis, fall
+    /// back only to the preceding owned anchor on that same generated line.
+    Active,
+    /// Attribute a matcher invocation to its received expression. V8 reports method calls at the
+    /// matcher property (for example `toBe`); Wake assertion diagnostics own the immediately
+    /// preceding user expression instead.
+    Previous,
+}
+
 impl<'a> GraphSourceMapper<'a> {
     fn new(
         root: &'a Path,
@@ -1510,6 +1521,18 @@ impl<'a> GraphSourceMapper<'a> {
     }
 
     fn map_stack(&self, stack: &str) -> Option<TestLocation> {
+        self.map_stack_with_bias(stack, StackAnchorBias::Active)
+    }
+
+    fn map_stack_before_current_anchor(&self, stack: &str) -> Option<TestLocation> {
+        self.map_stack_with_bias(stack, StackAnchorBias::Previous)
+    }
+
+    fn map_stack_with_bias(
+        &self,
+        stack: &str,
+        anchor_bias: StackAnchorBias,
+    ) -> Option<TestLocation> {
         let mut best = None;
         for (frame_index, frame) in stack.lines().enumerate() {
             let Some(frame) = parse_stack_frame(frame) else {
@@ -1524,7 +1547,9 @@ impl<'a> GraphSourceMapper<'a> {
             let Some(absolute_offset) = self.generated_offset(frame.line, frame.column) else {
                 continue;
             };
-            let Some((priority, location)) = self.map_generated_offset(absolute_offset) else {
+            let Some((priority, location)) =
+                self.map_generated_offset(absolute_offset, anchor_bias)
+            else {
                 continue;
             };
             let replace = best.as_ref().is_none_or(|(best_priority, best_index, _)| {
@@ -1544,7 +1569,11 @@ impl<'a> GraphSourceMapper<'a> {
         (offset < line.utf16_end).then_some(offset)
     }
 
-    fn map_generated_offset(&self, absolute_offset: usize) -> Option<(u8, TestLocation)> {
+    fn map_generated_offset(
+        &self,
+        absolute_offset: usize,
+        anchor_bias: StackAnchorBias,
+    ) -> Option<(u8, TestLocation)> {
         self.compiled
             .modules()
             .iter()
@@ -1554,9 +1583,34 @@ impl<'a> GraphSourceMapper<'a> {
                 if absolute_offset < body.utf16_start || absolute_offset >= body.utf16_end {
                     return None;
                 }
-                let original_byte = module.original_byte_offset_for_body_utf16_offset(
-                    absolute_offset - body.utf16_start,
-                )?;
+                let local_offset = absolute_offset - body.utf16_start;
+                let generated_line = self
+                    .generated_lines
+                    .partition_point(|line| line.utf16_start <= absolute_offset)
+                    .checked_sub(1)?;
+                let body_line = self
+                    .generated_lines
+                    .partition_point(|line| line.utf16_start <= body.utf16_start)
+                    .checked_sub(1)?;
+                let local_line = u32::try_from(generated_line.checked_sub(body_line)?).ok()?;
+                let mut preceding = module.source_mappings().iter().rev().filter(|mapping| {
+                    mapping.generated_line() == local_line
+                        && mapping.generated_utf16_offset() <= local_offset
+                });
+                let nearest_anchor = preceding
+                    .next()
+                    .map(|mapping| mapping.original_byte_offset());
+                let original_byte = match anchor_bias {
+                    StackAnchorBias::Active => module
+                        .original_byte_offset_for_body_utf16_offset(local_offset)
+                        .or(nearest_anchor)?,
+                    // Skip the matcher property's current anchor. Restricting candidates to the
+                    // same generated line prevents this stack-only blame policy from crossing a
+                    // source-map fence into an earlier statement.
+                    StackAnchorBias::Previous => preceding
+                        .next()
+                        .map_or(nearest_anchor?, |mapping| mapping.original_byte_offset()),
+                };
                 let original_byte = usize::try_from(original_byte).ok()?;
                 if original_byte > module.original_source().len()
                     || !module.original_source().is_char_boundary(original_byte)
@@ -3758,15 +3812,55 @@ fn normalize_coverage(
         module: &wake_js_runtime::CommonJsModuleScriptLayout,
         range: Range,
     ) -> Option<OriginalCoverageRange> {
-        if range.start >= range.end || range.end > module.body().utf16_end {
+        let body = module.body();
+        if range.start >= range.end || range.start < body.utf16_start || range.end > body.utf16_end
+        {
             return None;
         }
-        let start_byte = mapped_original_byte(module, range.start)?;
-        let end_byte = mapped_original_byte(module, range.end - 1)?;
+        let local_start = range.start - body.utf16_start;
+        let local_end = range.end - body.utf16_start;
+        let mappings = module.source_mappings();
+        let first_inside =
+            mappings.partition_point(|mapping| mapping.generated_utf16_offset() < local_start);
+        let first_inside = mappings
+            .get(first_inside)
+            .filter(|mapping| mapping.generated_utf16_offset() < local_end)
+            .map(|mapping| mapping.original_byte_offset());
+        let last_inside = mappings
+            .partition_point(|mapping| mapping.generated_utf16_offset() < local_end)
+            .checked_sub(1)
+            .and_then(|index| mappings.get(index))
+            .filter(|mapping| mapping.generated_utf16_offset() >= local_start)
+            .map(|mapping| mapping.original_byte_offset());
+
+        // Precise-coverage ranges include braces, whitespace and other generated punctuation at
+        // their boundaries. Typed codegen deliberately fences those positions as unmapped, so a
+        // range remains source-owned when it contains source anchors even if either boundary is a
+        // fence. Prefer the ordinary source-map floor lookup and use the first/last in-range
+        // anchors only for fenced endpoints.
+        let start_byte = mapped_original_byte(module, range.start).or(first_inside)?;
+        let end_byte = mapped_original_byte(module, range.end - 1).or(last_inside)?;
         Some(OriginalCoverageRange {
             start_byte: start_byte.min(end_byte),
             end_byte: start_byte.max(end_byte),
         })
+    }
+
+    fn mapped_original_function_range(
+        module: &wake_js_runtime::CommonJsModuleScriptLayout,
+        range: Range,
+    ) -> Option<OriginalCoverageRange> {
+        let body = module.body();
+        let local_start = range.start.checked_sub(body.utf16_start)?;
+        // Only an emitter-owned function boundary can introduce a source function. Generated
+        // CommonJS getters and module/decorator wrappers intentionally have no exact anchor; a
+        // floor lookup would otherwise inherit the preceding source token and count them as
+        // extra user functions.
+        module
+            .source_mappings()
+            .binary_search_by_key(&local_start, |mapping| mapping.generated_utf16_offset())
+            .ok()?;
+        mapped_original_range(module, range)
     }
 
     let Some(raw) = raw else {
@@ -3862,7 +3956,7 @@ fn normalize_coverage(
             let mut blocks = BTreeMap::<OriginalCoverageRange, bool>::new();
             for ranges in &function_ranges {
                 if let Some(range) = ranges.first().copied()
-                    && let Some(identity) = mapped_original_range(module, range)
+                    && let Some(identity) = mapped_original_function_range(module, range)
                 {
                     functions
                         .entry(identity)
@@ -5041,10 +5135,15 @@ fn structured_failure(
     failure: RuntimeFailure,
     source_mapper: &GraphSourceMapper<'_>,
 ) -> TestFailure {
-    let location = failure
-        .stack
-        .as_deref()
-        .and_then(|stack| source_mapper.map_stack(stack));
+    let location = failure.stack.as_deref().and_then(|stack| {
+        // Assertion failures are the sole diagnostics whose blame target is the received value
+        // rather than the exact callee token. All other failures keep ordinary active-map lookup.
+        if failure.code.as_deref() == Some("WAKE_TEST_ASSERTION") {
+            source_mapper.map_stack_before_current_anchor(stack)
+        } else {
+            source_mapper.map_stack(stack)
+        }
+    });
     TestFailure {
         message: failure.message,
         code: failure.code,
@@ -7350,6 +7449,45 @@ environment = "dom"
         assert!(html.contains("<title>Wake coverage</title>"), "{html}");
         assert!(html.contains("const marker"), "{html}");
         assert!(html.contains("class=\"line uncovered\""), "{html}");
+    }
+
+    #[test]
+    fn coverage_excludes_generated_export_getters_and_keeps_empty_source_functions() {
+        let fixture = fixture(
+            r#"
+                import {expect, test} from '@crab-dev/wake/test'
+                import {empty, object} from './value'
+                test('source functions', () => {
+                    empty()
+                    object.method()
+                    expect(true).toBe(true)
+                })
+            "#,
+        );
+        fs::write(
+            fixture.path().join("value.ts"),
+            "export const empty = () => {};\nexport const object = { method() {} };\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.path().join("wake.config.toml"),
+            "[test.coverage]\nenabled = true\nreporters = ['json']\n",
+        )
+        .unwrap();
+
+        let result = run_tests(options(fixture.path())).unwrap();
+        assert!(result.success, "{result:#?}");
+        let coverage = result.coverage.as_ref().expect("coverage result");
+        assert_eq!(coverage.files.len(), 1, "{coverage:#?}");
+        assert_eq!(coverage.files[0].path, "value.ts");
+        assert_eq!(
+            (
+                coverage.files[0].metrics.functions.covered,
+                coverage.files[0].metrics.functions.total,
+            ),
+            (2, 2),
+            "{coverage:#?}"
+        );
     }
 
     fn branch_coverage_fixture(second_branch: bool) -> tempfile::TempDir {

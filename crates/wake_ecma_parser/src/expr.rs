@@ -461,6 +461,28 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             .0
     }
 
+    /// Parse the restricted Stage-3 decorator expression grammar.
+    ///
+    /// An unparenthesized computed member tail is intentionally excluded: in
+    /// `@decorate [key] = value`, `[key]` starts the decorated class element rather than extending
+    /// the decorator expression. Arbitrary decorator expressions remain available through the
+    /// standard `@(expression)` escape hatch.
+    pub(crate) fn parse_decorator_expression(&mut self) -> Expression<'a> {
+        let lo = self.start();
+        let expr = if self.at_keyword(Keyword::New) {
+            self.parse_new_expression()
+        } else {
+            self.parse_primary_expression()
+        };
+        self.parse_call_member_tail(
+            lo,
+            expr,
+            wake_ecma_transform::OptionalChainMode::Value,
+            false,
+        )
+        .0
+    }
+
     fn parse_lhs_expression_with_optional_mode(
         &mut self,
         mode: wake_ecma_transform::OptionalChainMode,
@@ -478,7 +500,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.parse_primary_expression()
         };
         self.suppress_optional_chain_in_delete_cover = previous_delete_cover;
-        self.parse_call_member_tail(lo, expr, mode)
+        self.parse_call_member_tail(lo, expr, mode, true)
     }
 
     fn parse_new_expression(&mut self) -> Expression<'a> {
@@ -582,6 +604,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         lo: u32,
         mut expr: Expression<'a>,
         mode: wake_ecma_transform::OptionalChainMode,
+        allow_computed_tail: bool,
     ) -> (Expression<'a>, bool) {
         let mut preserve_optional_chain = std::mem::take(&mut self.preserve_optional_chain_tail);
         let defer_parenthesized_invocation = preserve_optional_chain
@@ -594,12 +617,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.cur.kind,
             TokenKind::Dot
                 | TokenKind::QuestionDot
-                | TokenKind::LBracket
                 | TokenKind::LParen
                 | TokenKind::TemplateNoSub
                 | TokenKind::TemplateHead
-        ) || (self.ts
-            && matches!(self.cur.kind, TokenKind::Bang | TokenKind::Lt));
+        ) || (allow_computed_tail && self.cur.kind == TokenKind::LBracket)
+            || (self.ts && matches!(self.cur.kind, TokenKind::Bang | TokenKind::Lt));
         if !defer_parenthesized_invocation
             && preserve_optional_chain
             && has_outer_tail
@@ -666,7 +688,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         }
                     }
                 }
-                TokenKind::LBracket => {
+                TokenKind::LBracket if allow_computed_tail => {
                     self.bump();
                     let idx = self.with_allow_in(true, |p| p.parse_expression());
                     self.expect(TokenKind::RBracket);

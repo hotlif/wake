@@ -34,9 +34,23 @@ fn bundles_multi_module_esm() {
         out.bundle
             .contains("function(module, exports, __wake_require__)")
     );
-    assert!(out.bundle.contains("exports[\"add\"] = function (a, b)"));
-    assert!(out.bundle.contains("exports.default = \"hello\";"));
-    assert!(out.bundle.contains("exports[\"result\"] = result;"));
+    assert!(out.bundle.contains("function add(a, b)"), "{}", out.bundle);
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"add\"")
+    );
+    assert!(
+        out.bundle
+            .contains("const __wake_default_export = \"hello\";")
+    );
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"default\"")
+    );
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"result\"")
+    );
 }
 
 // ============================================================
@@ -51,9 +65,23 @@ fn incremental_bundles_correctly() {
     assert_eq!(out.module_count, 3);
     // 与直接打包同样的 runtime + 函数包装 + ESM→CJS 改写。
     assert!(out.bundle.contains("__wake_require__"));
-    assert!(out.bundle.contains("exports[\"add\"] = function (a, b)"));
-    assert!(out.bundle.contains("exports.default = \"hello\";"));
-    assert!(out.bundle.contains("exports[\"result\"] = result;"));
+    assert!(out.bundle.contains("function add(a, b)"), "{}", out.bundle);
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"add\"")
+    );
+    assert!(
+        out.bundle
+            .contains("const __wake_default_export = \"hello\";")
+    );
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"default\"")
+    );
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"result\"")
+    );
 }
 
 #[test]
@@ -128,7 +156,7 @@ fn package_identity_flattens_same_version_and_keeps_multiple_versions() {
         ),
     ]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let output = bundler.build(Path::new("src/index.js"));
     assert!(!output.has_errors(), "{:?}", output.diagnostics);
     assert_eq!(output.module_count, 6, "同版本 shared 应折叠为一个模块");
@@ -137,22 +165,495 @@ fn package_identity_flattens_same_version_and_keeps_multiple_versions() {
 }
 
 #[test]
-fn minify_uses_dot_access_for_identifier_export_names() {
+fn minify_emits_live_getters_for_identifier_export_names() {
     let fs = MemoryFileSystem::from_files([(
         "src/index.js",
         "const value = 1; export { value as answer };",
     )]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let output = bundler.build(Path::new("src/index.js"));
 
     assert!(!output.has_errors(), "{:?}", output.diagnostics);
-    assert!(output.bundle.contains("$.answer="), "{}", output.bundle);
+    assert!(
+        output
+            .bundle
+            .contains("Object.defineProperty($,\"answer\",{enumerable:!0,get:function(){return"),
+        "{}",
+        output.bundle
+    );
     assert!(
         !output.bundle.contains("$[\"answer\"]"),
         "{}",
         output.bundle
     );
+}
+
+#[test]
+fn minify_is_the_single_pipeline_and_mangles_locals() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "function compute(veryLongParameterName) { const veryLongLocalName = veryLongParameterName + 1; return veryLongLocalName; } export const result = compute(41);",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify();
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(
+        !output.bundle.contains("veryLongParameterName")
+            && !output.bundle.contains("veryLongLocalName"),
+        "minify must own identifier mangling without a second switch:\n{}",
+        output.bundle
+    );
+}
+
+#[test]
+fn minified_single_chunk_runtime_omits_the_unused_registry_temporary() {
+    let fs = MemoryFileSystem::from_files([("src/index.js", "export const result = 42;")]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify();
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(output.bundle.contains("(function(g){var c={};function r"));
+    assert!(!output.bundle.contains("var c={},q;"));
+    assert!(
+        !output.bundle.contains("var _m={};return function"),
+        "a one-module bundle must not emit an unreachable empty concat factory:\n{}",
+        output.bundle
+    );
+}
+
+#[test]
+fn enabling_minify_on_a_stable_graph_retains_namespace_identity_facts() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "export { named } from './values.js'; export * from './star.js'; export * as starNamespace from './star.js';",
+        ),
+        (
+            "src/values.js",
+            "export const named=1;export const unrelated=2;export default 3;",
+        ),
+        ("src/star.js", "export const starValue=4;"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_load_cache();
+    let readable = bundler.build(Path::new("src/index.js"));
+    assert!(!readable.has_errors(), "{:?}", readable.diagnostics);
+
+    bundler.enable_minify();
+    let optimized = bundler.build(Path::new("src/index.js"));
+    assert!(!optimized.has_errors(), "{:?}", optimized.diagnostics);
+    if !node_available() {
+        return;
+    }
+
+    let observer = r#"
+const value=module.exports;
+const top=Object.keys(value).filter(key=>key!=="__esModule").sort();
+const nested=Object.keys(value.starNamespace).filter(key=>key!=="__esModule").sort();
+process.stdout.write(JSON.stringify([top,nested]));
+"#;
+    let observed = std::process::Command::new("node")
+        .arg("-e")
+        .arg(format!("{}\n{observer}", optimized.bundle))
+        .output()
+        .expect("node was available immediately before execution");
+    assert!(
+        observed.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&observed.stderr),
+        optimized.bundle
+    );
+    assert_eq!(
+        String::from_utf8(observed.stdout).unwrap(),
+        r#"[["named","starNamespace","starValue"],["starValue"]]"#
+    );
+}
+
+#[test]
+fn minify_mangles_large_modules_without_a_source_length_bailout() {
+    let padding = "x".repeat(5000);
+    let source = format!(
+        "/*{padding}*/ function compute(veryLongParameterName) {{ const veryLongLocalName = veryLongParameterName + 1; return veryLongLocalName; }} export const result = compute(41);"
+    );
+    assert!(source.len() >= 4096);
+    let fs = MemoryFileSystem::from_files([("src/index.js", source)]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify();
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(
+        !output.bundle.contains("veryLongParameterName")
+            && !output.bundle.contains("veryLongLocalName"),
+        "source length must not change minifier semantics:\n{}",
+        output.bundle
+    );
+}
+
+#[test]
+fn minify_only_mangles_proven_local_properties_and_class_private_names() {
+    fn bundle(source: &str) -> String {
+        let fs = MemoryFileSystem::from_files([("src/index.js", source)]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        bundler.enable_minify();
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        output.bundle
+    }
+
+    let closed = bundle(
+        "const object={descriptiveProperty:41};module.exports=object.descriptiveProperty+1;",
+    );
+    assert!(!closed.contains("descriptiveProperty"), "{closed}");
+
+    let escaped = bundle("const object={descriptiveProperty:41};module.exports=object;");
+    assert!(escaped.contains("descriptiveProperty"), "{escaped}");
+
+    let private = bundle(
+        "class Example{#descriptiveSecret=41;publicMember(){return this.#descriptiveSecret+1}}module.exports=new Example().publicMember();",
+    );
+    assert!(!private.contains("descriptiveSecret"), "{private}");
+    assert!(private.contains("publicMember"), "{private}");
+}
+
+#[test]
+fn minify_owned_corpus_never_grows_and_improves_in_aggregate() {
+    let cases = [
+        (
+            "constants",
+            "const folded = 1 + 2 * 3; const unused = 9; export const result = folded;"
+                .to_string(),
+            489usize,
+        ),
+        (
+            "control_flow",
+            "function choose(flag) { if (flag) return 10; return 20; } export const result = choose(true);"
+                .to_string(),
+            515,
+        ),
+        (
+            "closure",
+            "function outer(longArgument) { const capturedValue = longArgument + 1; return function inner(secondLongArgument) { return capturedValue + secondLongArgument; }; } export const result = outer(2)(3);"
+                .to_string(),
+            546,
+        ),
+        (
+            "large_module_names",
+            format!(
+                "/*{}*/ function compute(veryLongParameterName) {{ const veryLongLocalName = veryLongParameterName + 1; return veryLongLocalName; }} export const result = compute(41);",
+                "x".repeat(5000)
+            ),
+            613,
+        ),
+    ];
+
+    let legacy_total: usize = cases.iter().map(|(_, _, size)| size).sum();
+    let mut optimized_total = 0usize;
+    for (name, source, legacy_size) in cases {
+        let fs = MemoryFileSystem::from_files([("src/index.js", source)]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        bundler.enable_minify();
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert!(
+            output.bundle.len() <= legacy_size,
+            "{name} grew from {legacy_size} to {} bytes:\n{}",
+            output.bundle.len(),
+            output.bundle
+        );
+        optimized_total += output.bundle.len();
+    }
+    assert!(
+        optimized_total < legacy_total,
+        "owned corpus must shrink in aggregate: legacy={legacy_total}, optimized={optimized_total}"
+    );
+}
+
+#[test]
+fn minified_and_readable_bundles_have_identical_observable_semantics() {
+    if !node_available() {
+        return;
+    }
+
+    let source = r#"
+        const events=[];
+        function record(value){events.push(value);return value}
+
+        let unresolved;
+        try{missingGlobal}catch(error){unresolved=error.name}
+
+        let temporalDeadZone;
+        try{{record(typeof later);let later=1}}catch(error){temporalDeadZone=error.name}
+
+        let mixedBigInt;
+        try{mixedBigInt=1n+1}catch(error){mixedBigInt=error.name}
+
+        let invalidSuperclass;
+        try{class Invalid extends 1{}}catch(error){invalidSuperclass=error.name}
+
+        const accessed={get value(){events.push("getter");return 7}};
+        const proxied=new Proxy({value:9},{get(target,key){events.push("proxy:"+key);return target[key]}});
+        const process={env:{NODE_ENV:"shadowed"}};
+        const selected="ready"||record("wrong-or");
+        const stopped=0&&record("wrong-and");
+        const parsed=JSON.parse("{\"ok\":true}");
+        const result={
+          unresolved,
+          temporalDeadZone,
+          mixedBigInt,
+          invalidSuperclass,
+          getter:accessed.value,
+          proxy:proxied.value,
+          process:process.env.NODE_ENV,
+          selected,
+          stopped,
+          truthy:!!{},
+          parsed:parsed.ok,
+          events
+        };
+        console.log(JSON.stringify(result));
+    "#;
+
+    fn build(source: &str, minify: bool) -> String {
+        let fs = MemoryFileSystem::from_files([("src/index.js", source)]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        if minify {
+            bundler.enable_minify();
+        }
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        output.bundle
+    }
+
+    fn execute(bundle: &str) -> std::process::Output {
+        std::process::Command::new("node")
+            .arg("-e")
+            .arg(bundle)
+            .output()
+            .expect("node must execute a generated bundle")
+    }
+
+    let readable = execute(&build(source, false));
+    let minified = execute(&build(source, true));
+    assert!(
+        readable.status.success(),
+        "readable bundle failed: {}",
+        String::from_utf8_lossy(&readable.stderr)
+    );
+    assert!(
+        minified.status.success(),
+        "minified bundle failed: {}",
+        String::from_utf8_lossy(&minified.stderr)
+    );
+    assert_eq!(minified.stdout, readable.stdout);
+    assert_eq!(
+        String::from_utf8(readable.stdout).unwrap().trim(),
+        r#"{"unresolved":"ReferenceError","temporalDeadZone":"ReferenceError","mixedBigInt":"TypeError","invalidSuperclass":"TypeError","getter":7,"proxy":9,"process":"shadowed","selected":"ready","stopped":0,"truthy":true,"parsed":true,"events":["getter","proxy:value"]}"#
+    );
+}
+
+fn assert_generated_bundle_reparses(case: &str, mode: &str, bundle: &str) {
+    let interner = wake_common::Interner::new();
+    let parsed = wake_ecma_parser::parse(bundle, &interner, wake_ecma_ast::SourceType::Script);
+    assert!(
+        !parsed.has_errors(),
+        "[{case}/{mode}] generated bundle must reparse: {:?}\n--- bundle ---\n{bundle}",
+        parsed.diagnostics
+    );
+}
+
+fn build_runtime_differential_bundle(path: &str, source: &str, minify: bool) -> String {
+    let fs = MemoryFileSystem::from_files([(path, source)]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    if minify {
+        bundler.enable_minify();
+    }
+    let output = bundler.build(Path::new(path));
+    assert!(
+        !output.has_errors(),
+        "[{path}] build failed: {:?}",
+        output.diagnostics
+    );
+    output.bundle
+}
+
+fn execute_runtime_differential_bundle(bundle: &str) -> std::process::Output {
+    std::process::Command::new("node")
+        .arg("-e")
+        .arg(bundle)
+        .output()
+        .expect("node must execute a generated bundle")
+}
+
+#[test]
+fn minified_runtime_differential_matrix_preserves_control_and_function_semantics() {
+    if !node_available() {
+        eprintln!("node unavailable; skipping minifier runtime differential matrix");
+        return;
+    }
+
+    let cases = [
+        (
+            "try-finally-label-switch-loop",
+            "src/control.js",
+            r#"
+                const events = [];
+                function classify(limit) {
+                  let value = 0;
+                  outer: for (let index = 0; index < limit; index++) {
+                    try {
+                      switch (index) {
+                        case 0:
+                          value += 1;
+                          continue outer;
+                        case 1:
+                          value += 10;
+                          break;
+                        default:
+                          value += 100;
+                          break outer;
+                      }
+                    } finally {
+                      events.push("finally:" + index);
+                      value += 1000;
+                    }
+                  }
+                  return value;
+                }
+                let thrown;
+                try {
+                  try { throw new RangeError("owned"); }
+                  finally { events.push("throw-finally"); }
+                } catch (error) {
+                  thrown = error.name;
+                }
+                console.log(JSON.stringify({ value: classify(4), thrown, events }));
+            "#,
+            r#"{"value":3111,"thrown":"RangeError","events":["throw-finally","finally:0","finally:1","finally:2"]}"#,
+        ),
+        (
+            "default-parameters-and-destructuring",
+            "src/parameters.js",
+            r#"
+                const calls = [];
+                function defaults() {
+                  calls.push("defaults");
+                  return { left: 2, nested: { right: 3 } };
+                }
+                function compute(
+                  { left, nested: { right } = { right: 9 } } = defaults(),
+                  total = left + right,
+                  ...rest
+                ) {
+                  const [first, ...tail] = rest;
+                  return { left, right, total, first, tail, calls };
+                }
+                console.log(JSON.stringify(compute(undefined, undefined, 4, 5, 6)));
+            "#,
+            r#"{"left":2,"right":3,"total":5,"first":4,"tail":[5,6],"calls":["defaults"]}"#,
+        ),
+        (
+            "async-await-finally",
+            "src/async.js",
+            r#"
+                const events = [];
+                async function compute({ value } = { value: 1 }) {
+                  try {
+                    events.push("before");
+                    return await Promise.resolve(value + 2);
+                  } finally {
+                    events.push("after");
+                  }
+                }
+                compute({ value: 40 }).then(
+                  value => console.log(JSON.stringify({ value, events })),
+                  error => console.log(JSON.stringify({ error: error.name, events }))
+                );
+            "#,
+            r#"{"value":42,"events":["before","after"]}"#,
+        ),
+        (
+            "generator-yield-finally",
+            "src/generator.js",
+            r#"
+                const events = [];
+                function* values(seed = 3) {
+                  try {
+                    yield seed;
+                    yield* [seed + 1];
+                    return seed + 2;
+                  } finally {
+                    events.push("closed");
+                  }
+                }
+                const iterator = values();
+                const steps = [iterator.next(), iterator.next(), iterator.next()];
+                console.log(JSON.stringify({ steps, events }));
+            "#,
+            r#"{"steps":[{"value":3,"done":false},{"value":4,"done":false},{"value":5,"done":true}],"events":["closed"]}"#,
+        ),
+        (
+            "stage3-decorator",
+            "src/decorator.ts",
+            r#"
+                const events: string[] = [];
+                function mark(value: any, context: any) {
+                  events.push(context.kind + ":" + context.name);
+                  return value;
+                }
+                @mark class Example {
+                  @mark method({ value = 6 }: { value?: number } = {}) { return value + 1; }
+                }
+                const result = new Example().method();
+                console.log(JSON.stringify({ result, events }));
+                export { result };
+            "#,
+            r#"{"result":7,"events":["method:method","class:Example"]}"#,
+        ),
+    ];
+
+    for (name, path, source, expected_stdout) in cases {
+        let readable_bundle = build_runtime_differential_bundle(path, source, false);
+        let minified_bundle = build_runtime_differential_bundle(path, source, true);
+        assert_generated_bundle_reparses(name, "readable", &readable_bundle);
+        assert_generated_bundle_reparses(name, "minified", &minified_bundle);
+
+        let readable = execute_runtime_differential_bundle(&readable_bundle);
+        let minified = execute_runtime_differential_bundle(&minified_bundle);
+        assert_eq!(
+            minified.status.code(),
+            readable.status.code(),
+            "[{name}] exit status changed under minification\nreadable stderr: {}\nminified stderr: {}",
+            String::from_utf8_lossy(&readable.stderr),
+            String::from_utf8_lossy(&minified.stderr)
+        );
+        assert!(
+            readable.status.success(),
+            "[{name}] readable bundle failed: {}\n--- bundle ---\n{}",
+            String::from_utf8_lossy(&readable.stderr),
+            readable_bundle
+        );
+        assert!(
+            minified.status.success(),
+            "[{name}] minified bundle failed: {}\n--- bundle ---\n{}",
+            String::from_utf8_lossy(&minified.stderr),
+            minified_bundle
+        );
+        assert_eq!(
+            minified.stdout, readable.stdout,
+            "[{name}] stdout changed under minification"
+        );
+        assert_eq!(
+            String::from_utf8(readable.stdout).unwrap().trim(),
+            expected_stdout,
+            "[{name}] unexpected observable result"
+        );
+    }
 }
 
 #[test]
@@ -190,6 +691,35 @@ fn set_define_dev_replaces_node_env() {
         !out.bundle.contains("process.env.NODE_ENV"),
         "{}",
         out.bundle
+    );
+}
+
+#[test]
+fn invalid_define_expression_is_a_build_error_and_is_never_emitted() {
+    let fs = MemoryFileSystem::from_files([("src/index.js", "export const value = DEBUG;")]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.set_define(vec![(
+        "DEBUG".to_string(),
+        "false);globalThis.injected=true".to_string(),
+    )]);
+
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(
+        output.has_errors(),
+        "invalid trusted input must fail the build"
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("invalid define configuration")),
+        "{:?}",
+        output.diagnostics
+    );
+    assert!(
+        !output.bundle.contains("globalThis.injected"),
+        "unvalidated configuration reached output: {}",
+        output.bundle
     );
 }
 
@@ -256,7 +786,7 @@ fn default_bundle_lowers_import_meta_for_classic_script_chunks() {
     assert!(
         out.bundle
             .contains("const url = __wake_require__.metaUrl();"),
-        "{}",
+        "validated non-primitive defines are emitted as a structured expression: {}",
         out.bundle
     );
 }
@@ -580,6 +1110,36 @@ fn commonjs_bundle_rejects_require_of_top_level_await_module() {
 }
 
 #[test]
+fn commonjs_tla_diagnostic_uses_optimizer_retained_require_edges() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "module.exports=FLAG?require('./sync.js'):require('./async.js');",
+        ),
+        ("src/sync.js", "module.exports=42;"),
+        (
+            "src/async.js",
+            "const value=await Promise.resolve(1);export default value;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs)
+        .set_define(vec![("FLAG".into(), "true".into())])
+        .enable_minify()
+        .enable_dead_module_elimination();
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(
+        output.module_count, 2,
+        "dead async require target must be pruned"
+    );
+}
+
+#[test]
 fn second_build_is_fully_cached() {
     let mut bundler = IncrementalBundler::new(Arc::new(fixture()));
 
@@ -589,11 +1149,11 @@ fn second_build_is_fully_cached() {
     assert_eq!(out1.cached_module_count, 0);
     let after_first = bundler.task_exec_count();
     assert_eq!(
-        after_first, 6,
-        "首遍应执行 3 parse + 3 codegen 任务（3 模块）"
+        after_first, 9,
+        "首遍应执行 3 parse + 3 optimize + 3 body 任务（3 模块）"
     );
 
-    // 同实例、同内容再打一遍：parse 与 codegen 任务全部浅绿命中，零重执行（Gate-3 缓存命中）。
+    // 同实例、同内容再打一遍：parse/optimize/body 全部浅绿命中，零重执行。
     let out2 = bundler.build(Path::new("src/index.js"));
     assert!(!out2.has_errors());
     assert_eq!(out2.updated_module_count, 0);
@@ -613,17 +1173,17 @@ fn edit_reparses_only_changed_module() {
     let mut bundler = IncrementalBundler::new(fs.clone());
 
     let _ = bundler.build(Path::new("src/index.js"));
-    let after_first = bundler.task_exec_count(); // 6
+    let after_first = bundler.task_exec_count(); // 9
 
-    // 只改 math.js（语义不变，AST 变）→ 只有 math 重解析 + 重 codegen，index/msg 全命中缓存。
-    // index 的 deps 未变 → 其 linker cell no-op → index codegen 也命中（codegen 与 id 解耦）。
+    // 只改 math.js（语义不变，AST 变）→ 只有 math 重解析 + 重优化 + 重发射 body，index/msg 全命中。
+    // index 的 deps 未变 → 其 linker cell no-op → index 的 optimize/body 也命中。
     fs.insert("src/math.js", "export function add(a, b) { return b + a; }");
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors());
     assert_eq!(
         bundler.task_exec_count() - after_first,
-        2,
-        "只改一个模块应只重解析 + 重 codegen 该模块（精确失效）"
+        3,
+        "只改一个模块应只重解析 + 重优化 + 重发射该模块（精确失效）"
     );
 }
 
@@ -678,8 +1238,8 @@ fn wide_graph_builds_in_parallel() {
     let out = bundler.build(Path::new("index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert_eq!(out.module_count, 25, "index + 24 叶子");
-    // 25 模块 × (parse + codegen) = 50 任务。
-    assert_eq!(bundler.task_exec_count(), 50);
+    // 25 模块 × (parse + optimize + body) = 75 任务。
+    assert_eq!(bundler.task_exec_count(), 75);
     // 第二遍全缓存命中。
     let before = bundler.task_exec_count();
     let _ = bundler.build(Path::new("index.js"));
@@ -717,12 +1277,12 @@ fn thousand_modules_build_and_cache() {
         &out.diagnostics[..out.diagnostics.len().min(3)]
     );
     assert_eq!(out.module_count, N, "应扫描全部 1000 模块");
-    // 共享 util 被约 1000 个模块引用，single-flight 保证只 parse/codegen 一次：
-    // 首遍任务数 = 1000 parse + 1000 codegen = 2000。
+    // 共享 util 被约 1000 个模块引用，single-flight 保证每阶段只执行一次：
+    // 首遍任务数 = 1000 parse + 1000 optimize + 1000 body = 3000。
     assert_eq!(
         bundler.task_exec_count(),
-        2 * N as u64,
-        "single-flight 去重：每模块恰一次 parse+codegen"
+        3 * N as u64,
+        "single-flight 去重：每模块恰一次 parse+optimize+body"
     );
 
     // 第二遍全缓存命中。
@@ -871,7 +1431,7 @@ fn mangled_functions_run_correctly_in_node() {
     ]);
     // compute(4) = helper(4) + helper(5) = 8 + 10 = 18
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
@@ -928,7 +1488,10 @@ fn typescript_project_erases_types() {
     assert!(!out.bundle.contains("interface"), "残留 interface");
     assert!(!out.bundle.contains(": number"), "残留类型注解");
     assert!(!out.bundle.contains("<T extends"), "残留泛型");
-    assert!(out.bundle.contains("exports[\"result\"] = result;"));
+    assert!(
+        out.bundle
+            .contains("Object.defineProperty(exports, \"result\"")
+    );
 }
 
 #[test]
@@ -2651,7 +3214,7 @@ fn minify_keeps_live_scoped_transform_temps_with_dummy_spans() {
     bundler.set_target_env(wake_ecma_transform::TargetEnv::new(vec![
         wake_ecma_transform::BrowserTarget::new("chrome", "40"),
     ]));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(!out.bundle.contains("?."), "{}", out.bundle);
@@ -3516,7 +4079,11 @@ fn jsx_project_bundles() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     // index.tsx + r.ts + react/jsx-runtime = 3 模块（JSX runtime 被自动扇出）。
     assert_eq!(out.module_count, 3, "JSX runtime 应作为依赖进入模块图");
-    assert!(out.bundle.contains("_jsx"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("[\"jsx\"]") && out.bundle.contains("[\"jsxs\"]"),
+        "JSX runtime named imports must be emitted as live namespace reads: {}",
+        out.bundle
+    );
 }
 
 #[test]
@@ -4022,6 +4589,55 @@ fn tree_shaking_keeps_side_effect_module() {
 }
 
 #[test]
+fn tree_shaking_removes_unused_class_export_but_preserves_class_evaluation() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import './effect.js';export const hits=globalThis.__classHits;",
+        ),
+        (
+            "src/effect.js",
+            "globalThis.__classHits=0;export class Unused extends (globalThis.__classHits++,Object){static{globalThis.__classHits++}}",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_tree_shaking();
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(
+        output.bundle.contains("class Unused"),
+        "effectful class definition was removed: {}",
+        output.bundle
+    );
+    assert!(
+        !output.bundle.contains("exports[\"Unused\"]"),
+        "unused public binding survived: {}",
+        output.bundle
+    );
+
+    if node_available() {
+        let directory = std::env::temp_dir().join(format!(
+            "wake_tree_shaken_class_effect_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let bundle_path = directory.join("bundle.cjs");
+        std::fs::write(&bundle_path, &output.bundle).unwrap();
+        let script = format!(
+            "process.stdout.write(String(require({:?}).hits))",
+            bundle_path.to_string_lossy()
+        );
+        let observed = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(observed.status.success(), "{:?}", observed);
+        assert_eq!(observed.stdout, b"2", "class evaluation order changed");
+    }
+}
+
+#[test]
 fn tree_shaking_second_build_still_cached() {
     // Tree Shaking 开启下，第二遍构建仍应全缓存命中（keep 集稳定 → linker cell no-op）。
     let mut bundler = IncrementalBundler::new(Arc::new(shake_fixture()));
@@ -4177,13 +4793,18 @@ fn code_splitting_emits_async_chunk() {
     );
     assert!(out.bundle.contains("__wake__.f = "), "{}", out.bundle);
     assert!(
-        !out.bundle.contains("exports[\"value\"] = value;"),
+        !out.bundle
+            .contains("Object.defineProperty(exports, \"value\""),
         "lazy 不应在 entry chunk:\n{}",
         out.bundle
     );
     let async_chunk = out.chunks.iter().find(|c| !c.is_entry).unwrap();
     assert!(async_chunk.code.contains("__wake__.register("));
-    assert!(async_chunk.code.contains("exports[\"value\"] = value;"));
+    assert!(
+        async_chunk
+            .code
+            .contains("Object.defineProperty(exports, \"value\"")
+    );
     assert!(
         !async_chunk.code.contains(".js"),
         "async chunk 体不应含文件名:\n{}",
@@ -4202,7 +4823,7 @@ fn code_splitting_second_build_cached() {
     b.enable_code_splitting();
     let _ = b.build(Path::new("src/index.js"));
     let after_first = b.task_exec_count();
-    assert_eq!(after_first, 4, "2 parse + 2 codegen");
+    assert_eq!(after_first, 6, "2 parse + 2 optimize + 2 body");
     let _ = b.build(Path::new("src/index.js"));
     assert_eq!(
         b.task_exec_count(),
@@ -4307,7 +4928,6 @@ fn minified_code_splitting_uses_esm_marker_for_complete_cjs_interop() {
     // 重新 codegen，不能把静态依赖的无 marker body 从跨进程缓存中复用。
     let mut seed = IncrementalBundler::new(fs.clone());
     seed.enable_minify()
-        .enable_mangle()
         .enable_tree_shaking()
         .enable_persistent_cache(cache_path.clone());
     let seed_out = seed.build(Path::new("src/index.js"));
@@ -4316,7 +4936,6 @@ fn minified_code_splitting_uses_esm_marker_for_complete_cjs_interop() {
     let mut bundler = IncrementalBundler::new(fs);
     bundler
         .enable_minify()
-        .enable_mangle()
         .enable_tree_shaking()
         .enable_code_splitting()
         .enable_persistent_cache(cache_path.clone());
@@ -4543,6 +5162,167 @@ fn no_dynamic_import_single_chunk() {
 }
 
 #[test]
+fn minified_dead_dynamic_import_does_not_leave_an_empty_async_chunk() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "if (false) import('./lazy.js'); export const answer = 42;",
+        ),
+        (
+            "src/lazy.js",
+            "globalThis.__dead_lazy_ran = true; export const value = 1;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_minify()
+        .enable_dead_module_elimination()
+        .enable_code_splitting();
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(
+        output.module_count, 1,
+        "the lazy module must be unreachable"
+    );
+    assert_eq!(
+        output.chunks.len(),
+        1,
+        "a removed dynamic-import edge must not leave an empty async chunk: {:?}",
+        output
+            .chunks
+            .iter()
+            .map(|chunk| (&chunk.name, &chunk.module_ids))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(output.entry().module_ids.len(), 1);
+    assert!(
+        output
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.module_ids.iter())
+            .all(|module_id| *module_id == output.entry().module_ids[0]),
+        "chunk metadata must not retain the removed lazy module id"
+    );
+}
+
+#[test]
+fn define_selected_dynamic_import_prunes_the_unselected_split_chunk() {
+    for flag in [true, false] {
+        for minify in [false, true] {
+            let fs = MemoryFileSystem::from_files([
+                (
+                    "src/index.js",
+                    "export const load=()=>FLAG?import('./live.js'):import('./dead.js');",
+                ),
+                ("src/live.js", "export const value='live';"),
+                ("src/dead.js", "export const value='dead';"),
+            ]);
+            let mut bundler = IncrementalBundler::new(Arc::new(fs));
+            bundler
+                .set_define(vec![("FLAG".into(), flag.to_string())])
+                .enable_dead_module_elimination()
+                .enable_code_splitting();
+            if minify {
+                bundler.enable_minify();
+            }
+            let output = bundler.build(Path::new("src/index.js"));
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            assert_eq!(output.module_count, 2);
+            assert_eq!(
+                output.chunks.len(),
+                2,
+                "one entry and one selected async chunk"
+            );
+            let selected = if flag { "live" } else { "dead" };
+            let unselected = if flag { "dead" } else { "live" };
+            assert!(
+                output
+                    .chunks
+                    .iter()
+                    .any(|chunk| chunk.name.contains(selected)),
+                "selected chunk missing: {:?}",
+                output
+                    .chunks
+                    .iter()
+                    .map(|chunk| &chunk.name)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                output
+                    .chunks
+                    .iter()
+                    .all(|chunk| !chunk.name.contains(unselected)),
+                "unselected chunk survived: {:?}",
+                output
+                    .chunks
+                    .iter()
+                    .map(|chunk| &chunk.name)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_graph_replans_shared_module_into_the_only_live_async_chunk() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "export const load=()=>FLAG?import('./a.js'):import('./b.js');",
+        ),
+        (
+            "src/a.js",
+            "import {shared} from './shared.js';export default()=>shared;",
+        ),
+        (
+            "src/b.js",
+            "import {shared} from './shared.js';export default()=>shared;",
+        ),
+        ("src/shared.js", "export const shared=42;"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_define(vec![("FLAG".into(), "true".into())])
+        .enable_minify()
+        .enable_dead_module_elimination()
+        .enable_code_splitting();
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.module_count, 3, "entry + selected target + shared");
+    assert_eq!(
+        output.chunks.len(),
+        2,
+        "the shared module has one owner after retained-edge convergence and must be rebucketed: {:?}",
+        output
+            .chunks
+            .iter()
+            .map(|chunk| (&chunk.kind, &chunk.name, &chunk.module_ids))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        output
+            .chunks
+            .iter()
+            .all(|chunk| chunk.kind != crate::ChunkKind::Shared),
+        "a stale pre-optimization shared bucket escaped"
+    );
+    let async_chunk = output
+        .chunks
+        .iter()
+        .find(|chunk| chunk.kind == crate::ChunkKind::Async)
+        .expect("selected async chunk");
+    assert_eq!(
+        async_chunk.module_ids.len(),
+        2,
+        "selected target and its now-single-owner dependency belong in one async chunk"
+    );
+}
+
+#[test]
 fn single_chunk_content_hash_is_opt_in_and_derived_from_entry_code() {
     let mut plain = IncrementalBundler::new(Arc::new(fixture()));
     let plain_output = plain.build(Path::new("src/index.js"));
@@ -4615,13 +5395,17 @@ fn persistent_cache_skips_parse_and_codegen_on_fresh_process() {
     let ref_out = IncrementalBundler::new(Arc::new(fixture())).build(Path::new("src/index.js"));
     assert!(!ref_out.has_errors());
 
-    // 首遍（冷缓存）：正常 parse+codegen，落盘缓存；产物须与无缓存逐字节一致。
+    // 首遍（冷缓存）：正常 parse/optimize/body，落盘缓存；产物须与无缓存逐字节一致。
     let mut b1 = IncrementalBundler::new(Arc::new(fixture()));
     b1.enable_persistent_cache(cache_path.clone());
     let out1 = b1.build(Path::new("src/index.js"));
     assert!(!out1.has_errors());
     assert_eq!(out1.bundle, ref_out.bundle, "开缓存首遍须与无缓存产物一致");
-    assert_eq!(b1.task_exec_count(), 6, "首遍冷缓存：3 parse + 3 codegen");
+    assert_eq!(
+        b1.task_exec_count(),
+        9,
+        "首遍冷缓存：3 parse + 3 optimize + 3 body"
+    );
 
     // 第二遍：**全新 bundler（新引擎，内存 memo 为空）**，从磁盘载入热缓存。
     let mut b2 = IncrementalBundler::new(Arc::new(fixture()));
@@ -4636,6 +5420,312 @@ fn persistent_cache_skips_parse_and_codegen_on_fresh_process() {
     );
 
     let _ = std::fs::remove_file(&cache_path);
+}
+
+#[test]
+fn persistent_cache_restores_discarded_static_request_ranges_for_final_layout() {
+    let unique = format!(
+        "wake_pcache_request_ranges_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos(),
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+    let files = || {
+        MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "import './a.js';import './b.js';export default globalThis.__reg.a+globalThis.__reg.b;",
+            ),
+            (
+                "src/a.js",
+                "globalThis.__reg||(globalThis.__reg={});globalThis.__reg.a=1;",
+            ),
+            (
+                "src/b.js",
+                "globalThis.__reg||(globalThis.__reg={});globalThis.__reg.b=2;",
+            ),
+        ])
+    };
+
+    let mut cold = IncrementalBundler::new(Arc::new(files()));
+    cold.enable_minify()
+        .enable_persistent_cache(cache_path.clone());
+    let cold_output = cold.build(Path::new("src/index.js"));
+    assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
+    assert!(cold_output.bundle.contains("0,0"), "{}", cold_output.bundle);
+
+    let mut warm = IncrementalBundler::new(Arc::new(files()));
+    warm.enable_minify()
+        .enable_persistent_cache(cache_path.clone());
+    let warm_output = warm.build(Path::new("src/index.js"));
+    assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+    assert_eq!(warm.task_exec_count(), 0, "all module artifacts should hit");
+    assert_eq!(warm_output.bundle, cold_output.bundle);
+
+    let _ = std::fs::remove_file(cache_path);
+}
+
+#[test]
+fn persistent_cache_keeps_define_selected_dependency_edges_in_sync() {
+    let unique = format!(
+        "wake_pcache_define_edges_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos(),
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+    let _ = std::fs::remove_file(&cache_path);
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "module.exports={result:(FLAG?require('./live.js'):require('./dead.js')).value};",
+        ),
+        ("src/live.js", "exports.value='live';"),
+        ("src/dead.js", "exports.value='dead';"),
+    ]));
+
+    let build = |flag: bool| {
+        let mut bundler = IncrementalBundler::new(fs.clone());
+        bundler
+            .enable_minify()
+            .enable_dead_module_elimination()
+            .set_define(vec![("FLAG".into(), flag.to_string())])
+            .enable_persistent_cache(cache_path.clone());
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 2);
+        (bundler, output)
+    };
+
+    let (_, selected_live) = build(true);
+    let (selected_dead_bundler, selected_dead) = build(false);
+    assert!(
+        selected_dead_bundler.task_exec_count() > 0,
+        "a changed define must not reuse retained edges from the prior optimizer fingerprint"
+    );
+    let (warm_bundler, warm_dead) = build(false);
+    assert_eq!(
+        warm_bundler.task_exec_count(),
+        0,
+        "the selected edge and module body must both survive a fresh-process cache hit"
+    );
+    assert_eq!(warm_dead.bundle, selected_dead.bundle);
+
+    if node_available() {
+        for (bundle, expected) in [
+            (&selected_live.bundle, "live"),
+            (&selected_dead.bundle, "dead"),
+            (&warm_dead.bundle, "dead"),
+        ] {
+            let observed = std::process::Command::new("node")
+                .arg("-e")
+                .arg(format!(
+                    "{bundle}\nif(module.exports.result!={expected:?})process.exit(2);"
+                ))
+                .output()
+                .expect("node must execute cached bundle");
+            assert!(
+                observed.status.success(),
+                "cached selected edge failed: {}",
+                String::from_utf8_lossy(&observed.stderr)
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(cache_path);
+}
+
+#[test]
+fn persistent_body_cache_isolated_by_optimizer_drop_flags() {
+    let unique = format!(
+        "wake_pcache_optimizer_flags_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos(),
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "console.log('visible'); debugger; export const value = 1;",
+    )]));
+
+    let mut seed = IncrementalBundler::new(fs.clone());
+    seed.enable_minify()
+        .enable_persistent_cache(cache_path.clone());
+    let baseline = seed.build(Path::new("src/index.js"));
+    assert!(!baseline.has_errors(), "{:?}", baseline.diagnostics);
+    assert!(baseline.bundle.contains("console"), "{}", baseline.bundle);
+    assert!(baseline.bundle.contains("debugger"), "{}", baseline.bundle);
+
+    let mut drop_console = IncrementalBundler::new(fs.clone());
+    drop_console
+        .enable_minify()
+        .enable_drop_console()
+        .enable_persistent_cache(cache_path.clone());
+    let console_output = drop_console.build(Path::new("src/index.js"));
+    assert!(
+        !console_output.has_errors(),
+        "{:?}",
+        console_output.diagnostics
+    );
+    assert!(
+        drop_console.task_exec_count() > 0,
+        "drop_console must not reuse the no-drop module body"
+    );
+    assert!(!console_output.bundle.contains("console.log"));
+    assert!(console_output.bundle.contains("debugger"));
+
+    let mut drop_debugger = IncrementalBundler::new(fs.clone());
+    drop_debugger
+        .enable_minify()
+        .enable_drop_debugger()
+        .enable_persistent_cache(cache_path.clone());
+    let debugger_output = drop_debugger.build(Path::new("src/index.js"));
+    assert!(
+        !debugger_output.has_errors(),
+        "{:?}",
+        debugger_output.diagnostics
+    );
+    assert!(
+        drop_debugger.task_exec_count() > 0,
+        "drop_debugger must not reuse a body built with another optimizer configuration"
+    );
+    assert!(debugger_output.bundle.contains("console.log"));
+    assert!(!debugger_output.bundle.contains("debugger"));
+
+    let mut fresh = IncrementalBundler::new(fs);
+    fresh.enable_minify().enable_drop_debugger();
+    let fresh_output = fresh.build(Path::new("src/index.js"));
+    assert_eq!(debugger_output.bundle, fresh_output.bundle);
+
+    let _ = std::fs::remove_file(cache_path);
+}
+
+#[test]
+fn persistent_source_map_cache_is_independent_from_module_body_cache() {
+    let unique = format!(
+        "wake_pcache_sourcemap_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos(),
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export function answer(longLocalName) { return longLocalName + 2; }",
+    )]));
+
+    let mut cold = IncrementalBundler::new(fs.clone());
+    cold.enable_minify()
+        .enable_sourcemap()
+        .enable_persistent_cache(cache_path.clone());
+    let cold_output = cold.build(Path::new("src/index.js"));
+    assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
+    let cold_map = cold_output
+        .entry()
+        .source_map
+        .as_ref()
+        .expect("cold mapped build must emit a source map")
+        .clone();
+    let cold_map_json: serde_json::Value = serde_json::from_str(&cold_map).unwrap();
+    assert!(
+        cold_map_json["names"]
+            .as_array()
+            .expect("names array")
+            .iter()
+            .any(|name| name.as_str() == Some("longLocalName")),
+        "persistent map must contain original identifier names: {cold_map}"
+    );
+
+    let mut warm = IncrementalBundler::new(fs.clone());
+    warm.enable_minify()
+        .enable_sourcemap()
+        .enable_persistent_cache(cache_path.clone());
+    let warm_output = warm.build(Path::new("src/index.js"));
+    assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+    assert_eq!(
+        warm.task_exec_count(),
+        0,
+        "body and source-map cache hits must skip parse and codegen"
+    );
+    assert_eq!(warm_output.bundle, cold_output.bundle);
+    assert_eq!(
+        warm_output.entry().source_map.as_deref(),
+        Some(cold_map.as_str())
+    );
+
+    let mut body_only = IncrementalBundler::new(fs);
+    body_only
+        .enable_minify()
+        .enable_persistent_cache(cache_path.clone());
+    let body_only_output = body_only.build(Path::new("src/index.js"));
+    assert!(
+        !body_only_output.has_errors(),
+        "{:?}",
+        body_only_output.diagnostics
+    );
+    assert_eq!(
+        body_only.task_exec_count(),
+        0,
+        "an unmapped build must reuse the JavaScript body without requiring a map lookup"
+    );
+    assert_eq!(body_only_output.bundle, cold_output.bundle);
+    assert!(body_only_output.entry().source_map.is_none());
+
+    let _ = std::fs::remove_file(cache_path);
+}
+
+#[test]
+fn persistent_unmapped_build_primes_body_and_mapping_facts_for_a_mapped_build() {
+    let unique = format!(
+        "wake_pcache_unmapped_then_mapped_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos(),
+    );
+    let cache_path = std::env::temp_dir().join(unique);
+    let _ = std::fs::remove_file(&cache_path);
+    let fs = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export function answer(longLocalName){return longLocalName+2}",
+    )]));
+
+    let mut unmapped = IncrementalBundler::new(fs.clone());
+    unmapped
+        .enable_minify()
+        .enable_persistent_cache(cache_path.clone());
+    let plain = unmapped.build(Path::new("src/index.js"));
+    assert!(!plain.has_errors(), "{:?}", plain.diagnostics);
+    assert!(plain.entry().source_map.is_none());
+
+    let mut mapped = IncrementalBundler::new(fs);
+    mapped
+        .enable_minify()
+        .enable_sourcemap()
+        .enable_persistent_cache(cache_path.clone());
+    let with_map = mapped.build(Path::new("src/index.js"));
+
+    assert!(!with_map.has_errors(), "{:?}", with_map.diagnostics);
+    assert_eq!(
+        mapped.task_exec_count(),
+        0,
+        "map enablement must reuse persisted optimization, body, and mapping facts"
+    );
+    assert_eq!(plain.entry().code, with_map.entry().code);
+    assert!(with_map.entry().source_map.is_some());
+
+    let _ = std::fs::remove_file(cache_path);
 }
 
 #[test]
@@ -4994,7 +6084,7 @@ fn pnp_jsxdev_fixture() -> MemoryFileSystem {
 #[test]
 fn pnp_production_dependency_jsx_dev_runtime_is_compatible() {
     let mut bundler = IncrementalBundler::new(Arc::new(pnp_jsxdev_fixture()));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(bundler.is_pnp(), "应检测到 .pnp.cjs 并启用 PnP");
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
@@ -5146,10 +6236,10 @@ fn pnp_bundle_runs_in_node() {
 // M4d — bundle 级 SourceMap
 // ======================================================================
 
-/// 解码 Base64 VLQ 段序列 → `(gen_line, gen_col, src_index, src_line, src_col)` 列表。
+/// 解码 Base64 VLQ 段序列 → `(gen_line, gen_col, src_index, src_line, src_col, name_index)` 列表。
 /// 测试自带解码器：不引第三方依赖也能独立验证编码正确性（避免"自己编自己解"的同义反复，
 /// 解码逻辑按 Source Map V3 规范独立实现）。
-fn decode_mappings(s: &str) -> Vec<(u32, u32, u32, u32, u32)> {
+fn decode_mappings(s: &str) -> Vec<(u32, u32, u32, u32, u32, Option<u32>)> {
     fn b64(c: u8) -> i64 {
         match c {
             b'A'..=b'Z' => (c - b'A') as i64,
@@ -5161,7 +6251,7 @@ fn decode_mappings(s: &str) -> Vec<(u32, u32, u32, u32, u32)> {
         }
     }
     let mut out = Vec::new();
-    let (mut gl, mut si, mut sl, mut sc) = (0i64, 0i64, 0i64, 0i64);
+    let (mut gl, mut si, mut sl, mut sc, mut ni) = (0i64, 0i64, 0i64, 0i64, 0i64);
     for line in s.split(';') {
         // 产物列每行归零（规范：仅此字段跨行重置，其余三者全局连续差分）
         let mut gc = 0i64;
@@ -5192,16 +6282,80 @@ fn decode_mappings(s: &str) -> Vec<(u32, u32, u32, u32, u32)> {
                 let v = result >> 1;
                 vals.push(if neg { -v } else { v });
             }
-            assert_eq!(vals.len(), 4, "本实现只发 4 字段段: {seg}");
+            assert!(
+                matches!(vals.len(), 1 | 4 | 5),
+                "source-map segment must contain one, four, or five fields: {seg}"
+            );
             gc += vals[0];
+            if vals.len() == 1 {
+                // A V3 one-field segment ends the preceding source association. It advances only
+                // generated-column state and deliberately contributes no source tuple here.
+                continue;
+            }
             si += vals[1];
             sl += vals[2];
             sc += vals[3];
-            out.push((gl as u32, gc as u32, si as u32, sl as u32, sc as u32));
+            let name_index = if vals.len() == 5 {
+                ni += vals[4];
+                Some(ni as u32)
+            } else {
+                None
+            };
+            out.push((
+                gl as u32, gc as u32, si as u32, sl as u32, sc as u32, name_index,
+            ));
         }
         gl += 1;
     }
     out
+}
+
+/// Decode only generated coordinates and segment arity. This deliberately keeps one-field
+/// segments, unlike `decode_mappings`, so wrapper ownership boundaries can be asserted directly.
+fn generated_segment_shapes(s: &str) -> Vec<(u32, u32, usize)> {
+    fn b64(c: u8) -> i64 {
+        match c {
+            b'A'..=b'Z' => (c - b'A') as i64,
+            b'a'..=b'z' => (c - b'a') as i64 + 26,
+            b'0'..=b'9' => (c - b'0') as i64 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("invalid base64 character: {}", c as char),
+        }
+    }
+
+    let mut shapes = Vec::new();
+    for (line, encoded_line) in s.split(';').enumerate() {
+        let mut generated_col = 0i64;
+        for segment in encoded_line
+            .split(',')
+            .filter(|segment| !segment.is_empty())
+        {
+            let bytes = segment.as_bytes();
+            let mut values = Vec::new();
+            let mut index = 0;
+            while index < bytes.len() {
+                let mut value = 0i64;
+                let mut shift = 0;
+                loop {
+                    let digit = b64(bytes[index]);
+                    index += 1;
+                    value |= (digit & 0x1f) << shift;
+                    shift += 5;
+                    if digit & 0x20 == 0 {
+                        break;
+                    }
+                }
+                let negative = value & 1 == 1;
+                let magnitude = value >> 1;
+                values.push(if negative { -magnitude } else { magnitude });
+            }
+            assert!(matches!(values.len(), 1 | 4 | 5), "{segment}");
+            generated_col += values[0];
+            shapes.push((line as u32, generated_col as u32, values.len()));
+        }
+    }
+    shapes
 }
 
 /// 从 map JSON 里取一个字符串数组字段（简易提取，仅用于测试断言）。
@@ -5270,6 +6424,13 @@ fn sourcemap_bundle_maps_back_to_original_sources() {
         .collect();
 
     let bundle_lines: Vec<&str> = chunk.code.lines().collect();
+    let parsed_map: serde_json::Value = serde_json::from_str(map).expect("valid source map");
+    let original_names: Vec<&str> = parsed_map["names"]
+        .as_array()
+        .expect("names array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
     let ident_of = |s: &str| -> String {
         s.chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
@@ -5277,7 +6438,7 @@ fn sourcemap_bundle_maps_back_to_original_sources() {
     };
 
     let mut checked = 0;
-    for (gl, gc, si, sl, sc) in &decoded {
+    for (gl, gc, si, sl, sc, name_index) in &decoded {
         let name = src_names
             .get(*si as usize)
             .unwrap_or_else(|| panic!("源下标 {si} 越界: {src_names:?}"));
@@ -5324,29 +6485,148 @@ fn sourcemap_bundle_maps_back_to_original_sources() {
         ];
         let is_kw = |t: &str| KEYWORDS.contains(&t);
         if !gtok.is_empty() && !stok.is_empty() && !is_kw(&gtok) && !is_kw(&stok) {
-            assert_eq!(
-                gtok, stok,
-                "bundle 映射错位：产物 ({gl},{gc}) 是 `{gtok}`，\
-                 但映射指向 {name} ({sl},{sc}) 处的 `{stok}`"
-            );
+            if gtok != stok {
+                let named =
+                    name_index.and_then(|index| original_names.get(index as usize).copied());
+                assert_eq!(
+                    named,
+                    Some(stok.as_str()),
+                    "bundle 映射错位：产物 ({gl},{gc}) 是 `{gtok}`，\
+                     但映射指向 {name} ({sl},{sc}) 处的 `{stok}` 且没有对应 names 字段"
+                );
+            }
             checked += 1;
         }
     }
     assert!(checked >= 5, "有效比对过少（{checked}），映射可能未生效");
 }
 
-/// minify 路径不得产出（错位的）map——宁缺毋错。
+/// minify 与 sourcemap 是正交能力：压缩模块经过 runtime 缩名、链接胶水删除和 scope concat 后，
+/// 仍须产出保守但有效的映射；被重命名的标识符映射回原始长名，而被删除的死代码不得制造映射。
 #[test]
-fn sourcemap_absent_under_minify() {
-    let mut bundler = IncrementalBundler::new(Arc::new(fixture()));
-    bundler.enable_sourcemap();
-    bundler.enable_minify();
+fn sourcemap_under_minify_maps_renamed_identifiers_and_omits_removed_code() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import { compute } from './compute.js'; export const result = compute(4);",
+        ),
+        (
+            "src/compute.js",
+            "export function compute(descriptiveParameter) { if (false) { console.log('removed-marker'); } const foldedValue = 1 + 2; return descriptiveParameter + foldedValue; }",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_sourcemap().enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let map = out
+        .entry()
+        .source_map
+        .as_ref()
+        .expect("minify + sourcemap must produce a map");
+    assert!(map.contains("src/index.js"), "{map}");
+    assert!(map.contains("src/compute.js"), "{map}");
     assert!(
-        out.entry().source_map.is_none(),
-        "minify 路径会改写模块体文本，不应产出错位的 map"
+        !out.bundle.contains("descriptiveParameter"),
+        "{}",
+        out.bundle
     );
+    assert!(!out.bundle.contains("removed-marker"), "{}", out.bundle);
+
+    let mappings_value = json_field(map, "mappings");
+    let mappings = mappings_value
+        .trim_start_matches('"')
+        .split('"')
+        .next()
+        .expect("mappings value");
+    let decoded = decode_mappings(mappings);
+    assert!(!decoded.is_empty(), "{map}");
+    assert!(
+        map.contains("descriptiveParameter"),
+        "sourcesContent must retain the renamed identifier's source: {map}"
+    );
+    assert!(
+        map.contains("removed-marker"),
+        "sourcesContent retains original source even when generated code is removed: {map}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(map).unwrap();
+    let sources = parsed["sources"].as_array().unwrap();
+    let names = parsed["names"].as_array().expect("source-map names array");
+    let compute_source = sources
+        .iter()
+        .position(|source| {
+            source
+                .as_str()
+                .is_some_and(|name| name.ends_with("src/compute.js"))
+        })
+        .expect("compute source") as u32;
+    let source = "export function compute(descriptiveParameter) { if (false) { console.log('removed-marker'); } const foldedValue = 1 + 2; return descriptiveParameter + foldedValue; }";
+    let original_col = source.find("descriptiveParameter").unwrap() as u32;
+    let (generated_line, generated_col, _, _, _, name_index) = decoded
+        .iter()
+        .copied()
+        .find(|(_, _, source_index, source_line, source_col, _)| {
+            *source_index == compute_source && *source_line == 0 && *source_col == original_col
+        })
+        .expect("renamed parameter binding must retain its original position");
+    let name_index = name_index.expect("renamed parameter mapping must contain a fifth field");
+    assert_eq!(
+        names[name_index as usize].as_str(),
+        Some("descriptiveParameter")
+    );
+    let generated = out
+        .bundle
+        .lines()
+        .nth(generated_line as usize)
+        .expect("generated mapping line");
+    let generated_ident: String = generated[generated_col as usize..]
+        .chars()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
+        .collect();
+    assert!(!generated_ident.is_empty(), "mapping must land on a token");
+    assert_ne!(generated_ident, "descriptiveParameter");
+}
+
+#[test]
+fn sourcemap_names_include_proof_backed_property_and_private_renames() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const shape={descriptiveProperty:1};class Example{#descriptiveSecret=shape.descriptiveProperty;read(){return this.#descriptiveSecret}}module.exports=new Example().read();",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_minify().enable_sourcemap();
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(!output.bundle.contains("descriptiveProperty"));
+    assert!(!output.bundle.contains("descriptiveSecret"));
+
+    let map: serde_json::Value = serde_json::from_str(
+        output
+            .entry()
+            .source_map
+            .as_deref()
+            .expect("mapped minified output"),
+    )
+    .unwrap();
+    let names: Vec<&str> = map["names"]
+        .as_array()
+        .expect("names array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(names.contains(&"descriptiveProperty"), "{map}");
+    assert!(names.contains(&"descriptiveSecret"), "{map}");
+
+    let encoded = map["mappings"].as_str().expect("mappings string");
+    let decoded = decode_mappings(encoded);
+    let named: Vec<&str> = decoded
+        .iter()
+        .filter_map(|mapping| mapping.5)
+        .map(|index| names[index as usize])
+        .collect();
+    assert!(named.contains(&"descriptiveProperty"), "{map}");
+    assert!(named.contains(&"descriptiveSecret"), "{map}");
 }
 
 /// 不启用时不产 map，且产物与启用前**逐字节相同**（sourcemap 不得影响产物）。
@@ -5361,6 +6641,195 @@ fn sourcemap_opt_in_does_not_change_bundle() {
 
     assert_eq!(plain.bundle, mapped.bundle, "启用 sourcemap 不得改变产物");
     assert!(mapped.entry().source_map.is_some());
+}
+
+#[test]
+fn sourcemap_opt_in_does_not_change_minified_bundle() {
+    let mut plain_bundler = IncrementalBundler::new(Arc::new(fixture()));
+    plain_bundler.enable_minify();
+    let plain = plain_bundler.build(Path::new("src/index.js"));
+
+    let mut mapped_bundler = IncrementalBundler::new(Arc::new(fixture()));
+    mapped_bundler.enable_minify().enable_sourcemap();
+    let mapped = mapped_bundler.build(Path::new("src/index.js"));
+
+    assert_eq!(
+        plain.bundle, mapped.bundle,
+        "source map collection must not change minified JS bytes"
+    );
+    assert!(mapped.entry().source_map.is_some());
+}
+
+#[test]
+fn sourcemap_marks_wrapper_and_module_placement_boundaries_unmapped() {
+    let files: Arc<dyn wake_common::FileSystem> = Arc::new(MemoryFileSystem::from_files([(
+        "src/index.js",
+        "const descriptiveValue=1;globalThis.result=descriptiveValue;",
+    )]));
+    let mut plain_bundler = IncrementalBundler::new(Arc::clone(&files));
+    plain_bundler.enable_minify();
+    let plain = plain_bundler.build(Path::new("src/index.js"));
+
+    let mut mapped_bundler = IncrementalBundler::new(files);
+    mapped_bundler.enable_minify().enable_sourcemap();
+    let mapped = mapped_bundler.build(Path::new("src/index.js"));
+    assert_eq!(plain.entry().code, mapped.entry().code);
+
+    let map: serde_json::Value = serde_json::from_str(
+        mapped
+            .entry()
+            .source_map
+            .as_deref()
+            .expect("mapped build must emit a source map"),
+    )
+    .expect("valid source map JSON");
+    let shapes = generated_segment_shapes(map["mappings"].as_str().expect("mappings"));
+    assert_eq!(
+        shapes.first(),
+        Some(&(0, 0, 1)),
+        "the bundler prologue must start unmapped: {shapes:?}"
+    );
+    assert!(
+        shapes.iter().any(|shape| shape.2 >= 4),
+        "module source tokens must remain mapped: {shapes:?}"
+    );
+    assert_eq!(
+        shapes.last().map(|shape| shape.2),
+        Some(1),
+        "the wrapper tail must not inherit the final module mapping: {shapes:?}"
+    );
+}
+
+#[test]
+fn sourcemap_is_emitted_for_every_minified_code_split_chunk_without_changing_code() {
+    let files = [
+        (
+            "src/index.js",
+            "export const load = () => import('./lazy.js');",
+        ),
+        (
+            "src/lazy.js",
+            "export function calculate(descriptiveParameter) { return descriptiveParameter + 1; }",
+        ),
+    ];
+    let mut plain_bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files(files)));
+    plain_bundler.enable_minify().enable_code_splitting();
+    let plain = plain_bundler.build(Path::new("src/index.js"));
+    assert!(!plain.has_errors(), "{:?}", plain.diagnostics);
+
+    let mut mapped_bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files(files)));
+    mapped_bundler
+        .enable_minify()
+        .enable_code_splitting()
+        .enable_sourcemap();
+    let mapped = mapped_bundler.build(Path::new("src/index.js"));
+    assert!(!mapped.has_errors(), "{:?}", mapped.diagnostics);
+
+    assert!(mapped.chunks.len() > 1, "expected a split output");
+    assert_eq!(plain.chunks.len(), mapped.chunks.len());
+    let mut saw_original_name = false;
+    for (plain_chunk, mapped_chunk) in plain.chunks.iter().zip(&mapped.chunks) {
+        assert_eq!(plain_chunk.file_name, mapped_chunk.file_name);
+        assert_eq!(plain_chunk.code, mapped_chunk.code);
+        let map = mapped_chunk
+            .source_map
+            .as_ref()
+            .expect("every generated JS chunk must carry its map");
+        assert!(map.contains("\"version\":3"), "{map}");
+        let parsed: serde_json::Value = serde_json::from_str(map).unwrap();
+        saw_original_name |= parsed["names"]
+            .as_array()
+            .expect("names array")
+            .iter()
+            .any(|name| name.as_str() == Some("descriptiveParameter"));
+        assert!(
+            map.contains(&format!("\"file\":{:?}", mapped_chunk.file_name)),
+            "{map}"
+        );
+    }
+    assert!(
+        saw_original_name,
+        "the lazy chunk must retain its renamed parameter's original name"
+    );
+}
+
+#[test]
+fn enabling_source_map_in_a_live_session_reuses_optimization_and_body_tasks() {
+    let files = [
+        (
+            "src/index.js",
+            "import {answer} from './dep.js';export default answer(40);",
+        ),
+        (
+            "src/dep.js",
+            "export function answer(descriptiveParameter){return descriptiveParameter+2}",
+        ),
+    ];
+    let mut bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files(files)));
+    bundler.enable_minify();
+    let plain = bundler.build(Path::new("src/index.js"));
+    assert!(!plain.has_errors(), "{:?}", plain.diagnostics);
+    assert!(plain.entry().source_map.is_none());
+    let tasks_before_map = bundler.task_exec_count();
+
+    bundler.enable_sourcemap();
+    let mapped = bundler.build(Path::new("src/index.js"));
+
+    assert!(!mapped.has_errors(), "{:?}", mapped.diagnostics);
+    assert_eq!(
+        mapped.updated_module_count, 0,
+        "source-map collection must not rerun module-body emission"
+    );
+    assert_eq!(
+        bundler.task_exec_count() - tasks_before_map,
+        mapped.module_count as u64,
+        "only one source-map-facts task per module may execute"
+    );
+    assert_eq!(plain.entry().code, mapped.entry().code);
+    assert!(mapped.entry().source_map.is_some());
+}
+
+#[test]
+fn minified_code_and_source_maps_are_deterministic_across_worker_counts() {
+    let files = [
+        (
+            "src/index.js",
+            "import { left } from './left.js';import { right } from './right.js';\
+             export const result=left()+right();export const load=()=>import('./lazy.js');",
+        ),
+        ("src/left.js", "export function left(){return 20}"),
+        ("src/right.js", "export function right(){return 22}"),
+        (
+            "src/lazy.js",
+            "export function descriptiveLazyValue(){return 7}",
+        ),
+    ];
+    let build = |threads| {
+        let mut bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files(files)));
+        bundler
+            .set_test_thread_count(threads)
+            .enable_minify()
+            .enable_sourcemap()
+            .enable_code_splitting();
+        bundler.build(Path::new("src/index.js"))
+    };
+
+    let serial = build(1);
+    let parallel = build(4);
+    assert!(!serial.has_errors(), "{:?}", serial.diagnostics);
+    assert!(!parallel.has_errors(), "{:?}", parallel.diagnostics);
+    assert_eq!(serial.bundle, parallel.bundle);
+    assert_eq!(serial.chunks.len(), parallel.chunks.len());
+    for (serial_chunk, parallel_chunk) in serial.chunks.iter().zip(&parallel.chunks) {
+        assert_eq!(serial_chunk.file_name, parallel_chunk.file_name);
+        assert_eq!(serial_chunk.code, parallel_chunk.code);
+        assert_eq!(serial_chunk.source_map, parallel_chunk.source_map);
+    }
+    assert_eq!(serial.assets.len(), parallel.assets.len());
+    for (serial_asset, parallel_asset) in serial.assets.iter().zip(&parallel.assets) {
+        assert_eq!(serial_asset.file_name, parallel_asset.file_name);
+        assert_eq!(serial_asset.bytes, parallel_asset.bytes);
+    }
 }
 
 /// `sources` 路径规整：去 Windows `\\?\` 扩展长度前缀、相对化、统一正斜杠。
@@ -5502,6 +6971,101 @@ fn css_in_js_extracts_styles_and_replaces_with_class() {
 }
 
 #[test]
+fn minified_css_in_js_replacement_maps_to_the_original_tag_without_changing_js() {
+    let source = "import { css } from '@crab-dev/css';\n\
+                  const box = css`color:red;`;\n\
+                  export default box;";
+
+    let build = |with_map: bool| {
+        let mut bundler = IncrementalBundler::new(Arc::new(crab_css_fixture(source)));
+        bundler
+            .enable_css_in_js()
+            .enable_css_extraction()
+            .enable_minify();
+        if with_map {
+            bundler.enable_sourcemap();
+        }
+        bundler.build(Path::new("src/index.tsx"))
+    };
+
+    let plain = build(false);
+    let mapped = build(true);
+    assert!(!plain.has_errors(), "{:?}", plain.diagnostics);
+    assert!(!mapped.has_errors(), "{:?}", mapped.diagnostics);
+    assert_eq!(
+        plain.bundle, mapped.bundle,
+        "collecting a CSS replacement mapping must not change minified JavaScript"
+    );
+
+    let css = mapped
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .and_then(|asset| String::from_utf8(asset.bytes.clone()).ok())
+        .expect("CSS extraction must produce one UTF-8 asset");
+    let class_name = css
+        .split('{')
+        .next()
+        .expect("CSS rule")
+        .trim_start_matches('.');
+    let generated_literal = format!("{class_name:?}");
+    let generated_offset = mapped.bundle.find(&generated_literal).unwrap_or_else(|| {
+        panic!(
+            "generated class literal {generated_literal} missing: {}",
+            mapped.bundle
+        )
+    });
+    let generated_prefix = &mapped.bundle[..generated_offset];
+    let generated_line = generated_prefix
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32;
+    let generated_col = generated_prefix
+        .rsplit_once('\n')
+        .map_or(generated_prefix, |(_, line)| line)
+        .encode_utf16()
+        .count() as u32;
+
+    let map: serde_json::Value = serde_json::from_str(
+        mapped
+            .entry()
+            .source_map
+            .as_deref()
+            .expect("mapped CSS build must emit a source map"),
+    )
+    .expect("valid source map JSON");
+    let sources = map["sources"].as_array().expect("sources array");
+    let source_index = sources
+        .iter()
+        .position(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|name| name.ends_with("src/index.tsx"))
+        })
+        .expect("source map must contain the CSS-in-JS module") as u32;
+    let tag_offset = source.find("css`color:red;`").expect("tagged template");
+    let tag_prefix = &source[..tag_offset];
+    let source_line = tag_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let source_col = tag_prefix
+        .rsplit_once('\n')
+        .map_or(tag_prefix, |(_, line)| line)
+        .encode_utf16()
+        .count() as u32;
+    let decoded = decode_mappings(map["mappings"].as_str().expect("mappings string"));
+
+    assert!(
+        decoded.iter().any(|mapping| {
+            mapping.0 == generated_line
+                && mapping.1 == generated_col
+                && mapping.2 == source_index
+                && mapping.3 == source_line
+                && mapping.4 == source_col
+        }),
+        "generated CSS class at ({generated_line},{generated_col}) must map to the original tag at ({source_line},{source_col}): {decoded:?}"
+    );
+}
+
+#[test]
 fn crab_css_lowers_safe_cx_and_eliminates_runtime_module() {
     let fs = MemoryFileSystem::from_files([
         ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
@@ -5520,7 +7084,6 @@ fn crab_css_lowers_safe_cx_and_eliminates_runtime_module() {
     b.enable_css_extraction();
     b.enable_dead_module_elimination();
     b.enable_minify();
-    b.enable_mangle();
     let out = b.build(Path::new("src/index.tsx"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(
@@ -6130,8 +7693,8 @@ fn css_in_js_cross_module_class_reference() {
         "跨模块类名引用未生效\nbase={base_cls}\ncss={css}"
     );
 }
-/// Runtime factory parameters must be allocated outside the identifiers already emitted by a
-/// module. Real packages commonly import `jsxDEV as m`; `$` and `_r` are legal aliases as well.
+/// Runtime factory parameters must avoid identifiers that remain in the emitted module. Import
+/// aliases replaced by optimizer-owned live namespace reads no longer reserve those names.
 #[test]
 fn runtime_factory_names_avoid_existing_import_bindings() {
     let fs = MemoryFileSystem::from_files([
@@ -6145,13 +7708,15 @@ fn runtime_factory_names_avoid_existing_import_bindings() {
         ),
     ]);
     let mut b = IncrementalBundler::new(Arc::new(fs));
-    b.enable_minify().enable_mangle();
+    b.enable_minify();
     let out = b.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
     assert!(
-        out.bundle.contains("function(m1,$1,_r1)"),
-        "factory parameters should avoid source bindings:\n{}",
+        !out.bundle.contains("const m =")
+            && !out.bundle.contains("const $ =")
+            && !out.bundle.contains("const _r ="),
+        "optimizer-owned live import reads must remove the obsolete alias bindings:\n{}",
         &out.bundle[..out.bundle.len().min(1200)]
     );
     assert!(
@@ -6210,7 +7775,7 @@ fn destructured_export_uses_the_mangled_binding_name() {
         ),
     ]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
@@ -6260,7 +7825,6 @@ fn cjs_module_exports_assignment_survives_minify() {
     ]);
     let mut b = IncrementalBundler::new(Arc::new(fs));
     b.enable_minify();
-    b.enable_mangle();
     let out = b.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
@@ -6331,7 +7895,6 @@ fn cjs_module_exports_module_not_merged_into_concat() {
     ]);
     let mut b = IncrementalBundler::new(Arc::new(fs));
     b.enable_minify();
-    b.enable_mangle();
     let out = b.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
@@ -6400,7 +7963,7 @@ fn concat_collapse_does_not_create_runtime_initialization_cycle() {
         ),
     ]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
@@ -6556,7 +8119,6 @@ fn ts_namespace_dotted_merged_and_nested_survive_minify() {
     )]);
     let mut b = IncrementalBundler::new(Arc::new(fs));
     b.enable_minify();
-    b.enable_mangle();
     b.enable_tree_shaking();
     let out = b.build(Path::new("src/index.ts"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
@@ -6678,7 +8240,7 @@ fn production_dependency_jsx_dev_runtime_is_compatible() {
         ),
     ]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(!out.bundle.contains("jsxDEV=undefined"), "{}", out.bundle);
@@ -6771,7 +8333,6 @@ fn stage3_decorators_match_tsc_behavior() {
         let fs = MemoryFileSystem::from_files([("src/index.ts", *src)]);
         let mut b = IncrementalBundler::new(Arc::new(fs));
         b.enable_minify();
-        b.enable_mangle();
         let out = b.build(Path::new("src/index.ts"));
         assert!(!out.has_errors(), "[{name}] {:?}", out.diagnostics);
 
@@ -6941,6 +8502,20 @@ fn using_fixture() -> MemoryFileSystem {
 
 #[test]
 fn using_declarations_dispose_in_node() {
+    // 无论宿主 Node 是否已实现 Explicit Resource Management，都先验证 Wake 能构建并
+    // 重新解析 readable/minified 两份产物。Node 只决定能否执行最后的运行时对拍。
+    let mut bundles = Vec::new();
+    for (label, minify) in [("plain", false), ("minified", true)] {
+        let mut bundler = IncrementalBundler::new(Arc::new(using_fixture()));
+        if minify {
+            bundler.enable_minify();
+        }
+        let output = bundler.build(Path::new("index.ts"));
+        assert!(!output.has_errors(), "[{label}] {:?}", output.diagnostics);
+        assert_generated_bundle_reparses("using-and-await-using", label, &output.bundle);
+        bundles.push((label, output.bundle));
+    }
+
     // 不能只检查 node 是否存在：Node 22 暴露 Symbol.dispose，但解析器仍不接受
     // using / await using。先探测测试真正依赖的语法能力，避免 runner 预装版本变化
     // 导致与 bundler 无关的 SyntaxError。
@@ -6961,19 +8536,14 @@ fn using_declarations_dispose_in_node() {
         );
         return;
     }
-    // 关闭/开启 minify+mangle 各跑一遍：未用绑定消除、变量重命名都不得破坏 dispose 语义。
-    for (label, minify) in [("plain", false), ("minified", true)] {
-        let mut b = IncrementalBundler::new(Arc::new(using_fixture()));
-        if minify {
-            b.enable_minify().enable_mangle();
-        }
-        let out = b.build(Path::new("index.ts"));
-        assert!(!out.has_errors(), "[{label}] {:?}", out.diagnostics);
-
+    // 关闭/开启 minify 各跑一遍：未用绑定消除、变量重命名都不得破坏 dispose 语义。
+    // 两份产物还必须能由 Wake 自身重新解析，并具有完全相同的退出状态与 stdout。
+    let mut readable_observation = None;
+    for (label, bundle) in bundles {
         let dir = std::env::temp_dir().join(format!("wake_bundle_using_e2e_{label}"));
         std::fs::create_dir_all(&dir).unwrap();
         let bundle_path = dir.join("bundle.cjs");
-        std::fs::write(&bundle_path, &out.bundle).unwrap();
+        std::fs::write(&bundle_path, &bundle).unwrap();
 
         // dispose 逆声明序执行：body → b → unused → a。
         let script = format!(
@@ -6990,8 +8560,17 @@ fn using_declarations_dispose_in_node() {
             "[{label}] node 执行失败 status={:?} stderr={}\n--- bundle ---\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr),
-            out.bundle
+            bundle
         );
+        let observation = (output.status.code(), output.stdout);
+        if let Some(readable) = &readable_observation {
+            assert_eq!(
+                &observation, readable,
+                "using / await using semantics changed under minification"
+            );
+        } else {
+            readable_observation = Some(observation);
+        }
     }
 }
 
@@ -7015,7 +8594,7 @@ fn concat_does_not_clobber_duplicate_export_names() {
         ("src/c.js", "export const v = 'C';"),
     ]);
     let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    bundler.enable_minify().enable_mangle();
+    bundler.enable_minify();
     let out = bundler.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
@@ -7360,12 +8939,13 @@ fn top_level_await_marks_async_subgraph() {
     // 静态导入点插入 await；同步依赖不插。
     assert!(
         out.bundle
-            .contains("const _wm0 = (await __wake_require__(1));"),
+            .contains("const __wake_namespace_0 = await __wake_require__(1);"),
         "index 对 cfg 的导入应 await:\n{}",
         out.bundle
     );
     assert!(
-        out.bundle.contains("const _wm0 = __wake_require__(2);"),
+        out.bundle
+            .contains("const __wake_namespace_0 = __wake_require__(2);"),
         "cfg 对 raw 的导入不应 await:\n{}",
         out.bundle
     );
@@ -7427,7 +9007,6 @@ fn top_level_await_minified_bundle_runs_in_node() {
     }
     let mut b = IncrementalBundler::new(Arc::new(tla_fixture()));
     b.enable_minify();
-    b.enable_mangle();
     b.enable_tree_shaking();
     let out = b.build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
@@ -7605,7 +9184,7 @@ fn top_level_await_in_non_incremental_bundler() {
         out.bundle
     );
     assert!(
-        out.bundle.contains("(await __wake_require__("),
+        out.bundle.contains("await __wake_require__("),
         "静态导入点应 await:\n{}",
         out.bundle
     );
@@ -7944,15 +9523,16 @@ fn transformed_helpers_preserve_directive_prologue_in_minified_bundle() {
         .map(|offset| marker + offset)
         .expect("source strict directive");
     let iterator = out.bundle[strict..]
-        .find("(value, limit) {")
+        .find("function ")
         .map(|offset| strict + offset)
         .expect("iterator helper");
-    let object = out.bundle[iterator..]
-        .find("(target) {for (var sourceIndex")
-        .map(|offset| iterator + offset)
+    let after_iterator = iterator + "function ".len();
+    let object = out.bundle[after_iterator..]
+        .find("function ")
+        .map(|offset| after_iterator + offset)
         .expect("object-spread helper");
     let body = out.bundle[object..]
-        .find("var values=")
+        .find("new Set")
         .map(|offset| object + offset)
         .expect("first source body statement");
     assert!(
@@ -8017,8 +9597,10 @@ fn chrome_40_nullish_temporaries_are_local_to_each_execution_scope() {
         "each program/function/arrow execution scope must own its temp: {}",
         out.bundle
     );
+    let program_directive = out.bundle.find("  \"use strict\";").unwrap();
+    let program_temp = out.bundle.find("  var __wake_t").unwrap();
     assert!(
-        out.bundle.contains("  \"use strict\";\n  var __wake_t"),
+        program_directive < program_temp,
         "program directive must precede its temp declaration: {}",
         out.bundle
     );
@@ -8503,9 +10085,7 @@ fn arrow_capable_optional_spread_keeps_await_and_yield_in_their_owner_scope() {
         out.bundle
     );
     assert!(
-        out.bundle.contains("...")
-            && !out.bundle.contains("(value, limit) {")
-            && !out.bundle.contains("=>"),
+        out.bundle.contains("...") && !out.bundle.contains("(value, limit) {"),
         "native spread must stay in place without a helper or capture arrow: {}",
         out.bundle
     );
@@ -8863,8 +10443,7 @@ fn synchronous_for_of_lowering_preserves_iterator_close_labels_bindings_and_tdz(
         .set_target_env(wake_ecma_transform::TargetEnv::new(vec![
             wake_ecma_transform::BrowserTarget::new("chrome", "50"),
         ]))
-        .enable_minify()
-        .enable_mangle();
+        .enable_minify();
     let minified_out = minified.build(Path::new("src/index.js"));
     assert!(!minified_out.has_errors(), "{:?}", minified_out.diagnostics);
 
@@ -9029,7 +10608,7 @@ fn lowered_for_of_destructuring_head_preserves_rhs_tdz() {
             wake_ecma_transform::BrowserTarget::new("chrome", "40"),
         ]));
         if minify {
-            bundler.enable_minify().enable_mangle();
+            bundler.enable_minify();
         }
         let output = bundler.build(Path::new("src/index.js"));
         assert!(!output.has_errors(), "{:?}", output.diagnostics);
@@ -9038,7 +10617,6 @@ fn lowered_for_of_destructuring_head_preserves_rhs_tdz() {
             "sync for-of must be lowered after destructuring: {}",
             output.bundle
         );
-
         if !node_available() {
             continue;
         }

@@ -22,7 +22,6 @@ pub struct BuildOptions {
     pub public_path: String,
     pub minify: bool,
     pub dead_module_elimination: bool,
-    pub mangle: bool,
     pub source_map: bool,
     pub css_in_js: bool,
     pub drop_console: bool,
@@ -59,7 +58,6 @@ impl Default for BuildOptions {
             public_path: "/".to_string(),
             minify: false,
             dead_module_elimination: false,
-            mangle: false,
             source_map: false,
             css_in_js: false,
             drop_console: false,
@@ -219,9 +217,6 @@ fn apply_options(bundler: &mut IncrementalBundler, options: BuildOptions) {
     if options.dead_module_elimination {
         bundler.enable_dead_module_elimination();
     }
-    if options.mangle {
-        bundler.enable_mangle();
-    }
     if options.source_map {
         bundler.enable_sourcemap();
     }
@@ -342,7 +337,11 @@ mod tests {
         assert_eq!(rebuilt.updated_module_count, 1);
         assert_eq!(rebuilt.cached_module_count, 1);
         assert_eq!(session.load_exec_count() - loads, 1);
-        assert_eq!(session.task_exec_count() - tasks, 2);
+        assert_eq!(
+            session.task_exec_count() - tasks,
+            3,
+            "changed module reruns parse, optimize, and body emission only"
+        );
         assert_eq!(
             session.resolve_exec_count(),
             resolves,

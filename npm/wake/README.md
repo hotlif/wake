@@ -50,12 +50,19 @@ await bundle({
   format: 'cjs',
   target: 'node20',
   external: ['vscode'],
+  minify: true,
+  sourceMap: true,
 })
 ```
 
 `platform: 'node'` defaults to CommonJS and `node20`, so `format` and `target`
-can be omitted. `bundle()` returns a dedicated result whose `code` is always a
-string. With `sourceMap: true`, `sourceMap` is returned in memory; when
+can be omitted. `minify: true` and `sourceMap: true` can be combined; a source
+map is emitted for optimized output without switching to an unminified pipeline.
+Minification uses Wake's centralized Closure-style ordered-pass/fixed-point
+pipeline; this does not expose Closure `ADVANCED`, externs, or whole-world
+configuration.
+`bundle()` returns a dedicated result whose `code` is always a string. With
+`sourceMap: true`, `sourceMap` is returned in memory; when
 `outfile` is present Wake also writes `<outfile>.map`, exposes
 `sourceMapFile`, and appends the matching `sourceMappingURL`.
 

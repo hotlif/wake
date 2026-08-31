@@ -129,25 +129,31 @@ fn bundle_writes_exact_node_commonjs_outfile_without_web_outputs() {
     assert!(!root.join("index.html").exists());
     assert!(!root.join("manifest.json").exists());
 
-    let invalid = Command::new(env!("CARGO_BIN_EXE_wake"))
+    let mapped_output = root.join("mapped.js");
+    let mapped = Command::new(env!("CARGO_BIN_EXE_wake"))
         .args([
             "--ui",
             "plain",
             "bundle",
             source_dir.join("index.ts").to_str().unwrap(),
             "--outfile",
-            root.join("invalid.js").to_str().unwrap(),
+            mapped_output.to_str().unwrap(),
             "--minify",
             "--sourcemap",
         ])
         .output()
         .unwrap();
-    assert_eq!(invalid.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&invalid.stderr).contains("WAKE_CONFIG"),
+        mapped.status.success(),
         "{}",
-        String::from_utf8_lossy(&invalid.stderr)
+        String::from_utf8_lossy(&mapped.stderr)
     );
+    let mapped_code = std::fs::read_to_string(&mapped_output).unwrap();
+    assert!(
+        mapped_code.ends_with("//# sourceMappingURL=mapped.js.map\n"),
+        "{mapped_code}"
+    );
+    assert!(root.join("mapped.js.map").is_file());
 
     std::fs::remove_dir_all(root).unwrap();
 }

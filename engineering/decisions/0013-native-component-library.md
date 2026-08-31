@@ -90,6 +90,14 @@ Preserve-module 代码生成现在会在每个文件引用时注入一次 defaul
 现在会在稳定输出目录下按内容逐文件替换并支持回滚，其中包括 Windows 回归：连续构建期间保持
 `declarations` 打开且不共享删除权限。
 
+Preserve-module CommonJS 的 ESM live binding 不再由 codegen 根据字符串单独猜测。Library graph 只选择
+内部 preserve-CJS mode；`wake_ecma_minify::optimize` 独占无冲突 namespace 分配，并按当前 import binding
+`SymbolId` 生成实时读取表达式。Codegen 的普通标识符读取与 re-export getter 都消费同一
+`OptimizedProgram` 事实，不接收 namespace/live-binding side-plan。命名 import 用 value sequence 避免
+call/tag 错绑 namespace `this`；namespace import 只物化一次，保持身份。Direct `eval`/`with` 无法与
+当前结构化重写同时证明安全，因此返回
+显式构建诊断，不降级为静态 import snapshot。
+
 当前 crab-dev 组件工作区的隔离副本在不改源码的情况下成功构建了 51 个包入口中的 43 个。其余八个
 失败会按设计关闭：四种公共声明推断形式和四种不受支持的复杂 TSX 解析形式。声明图跟踪公共重新导出
 和类型边，而非只用于实现的运行时导入，避免内部常量造成虚假的公共类型失败。

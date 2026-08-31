@@ -37,6 +37,29 @@ fn var_hoisting() {
 }
 
 #[test]
+fn repeated_var_declarations_report_each_occurrence_with_one_symbol() {
+    let (model, interner) = analyze_src("var value=0;{var value;}value=1;");
+    let value = interner.intern("value");
+    let occurrences: Vec<_> = model
+        .binding_occurrences
+        .iter()
+        .filter(|occurrence| occurrence.name == value)
+        .collect();
+    assert!(occurrences.len() >= 2);
+    assert!(
+        occurrences
+            .iter()
+            .all(|occurrence| occurrence.symbol == occurrences[0].symbol)
+    );
+    assert!(
+        occurrences
+            .iter()
+            .any(|occurrence| occurrence.span != occurrences[0].span),
+        "the concrete redeclaration location must not collapse into the canonical symbol span"
+    );
+}
+
+#[test]
 fn block_scoping() {
     let (model, interner) = analyze_src("{ let c = 1; } c;");
     let c = interner.intern("c");

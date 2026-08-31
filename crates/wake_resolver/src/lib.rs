@@ -300,6 +300,11 @@ pub struct Resolver {
     package_configs: Mutex<FxHashMap<PathBuf, Option<PackageConfig>>>,
     /// 物理文件路径 → 扁平逻辑模块身份。
     module_identities: Mutex<FxHashMap<PathBuf, ModuleIdentity>>,
+    /// 文件所在目录 → 最近的 package root；`None` 表示祖先链上没有。
+    ///
+    /// 模块身份是按文件路径缓存的，冷构建中每个文件仍是唯一 miss。这个目录级
+    /// 路径压缩缓存使同目录与相邻目录的文件共用一次向上 `package.json` 探测。
+    package_owners: Mutex<FxHashMap<PathBuf, Option<PathBuf>>>,
     /// issuer 目录 → 包名 → 向上搜索到的全部 package root。
     package_roots: Mutex<PackageRootCache>,
     /// Yarn PnP 清单。`Some` 时裸说明符走 PnP 依赖图（不走 `node_modules` 上溯）。
@@ -320,6 +325,7 @@ impl Resolver {
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
             module_identities: Mutex::new(FxHashMap::default()),
+            package_owners: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
             pnp_registry: None,
@@ -347,6 +353,7 @@ impl Resolver {
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
             module_identities: Mutex::new(FxHashMap::default()),
+            package_owners: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: Some(manifest),
             pnp_registry: None,
@@ -364,6 +371,7 @@ impl Resolver {
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
             module_identities: Mutex::new(FxHashMap::default()),
+            package_owners: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
             pnp_registry: Some(registry),
@@ -515,7 +523,7 @@ impl Resolver {
     }
 
     fn module_identity_uncached(&self, path: &Path) -> ModuleIdentity {
-        let Some(root) = Self::find_package_root(self.fs.as_ref(), path) else {
+        let Some(root) = self.find_package_root(path) else {
             return ModuleIdentity::File(path.to_path_buf());
         };
         let Some(config) = self.read_package_config(&root.join("package.json")) else {
@@ -547,6 +555,7 @@ impl Resolver {
         self.cache.lock().unwrap().clear();
         self.package_configs.lock().unwrap().clear();
         self.module_identities.lock().unwrap().clear();
+        self.package_owners.lock().unwrap().clear();
         self.package_roots.lock().unwrap().clear();
     }
 
@@ -826,9 +835,21 @@ impl Resolver {
         None
     }
 
-    fn find_package_root(fs: &dyn FileSystem, path: &Path) -> Option<PathBuf> {
+    fn find_package_root(&self, path: &Path) -> Option<PathBuf> {
+        // `module_identity` already normalized `path`, so cache hits can probe the borrowed parent
+        // directly without allocating another normalized `PathBuf` per module.
         let start = path.parent()?;
+        let mut visited = Vec::new();
         for dir in start.ancestors() {
+            // 只在短临界区读缓存；真实 FS 探测始终在锁外，保持并行 resolver
+            // 的锁粒度。同 key 首次竞争时可能重复少量幂等探测，结果一致。
+            let cached = self.package_owners.lock().unwrap().get(dir).cloned();
+            if let Some(root) = cached {
+                self.remember_package_owner(&visited, root.clone());
+                return root;
+            }
+            visited.push(dir.to_path_buf());
+
             let parent = dir.parent();
             let direct = parent
                 .and_then(Path::file_name)
@@ -842,13 +863,28 @@ impl Resolver {
                     .and_then(Path::file_name)
                     .is_some_and(|name| name == "node_modules");
             if direct || scoped {
-                return Some(normalize(dir));
+                let root = Some(dir.to_path_buf());
+                self.remember_package_owner(&visited, root.clone());
+                return root;
+            }
+            if self.fs.is_file(&dir.join("package.json")) {
+                let root = Some(dir.to_path_buf());
+                self.remember_package_owner(&visited, root.clone());
+                return root;
             }
         }
-        start
-            .ancestors()
-            .find(|dir| fs.is_file(&dir.join("package.json")))
-            .map(normalize)
+        self.remember_package_owner(&visited, None);
+        None
+    }
+
+    fn remember_package_owner(&self, directories: &[PathBuf], root: Option<PathBuf>) {
+        if directories.is_empty() {
+            return;
+        }
+        let mut owners = self.package_owners.lock().unwrap();
+        for directory in directories {
+            owners.insert(directory.clone(), root.clone());
+        }
     }
 
     fn path_to_logical_string(path: &Path) -> String {
@@ -1083,8 +1119,57 @@ pub(crate) fn split_package(specifier: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use wake_common::MemoryFileSystem;
+
+    #[derive(Default)]
+    struct CountingFileSystem {
+        inner: MemoryFileSystem,
+        package_json_probes: AtomicUsize,
+    }
+
+    impl CountingFileSystem {
+        fn insert(&self, path: impl AsRef<Path>, contents: impl Into<Vec<u8>>) {
+            self.inner.insert(path, contents);
+        }
+
+        fn package_json_probes(&self) -> usize {
+            self.package_json_probes.load(Ordering::Relaxed)
+        }
+    }
+
+    impl FileSystem for CountingFileSystem {
+        fn read_to_string(&self, path: &Path) -> io::Result<String> {
+            self.inner.read_to_string(path)
+        }
+
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            self.inner.read(path)
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            if path.file_name().is_some_and(|name| name == "package.json") {
+                self.package_json_probes.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.is_file(path)
+        }
+
+        fn is_dir(&self, path: &Path) -> bool {
+            self.inner.is_dir(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.inner.read_dir(path)
+        }
+    }
 
     fn resolver(files: &[(&str, &str)]) -> Resolver {
         let fs = MemoryFileSystem::new();
@@ -1194,6 +1279,141 @@ mod tests {
         let a = r.module_identity(Path::new("node_modules/a/node_modules/shared/index.js"));
         let b = r.module_identity(Path::new("node_modules/b/node_modules/shared/index.js"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn module_identity_compresses_package_root_lookups_by_directory() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert(
+            "project/package.json",
+            r#"{"name":"app","version":"1.0.0"}"#,
+        );
+        for index in 0..64 {
+            fs.insert(
+                format!("project/src/pages/page-{index}.js"),
+                "export default 1",
+            );
+            fs.insert(
+                format!("project/src/utils/util-{index}.js"),
+                "export default 1",
+            );
+        }
+        let resolver = Resolver::new(fs.clone());
+
+        for (directory, prefix) in [("pages", "page"), ("utils", "util")] {
+            for index in 0..64 {
+                let path = format!("project/src/{directory}/{prefix}-{index}.js");
+                assert!(matches!(
+                    resolver.module_identity(Path::new(&path)),
+                    ModuleIdentity::Package { package, .. } if package.name == "app"
+                ));
+            }
+        }
+
+        // pages 首次：pages → src → project；utils 首次：utils → 已缓存 src。
+        assert_eq!(fs.package_json_probes(), 4);
+    }
+
+    #[test]
+    fn package_owner_path_compression_is_safe_under_parallel_discovery() {
+        const THREADS: usize = 8;
+        const FILES_PER_THREAD: usize = 8;
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert(
+            "project/package.json",
+            r#"{"name":"app","version":"1.0.0"}"#,
+        );
+        for index in 0..=THREADS * FILES_PER_THREAD {
+            fs.insert(
+                format!("project/src/pages/page-{index}.js"),
+                "export default 1",
+            );
+        }
+        let resolver = Arc::new(Resolver::new(fs.clone()));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for thread in 0..THREADS {
+            let resolver = Arc::clone(&resolver);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for offset in 0..FILES_PER_THREAD {
+                    let index = thread * FILES_PER_THREAD + offset;
+                    let path = format!("project/src/pages/page-{index}.js");
+                    assert!(matches!(
+                        resolver.module_identity(Path::new(&path)),
+                        ModuleIdentity::Package { package, .. } if package.name == "app"
+                    ));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let probes = fs.package_json_probes();
+        assert!(probes <= THREADS * 3);
+        assert!(matches!(
+            resolver.module_identity(Path::new("project/src/pages/page-64.js")),
+            ModuleIdentity::Package { package, .. } if package.name == "app"
+        ));
+        assert_eq!(fs.package_json_probes(), probes);
+    }
+
+    #[test]
+    fn cached_parent_owner_does_not_hide_a_nested_package_boundary() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert(
+            "project/package.json",
+            r#"{"name":"outer","version":"1.0.0"}"#,
+        );
+        fs.insert("project/src/outer.js", "export default 1");
+        fs.insert(
+            "project/src/vendor/nested/package.json",
+            r#"{"name":"nested","version":"2.0.0"}"#,
+        );
+        fs.insert("project/src/vendor/nested/index.js", "export default 2");
+        fs.insert(
+            "project/src/vendor/nested/lib/feature.js",
+            "export default 3",
+        );
+        let resolver = Resolver::new(fs);
+
+        assert!(matches!(
+            resolver.module_identity(Path::new("project/src/outer.js")),
+            ModuleIdentity::Package { package, .. } if package.name == "outer"
+        ));
+        for path in [
+            "project/src/vendor/nested/index.js",
+            "project/src/vendor/nested/lib/feature.js",
+        ] {
+            assert!(matches!(
+                resolver.module_identity(Path::new(path)),
+                ModuleIdentity::Package { package, .. } if package.name == "nested"
+            ));
+        }
+    }
+
+    #[test]
+    fn clear_cache_invalidates_package_owner_path_compression() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert("project/src/value.js", "export default 1");
+        let resolver = Resolver::new(fs.clone());
+        let path = Path::new("project/src/value.js");
+
+        assert!(matches!(
+            resolver.module_identity(path),
+            ModuleIdentity::File(_)
+        ));
+        fs.insert(
+            "project/package.json",
+            r#"{"name":"app","version":"1.0.0"}"#,
+        );
+        resolver.clear_cache();
+        assert!(matches!(
+            resolver.module_identity(path),
+            ModuleIdentity::Package { package, .. } if package.name == "app"
+        ));
     }
 
     #[test]

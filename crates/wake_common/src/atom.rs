@@ -6,6 +6,7 @@
 //! **正确性纪律（DESIGN §10.3）**：`Atom` 是进程内句柄，**禁止落盘**——
 //! 持久化前必须还原为字符串。因此这里刻意 **不** 为 `Atom` 实现 `Serialize`/`rkyv`。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rustc_hash::FxHashMap;
@@ -15,6 +16,7 @@ const SHARD_COUNT: usize = 16;
 const SHARD_BITS: u32 = 4; // log2(SHARD_COUNT)
 const INDEX_BITS: u32 = u32::BITS - SHARD_BITS; // 28
 const INDEX_MASK: u32 = (1u32 << INDEX_BITS) - 1;
+static NEXT_INTERNER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 驻留后的字符串句柄。`Copy`、`u32` 大小，比较为常数时间。
 ///
@@ -64,6 +66,7 @@ struct Shard {
 ///
 /// 通常整个进程共享一个 `Interner`（放进编译上下文里以 `&` 传递）。
 pub struct Interner {
+    identity: u64,
     shards: Box<[RwLock<Shard>]>,
 }
 
@@ -75,11 +78,19 @@ impl Default for Interner {
 
 impl Interner {
     pub fn new() -> Interner {
+        let identity = NEXT_INTERNER_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(identity, u64::MAX, "interner identity space exhausted");
         let shards = (0..SHARD_COUNT)
             .map(|_| RwLock::new(Shard::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Interner { shards }
+        Interner { identity, shards }
+    }
+
+    /// Process-local identity used to prevent `Atom` values from being resolved by another table.
+    /// It is deliberately not a persistent-cache key.
+    pub const fn identity(&self) -> u64 {
+        self.identity
     }
 
     #[inline]
@@ -141,6 +152,15 @@ mod tests {
         assert_ne!(a, c);
         assert_eq!(it.resolve(a), "foo");
         assert_eq!(it.resolve(c), "bar");
+    }
+
+    #[test]
+    fn interner_identity_is_unique_even_for_equal_contents() {
+        let first = Interner::new();
+        let second = Interner::new();
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(first.resolve(first.intern("same")), "same");
+        assert_eq!(second.resolve(second.intern("same")), "same");
     }
 
     #[test]

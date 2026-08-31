@@ -37,12 +37,16 @@ const result = await bundle({
   target: "node20",
   external: ["vscode"],
   minify: true,
+  sourceMap: true,
 });
 console.log(result.outputFile);
 ```
 
 Node 平台自动外置 Node 内置模块。显式 external 必须是裸 npm 包名并同时覆盖其子路径。
-首版 Node bundle 只支持 CommonJS 单文件，`minify` 与 `sourceMap` 不能同时启用。
+首版 Node bundle 只支持 CommonJS 单文件，`minify` 与 `sourceMap` 可以同时启用；生成 map 不会
+选择另一套未压缩代码，也不改变 JavaScript 主体。
+`minify` 使用 Wake 集中式的 Closure 风格有序 pass/固定点管线；这不是 Closure `ADVANCED`
+兼容模式，Node API 不新增 externs 或 whole-world 选项。
 启用 `sourceMap` 时，内存构建通过 `result.sourceMap` 返回映射；设置 `outfile` 后还会原子写入
 `<outfile>.map`、返回 `result.sourceMapFile`，并在 JavaScript 末尾写入对应的
 `sourceMappingURL`。

@@ -16,10 +16,15 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 ### 2.1 基础与编译核心
 
 - `wake_common`：Span、源码、诊断、文件系统抽象、字符串驻留和压缩包读取。
-- `wake_ecma_ast`：arena AST、自引用持有者、访问器和结构指纹。
+- `wake_ecma_ast`：arena AST、自引用持有者、访问器和结构指纹；parser 创建的 `ModuleAst` 同时拥有
+  精确源码字节，并记录创建 AST `Atom` 的进程内 interner identity。
 - `wake_ecma_lexer`、`wake_ecma_parser`：词法、语法、依赖提取，以及必须借助 cover grammar/作用域上下文完成的 lowering 编排。
 - `wake_ecma_semantic`：独立的符号、作用域与引用分析；不通过 parser façade 暴露。
-- `wake_ecma_transform`、`wake_ecma_codegen`、`wake_ecma_minify`：可复用 lowering 规则、生成、Source Map 和生产压缩。
+- `wake_ecma_transform`：可复用 lowering 规则与 AST helper。
+- `wake_ecma_minify`：拥有 `TypedProgram` 可变语法树、稳定节点/列表/名字/符号身份、当前树分析、
+  可信编辑、显式 pass 固定点、typed module plan 和属性/标识符改名。Parser AST 只在入口降低一次。
+- `wake_ecma_codegen`：从最终 `TypedProgram` 直接发射合法 token、最短字面量与 Source Map；生产压缩
+  路径不读取 parser AST 或外部优化计划，也不重新决定 DCE、内联、模块改写或名字。
 
 编译核心只依赖 workspace 白名单中的少量通用库，不依赖网络、CLI 或 Node-API。
 
@@ -43,7 +48,8 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 - `wake_test_host`：唯一持久测试 session、IPC transport、取消、进程/浏览器崩溃隔离和关闭 owner；消费 `wake_test_contract` 并调用 `wake_test`，不拥有断言或 React 语义。
 - `wake_turbo`、`wake_turbo_macros`：红绿失效、single-flight、任务宏和工作窃取执行器。
 - `wake_cache`：稳定 DTO 的持久化编码；不保存进程内 `Atom` 或 AST 指针。
-- `wake_bundler`：Scan、Link、chunk、runtime、资源与 emit 编排。
+- `wake_bundler`：Scan、Link、chunk、runtime、资源与 emit 编排，并私有拥有 scope-concat 的保守 AST
+  安全扫描；codegen 不导出 concat eligibility 分析接口。
 - `wake_config`：声明式 TOML 配置、项目根发现和 Browserslist 规范化。
 
 ### 2.4 产品边缘层
@@ -62,7 +68,7 @@ common ─ ecma_ast
    ├─ semantic
    └─ transform ─ parser（消费 lexer + lowering helpers）
 
-parser + semantic + transform ─ codegen/minify
+parser + semantic + transform ─ minify ─ codegen
 
 common ─ resolver
 common + ecma_ast ─ graph
@@ -106,6 +112,24 @@ wake_test_contract → wake_app → cli / node binding
     Components 不能覆盖；ignore/unmanaged issuer 按 Yarn 指示执行经典 Node 解析。所有消费者只通过
     `ResolutionEnvironment` 访问解析状态并传播结构化诊断。没有 PnP 根的 npm 项目以实际
     `node_modules` 文件树为权威；`package-lock.json` 只触发结构失效，不参与运行时依赖求解。
+15. JavaScript 优化只有 `wake_ecma_minify` 一个生产语义入口。模块图用稳定 export 名称分别保存
+    “声明绑定必须保留”和“公开 key 确实被观察”，并另带 plain `export *` 转发事实；bundler 以
+    `LinkerExportLiveness` 交给优化器。优化器在 `optimize` 边界建立唯一的 parser semantic model，只把
+    声明保留名称解析为本次程序的 `SymbolId`，公开观察名称保持稳定字符串，并同时降低
+    `TypedProgram`；进程内 ID 不跨 crate 边界或重新解析持久化。优化器报告的依赖再映射为保留的
+    `ModuleId`。未提供 linker liveness 的
+    preserve ESM 保留公开导出的本地名，只有带已校验 liveness 的 linked 输出可以缩名。Codegen 的生产
+    压缩入口只接收优化器拥有的最终 `TypedProgram`，不得另收 parser AST 或自行重建压缩、名字优化、
+    hoist、属性改名和模块计划；内部转换只能通过 `OptimizeInput` 的结构化可信编辑进入 typed IR。
+16. `minify` 是完整优化管线的唯一公开开关，并可与 Source Map 同时启用。是否生成 map 不得改变
+    JavaScript payload；改名段通过 V3 `names`/第五 VLQ 字段携带原名。持久缓存独立保存模块映射与
+    names 表。`want_map` 不进入 optimize 或 body 任务身份；body 的同一次 token walk 总是记录映射事实，
+    独立 map 任务只消费这些事实，因此 mapped/unmapped 共用同一优化结果和 JS body。
+17. 属性改名仅限类私有名和可证明未逃逸、无动态/反射访问的局部封闭对象形状；公共类成员、宿主属性、
+    `__proto__` 与协议名始终保留。该边界不得通过 whole-world 或 externs 假设放宽。
+18. 生产 `optimize` 必须同时校验 `OptimizeInput.source` 与 parser owner 的精确源码字节，以及传入
+    `Interner` 与 owner 记录的 identity。Span、`SymbolId` 与 `Atom` 只属于同一解析结果；即使另一张
+    interner 表碰巧能 resolve 同一数值也不得接受。该进程内 identity 不进入持久缓存。
 
 上述依赖方向与来源规则的唯一机器事实来源是
 [architecture-boundaries.json](architecture-boundaries.json)；叙述文档不维护第二份 allowlist。
@@ -117,16 +141,73 @@ CLI / Node API
   → wake_app 解析 cwd、configPath 与取消信号
   → wake_config 发现并规范化项目
   → BuildSession / IncrementalBundler
-  → resolve + load + parse
-  → module graph + liveness + chunk graph
-  → transform + codegen + minify
+  → resolve + load + parse + transform
+  → module graph retained-binding names + observed public names + export-star fact
+  → OptimizeInput with stable linker export facts
+  → optimizer-owned semantic resolution + owned optimization state
+  → explicit passes to fixed point + retained dependency convergence
+  → recompute chunk ownership from retained edges
+  → shared optimized program → body emission + independent source-map facts task
   → JS/CSS/assets/HTML/manifest
   → 内存返回或原子写入 outdir
 ```
 
 开发服务器持有 `BuildSession`，文件变化经 watcher 合并后执行失效和重建，再通过 WebSocket 发送更新。一次性生产构建会绕过不需要的常驻服务资源。
+压缩器版本、defines/drop flags、链接活跃性、可信编辑和包装器保留名参与优化身份；图、优化器指纹与持久任务
+都用稳定的声明保留名、公开观察名和 star 事实作为身份，解析得到的 `SymbolId` 只在当前 optimizer 调用内有效。optimizer key 不含最终
+chunk 编号，retained edges 收敛后才形成 final-layout body key；map 开关不进入二者。当前
+`wake-closure-minifier-v12` 与缓存 schema 10 使旧压缩缓存自然失效。持久层除 JavaScript 与 mapping
+facts 外，只保存 codegen 生成的字节区间和稳定目标 module ID；不持久化 arena 指针、`NodeId`、进程内
+符号 ID 或可变 IR。长期所有权、
+表示边界和验证门禁见
+[ADR 0023](decisions/0023-closure-style-minifier-pipeline.md)。该设计借鉴 Closure Compiler 的 pass
+调度思想，不是 Closure `ADVANCED` 的类型/whole-world 兼容层，也不引入其源码或依赖。
+精确公开名/声明活跃性拆分、空 barrel 的副作用请求保留和 binding-free 单遍规范化见
+[ADR 0024](decisions/0024-linker-proven-barrel-compaction.md)。
 
-## 4.1 测试数据流
+### 4.1 压缩器所有权状态
+
+`TypedProgram` 是优化阶段唯一的可变语法事实源。它完整拥有可发射节点、child lists、名字 spelling、
+当前程序内的符号记录和 `Source`/`Derived`/`Synthetic` origin，并用稳定 `NodeId`、`ListId`、`NameId` 和
+`SymbolId` 连接它们。Parser AST 与初始 semantic model 只服务一次 lowering；结构 pass 通过 typed
+mutation 修改当前树，`validate()` 检查 parent/child、列表、节点类别和名字不变量。`Span` 只保留来源与
+可信编辑定位，不再承担活跃性或 rewrite table key。
+
+`TypedAnalysis::rebuild` 只从当前 live tree 重建 lexical scope、读写引用、capture、CFG、确定初始化、
+effect 和 escape facts。同一 `TypedProgram::revision` 上的 binding-sensitive pass 共享分析；任一结构 pass
+发生真实变化后，调度器在下一次绑定敏感工作前重建。固定点收敛时的当前分析直接供最终改名和动态作用域
+判断复用，因此删除或替换的引用不会通过旧 snapshot 继续存活，也不会为未变化的轮次重复扫描。Direct `eval` 与 `with` 冻结其可见环境，
+但不要求无关作用域或整模块退回另一条实现。
+
+一次性可信编辑、runtime helper、装饰器和 typed module planning 完成后，`typed_pipeline.rs` 按常量折叠、
+控制流简化、封闭函数内联、单次变量内联、DCE、声明/sequence 合并和 late peephole 的顺序运行全局固定
+点。每个 pass 只报告真实结构变化；完整轮次无变化才收敛，100 轮仍变化返回诊断。最终名字直接写回
+owned name occurrences。依赖体积收益的候选由 typed token 成本约束为不增长，未证明安全或更短的候选
+保持原形。
+
+模块转换也由 typed IR 拥有：优化前建立 `TypedModulePlan`，固定点后从 live tree seal 保留请求，最终
+链接/chunk facts 到齐后调用 `finalize_typed_modules`，再交给 typed emitter。Preserve ESM、Preserve CJS
+和 bundled CJS 共用这一 plan→seal→finalize 生命周期；bundler/codegen 不维护 namespace 或 live-read
+side-plan。
+
+优化产物的 mapped/unmapped codegen 都由 `wake_ecma_codegen::typed` 执行同一个 token walk，mapping
+只是可选 sink。Source/Derived anchor 提供源位置，改名 occurrence 把原名写入 V3 `names`，无可靠来源的
+合成标点和 wrapper 保持 unmapped。每类折叠、内联、参数替换和模块 wrapper 的细粒度映射仍必须由独立
+回归证明，不能仅依据 origin 元数据宣称完整覆盖。
+
+Scope-concat 是否能用 bare block 的保守扫描由 `wake_bundler::concat` 私有拥有，结果只服务 bundler
+wrapper 策略；codegen 不分析 concat eligibility。
+
+原子迁移后，生产路径只保留 `OptimizeInput` → owned typed IR → typed emitter；不保留兼容 emitter、
+第二套名字优化状态、4096 字节退让或 Source Map 禁用分支。完成条件及尚未执行的验证必须按
+[ADR 0023](decisions/0023-closure-style-minifier-pipeline.md)
+报告，不能以文档描述代替测试证据。
+
+Source-mapped coverage 对函数指标采用更严格的所有权边界：只有 V8 函数起点精确命中 codegen 在真实
+源函数起点写入的 map anchor 才进入用户函数统计。Preserve-CJS export getter 等合成函数不拥有该锚点，
+不会因为 floor mapping 继承前一源位置而被计数。
+
+## 4.2 测试数据流
 
 ```text
 wake test / runTests() / TestContext

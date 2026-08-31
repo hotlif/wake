@@ -19,7 +19,11 @@ wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap]
 | `--outdir` | `dist` | 输出目录 |
 | `--cache` | 关闭 | 启用持久构建缓存 |
 | `--watch` | 关闭 | 构建后持续监听 |
-| `--sourcemap` | 关闭 | 输出 source map，同时关闭压缩和代码分割 |
+| `--sourcemap` | 关闭 | 输出与生产压缩、代码分割兼容的 source map |
+
+生产构建继续使用 Wake 集中式的 Closure 风格有序 pass/固定点压缩管线；`--sourcemap` 增加映射
+文件和对应 trailer，不会切换到另一套未压缩产物，也不会改变不含 trailer 的 JavaScript 主体。
+“Closure 风格”描述调度架构，不代表 Closure `ADVANCED` 输出，也没有 externs/Advanced 选项。
 
 全局 `--no-color` 关闭颜色，`--ui auto|tui|plain` 控制长任务终端界面。自动化脚本应根据退出码和结构化诊断判断成功，不解析进度文案。
 

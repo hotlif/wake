@@ -525,7 +525,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let mut out = self.new_vec::<Expression>();
         while self.at(TokenKind::At) {
             self.bump(); // @
-            out.push(self.parse_lhs_expression());
+            out.push(self.parse_decorator_expression());
         }
         out
     }

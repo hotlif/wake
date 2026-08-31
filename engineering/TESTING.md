@@ -161,15 +161,58 @@ lock graph，不能使用 target-scoped fetch；Rusty V8 archive 校验仍必须
 - lexer snapshot：字面量、模板、正则、ASI、类私有名和 JSX 边界；
 - parser/semantic：JS、TS、JSX、TSX、scope、引用、依赖与顶层 await；
 - TypeScript 7 compatibility fixture：高级类型、类/函数、模块、TSX、值语义及严格类型负例；
-- codegen/minify：优先级括号、重命名、DCE、导出和 Source Map；
+- typed IR 所有权：`typed_ir.rs` 的测试必须覆盖全部 parser/lowering 节点进入 owned arena、稳定
+  `NodeId`/`ListId`/`NameId`/`SymbolId`、source/derived/synthetic origin、结构 mutation、tombstone、clone、
+  fingerprint 和 `validate()` 反例。每个代表性 JS/TS/JSX/TSX 程序必须经过 lower→typed emit→reparse；
+  搜索门禁还要证明生产 codegen 只读取最终 owned typed IR，不读取 parser AST、外部优化计划或兼容 emitter；
+- 结构化编辑：`typed_edits.rs` 覆盖 primitive/expression define、CSS-in-JS replacement、statement/binding
+  删除、依赖保留、shorthand 展开、写目标保护，以及目标不唯一、重叠、owner 错配和错误节点类别诊断。
+  输入字符串不能成为 codegen rewrite 事实；
+- 当前树分析：`typed_analysis.rs` 覆盖 lexical scope、遮蔽、closure capture、读写、direct eval/with 的
+  局部冻结、CFG edge、确定初始化、TDZ、effect 和 escape summary。相同 program revision 必须复用当前
+  analysis；结构改写后必须在下一次 binding-sensitive pass 前重新 `TypedAnalysis::rebuild`，并证明已删除/
+  替换引用、控制流和别名不会通过旧分析继续计活。work-count 必须同时覆盖“无变化仅一次”和“变化后重建”；
+- 固定点 pass：`typed_pipeline.rs`、`typed_passes.rs` 与 `typed_inline.rs` 覆盖固定顺序、统一真实变更计数、
+  二次机会、无变更终止和 100 轮诊断，以及 primitive fold、条件简化、封闭函数内联、单次变量内联、
+  DCE、声明/sequence 合并和 late peephole 的正反例。候选成本测试必须包含 precedence parentheses、token
+  separator、重复引用、改名后长度和极端保留名，所有依赖体积收益的候选只允许不增长；
+- minify 语义：覆盖闭包/遮蔽、eval/with、TDZ、try/finally、labels、switch/loops、类与装饰器、using、
+  BigInt、NaN/-0、optional chain、默认参数、解构、await/yield、`this`/`arguments`/`super`/`new.target`、
+  初始化器及异常/副作用顺序。无法证明的语法要局部保持原形，不允许整模块 fallback；
+- 属性与名字安全：`typed_mangle.rs` 覆盖类私有名和封闭局部对象正例，以及动态访问、逃逸、枚举、反射、
+  序列化、Proxy、delete、spread/rest、方法/accessor、公共/宿主/协议属性的保守反例；另覆盖 capture、
+  作用域槽复用、运行时可观察函数/类名、保留名和重复运行确定性；
+- typed codegen/Source Map：`wake_ecma_codegen/src/typed.rs` 覆盖全部 typed node、优先级/token 边界、最短
+  字面量和输出重解析。Mapped/unmapped 必须执行相同 token walk 并产生逐字节相同 body；Source、Derived、
+  TrustedEdit、Synthetic/unmapped 和改名 V3 `names` 分别测试 generated/source 位置。折叠、函数体内联、
+  实参替换、CSS 编辑和模块 wrapper 的细粒度映射不能互相代替证据；
+- typed modules：`typed_modules.rs` 覆盖 plan→seal→finalize、显式 `None` 与 `Some(empty)` liveness、非法
+  `(ModuleId, SymbolId)` 内部根、声明保留名与公开观察名的分离、同一绑定多 public alias、具名/default/
+  namespace re-export 的 getter 过滤及源副作用保留、稳定名称到当前符号的别名/遮蔽解析、
+  Preserve ESM、Preserve CJS、bundled CJS、import/export/re-export、default/
+  namespace interop、receiver stripping、循环和顶层 await。最终 emit 前必须验证没有 pending sentinel；
+- concat 所有权证据：`wake_bundler::concat` 的私有表驱动用例覆盖安全 ESM、顶层/嵌套 `var`、嵌套
+  `this` 与无 ESM syntax 的保守结果；codegen 不再导出 `ConcatBlockInfo`/扫描入口；
 - fuzz smoke：随机输入不 panic；深度 fuzz 使用 `cargo +nightly fuzz run lex` 人工执行。
+
+上述矩阵只有在对应命令实际通过后才能写成已验证能力；单点字符串断言、origin 元数据存在或单个
+mapped fixture 都不能替代运行时差分、重解析和完整 source-map 坐标断言。
 
 ## 3.2 增量与缓存
 
 - 同内容二次构建应命中；
 - 单文件变化只失效受影响记录；
 - resolver miss、结构性文件和配置身份正确失效；
-- persistent cache 冷/热路径的 Tree Shaking、concat、顶层 await 和代码分割产物等价；
+- persistent cache 冷/热路径覆盖生成体、保留模块 ID、Source Map/names、concat、顶层 await 和代码分割；
+- 压缩器版本（当前 `wake-closure-minifier-v12`）、defines/drop flags、图/缓存中的声明保留名、公开观察名、
+  star 事实、可信编辑和保留名变化必须正确失效。当前 AST 的 `SymbolId` 只用于 optimizer 内部，不是指纹或持久
+  缓存输入；
+  retained edges 使用不含最终 chunk 编号的 optimizer key；JavaScript body、mapping facts 和 generated
+  discarded-request ranges 使用 retained 收敛后的 final-layout key 并在持久层存取。`want_map` 不进入
+  optimize/body identity；
+  同实例开 map、未映射冷缓存后新进程开 map、shared rebucket 均有回归；
+- 同一线程配置下重复 optimize 的名字、指纹和 pass 统计已有确定性用例；bundler 另有 1/4 worker
+  的代码、分包 map 和 assets 对拍。更多调度配置以及优化器保留依赖/pass 统计的跨线程对拍仍需扩展；
 - `wake_turbo` 红绿参考、并发压力、循环检测和纯并行降级通过。
 
 ## 3.3 Bundler fixture
@@ -185,8 +228,15 @@ lock graph，不能使用 target-scoped fetch；Rusty V8 archive 校验仍必须
 - `2k-modules`：生成式压力与跨工具测量。
 
 关键语义必须执行产物或在真实服务器中验证。仅检查 bundle 字符串适合局部形态断言，不能替代运行时回归。
+`wake_ecma_codegen/tests/typed_pipeline_acceptance.rs` 是 owned optimizer 的统一差分 harness：完全自有的
+JS/TS/JSX/TSX 案例逐例生成 readable/minified/mapped body，重新解析两份 JavaScript，并在 Node VM 中
+比较返回值、异常类型和日志顺序；mapped/unmapped body 必须逐字节相同。Bundler 的 runtime differential
+matrix 再覆盖控制流、参数/解构、async/generator、装饰器，以及 ESM/CJS 循环、live export、动态 chunk
+和顶层 await 的最终 bundle 语义。语料不得复制 Closure Compiler 或其他第三方压缩器的测试、源码或语料。
 Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-module 文件；Windows 重复构建测试
-必须覆盖被 watcher 持有的输出目录、变化声明替换和中途失败回滚。
+必须覆盖被 watcher 持有的输出目录、变化声明替换和中途失败回滚。Preserve-CJS 运行时用例还必须
+比较初值/变更后的实时命名导入和 re-export、循环、default interop、命名 import call/tag receiver、namespace
+身份、shorthand、JSX 共享 Span 与用户 namespace 名冲突。
 
 ## 3.4 Docs
 
@@ -199,7 +249,7 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
 ## 3.5 Node API
 
 - ESM/CommonJS 导出一致；
-- build、bundle、BuildContext、应用/文档服务器和事件；
+- build、bundle、BuildContext、应用/文档服务器和事件，包括 CLI/Node 的 `minify + sourceMap` 组合；
 - AbortSignal、关闭幂等、async dispose 和结构化错误；
 - experimental 句柄 dispose、字符串便捷入口和 TypeScript 声明；
 - 主包与五个平台包的版本、文件清单和可选依赖一致。
@@ -221,7 +271,9 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
   现代 async clock、外部 value/DOM/accessibility/visual snapshot；不得把 Jest automock、mock
   hoisting、legacy timer、inline snapshot 或 Babel coverage 当作 Wake 能力；
 - V8 range coverage 经 Source Map 回映原始 JS/TS/JSX/TSX，并在 cold、warm 与 watch rerun 中
-  产生同一规范化 Wake schema；
+  产生同一规范化 Wake schema。函数统计只接受 V8 range 起点精确命中 emitter-owned 真实函数
+  map anchor，不对函数起点做 floor lookup；preserve-CJS 合成 export getter 必须排除，空源 arrow/method 仍按
+  真实锚点计入；
 - reverse-dependency watch 只重跑受影响 suite，但每轮获得干净 realm 或 BrowserContext；浏览器
   进程可以复用，页面、module registry 与 DOM 状态不能复用；
 - 无限循环、host/browser panic 或 crash、协议损坏、资源 origin 伪造、取消和关闭不泄漏调用
@@ -254,7 +306,15 @@ cargo test -p wake_bundler --test performance_invariants --release
 cargo bench --workspace --no-run
 ```
 
-第一条用稳定 work-count 检查 edit-one 的 loader、resolver、link/chunk 与 codegen 工作局部性；第二条保证 benchmark 可编译。两者都不判断机器相关的耗时回归。提交性能数字或优化声明前按 [PERFORMANCE.md](PERFORMANCE.md) 运行实际测量并保存环境信息。
+第一条用稳定 work-count 检查 edit-one 的 loader、resolver、link/optimize/chunk 与 codegen 工作局部性；
+第二条保证 benchmark 可编译。`typed_pipeline_owned_payload_never_grows_and_shrinks_in_aggregate` 使用四个
+完全自有的源码 body、冻结旧实现 body/字节数和 typed ceiling；它直接比较 optimized-program emitter 的
+JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer，并断言逐例 `new <= legacy`、
+聚合 `new < legacy`。`minify_owned_corpus_never_grows_and_improves_in_aggregate` 另以最终 bundle 字节执行一层
+集成门禁。JS/TS/JSX/TSX lowering 变体、重解析、Node 差分和 mapped/unmapped 相同由同一 acceptance crate
+的独立矩阵覆盖；局部候选的非增长性质由 typed pass/inline/mangle token-cost 正反例约束。
+旧实现只保留审阅过的 body 与数字基线，不保留可执行 fallback。任何性能数字仍须按
+[PERFORMANCE.md](PERFORMANCE.md) 保存环境信息。
 
 # 6. 发布门禁
 

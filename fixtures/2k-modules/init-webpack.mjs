@@ -4,11 +4,16 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
-const config = {
+const config = `import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const fixtureDir = fileURLToPath(new URL('.', import.meta.url));
+
+export default {
   mode: 'production',
-  entry: join(__dirname, 'input', 'entry.js'),
+  entry: join(fixtureDir, 'input', 'entry.js'),
   output: {
-    path: join(__dirname, 'dist-webpack'),
+    path: join(fixtureDir, 'dist-webpack'),
     filename: 'bundle.js',
     clean: true,
   },
@@ -22,11 +27,12 @@ const config = {
   devtool: false,
   stats: 'errors-warnings',
 };
+`;
 
 mkdirSync(join(__dirname, 'dist-webpack'), { recursive: true });
 writeFileSync(
   join(__dirname, 'webpack.config.mjs'),
-  `export default ${JSON.stringify(config, null, 2)};\n`,
+  config,
   'utf8',
 );
 console.log('Created webpack.config.mjs');

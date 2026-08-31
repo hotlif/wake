@@ -291,7 +291,10 @@ pub fn lower_for_of<'a>(
                         span,
                         operator: AssignmentOperator::Assign,
                         left: Expression::Identifier(
-                            arena.alloc(Ident::new(Span::DUMMY, ident.name)),
+                            // This write is the transformed occurrence of the source loop-head
+                            // binding. Keep that source anchor so the semantic occurrence table
+                            // can attach the same SymbolId as both `var` declarations.
+                            arena.alloc(Ident::new(ident.span, ident.name)),
                         ),
                         right: value,
                     })),
@@ -478,7 +481,18 @@ fn collect_for_of_tdz_declarators<'a>(
     match pattern {
         Pattern::Ident(ident) => declarations.push(VariableDeclarator {
             span: Span::DUMMY,
-            id: Pattern::Ident(arena.alloc(Ident::new(Span::DUMMY, ident.name))),
+            // The dormant TDZ binding is distinct from the per-iteration binding but originates
+            // at the same loop-head identifier. A zero-width anchor at the end of that token
+            // gives the owned IR a deterministic semantic occurrence without pretending this is
+            // another source token.
+            id: Pattern::Ident(arena.alloc(Ident::new(
+                if ident.span.is_dummy() {
+                    Span::DUMMY
+                } else {
+                    Span::at(ident.span.hi)
+                },
+                ident.name,
+            ))),
             init: None,
         }),
         Pattern::Array(array) => {

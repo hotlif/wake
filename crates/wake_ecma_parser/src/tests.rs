@@ -371,6 +371,75 @@ fn parse_ok(src: &str, st: SourceType) -> crate::ParseOutput {
 }
 
 #[test]
+fn decorators_before_export_are_retained_on_exported_classes() {
+    let interner = Interner::new();
+    let source = "@first @second export default class Defaulted {}\n\
+                  @sealed export class Named {}";
+    let output = parse(source, &interner, SourceType::TypeScript);
+    assert!(
+        !output.has_errors(),
+        "decorated exports must parse without diagnostics: {:?}",
+        output.diagnostics
+    );
+
+    output.module.with_ast(|program| {
+        assert_eq!(program.body.len(), 2, "unexpected AST: {:?}", program.body);
+
+        let Statement::ExportDefault(default_export) = program.body[0] else {
+            panic!("expected a default export: {:?}", program.body[0]);
+        };
+        let ExportDefaultKind::Class(default_class) = default_export.declaration else {
+            panic!("expected a default-exported class");
+        };
+        let default_decorators = default_class
+            .decorators
+            .iter()
+            .map(|decorator| match decorator {
+                Expression::Identifier(ident) => interner.resolve(ident.name),
+                other => panic!("expected identifier decorator, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(default_decorators, ["first", "second"]);
+
+        let Statement::ExportNamed(named_export) = program.body[1] else {
+            panic!("expected a named export: {:?}", program.body[1]);
+        };
+        let Some(Statement::ClassDeclaration(named_class)) = named_export.declaration else {
+            panic!("expected a named exported class declaration");
+        };
+        assert_eq!(named_class.decorators.len(), 1);
+        assert!(matches!(
+            named_class.decorators[0],
+            Expression::Identifier(ident) if interner.resolve(ident.name) == "sealed"
+        ));
+    });
+}
+
+#[test]
+fn decorator_call_does_not_consume_the_decorated_computed_key() {
+    let interner = Interner::new();
+    let source = "class C { @make('field') [key('value')] = 1; }";
+    let output = parse(source, &interner, SourceType::TypeScript);
+    assert!(
+        !output.has_errors(),
+        "decorated computed field must parse: {:?}",
+        output.diagnostics
+    );
+    output.module.with_ast(|program| {
+        let Statement::ClassDeclaration(class) = program.body[0] else {
+            panic!("expected class declaration");
+        };
+        let ClassMember::Property(property) = class.body[0] else {
+            panic!("expected property definition");
+        };
+        assert!(property.computed);
+        assert!(matches!(property.key, PropertyKey::Computed(_)));
+        assert_eq!(property.decorators.len(), 1);
+        assert!(matches!(property.decorators[0], Expression::Call(_)));
+    });
+}
+
+#[test]
 fn ts_arrow_parameters_support_optional_types_and_defaults() {
     parse_ok(
         "type Item = { id: string };
@@ -945,6 +1014,29 @@ fn parse_fingerprint_isolated_by_parse_configuration() {
         development.module.structure_hash(),
         "JSX dev 与 production 解析结果必须使用不同指纹"
     );
+}
+
+#[test]
+fn parse_output_owns_the_exact_source_used_by_ast_spans() {
+    let interner = Interner::new();
+    let output = {
+        let source = String::from("export const answer = 42;");
+        parse(&source, &interner, SourceType::Module)
+    };
+
+    assert_eq!(output.module.source(), Some("export const answer = 42;"));
+}
+
+#[test]
+fn parser_owned_ast_records_whether_recovery_reported_errors() {
+    let interner = Interner::new();
+    let valid = parse("value", &interner, SourceType::Module);
+    assert!(!valid.has_errors(), "{:?}", valid.diagnostics);
+    assert_eq!(valid.module.parser_had_errors(), Some(false));
+
+    let invalid = parse("0x", &interner, SourceType::Module);
+    assert!(invalid.has_errors(), "bare radix prefix must be rejected");
+    assert_eq!(invalid.module.parser_had_errors(), Some(true));
 }
 
 #[test]

@@ -46,7 +46,7 @@ cargo bench --workspace --no-run
 cargo test -p wake_bundler --test performance_invariants --release
 ```
 
-该门禁固定检查 edit-one 只读取并 codegen 一个模块、复用 resolver 拓扑和 link/chunk 规划。它不使用共享 runner 上不稳定的绝对毫秒数。
+该门禁固定检查 edit-one 只读取并 optimize/codegen 一个模块、复用 resolver 拓扑和 link/chunk 规划。它不使用共享 runner 上不稳定的绝对毫秒数。
 
 运行单项：
 
@@ -73,7 +73,35 @@ npm run bench
 
 `npm run bench` 和 `npm run compare` 共用同一 runner，对 Wake、Vite 和 webpack 执行正确性校验、纯构建墙钟、峰值内存和产物大小比较。跨工具比较必须确认各方使用相同模式、source map、minify、缓存和输出清理策略；否则只能作为探索数据。
 
-# 4. 启动与 npm 开销
+# 4. 压缩器体积与工作量门禁
+
+Closure 风格管线只使用 Wake 完全自有的源码语料和冻结旧数字，不复制或下载 Closure Compiler 或
+其他第三方压缩器的源码、测试、二进制和语料，也不增加 Cargo/Yarn 依赖。自动门禁由两层组成：
+`typed_pipeline_acceptance` 直接测量不含 runtime/header 与 map trailer 的 optimized-program JavaScript
+payload；bundler 自有语料再比较最终 bundle。局部 size-contingent rewrite 由 `typed_passes.rs`、
+`typed_inline.rs` 和 `typed_mangle.rs` 的 typed token cost 单元与反例测试约束。
+
+体积门禁按以下顺序执行：
+
+1. 生成代码必须重新解析，并通过未压缩/压缩 Node 运行时差分；
+2. 规范化出不含 runtime/header 和 source-map trailer 的 JS payload；每例必须 `new <= legacy`，
+   全部语料聚合必须 `new < legacy`；
+3. payload 不包含 `sourceMappingURL` trailer 与必须保留的产物头，mapped/unmapped 的 payload 必须相同；
+4. 记录固定点轮数、各 pass 变更计数和最终字节数；100 轮不收敛属于正确性失败，不作为性能样本；
+5. `BuildSemanticModel` work-count 必须证明无结构变化的 minify 只建立一次 typed analysis，结构变化后才在
+   下一次 binding-sensitive pass 前重建；
+6. 2k modules 与 edit-one 门禁验证优化任务的工作局部性，不使用源码长度退让换取吞吐。
+
+旧压缩器只以审阅过的数字基线存在，不保留第二条可执行路径。Typed primitive folding 使用实际最短
+literal/operator token cost；封闭函数与 primitive specialization 计入声明、调用次数、结果和必要括号；
+标识符/属性改名计入全部 live occurrences、保留名和 export/runtime 额外成本。只有不增长候选才提交，
+属性改名要求严格缩小。纯删除、合法性规范化和可信配置编辑不属于可选体积候选。
+
+局部 cost 函数与完整 emitter payload 门禁必须同时保留：新增候选必须有 precedence、separator、重复
+引用和改名交互反例。任何体积收益必须与语义、Source Map 和冷/热缓存证据一起报告；跨线程确定性结论
+必须来自实际 worker 矩阵，不能从稳定 ID 或 fingerprint 的存在推断。
+
+# 5. 启动与 npm 开销
 
 Node 包启动 smoke：
 
@@ -84,16 +112,25 @@ node scripts/check-startup.mjs
 
 该脚本用于发现加载器、平台包选择和 CLI 启动的大幅退化，不是稳定的毫秒级 SLA。安装验证使用 `npm run npm:pack:check` 和发布后的干净 registry smoke，关注是否触发源码编译或 postinstall。
 
-# 5. 冷、热与增量口径
+# 6. 冷、热与增量口径
 
 - 冷构建：新进程、无内存会话；是否保留 `.wake/cache.bin` 必须说明。
-- 持久化缓存构建：新进程但保留 cache，验证跳过 source read/parse/codegen 的程度。
+- 持久化缓存构建：新进程但保留 cache，验证跳过 source read/parse/optimize/codegen 的程度。
 - 热重建：同一 `BuildSession`/`BuildContext`，无变化或指定 changed paths。
 - Dev HMR：包含 watcher 合并、构建和消息发送；浏览器应用时间应单独测量。
 
-性能提升必须同时验证冷/热产物等价、诊断一致和缓存失效。只减少 `durationMs` 但改变代码、chunk 或错误不是有效优化。
+性能提升必须同时验证冷/热产物等价、诊断一致和缓存失效。压缩器版本（当前
+`wake-closure-minifier-v12`）、defines/drop flags、图/缓存中稳定的声明保留名、公开观察名与 star 事实、可信编辑和保留名参与
+相关身份；optimizer 内部解析的 `SymbolId` 以及 parser owner 的 interner identity 只对本次 AST 有效，
+不作为持久性能缓存身份。retained facts、final-layout JavaScript body 和 mapping facts 分阶段缓存；
+`want_map` 不进入 optimize/body 任务 key。启用 map 不得改变 JS payload 或重跑这两个阶段；只减少
+`durationMs` 但改变代码、chunk、map 或错误不是有效优化。
 
-# 6. 建立回归门禁的前置条件
+Source Map 合并必须对每个 module placement 只索引一次 generated token 位置；局部 mapping 随后按
+`(line, UTF-16 column)` 做精确或单列 separator 回退查询。不得让每条 mapping 从 token 列表头重新
+扫描，否则 React 等大型模块会形成 `O(mapping × token)`，使 mapped code-split/lazy 构建退化。
+
+# 7. 建立回归门禁的前置条件
 
 接入自动阈值前需要：
 

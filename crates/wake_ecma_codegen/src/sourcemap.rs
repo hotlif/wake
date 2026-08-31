@@ -24,6 +24,28 @@ pub struct Mapping {
     pub src_index: u32,
     /// 源码字节偏移（`Span::lo`）。
     pub src_offset: u32,
+    /// 可选原标识符名下标（对应模块或最终 [`SourceMap::names`]）。
+    /// Source Map V3 仅在该值存在时为当前段编码第五个 VLQ 字段。
+    pub name_index: Option<u32>,
+    /// `true` 表示 Source Map V3 的单字段段：该位置起生成代码不对应任何源位置。
+    ///
+    /// 这类段用于合成括号、链接器包装器和其它生成标点。源侧字段在这种段上被忽略；保留
+    /// 固定宽度结构是为了让热路径与持久缓存继续使用紧凑的 `Copy` 记录。
+    pub is_unmapped: bool,
+}
+
+impl Mapping {
+    /// 创建一个只携带生成列的 Source Map V3 unmapped segment。
+    pub const fn unmapped(gen_line: u32, gen_col: u32) -> Self {
+        Self {
+            gen_line,
+            gen_col,
+            src_index: 0,
+            src_offset: 0,
+            name_index: None,
+            is_unmapped: true,
+        }
+    }
 }
 
 /// 一个模块 codegen 产出的映射集合（模块内局部坐标，尚未平移到 bundle）。
@@ -31,6 +53,8 @@ pub struct Mapping {
 pub struct ModuleMappings {
     /// 按产物位置递增顺序记录的映射（`src_index` 此时恒为 0，合并时由 bundler 重写）。
     pub mappings: Vec<Mapping>,
+    /// 当前模块映射使用的原标识符名表；[`Mapping::name_index`] 指向这里。
+    pub names: Vec<String>,
 }
 
 impl ModuleMappings {
@@ -52,6 +76,8 @@ pub struct SourceMap {
     pub sources_content: Vec<Option<String>>,
     /// 全部映射（产物坐标须**按行、列递增**排序后才能正确编码）。
     pub mappings: Vec<Mapping>,
+    /// 原标识符名表；命名映射的第五字段指向这里。
+    pub names: Vec<String>,
     /// 可选的 `file` 字段（产物文件名）。
     pub file: Option<String>,
 }
@@ -68,6 +94,16 @@ impl SourceMap {
         (self.sources.len() - 1) as u32
     }
 
+    /// Deterministically intern an original identifier name in first-use order.
+    pub fn add_name(&mut self, name: impl Into<String>) -> u32 {
+        let name = name.into();
+        if let Some(index) = self.names.iter().position(|current| current == &name) {
+            return index as u32;
+        }
+        self.names.push(name);
+        (self.names.len() - 1) as u32
+    }
+
     /// 序列化为 Source Map V3 JSON。
     ///
     /// `resolve`：把 `(src_index, src_offset)` 还原为 `(行, 列)`（0 基、UTF-16）。由调用方
@@ -77,6 +113,16 @@ impl SourceMap {
         // mappings 必须按产物位置有序；调用方通常已有序，这里做一次稳定排序兜底。
         let mut sorted = self.mappings.clone();
         sorted.sort_by_key(|m| (m.gen_line, m.gen_col));
+        for mapping in &mut sorted {
+            if !mapping.is_unmapped
+                && mapping
+                    .name_index
+                    .is_some_and(|index| index as usize >= self.names.len())
+            {
+                debug_assert!(false, "source-map name index is out of bounds");
+                mapping.name_index = None;
+            }
+        }
 
         let mut out = String::with_capacity(sorted.len() * 8 + 256);
         out.push_str("{\"version\":3,");
@@ -102,7 +148,14 @@ impl SourceMap {
                 None => out.push_str("null"),
             }
         }
-        out.push_str("],\"names\":[],\"mappings\":\"");
+        out.push_str("],\"names\":[");
+        for (i, name) in self.names.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            json_string(&mut out, name);
+        }
+        out.push_str("],\"mappings\":\"");
         out.push_str(&encode_mappings(&sorted, &mut resolve));
         out.push_str("\"}");
         out
@@ -111,8 +164,9 @@ impl SourceMap {
 
 /// 把有序映射编码为 V3 的 `mappings` 字符串。
 ///
-/// 分号分隔产物行、逗号分隔段；每段 4 个 VLQ 字段（产物列、源下标、源行、源列），
-/// 除产物列在换行时重置外，其余三个字段**跨行连续**做差分（规范要求）。
+/// 分号分隔产物行、逗号分隔段；unmapped 段只有 1 个 VLQ 字段（产物列），普通段有
+/// 4 个字段（产物列、源下标、源行、源列），命名段追加第 5 个原名下标字段。除产物列在换行时重置外，
+/// 其余字段**跨行连续**做差分；unmapped 段不改变任何源侧差分基准。
 fn encode_mappings(sorted: &[Mapping], resolve: &mut impl FnMut(u32, u32) -> (u32, u32)) -> String {
     let mut out = String::new();
     // 差分基准（规范：产物列每行归零，其余三者全局连续）。
@@ -120,6 +174,7 @@ fn encode_mappings(sorted: &[Mapping], resolve: &mut impl FnMut(u32, u32) -> (u3
     let mut prev_src_index: i64 = 0;
     let mut prev_src_line: i64 = 0;
     let mut prev_src_col: i64 = 0;
+    let mut prev_name_index: i64 = 0;
     let mut cur_line: u32 = 0;
     let mut first_in_line = true;
 
@@ -136,12 +191,20 @@ fn encode_mappings(sorted: &[Mapping], resolve: &mut impl FnMut(u32, u32) -> (u3
         }
         first_in_line = false;
 
-        let (src_line, src_col) = resolve(m.src_index, m.src_offset);
         vlq(&mut out, m.gen_col as i64 - prev_gen_col);
+        prev_gen_col = m.gen_col as i64;
+        if m.is_unmapped {
+            continue;
+        }
+
+        let (src_line, src_col) = resolve(m.src_index, m.src_offset);
         vlq(&mut out, m.src_index as i64 - prev_src_index);
         vlq(&mut out, src_line as i64 - prev_src_line);
         vlq(&mut out, src_col as i64 - prev_src_col);
-        prev_gen_col = m.gen_col as i64;
+        if let Some(name_index) = m.name_index {
+            vlq(&mut out, name_index as i64 - prev_name_index);
+            prev_name_index = name_index as i64;
+        }
         prev_src_index = m.src_index as i64;
         prev_src_line = src_line as i64;
         prev_src_col = src_col as i64;
@@ -241,12 +304,16 @@ mod tests {
             gen_col: 0,
             src_index: idx,
             src_offset: 0,
+            name_index: None,
+            is_unmapped: false,
         });
         sm.mappings.push(Mapping {
             gen_line: 1,
             gen_col: 2,
             src_index: idx,
             src_offset: 11,
+            name_index: None,
+            is_unmapped: false,
         });
         // 源偏移 0 → (0,0)；偏移 11 → (1,0)
         let json = sm.to_json(|_, off| if off == 0 { (0, 0) } else { (1, 0) });
@@ -255,6 +322,10 @@ mod tests {
         assert!(json.contains("\"mappings\":\"AAAA;EACA\""), "实际: {json}");
         assert!(json.contains("\"version\":3"));
         assert!(json.contains("\"sources\":[\"a.js\"]"));
+        assert!(
+            json.contains("\"names\":[]"),
+            "ordinary mappings stay unnamed: {json}"
+        );
     }
 
     #[test]
@@ -267,6 +338,8 @@ mod tests {
             gen_col: 0,
             src_index: idx,
             src_offset: 0,
+            name_index: None,
+            is_unmapped: false,
         });
         let json = sm.to_json(|_, _| (0, 0));
         assert!(json.contains("\"mappings\":\";;;AAAA\""), "实际: {json}");
@@ -294,15 +367,98 @@ mod tests {
             gen_col: 0,
             src_index: idx,
             src_offset: 0,
+            name_index: None,
+            is_unmapped: false,
         });
         sm.mappings.push(Mapping {
             gen_line: 0,
             gen_col: 0,
             src_index: idx,
             src_offset: 0,
+            name_index: None,
+            is_unmapped: false,
         });
         let json = sm.to_json(|_, _| (0, 0));
         // 排序后：第 0 行一段、第 1 行一段
         assert!(json.contains("\"mappings\":\"AAAA;AAAA\""), "实际: {json}");
+    }
+
+    #[test]
+    fn named_segments_emit_names_and_a_fifth_vlq_field() {
+        let mut sm = SourceMap::new();
+        let idx = sm.add_source("a.js", Some("const descriptiveName = 1;".into()));
+        let name = sm.add_name("descriptiveName");
+        sm.mappings.push(Mapping {
+            gen_line: 0,
+            gen_col: 0,
+            src_index: idx,
+            src_offset: 0,
+            name_index: None,
+            is_unmapped: false,
+        });
+        sm.mappings.push(Mapping {
+            gen_line: 0,
+            gen_col: 6,
+            src_index: idx,
+            src_offset: 6,
+            name_index: Some(name),
+            is_unmapped: false,
+        });
+
+        let json = sm.to_json(|_, offset| (0, offset));
+        assert!(json.contains("\"names\":[\"descriptiveName\"]"), "{json}");
+        // First segment has four fields. The named segment has a fifth, zero-delta name field.
+        assert!(json.contains("\"mappings\":\"AAAA,MAAMA\""), "{json}");
+    }
+
+    #[test]
+    fn name_deltas_continue_across_unnamed_segments() {
+        let mut sm = SourceMap::new();
+        let source = sm.add_source("a.js", None);
+        let alpha = sm.add_name("alpha");
+        let beta = sm.add_name("beta");
+        for (gen_col, name_index) in [(0, Some(alpha)), (1, None), (2, Some(beta))] {
+            sm.mappings.push(Mapping {
+                gen_line: 0,
+                gen_col,
+                src_index: source,
+                src_offset: 0,
+                name_index,
+                is_unmapped: false,
+            });
+        }
+
+        let json = sm.to_json(|_, _| (0, 0));
+        assert!(json.contains("\"names\":[\"alpha\",\"beta\"]"), "{json}");
+        // `beta` is +1 from the prior named segment even though an unnamed segment sits between.
+        assert!(json.contains("\"mappings\":\"AAAAA,CAAA,CAAAC\""), "{json}");
+    }
+
+    #[test]
+    fn unmapped_segments_encode_only_the_generated_column() {
+        let mut sm = SourceMap::new();
+        let source = sm.add_source("a.js", Some("value".into()));
+        sm.mappings.push(Mapping {
+            gen_line: 0,
+            gen_col: 0,
+            src_index: source,
+            src_offset: 0,
+            name_index: None,
+            is_unmapped: false,
+        });
+        sm.mappings.push(Mapping::unmapped(0, 3));
+        sm.mappings.push(Mapping {
+            gen_line: 0,
+            gen_col: 4,
+            src_index: source,
+            src_offset: 1,
+            name_index: None,
+            is_unmapped: false,
+        });
+
+        let json = sm.to_json(|_, offset| (0, offset));
+        // `G` is the one-field generated-column delta (+3). The following mapped segment keeps
+        // source deltas relative to the preceding *mapped* segment, as required by V3.
+        assert!(json.contains("\"mappings\":\"AAAA,G,CAAC\""), "{json}");
     }
 }

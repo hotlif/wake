@@ -474,14 +474,12 @@ fn top_level_declaration(program: &Program, name: Atom) -> Option<Span> {
 /// 一次模块转换的产出。
 #[derive(Debug, Default)]
 pub struct TransformResult {
-    /// `span → 替换源码`（标签模板 span → JS 字符串字面量）。喂给 codegen 的
-    /// `MinifyCtx::expression_replacements`。
+    /// `span → 已验证表达式源码`（标签模板 span → JS 字符串字面量）。Bundler 将值解析为
+    /// optimizer-owned trusted expression edit；codegen 不读取这张输入表或任意源码片段。
     pub replacements: FxHashMap<Span, String>,
-    /// 替换文本直接复用了原源码的表达式范围；mangler 必须保留其中引用的绑定名。
-    pub verbatim_replacement_spans: Vec<Span>,
-    /// 已被完整静态消解、可从 codegen 删除的 CSS-in-JS import 语句。
+    /// 已被完整静态消解、可由优化器从 typed IR 结构化删除的 CSS-in-JS import 语句。
     pub removable_import_spans: Vec<Span>,
-    /// mixed import 中已静态消解、可不生成局部读取的 import binding span。
+    /// mixed import 中已静态消解、可由优化器删除的 import binding span。
     pub removable_import_binding_spans: Vec<Span>,
     /// 本模块抽取出的 CSS（已按声明序拼接）。
     pub css: String,
@@ -741,7 +739,7 @@ pub fn transform_with_class_prefix(
         imported: &imported,
     };
 
-    // 3) 抽取 css/keyframes/globalStyle，并写入 span replacement。
+    // 3) 抽取 css/keyframes/globalStyle，并记录结构化可信表达式编辑的目标和值。
     {
         let mut collector = Collector {
             interner,
@@ -773,7 +771,7 @@ pub fn transform_with_class_prefix(
     };
     usage.visit_program(program);
 
-    // import 的全部 specifier 都已消解时删整条语句，codegen 不再发出 require，
+    // import 的全部 specifier 都已消解时由优化器删整条语句，typed emitter 不再发出 require，
     // 随后的 dead-module elimination 就能把 @crab-dev/css 从模块图中移除。
     for stmt in program.body.iter() {
         let Statement::Import(imp) = stmt else {
@@ -914,7 +912,6 @@ impl<'ast> Visit<'ast> for CssInJsUsage<'_, '_> {
                 self.safe.insert(binding.symbol, false);
             } else if let Some(replacement) = cx_replacement(call, self.source) {
                 self.out.replacements.insert(call.span, replacement);
-                self.out.verbatim_replacement_spans.push(call.span);
             } else {
                 self.safe.insert(binding.symbol, false);
             }
@@ -1610,7 +1607,7 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-/// 生成合法的 JS 字符串字面量（`expression_replacements` 是裸文本插入，必须自行转义）。
+/// 生成合法的 JS 字符串字面量；该文本随后会被解析为可信表达式，必须自行转义。
 fn js_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

@@ -14,6 +14,7 @@ use wake_common::{Diagnostic, FileSystem, FxHashMap};
 use wake_ecma_codegen::ModuleLinker;
 
 mod chunk;
+mod concat;
 pub mod incremental;
 pub mod library;
 mod loader;

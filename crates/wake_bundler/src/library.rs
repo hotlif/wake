@@ -10,14 +10,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use wake_common::{FileSystem, FxHashMap, FxHashSet, Interner, OsFileSystem, fs::normalize};
-use wake_ecma_ast::{ImportSpecifier, ModuleExportName, SourceType, Statement};
+use wake_ecma_ast::SourceType;
 pub use wake_ecma_codegen::PreserveModuleFormat;
-use wake_ecma_codegen::{
-    ModuleSpecifierRewriter, codegen_preserved_module_mangled, preserved_import_namespace,
-};
-use wake_ecma_minify::MinifyCtx;
+use wake_ecma_codegen::{ModuleSpecifierRewriter, codegen_preserved_optimized};
+use wake_ecma_minify::{OptimizeInput, TrustedExpressionEdit, optimize};
 use wake_ecma_parser::{ParseOutput, parse};
-use wake_ecma_semantic::{DeclKind, analyze};
 use wake_resolver::{ModuleIdentity, ResolutionEnvironment, ResolveOptions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,6 +334,7 @@ impl LibraryGraph {
                 module,
                 current_output: file_name,
                 output_paths: &output_paths,
+                lower_dynamic_import_to_require: format == PreserveModuleFormat::CommonJs,
             };
             let code = module
                 .parsed
@@ -369,37 +367,40 @@ impl LibraryGraph {
                         ));
                     }
                     css.push_str(&transformed.css);
-                    let mut minify = MinifyCtx::default();
+                    let mut optimize_input = OptimizeInput::new(&module.source);
+                    optimize_input.minify = false;
                     if format == PreserveModuleFormat::CommonJs {
-                        minify
-                            .expression_replacements
-                            .extend(live_import_replacements(program, &self.interner));
+                        optimize_input.set_preserve_commonjs(true);
                     }
                     for (span, replacement) in &transformed.replacements {
-                        minify
-                            .expression_replacements
-                            .insert(*span, replacement.clone());
+                        let parsed_replacement =
+                            parse(replacement, &self.interner, SourceType::Module);
+                        optimize_input.add_expression_edit(
+                            TrustedExpressionEdit::from_parsed_program(
+                                *span,
+                                &parsed_replacement.module,
+                                &self.interner,
+                            ),
+                        );
                     }
-                    minify
-                        .remove_spans
-                        .extend(transformed.removable_import_spans.iter().copied());
-                    minify
-                        .unused_var_spans
-                        .extend(transformed.removable_import_binding_spans.iter().copied());
-                    let has_side_tables = !transformed.replacements.is_empty()
-                        || !transformed.removable_import_spans.is_empty()
-                        || !transformed.removable_import_binding_spans.is_empty()
-                        || !minify.expression_replacements.is_empty();
-                    Ok(codegen_preserved_module_mangled(
-                        program,
+                    optimize_input.extend_statement_removals(
+                        transformed.removable_import_spans.iter().copied(),
+                    );
+                    optimize_input.extend_binding_removals(
+                        transformed.removable_import_binding_spans.iter().copied(),
+                    );
+                    optimize_input.module_name = Some(path_to_slash(&module.path));
+                    let optimized = optimize(
+                        module.parsed.module.clone(),
+                        &self.interner,
+                        &optimize_input,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(codegen_preserved_optimized(
+                        &optimized,
                         &self.interner,
                         format,
                         &rewriter,
-                        &[],
-                        false,
-                        None,
-                        has_side_tables.then_some(&minify),
-                        false,
                     ))
                 })?;
             output.push(LibraryOutputModule {
@@ -554,68 +555,6 @@ fn dependency_analysis_target(dependency: &LibraryDependency) -> Option<u32> {
     }
 }
 
-fn live_import_replacements(
-    program: &wake_ecma_ast::Program,
-    interner: &Interner,
-) -> FxHashMap<wake_common::Span, String> {
-    let mut declaration_expressions = FxHashMap::default();
-    for statement in program.body.iter() {
-        let Statement::Import(import) = statement else {
-            continue;
-        };
-        let namespace = preserved_import_namespace(import.span);
-        for specifier in import.specifiers.iter() {
-            match specifier {
-                ImportSpecifier::Default { local, .. } => {
-                    declaration_expressions.insert(
-                        local.span,
-                        format!(
-                            "({namespace} && {namespace}.__esModule ? {namespace}.default : {namespace})"
-                        ),
-                    );
-                }
-                ImportSpecifier::Namespace { local, .. } => {
-                    declaration_expressions
-                        .insert(local.span, format!("__wake_interop_star({namespace})"));
-                }
-                ImportSpecifier::Named {
-                    imported, local, ..
-                } => {
-                    let imported = match imported {
-                        ModuleExportName::Ident(identifier) => interner.resolve(identifier.name),
-                        ModuleExportName::String(value) => interner.resolve(*value),
-                    };
-                    declaration_expressions
-                        .insert(local.span, format!("{namespace}[{imported:?}]"));
-                }
-            }
-        }
-    }
-    if declaration_expressions.is_empty() {
-        return FxHashMap::default();
-    }
-
-    let semantic = analyze(program);
-    let mut symbol_expressions = FxHashMap::default();
-    for (symbol_id, symbol) in semantic.symbols.iter().enumerate() {
-        if symbol.decl_kind == DeclKind::Import
-            && let Some(expression) = declaration_expressions.get(&symbol.span)
-        {
-            symbol_expressions.insert(symbol_id as u32, expression.clone());
-        }
-    }
-    semantic
-        .references
-        .iter()
-        .filter_map(|reference| {
-            let symbol = reference.resolved?;
-            symbol_expressions
-                .get(&symbol)
-                .map(|expression| (reference.span, expression.clone()))
-        })
-        .collect()
-}
-
 fn assign_module(
     identity: ModuleIdentity,
     path: PathBuf,
@@ -645,6 +584,7 @@ struct GraphSpecifierRewriter<'a> {
     module: &'a LibraryModule,
     current_output: &'a Path,
     output_paths: &'a FxHashMap<u32, PathBuf>,
+    lower_dynamic_import_to_require: bool,
 }
 
 impl ModuleSpecifierRewriter for GraphSpecifierRewriter<'_> {
@@ -662,6 +602,10 @@ impl ModuleSpecifierRewriter for GraphSpecifierRewriter<'_> {
             self.current_output.parent().unwrap_or(Path::new("")),
             target,
         ))
+    }
+
+    fn lower_dynamic_import_to_require(&self) -> bool {
+        self.lower_dynamic_import_to_require
     }
 }
 
@@ -1089,6 +1033,127 @@ export async function lazy() { return (await import('./lazy.js')).answer; }"#,
             "status={:?} stderr={}",
             result.status.code(),
             String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn direct_commonjs_jsx_runtime_replacement_targets_only_the_synthetic_callee() {
+        let project = tempdir().unwrap();
+        write(
+            &project.path().join("package.json"),
+            r#"{"name":"example"}"#,
+        );
+        write(
+            &project.path().join("src/index.tsx"),
+            "const _wi0_0 = 'answer'; export default <button>{_wi0_0}</button>;",
+        );
+
+        let graph =
+            LibraryGraph::scan(LibraryGraphOptions::new(project.path(), "src/index.tsx")).unwrap();
+        let cjs = graph.emit(PreserveModuleFormat::CommonJs).unwrap();
+        let entry = &cjs.modules[0].code;
+        assert!(
+            entry.contains("require(\"react/jsx-runtime\")")
+                && entry.contains("[\"jsx\"])(\"button\"")
+                && entry.contains("const _wi0_0 = \"answer\""),
+            "the semantic `_jsx` import binding must replace only the call callee:\n{entry}"
+        );
+        assert!(
+            !entry.contains("[\"Fragment\"])(\"button\"")
+                && !entry.contains("exports.default = __wake_namespace_0[\"jsx\"];")
+                && !entry.contains("exports.default=_wi0_0_1[\"jsx\"];"),
+            "the enclosing JSX call must not be replaced by a shared-span edit:\n{entry}"
+        );
+        let reparsed = parse(entry, &Interner::new(), SourceType::Script);
+        assert!(
+            !reparsed.has_errors(),
+            "{:?}\n{entry}",
+            reparsed.diagnostics
+        );
+    }
+
+    #[test]
+    fn direct_commonjs_import_reads_preserve_call_receiver_and_object_shorthand() {
+        if !node_available() {
+            return;
+        }
+        let project = tempdir().unwrap();
+        write(
+            &project.path().join("package.json"),
+            r#"{"name":"example"}"#,
+        );
+        write(
+            &project.path().join("src/index.ts"),
+            "import { check } from './dep.js'; import * as namespace from './plain.js'; export const direct = check(); export const holder = { check }; export const stable = namespace === namespace; export { namespace };",
+        );
+        write(
+            &project.path().join("src/dep.ts"),
+            "export const marker = 'namespace'; export function check() { return this && this.marker || 'value'; }",
+        );
+        write(
+            &project.path().join("src/plain.js"),
+            "module.exports = { value: 1 };",
+        );
+
+        let graph =
+            LibraryGraph::scan(LibraryGraphOptions::new(project.path(), "src/index.ts")).unwrap();
+        let cjs = graph.emit(PreserveModuleFormat::CommonJs).unwrap();
+        let output = project.path().join("out/cjs");
+        write_output(&output, &cjs);
+        let entry_code = &cjs
+            .modules
+            .iter()
+            .find(|module| module.id == 0)
+            .expect("entry module")
+            .code;
+        assert!(
+            entry_code.contains("const holder = { check: __wake_namespace_0[\"check\"] }"),
+            "object shorthand must become a value read without retaining a receiver:\n{entry_code}"
+        );
+
+        let entry = output
+            .join("index.cjs")
+            .to_string_lossy()
+            .replace('\\', "\\\\");
+        let script = format!(
+            "const m=require(\"{entry}\");if(m.direct!=='value'||m.holder.check()!=='value')throw Error('receiver');if(!m.stable||m.namespace!==m.namespace)throw Error('identity');process.stdout.write('OK')"
+        );
+        let result = Command::new("node").args(["-e", &script]).output().unwrap();
+        assert!(
+            result.status.success() && result.stdout == b"OK",
+            "status={:?} stderr={} entry={entry_code}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn direct_commonjs_import_write_targets_are_never_replaced() {
+        let project = tempdir().unwrap();
+        write(
+            &project.path().join("package.json"),
+            r#"{"name":"example"}"#,
+        );
+        write(
+            &project.path().join("src/index.ts"),
+            "import { value } from './dep.js'; try { value = 1; value++; for (value in { x: 1 }) break; for (value of [1]) break; } catch {}",
+        );
+        write(&project.path().join("src/dep.ts"), "export let value = 0;");
+
+        let graph =
+            LibraryGraph::scan(LibraryGraphOptions::new(project.path(), "src/index.ts")).unwrap();
+        let cjs = graph.emit(PreserveModuleFormat::CommonJs).unwrap();
+        let entry = &cjs.modules[0].code;
+        assert!(!entry.contains("0,_wi"), "{entry}");
+        assert!(entry.contains("value = 1"), "{entry}");
+        assert!(entry.contains("value++"), "{entry}");
+        assert!(entry.contains("for (value in"), "{entry}");
+        assert!(entry.contains("for (value of"), "{entry}");
+        let reparsed = parse(entry, &Interner::new(), SourceType::Script);
+        assert!(
+            !reparsed.has_errors(),
+            "{:?}\n{entry}",
+            reparsed.diagnostics
         );
     }
 }

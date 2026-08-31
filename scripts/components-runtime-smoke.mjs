@@ -94,7 +94,10 @@ export async function assertComponentsRuntime(entryPath) {
 
   const [iconModuleId] = findSingleModule(
     runtime,
-    (factory) => /createLucideIcon\(["']sliders-horizontal["']/.test(factory),
+    (factory) =>
+      /(?:createLucideIcon|\(\s*0\s*,\s*[$\w]+\.default\s*\))\(\s*["']sliders-horizontal["']/.test(
+        factory,
+      ),
     'SlidersHorizontal icon',
   )
   const iconModule = runtime.require(Number(iconModuleId))
@@ -111,7 +114,9 @@ export async function assertComponentsRuntime(entryPath) {
       `${escapeRegExp(bindings.requireName)}\\(\\s*${iconModuleId}\\s*\\)`,
     )
     const exportedIcon = new RegExp(
-      `${escapeRegExp(bindings.exportsName)}\\.SlidersHorizontal\\s*=`,
+      `(?:${escapeRegExp(bindings.exportsName)}\\.SlidersHorizontal\\s*=` +
+        `|Object\\.defineProperty\\(\\s*${escapeRegExp(bindings.exportsName)}\\s*,` +
+        `\\s*["']SlidersHorizontal["'])`,
     )
     return requiredIcon.test(source) && exportedIcon.test(source)
   })

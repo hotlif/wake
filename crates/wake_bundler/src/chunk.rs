@@ -28,6 +28,7 @@ use wake_common::{FxHashMap, FxHashSet};
 use crate::ChunkKind;
 
 /// 一个模块的依赖边（供 chunk 划分）。
+#[derive(Clone)]
 pub(crate) struct ModuleEdges {
     /// 静态依赖目标模块 id（import / export-from / require；去重排序）。
     pub static_targets: Vec<u32>,

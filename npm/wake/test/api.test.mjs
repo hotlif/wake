@@ -495,6 +495,48 @@ test('writes an executable Node CommonJS bundle to an exact outfile', async () =
   await rm(cwd, { recursive: true, force: true })
 })
 
+test('minifies with a source map without changing the JavaScript payload', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-node-minified-map-'))
+  const outfile = join(cwd, 'dist', 'bundle.cjs')
+  try {
+    await writeFile(join(cwd, 'package.json'), '{"name":"minified-map-fixture"}')
+    await writeFile(
+      join(cwd, 'entry.js'),
+      'function compute(descriptiveParameter) { const foldedValue = 1 + 2; return descriptiveParameter + foldedValue; } export const answer = compute(39);',
+    )
+
+    const unmapped = await bundle({
+      cwd,
+      entry: 'entry.js',
+      outfile,
+      platform: 'node',
+      minify: true,
+    })
+    const mapped = await bundle({
+      cwd,
+      entry: 'entry.js',
+      outfile,
+      platform: 'node',
+      minify: true,
+      sourceMap: true,
+    })
+
+    const trailer = '//# sourceMappingURL=bundle.cjs.map\n'
+    assert.equal(unmapped.success, true)
+    assert.equal(mapped.success, true)
+    assert.equal(typeof mapped.sourceMap, 'string')
+    assert.equal(mapped.sourceMapFile, `${outfile}.map`)
+    assert.ok(mapped.files.some((file) => file.kind === 'map'))
+    assert.ok(mapped.code.endsWith(trailer))
+    assert.equal(mapped.code.slice(0, -trailer.length), unmapped.code)
+    assert.equal(await readFile(outfile, 'utf8'), mapped.code)
+    assert.equal(await readFile(`${outfile}.map`, 'utf8'), mapped.sourceMap)
+    assert.equal(require(outfile).answer, 42)
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
     server.once('error', reject)
@@ -865,7 +907,7 @@ test('normalizes cancellation and configuration failures', async () => {
   )
 
   await assert.rejects(
-    bundle({ minify: true, sourceMap: true }),
+    bundle({ platform: 'node', format: 'iife' }),
     (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
   )
 })

@@ -14,6 +14,7 @@ wake_common.workspace = true
 wake_turbo_macros.workspace = true
 rustc-hash.workspace = true
 xxhash-rust.workspace = true
+crossbeam-utils.workspace = true
 
 # 工作窃取执行器（crossbeam-deque）：仅非 loom 构建需要。loom 验证独立 single-flight 模型，
 # 不碰执行器；排除 crossbeam 也避开其构建脚本触发 Windows Defender 误报（os error 225）。

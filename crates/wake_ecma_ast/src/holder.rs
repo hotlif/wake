@@ -19,6 +19,7 @@
 //! 4. 指纹用 AST 的 **结构** hash（构建时顺手算），绝不用指针地址——重启/复用池后指针会变。
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use bumpalo::Bump;
 use wake_common::{Hash64, Interner};
@@ -47,6 +48,15 @@ pub struct ModuleAst {
     /// **字段顺序要紧**：`program` 先 drop（bumpalo `Vec` 析构需读 arena，彼时 arena 仍在），
     /// `arena` 后 drop 释放内存。
     program: Program<'static>,
+    /// Exact source bytes used to parse this program, when the holder came from a parser.
+    /// Hand-built ASTs may omit source ownership and therefore cannot enter source-driven
+    /// optimization without an explicit test-only seam.
+    source: Option<Arc<str>>,
+    /// Process-local identity of the interner which created this parser AST's `Atom` values.
+    interner_identity: Option<u64>,
+    /// Whether the parser recovered from at least one error while producing this tree. `None`
+    /// identifies hand-built or cloned ASTs which cannot act as syntax-validation evidence.
+    parser_had_errors: Option<bool>,
     /// 裸指针持有的堆上 arena（见不变量 2）。仅为其 Drop 副作用存在（释放 arena），故加 `_` 前缀。
     _arena: ArenaOwner,
     /// 构建时算好的结构指纹（早期截断 / 缓存键用）。
@@ -94,6 +104,9 @@ impl ModuleAst {
 
         ModuleAst {
             program,
+            source: None,
+            interner_identity: None,
+            parser_had_errors: None,
             _arena: ArenaOwner(ptr),
             structure_hash,
         }
@@ -120,10 +133,34 @@ impl ModuleAst {
 
         ModuleAst {
             program,
+            source: None,
+            interner_identity: None,
+            parser_had_errors: None,
             _arena: ArenaOwner(ptr),
             structure_hash,
         }
     }
+
+    /// Build a parser-owned AST while retaining the exact source bytes that define every span.
+    ///
+    /// Keeping source identity in the same owner prevents downstream optimization from pairing a
+    /// valid AST with a different, merely same-length string.
+    #[doc(hidden)]
+    pub fn from_source_builder_prehashed<F>(
+        source: Arc<str>,
+        interner_identity: u64,
+        structure_hash: Hash64,
+        build: F,
+    ) -> ModuleAst
+    where
+        F: for<'a> FnOnce(&'a Bump) -> Program<'a>,
+    {
+        let mut module = Self::from_builder_prehashed(structure_hash, build);
+        module.source = Some(source);
+        module.interner_identity = Some(interner_identity);
+        module
+    }
+
     /// 便捷构造：样例 AST `let sum = 0 + 1 + ... + depth;`（spike 演示用）。
     pub fn build_sample(interner: &Interner, depth: u32) -> ModuleAst {
         ModuleAst::from_builder(|arena| crate::build_sample(arena, interner, depth))
@@ -134,6 +171,27 @@ impl ModuleAst {
         // 把 'static 视图协变收窄到本次借用的生命周期。
         let program: &Program<'static> = &self.program;
         f(program)
+    }
+
+    /// Exact parser source backing this AST's spans. Hand-built holders return `None`.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Process-local identity of the interner backing this parser-owned AST.
+    pub const fn interner_identity(&self) -> Option<u64> {
+        self.interner_identity
+    }
+
+    /// Parser recovery status carried by the AST owner. Hand-built/cloned trees return `None`.
+    pub const fn parser_had_errors(&self) -> Option<bool> {
+        self.parser_had_errors
+    }
+
+    /// Attach parser recovery status before the owner is shared through `Arc`.
+    #[doc(hidden)]
+    pub fn set_parser_had_errors(&mut self, had_errors: bool) {
+        self.parser_had_errors = Some(had_errors);
     }
 
     /// 结构指纹（构建时算好，O(1) 读取）。
@@ -197,6 +255,25 @@ mod tests {
         });
         assert_eq!(nums, 5); // 0..=4
         assert_eq!(binaries, 4);
+    }
+
+    #[test]
+    fn parser_owned_holder_keeps_exact_source_bytes() {
+        let interner = Interner::new();
+        let ast = {
+            let source: Arc<str> = Arc::from("const answer = 42;");
+            ModuleAst::from_source_builder_prehashed(source, interner.identity(), 7, |arena| {
+                Program::new_in(arena, SourceType::Module)
+            })
+        };
+
+        assert_eq!(ast.source(), Some("const answer = 42;"));
+        assert_eq!(ast.interner_identity(), Some(interner.identity()));
+        assert!(
+            ModuleAst::from_builder(|arena| { Program::new_in(arena, SourceType::Module) })
+                .source()
+                .is_none()
+        );
     }
 
     fn count(e: &Expression<'_>, nums: &mut u32, bins: &mut u32) {

@@ -1,44 +1,48 @@
-//! # wake_ecma_minify — JavaScript Minifier
+//! # wake_ecma_minify — owned Closure-style JavaScript optimizer
 //!
-//! Progressive minification passes for the wake bundler.
-//!
-//! ## Architecture
-//!
-//! All passes produce **side-tables** consumed by `wake_ecma_codegen` at emit time.
-//! The AST itself is never mutated (it lives in a frozen bump arena).
-//!
-//! ## Passes
-//!
-//! | Module | Phase | Description |
-//! |--------|-------|-------------|
-//! | [`mangle`] | ✅ M4 | Scope-safe identifier renaming (a→b, c→d) |
-//! | [`const_eval`] | 🏗️ 2.1 | Compile-time expression evaluation engine |
-//! | [`purity`] | 🏗️ 1.3 | Function purity / side-effect analysis |
-//! | [`analyze`] | 🏗️ 2.3 | Variable usage (reference counting, scope tracking) |
-//! | [`simplify`] | 🏗️ 2.1 | Expression simplification planner |
-//! | [`ctx`] | 🏗️ 4.1 | Aggregated minification context |
+//! [`optimize`] lowers a parser-owned frozen AST once into [`codegen_bridge::TypedProgram`], applies
+//! trusted structural edits, runs an explicitly ordered fixed-point pipeline, finalizes safe
+//! names, and returns a lifetime-independent [`OptimizedProgram`]. No parser-AST or span-side-table
+//! optimization path remains.
 
-pub mod analyze;
-pub mod const_eval;
-pub mod ctx;
-pub mod dce;
-pub mod hoist;
-pub mod mangle;
-pub mod prop_mangle;
-pub mod purity;
-pub mod simplify;
-pub mod statements;
+mod const_eval;
+mod optimizer;
+mod owned_optimizer;
 
-pub use analyze::*;
-pub use const_eval::*;
-pub use ctx::*;
-pub use dce::*;
-pub use hoist::*;
-pub use mangle::*;
-pub use prop_mangle::*;
-pub use purity::*;
-pub use simplify::*;
-pub use statements::*;
+mod typed_analysis;
+mod typed_decorators;
+mod typed_edits;
+mod typed_inline;
+mod typed_ir;
+mod typed_lowering;
+mod typed_mangle;
+mod typed_modules;
+mod typed_passes;
+mod typed_pipeline;
+
+/// Narrow implementation bridge used only by `wake_ecma_codegen` to emit an optimizer-owned
+/// program. This is not a second optimization entry point.
+#[doc(hidden)]
+pub mod codegen_bridge {
+    pub use crate::const_eval::write_number_minified;
+    pub use crate::typed_ir::{
+        ArrowBodyKind, ClassContext, ExportDefaultValueKind, ForInitializerKind, ForLeftKind,
+        FunctionContext, ImportSpecifierKind, IrList, IrModuleName, IrName, IrNode, IrNodeData,
+        IrOrigin, IrPropertyKey, ListId, ModuleNameKind, NameId, NameRole, NameSyntax, NodeId,
+        PropertyKeyKind, SyntheticOriginKind, TypedIrError, TypedProgram,
+    };
+    pub use crate::typed_modules::{
+        FinalizedTypedProgram, TypedChunkId, TypedDiscardedStaticRequest, TypedFinalModuleFacts,
+        TypedFinalModuleReport, TypedFinalModuleTarget, TypedModuleError, TypedModuleId,
+        TypedModuleMode, TypedModulePlan, TypedModuleRequestEdge, TypedModuleRequestKind,
+        TypedModuleSpecifierRewrite, TypedResolvedModule, finalize_owned_typed_modules,
+        finalize_typed_modules,
+    };
+}
+
+pub use const_eval::ConstVal;
+pub(crate) use const_eval::write_number_minified;
+pub use optimizer::*;
 
 #[cfg(test)]
 mod tests;

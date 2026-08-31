@@ -1,14 +1,14 @@
 //! # 增量 + 并行打包（引擎接入，PLAN §3.2 / DESIGN §10.3、§10.6）
 //!
-//! 把 `parse` 与 `codegen` 两个最贵环节接入 wake_turbo 引擎，实现：
-//! - **第二遍构建全管线缓存命中**（内容/依赖未变 → parse/codegen 浅绿命中，零重执行）；
+//! 把 `parse`、`optimize`、`emit_body` 与 `source_map_facts` 接入 wake_turbo 引擎，实现：
+//! - **第二遍构建全管线缓存命中**（内容/依赖未变 → 各阶段浅绿命中，零重执行）；
 //! - **Scan 全并行**（DESIGN §10.6）：**分层 BFS**，每层用工作窃取执行器 `par_request` 并行 parse；
-//!   codegen 阶段同样并行。
+//!   optimize/body 阶段同样并行。
 //!
 //! ## cycle-safe 说明
 //!
-//! parse/codegen 任务**互不递归请求**（parse 只依赖自己的内容 cell）——任务图是「从内容 cell
-//! 发散的星形」，**无环**。模块*依赖*图的循环由驱动层 BFS 的逻辑模块身份去重集合处理，
+//! 任务按 parse → optimize → body → optional map 单向依赖，**无环**。模块*依赖*图的循环由
+//! 驱动层 BFS 的逻辑模块身份去重集合处理，
 //! 不会造成任务图环 / single-flight 死锁。故并行 scan **不需要 SCC 成组**（那是「full scan-as-tasks」
 //! 递归请求路线才需要的，此处务实绕开）。
 //!
@@ -25,25 +25,26 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_utils::CachePadded;
 use wake_cache::{
-    BuildCache, CachedDep, CachedLiveness, CachedNamedImport, CachedUse, FileStamp, ModuleSummary,
+    BuildCache, CachedDep, CachedDiscardedStaticRequest, CachedLiveness, CachedMapping,
+    CachedModuleMappings, CachedNamedImport, CachedUse, FileStamp, ModuleSummary,
 };
 use wake_common::{
     Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, SourceFile, Span, fs::normalize,
 };
 use wake_ecma_ast::{
-    DependencyKind, ExportDefaultKind, ModuleAst, ModuleExportName, Pattern, Program, SourceType,
-    Statement,
+    DependencyKind, Expression, MemberProperty, ModuleAst, Program, SourceType, Statement,
+    UnaryOperator,
 };
 use wake_ecma_codegen::{
-    ConcatBlockInfo, Mapping, ModuleMappings, SourceMap, codegen_module_shaken_mangled,
-    codegen_module_shaken_with_map, concat_block_info,
+    GeneratedDiscardedStaticRequest, Mapping, ModuleMappings, SourceMap,
+    codegen_optimized_with_map_and_requests,
 };
 use wake_ecma_minify::{
-    MinifyCtx, SimplifyAction, analyze_dce, analyze_vars_with_model, collect_init_map, has_hazard,
-    is_undefined_shadowed, plan_mangle_with_model_and_protected, plan_simplifications,
+    ConstVal, LinkerExportLiveness, NodeOrigin, OptimizeDependency, OptimizeInput,
+    OptimizedProgram, PIPELINE_VERSION, SyntheticReason, TrustedExpression, TrustedExpressionEdit,
+    ValidatedDefine, optimize, optimize_one_shot,
 };
-use wake_ecma_parser::parse_with;
-use wake_ecma_semantic::analyze;
+use wake_ecma_parser::{parse, parse_with};
 use wake_ecma_transform::{FeatureSet, TargetEnv};
 use wake_graph::{
     ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
@@ -57,6 +58,7 @@ use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, global_executor, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
+use crate::concat::{ConcatBlockInfo, scan_concat_block_info};
 use crate::loader::{
     LoadOptions, Loaded, cached_source_type, is_asset_path, load_source, push_js_string,
 };
@@ -78,7 +80,12 @@ type LoadedResult = (
     Option<u64>,
 );
 enum ResolveResult {
-    Internal(ResolvedModule),
+    Internal {
+        module: ResolvedModule,
+        /// One-shot cold builds may prove an exact relative file while reading it. Carry that
+        /// immutable loader result into the next BFS layer instead of reopening the same file.
+        prefetched: Option<Arc<Loaded>>,
+    },
     External(String),
     Error,
 }
@@ -87,6 +94,7 @@ type CodegenExecCounts = Arc<[CachePadded<AtomicU64>]>;
 /// I/O 小任务的目标批次数：既给工作窃取留出余量，又避免为数千个小文件逐个分配
 /// `Job`、逐个经 channel 回传。最终顺序仍由调用方的索引槽位恢复。
 const IO_BATCHES_PER_WORKER: usize = 4;
+const CPU_BATCHES_PER_WORKER: usize = 32;
 const CODEGEN_COUNTER_SHARDS: usize = 64;
 
 fn file_stamp(path: &Path) -> Option<FileStamp> {
@@ -143,6 +151,22 @@ fn into_bounded_batches<T>(items: Vec<T>, max_batches: usize) -> Vec<Vec<T>> {
     .collect()
 }
 
+/// Return the literal candidate for the narrow resolve+load fusion fast path.
+///
+/// Relative specifiers are resolved before aliases in `wake_resolver`; requiring an explicit,
+/// non-empty extension excludes extension completion and directory entry selection. A failed
+/// read is never authoritative: the caller must fall back to the regular resolver so TS twins,
+/// directory indexes and canonical diagnostics retain their existing behavior.
+fn exact_relative_file_candidate(specifier: &str, from_dir: &Path) -> Option<PathBuf> {
+    let path = Path::new(specifier);
+    let explicit_relative = specifier.starts_with("./") || specifier.starts_with("../");
+    (explicit_relative
+        && path
+            .extension()
+            .is_some_and(|extension| !extension.is_empty()))
+    .then(|| normalize(&from_dir.join(path)))
+}
+
 /// 小模块的 parse/codegen 本身很快，逐模块穿过 `Executor` 的 boxed job + mpsc 会放大固定开销。
 /// 外层每个任务处理一个连续小批次；`Engine::enter` 仍覆盖批内全部 query，结果按批次与批内顺序展平。
 fn par_request_batched<T, F>(engine: &Arc<Engine>, exec: &Executor, requests: Vec<F>) -> Vec<T>
@@ -150,7 +174,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let max_batches = exec.num_threads().saturating_mul(IO_BATCHES_PER_WORKER);
+    let max_batches = exec.num_threads().saturating_mul(CPU_BATCHES_PER_WORKER);
     let batches: Vec<_> = into_bounded_batches(requests, max_batches)
         .into_iter()
         .map(|batch| {
@@ -196,6 +220,221 @@ mod batching_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod exact_relative_prefetch_tests {
+    use std::io;
+
+    use wake_common::MemoryFileSystem;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingFileSystem {
+        inner: MemoryFileSystem,
+        reads: Mutex<FxHashMap<PathBuf, usize>>,
+        file_probes: Mutex<FxHashMap<PathBuf, usize>>,
+    }
+
+    impl CountingFileSystem {
+        fn insert(&self, path: impl AsRef<Path>, contents: impl Into<Vec<u8>>) {
+            self.inner.insert(path, contents);
+        }
+
+        fn reads(&self, path: &str) -> usize {
+            self.reads
+                .lock()
+                .unwrap()
+                .get(&normalize(Path::new(path)))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn file_probes(&self, path: &str) -> usize {
+            self.file_probes
+                .lock()
+                .unwrap()
+                .get(&normalize(Path::new(path)))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn record(counter: &Mutex<FxHashMap<PathBuf, usize>>, path: &Path) {
+            *counter.lock().unwrap().entry(normalize(path)).or_default() += 1;
+        }
+    }
+
+    impl FileSystem for CountingFileSystem {
+        fn read_to_string(&self, path: &Path) -> io::Result<String> {
+            Self::record(&self.reads, path);
+            self.inner.read_to_string(path)
+        }
+
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            Self::record(&self.reads, path);
+            self.inner.read(path)
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            Self::record(&self.file_probes, path);
+            self.inner.is_file(path)
+        }
+
+        fn is_dir(&self, path: &Path) -> bool {
+            self.inner.is_dir(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.inner.read_dir(path)
+        }
+    }
+
+    fn exact_fixture() -> Arc<CountingFileSystem> {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert(
+            "src/index.js",
+            "import { value } from './dep.js'; export { value };",
+        );
+        fs.insert("src/dep.js", "export const value = 1;");
+        fs
+    }
+
+    #[test]
+    fn exact_relative_candidate_has_the_proven_narrow_shape() {
+        assert_eq!(
+            exact_relative_file_candidate("./dep.js", Path::new("src/nested")),
+            Some(PathBuf::from("src/nested/dep.js"))
+        );
+        assert_eq!(
+            exact_relative_file_candidate("../dep.ts", Path::new("src/nested")),
+            Some(PathBuf::from("src/dep.ts"))
+        );
+        for specifier in ["dep.js", "./dep", "../dep", "/dep.js", "./.js"] {
+            assert_eq!(
+                exact_relative_file_candidate(specifier, Path::new("src")),
+                None,
+                "{specifier} must use the canonical resolver"
+            );
+        }
+    }
+
+    #[test]
+    fn one_shot_exact_relative_prefetch_reads_the_dependency_once_without_stat() {
+        let fs = exact_fixture();
+        let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 2);
+        assert_eq!(fs.reads("src/dep.js"), 1);
+        assert_eq!(fs.file_probes("src/dep.js"), 0);
+        assert_eq!(bundler.load_exec_count(), 2);
+    }
+
+    #[test]
+    fn non_one_shot_and_load_cached_builds_keep_the_canonical_resolver_path() {
+        let regular_fs = exact_fixture();
+        let mut regular = IncrementalBundler::new(regular_fs.clone());
+        let regular_output = regular.build(Path::new("src/index.js"));
+        assert!(
+            !regular_output.has_errors(),
+            "{:?}",
+            regular_output.diagnostics
+        );
+        assert!(regular_fs.file_probes("src/dep.js") > 0);
+
+        let cached_fs = exact_fixture();
+        let mut cached = IncrementalBundler::new_one_shot(cached_fs.clone());
+        cached.enable_load_cache();
+        let cached_output = cached.build(Path::new("src/index.js"));
+        assert!(
+            !cached_output.has_errors(),
+            "{:?}",
+            cached_output.diagnostics
+        );
+        assert!(cached_fs.file_probes("src/dep.js") > 0);
+    }
+
+    #[test]
+    fn failed_exact_prefetch_falls_back_to_the_typescript_twin() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert(
+            "src/index.js",
+            "import { value } from './dep.js'; export { value };",
+        );
+        fs.insert("src/dep.ts", "export const value: number = 1;");
+        let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 2);
+        assert_eq!(
+            fs.reads("src/dep.js"),
+            1,
+            "the failed probe is attempted once"
+        );
+        assert_eq!(
+            fs.reads("src/dep.ts"),
+            1,
+            "the resolved twin is loaded once"
+        );
+        assert!(fs.file_probes("src/dep.js") > 0);
+    }
+
+    #[test]
+    fn failed_exact_prefetch_falls_back_to_directory_resolution() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert("src/index.js", "export { value } from './dir.js';");
+        fs.insert("src/dir.js/index.js", "export const value = 1;");
+        let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 2);
+        assert_eq!(fs.reads("src/dir.js"), 1);
+        assert_eq!(fs.reads("src/dir.js/index.js"), 1);
+    }
+
+    #[test]
+    fn explicit_external_is_classified_before_prefetch() {
+        let fs = exact_fixture();
+        let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+        bundler.set_external_packages(vec!["./dep.js".into()]);
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 1);
+        assert_eq!(fs.reads("src/dep.js"), 0);
+        assert_eq!(fs.file_probes("src/dep.js"), 0);
+    }
+
+    #[test]
+    fn node_browser_resource_is_not_read_before_its_canonical_diagnostic() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert("src/index.js", "import './style.css';");
+        fs.insert("src/style.css", "body { color: red; }");
+        let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+        bundler
+            .set_platform(BuildPlatform::Node)
+            .set_module_format(ModuleFormat::CommonJs);
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(output.has_errors());
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0303"))
+        );
+        assert_eq!(fs.reads("src/style.css"), 0);
+        assert!(fs.file_probes("src/style.css") > 0);
+    }
+}
+
 #[derive(Clone)]
 struct MemoryScanSummary {
     persisted: Arc<ModuleSummary>,
@@ -213,9 +452,16 @@ struct StableModuleGraph {
 #[derive(Clone)]
 struct LinkPlan {
     fingerprint: u64,
-    keep: FxHashMap<u32, Option<Vec<String>>>,
-    chunk_graph: Option<ChunkGraph>,
-    async_ids: FxHashSet<u32>,
+    keep: FxHashMap<u32, Option<ExportKeep>>,
+}
+
+/// Stable linker facts crossing into one optimizer task. Declaration retention and public-name
+/// observation are deliberately separate: a locally used export binding need not expose a getter.
+#[derive(Clone, Hash, PartialEq, Eq, Default)]
+struct ExportKeep {
+    retained_export_names: Vec<String>,
+    observed_export_names: Vec<String>,
+    preserve_export_star: bool,
 }
 
 /// scan 阶段单模块的解析结果：(依赖, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
@@ -239,15 +485,26 @@ struct ParsedLayerResult {
     block_info: Option<ConcatBlockInfo>,
 }
 
-/// linker 输入 cell 的类型：依赖映射 + Tree Shaking 保留集 + 动态 import 的 chunk 落点。
-///
-/// `keep_exports`：`None` = 不 shake（入口 / 被整体使用）；`Some(已排序名单)` = 只保留这些导出。
-/// `dyn_chunks`：本模块每个跨 chunk 动态 import 的 (说明符, 目标 chunk id)（排序去重）。
-/// 各字段都进 cell 指纹——任一变化精确触发 codegen 重跑；chunk **归属/文件名**不进指纹（纯 emit 期）。
+/// Optimizer-owned link facts. Final chunk ids are deliberately absent: retained dependency
+/// convergence can therefore re-plan chunks without invalidating semantic optimization.
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
-struct LinkerData {
+struct OptimizeLinkerData {
+    /// Deterministic BFS module identity. Combined with parser-local `SymbolId` values only inside
+    /// the codegen task; it is never persisted as a semantic identifier.
+    module_id: u32,
     deps: DepIds,
-    keep_exports: Option<Vec<String>>,
+    /// Source specifiers whose resolved internal target contains ESM syntax. The optimizer turns
+    /// these stable link facts into parser-generation SymbolId replacements; SymbolIds themselves
+    /// never enter this persisted/hashable boundary.
+    internal_esm_deps: Vec<String>,
+    export_keep: Option<ExportKeep>,
+}
+
+/// Final body-emission link facts, created only after optimizer-retained edges have converged and
+/// the chunk graph has been recomputed from that converged graph.
+#[derive(Clone, Hash, PartialEq, Eq, Default)]
+struct EmitLinkerData {
+    deps: DepIds,
     dyn_chunks: Vec<(String, u32)>,
     /// 本模块依赖里属于 **async 子图**（顶层 await 传染）的模块 id（升序去重）。
     /// codegen 据此把静态导入点写成 `(await __wake_require__(id))`。进指纹 → async 归属变化精确重跑。
@@ -284,25 +541,49 @@ impl std::hash::Hash for CssCodegenInput {
     }
 }
 
-/// Every non-Vc option captured by codegen. These values are mutable through the public builder
-/// API, so they must participate in the Turbo task identity just like source/linker/CSS inputs.
-/// Otherwise a long-lived bundler can reuse a development module body after switching to a
-/// production define/minify configuration.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct CodegenOptionsInput {
+/// Every non-Vc semantic option captured by optimization. Source-map enablement is intentionally
+/// absent because mapping collection is a downstream consumer of body mapping facts.
+#[derive(Clone, Debug)]
+struct OptimizeOptionsInput {
     define: Vec<(String, String)>,
+    /// Parser-validated form of `define`. This is a deterministic function of `define`; custom
+    /// equality/hash below deliberately use the raw strings as the stable Turbo identity.
+    validated_define: Result<Vec<ValidatedDefine>, String>,
     minify: bool,
-    mangle: bool,
-    minify_names: bool,
     drop_console: bool,
     drop_debugger: bool,
-    want_map: bool,
+    module_name: String,
+    one_shot: bool,
+}
+
+impl PartialEq for OptimizeOptionsInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.define == other.define
+            && self.minify == other.minify
+            && self.drop_console == other.drop_console
+            && self.drop_debugger == other.drop_debugger
+            && self.module_name == other.module_name
+            && self.one_shot == other.one_shot
+    }
+}
+
+impl Eq for OptimizeOptionsInput {}
+
+impl Hash for OptimizeOptionsInput {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.define.hash(state);
+        self.minify.hash(state);
+        self.drop_console.hash(state);
+        self.drop_debugger.hash(state);
+        self.module_name.hash(state);
+        self.one_shot.hash(state);
+    }
 }
 
 /// `parse` 任务的输出：AST 持有者 + 源文本 + 依赖（说明符已解为 `String`）+ 诊断。
 /// 作为引擎 cell 值，须 `Send + Sync + 'static`（`ModuleAst` 已具备）+ 指纹。
 pub struct ParsedModule {
-    pub ast: ModuleAst,
+    pub ast: Arc<ModuleAst>,
     /// 原始源文本（minify 简化器需要读取 span 对应的源码文本）。
     pub source: Arc<str>,
     pub deps: Vec<ParsedDep>,
@@ -341,6 +622,10 @@ pub struct IncrementalBundler {
     resolution_environment: Arc<ResolutionEnvironment>,
     interner: Arc<Interner>,
     engine: Arc<Engine>,
+    /// CLI/library one-shot builds never advance the in-memory task graph to a second generation.
+    /// The transient engine therefore stores cross-stage values without red/green fingerprints.
+    one_shot: bool,
+    one_shot_built: bool,
     exec: Arc<Executor>,
     /// `Arc` 包裹：每层依赖 resolve 经工作窃取执行器**并行**（`Resolver` 现为 `Sync`，见其 `cache` 注释）。
     resolver: Arc<Resolver>,
@@ -353,13 +638,15 @@ pub struct IncrementalBundler {
     /// 规范化路径 → 内容输入 cell（跨构建保留）。
     content_cells: FxHashMap<PathBuf, Vc<Content>>,
     /// 规范化路径 → linker 输入 cell（跨构建保留）。
-    linker_cells: FxHashMap<PathBuf, Vc<LinkerData>>,
+    optimize_linker_cells: FxHashMap<PathBuf, Vc<OptimizeLinkerData>>,
+    /// Final-layout linker facts are isolated from optimizer inputs so retained-edge re-planning
+    /// invalidates only body emission.
+    emit_linker_cells: FxHashMap<PathBuf, Vc<EmitLinkerData>>,
     /// 规范化路径 → CSS codegen 输入。跨模块 token、名称 seed 或 dev/prod 注入模式变化时，
     /// 即使本模块源码/linker 数据不变，也必须让 codegen 任务失效。
     css_codegen_cells: FxHashMap<PathBuf, Vc<CssCodegenInput>>,
-    /// 规范化路径 → define/minify/DCE/sourcemap codegen 输入。配置 setter 可在同一实例的两次
-    /// build 之间调用；cell 让配置改变精确推进 codegen revision，避免闭包捕获旧值。
-    codegen_options_cells: FxHashMap<PathBuf, Vc<CodegenOptionsInput>>,
+    /// 规范化路径 → define/minify/DCE 优化输入。sourceMap 不属于此 cell。
+    optimize_options_cells: FxHashMap<PathBuf, Vc<OptimizeOptionsInput>>,
     /// codegen 任务体真正执行的累计次数。按构建前后差值形成准确的更新模块数。
     /// 计数器由已注册的重算闭包长期持有，因此跨 generation 仍能正确归属到同一 bundler。
     codegen_exec_counts: CodegenExecCounts,
@@ -373,9 +660,8 @@ pub struct IncrementalBundler {
     memory_parse_vcs: FxHashMap<u64, Vc<ParsedModule>>,
     /// 上一成功 generation 的完整模块图。普通内容编辑在依赖形状不变时直接复用稳定 id/边。
     stable_graph: Option<StableModuleGraph>,
-    /// Link/chunk planning is a pure function of semantic scan summaries and bundler options. Keep
-    /// the previous value so implementation-only edits can skip whole-graph liveness propagation
-    /// and static-closure planning even though emit still materializes the public output string.
+    /// Export liveness is a pure function of semantic scan summaries and link options. Chunk
+    /// planning is intentionally not cached here: it is recomputed from optimizer-retained edges.
     link_plan: Option<LinkPlan>,
     link_plan_reuse_count: AtomicU64,
     topology_invalidated: AtomicBool,
@@ -394,7 +680,8 @@ pub struct IncrementalBundler {
     content_hash: bool,
     /// 共享 chunk 抽取阈值（模块被 ≥N 个 async root 共享则抽取，默认 2）。
     share_threshold: usize,
-    /// 持久化构建缓存（opt-in，PLAN §7.1）。`Some` 时：命中摘要跳 parse、命中产物跳 parse+codegen。
+    /// 持久化构建缓存（opt-in，PLAN §7.1）。命中摘要跳 parse；retained facts、body 与 mapping
+    /// facts 各自按阶段命中。
     /// 落盘路径见 `cache_path`。默认 `None`——默认构建路径与产物逐字节不变、性能不受影响。
     cache: Option<BuildCache>,
     cache_path: Option<PathBuf>,
@@ -418,18 +705,11 @@ pub struct IncrementalBundler {
     /// 死模块消除（默认关；prod build 开）：codegen DCE 剥离死 `require` 后，从 entry 重算可达模块、
     /// 丢弃不可达者（如 `if(false)` 里 `require('…development')` 拉进图但已不可达的 dev 包）。§M4b 后续。
     dead_module_elimination: bool,
-    /// 标识符 mangling（默认关；prod build 开）：作用域安全地把非模块作用域局部/参数重命名为短名。
-    /// 每模块 `wake_ecma_minify::plan_mangle` 构建 `span→新名` 侧表传入 codegen（WAKE-COMPATIBILITY §M4）。
-    /// 影响产物缓存键（[`MANGLE_SALT`]）。
-    mangle: bool,
     /// 移除 `console.*` 调用（默认关；prod build 可选开）。
     drop_console: bool,
     /// 移除 `debugger` 语句（默认关；prod build 可选开）。
     drop_debugger: bool,
-    /// 产出 Source Map（WAKE-COMPATIBILITY §M4d）。当前仅支持 **非 minify 单包**路径：
-    /// 该路径下模块体逐行原样拼接（仅前缀 2 空格缩进），行偏移法精确成立。
-    /// minify 路径会 scope-hoist + 改写模块体文本，映射会错位，故 [`IncrementalBundler::build`]
-    /// 在 minify 时不产 map（见 emit 处的守卫）。
+    /// 产出 Source Map（WAKE-COMPATIBILITY §M4d），支持普通及 minify、单包及代码分割路径。
     sourcemap: bool,
     /// `@crab-dev/css` 零运行时编译：构建期把 `` css`...` `` 抽取为静态 CSS
     /// （WAKE-COMPATIBILITY §M5）。见 [`IncrementalBundler::enable_css_in_js`]。
@@ -502,6 +782,20 @@ struct PendingModule {
 
 impl IncrementalBundler {
     pub fn new(fs: Arc<dyn FileSystem>) -> IncrementalBundler {
+        Self::new_with_lifetime(fs, false)
+    }
+
+    /// Construct a bundler for exactly one build invocation.
+    ///
+    /// This keeps the same typed `Vc` stage boundaries but omits in-memory incremental metadata
+    /// that cannot be reused before the process-level operation returns. Watch/dev sessions must
+    /// use [`IncrementalBundler::new`].
+    #[doc(hidden)]
+    pub fn new_one_shot(fs: Arc<dyn FileSystem>) -> IncrementalBundler {
+        Self::new_with_lifetime(fs, true)
+    }
+
+    fn new_with_lifetime(fs: Arc<dyn FileSystem>, one_shot: bool) -> IncrementalBundler {
         // 默认 define：`process.env.NODE_ENV → "production"`（与旧 codegen 硬编码默认逐字节一致）。
         let default_define: Arc<[(String, String)]> = Arc::from(vec![
             (
@@ -526,14 +820,21 @@ impl IncrementalBundler {
             fs: resolution_environment.file_system(),
             resolution_environment,
             interner: Arc::new(Interner::new()),
-            engine: Arc::new(Engine::new()),
+            engine: Arc::new(if one_shot {
+                Engine::new_one_shot()
+            } else {
+                Engine::new()
+            }),
+            one_shot,
+            one_shot_built: false,
             exec: global_executor(),
             define: default_define,
             define_hash,
             content_cells: FxHashMap::default(),
-            linker_cells: FxHashMap::default(),
+            optimize_linker_cells: FxHashMap::default(),
+            emit_linker_cells: FxHashMap::default(),
             css_codegen_cells: FxHashMap::default(),
-            codegen_options_cells: FxHashMap::default(),
+            optimize_options_cells: FxHashMap::default(),
             codegen_exec_counts: new_codegen_exec_counts(),
             load_cache: Arc::new(Mutex::new(FxHashMap::default())),
             load_exec_count: Arc::new(AtomicU64::new(0)),
@@ -561,7 +862,6 @@ impl IncrementalBundler {
             public_path: "/".to_string(),
             minify: false,
             dead_module_elimination: false,
-            mangle: false,
             drop_console: false,
             drop_debugger: false,
             sourcemap: false,
@@ -571,6 +871,15 @@ impl IncrementalBundler {
             target_fingerprint: default_target.fingerprint(),
             transform_features: default_target.required_features(),
         }
+    }
+
+    /// Replace the shared production executor before a test build so determinism can be checked
+    /// across different worker counts. This intentionally stays test-only: production contexts
+    /// share one process-wide pool to bound total thread ownership.
+    #[cfg(test)]
+    pub(crate) fn set_test_thread_count(&mut self, threads: usize) -> &mut Self {
+        self.exec = Arc::new(Executor::new(threads));
+        self
     }
 
     /// 设置已规范化目标环境，并将其稳定指纹混入 parse/transform 内容键。
@@ -618,11 +927,16 @@ impl IncrementalBundler {
     }
 
     fn reset_parse_graph(&mut self) {
-        self.engine = Arc::new(Engine::new());
+        self.engine = Arc::new(if self.one_shot {
+            Engine::new_one_shot()
+        } else {
+            Engine::new()
+        });
         self.content_cells.clear();
-        self.linker_cells.clear();
+        self.optimize_linker_cells.clear();
+        self.emit_linker_cells.clear();
         self.css_codegen_cells.clear();
-        self.codegen_options_cells.clear();
+        self.optimize_options_cells.clear();
         self.memory_summaries.clear();
         self.memory_parse_vcs.clear();
         self.stable_graph = None;
@@ -697,25 +1011,18 @@ impl IncrementalBundler {
         map_source_name(path, self.project_root.as_deref())
     }
 
-    /// 启用紧凑 codegen（省换行/缩进，WAKE-COMPATIBILITY §M4a）。prod build 用；影响产物缓存键。
+    /// 启用完整生产优化管线：语义优化、紧凑 codegen 与作用域安全的标识符改名。
+    ///
+    /// `minify` 是压缩行为的唯一开关；调用方不应再额外启用 name mangling。
     pub fn enable_minify(&mut self) -> &mut Self {
         self.minify = true;
         self
     }
 
-    /// 启用死模块消除（WAKE-COMPATIBILITY §M4b 后续）：emit 前从 entry 按存活 `require` 边重算可达模块，
-    /// 丢弃不可达者。与 `enable_minify` 搭配（DCE 剥离死 `require` 后才有不可达模块可删）。安全：
-    /// 边提取误判只会「多留」不会「错删」。
+    /// 启用死模块消除：emit 前从 entry 按优化器报告的结构化保留依赖边重算可达集，
+    /// 丢弃不可达模块。发射后 JavaScript 字符串不再参与该判定。
     pub fn enable_dead_module_elimination(&mut self) -> &mut Self {
         self.dead_module_elimination = true;
-        self
-    }
-
-    /// 启用标识符 mangling（WAKE-COMPATIBILITY §M4）：每模块规划作用域安全的短名重命名（只动非模块
-    /// 作用域局部/参数，模块顶层与 import/export 名保留）。须与 [`enable_minify`](Self::enable_minify)
-    /// 搭配（mangle 侧表只在紧凑 codegen 路径生效）；影响产物缓存键。
-    pub fn enable_mangle(&mut self) -> &mut Self {
-        self.mangle = true;
         self
     }
 
@@ -724,9 +1031,7 @@ impl IncrementalBundler {
     /// 产物 chunk 的 [`OutputChunk::source_map`](crate::OutputChunk::source_map) 将带上 V3 JSON，
     /// 由调用方决定写盘（`<chunk>.js.map`）或经 dev server 提供。
     ///
-    /// **限制**：仅在**非 minify 单包**路径生效。minify 路径做 scope hoisting 且会改写模块体文本
-    /// （`strip_hoisted_requires_and_barrels`/`compact_reg_body`），行偏移法失效，此时不产 map
-    /// （宁可没有，也不给出错位的映射——错位的 sourcemap 比没有更误导）。
+    /// mapped 与 unmapped 构建共用同一发射器，开启映射不会改变 JavaScript 主体字节。
     pub fn enable_sourcemap(&mut self) -> &mut Self {
         self.sourcemap = true;
         self
@@ -1193,28 +1498,31 @@ impl IncrementalBundler {
             } else {
                 Vec::new()
             };
-            let liveness = (self.cache.is_some() || self.load_cache_enabled || self.tree_shaking)
+            let liveness = (self.cache.is_some()
+                || self.load_cache_enabled
+                || self.tree_shaking
+                || self.minify)
                 .then(|| {
                     Arc::new(parsed.ast.with_ast(|p| {
                         collect_module_liveness_with_css(p, self.interner.as_ref(), self.css_in_js)
                     }))
                 });
-            let block_info = (self.cache.is_some() || self.load_cache_enabled || self.minify)
-                .then(|| parsed.ast.with_ast(concat_block_info));
+            // Target-kind facts are required by linked import semantics in readable and minified
+            // builds alike, not just by minified scope concatenation.
+            let block_info = parsed.ast.with_ast(scan_concat_block_info);
 
             self.memory_parse_vcs.insert(item.content_key, parse_vc);
             if parsed.diagnostics.is_empty() && (self.cache.is_some() || self.load_cache_enabled) {
                 let live = liveness
                     .as_ref()
                     .expect("cache summary always includes liveness");
-                let block = block_info.expect("cache summary always includes concat info");
                 let summary = Arc::new(ModuleSummary {
                     deps: deps.iter().map(parsed_dep_to_cached).collect(),
                     uses: uses.iter().map(import_use_to_cached).collect(),
                     has_top_level_await: parsed.has_top_level_await,
                     liveness: runtime_liveness_to_cached(live, &self.interner),
-                    concat_is_esm: block.is_esm,
-                    concat_block_safe: block.block_safe,
+                    concat_is_esm: block_info.is_esm,
+                    concat_block_safe: block_info.block_safe,
                 });
                 self.memory_summaries.insert(
                     item.content_key,
@@ -1222,7 +1530,7 @@ impl IncrementalBundler {
                         persisted: summary.clone(),
                         deps: deps.clone(),
                         liveness: live.clone(),
-                        block_info: block,
+                        block_info,
                     },
                 );
                 if let Some(cache) = self.cache.as_mut() {
@@ -1235,8 +1543,11 @@ impl IncrementalBundler {
             rec.source_type = item.loaded.source_type;
             rec.content_vc = item.content_vc;
             rec.deps = deps;
-            rec.liveness = self.tree_shaking.then_some(liveness).flatten();
-            rec.block_info = self.minify.then_some(block_info).flatten();
+            // Minified scope concatenation also consumes namespace-identity facts from this
+            // parser generation. Retain an analysis already paid for by the generation cache even
+            // during a readable build, so switching that stable graph to minify cannot lose it.
+            rec.liveness = liveness;
+            rec.block_info = Some(block_info);
             rec.has_top_level_await = parsed.has_top_level_await;
             rec.parse_vc = Some(parse_vc);
             rec.parsed = Some(parsed);
@@ -1248,6 +1559,11 @@ impl IncrementalBundler {
 
     /// 从 `entry` 增量 + 并行打包。
     pub fn build(&mut self, entry: &Path) -> BuildOutput {
+        assert!(
+            !self.one_shot || !self.one_shot_built,
+            "one-shot IncrementalBundler may only build once"
+        );
+        self.one_shot_built = true;
         let codegen_exec_before = codegen_exec_count(&self.codegen_exec_counts);
         // 首次 build 前惰性探测 Yarn PnP（从入口目录向上找 `.pnp.cjs`）。命中则 fs 变 zip 感知、
         // 解析器切 PnP 模式；非 PnP 项目无副作用。dev/watch 复用同一 bundler，只探一次。
@@ -1285,7 +1601,8 @@ impl IncrementalBundler {
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
         let entry_identity = self.resolver.module_identity(&entry_norm);
         let entry_id = assign_id(&mut module_to_id, &mut next_id, entry_identity);
-        let mut frontier: Vec<(u32, PathBuf)> = vec![(entry_id, entry_norm.clone())];
+        let mut frontier: Vec<(u32, PathBuf, Option<Arc<Loaded>>)> =
+            vec![(entry_id, entry_norm.clone(), None)];
         let mut collected_assets: Vec<(String, Vec<u8>)> = Vec::new();
         let mut collected_css: Vec<(u32, String)> = Vec::new();
 
@@ -1340,7 +1657,8 @@ impl IncrementalBundler {
             // 结果按输入顺序返回（`Executor::parallel` 保序）→ 后续串行建 cell/查缓存的顺序、
             // assign_id 与产物收集序完全不变 → 产物逐字节一致。读完再做 `&mut self` 的 cell/缓存
             // 记账（这些依赖共享可变状态，本就该串行；它们很便宜）。
-            let frontier_items: Vec<(u32, PathBuf)> = std::mem::take(&mut frontier);
+            let frontier_items: Vec<(u32, PathBuf, Option<Arc<Loaded>>)> =
+                std::mem::take(&mut frontier);
             let persistent_variant =
                 persistent_source_variant(self.jsx.salt(), self.target_fingerprint);
             let tr = timing.then(std::time::Instant::now);
@@ -1351,8 +1669,10 @@ impl IncrementalBundler {
                 let mut misses = Vec::new();
                 {
                     let cache = self.load_cache.lock().unwrap();
-                    for (index, (id, path)) in frontier_items.into_iter().enumerate() {
-                        if self.load_cache_enabled
+                    for (index, (id, path, prefetched)) in frontier_items.into_iter().enumerate() {
+                        if let Some(loaded) = prefetched {
+                            slots[index] = Some((id, path, Ok(loaded), None, None));
+                        } else if self.load_cache_enabled
                             && let Some(loaded) = cache.get(&path).cloned()
                         {
                             slots[index] = Some((id, path, Ok(loaded), None, None));
@@ -1525,8 +1845,7 @@ impl IncrementalBundler {
                 .map(|(i, _)| i)
                 .collect();
             let analyze_liveness =
-                self.cache.is_some() || self.load_cache_enabled || self.tree_shaking;
-            let analyze_block_info = self.cache.is_some() || self.load_cache_enabled || self.minify;
+                self.cache.is_some() || self.load_cache_enabled || self.tree_shaking || self.minify;
             let requests: Vec<_> = to_parse
                 .iter()
                 .map(|&i| {
@@ -1563,7 +1882,7 @@ impl IncrementalBundler {
                                     css_in_js,
                                 ))
                             });
-                            let block_info = analyze_block_info.then(|| concat_block_info(program));
+                            let block_info = Some(scan_concat_block_info(program));
                             (uses, liveness, block_info)
                         });
                         ParsedLayerResult {
@@ -1630,20 +1949,13 @@ impl IncrementalBundler {
                                 &path,
                             );
                         }
-                        let liveness = self.tree_shaking.then(|| {
-                            memory_liveness.unwrap_or_else(|| {
-                                Arc::new(cached_liveness_to_runtime(
-                                    &sum.liveness,
-                                    &self.interner,
-                                ))
-                            })
-                        });
-                        let block_info = self.minify.then_some(
-                            memory_block_info.unwrap_or(ConcatBlockInfo {
-                                is_esm: sum.concat_is_esm,
-                                block_safe: sum.concat_block_safe,
-                            }),
-                        );
+                        let liveness = Some(memory_liveness.unwrap_or_else(|| {
+                            Arc::new(cached_liveness_to_runtime(&sum.liveness, &self.interner))
+                        }));
+                        let block_info = Some(memory_block_info.unwrap_or(ConcatBlockInfo {
+                            is_esm: sum.concat_is_esm,
+                            block_safe: sum.concat_block_safe,
+                        }));
                         (
                             memory_deps.unwrap_or_else(|| {
                                 sum.deps.iter().map(cached_dep_to_parsed).collect()
@@ -1703,8 +2015,8 @@ impl IncrementalBundler {
                             has_tla,
                             Some(parsed),
                             Some(parse_vc),
-                            self.tree_shaking.then_some(liveness).flatten(),
-                            self.minify.then_some(block_info).flatten(),
+                            liveness,
+                            block_info,
                         )
                     }
                 };
@@ -1714,9 +2026,10 @@ impl IncrementalBundler {
                 for dep in deps.iter() {
                     resolve_reqs.push((dep.specifier.clone(), from_dir.clone(), dep.kind));
                 }
-                // 绑定级活跃性（仅 tree-shaking 且本模块有新 parse 的 AST 时；缓存摘要命中 → None → 保守全保留）。
+                // 绑定级活跃性同时承载 minified concat 的 namespace identity 事实；
+                // SymbolId 只在当前 parse 世代内解析，持久化边界仍只存公开名与说明符。
                 let liveness = cached_liveness.or_else(|| {
-                    if self.tree_shaking {
+                    if self.tree_shaking || self.minify {
                         parsed_opt.as_ref().map(|p| {
                             Arc::new(p.ast.with_ast(|prog| {
                                 collect_module_liveness_with_css(
@@ -1730,15 +2043,12 @@ impl IncrementalBundler {
                         None
                     }
                 });
-                // 单包 concat 块安全（仅 minify + 有新 parse AST 时；缓存命中 → None → 保守 IIFE）。
+                // ESM target kind is required by import interop in every linked mode; block safety
+                // is consumed only by minified concat but is cheap to retain from the same scan.
                 let block_info = cached_block_info.or_else(|| {
-                    if self.minify {
-                        parsed_opt
-                            .as_ref()
-                            .map(|p| p.ast.with_ast(concat_block_info))
-                    } else {
-                        None
-                    }
+                    parsed_opt
+                        .as_ref()
+                        .map(|p| p.ast.with_ast(scan_concat_block_info))
                 });
                 pending.push(PendingModule {
                     id,
@@ -1759,6 +2069,11 @@ impl IncrementalBundler {
             let resolved_flat: Vec<ResolveResult> = if resolve_reqs.is_empty() {
                 Vec::new()
             } else {
+                // Persistent and generation load caches have their own source/stamp ownership.
+                // Fuse exact resolution with loading only when this process can consume the
+                // source exactly once and no later generation needs a resolver/cache record.
+                let prefetch_exact_relative =
+                    self.one_shot && self.cache.is_none() && !self.load_cache_enabled;
                 let tr = timing.then(std::time::Instant::now);
                 let mut slots: Vec<Option<ResolveResult>> = std::iter::repeat_with(|| None)
                     .take(resolve_reqs.len())
@@ -1769,6 +2084,9 @@ impl IncrementalBundler {
                     .map(|batch| {
                         let resolver = Arc::clone(&self.resolver);
                         let resolve_exec_count = self.resolve_exec_count.clone();
+                        let load_exec_count = self.load_exec_count.clone();
+                        let fs = Arc::clone(&self.fs);
+                        let load_opts = Arc::clone(&load_opts);
                         let platform = self.platform;
                         let external_packages = Arc::clone(&self.external_packages);
                         move || {
@@ -1783,12 +2101,52 @@ impl IncrementalBundler {
                                     ) {
                                         ResolveResult::External(specifier)
                                     } else {
-                                        let profile = resolution_profile(platform, kind);
-                                        match resolver.resolve_module_with_profile(
-                                            &specifier, &from_dir, &profile,
-                                        ) {
-                                            Ok(module) => ResolveResult::Internal(module),
-                                            Err(_) => ResolveResult::Error,
+                                        let resolve_normally = || {
+                                            let profile = resolution_profile(platform, kind);
+                                            match resolver.resolve_module_with_profile(
+                                                &specifier, &from_dir, &profile,
+                                            ) {
+                                                Ok(module) => ResolveResult::Internal {
+                                                    module,
+                                                    prefetched: None,
+                                                },
+                                                Err(_) => ResolveResult::Error,
+                                            }
+                                        };
+                                        let candidate = prefetch_exact_relative
+                                            .then(|| {
+                                                exact_relative_file_candidate(&specifier, &from_dir)
+                                            })
+                                            .flatten()
+                                            // Node rejects browser resources immediately after
+                                            // resolve; do not read/transform one merely to emit
+                                            // that same diagnostic.
+                                            .filter(|path| {
+                                                platform != BuildPlatform::Node
+                                                    || !is_node_browser_resource(path)
+                                            });
+                                        if let Some(candidate) = candidate {
+                                            load_exec_count.fetch_add(1, Ordering::Relaxed);
+                                            match load_source(
+                                                fs.as_ref(),
+                                                &candidate,
+                                                load_opts.as_ref(),
+                                            ) {
+                                                Ok(loaded) => ResolveResult::Internal {
+                                                    module: ResolvedModule {
+                                                        identity: resolver
+                                                            .module_identity(&candidate),
+                                                        path: candidate,
+                                                    },
+                                                    prefetched: Some(Arc::new(loaded)),
+                                                },
+                                                // A speculative failure proves nothing. The
+                                                // canonical resolver+loader path owns TS twins,
+                                                // directories and all user-visible diagnostics.
+                                                Err(_) => resolve_normally(),
+                                            }
+                                        } else {
+                                            resolve_normally()
                                         }
                                     };
                                     (index, resolved)
@@ -1813,7 +2171,7 @@ impl IncrementalBundler {
                 out
             };
             // —— Pass 2：串行按「模块序×依赖序」消费 resolve 结果，assign_id + 建图 + 建 ModuleRec ——
-            let mut next: Vec<(u32, PathBuf)> = Vec::new();
+            let mut next: Vec<(u32, PathBuf, Option<Arc<Loaded>>)> = Vec::new();
             let mut flat_idx = 0usize;
             for pm in pending {
                 let PendingModule {
@@ -1835,7 +2193,10 @@ impl IncrementalBundler {
                     let resolved = &resolved_flat[flat_idx];
                     flat_idx += 1;
                     match resolved {
-                        ResolveResult::Internal(resolved) => {
+                        ResolveResult::Internal {
+                            module: resolved,
+                            prefetched,
+                        } => {
                             if self.platform == BuildPlatform::Node
                                 && is_node_browser_resource(&resolved.path)
                             {
@@ -1858,7 +2219,11 @@ impl IncrementalBundler {
                                 resolved.identity.clone(),
                             );
                             if !known {
-                                next.push((did, resolved.path.clone()));
+                                next.push((
+                                    did,
+                                    resolved.path.clone(),
+                                    prefetched.as_ref().map(Arc::clone),
+                                ));
                             }
                             dep_ids.push((dep.specifier.clone(), did));
                         }
@@ -1913,78 +2278,27 @@ impl IncrementalBundler {
         let t_link_start = timing.then(std::time::Instant::now);
 
         let link_fingerprint = self.link_plan_fingerprint(&modules, entry_id, next_id);
-        let (keep, chunk_graph, async_ids) = if let Some(plan) = self
+        let keep = if let Some(plan) = self
             .link_plan
             .as_ref()
             .filter(|plan| plan.fingerprint == link_fingerprint)
         {
             self.link_plan_reuse_count.fetch_add(1, Ordering::Relaxed);
-            (
-                plan.keep.clone(),
-                plan.chunk_graph.clone(),
-                plan.async_ids.clone(),
-            )
+            plan.keep.clone()
         } else {
-            // —— Link：Tree Shaking + chunk closures + top-level-await propagation. ——
+            // —— Link：Tree Shaking. Top-level-await propagation and chunk ownership are computed
+            // only after optimizer-retained dependency edges have converged. ——
             let keep = self.compute_keep_exports(&modules, entry_id, next_id);
-            let chunk_graph = if self.code_splitting {
-                let edges = build_module_edges(&modules);
-                compute_chunk_graph(&edges, entry_id, self.share_threshold)
-            } else {
-                None
-            };
-            let async_ids = async_module_ids(&modules);
             self.link_plan = Some(LinkPlan {
                 fingerprint: link_fingerprint,
                 keep: keep.clone(),
-                chunk_graph: chunk_graph.clone(),
-                async_ids: async_ids.clone(),
             });
-            (keep, chunk_graph, async_ids)
+            keep
         };
-        // 单包 minify 仍可使用现有的无 marker 紧凑路径；代码分割必须让各 chunk 的 runtime
-        // 通过 `__esModule` 可靠区分 ESM 与 CJS（`default` 键本身不是可靠信号）。
-        let no_esmodule = self.minify && chunk_graph.is_none();
-        if self.module_format == ModuleFormat::CommonJs {
-            if async_ids.contains(&entry_id) {
-                let source = modules
-                    .values()
-                    .find(|module| module.has_top_level_await)
-                    .map(|module| path_to_slash(&module.path))
-                    .unwrap_or_else(|| path_to_slash(&entry_norm));
-                diagnostics.push(
-                    Diagnostic::error("CommonJS 入口的同步依赖图不支持顶层 await")
-                        .with_code("WAKE0304")
-                        .with_path(source),
-                );
-            } else {
-                for module in modules.values() {
-                    let targets = module
-                        .dep_ids
-                        .iter()
-                        .map(|(specifier, id)| (specifier.as_str(), *id))
-                        .collect::<FxHashMap<_, _>>();
-                    for dependency in &module.deps {
-                        if dependency.kind == DependencyKind::Require
-                            && targets
-                                .get(dependency.specifier.as_str())
-                                .is_some_and(|target| async_ids.contains(target))
-                        {
-                            diagnostics.push(
-                                Diagnostic::error(
-                                    "CommonJS require() 不能同步加载包含顶层 await 的模块",
-                                )
-                                .with_code("WAKE0304")
-                                .with_path(path_to_slash(&module.path))
-                                .with_primary(dependency.span, "此 require() 指向异步模块"),
-                            );
-                        }
-                    }
-                }
-            }
-        }
         let link_time = t_link_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let t_codegen_start = timing.then(std::time::Instant::now);
+        let mut optimize_time = std::time::Duration::ZERO;
+        let mut body_time = std::time::Duration::ZERO;
 
         // —— codegen 阶段：设 linker cell（驱动）+ 查产物缓存 + 并行 codegen 未命中者 ——
         let ordered: Vec<u32> = (0..next_id).filter(|id| modules.contains_key(id)).collect();
@@ -2000,69 +2314,71 @@ impl IncrementalBundler {
                     .any(|d| wake_css_in_js::is_css_in_js_source(&d.specifier))
             });
 
-        // 3a. 为每个模块设 linker cell、算 body_key、查产物缓存。
+        // 3a. Build optimizer identities and read optimizer-owned retained facts. Neither final
+        // chunk numbering nor source-map enablement participates in this stage.
+        let optimizer_salt =
+            optimizer_config_salt(self.minify, self.drop_console, self.drop_debugger);
         let mut plans: Vec<CgPlan> = Vec::with_capacity(ordered.len());
         for &id in &ordered {
-            let (path, dep_ids, dyn_chunks, content_key) = {
+            let (path, dep_ids, content_key) = {
                 let rec = &modules[&id];
-                let dyn_chunks = dyn_chunks_of(rec, chunk_graph.as_ref());
-                (
-                    rec.path.clone(),
-                    rec.dep_ids.clone(),
-                    dyn_chunks,
-                    rec.content_key,
-                )
+                (rec.path.clone(), rec.dep_ids.clone(), rec.content_key)
             };
-            // 本模块依赖中落在 async 子图内的（升序去重）——codegen 据此给静态导入点加 `await`。
-            let mut async_deps: Vec<u32> = dep_ids
+            let mut internal_esm_deps: Vec<String> = dep_ids
                 .iter()
-                .map(|(_, tid)| *tid)
-                .filter(|tid| async_ids.contains(tid))
+                .filter(|(_, target)| {
+                    modules
+                        .get(target)
+                        .and_then(|module| module.block_info)
+                        .is_some_and(|info| info.is_esm)
+                })
+                .map(|(specifier, _)| specifier.clone())
                 .collect();
-            async_deps.sort_unstable();
-            async_deps.dedup();
-            let data = LinkerData {
+            internal_esm_deps.sort_unstable();
+            internal_esm_deps.dedup();
+            let data = OptimizeLinkerData {
+                module_id: id,
                 deps: dep_ids,
-                keep_exports: keep.get(&id).cloned().flatten(),
-                dyn_chunks,
-                async_deps,
-                no_esmodule,
+                internal_esm_deps,
+                export_keep: keep.get(&id).cloned().flatten(),
             };
-            // body_key 与查缓存仅在启用缓存时做——`hash_linker`（SipHash 全依赖）无缓存时纯浪费。
-            // linker（含 ESM marker 模式）+ define/minify/mangle 指纹混入低 64 位，配置变化
-            // 会精确失效缓存，尤其禁止分割构建复用单包 minify 的无 marker 模块体。
-            let (body_key, cached_body) = if self.cache.is_some() {
-                let minify_salt = if self.minify { MINIFY_SALT } else { 0 };
-                let mangle_salt = if self.mangle { MANGLE_SALT } else { 0 };
-                let low = hash_linker(&data) ^ self.define_hash ^ minify_salt ^ mangle_salt;
-                let bk = ((content_key as u128) << 64) | (low as u128);
-                // 产物磁盘缓存只存模块体（schema v1），不存映射与 CSS-in-JS 抽取的样式。
-                // 启用其一时视为未命中并重算，否则缓存命中的模块会丢失 map / 丢失 CSS
-                // （后者更危险：产物 JS 正确但样式凭空消失）。
-                let cb = if self.sourcemap || cij_active {
-                    None
-                } else {
-                    self.cache.as_mut().and_then(|c| c.body(bk))
-                };
-                (bk, cb)
+            let optimize_linker_hash = hash_optimize_linker(&data);
+            let optimize_key = ((content_key as u128) << 64)
+                | ((optimize_linker_hash ^ self.define_hash ^ optimizer_salt) as u128);
+            let cached_retained_module_ids = if cij_active {
+                None
             } else {
-                (0u128, None)
+                self.cache
+                    .as_mut()
+                    .and_then(|cache| cache.retained_module_ids(optimize_key))
             };
-            let linker_vc = self.linker_cell(&path, data);
+            let optimize_linker_vc = self.optimize_linker_cell(&path, data);
             plans.push(CgPlan {
                 id,
                 path,
-                body_key,
-                linker_vc,
-                cached_body,
+                content_key,
+                optimize_key,
+                optimize_linker_hash,
+                optimize_linker_vc,
+                optimized_vc: None,
+                optimized_artifact: None,
+                retained_module_ids: cached_retained_module_ids,
+                body_key: 0,
+                emit_linker_vc: None,
+                emit_linker_data: None,
+                body_vc: None,
+                cached_body: None,
+                cached_map: None,
+                cached_discarded_static_requests: None,
             });
         }
 
-        // 3b. 未命中产物缓存的模块里，摘要曾命中（parse 被延迟）的现在补 parse。
+        // 3b. Retained-fact misses must optimize before chunk planning. Parse only those modules;
+        // a complete persistent hit keeps the parser and optimizer cold.
         let need_parse: Vec<usize> = plans
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.cached_body.is_none() && modules[&p.id].parse_vc.is_none())
+            .filter(|(_, p)| p.retained_module_ids.is_none() && modules[&p.id].parse_vc.is_none())
             .map(|(i, _)| i)
             .collect();
         if !need_parse.is_empty() {
@@ -2090,7 +2406,7 @@ impl IncrementalBundler {
             }
         }
 
-        // 3b′. CSS-in-JS：先算各模块的「静态导出常量」，再为每个模块把它的 import 绑定
+        // 3b'. CSS-in-JS：先算各模块的「静态导出常量」，再为每个模块把它的 import 绑定
         // 解析成可求值的静态值（`token` → 那个模块 default 导出的对象）。
         // 只做**一层**：被引用模块自身的求值仅用其模块内信息（design token 文件正是此形态）。
         let cij_scopes: FxHashMap<u32, Arc<wake_css_in_js::value::Scope>> = if cij_active {
@@ -2099,23 +2415,25 @@ impl IncrementalBundler {
             FxHashMap::default()
         };
 
-        // 3c. 并行 codegen 所有未命中产物缓存的模块。
-        let miss: Vec<usize> = plans
+        // 3c. Optimize retained-fact misses in parallel.
+        let optimize_miss: Vec<usize> = plans
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.cached_body.is_none())
+            .filter(|(_, p)| p.retained_module_ids.is_none())
             .map(|(i, _)| i)
             .collect();
-        let mut requests = Vec::with_capacity(miss.len());
-        for &i in &miss {
+        // User-provided define text is parsed once for this build, never once per module. The raw
+        // form remains in the Vc identity; the validated form is carried in the same input cell so
+        // a long-lived task cannot retain stale trusted edits after configuration changes.
+        let validated_define = validate_defines(&self.define);
+        let mut requests = Vec::with_capacity(optimize_miss.len());
+        for &i in &optimize_miss {
             let parse_vc = modules[&plans[i].id]
                 .parse_vc
-                .expect("未命中模块此时必已 parse");
-            let linker_vc = plans[i].linker_vc;
+                .expect("optimizer miss must be parsed");
+            let linker_vc = plans[i].optimize_linker_vc;
             let interner = self.interner.clone();
             let id = plans[i].id;
-            let codegen_exec_counts = self.codegen_exec_counts.clone();
-            let codegen_counter_shard = id as usize & (CODEGEN_COUNTER_SHARDS - 1);
             let cij = cij_scopes.get(&id).cloned();
             // dev（未开抽取）时把 CSS 以 `<style>` 注入模块体；prod 带出聚合。
             let inject_style = !self.extract_css;
@@ -2137,76 +2455,424 @@ impl IncrementalBundler {
                 inject_style,
             };
             let css_input_vc = self.css_codegen_cell(&plans[i].path, css_input);
-            let options_input_vc = self.codegen_options_cell(
+            let options_input_vc = self.optimize_options_cell(
                 &plans[i].path,
-                CodegenOptionsInput {
+                OptimizeOptionsInput {
                     define: self.define.iter().cloned().collect(),
+                    validated_define: validated_define.clone(),
                     minify: self.minify,
-                    mangle: self.mangle,
-                    minify_names: self.minify,
                     drop_console: self.drop_console,
                     drop_debugger: self.drop_debugger,
-                    want_map: self.sourcemap,
+                    module_name: path_to_slash(&plans[i].path),
+                    one_shot: self.one_shot,
                 },
             );
             requests.push(move || {
-                codegen_request(
+                optimize_request(
                     parse_vc,
                     linker_vc,
                     css_input_vc,
                     options_input_vc,
                     interner,
-                    codegen_exec_counts,
-                    codegen_counter_shard,
                 )
             });
         }
         let engine = Arc::clone(&self.engine);
-        let miss_bodies = par_request_batched(&engine, &self.exec, requests);
-
-        // 3d. 新算的 body 写回缓存；汇总所有 body（命中 + 新算），按 `ordered` 出序。
-        let mut body_of: FxHashMap<u32, Arc<String>> = FxHashMap::default();
-        // 模块局部映射（仅 sourcemap 启用时非空）——emit 拼接时按行偏移平移合并。
-        let mut map_of: FxHashMap<u32, Arc<ModuleMappings>> = FxHashMap::default();
-        for (&i, out) in miss.iter().zip(miss_bodies) {
-            if let Some(c) = self.cache.as_mut() {
-                // Arc clone：写回缓存不再深拷贝整段 body。
-                c.put_body(plans[i].body_key, out.code.clone());
+        let t_optimize_start = timing.then(std::time::Instant::now);
+        let optimized_results = par_request_batched(&engine, &self.exec, requests);
+        optimize_time +=
+            t_optimize_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+        let mut timing_optimizer_modules = 0_usize;
+        let mut timing_optimizer_iterations = 0_usize;
+        let mut timing_optimizer_passes = Vec::<(&'static str, usize, usize)>::new();
+        for (&i, (optimized_vc, out)) in optimize_miss.iter().zip(optimized_results) {
+            if timing && let Some(optimized) = &out.optimized {
+                timing_optimizer_modules += 1;
+                timing_optimizer_iterations += optimized.stats().iterations;
+                for pass in &optimized.stats().passes {
+                    if let Some((_, runs, changes)) = timing_optimizer_passes
+                        .iter_mut()
+                        .find(|(name, _, _)| *name == pass.pass.name())
+                    {
+                        *runs += pass.runs;
+                        *changes += pass.changes;
+                    } else {
+                        timing_optimizer_passes.push((pass.pass.name(), pass.runs, pass.changes));
+                    }
+                }
             }
-            if let Some(m) = &out.map {
-                map_of.insert(plans[i].id, m.clone());
-            }
-            // CSS-in-JS 抽取的样式汇入与 `.css` 模块同一条聚合通道（prod）。
-            if let Some(c) = &out.css {
-                collected_css.push((plans[i].id, (**c).clone()));
+            if out.optimized.is_some()
+                && let Some(c) = self.cache.as_mut()
+            {
+                c.put_retained_module_ids(plans[i].optimize_key, out.retained_module_ids.clone());
             }
             extend_module_diagnostics(&mut diagnostics, &out.diagnostics, &plans[i].path);
-            body_of.insert(plans[i].id, out.code.clone());
-        }
-        for p in &plans {
-            if let Some(cb) = &p.cached_body {
-                // 命中缓存：Arc clone（引用计数自增），消除整段 body 的第二次 memcpy。
-                body_of.insert(p.id, cb.clone());
+            plans[i].retained_module_ids = Some(out.retained_module_ids.clone());
+            plans[i].optimized_vc = Some(optimized_vc);
+            if self.one_shot && !self.sourcemap {
+                plans[i].optimized_artifact = Some(out);
             }
         }
-        let bodies: Vec<(u32, Arc<String>)> = ordered
+        if timing && timing_optimizer_modules != 0 {
+            let passes = timing_optimizer_passes
+                .iter()
+                .map(|(name, runs, changes)| format!("{name}:{runs}/{changes}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "[wake-optimizer] modules={} avg-iterations={:.2} passes(run/change)={passes}",
+                timing_optimizer_modules,
+                timing_optimizer_iterations as f64 / timing_optimizer_modules as f64,
+            );
+        }
+        let retained_edges: Vec<(u32, Arc<Vec<u32>>)> = plans
             .iter()
-            .map(|&id| (id, body_of[&id].clone()))
+            .map(|plan| {
+                (
+                    plan.id,
+                    plan.retained_module_ids
+                        .as_ref()
+                        .expect("retained facts")
+                        .clone(),
+                )
+            })
             .collect();
 
-        // —— 死模块消除：从 entry 按存活 `require` 边（codegen DCE 后）重算可达，丢弃不可达模块 ——
-        let bodies = if self.dead_module_elimination {
-            let live = live_modules(&bodies, entry_id);
-            bodies
-                .into_iter()
-                .filter(|(id, _)| live.contains(id))
-                .collect::<Vec<_>>()
+        // —— Retained-edge convergence and fresh chunk planning. ——
+        let (live, final_edges) = if self.dead_module_elimination {
+            let live = live_modules(&retained_edges, entry_id);
+            let edges = retained_module_edges(&modules, &retained_edges, &live);
+            (live, edges)
         } else {
-            bodies
+            (
+                ordered.iter().copied().collect::<FxHashSet<_>>(),
+                build_module_edges(&modules),
+            )
         };
-        // 存活模块 id（升序，= 过滤后的 `ordered`）——供 module_count 与单包 module_ids。
-        let live_ids: Vec<u32> = bodies.iter().map(|(id, _)| *id).collect();
+        let chunk_graph = if self.code_splitting {
+            compute_chunk_graph(&final_edges, entry_id, self.share_threshold)
+        } else {
+            None
+        };
+        let async_ids = async_module_ids_with_edges(&modules, &final_edges);
+        if self.module_format == ModuleFormat::CommonJs {
+            if async_ids.contains(&entry_id) {
+                let source = modules
+                    .iter()
+                    .filter(|(id, _)| live.contains(id))
+                    .find(|(_, module)| module.has_top_level_await)
+                    .map(|(_, module)| path_to_slash(&module.path))
+                    .unwrap_or_else(|| path_to_slash(&entry_norm));
+                diagnostics.push(
+                    Diagnostic::error("CommonJS 入口的同步依赖图不支持顶层 await")
+                        .with_code("WAKE0304")
+                        .with_path(source),
+                );
+            } else {
+                for (&module_id, module) in modules.iter().filter(|(id, _)| live.contains(id)) {
+                    let retained_targets = final_edges
+                        .get(&module_id)
+                        .map(|edges| edges.static_targets.as_slice())
+                        .unwrap_or_default();
+                    let targets = module
+                        .dep_ids
+                        .iter()
+                        .map(|(specifier, id)| (specifier.as_str(), *id))
+                        .collect::<FxHashMap<_, _>>();
+                    for dependency in &module.deps {
+                        if dependency.kind == DependencyKind::Require
+                            && targets
+                                .get(dependency.specifier.as_str())
+                                .is_some_and(|target| {
+                                    retained_targets.contains(target) && async_ids.contains(target)
+                                })
+                        {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "CommonJS require() 不能同步加载包含顶层 await 的模块",
+                                )
+                                .with_code("WAKE0304")
+                                .with_path(path_to_slash(&module.path))
+                                .with_primary(dependency.span, "此 require() 指向异步模块"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Single-package minify can omit the ESM marker. A split runtime needs it for ESM/CJS
+        // interop; this final-layout fact is intentionally downstream of optimization.
+        let no_esmodule = self.minify && chunk_graph.is_none();
+        let live_ids: Vec<u32> = ordered
+            .iter()
+            .copied()
+            .filter(|id| live.contains(id))
+            .collect();
         let live_id_set: FxHashSet<u32> = live_ids.iter().copied().collect();
+
+        // 3d. Final body identities and persistent hits. Every body is persisted together with
+        // mapping facts, even for an unmapped request, so later map enablement never re-emits JS.
+        for plan in plans.iter_mut().filter(|plan| live.contains(&plan.id)) {
+            let rec = &modules[&plan.id];
+            let mut async_deps: Vec<u32> = rec
+                .dep_ids
+                .iter()
+                .map(|(_, target)| *target)
+                .filter(|target| async_ids.contains(target))
+                .collect();
+            async_deps.sort_unstable();
+            async_deps.dedup();
+            let emit_data = EmitLinkerData {
+                deps: rec.dep_ids.clone(),
+                dyn_chunks: dyn_chunks_of(rec, chunk_graph.as_ref()),
+                async_deps,
+                no_esmodule,
+            };
+            let emit_hash = hash_emit_linker(&emit_data);
+            plan.body_key = ((plan.content_key as u128) << 64)
+                | ((plan.optimize_linker_hash ^ self.define_hash ^ optimizer_salt ^ emit_hash)
+                    as u128);
+            if self.one_shot && !self.sourcemap {
+                plan.emit_linker_data = Some(Arc::new(emit_data.clone()));
+            }
+            plan.emit_linker_vc = Some(self.emit_linker_cell(&plan.path, emit_data));
+            if !cij_active && let Some(cache) = self.cache.as_mut() {
+                let body = cache.body(plan.body_key);
+                let mappings = cache.mappings(plan.body_key);
+                if body.is_some() && mappings.is_some() {
+                    plan.cached_body = body;
+                    if let Some(mappings) = mappings {
+                        let (map, requests) = module_metadata_from_cache(mappings);
+                        plan.cached_map = Some(map);
+                        plan.cached_discarded_static_requests = requests;
+                    }
+                }
+            }
+        }
+
+        // A retained-fact hit can still have a missing body (for example after bounded cache
+        // eviction). Materialize its optimizer value now, without affecting final chunk planning.
+        let late_optimize: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| {
+                live.contains(&plan.id) && plan.cached_body.is_none() && plan.optimized_vc.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let late_need_parse: Vec<usize> = late_optimize
+            .iter()
+            .copied()
+            .filter(|index| modules[&plans[*index].id].parse_vc.is_none())
+            .collect();
+        if !late_need_parse.is_empty() {
+            let reqs: Vec<_> = late_need_parse
+                .iter()
+                .map(|&i| {
+                    let rec = &modules[&plans[i].id];
+                    let cell = rec.content_vc;
+                    let st = rec.source_type;
+                    let interner = self.interner.clone();
+                    let jsx = self.jsx;
+                    let transform_features = self.transform_features;
+                    let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&rec.path)));
+                    move || parse_request(cell, interner, st, jsx, transform_features, file_name)
+                })
+                .collect();
+            let engine = Arc::clone(&self.engine);
+            let results = par_request_batched(&engine, &self.exec, reqs);
+            for (&i, (parse_vc, parsed)) in late_need_parse.iter().zip(results) {
+                let rec = modules.get_mut(&plans[i].id).expect("late parse module");
+                extend_module_diagnostics(&mut diagnostics, &parsed.diagnostics, &rec.path);
+                rec.parse_vc = Some(parse_vc);
+                rec.parsed = Some(parsed);
+            }
+        }
+        let mut late_requests = Vec::with_capacity(late_optimize.len());
+        for &i in &late_optimize {
+            let parse_vc = modules[&plans[i].id]
+                .parse_vc
+                .expect("late optimizer parse");
+            let linker_vc = plans[i].optimize_linker_vc;
+            let interner = self.interner.clone();
+            let css_input_vc = self.css_codegen_cell(&plans[i].path, CssCodegenInput::default());
+            let options_input_vc = self.optimize_options_cell(
+                &plans[i].path,
+                OptimizeOptionsInput {
+                    define: self.define.iter().cloned().collect(),
+                    validated_define: validated_define.clone(),
+                    minify: self.minify,
+                    drop_console: self.drop_console,
+                    drop_debugger: self.drop_debugger,
+                    module_name: path_to_slash(&plans[i].path),
+                    one_shot: self.one_shot,
+                },
+            );
+            late_requests.push(move || {
+                optimize_request(
+                    parse_vc,
+                    linker_vc,
+                    css_input_vc,
+                    options_input_vc,
+                    interner,
+                )
+            });
+        }
+        let engine = Arc::clone(&self.engine);
+        let t_late_optimize_start = timing.then(std::time::Instant::now);
+        let late_results = par_request_batched(&engine, &self.exec, late_requests);
+        optimize_time +=
+            t_late_optimize_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+        for (&i, (optimized_vc, out)) in late_optimize.iter().zip(late_results) {
+            debug_assert_eq!(
+                plans[i].retained_module_ids.as_deref().map(Vec::as_slice),
+                Some(out.retained_module_ids.as_slice()),
+                "persisted retained facts must match recomputed optimizer output"
+            );
+            extend_module_diagnostics(&mut diagnostics, &out.diagnostics, &plans[i].path);
+            plans[i].optimized_vc = Some(optimized_vc);
+            if self.one_shot && !self.sourcemap {
+                plans[i].optimized_artifact = Some(out);
+            }
+        }
+
+        // 3e. Emit JS bodies independently of source-map requests. Mapping facts are collected in
+        // the same token walk and handed to the downstream source-map task.
+        let body_miss: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| live.contains(&plan.id) && plan.cached_body.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        let mut body_requests = Vec::with_capacity(body_miss.len());
+        for &i in &body_miss {
+            let direct = (self.one_shot && !self.sourcemap).then(|| {
+                (
+                    plans[i]
+                        .optimized_artifact
+                        .clone()
+                        .expect("one-shot body miss optimizer value"),
+                    plans[i]
+                        .emit_linker_data
+                        .clone()
+                        .expect("one-shot final linker value"),
+                )
+            });
+            let optimized_vc = plans[i].optimized_vc;
+            let emit_linker_vc = plans[i].emit_linker_vc;
+            let interner = self.interner.clone();
+            let codegen_exec_counts = self.codegen_exec_counts.clone();
+            let codegen_counter_shard = plans[i].id as usize & (CODEGEN_COUNTER_SHARDS - 1);
+            body_requests.push(move || {
+                if let Some((artifact, data)) = direct {
+                    (
+                        None,
+                        Arc::new(emit_body(
+                            &artifact,
+                            &data,
+                            &interner,
+                            &codegen_exec_counts,
+                            codegen_counter_shard,
+                        )),
+                    )
+                } else {
+                    let (body_vc, body) = emit_body_request(
+                        optimized_vc.expect("body miss optimizer value"),
+                        emit_linker_vc.expect("final linker value"),
+                        interner,
+                        codegen_exec_counts,
+                        codegen_counter_shard,
+                    );
+                    (Some(body_vc), body)
+                }
+            });
+        }
+        let engine = Arc::clone(&self.engine);
+        let t_body_start = timing.then(std::time::Instant::now);
+        let emitted = par_request_batched(&engine, &self.exec, body_requests);
+        body_time += t_body_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+        let mut timing_trivial_bodies = 0_usize;
+        let mut timing_trivial_body_nanos = 0_u64;
+        let mut timing_full_body_nanos = 0_u64;
+        let mut body_of: FxHashMap<u32, Arc<String>> = FxHashMap::default();
+        let mut map_of: FxHashMap<u32, Arc<ModuleMappings>> = FxHashMap::default();
+        let mut discarded_static_requests_of: FxHashMap<
+            u32,
+            Arc<Vec<GeneratedDiscardedStaticRequest>>,
+        > = FxHashMap::default();
+        for (&i, (body_vc, out)) in body_miss.iter().zip(emitted) {
+            if timing {
+                if out.sealed_trivial {
+                    timing_trivial_bodies += 1;
+                    timing_trivial_body_nanos =
+                        timing_trivial_body_nanos.saturating_add(out.codegen_nanos);
+                } else {
+                    timing_full_body_nanos =
+                        timing_full_body_nanos.saturating_add(out.codegen_nanos);
+                }
+            }
+            if out.cacheable
+                && let Some(cache) = self.cache.as_mut()
+            {
+                cache.put_body(plans[i].body_key, out.code.clone());
+                cache.put_mappings(
+                    plans[i].body_key,
+                    Arc::new(cached_mappings_from_module(
+                        &out.mapping_facts,
+                        &out.discarded_static_requests,
+                    )),
+                );
+            }
+            if let Some(css) = &out.css {
+                collected_css.push((plans[i].id, (**css).clone()));
+            }
+            plans[i].body_vc = body_vc;
+            body_of.insert(plans[i].id, out.code.clone());
+            if !out.discarded_static_requests.is_empty() {
+                discarded_static_requests_of
+                    .insert(plans[i].id, out.discarded_static_requests.clone());
+            }
+        }
+        if timing && !body_miss.is_empty() {
+            eprintln!(
+                "[wake-body] trivial={}/{} codegen-cpu(trivial/full)={:.1}/{:.1}ms body-wall={:.1}ms",
+                timing_trivial_bodies,
+                body_miss.len(),
+                timing_trivial_body_nanos as f64 / 1_000_000.0,
+                timing_full_body_nanos as f64 / 1_000_000.0,
+                body_time.as_secs_f64() * 1000.0,
+            );
+        }
+        for plan in plans.iter().filter(|plan| live.contains(&plan.id)) {
+            if let Some(body) = &plan.cached_body {
+                body_of.insert(plan.id, body.clone());
+            }
+            if let Some(requests) = &plan.cached_discarded_static_requests {
+                discarded_static_requests_of.insert(plan.id, requests.clone());
+            }
+            if self.sourcemap
+                && let Some(map) = &plan.cached_map
+            {
+                map_of.insert(plan.id, map.clone());
+            }
+        }
+        if self.sourcemap {
+            let mut map_requests = Vec::with_capacity(body_miss.len());
+            for &i in &body_miss {
+                let body_vc = plans[i].body_vc.expect("new body task value");
+                map_requests.push(move || source_map_facts_request(body_vc));
+            }
+            let engine = Arc::clone(&self.engine);
+            let maps = par_request_batched(&engine, &self.exec, map_requests);
+            for (&i, map) in body_miss.iter().zip(maps) {
+                map_of.insert(plans[i].id, map);
+            }
+        }
+        let bodies: Vec<(u32, Arc<String>)> = live_ids
+            .iter()
+            .map(|id| (*id, body_of[id].clone()))
+            .collect();
+
         if self.extract_css && !collected_css.is_empty() {
             collected_css.retain(|(id, _)| live_id_set.contains(id));
         }
@@ -2231,11 +2897,14 @@ impl IncrementalBundler {
             .iter()
             .filter_map(|(&id, rec)| rec.block_info.map(|bi| (id, bi)))
             .collect();
+        let namespace_identity_ids = namespace_identity_module_ids(&modules);
 
-        // SourceMap 仅在「启用 + 非 minify」时产出：minify 分支会 scope-hoist 并改写模块体文本，
-        // 行偏移法失效（错位的 map 比没有更误导），故此时不采集。
-        let want_map = self.sourcemap && !self.minify;
-        let mut body_starts: Vec<(u32, u32)> = Vec::new();
+        // Source maps are orthogonal to optimization. The emitter records the exact final byte
+        // placement of every surviving source body fragment; merge_bundle_map then conservatively
+        // aligns module-local mappings through minify's string rewrites and scope concatenation.
+        // Mapping collection must never participate in output decisions.
+        let want_map = self.sourcemap;
+        let mut body_placements = Vec::new();
 
         let mut output = match &chunk_graph {
             None => {
@@ -2245,10 +2914,12 @@ impl IncrementalBundler {
                     self.minify,
                     no_esmodule,
                     &block_infos,
+                    &namespace_identity_ids,
                     &async_ids,
+                    &discarded_static_requests_of,
                     &self.exec,
                     self.module_format,
-                    want_map.then_some(&mut body_starts),
+                    want_map.then_some(&mut body_placements),
                 );
                 let mut o =
                     crate::single_chunk(bundle, live_ids.len(), diagnostics, live_ids.clone());
@@ -2262,20 +2933,35 @@ impl IncrementalBundler {
                     entry.file_name = chunk_filename(name, &entry.code, self.content_hash);
                 }
                 if want_map {
-                    // 源文件名 + 源文本：文本取自 parse 结果；缓存命中未 parse 的模块只带路径
-                    // （sourcesContent 为 null，浏览器按路径自取）。
+                    // 源文件名 + 源文本：优先复用 parse 结果；全缓存命中而未 parse 时直接读内容
+                    // input cell，使冷热缓存的 sourcesContent 与最终 map 逐字节一致。
                     let mut sources: FxHashMap<u32, (String, Option<String>)> =
                         FxHashMap::default();
                     let cwd = std::env::current_dir().ok();
-                    for (id, _) in &body_starts {
-                        if let Some(rec) = modules.get(id) {
+                    for placement in &body_placements {
+                        let id = placement.module_id;
+                        if let Some(rec) = modules.get(&id) {
                             let name = map_source_name(&rec.path, cwd.as_deref());
-                            let content = rec.parsed.as_ref().map(|p| p.source.to_string());
-                            sources.insert(*id, (name, content));
+                            let content = Some(
+                                rec.parsed
+                                    .as_ref()
+                                    .map(|p| p.source.to_string())
+                                    .unwrap_or_else(|| {
+                                        self.engine.enter(|| rec.content_vc.read().to_string())
+                                    }),
+                            );
+                            sources.insert(id, (name, content));
                         }
                     }
                     let file = o.chunks[o.entry_chunk].file_name.clone();
-                    let sm = merge_bundle_map(&body_starts, &map_of, &sources, Some(file));
+                    let sm = merge_bundle_map(
+                        &o.chunks[o.entry_chunk].code,
+                        &body_placements,
+                        &bodies,
+                        &map_of,
+                        &sources,
+                        Some(file),
+                    );
                     let json = serialize_map(&sm, &sources);
                     o.chunks[o.entry_chunk].source_map = Some(json);
                 }
@@ -2283,6 +2969,7 @@ impl IncrementalBundler {
             }
             Some(g) => {
                 let token = build_token(&normalize(entry), live_ids.len());
+                let mut chunk_placements: FxHashMap<u32, Vec<BodyPlacement>> = FxHashMap::default();
                 let (mut chunks, entry_chunk) = emit_chunks(
                     &bodies,
                     g,
@@ -2292,11 +2979,50 @@ impl IncrementalBundler {
                     self.content_hash,
                     &async_ids,
                     &style_files,
+                    want_map.then_some(&mut chunk_placements),
                 );
                 if let Some(name) = self.entry_chunk_name.as_deref() {
                     let entry = &mut chunks[entry_chunk];
                     entry.name = name.to_string();
                     entry.file_name = chunk_filename(name, &entry.code, self.content_hash);
+                }
+                if want_map {
+                    let cwd = std::env::current_dir().ok();
+                    for chunk in &mut chunks {
+                        let Some(placements) = chunk_placements.get(&chunk.chunk_id) else {
+                            continue;
+                        };
+                        let mut sources: FxHashMap<u32, (String, Option<String>)> =
+                            FxHashMap::default();
+                        for placement in placements {
+                            let id = placement.module_id;
+                            if let Some(rec) = modules.get(&id) {
+                                sources.entry(id).or_insert_with(|| {
+                                    (
+                                        map_source_name(&rec.path, cwd.as_deref()),
+                                        Some(
+                                            rec.parsed
+                                                .as_ref()
+                                                .map(|p| p.source.to_string())
+                                                .unwrap_or_else(|| {
+                                                    self.engine
+                                                        .enter(|| rec.content_vc.read().to_string())
+                                                }),
+                                        ),
+                                    )
+                                });
+                            }
+                        }
+                        let sm = merge_bundle_map(
+                            &chunk.code,
+                            placements,
+                            &bodies,
+                            &map_of,
+                            &sources,
+                            Some(chunk.file_name.clone()),
+                        );
+                        chunk.source_map = Some(serialize_map(&sm, &sources));
+                    }
                 }
                 let bundle = chunks[entry_chunk].code.clone();
                 BuildOutput {
@@ -2320,7 +3046,7 @@ impl IncrementalBundler {
 
         output.updated_module_count = codegen_exec_count(&self.codegen_exec_counts)
             .saturating_sub(codegen_exec_before) as usize;
-        output.cached_module_count = plans.len().saturating_sub(output.updated_module_count);
+        output.cached_module_count = live_ids.len().saturating_sub(output.updated_module_count);
 
         // —— 带外产物：超阈值资源（按文件名去重）+ prod 聚合 CSS（模块 id 升序 = BFS 发现序）——
         let mut assets: Vec<OutputAsset> = style_assets;
@@ -2350,13 +3076,17 @@ impl IncrementalBundler {
             let total = t0.elapsed();
             let emit_time = t_emit_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
             eprintln!(
-                "[wake-timing] 模块={} | scan={:.1?} (read={:.1?} resolve={:.1?}) | link={:.1?} | codegen={:.1?} | emit={:.1?} | 总={:.1?}",
+                "[wake-timing] 模块={} workers={} lifetime={} | scan={:.1?} (read={:.1?} resolve={:.1?}) | link={:.1?} | codegen={:.1?} (optimize={:.1?} body={:.1?}) | emit={:.1?} | 总={:.1?}",
                 ordered.len(),
+                self.exec.num_threads(),
+                if self.one_shot { "one-shot" } else { "session" },
                 t_scan,
                 read_time,
                 resolve_time,
                 link_time,
                 codegen_time,
+                optimize_time,
+                body_time,
                 emit_time,
                 total,
             );
@@ -2399,14 +3129,29 @@ impl IncrementalBundler {
         }
     }
 
-    /// 取/建某路径的 linker cell 并写入最新数据（deps + keep 未变则 no-op）。
-    fn linker_cell(&mut self, path: &Path, data: LinkerData) -> Vc<LinkerData> {
-        if let Some(&cell) = self.linker_cells.get(path) {
+    /// Get/update optimizer-owned linker facts. Final chunk numbering never enters this cell.
+    fn optimize_linker_cell(
+        &mut self,
+        path: &Path,
+        data: OptimizeLinkerData,
+    ) -> Vc<OptimizeLinkerData> {
+        if let Some(&cell) = self.optimize_linker_cells.get(path) {
             self.engine.set_input(cell, data);
             cell
         } else {
             let cell = self.engine.new_input(data);
-            self.linker_cells.insert(path.to_path_buf(), cell);
+            self.optimize_linker_cells.insert(path.to_path_buf(), cell);
+            cell
+        }
+    }
+
+    fn emit_linker_cell(&mut self, path: &Path, data: EmitLinkerData) -> Vc<EmitLinkerData> {
+        if let Some(&cell) = self.emit_linker_cells.get(path) {
+            self.engine.set_input(cell, data);
+            cell
+        } else {
+            let cell = self.engine.new_input(data);
+            self.emit_linker_cells.insert(path.to_path_buf(), cell);
             cell
         }
     }
@@ -2422,17 +3167,17 @@ impl IncrementalBundler {
         }
     }
 
-    fn codegen_options_cell(
+    fn optimize_options_cell(
         &mut self,
         path: &Path,
-        data: CodegenOptionsInput,
-    ) -> Vc<CodegenOptionsInput> {
-        if let Some(&cell) = self.codegen_options_cells.get(path) {
+        data: OptimizeOptionsInput,
+    ) -> Vc<OptimizeOptionsInput> {
+        if let Some(&cell) = self.optimize_options_cells.get(path) {
             self.engine.set_input(cell, data);
             cell
         } else {
             let cell = self.engine.new_input(data);
-            self.codegen_options_cells.insert(path.to_path_buf(), cell);
+            self.optimize_options_cells.insert(path.to_path_buf(), cell);
             cell
         }
     }
@@ -2449,8 +3194,8 @@ impl IncrementalBundler {
         modules: &FxHashMap<u32, ModuleRec>,
         entry_id: u32,
         next_id: u32,
-    ) -> FxHashMap<u32, Option<Vec<String>>> {
-        let mut keep: FxHashMap<u32, Option<Vec<String>>> = FxHashMap::default();
+    ) -> FxHashMap<u32, Option<ExportKeep>> {
+        let mut keep: FxHashMap<u32, Option<ExportKeep>> = FxHashMap::default();
         if !self.tree_shaking {
             for &id in modules.keys() {
                 keep.insert(id, None);
@@ -2510,11 +3255,24 @@ impl IncrementalBundler {
 
         for &id in modules.keys() {
             let k = match live_keep.get(&id) {
-                Some(LiveResult::Names(atoms)) => {
-                    let mut v: Vec<String> =
-                        atoms.iter().map(|a| self.interner.resolve(*a)).collect();
-                    v.sort_unstable();
-                    Some(v)
+                Some(LiveResult::Names {
+                    retained,
+                    observed,
+                    preserve_export_star,
+                }) => {
+                    let resolve_names = |atoms: &FxHashSet<_>| {
+                        let mut names: Vec<String> = atoms
+                            .iter()
+                            .map(|atom| self.interner.resolve(*atom))
+                            .collect();
+                        names.sort_unstable();
+                        names
+                    };
+                    Some(ExportKeep {
+                        retained_export_names: resolve_names(retained),
+                        observed_export_names: resolve_names(observed),
+                        preserve_export_star: *preserve_export_star,
+                    })
                 }
                 // `All` 或不在结果里（缺绑定分析）→ 保守全保留。
                 _ => None,
@@ -2678,13 +3436,92 @@ fn is_node_builtin(spec: &str) -> bool {
     )
 }
 
-/// codegen 阶段一个模块的计划：产物键 + linker 句柄 + 命中的缓存体（`None` = 需 codegen）。
+/// Per-module staged optimizer/body plan. Process-local Vc values never cross the persistent
+/// boundary; stable retained targets, JavaScript, and mapping facts use separate cache entries.
 struct CgPlan {
     id: u32,
     path: PathBuf,
+    content_key: u64,
+    optimize_key: u128,
+    optimize_linker_hash: u64,
+    optimize_linker_vc: Vc<OptimizeLinkerData>,
+    optimized_vc: Option<Vc<OptimizeArtifact>>,
+    /// One-shot terminal emission consumes this Arc directly instead of re-entering the task graph.
+    optimized_artifact: Option<Arc<OptimizeArtifact>>,
+    retained_module_ids: Option<Arc<Vec<u32>>>,
     body_key: u128,
-    linker_vc: Vc<LinkerData>,
+    emit_linker_vc: Option<Vc<EmitLinkerData>>,
+    emit_linker_data: Option<Arc<EmitLinkerData>>,
+    body_vc: Option<Vc<EmittedBody>>,
     cached_body: Option<Arc<String>>,
+    cached_map: Option<Arc<ModuleMappings>>,
+    cached_discarded_static_requests: Option<Arc<Vec<GeneratedDiscardedStaticRequest>>>,
+}
+
+fn cached_mappings_from_module(
+    mappings: &ModuleMappings,
+    discarded_static_requests: &[GeneratedDiscardedStaticRequest],
+) -> CachedModuleMappings {
+    CachedModuleMappings {
+        mappings: mappings
+            .mappings
+            .iter()
+            .map(|mapping| CachedMapping {
+                gen_line: mapping.gen_line,
+                gen_col: mapping.gen_col,
+                src_index: mapping.src_index,
+                src_offset: mapping.src_offset,
+                name_index: mapping.name_index,
+                is_unmapped: mapping.is_unmapped,
+            })
+            .collect(),
+        names: mappings.names.clone(),
+        discarded_static_requests: discarded_static_requests
+            .iter()
+            .map(|request| CachedDiscardedStaticRequest {
+                start: request.start,
+                end: request.end,
+                target_module_id: request.target_module_id,
+            })
+            .collect(),
+    }
+}
+
+fn module_metadata_from_cache(
+    mappings: Arc<CachedModuleMappings>,
+) -> (
+    Arc<ModuleMappings>,
+    Option<Arc<Vec<GeneratedDiscardedStaticRequest>>>,
+) {
+    let module_mappings = Arc::new(ModuleMappings {
+        mappings: mappings
+            .mappings
+            .iter()
+            .map(|mapping| Mapping {
+                gen_line: mapping.gen_line,
+                gen_col: mapping.gen_col,
+                src_index: mapping.src_index,
+                src_offset: mapping.src_offset,
+                name_index: mapping.name_index,
+                is_unmapped: mapping.is_unmapped,
+            })
+            .collect(),
+        names: mappings.names.clone(),
+    });
+    let requests = (!mappings.discarded_static_requests.is_empty()).then(|| {
+        Arc::new(
+            mappings
+                .discarded_static_requests
+                .iter()
+                .map(|request| GeneratedDiscardedStaticRequest {
+                    start: request.start,
+                    end: request.end,
+                    target_module_id: request.target_module_id,
+                })
+                .collect(),
+        )
+    });
+    (module_mappings, requests)
 }
 
 fn extend_module_diagnostics(
@@ -2773,21 +3610,36 @@ impl JsxRuntimeOptions {
     }
 }
 
-/// linker 键：对 `LinkerData`（依赖 id 映射 + keep + dyn_chunks + marker 模式）取稳定 hash
-///（固定种子 SipHash，跨进程稳定）。
-fn hash_linker(data: &LinkerData) -> u64 {
+/// Stable optimizer identity. It deliberately excludes final chunk ids and map enablement.
+fn hash_optimize_linker(data: &OptimizeLinkerData) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     data.hash(&mut h);
     h.finish()
 }
 
-/// minify 开关的缓存键盐（黄金比例常量）——minify 变化时与 define 指纹一并改变产物键。
-const MINIFY_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Stable final-layout body identity. This is downstream of retained-edge convergence.
+fn hash_emit_linker(data: &EmitLinkerData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
+}
 
-/// mangle 开关的缓存键盐——mangle 变化（开/关）时改变产物键，避免命中另一口径的旧产物。
-/// Covers both identifier mangling and property mangling.
-const MANGLE_SALT: u64 = 0xC2B2_AE3D_27D4_EB4F;
+/// Complete optimizer configuration identity for persistent module-body and source-map cache
+/// invalidation. The pipeline version applies even to an unminified request because the optimizer
+/// still validates and applies trusted edits before emission.
+fn optimizer_config_salt(minify: bool, drop_console: bool, drop_debugger: bool) -> u64 {
+    let version = xxh3_64_with_seed(PIPELINE_VERSION.as_bytes(), 0x9E37_79B9_7F4A_7C15);
+    xxh3_64_with_seed(
+        &[
+            u8::from(minify),
+            u8::from(drop_console),
+            u8::from(drop_debugger),
+        ],
+        version,
+    )
+}
 
 /// define 表指纹（固定种子 SipHash，跨进程稳定）——混入产物缓存键，使 define 变化精确失效缓存。
 fn hash_define(define: &[(String, String)]) -> u64 {
@@ -2795,6 +3647,183 @@ fn hash_define(define: &[(String, String)]) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     define.hash(&mut h);
     h.finish()
+}
+
+/// Parse configuration-provided define values once per build before they enter the optimizer.
+/// The parser wrapper proves the complete value is one expression, so statement/comment injection
+/// and trailing tokens become diagnostics. The optimizer owns the eventual grouping bytes;
+/// syntax-level primitives alone enter constant folding.
+fn validate_defines(define: &[(String, String)]) -> Result<Vec<ValidatedDefine>, String> {
+    let interner = Interner::new();
+    let mut seen = FxHashSet::default();
+    let mut validated = Vec::with_capacity(define.len());
+
+    for (key, value) in define {
+        if key.is_empty() || key.trim() != key || !seen.insert(key.clone()) {
+            return Err(format!(
+                "define key `{key}` must be a unique, non-empty static member chain"
+            ));
+        }
+
+        let key_source = format!("const __wake_define_key__=({key});");
+        let parsed_key = parse(&key_source, &interner, SourceType::Module);
+        if parsed_key.has_errors()
+            || !parsed_key
+                .module
+                .with_ast(|program| define_initializer(program).is_some_and(is_static_define_key))
+        {
+            return Err(format!(
+                "define key `{key}` must be an identifier, meta-property, or dot member chain{}",
+                parse_error_suffix(&parsed_key.diagnostics)
+            ));
+        }
+
+        if value.trim().is_empty() {
+            return Err(format!("define `{key}` has an empty expression"));
+        }
+        let value_source = format!("const __wake_define_value__=({value});");
+        let parsed_value = parse(&value_source, &interner, SourceType::Script);
+        if parsed_value.has_errors() {
+            return Err(format!(
+                "define `{key}` is not one valid JavaScript expression{}",
+                parse_error_suffix(&parsed_value.diagnostics)
+            ));
+        }
+        let Some(primitive) = parsed_value.module.with_ast(|program| {
+            define_initializer(program)
+                .map(|expression| primitive_define_value(expression, &interner))
+        }) else {
+            return Err(format!(
+                "define `{key}` is not one valid JavaScript expression"
+            ));
+        };
+
+        let entry = if let Some(primitive) = primitive {
+            ValidatedDefine::primitive(key.clone(), primitive)
+        } else {
+            // `TrustedExpression` deliberately accepts only an expression program, never the
+            // temporary variable declaration used above to classify primitive values. Grouping
+            // keeps object/class/function expressions unambiguous while the parser still proves
+            // that all configured bytes belong to one expression.
+            let expression_source = format!("({value})");
+            let parsed_expression = parse(&expression_source, &interner, SourceType::Script);
+            let expression =
+                TrustedExpression::from_parsed_program(&parsed_expression.module, &interner);
+            if !expression.is_valid() {
+                return Err(format!(
+                    "define `{key}` could not be lowered into one owned expression"
+                ));
+            }
+            ValidatedDefine::expression(key.clone(), expression)
+        };
+        validated.push(entry);
+    }
+
+    Ok(validated)
+}
+
+fn define_initializer<'ast>(program: &'ast Program<'ast>) -> Option<Expression<'ast>> {
+    if program.body.len() != 1 {
+        return None;
+    }
+    let Statement::VariableDeclaration(declaration) = program.body[0] else {
+        return None;
+    };
+    if declaration.declarations.len() != 1 {
+        return None;
+    }
+    declaration.declarations[0].init
+}
+
+fn is_static_define_key(expression: Expression<'_>) -> bool {
+    match expression {
+        Expression::Identifier(_) | Expression::MetaProperty(_) => true,
+        Expression::Member(member) if !member.optional => {
+            matches!(member.property, MemberProperty::Ident(_))
+                && is_static_define_key(member.object)
+        }
+        _ => false,
+    }
+}
+
+fn primitive_define_value(expression: Expression<'_>, interner: &Interner) -> Option<ConstVal> {
+    match expression {
+        Expression::NumberLiteral(literal) => Some(ConstVal::Num(literal.value)),
+        Expression::StringLiteral(literal) => Some(ConstVal::Str(interner.resolve(literal.value))),
+        Expression::BooleanLiteral(literal) => Some(ConstVal::Bool(literal.value)),
+        Expression::NullLiteral(_) => Some(ConstVal::Null),
+        Expression::Identifier(identifier) => match interner.resolve(identifier.name).as_str() {
+            "undefined" => Some(ConstVal::Undefined),
+            "NaN" => Some(ConstVal::Num(f64::NAN)),
+            "Infinity" => Some(ConstVal::Num(f64::INFINITY)),
+            _ => None,
+        },
+        Expression::Unary(unary) => {
+            let argument = primitive_define_value(unary.argument, interner)?;
+            match (unary.operator, argument) {
+                (UnaryOperator::Minus, ConstVal::Num(value)) => Some(ConstVal::Num(-value)),
+                (UnaryOperator::Plus, ConstVal::Num(value)) => Some(ConstVal::Num(value)),
+                (UnaryOperator::LogicalNot, value) => Some(ConstVal::Bool(!value.truthy())),
+                (UnaryOperator::Void, _) => Some(ConstVal::Undefined),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_error_suffix(diagnostics: &[Diagnostic]) -> String {
+    diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| format!(": {}", diagnostic.message))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod define_validation_tests {
+    use wake_ecma_minify::ValidatedDefineValue;
+
+    use super::*;
+
+    #[test]
+    fn define_values_are_parsed_and_primitives_are_typed() {
+        let values = validate_defines(&[
+            ("DEBUG".into(), "false".into()),
+            ("process.env.MODE".into(), "'production'".into()),
+            ("CONFIG".into(), "{answer: 42}".into()),
+        ])
+        .expect("valid definitions");
+
+        assert!(matches!(
+            values[0].value,
+            ValidatedDefineValue::Primitive(ConstVal::Bool(false))
+        ));
+        assert!(matches!(
+            &values[1].value,
+            ValidatedDefineValue::Primitive(ConstVal::Str(value)) if value == "production"
+        ));
+        assert!(matches!(
+            &values[2].value,
+            ValidatedDefineValue::Expression(value) if value.source() == "{answer: 42}"
+        ));
+    }
+
+    #[test]
+    fn define_validation_rejects_non_static_keys_and_statement_injection() {
+        assert!(validate_defines(&[("config[key]".into(), "1".into())]).is_err());
+        assert!(
+            validate_defines(&[("DEBUG".into(), "false);globalThis.injected=true".into())])
+                .is_err()
+        );
+        assert!(
+            validate_defines(&[
+                ("DEBUG".into(), "true".into()),
+                ("DEBUG".into(), "false".into())
+            ])
+            .is_err()
+        );
+    }
 }
 
 fn dep_kind_to_u8(k: DependencyKind) -> u8 {
@@ -2968,117 +3997,154 @@ fn parse_request(
     (vc, arc)
 }
 
-/// 收集模块中所有 (export_name, variable_name, declarator_span) 三元组。
-/// declarator_span 用于 span 级别精确匹配，避免同名字段在不同作用域被误判。
-fn collect_export_var_pairs(program: &Program, interner: &Interner) -> Vec<(String, String, Span)> {
-    let mut pairs = Vec::new();
-    for stmt in program.body.iter() {
-        match stmt {
-            Statement::ExportNamed(s) => {
-                if let Some(decl) = &s.declaration {
-                    match decl {
-                        Statement::VariableDeclaration(d) => {
-                            for decl in d.declarations.iter() {
-                                if let Pattern::Ident(id) = &decl.id {
-                                    let name = interner.resolve(id.name);
-                                    pairs.push((name.clone(), name, decl.span));
-                                }
-                            }
-                        }
-                        Statement::FunctionDeclaration(f) => {
-                            if let Some(id) = f.id {
-                                let name = interner.resolve(id.name);
-                                pairs.push((name.clone(), name, f.span));
-                            }
-                        }
-                        Statement::ClassDeclaration(c) => {
-                            if let Some(id) = c.id {
-                                let name = interner.resolve(id.name);
-                                pairs.push((name.clone(), name, c.span));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                for spec in s.specifiers.iter() {
-                    let exported = match &spec.exported {
-                        ModuleExportName::Ident(id) => interner.resolve(id.name),
-                        ModuleExportName::String(a) => interner.resolve(*a),
-                    };
-                    let local = match &spec.local {
-                        ModuleExportName::Ident(id) => interner.resolve(id.name),
-                        ModuleExportName::String(a) => interner.resolve(*a),
-                    };
-                    pairs.push((exported, local, spec.span));
-                }
-            }
-            Statement::ExportDefault(s) => {
-                let (var_name, span) = match &s.declaration {
-                    ExportDefaultKind::Function(f) => {
-                        (f.id.map(|id| interner.resolve(id.name)), f.span)
-                    }
-                    ExportDefaultKind::Class(c) => {
-                        (c.id.map(|id| interner.resolve(id.name)), c.span)
-                    }
-                    _ => (None, s.span),
-                };
-                if let Some(name) = var_name {
-                    pairs.push(("default".to_string(), name, span));
-                }
-            }
-            _ => {}
-        }
-    }
-    pairs
+/// Optimizer task output. The owned program is process-local; only stable retained target ids are
+/// persisted. Hashing uses the optimizer's stable fingerprint rather than arena addresses.
+struct OptimizeArtifact {
+    optimized: Option<Arc<OptimizedProgram>>,
+    retained_module_ids: Arc<Vec<u32>>,
+    css: Option<Arc<String>>,
+    inject_style: bool,
+    style_seed: Option<String>,
+    diagnostics: Vec<Diagnostic>,
 }
 
-/// codegen 任务产物：模块体 + 可选的 SourceMap 映射（WAKE-COMPATIBILITY §M4d）。
-///
-/// `code` 用 `Arc<String>` 内嵌（而非裸 `String`），使下游 `bodies` 与产物磁盘缓存得以
-/// 沿用 `Arc<String>` 类型、取出时只做引用计数自增，接入 sourcemap 无需改动既有拼接与缓存路径。
-pub(crate) struct CodegenBody {
-    pub(crate) code: Arc<String>,
-    /// 模块内局部坐标的映射（`None` = 未请求 sourcemap）。
-    pub(crate) map: Option<Arc<ModuleMappings>>,
-    /// CSS-in-JS 抽取出的样式（`None` = 未启用 / 无样式 / 已内联为 `<style>` 注入）。
-    pub(crate) css: Option<Arc<String>>,
-    /// CSS-in-JS 求值诊断（警告级）。
-    pub(crate) diagnostics: Vec<Diagnostic>,
-}
-
-// CSS 内容必须参与指纹：类名身份刻意与声明内容解耦，因此 token `red → blue` 时 JS 可以逐字
-// 不变而 CSS 已变化。若只 hash code，Turbo 的 changed-at 截断会把真实样式更新误判为绿色。
-impl std::hash::Hash for CodegenBody {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.code.hash(state);
+impl Hash for OptimizeArtifact {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.optimized
+            .as_ref()
+            .map(|program| program.fingerprint())
+            .hash(state);
+        self.retained_module_ids.hash(state);
         self.css.hash(state);
-        if let Some(map) = &self.map {
-            for mapping in &map.mappings {
-                mapping.gen_line.hash(state);
-                mapping.gen_col.hash(state);
-                mapping.src_index.hash(state);
-                mapping.src_offset.hash(state);
-            }
-        }
+        self.inject_style.hash(state);
+        self.style_seed.hash(state);
         for diagnostic in &self.diagnostics {
             format!("{diagnostic:?}").hash(state);
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn codegen_request(
+/// Byte-identical body plus module-local mapping facts produced by the same token walk. Mapping
+/// facts are always present, making source-map enablement a downstream-only operation.
+pub(crate) struct EmittedBody {
+    pub(crate) code: Arc<String>,
+    pub(crate) mapping_facts: Arc<ModuleMappings>,
+    pub(crate) discarded_static_requests: Arc<Vec<GeneratedDiscardedStaticRequest>>,
+    pub(crate) css: Option<Arc<String>>,
+    cacheable: bool,
+    /// WAKE_TIMING-only aggregation payload; deliberately excluded from the task fingerprint.
+    sealed_trivial: bool,
+    codegen_nanos: u64,
+}
+
+fn hash_module_mappings<H: Hasher>(map: &ModuleMappings, state: &mut H) {
+    map.mappings.len().hash(state);
+    for mapping in &map.mappings {
+        mapping.gen_line.hash(state);
+        mapping.gen_col.hash(state);
+        mapping.src_index.hash(state);
+        mapping.src_offset.hash(state);
+        mapping.name_index.hash(state);
+        mapping.is_unmapped.hash(state);
+    }
+    map.names.hash(state);
+}
+
+impl Hash for EmittedBody {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.code.hash(state);
+        hash_module_mappings(&self.mapping_facts, state);
+        self.discarded_static_requests.hash(state);
+        self.css.hash(state);
+        self.cacheable.hash(state);
+    }
+}
+
+struct SourceMapFacts(Arc<ModuleMappings>);
+
+impl Hash for SourceMapFacts {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_module_mappings(&self.0, state);
+    }
+}
+
+#[cfg(test)]
+mod emitted_body_hash_tests {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::sync::Arc;
+
+    use wake_ecma_codegen::{GeneratedDiscardedStaticRequest, Mapping, ModuleMappings};
+
+    use super::EmittedBody;
+
+    fn fingerprint(body: &EmittedBody) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        body.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn body(name_index: Option<u32>, name: &str) -> EmittedBody {
+        EmittedBody {
+            code: Arc::new("let a=1;".into()),
+            mapping_facts: Arc::new(ModuleMappings {
+                mappings: vec![Mapping {
+                    gen_line: 0,
+                    gen_col: 4,
+                    src_index: 0,
+                    src_offset: 4,
+                    name_index,
+                    is_unmapped: false,
+                }],
+                names: vec![name.into()],
+            }),
+            discarded_static_requests: Arc::new(Vec::new()),
+            css: None,
+            cacheable: true,
+            sealed_trivial: false,
+            codegen_nanos: 0,
+        }
+    }
+
+    #[test]
+    fn mapping_names_and_name_index_participate_in_the_body_fingerprint() {
+        let baseline = fingerprint(&body(Some(0), "descriptiveName"));
+        assert_ne!(baseline, fingerprint(&body(None, "descriptiveName")));
+        assert_ne!(baseline, fingerprint(&body(Some(0), "differentName")));
+    }
+
+    #[test]
+    fn unmapped_segments_participate_in_the_body_fingerprint() {
+        let baseline = body(None, "descriptiveName");
+        let mut changed = body(None, "descriptiveName");
+        Arc::make_mut(&mut changed.mapping_facts).mappings[0].is_unmapped = true;
+        assert_ne!(fingerprint(&baseline), fingerprint(&changed));
+    }
+
+    #[test]
+    fn discarded_static_request_ranges_participate_in_the_body_fingerprint() {
+        let baseline = body(None, "descriptiveName");
+        let mut changed = body(None, "descriptiveName");
+        Arc::make_mut(&mut changed.discarded_static_requests).push(
+            GeneratedDiscardedStaticRequest {
+                start: 0,
+                end: 3,
+                target_module_id: 7,
+            },
+        );
+        assert_ne!(fingerprint(&baseline), fingerprint(&changed));
+    }
+}
+
+fn optimize_request(
     parse_vc: Vc<ParsedModule>,
-    linker_vc: Vc<LinkerData>,
+    linker_vc: Vc<OptimizeLinkerData>,
     css_input_vc: Vc<CssCodegenInput>,
-    options_input_vc: Vc<CodegenOptionsInput>,
+    options_input_vc: Vc<OptimizeOptionsInput>,
     interner: Arc<Interner>,
-    codegen_exec_counts: CodegenExecCounts,
-    codegen_counter_shard: usize,
-) -> Arc<CodegenBody> {
+) -> (Vc<OptimizeArtifact>, Arc<OptimizeArtifact>) {
     let id = TaskId::of(
         "wake_bundler",
-        "codegen",
+        "optimize",
         &[
             parse_vc.arg_ref(),
             linker_vc.arg_ref(),
@@ -3087,283 +4153,240 @@ fn codegen_request(
         ],
     );
     let vc = query(id, move || {
-        codegen_exec_counts[codegen_counter_shard].fetch_add(1, Ordering::Relaxed);
         let parsed = parse_vc.read();
         let css_input = css_input_vc.read();
         let options = options_input_vc.read();
-        let define = &options.define;
         let minify = options.minify;
-        let mangle = options.mangle;
-        let minify_names = options.minify_names;
         let drop_console = options.drop_console;
         let drop_debugger = options.drop_debugger;
-        let want_map = options.want_map;
-        // Large generated modules expose span-keyed rename/liveness divergence between source
-        // declarations and linker-generated reads. Keep their names/exports stable until the
-        // optimizer is keyed end-to-end by SymbolId; small modules retain the normal fast path.
-        let compatibility_mode = mangle && parsed.source.len() >= 4096;
-        let mangle = mangle && !compatibility_mode;
-        let minify_names = minify_names && !compatibility_mode;
+        let module_name = &options.module_name;
+        let one_shot = options.one_shot;
+        let define = match &options.validated_define {
+            Ok(define) => define,
+            Err(message) => {
+                return OptimizeArtifact {
+                    optimized: None,
+                    retained_module_ids: Arc::new(Vec::new()),
+                    css: None,
+                    inject_style: css_input.inject_style,
+                    style_seed: css_input.seed.clone(),
+                    diagnostics: vec![Diagnostic::error(format!(
+                        "invalid define configuration: {message}"
+                    ))],
+                };
+            }
+        };
         let data = linker_vc.read();
-        let no_esmodule = data.no_esmodule;
-        let linker = Linker {
-            map: SpecifierLookup::new(&data.deps),
-            dyn_chunk: SpecifierLookup::new(&data.dyn_chunks),
-            async_ids: &data.async_deps,
-        };
-        // Cross-module export shaking is disabled until declaration removal and synthesized
-        // export writes share one SymbolId-based liveness model. Unreachable modules are still
-        // removed by the graph phase.
-        let keep: Option<&[String]> = if compatibility_mode {
-            None
-        } else {
-            data.keep_exports.as_deref()
-        };
+        // The graph communicates its stable, persisted export-name keep set at the module
+        // boundary. The optimizer resolves those module-local names to semantic SymbolIds and
+        // computes the rooted declaration closure before it commits binding removals; codegen
+        // only consumes those proofs.
+        let keep = data.export_keep.as_ref();
         // 所有 codegen 配置都来自 Vc input；同一 bundler 实例在 build 之间切换 dev/prod 时会
         // 精确失效模块体，持久缓存仍由 body_key 的对应盐隔离。
-        let dv: Vec<(&str, &str)> = define
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
         parsed.ast.with_ast(|program| {
-            // —— `@crab-dev/css` 静态编译：与 mangle/minify 无关，先跑 ——
+            // —— `@crab-dev/css` 静态编译：先生成可信结构化编辑，再交给 optimizer ——
             // 产出「标签模板 span → 类名字面量」替换 + 本模块抽取的 CSS。
             let imported: wake_css_in_js::value::Scope = css_input.scope.iter().cloned().collect();
             let cij = css_input.seed.as_deref().map(|seed| {
                 wake_css_in_js::transform(program, &interner, &parsed.source, seed, &imported)
             });
 
-            // emit 把每个模块包成 `function(m,$,_r){…}`（`m`=module、`$`=exports、`_r`=require 的
-            // 压缩名）。声明为保留名，mangler 不会把局部压成它们而与包装器参数撞车（曾致 React
-            // 产物 `class m{}` 与参数 `m` 重复声明 → SyntaxError）。
-            let export_pairs = collect_export_var_pairs(program, &interner);
-            let mut protected_names = vec!["m", "$", "_r"];
-            protected_names.extend(
-                export_pairs
-                    .iter()
-                    .map(|(_, local_name, _)| local_name.as_str()),
-            );
-            let semantic = (minify || mangle).then(|| analyze(program));
-            let semantic_safe = !has_hazard(program, &interner);
-            let plan = (mangle && semantic_safe).then(|| {
-                plan_mangle_with_model_and_protected(
-                    program,
-                    &interner,
-                    &protected_names,
-                    semantic.as_ref().expect("semantic model was requested"),
-                    cij.as_ref()
-                        .map(|c| c.verbatim_replacement_spans.as_slice())
-                        .unwrap_or_default(),
+            let mut optimize_input = OptimizeInput::new(&parsed.source);
+            optimize_input.minify = minify;
+            // Bundled ESM is lowered through the same CommonJS-shaped registry as preserved CJS
+            // artifacts. Let the optimizer own import namespace allocation and rewrite named /
+            // default reads by semantic SymbolId so they remain live across module cycles instead
+            // of becoming initialization-time property snapshots.
+            optimize_input.set_bundled_commonjs(true);
+            optimize_input
+                .set_bundled_internal_esm_dependencies(data.internal_esm_deps.iter().cloned());
+            optimize_input.defines = define.clone();
+            optimize_input.drop_console = drop_console;
+            optimize_input.drop_debugger = drop_debugger;
+            optimize_input.module_name = Some(module_name.clone());
+            optimize_input.dependencies = parsed
+                .deps
+                .iter()
+                .map(|dependency| OptimizeDependency {
+                    specifier: dependency.specifier.clone(),
+                    origin: if dependency.span.is_dummy() {
+                        NodeOrigin::Synthetic {
+                            anchor: None,
+                            reason: SyntheticReason::LoweringGenerated,
+                        }
+                    } else {
+                        NodeOrigin::Source(dependency.span)
+                    },
+                })
+                .collect();
+            optimize_input.reserved_names = vec!["m".into(), "$".into(), "_r".into()];
+            // `None` is the optimizer's explicit "preserve every public export" contract. Exact
+            // linker sets cross the boundary only as stable public names; the optimizer resolves
+            // them to parser-generation SymbolIds through the same semantic model used by owned
+            // lowering, so no duplicate parser analysis or process-local ID escapes this task.
+            optimize_input.linker_liveness = keep.map(|keep| {
+                LinkerExportLiveness::from_parts(
+                    data.module_id,
+                    keep.retained_export_names.iter().cloned(),
+                    keep.observed_export_names.iter().cloned(),
+                    keep.preserve_export_star,
                 )
             });
-            // 属性名混淆默认关闭：逐模块、基于名字频率的属性重命名从根本上不健全——
-            // 它无法看到跨模块 / 宿主（React style、DOM）对属性的读取，也无法处理计算成员
-            // `obj[expr]` 与运行时字符串键，会破坏 enum 成员访问、内联 style、查表等。
-            // 对齐 esbuild（不混淆属性）/ Terser（默认关闭）。TODO：改为命名约定 opt-in。
-            let _ = wake_ecma_minify::plan_prop_mangle;
-            {
-                let mut minify_ctx = MinifyCtx {
-                    defines: &dv,
-                    prop_rename: None,
-                    ..MinifyCtx::default()
-                };
-                // CSS-in-JS 的替换先于 minify 填充：二者 span 不相交（前者是 TaggedTemplate，
-                // 后者来自常量折叠），顺序不影响结果。
-                if let Some(c) = &cij {
-                    for (span, text) in &c.replacements {
-                        minify_ctx
-                            .expression_replacements
-                            .insert(*span, text.clone());
-                    }
-                }
-                if minify {
-                    let source: &str = &parsed.source;
-
-                    // 1) 表达式简化 + 常量折叠
-                    let sp = plan_simplifications(program, source, &interner);
-                    for (span, action) in &sp.actions {
-                        match action {
-                            SimplifyAction::RemoveDoubleNot => {
-                                minify_ctx.double_not_spans.insert(*span);
-                            }
-                            SimplifyAction::BracketToDot => {
-                                if let Some(name) = sp.bracket_names.get(span) {
-                                    minify_ctx.bracket_to_dot.insert(*span, name.clone());
-                                }
-                            }
-                            SimplifyAction::ReplaceWith(text) => {
-                                minify_ctx
-                                    .expression_replacements
-                                    .insert(*span, text.clone());
-                            }
-                        }
-                    }
-                    minify_ctx.constants = sp.constants;
-
-                    // 2) DCE
-                    let dce = analyze_dce(program, &interner, drop_debugger, drop_console);
-
-                    // 3) 变量使用分析（未引用变量消除 + 变量内联）。被 tree shaking 删除的
-                    // export 不再人为保活其本地声明；同一本地仍由另一个活跃导出引用时除外。
-                    let keep_set: Option<FxHashSet<&str>> =
-                        keep.map(|keep_names| keep_names.iter().map(String::as_str).collect());
-                    let export_pairs = keep_set
-                        .as_ref()
-                        .map(|_| collect_export_var_pairs(program, &interner));
-                    let removable_export_locals =
-                        if let (Some(keep_set), Some(pairs)) = (&keep_set, &export_pairs) {
-                            let live_locals: FxHashSet<&str> = pairs
-                                .iter()
-                                .filter(|(export, _, _)| keep_set.contains(export.as_str()))
-                                .map(|(_, local, _)| local.as_str())
-                                .collect();
-                            pairs
-                                .iter()
-                                .filter(|(export, local, _)| {
-                                    !keep_set.contains(export.as_str())
-                                        && !live_locals.contains(local.as_str())
-                                })
-                                .map(|(_, local, _)| interner.intern(local))
-                                .collect()
-                        } else {
-                            FxHashSet::default()
-                        };
-                    let va = if semantic_safe {
-                        analyze_vars_with_model(
-                            program,
-                            semantic.as_ref().expect("semantic model was requested"),
-                            &dce.remove_spans,
-                            &removable_export_locals,
-                        )
-                    } else {
-                        Default::default()
-                    };
-                    minify_ctx.remove_spans = dce.remove_spans;
-                    minify_ctx.unused_vars = va.unused_vars;
-                    minify_ctx.unused_var_spans = va.unused_var_spans;
-
-                    // 3b) Tree shaking 整合：导出被移除时，标记对应声明 span。
-                    // Span 匹配确保作用域安全（不同作用域的同名变量不同 span）。
-                    if let (Some(keep_set), Some(pairs)) = (&keep_set, &export_pairs) {
-                        for (export_name, _var_name, decl_span) in pairs {
-                            if !keep_set.contains(export_name.as_str()) {
-                                minify_ctx.removed_export_spans.insert(*decl_span);
-                            }
-                        }
-                    }
-
-                    // 4) 变量内联（Phase 2.4）：将单次使用纯变量的初始化表达式注入 inline_vars。
-                    // 按该变量**唯一一次使用**的引用 span 索引（非名字）——否则会把其它作用域里
-                    // 同名变量的引用也一并替换（曾致 react-dom 局部 root/lane 被换成模块级同名变量）。
-                    if !va.inline_candidates.is_empty() {
-                        let init_map = collect_init_map(program);
-                        for (name, &decl_span) in &va.inline_candidates {
-                            if let (Some(&ref_span), Some(init)) =
-                                (va.inline_ref_spans.get(name), init_map.get(&decl_span))
-                            {
-                                minify_ctx.inline_vars.insert(ref_span, *init);
-                            }
-                        }
-                    }
-
-                    // 5) Phase 3: statement-level optimizations
-                    let if_return = wake_ecma_minify::analyze_if_return(program);
-                    let join_vars = wake_ecma_minify::analyze_join_vars(program);
-                    let seq = wake_ecma_minify::analyze_sequences(program);
-                    minify_ctx.populate_stmts(if_return, join_vars, seq);
-
-                    // 6) Scope hoisting：默认关闭。原实现把嵌套（含条件分支 if/switch/try）里的
-                    // `var x = <init>` 连同**初始化器**提到函数顶部，改变了求值时机与顺序——当 init
-                    // 有副作用或会抛（如守卫内 `var w = a.b` 中 a 在守卫外为 null）时直接改变语义
-                    // （曾致 react-dom `flushMutationEffects` 读 null.flags 崩溃）。安全的作用域提升需
-                    // 完整的「不抛 + 无副作用 + 提升后不改变可观察值」分析，暂未实现；先关闭保正确性。
-                    // let hoist_plan = wake_ecma_minify::plan_hoist(program);
-                    // minify_ctx.hoist = hoist_plan;
-                    let _ = wake_ecma_minify::plan_hoist;
-
-                    // 7) Check if undefined is safe to replace with void 0
-                    minify_ctx.no_undefined_shadow = !is_undefined_shadowed(program, &interner);
-
-                    minify_ctx.minify = true;
-                }
-                if let Some(c) = &cij {
-                    minify_ctx
-                        .remove_spans
-                        .extend(c.removable_import_spans.iter().copied());
-                    minify_ctx
-                        .unused_var_spans
-                        .extend(c.removable_import_binding_spans.iter().copied());
-                }
-
-                let rename = plan.as_ref().map(|p| p.table());
-                // 仅在确有侧表要用时传 ctx：传 `Some(空 ctx)` 会让 codegen 走
-                // `emit_var_decl_elim` 等分支，改变无 minify 场景的既有产物。
-                let ctx_ref = (minify || mangle || cij.is_some()).then_some(&minify_ctx);
-
-                let (code, map) = if want_map {
-                    let (c, m) = codegen_module_shaken_with_map(
-                        program,
+            if let Some(result) = &cij {
+                for (&span, replacement) in &result.replacements {
+                    let parsed_replacement = parse(replacement, &interner, SourceType::Module);
+                    optimize_input.add_expression_edit(TrustedExpressionEdit::from_parsed_program(
+                        span,
+                        &parsed_replacement.module,
                         &interner,
-                        &linker,
-                        keep,
-                        &dv,
-                        minify,
-                        rename,
-                        ctx_ref,
-                        no_esmodule,
-                        minify_names,
-                    );
-                    (c, Some(Arc::new(m)))
-                } else {
-                    (
-                        codegen_module_shaken_mangled(
-                            program,
-                            &interner,
-                            &linker,
-                            keep,
-                            &dv,
-                            minify,
-                            rename,
-                            ctx_ref,
-                            no_esmodule,
-                            minify_names,
-                        ),
-                        None,
-                    )
-                };
-
-                // dev（不抽取 CSS）时把样式随模块体注入 `<style>`，与 `.css` 模块的 dev 行为一致；
-                // prod 则把 CSS 带出，由 driver 聚合进 `styles.<hash>.css`。
-                let css = cij.as_ref().filter(|c| !c.css.is_empty()).map(|c| &c.css);
-                let code = if css_input.inject_style {
-                    if let Some(result) = &cij {
-                        let mut output = code;
-                        append_style_injection(
-                            &mut output,
-                            &result.css,
-                            css_input.seed.as_deref().unwrap_or("module"),
-                        );
-                        output
-                    } else {
-                        code
-                    }
-                } else {
-                    code
-                };
-                CodegenBody {
-                    code: Arc::new(code),
-                    map,
-                    css: if css_input.inject_style {
-                        None
-                    } else {
-                        css.map(|c| Arc::new(c.clone()))
-                    },
-                    diagnostics: cij.map(|c| c.diagnostics).unwrap_or_default(),
+                    ));
                 }
+                optimize_input
+                    .extend_statement_removals(result.removable_import_spans.iter().copied());
+                optimize_input
+                    .extend_binding_removals(result.removable_import_binding_spans.iter().copied());
+            }
+
+            let optimized = match if one_shot {
+                optimize_one_shot(parsed.ast.clone(), &interner, &optimize_input)
+            } else {
+                optimize(parsed.ast.clone(), &interner, &optimize_input)
+            } {
+                Ok(optimized) => optimized,
+                Err(error) => {
+                    let mut diagnostics = cij
+                        .as_ref()
+                        .map(|result| result.diagnostics.clone())
+                        .unwrap_or_default();
+                    diagnostics.push(Diagnostic::error(error.to_string()));
+                    return OptimizeArtifact {
+                        optimized: None,
+                        retained_module_ids: Arc::new(Vec::new()),
+                        css: None,
+                        inject_style: css_input.inject_style,
+                        style_seed: css_input.seed.clone(),
+                        diagnostics,
+                    };
+                }
+            };
+            let mut retained_module_ids: Vec<u32> = optimized
+                .retained_dependencies()
+                .iter()
+                .filter_map(|dependency| {
+                    data.deps.iter().find_map(|(specifier, id)| {
+                        (specifier == &dependency.specifier).then_some(*id)
+                    })
+                })
+                .collect();
+            retained_module_ids.sort_unstable();
+            retained_module_ids.dedup();
+
+            let css = cij
+                .as_ref()
+                .filter(|result| !result.css.is_empty())
+                .map(|result| Arc::new(result.css.clone()));
+            OptimizeArtifact {
+                optimized: Some(Arc::new(optimized)),
+                retained_module_ids: Arc::new(retained_module_ids),
+                css,
+                inject_style: css_input.inject_style,
+                style_seed: css_input.seed.clone(),
+                diagnostics: cij.map(|result| result.diagnostics).unwrap_or_default(),
             }
         })
     });
-    vc.read()
+    let value = vc.read();
+    (vc, value)
+}
+
+fn emit_body_request(
+    optimized_vc: Vc<OptimizeArtifact>,
+    linker_vc: Vc<EmitLinkerData>,
+    interner: Arc<Interner>,
+    codegen_exec_counts: CodegenExecCounts,
+    codegen_counter_shard: usize,
+) -> (Vc<EmittedBody>, Arc<EmittedBody>) {
+    let id = TaskId::of(
+        "wake_bundler",
+        "emit_body",
+        &[optimized_vc.arg_ref(), linker_vc.arg_ref()],
+    );
+    let vc = query(id, move || {
+        let artifact = optimized_vc.read();
+        let data = linker_vc.read();
+        emit_body(
+            &artifact,
+            &data,
+            &interner,
+            &codegen_exec_counts,
+            codegen_counter_shard,
+        )
+    });
+    let value = vc.read();
+    (vc, value)
+}
+
+fn emit_body(
+    artifact: &OptimizeArtifact,
+    data: &EmitLinkerData,
+    interner: &Interner,
+    codegen_exec_counts: &[CachePadded<AtomicU64>],
+    codegen_counter_shard: usize,
+) -> EmittedBody {
+    codegen_exec_counts[codegen_counter_shard].fetch_add(1, Ordering::Relaxed);
+    let Some(optimized) = artifact.optimized.as_ref() else {
+        return EmittedBody {
+            code: Arc::new(String::new()),
+            mapping_facts: Arc::new(ModuleMappings::default()),
+            discarded_static_requests: Arc::new(Vec::new()),
+            css: None,
+            cacheable: false,
+            sealed_trivial: false,
+            codegen_nanos: 0,
+        };
+    };
+    let linker = Linker {
+        map: SpecifierLookup::new(&data.deps),
+        dyn_chunk: SpecifierLookup::new(&data.dyn_chunks),
+        async_ids: &data.async_deps,
+    };
+    let sealed_trivial = optimized.can_emit_sealed_without_finalization(data.no_esmodule);
+    let codegen_started = std::time::Instant::now();
+    let (mut code, mappings, discarded_static_requests) =
+        codegen_optimized_with_map_and_requests(optimized, interner, &linker, data.no_esmodule);
+    let codegen_nanos = codegen_started
+        .elapsed()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    if artifact.inject_style
+        && let Some(css) = &artifact.css
+    {
+        append_style_injection(
+            &mut code,
+            css,
+            artifact.style_seed.as_deref().unwrap_or("module"),
+        );
+    }
+    EmittedBody {
+        code: Arc::new(code),
+        mapping_facts: Arc::new(mappings),
+        discarded_static_requests: Arc::new(discarded_static_requests),
+        css: (!artifact.inject_style)
+            .then(|| artifact.css.clone())
+            .flatten(),
+        cacheable: true,
+        sealed_trivial,
+        codegen_nanos,
+    }
+}
+
+fn source_map_facts_request(body_vc: Vc<EmittedBody>) -> Arc<ModuleMappings> {
+    let id = TaskId::of("wake_bundler", "source_map_facts", &[body_vc.arg_ref()]);
+    let vc = query(id, move || {
+        SourceMapFacts(body_vc.read().mapping_facts.clone())
+    });
+    vc.read().0.clone()
 }
 
 /// 给模块体追加带稳定 module id 的 `<style>` upsert/remove（dev 路径）。每个 bundle runtime
@@ -3441,15 +4464,15 @@ fn parse_module(
     }
 }
 
-/// 死模块消除：从 `entry_id` 出发，按各模块体中**存活**的 `__wake_require__(id)` / `.import(cid,id)`
-/// 调用（codegen DCE 已剥离死 `require`）重算可达模块集。误判只会「多留」不会「错删」。
-fn live_modules(bodies: &[(u32, Arc<String>)], entry_id: u32) -> FxHashSet<u32> {
-    let mut edges: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
-    for (id, body) in bodies {
-        let mut refs = FxHashSet::default();
-        extract_referenced_ids(body, &mut refs);
-        edges.insert(*id, refs);
-    }
+/// 死模块消除：从 `entry_id` 出发，沿优化器报告的保留依赖边做单调 BFS。
+///
+/// 边是在源 AST/IR 上按 span 判活后产生的结构化数据；发射后代码的字符串、注释或字面量
+/// 不参与模块可达性判定。
+fn live_modules(edges: &[(u32, Arc<Vec<u32>>)], entry_id: u32) -> FxHashSet<u32> {
+    let edges: FxHashMap<u32, &[u32]> = edges
+        .iter()
+        .map(|(id, targets)| (*id, targets.as_slice()))
+        .collect();
     let mut live: FxHashSet<u32> = FxHashSet::default();
     let mut stack = vec![entry_id];
     while let Some(id) = stack.pop() {
@@ -3457,7 +4480,7 @@ fn live_modules(bodies: &[(u32, Arc<String>)], entry_id: u32) -> FxHashSet<u32> 
             continue;
         }
         if let Some(refs) = edges.get(&id) {
-            for &r in refs {
+            for &r in *refs {
                 if !live.contains(&r) {
                     stack.push(r);
                 }
@@ -3467,43 +4490,34 @@ fn live_modules(bodies: &[(u32, Arc<String>)], entry_id: u32) -> FxHashSet<u32> 
     live
 }
 
-/// 从一段模块体提取其引用的内部模块 id：`__wake_require__(<id>)`（静态/内联动态）与
-/// `__wake_require__.import(<cid>, <id>)`（跨 chunk 动态，取第二参 = 模块 id）。
-fn extract_referenced_ids(body: &str, out: &mut FxHashSet<u32>) {
-    const NEEDLE: &str = "__wake_require__";
-    let mut rest = body;
-    while let Some(pos) = rest.find(NEEDLE) {
-        let after = &rest[pos + NEEDLE.len()..];
-        if let Some(a) = after.strip_prefix('(') {
-            if let Some(id) = parse_leading_u32(a) {
-                out.insert(id);
-            }
-        } else if let Some(a) = after.strip_prefix(".import(") {
-            // 第一参是 chunk id，第二参是模块 id。
-            let a = skip_u32(a.trim_start());
-            let a = a.trim_start().strip_prefix(',').unwrap_or(a).trim_start();
-            if let Some(id) = parse_leading_u32(a) {
-                out.insert(id);
-            }
-        }
-        rest = after;
-    }
-}
+#[cfg(test)]
+mod retained_dependency_liveness_tests {
+    use std::sync::Arc;
 
-/// 解析字符串前缀的十进制 u32（无前导数字 → `None`）。
-fn parse_leading_u32(s: &str) -> Option<u32> {
-    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    if end == 0 {
-        None
-    } else {
-        s[..end].parse().ok()
-    }
-}
+    use wake_common::FxHashSet;
 
-/// 跳过字符串前缀的十进制数字，返回剩余。
-fn skip_u32(s: &str) -> &str {
-    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    &s[end..]
+    use super::live_modules;
+
+    #[test]
+    fn follows_only_structured_optimizer_edges() {
+        let edges = vec![
+            (0, Arc::new(vec![1, 2])),
+            (1, Arc::new(vec![3])),
+            (2, Arc::new(Vec::new())),
+            (3, Arc::new(vec![2])),
+            // A generated body could contain text resembling a require for this module, but no
+            // structured edge reaches it, so it must remain dead.
+            (99, Arc::new(vec![0])),
+        ];
+
+        assert_eq!(live_modules(&edges, 0), FxHashSet::from_iter([0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn cycles_terminate_and_keep_each_reachable_module_once() {
+        let edges = vec![(4, Arc::new(vec![5])), (5, Arc::new(vec![4]))];
+        assert_eq!(live_modules(&edges, 4), FxHashSet::from_iter([4, 5]));
+    }
 }
 
 /// 检测模块 body 是否仅含 `__reg` 副作用（无 exports、无 require、无局部声明）。
@@ -3601,14 +4615,15 @@ fn try_barrel(body: &str, bytes: &[u8], abs: usize, call_end: usize) -> Option<(
     }
 }
 
-/// 移除对 hoisted 模块的引用（单遍 O(body)）：
-/// 1) barrel re-export 整段：`const _wmX = __wake_require__(N);for (..._wmX...)`
-/// 2) 独立 `__wake_require__(N);` 语句（前置为 `;`/`{`/起始）
+/// 移除对 hoisted 模块的 generated barrel re-export 整段：
+/// `const _wmX = __wake_require__(N);for (..._wmX...)`。
+///
+/// 独立 static request 的删除已由 typed finalizer + generated byte range 拥有；不能在这里
+/// 从文本猜测，否则 `";__wake_require__(N);"` 之类的用户字符串会被误删。
 ///
 /// 原实现对每个 hoisted id（可达上千）各 `format!`+全串 `find`/重建一遍——O(id 数 × body)，且被少数
 /// 引用极多候选的巨型 barrel/聚合模块放大到几十毫秒。此版单遍扫描每个 require 调用，就地按局部上下文
-/// 分类（barrel / 独立 / 非独立保留），收集**互不相交**的删除区间后一次性重建。与原版逐字节等价：
-/// 各 id 的删除区间互不相交 → 处理顺序无关；barrel/独立的判定条件逐字节复刻。
+/// 分类 generated barrel，收集**互不相交**的删除区间后一次性重建。
 fn strip_hoisted_requires_and_barrels(body: &str, hoisted: &FxHashSet<u32>) -> String {
     let bytes = body.as_bytes();
     let mut cuts: Vec<(usize, usize)> = Vec::new();
@@ -3619,12 +4634,6 @@ fn strip_hoisted_requires_and_barrels(body: &str, hoisted: &FxHashSet<u32>) -> S
         // barrel 优先（其 require 前置为 ` = `，天然非独立）。
         if let Some(span) = try_barrel(body, bytes, abs, call_end) {
             cuts.push(span);
-            return;
-        }
-        // 独立语句：前置 `;`/`{`/起始，且 require 后紧跟 `;`。
-        let prev_ok = abs == 0 || bytes[abs - 1] == b';' || bytes[abs - 1] == b'{';
-        if prev_ok && call_end < bytes.len() && bytes[call_end] == b';' {
-            cuts.push((abs, call_end + 1)); // 含末尾 `;`
         }
     });
     if cuts.is_empty() {
@@ -3718,13 +4727,61 @@ fn append_inline_regs(out: &mut String, inline_regs: &[String]) {
     }
 }
 
+fn inline_regs_need_registry_temp(inline_regs: &[String]) -> bool {
+    inline_regs.iter().any(|reg| {
+        let compact = compact_reg_body(reg);
+        let compact = compact.trim().trim_end_matches(';').trim_end();
+        exact_reg_assignment(compact).is_some()
+    })
+}
+
 #[cfg(test)]
 mod inline_reg_tests {
     use super::{
-        append_inline_regs, exported_names, strip_hoisted_requires_and_barrels,
+        append_inline_regs, exported_names, inline_regs_need_registry_temp,
+        replace_eager_discarded_static_requests, strip_hoisted_requires_and_barrels,
         strip_standalone_requires,
     };
     use wake_common::FxHashSet;
+    use wake_ecma_codegen::GeneratedDiscardedStaticRequest;
+
+    #[test]
+    fn replaces_only_proven_requests_to_eager_targets_without_rewriting_sequence_grammar() {
+        let body = "__wake_require__(1),value,__wake_require__(2);";
+        let first_end = "__wake_require__(1)".len();
+        let second_start = body.find("__wake_require__(2)").unwrap();
+        let requests = [
+            GeneratedDiscardedStaticRequest {
+                start: 0,
+                end: first_end as u32,
+                target_module_id: 1,
+            },
+            GeneratedDiscardedStaticRequest {
+                start: second_start as u32,
+                end: (second_start + "__wake_require__(2)".len()) as u32,
+                target_module_id: 2,
+            },
+        ];
+        let eager = FxHashSet::from_iter([1]);
+
+        assert_eq!(
+            replace_eager_discarded_static_requests(body, &requests, &eager),
+            "0,value,__wake_require__(2);"
+        );
+        assert_eq!(
+            replace_eager_discarded_static_requests(
+                body,
+                &[GeneratedDiscardedStaticRequest {
+                    start: 20,
+                    end: 10,
+                    target_module_id: 1,
+                }],
+                &eager,
+            ),
+            body,
+            "malformed cached metadata must make the optimization a no-op"
+        );
+    }
 
     #[test]
     fn skips_empty_registry_bodies_without_leaving_commas() {
@@ -3751,6 +4808,17 @@ mod inline_reg_tests {
         let mut out = "runtime".to_string();
         append_inline_regs(&mut out, &[String::new(), " ; ".to_string()]);
         assert_eq!(out, "runtime");
+        assert!(!inline_regs_need_registry_temp(&[
+            String::new(),
+            " ; ".to_string()
+        ]));
+    }
+
+    #[test]
+    fn declares_the_registry_temp_when_an_inlined_registry_assignment_needs_it() {
+        assert!(inline_regs_need_registry_temp(&[String::from(
+            "globalThis.__reg || (globalThis.__reg = {});globalThis.__reg.a = 1;"
+        )]));
     }
 
     #[test]
@@ -3758,9 +4826,23 @@ mod inline_reg_tests {
         let names = exported_names("const label=\"中文件exports\";exports[\"ok\"] = 1;");
         assert!(names.contains("ok"));
 
+        let concat_members = FxHashSet::from_iter([1]);
         assert_eq!(
-            strip_standalone_requires("const label=\"中文\";_r(1);exports.value = label;"),
+            strip_standalone_requires(
+                "const label=\"中文\";_r(1);exports.value = label;",
+                &concat_members,
+            ),
             "const label=\"中文\";exports.value = label;"
+        );
+        assert_eq!(
+            strip_standalone_requires("_r(1),globalThis.effect=1;", &concat_members),
+            "_r(1),globalThis.effect=1;",
+            "a require at the head of a sequence is not a standalone statement"
+        );
+        assert_eq!(
+            strip_standalone_requires("_r(2);globalThis.effect=1;", &concat_members),
+            "_r(2);globalThis.effect=1;",
+            "a standalone factory dependency must execute when it is outside this concat"
         );
 
         let mut hoisted = FxHashSet::default();
@@ -3769,6 +4851,12 @@ mod inline_reg_tests {
         assert_eq!(
             strip_hoisted_requires_and_barrels(embedded, &hoisted),
             embedded
+        );
+        let standalone_text = "globalThis.label=\";__wake_require__(1);\";";
+        assert_eq!(
+            strip_hoisted_requires_and_barrels(standalone_text, &hoisted),
+            standalone_text,
+            "standalone request-shaped text is not a structural deletion proof"
         );
     }
 }
@@ -3829,6 +4917,13 @@ struct RuntimeNames {
 impl RuntimeNames {
     fn for_bodies<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Self {
         let bodies: Vec<&str> = bodies.into_iter().collect();
+        // Runtime property calls (for example the trusted `import.meta.url` lowering to
+        // `__wake_require__.metaUrl()`) are emitted as an opaque expression today. The compact
+        // body rewrite only shortens direct `__wake_require__(...)` calls, so shortening the
+        // wrapper parameter here would leave that property read unbound. Keep the canonical
+        // parameter locally until all such compiler-generated reads are structural IR nodes.
+        let requires_runtime_properties =
+            bodies.iter().any(|body| body.contains("__wake_require__."));
         let mut used = FxHashSet::default();
         let mut pick = |preferred: &str| {
             for suffix in 0u32.. {
@@ -3848,10 +4943,17 @@ impl RuntimeNames {
             }
             unreachable!()
         };
+        let module = pick("m");
+        let exports = pick("$");
+        let require = if requires_runtime_properties {
+            "__wake_require__".to_string()
+        } else {
+            pick("_r")
+        };
         Self {
-            module: pick("m"),
-            exports: pick("$"),
-            require: pick("_r"),
+            module,
+            exports,
+            require,
         }
     }
 }
@@ -4013,6 +5115,28 @@ fn build_style_artifacts(
 /// [`emit_export_binding`]: wake_ecma_codegen
 fn exported_names(body: &str) -> FxHashSet<String> {
     let mut out = FxHashSet::default();
+    // Mutable ESM bindings and bundled re-exports use getter-backed properties. Compare the
+    // emitted literal spelling: equal public names have equal escaped spellings, while a partial
+    // parse can only conservatively create an extra conflict/standalone module.
+    let mut getter_rest = body;
+    const GETTER: &str = "Object.defineProperty(exports,";
+    while let Some(position) = getter_rest.find(GETTER) {
+        getter_rest = &getter_rest[position + GETTER.len()..];
+        let literal = getter_rest.trim_start();
+        let Some(quote) = literal
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '\'' | '"'))
+        else {
+            continue;
+        };
+        let value = &literal[quote.len_utf8()..];
+        let Some(end) = value.find(quote) else {
+            break;
+        };
+        out.insert(value[..end].to_string());
+        getter_rest = &value[end + quote.len_utf8()..];
+    }
     let bytes = body.as_bytes();
     let mut i = 0usize;
     while let Some(pos) = body[i..].find("exports") {
@@ -4072,6 +5196,54 @@ fn exported_names(body: &str) -> FxHashSet<String> {
     out
 }
 
+/// Internal modules whose exported namespace object is observed as an object, rather than only
+/// through one statically named property.
+///
+/// Scope concatenation normally lets several ESM factories share one compact `exports` object.
+/// That is valid for target-aware named/default reads, but it is observably wrong for namespace
+/// imports, star re-exports, dynamic import, and `require`: the shared object would expose exports
+/// belonging to unrelated concat members. These facts come from the current parser generation's
+/// liveness model and resolved graph ids; no `SymbolId` crosses the cache boundary.
+fn namespace_identity_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
+    let mut targets = FxHashSet::default();
+    for module in modules.values() {
+        let resolved = module
+            .dep_ids
+            .iter()
+            .map(|(specifier, id)| (specifier.as_str(), *id))
+            .collect::<FxHashMap<_, _>>();
+        let mut retain = |specifier: &str| {
+            if let Some(id) = resolved.get(specifier) {
+                targets.insert(*id);
+            }
+        };
+
+        if let Some(liveness) = &module.liveness {
+            for (_, specifier) in &liveness.namespace_imports {
+                retain(specifier);
+            }
+            for specifier in &liveness.reexport_star {
+                retain(specifier);
+            }
+            for (_, specifier) in &liveness.ns_reexports {
+                retain(specifier);
+            }
+        }
+
+        // Both forms return the target's namespace object at runtime. Keeping their targets
+        // factory-owned is also the conservative fallback for modules lacking liveness facts.
+        for dependency in &module.deps {
+            if matches!(
+                dependency.kind,
+                DependencyKind::DynamicImport | DependencyKind::Require
+            ) {
+                retain(&dependency.specifier);
+            }
+        }
+    }
+    targets
+}
+
 /// 模块体是否**整体重新赋值** `module.exports`（`module.exports = X`），而非只挂属性
 /// （`module.exports.foo = X`）。
 ///
@@ -4096,8 +5268,9 @@ fn reassigns_module_exports(body: &str) -> bool {
     false
 }
 
-/// 移除独立的 `_r(N);` 调用（合并模块内不再需要）
-fn strip_standalone_requires(body: &str) -> String {
+/// 移除指向同一 concat 成员的独立 `_r(N);` 调用（成员 body 已在 concat 中按序执行）。
+/// 指向独立 factory 的请求必须保留，否则它的顶层副作用永远不会执行。
+fn strip_standalone_requires(body: &str, concat_members: &FxHashSet<u32>) -> String {
     let mut result = String::with_capacity(body.len());
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -4111,6 +5284,7 @@ fn strip_standalone_requires(body: &str) -> String {
                     j += 1;
                 }
                 if j > i + 3 {
+                    let target = body[i + 3..j].parse::<u32>().ok();
                     let mut k = j;
                     while k < n && bytes[k].is_ascii_whitespace() {
                         k += 1;
@@ -4121,11 +5295,13 @@ fn strip_standalone_requires(body: &str) -> String {
                     while k < n && bytes[k].is_ascii_whitespace() {
                         k += 1;
                     }
-                    if k < n && bytes[k] == b';' {
-                        k += 1;
+                    if k < n
+                        && bytes[k] == b';'
+                        && target.is_some_and(|target| concat_members.contains(&target))
+                    {
+                        i = k + 1;
+                        continue;
                     }
-                    i = k;
-                    continue;
                 }
             }
         }
@@ -4373,16 +5549,68 @@ fn interop_default_helper(name: &str, no_esmodule: bool) -> String {
     }
 }
 
-/// 生成 namespace import interop helper。在无 `__esModule` 标记的模式下，
-/// codegen 已把 ESM 导出写入同一 exports 对象，直接返回即可保留 `.default`。
-fn interop_star_helper(name: &str, no_esmodule: bool) -> String {
-    if no_esmodule {
-        format!("function {name}(m){{return m}}")
-    } else {
-        format!(
-            "function {name}(m){{if(m&&m.__esModule)return m;var ns={{}};if(m!=null){{for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}}ns.default=m;return ns}}"
-        )
+/// Generate namespace-import interop for CJS or external/unknown targets. Internal ESM imports
+/// bypass this helper using the target-kind fact carried by the optimizer, so the compact
+/// no-marker runtime must still build a standards-shaped CJS namespace with `.default`.
+fn interop_star_helper(name: &str, _no_esmodule: bool) -> String {
+    format!(
+        "function {name}(m){{if(m&&m.__esModule)return m;var ns={{}};if(m!=null){{for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}}ns.default=m;return ns}}"
+    )
+}
+
+/// Replace only finalizer-proven, generated request expressions whose target has already been
+/// selected for eager inline execution. `0` deliberately preserves the surrounding typed
+/// statement/sequence grammar; later minified text passes therefore never have to infer or repair
+/// commas, parentheses, or semicolons.
+fn replace_eager_discarded_static_requests(
+    body: &str,
+    requests: &[GeneratedDiscardedStaticRequest],
+    eager_targets: &FxHashSet<u32>,
+) -> String {
+    if requests.is_empty()
+        || !requests
+            .iter()
+            .any(|request| eager_targets.contains(&request.target_module_id))
+    {
+        return body.to_owned();
     }
+
+    // Persistent metadata is untrusted input. Any malformed/overlapping/out-of-bounds range turns
+    // the optimization into a conservative no-op instead of allowing a byte splice to corrupt JS.
+    let mut previous_end = 0_usize;
+    for request in requests {
+        let start = request.start as usize;
+        let end = request.end as usize;
+        if start < previous_end
+            || start >= end
+            || end > body.len()
+            || !body.is_char_boundary(start)
+            || !body.is_char_boundary(end)
+        {
+            return body.to_owned();
+        }
+        previous_end = end;
+    }
+
+    let removed_bytes = requests
+        .iter()
+        .filter(|request| eager_targets.contains(&request.target_module_id))
+        .map(|request| (request.end - request.start).saturating_sub(1) as usize)
+        .sum::<usize>();
+    let mut out = String::with_capacity(body.len().saturating_sub(removed_bytes));
+    let mut cursor = 0_usize;
+    for request in requests {
+        if !eager_targets.contains(&request.target_module_id) {
+            continue;
+        }
+        let start = request.start as usize;
+        let end = request.end as usize;
+        out.push_str(&body[cursor..start]);
+        out.push('0');
+        cursor = end;
+    }
+    out.push_str(&body[cursor..]);
+    out
 }
 
 /// 拼接各模块（已 codegen 的）函数体 + mini runtime。
@@ -4390,19 +5618,37 @@ fn interop_star_helper(name: &str, no_esmodule: bool) -> String {
 /// `async_ids`：async 子图（顶层 await）。非空时包装器改 `async function`、runtime 换 Promise 感知版、
 /// 且**关闭模块合并**；**为空时逐字节等同于改造前的产物**（无顶层 await 的项目零影响）。
 ///
-/// `body_starts`：非 `None` 时，回填「模块 id → 体首行在 bundle 中的 0 基行号」，供
-/// [`merge_bundle_map`] 平移模块内映射。**仅非 minify 分支回填**（minify 分支会重排/改写
-/// 模块体，行偏移法不成立）。
+#[derive(Clone, Debug)]
+struct BodyPlacement {
+    module_id: u32,
+    /// Byte offset of `emitted` in the final chunk.
+    generated_offset: usize,
+    /// Exact final text derived from this module. Synthetic runtime wrappers are excluded.
+    emitted: String,
+}
+
+#[derive(Clone, Debug)]
+struct RelativeBodyPlacement {
+    module_id: u32,
+    offset: usize,
+    emitted: String,
+}
+
+/// `body_placements`：非 `None` 时，回填每段存活模块文本在最终 bundle 中的精确字节位置。
+/// minify 的 scope concat 可让一个最终 factory 包含多个来源模块，因此同一 factory 可以产生
+/// 多条 placement；合成 wrapper 不登记来源。
 fn emit(
     bodies: &[(u32, Arc<String>)],
     entry_id: u32,
     minify: bool,
     no_esmodule: bool,
     block_infos: &FxHashMap<u32, ConcatBlockInfo>,
+    namespace_identity_ids: &FxHashSet<u32>,
     async_ids: &FxHashSet<u32>,
+    discarded_static_requests: &FxHashMap<u32, Arc<Vec<GeneratedDiscardedStaticRequest>>>,
     exec: &Executor,
     module_format: ModuleFormat,
-    body_starts: Option<&mut Vec<(u32, u32)>>,
+    mut body_placements: Option<&mut Vec<BodyPlacement>>,
 ) -> String {
     let mut keep_bodies: Vec<(u32, Arc<String>)> = Vec::new();
 
@@ -4435,7 +5681,14 @@ fn emit(
                     let id = *id;
                     let body = body.clone();
                     let ph = pre_hoisted.clone();
-                    move || (id, strip_hoisted_requires_and_barrels(&body, &ph))
+                    let requests = discarded_static_requests
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Vec::new()));
+                    move || {
+                        let body = replace_eager_discarded_static_requests(&body, &requests, &ph);
+                        (id, strip_hoisted_requires_and_barrels(&body, &ph))
+                    }
                 })
                 .collect();
             exec.parallel(jobs)
@@ -4477,9 +5730,19 @@ fn emit(
         // 构建最终模块表。含顶层 await 时**不做模块合并**：合并闭包是单个函数，无法表达
         // 「其中一部分模块是 async、且彼此有 await 依赖顺序」；退回逐模块注册表（仍是紧凑产物）。
         let mut final_modules: Vec<(u32, String)> = Vec::new();
+        let mut module_fragments: FxHashMap<u32, Vec<RelativeBodyPlacement>> = FxHashMap::default();
         if async_ids.is_empty() {
             // —— 模块合并：将所有非 hoist 模块体拼接到一个闭包，避免命名冲突 ——
-            let concat_id = entry_id + (filtered.len() as u32) + 1000;
+            // Synthetic factories occupy an ID outside the complete real-module domain. The old
+            // `entry + filtered + 1000` formula could collide with a live source module (observed
+            // at real id 1032 in the 2k fixture), silently redirecting that source request to the
+            // concat factory.
+            let concat_id = bodies
+                .iter()
+                .map(|(id, _)| *id)
+                .max()
+                .and_then(|id| id.checked_add(1))
+                .expect("bundle module id space exhausted before concat factory allocation");
             // 被合并模块是否全为 ESM（恒 strict-safe）→ 给 concat 函数加 `"use strict"`，使**块级函数声明
             // 变块作用域**，从而可用裸 `{}` 块替代 IIFE 包裹（省 `(function(){`+`})();` 开销）而不发生
             // 顶层名跨模块碰撞。任一非 ESM（可能依赖 sloppy 语义）→ 全走 IIFE 且不加 strict（保守安全）。
@@ -4508,6 +5771,7 @@ fn emit(
                     *id != entry_id
                         && (reassigns_module_exports(body)
                             || cyclic.contains(id)
+                            || namespace_identity_ids.contains(id)
                             || !block_infos.get(id).is_some_and(|info| info.is_esm))
                 })
                 .map(|(id, _)| *id)
@@ -4549,6 +5813,7 @@ fn emit(
                 .map(|(id, _)| *id)
                 .filter(|id| *id != entry_id && !standalone.contains(id))
                 .collect();
+            let concat_member_set = concat_member_ids.iter().copied().collect::<FxHashSet<_>>();
 
             // `_r` 垫片：并入 concat 的模块共享 `$`，其余 id **转发真实 require**
             // （独立模块有自己的 module.exports，不能返回 `$`）。
@@ -4563,11 +5828,15 @@ fn emit(
                 ));
             }
 
+            let mut concat_fragments = Vec::new();
             for (id, body) in &filtered {
                 if *id == entry_id || standalone.contains(id) {
                     continue;
                 }
-                let b = strip_standalone_requires(&compact_body_names(body, &runtime_names));
+                let b = strip_standalone_requires(
+                    &compact_body_names(body, &runtime_names),
+                    &concat_member_set,
+                );
                 // 块安全（ESM 且无 `var`/`this`）+ 整组 strict → 用裸 `{}` 块（strict 下块级函数声明块作用域，
                 // let/const 本就块作用域 → 顶层名不跨块碰撞）。否则用 IIFE 建立真正函数作用域隔离
                 // （`var` 会 hoist 出块、sloppy 下块级函数亦 hoist；曾致 React Symbol 覆盖 scheduler 计数器）。
@@ -4577,15 +5846,33 @@ fn emit(
                 let block_safe = all_esm && block_infos.get(id).is_some_and(|bi| bi.block_safe);
                 if !has_scope_binding {
                     // 经过 tree shaking 后只剩表达式的模块不再需要隔离作用域。
+                    let offset = concat_body.len();
                     concat_body.push_str(&b);
+                    concat_fragments.push(RelativeBodyPlacement {
+                        module_id: *id,
+                        offset,
+                        emitted: b,
+                    });
                 } else if block_safe {
                     concat_body.push('{');
+                    let offset = concat_body.len();
                     concat_body.push_str(&b);
                     concat_body.push('}');
+                    concat_fragments.push(RelativeBodyPlacement {
+                        module_id: *id,
+                        offset,
+                        emitted: b,
+                    });
                 } else {
                     concat_body.push_str("(function(){");
+                    let offset = concat_body.len();
                     concat_body.push_str(&b);
                     concat_body.push_str("})();");
+                    concat_fragments.push(RelativeBodyPlacement {
+                        module_id: *id,
+                        offset,
+                        emitted: b,
+                    });
                 }
             }
 
@@ -4611,7 +5898,16 @@ fn emit(
             // 构建最终模块表：入口 + stubs + 独立 CJS 模块 + 合并模块
             for (id, body) in &filtered {
                 if *id == entry_id {
-                    final_modules.push((entry_id, redirect(body)));
+                    let emitted = redirect(body);
+                    module_fragments.insert(
+                        entry_id,
+                        vec![RelativeBodyPlacement {
+                            module_id: entry_id,
+                            offset: 0,
+                            emitted: emitted.clone(),
+                        }],
+                    );
+                    final_modules.push((entry_id, emitted));
                     break;
                 }
             }
@@ -4620,14 +5916,35 @@ fn emit(
             }
             for (id, body) in &filtered {
                 if standalone.contains(id) {
-                    final_modules.push((*id, redirect(body)));
+                    let emitted = redirect(body);
+                    module_fragments.insert(
+                        *id,
+                        vec![RelativeBodyPlacement {
+                            module_id: *id,
+                            offset: 0,
+                            emitted: emitted.clone(),
+                        }],
+                    );
+                    final_modules.push((*id, emitted));
                 }
             }
-            final_modules.push((concat_id, concat_body));
+            if !concat_member_ids.is_empty() {
+                module_fragments.insert(concat_id, concat_fragments);
+                final_modules.push((concat_id, concat_body));
+            }
         } else {
             // async 子图存在 → 逐模块注册（`_r` 返回 Promise，由导入点 `await`）。
             for (id, body) in &filtered {
-                final_modules.push((*id, compact_body_names(body, &runtime_names)));
+                let emitted = compact_body_names(body, &runtime_names);
+                module_fragments.insert(
+                    *id,
+                    vec![RelativeBodyPlacement {
+                        module_id: *id,
+                        offset: 0,
+                        emitted: emitted.clone(),
+                    }],
+                );
+                final_modules.push((*id, emitted));
             }
             for &sid in &ref_ids {
                 if !final_modules.iter().any(|(i, _)| *i == sid) {
@@ -4649,6 +5966,9 @@ fn emit(
         let needs_interop_star = final_bodies
             .iter()
             .any(|b| b.contains("__wake_interop_star"));
+        let needs_meta_url = final_bodies
+            .iter()
+            .any(|body| body.contains("__wake_require__.metaUrl"));
         // minify 下省略 `__esModule` 标记，故不能用它区分「转译 ESM」与「纯 CJS」，改按
         // **是否存在 `default` 键**判定：转译 ESM 必定写了 `exports.default`，而
         // `module.exports = {…}` 的纯 CJS 通常没有。
@@ -4659,11 +5979,30 @@ fn emit(
         let interop_default = interop_default_helper("__wake_interop_default", no_esmodule);
         let interop_star = interop_star_helper("__wake_interop_star", no_esmodule);
         // async 变体：async 模块的包装器返回 Promise → 缓存并返回它，导入方 `await` 得到最终 exports。
-        out.push_str(if async_ids.is_empty() {
-            "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
-        } else {
-            "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
+        let needs_registry_temp = inline_regs_need_registry_temp(&inline_regs);
+        out.push_str(match (async_ids.is_empty(), needs_registry_temp) {
+            (true, false) => {
+                "(function(g){var c={};function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
+            }
+            (true, true) => {
+                "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
+            }
+            (false, false) => {
+                "(function(g){var c={};function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
+            }
+            (false, true) => {
+                "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
+            }
         });
+
+        if needs_meta_url {
+            // `import.meta.url` is lowered by a trusted edit to this runtime property. The
+            // readable runtime always installs it; the compact runtime does so on demand to keep
+            // unrelated bundles byte-identical and avoid an unbound/undefined helper call.
+            out.push_str(
+                "r.metaUrl=function(){return typeof document!='undefined'?document.baseURI:''};",
+            );
+        }
 
         append_inline_regs(&mut out, &inline_regs);
 
@@ -4687,7 +6026,17 @@ fn emit(
                     "{}:{kw}({},{},{}){{",
                     id, runtime_names.module, runtime_names.exports, runtime_names.require
                 ));
+                let body_offset = out.len();
                 out.push_str(body);
+                if let Some(slot) = body_placements.as_deref_mut()
+                    && let Some(fragments) = module_fragments.get(id)
+                {
+                    slot.extend(fragments.iter().map(|fragment| BodyPlacement {
+                        module_id: fragment.module_id,
+                        generated_offset: body_offset + fragment.offset,
+                        emitted: fragment.emitted.clone(),
+                    }));
+                }
                 out.push_str("},");
             }
         }
@@ -4695,10 +6044,10 @@ fn emit(
         out.push_str(&format!("var e=r({});", entry_id));
         if module_format == ModuleFormat::CommonJs {
             out.push_str(
-                "module.exports=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);",
+                "module.exports=e;return e;})(typeof globalThis!='undefined'?globalThis:this);",
             );
         } else {
-            out.push_str("if(typeof module!=='undefined'&&module.exports)module.exports=e;else g.__wake_entry__=e;return e;})(typeof globalThis!=='undefined'?globalThis:this);");
+            out.push_str("if(typeof module!='undefined'&&module.exports)module.exports=e;else g.__wake_entry__=e;return e;})(typeof globalThis!='undefined'?globalThis:this);");
         }
         out
     } else {
@@ -4715,10 +6064,7 @@ fn emit(
             PRELUDE_ASYNC
         });
         out.push_str("var __wake_modules__ = {\n");
-        // SourceMap：逐模块记录其体在 bundle 中的起始行，供调用方平移模块内局部映射。
-        // 本分支模块体**逐行原样**拼接（仅前缀 2 空格），故映射平移是 (行 +offset, 列 +2)。
-        let mut starts: Vec<(u32, u32)> = Vec::with_capacity(filtered.len());
-        let mut line = count_lines(&out);
+        // SourceMap：记录实际写入的带缩进模块片段；merge 阶段按 token 对齐到原始模块体。
         for (id, body) in &filtered {
             // async 子图成员的包装器必须是 `async function`：其体内静态导入点被写成
             // `(await __wake_require__(id))`。
@@ -4729,16 +6075,22 @@ fn emit(
             };
             let head = format!("{id}: {kw}(module, exports, __wake_require__) {{\n");
             out.push_str(&head);
-            line += 1; // 包装头占 1 行
-            starts.push((*id, line));
+            let generated_offset = out.len();
+            let mut emitted = String::with_capacity(body.len() + body.lines().count() * 3);
             for l in body.lines() {
-                out.push_str("  ");
-                out.push_str(l);
-                out.push('\n');
-                line += 1;
+                emitted.push_str("  ");
+                emitted.push_str(l);
+                emitted.push('\n');
+            }
+            out.push_str(&emitted);
+            if let Some(slot) = body_placements.as_deref_mut() {
+                slot.push(BodyPlacement {
+                    module_id: *id,
+                    generated_offset,
+                    emitted,
+                });
             }
             out.push_str("},\n");
-            line += 1;
         }
         out.push_str(
             "};\n__wake_require__.m = __wake_modules__;\n__wake_require__.c = __wake_cache__;\n",
@@ -4751,16 +6103,8 @@ fn emit(
         } else {
             POSTLUDE
         });
-        if let Some(slot) = body_starts {
-            *slot = starts;
-        }
         out
     }
-}
-
-/// 统计字符串中的换行数（= 其后续内容所处的 0 基行号）。
-fn count_lines(s: &str) -> u32 {
-    s.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32
 }
 
 /// 模块路径 → SourceMap `sources` 条目名。
@@ -4825,15 +6169,365 @@ fn serialize_map(sm: &SourceMap, sources: &FxHashMap<u32, (String, Option<String
     })
 }
 
-/// 把各模块的局部映射按 bundle 行偏移平移、合并为整包 [`SourceMap`]。
-///
-/// `body_starts`：模块 id → 其体首行在 bundle 中的 0 基行号（由 [`emit`] 采集）。
-/// `sources`：模块 id → (源文件名, 源文本)。缺失源文本的模块（缓存命中未 parse）以 `None` 带出，
-/// 浏览器会退回按 `sources` 路径自行拉取。
-///
-/// 平移规则来自 emit 的非 minify 拼接：行 `+start`、列 `+2`（每行固定 2 空格缩进）。
+#[derive(Clone, Copy, Debug)]
+struct GeneratedToken<'a> {
+    text: &'a str,
+    line: u32,
+    col: u32,
+}
+
+/// Tokenize generated JavaScript just far enough to align codegen output through bundler-owned
+/// textual rewrites. This is not a parser: quoted literals are kept whole, identifier/number runs
+/// are grouped, and punctuation is a single token. The alignment is deliberately conservative.
+fn generated_tokens(code: &str) -> Vec<GeneratedToken<'_>> {
+    fn is_word(c: char) -> bool {
+        c == '_' || c == '$' || c.is_alphanumeric() || !c.is_ascii()
+    }
+
+    let mut tokens = Vec::new();
+    let mut byte = 0;
+    let mut line = 0u32;
+    let mut col = 0u32;
+    while byte < code.len() {
+        let ch = code[byte..].chars().next().expect("valid UTF-8 suffix");
+        if ch.is_whitespace() {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else if ch != '\r' {
+                col += ch.len_utf16() as u32;
+            }
+            byte += ch.len_utf8();
+            continue;
+        }
+
+        let start = byte;
+        let start_line = line;
+        let start_col = col;
+        let end = if is_word(ch) {
+            let mut end = byte + ch.len_utf8();
+            let rest_start = end;
+            for (relative, next) in code[rest_start..].char_indices() {
+                if !is_word(next) {
+                    break;
+                }
+                end = rest_start + relative + next.len_utf8();
+            }
+            end
+        } else if matches!(ch, '\'' | '"' | '`') {
+            let quote = ch;
+            let mut escaped = false;
+            let mut end = byte + ch.len_utf8();
+            for next in code[end..].chars() {
+                end += next.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if next == '\\' {
+                    escaped = true;
+                } else if next == quote {
+                    break;
+                }
+            }
+            end
+        } else {
+            byte + ch.len_utf8()
+        };
+
+        let text = &code[start..end];
+        tokens.push(GeneratedToken {
+            text,
+            line: start_line,
+            col: start_col,
+        });
+        for emitted in text.chars() {
+            if emitted == '\n' {
+                line += 1;
+                col = 0;
+            } else if emitted != '\r' {
+                col += emitted.len_utf16() as u32;
+            }
+        }
+        byte = end;
+    }
+    tokens
+}
+
+/// Patience-style token alignment. A segment is mapped wholesale when it is identical; otherwise
+/// only tokens unique on both sides become anchors and recursion proves the gaps independently.
+/// Ambiguous repeated/deleted text is left unmapped rather than guessed.
+fn align_generated_tokens(
+    old: &[GeneratedToken<'_>],
+    new: &[GeneratedToken<'_>],
+) -> Vec<Option<usize>> {
+    fn recurse(
+        old: &[GeneratedToken<'_>],
+        new: &[GeneratedToken<'_>],
+        old_range: std::ops::Range<usize>,
+        new_range: std::ops::Range<usize>,
+        aligned: &mut [Option<usize>],
+    ) {
+        if old_range.is_empty() || new_range.is_empty() {
+            return;
+        }
+        if old_range.len() == new_range.len()
+            && old[old_range.clone()]
+                .iter()
+                .zip(&new[new_range.clone()])
+                .all(|(left, right)| left.text == right.text)
+        {
+            for (old_index, new_index) in old_range.zip(new_range) {
+                aligned[old_index] = Some(new_index);
+            }
+            return;
+        }
+
+        let mut old_counts: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
+        for index in old_range.clone() {
+            let entry = old_counts.entry(old[index].text).or_insert((0, index));
+            entry.0 += 1;
+            entry.1 = index;
+        }
+        let mut new_counts: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
+        for index in new_range.clone() {
+            let entry = new_counts.entry(new[index].text).or_insert((0, index));
+            entry.0 += 1;
+            entry.1 = index;
+        }
+
+        let mut anchors = Vec::new();
+        let mut last_new = None;
+        for old_index in old_range.clone() {
+            let text = old[old_index].text;
+            let Some(&(1, new_index)) = new_counts.get(text) else {
+                continue;
+            };
+            if old_counts.get(text).is_some_and(|entry| entry.0 == 1)
+                && last_new.is_none_or(|last| new_index > last)
+            {
+                anchors.push((old_index, new_index));
+                last_new = Some(new_index);
+            }
+        }
+        if anchors.is_empty() {
+            return;
+        }
+
+        let mut old_start = old_range.start;
+        let mut new_start = new_range.start;
+        for (old_anchor, new_anchor) in anchors {
+            recurse(
+                old,
+                new,
+                old_start..old_anchor,
+                new_start..new_anchor,
+                aligned,
+            );
+            aligned[old_anchor] = Some(new_anchor);
+            old_start = old_anchor + 1;
+            new_start = new_anchor + 1;
+        }
+        recurse(
+            old,
+            new,
+            old_start..old_range.end,
+            new_start..new_range.end,
+            aligned,
+        );
+    }
+
+    let mut aligned = vec![None; old.len()];
+    recurse(old, new, 0..old.len(), 0..new.len(), &mut aligned);
+    aligned
+}
+
+fn generated_positions(code: &str, placements: &[BodyPlacement]) -> Vec<(u32, u32)> {
+    let mut order: Vec<usize> = (0..placements.len()).collect();
+    order.sort_unstable_by_key(|index| placements[*index].generated_offset);
+    let mut positions = vec![(0, 0); placements.len()];
+    let mut byte = 0usize;
+    let mut line = 0u32;
+    let mut col = 0u32;
+    for index in order {
+        let target = placements[index].generated_offset.min(code.len());
+        debug_assert!(
+            target >= byte,
+            "placements must point at ordered UTF-8 boundaries"
+        );
+        for ch in code[byte..target].chars() {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else if ch != '\r' {
+                col += ch.len_utf16() as u32;
+            }
+        }
+        byte = target;
+        positions[index] = (line, col);
+    }
+    positions
+}
+
+fn advance_generated_position((mut line, mut col): (u32, u32), generated: &str) -> (u32, u32) {
+    for ch in generated.chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else if ch != '\r' {
+            col += ch.len_utf16() as u32;
+        }
+    }
+    (line, col)
+}
+
+struct MappingTokenIndex {
+    first_by_position: FxHashMap<(u32, u32), usize>,
+}
+
+impl MappingTokenIndex {
+    fn new(tokens: &[GeneratedToken<'_>]) -> Self {
+        let mut first_by_position = FxHashMap::default();
+        for (index, token) in tokens.iter().enumerate() {
+            first_by_position
+                .entry((token.line, token.col))
+                .or_insert(index);
+        }
+        Self { first_by_position }
+    }
+
+    fn find(&self, mapping: &Mapping) -> Option<usize> {
+        let exact = self
+            .first_by_position
+            .get(&(mapping.gen_line, mapping.gen_col))
+            .copied();
+        // `push` can insert one separator after `mark` to prevent token merging. Preserve the
+        // old linear search's first-match semantics even for duplicate or non-canonical token
+        // slices by selecting the lower index across the exact and one-column positions.
+        let next = mapping.gen_col.checked_add(1).and_then(|column| {
+            self.first_by_position
+                .get(&(mapping.gen_line, column))
+                .copied()
+        });
+        match (exact, next) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(index), None) | (None, Some(index)) => Some(index),
+            (None, None) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mapping_token_index_tests {
+    use super::*;
+
+    fn mapping(line: u32, col: u32) -> Mapping {
+        Mapping::unmapped(line, col)
+    }
+
+    #[test]
+    fn position_index_matches_exact_and_one_column_fallback() {
+        let tokens = generated_tokens("alpha + beta");
+        let index = MappingTokenIndex::new(&tokens);
+
+        assert_eq!(index.find(&mapping(0, 0)), Some(0));
+        assert_eq!(index.find(&mapping(0, 5)), Some(1));
+    }
+
+    #[test]
+    fn position_index_retains_the_first_duplicate_position() {
+        let tokens = [
+            GeneratedToken {
+                text: "fallback-first",
+                line: 2,
+                col: 8,
+            },
+            GeneratedToken {
+                text: "exact-first",
+                line: 2,
+                col: 7,
+            },
+            GeneratedToken {
+                text: "exact-duplicate",
+                line: 2,
+                col: 7,
+            },
+        ];
+        let index = MappingTokenIndex::new(&tokens);
+
+        assert_eq!(index.find(&mapping(2, 7)), Some(0));
+        assert_eq!(index.find(&mapping(2, 6)), Some(1));
+    }
+
+    #[test]
+    fn position_index_uses_utf16_columns_and_rejects_misses() {
+        let tokens = generated_tokens("😀 x");
+        let index = MappingTokenIndex::new(&tokens);
+
+        assert_eq!(tokens[1].text, "x");
+        assert_eq!(tokens[1].col, 3);
+        assert_eq!(index.find(&mapping(0, 2)), Some(1));
+        assert_eq!(index.find(&mapping(0, 1)), None);
+        assert_eq!(index.find(&mapping(1, 3)), None);
+    }
+
+    #[test]
+    fn position_index_is_equivalent_to_linear_first_match() {
+        let tokens = [
+            GeneratedToken {
+                text: "later-line",
+                line: 3,
+                col: 2,
+            },
+            GeneratedToken {
+                text: "fallback-before-exact",
+                line: 1,
+                col: 5,
+            },
+            GeneratedToken {
+                text: "exact",
+                line: 1,
+                col: 4,
+            },
+            GeneratedToken {
+                text: "exact-duplicate",
+                line: 1,
+                col: 4,
+            },
+            GeneratedToken {
+                text: "origin",
+                line: 0,
+                col: 0,
+            },
+        ];
+        let index = MappingTokenIndex::new(&tokens);
+
+        for line in 0..=4 {
+            for col in 0..=8 {
+                let mapping = mapping(line, col);
+                let linear = tokens.iter().position(|token| {
+                    token.line == mapping.gen_line
+                        && (token.col == mapping.gen_col
+                            || mapping
+                                .gen_col
+                                .checked_add(1)
+                                .is_some_and(|next| token.col == next))
+                });
+                assert_eq!(
+                    index.find(&mapping),
+                    linear,
+                    "indexed lookup changed linear first-match semantics at ({line}, {col})"
+                );
+            }
+        }
+    }
+}
+
+/// Merge module-local mappings into a final bundle map. Each placement carries the exact emitted
+/// fragment and final byte position. Local mappings survive only when token alignment proves that
+/// the corresponding generated token remains present and in order after bundler rewrites.
 fn merge_bundle_map(
-    body_starts: &[(u32, u32)],
+    bundle: &str,
+    body_placements: &[BodyPlacement],
+    bodies: &[(u32, Arc<String>)],
     module_maps: &FxHashMap<u32, Arc<ModuleMappings>>,
     sources: &FxHashMap<u32, (String, Option<String>)>,
     file: Option<String>,
@@ -4842,9 +6536,14 @@ fn merge_bundle_map(
         file,
         ..SourceMap::new()
     };
+    let mut name_indices: FxHashMap<String, u32> = FxHashMap::default();
     // 源文件按模块 id 升序登记，保证产物稳定（同输入 → 同 map）。
-    let mut ids: Vec<u32> = body_starts.iter().map(|(id, _)| *id).collect();
+    let mut ids: Vec<u32> = body_placements
+        .iter()
+        .map(|placement| placement.module_id)
+        .collect();
     ids.sort_unstable();
+    ids.dedup();
     let mut src_index: FxHashMap<u32, u32> = FxHashMap::default();
     for id in &ids {
         if let Some((name, content)) = sources.get(id) {
@@ -4852,20 +6551,104 @@ fn merge_bundle_map(
             src_index.insert(*id, idx);
         }
     }
-    for (id, start) in body_starts {
-        let (Some(mm), Some(&si)) = (module_maps.get(id), src_index.get(id)) else {
+    let body_of: FxHashMap<u32, &str> = bodies
+        .iter()
+        .map(|(id, body)| (*id, body.as_str()))
+        .collect();
+    let base_positions = generated_positions(bundle, body_placements);
+    // Everything before the first module body is bundler-owned wrapper code. A one-field segment
+    // at the file origin prevents that prologue from inheriting a source association.
+    sm.mappings.push(Mapping::unmapped(0, 0));
+    for (placement_index, placement) in body_placements.iter().enumerate() {
+        let id = placement.module_id;
+        let (base_line, base_col) = base_positions[placement_index];
+        // Each placement is an island of module-owned code inside wrapper/concat glue. Fence both
+        // edges even when token alignment later drops every local source anchor.
+        sm.mappings.push(Mapping::unmapped(base_line, base_col));
+        let (Some(mm), Some(&si), Some(original)) =
+            (module_maps.get(&id), src_index.get(&id), body_of.get(&id))
+        else {
+            let (end_line, end_col) =
+                advance_generated_position((base_line, base_col), &placement.emitted);
+            sm.mappings.push(Mapping::unmapped(end_line, end_col));
             continue;
         };
+        debug_assert_eq!(
+            bundle.get(
+                placement.generated_offset..placement.generated_offset + placement.emitted.len()
+            ),
+            Some(placement.emitted.as_str())
+        );
+        let original_tokens = generated_tokens(original);
+        let emitted_tokens = generated_tokens(&placement.emitted);
+        let aligned = align_generated_tokens(&original_tokens, &emitted_tokens);
+        let original_token_index = MappingTokenIndex::new(&original_tokens);
         for m in &mm.mappings {
-            sm.mappings.push(Mapping {
-                gen_line: m.gen_line + start,
-                gen_col: m.gen_col + 2, // 每行前缀 2 空格缩进
-                src_index: si,
-                src_offset: m.src_offset,
-            });
+            let Some(old_token) = original_token_index.find(m) else {
+                continue;
+            };
+            let Some(new_token) = aligned[old_token] else {
+                continue;
+            };
+            let token = emitted_tokens[new_token];
+            let gen_line = base_line + token.line;
+            let gen_col = if token.line == 0 {
+                base_col + token.col
+            } else {
+                token.col
+            };
+            if m.is_unmapped {
+                sm.mappings.push(Mapping::unmapped(gen_line, gen_col));
+            } else {
+                let name_index = m
+                    .name_index
+                    .and_then(|index| mm.names.get(index as usize))
+                    .map(|name| {
+                        if let Some(index) = name_indices.get(name) {
+                            *index
+                        } else {
+                            let index = sm.names.len() as u32;
+                            sm.names.push(name.clone());
+                            name_indices.insert(name.clone(), index);
+                            index
+                        }
+                    });
+                sm.mappings.push(Mapping {
+                    gen_line,
+                    gen_col,
+                    src_index: si,
+                    src_offset: m.src_offset,
+                    name_index,
+                    is_unmapped: false,
+                });
+            }
         }
+        let (end_line, end_col) =
+            advance_generated_position((base_line, base_col), &placement.emitted);
+        sm.mappings.push(Mapping::unmapped(end_line, end_col));
     }
     sm.mappings.sort_by_key(|m| (m.gen_line, m.gen_col));
+    let mut deduplicated: Vec<Mapping> = Vec::with_capacity(sm.mappings.len());
+    for mapping in sm.mappings.drain(..) {
+        if let Some(previous) = deduplicated.last_mut()
+            && previous.gen_line == mapping.gen_line
+            && previous.gen_col == mapping.gen_col
+        {
+            // Stable insertion order models ownership boundaries: a module mapping replaces its
+            // leading wrapper fence, while the trailing fence replaces a mapping at body end.
+            // For two source anchors, retain the richer named segment as before.
+            if previous.is_unmapped != mapping.is_unmapped
+                || (!mapping.is_unmapped
+                    && previous.name_index.is_none()
+                    && mapping.name_index.is_some())
+            {
+                *previous = mapping;
+            }
+        } else {
+            deduplicated.push(mapping);
+        }
+    }
+    sm.mappings = deduplicated;
     sm
 }
 
@@ -4881,10 +6664,26 @@ fn merge_bundle_map(
 /// - 动态 `import()`：本就产出 Promise，`Promise.resolve(...)` 会把 async 模块的 Promise 展平；
 /// - CJS `require()`：调用点可能嵌在普通函数体内，插不进 `await`（同步 require 一个 async 模块
 ///   在任何打包器里都无解，见 `docs/TS-SYNTAX-SUPPORT.md` §11）。
-fn async_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
+///
+/// Recompute top-level-await propagation from the optimizer-retained static graph. This prevents
+/// a removed conditional import from keeping an otherwise synchronous module body async.
+fn async_module_ids_with_edges(
+    modules: &FxHashMap<u32, ModuleRec>,
+    retained_edges: &FxHashMap<u32, ModuleEdges>,
+) -> FxHashSet<u32> {
     // 反向边：被导入者 → 静态 ESM 导入它的模块。
     let mut importers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for (&id, rec) in modules {
+        let retained = retained_edges
+            .get(&id)
+            .map(|edges| {
+                edges
+                    .static_targets
+                    .iter()
+                    .copied()
+                    .collect::<FxHashSet<_>>()
+            })
+            .unwrap_or_default();
         let spec2id: FxHashMap<&str, u32> =
             rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
         for dep in rec.deps.iter() {
@@ -4894,7 +6693,9 @@ fn async_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
             ) {
                 continue;
             }
-            if let Some(&tid) = spec2id.get(dep.specifier.as_str()) {
+            if let Some(&tid) = spec2id.get(dep.specifier.as_str())
+                && retained.contains(&tid)
+            {
                 importers.entry(tid).or_default().push(id);
             }
         }
@@ -4902,7 +6703,7 @@ fn async_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
     let mut set: FxHashSet<u32> = FxHashSet::default();
     let mut stack: Vec<u32> = Vec::new();
     for (&id, rec) in modules {
-        if rec.has_top_level_await && set.insert(id) {
+        if retained_edges.contains_key(&id) && rec.has_top_level_await && set.insert(id) {
             stack.push(id);
         }
     }
@@ -4958,6 +6759,34 @@ fn build_module_edges(modules: &FxHashMap<u32, ModuleRec>) -> FxHashMap<u32, Mod
     edges
 }
 
+/// Restrict parser-discovered edge kinds to the exact dependency targets retained by each
+/// optimizer result. `live` is already the monotonic entry closure, so this produces the sole
+/// graph consumed by final chunk pruning and emit. The target ids are process-local BFS module
+/// identities; parser-local `SymbolId` values have already done their job inside optimization and
+/// never cross this boundary or enter persistent graph state.
+fn retained_module_edges(
+    modules: &FxHashMap<u32, ModuleRec>,
+    retained: &[(u32, Arc<Vec<u32>>)],
+    live: &FxHashSet<u32>,
+) -> FxHashMap<u32, ModuleEdges> {
+    let retained_by_module = retained
+        .iter()
+        .map(|(module, targets)| (*module, targets.iter().copied().collect::<FxHashSet<u32>>()))
+        .collect::<FxHashMap<_, _>>();
+    let mut edges = build_module_edges(modules);
+    edges.retain(|module, _| live.contains(module));
+    for (&module, module_edges) in &mut edges {
+        let targets = retained_by_module.get(&module);
+        module_edges.static_targets.retain(|target| {
+            live.contains(target) && targets.is_some_and(|targets| targets.contains(target))
+        });
+        module_edges.dyn_targets.retain(|target| {
+            live.contains(target) && targets.is_some_and(|targets| targets.contains(target))
+        });
+    }
+    edges
+}
+
 /// 本模块每个「跨 chunk」动态 import 的 (说明符, 目标 chunk id)（排序去重；目标落 entry=0 者不入表）。
 fn dyn_chunks_of(rec: &ModuleRec, chunk_graph: Option<&ChunkGraph>) -> Vec<(String, u32)> {
     let Some(g) = chunk_graph else {
@@ -4985,8 +6814,9 @@ fn render_module_entries(
     module_ids: &[u32],
     body_of: &FxHashMap<u32, &Arc<String>>,
     async_ids: &FxHashSet<u32>,
-) -> String {
+) -> (String, Vec<BodyPlacement>) {
     let mut out = String::new();
+    let mut placements = Vec::new();
     for &id in module_ids {
         if let Some(body) = body_of.get(&id) {
             let kw = if async_ids.contains(&id) {
@@ -4997,15 +6827,23 @@ fn render_module_entries(
             out.push_str(&format!(
                 "{id}: {kw}(module, exports, __wake_require__) {{\n"
             ));
+            let generated_offset = out.len();
+            let mut emitted = String::with_capacity(body.len() + body.lines().count() * 3);
             for line in body.lines() {
-                out.push_str("  ");
-                out.push_str(line);
-                out.push('\n');
+                emitted.push_str("  ");
+                emitted.push_str(line);
+                emitted.push('\n');
             }
+            out.push_str(&emitted);
+            placements.push(BodyPlacement {
+                module_id: id,
+                generated_offset,
+                emitted,
+            });
             out.push_str("},\n");
         }
     }
-    out
+    (out, placements)
 }
 
 /// 多产物 emit：先渲染并 hash 非 entry chunk（体内无文件名 → hash 无环），再渲染内嵌 f/d 映射的 entry。
@@ -5018,6 +6856,7 @@ fn emit_chunks(
     hashed: bool,
     async_ids: &FxHashSet<u32>,
     style_files: &BTreeMap<u32, Vec<String>>,
+    mut chunk_placements: Option<&mut FxHashMap<u32, Vec<BodyPlacement>>>,
 ) -> (Vec<OutputChunk>, usize) {
     let body_of: FxHashMap<u32, &Arc<String>> = bodies.iter().map(|(id, b)| (*id, b)).collect();
 
@@ -5028,8 +6867,14 @@ fn emit_chunks(
         if plan.id == 0 {
             continue;
         }
-        let entries = render_module_entries(&plan.modules, &body_of, async_ids);
-        let code = render_async_chunk(token, plan.id, &entries);
+        let (entries, mut placements) = render_module_entries(&plan.modules, &body_of, async_ids);
+        let (code, entries_offset) = render_async_chunk(token, plan.id, &entries);
+        if let Some(slot) = chunk_placements.as_deref_mut() {
+            for placement in &mut placements {
+                placement.generated_offset += entries_offset;
+            }
+            slot.insert(plan.id, placements);
+        }
         let file = chunk_filename(&plan.name, &code, hashed);
         file_of.insert(plan.id, file.clone());
         nonentry.push(OutputChunk {
@@ -5042,7 +6887,7 @@ fn emit_chunks(
             module_ids: plan.modules.clone(),
             imports: Vec::new(), // 回填于下
             styles: style_files.get(&plan.id).cloned().unwrap_or_default(),
-            source_map: None, // 代码分割路径暂不产 map（M4d 首期只覆盖单包）
+            source_map: None, // requested maps are merged after every chunk has its final file name
         });
     }
     // 回填非 entry chunk 的静态依赖文件名。
@@ -5057,11 +6902,11 @@ fn emit_chunks(
 
     // 2. 渲染 entry chunk（内嵌 f/d 映射，引用非 entry 的文件名）。
     let entry_plan = g.chunks.iter().find(|c| c.id == 0).expect("entry chunk");
-    let entries = render_module_entries(&entry_plan.modules, &body_of, async_ids);
+    let (entries, mut placements) = render_module_entries(&entry_plan.modules, &body_of, async_ids);
     let f_map = json_file_map(&file_of);
     let d_map = json_deps_map(&g.chunk_deps);
     let s_map = json_styles_map(style_files);
-    let code = render_entry_chunk(
+    let (code, entries_offset) = render_entry_chunk(
         token,
         entry_id,
         public_path,
@@ -5070,6 +6915,12 @@ fn emit_chunks(
         &s_map,
         &entries,
     );
+    if let Some(slot) = chunk_placements {
+        for placement in &mut placements {
+            placement.generated_offset += entries_offset;
+        }
+        slot.insert(0, placements);
+    }
     let file = chunk_filename(&entry_plan.name, &code, hashed);
     let entry = OutputChunk {
         name: entry_plan.name.clone(),
@@ -5081,7 +6932,7 @@ fn emit_chunks(
         module_ids: entry_plan.modules.clone(),
         imports: Vec::new(),
         styles: style_files.get(&0).cloned().unwrap_or_default(),
-        source_map: None, // 同上：代码分割路径暂不产 map
+        source_map: None, // requested maps are merged after every chunk has its final file name
     };
 
     // 3. 按 chunk id 升序组装。
@@ -5101,7 +6952,7 @@ fn render_entry_chunk(
     d_map: &str,
     s_map: &str,
     entries: &str,
-) -> String {
+) -> (String, usize) {
     // 分割 runtime 跨 chunk 处理未知模块形态，必须使用 codegen 保留的 ESM marker；不能用
     // `default` 自有键猜测，因为合法 CJS 也可能导出 `{ default: value }`。
     let interop_default = interop_default_helper("interopDefault", false);
@@ -5121,6 +6972,7 @@ fn render_entry_chunk(
     out.push_str(&format!("Object.assign(__wake__.s, {s_map});\n"));
     out.push_str("__wake__.markLoaded(0);\n");
     out.push_str("__wake__.register({\n");
+    let entries_offset = out.len();
     out.push_str(entries);
     out.push_str("});\n");
     out.push_str(&format!(
@@ -5131,18 +6983,19 @@ fn render_entry_chunk(
     );
     out.push_str("else g.__wake_entry__ = __wake_entry__;\n");
     out.push_str("})();\n");
-    out
+    (out, entries_offset)
 }
 
 /// async/shared chunk：接入已建 registry + register 模块 + markLoaded。
-fn render_async_chunk(token: &str, this_chunk_id: u32, entries: &str) -> String {
+fn render_async_chunk(token: &str, this_chunk_id: u32, entries: &str) -> (String, usize) {
     let mut out = RUNTIME_ASYNC_PRELUDE.replace("__WAKE_NS__", token);
     out.push_str("__wake__.register({\n");
+    let entries_offset = out.len();
     out.push_str(entries);
     out.push_str("});\n");
     out.push_str(&format!("__wake__.markLoaded({this_chunk_id});\n"));
     out.push_str("})();\n");
-    out
+    (out, entries_offset)
 }
 
 /// `{ 1: "lazy.abcd.js", 2: "shared.efgh.js" }`（chunk id 升序）。

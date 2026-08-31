@@ -26,7 +26,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.error_expected("枚举名");
             Ident::new(self.cur.span, self.interner.intern("__enum__"))
         };
-        let e_atom = name.name;
+        let parameter = transformed_parameter(name);
         self.expect(TokenKind::LBrace);
 
         let mut stmts = self.new_vec::<Statement>();
@@ -68,12 +68,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             };
 
             // E["member"]
-            let forward = self.member_str(e_atom, member_atom);
+            let forward = self.member_str(parameter, member_atom);
             // E["member"] = init
             let assign1 = self.assign(forward, init);
             if is_numeric {
                 // 反向映射：E[ (E["member"] = init) ] = "member"
-                let outer = self.member_expr_computed(e_atom, assign1);
+                let outer = self.member_expr_computed(parameter, assign1);
                 let key_str = self.str_lit(member_atom);
                 let assign2 = self.assign(outer, key_str);
                 stmts.push(self.expr_stmt(assign2));
@@ -90,14 +90,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         // return E;
         stmts.push(Statement::Return(self.alloc(ReturnStatement {
             span: Span::DUMMY,
-            argument: Some(self.ident_ref(e_atom)),
+            argument: Some(self.ident_ref_at(parameter)),
         })));
 
         // var E = function (E) { stmts }(E || (E = {}));
         // 用 `||` 而非 `{}`：TS 的 enum 同样支持跨声明合并。
-        let init = self.or_assign_ident(e_atom);
+        let init = self.or_assign_ident(name);
         let decl_span = self.span_to(lo);
-        self.build_value_iife(decl_span, name, stmts, init)
+        self.build_value_iife(decl_span, name, parameter, stmts, init)
     }
 
     /// 解析 `namespace N { .. }` / `module N { .. }` → `var N = function (N) { ..; return N; }(N || (N = {}))`。
@@ -133,15 +133,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        let parameters: Vec<Ident> = segments
+            .iter()
+            .copied()
+            .map(transformed_parameter)
+            .collect();
         // 成员挂载到**最内层**段上（`namespace A.B.C { export const x }` → `C.x`）。
-        let inner_atom = segments[segments.len() - 1].name;
+        let inner_binding = parameters[parameters.len() - 1];
         self.expect(TokenKind::LBrace);
 
         let mut stmts = self.new_vec::<Statement>();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let before = self.cur.span.lo;
             let s = self.parse_statement();
-            self.lower_namespace_member(s, inner_atom, &mut stmts);
+            self.lower_namespace_member(s, inner_binding, &mut stmts);
             if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
                 self.bump();
             }
@@ -150,7 +155,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         stmts.push(Statement::Return(self.alloc(ReturnStatement {
             span: Span::DUMMY,
-            argument: Some(self.ident_ref(inner_atom)),
+            argument: Some(self.ident_ref_at(inner_binding)),
         })));
 
         // 由内向外逐层包裹：最内层的初始化实参是 `<父段>.<本段> || (<父段>.<本段> = {})`，
@@ -161,10 +166,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             let seg = segments[depth];
             let init = if depth == 0 {
                 // 顶层：`A || (A = {})`
-                self.or_assign_ident(seg.name)
+                self.or_assign_ident(seg)
             } else {
                 // 嵌套：`Parent.Seg || (Parent.Seg = {})`
-                self.or_assign_member(segments[depth - 1].name, seg.name)
+                self.or_assign_member(parameters[depth - 1], seg.name)
             };
             // **每层必须用各自的 span**：压缩器的侧表以 span 为键，若各层共用同一 span，
             // 对某一层的「未用绑定消除」判定会连带命中其它层，把整个嵌套削平
@@ -175,7 +180,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             } else {
                 seg.span
             };
-            let iife = self.build_value_iife(decl_span, seg, current, init);
+            let iife = self.build_value_iife(decl_span, seg, parameters[depth], current, init);
             if depth == 0 {
                 return iife;
             }
@@ -184,7 +189,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             outer.push(iife);
             outer.push(Statement::Return(self.alloc(ReturnStatement {
                 span: Span::DUMMY,
-                argument: Some(self.ident_ref(segments[depth - 1].name)),
+                argument: Some(self.ident_ref_at(parameters[depth - 1])),
             })));
             current = outer;
         }
@@ -192,23 +197,23 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// `X || (X = {})`——命名空间/枚举的**声明合并**初始化式。
-    fn or_assign_ident(&self, name: Atom) -> Expression<'a> {
+    fn or_assign_ident(&self, binding: Ident) -> Expression<'a> {
         let assign = Expression::Assignment(self.alloc(AssignmentExpression {
             span: Span::DUMMY,
             operator: AssignmentOperator::Assign,
-            left: self.ident_ref(name),
+            left: self.ident_ref_at(binding),
             right: self.empty_object(),
         }));
         Expression::Logical(self.alloc(LogicalExpression {
             span: Span::DUMMY,
             operator: LogicalOperator::Or,
-            left: self.ident_ref(name),
+            left: self.ident_ref_at(binding),
             right: assign,
         }))
     }
 
     /// `Obj.Prop || (Obj.Prop = {})`。
-    fn or_assign_member(&self, obj: Atom, prop: Atom) -> Expression<'a> {
+    fn or_assign_member(&self, obj: Ident, prop: Atom) -> Expression<'a> {
         let assign = Expression::Assignment(self.alloc(AssignmentExpression {
             span: Span::DUMMY,
             operator: AssignmentOperator::Assign,
@@ -234,7 +239,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     fn lower_namespace_member(
         &self,
         s: Statement<'a>,
-        n_atom: Atom,
+        namespace: Ident,
         out: &mut wake_ecma_ast::AVec<'a, Statement<'a>>,
     ) {
         match s {
@@ -242,7 +247,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 if let Some(decl) = e.declaration {
                     out.push(decl);
                     for name in declared_names(&decl) {
-                        out.push(self.expr_stmt(self.dot_assign(n_atom, name)));
+                        out.push(self.expr_stmt(self.dot_assign(namespace, name)));
                     }
                 } else {
                     // export { a, b as c } → N.c = a ...
@@ -253,8 +258,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                             let assign = Expression::Assignment(self.alloc(AssignmentExpression {
                                 span: Span::DUMMY,
                                 operator: AssignmentOperator::Assign,
-                                left: self.member_dot(n_atom, exported.name),
-                                right: self.ident_ref(local.name),
+                                left: self.member_dot(namespace, exported.name),
+                                right: self.ident_ref_at(local),
                             }));
                             out.push(self.expr_stmt(assign));
                         }
@@ -267,20 +272,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// `N.name = name`。
-    fn dot_assign(&self, obj: Atom, name: Atom) -> Expression<'a> {
+    fn dot_assign(&self, obj: Ident, name: Ident) -> Expression<'a> {
         Expression::Assignment(self.alloc(AssignmentExpression {
             span: Span::DUMMY,
             operator: AssignmentOperator::Assign,
-            left: self.member_dot(obj, name),
-            right: self.ident_ref(name),
+            left: self.member_dot(obj, name.name),
+            right: self.ident_ref_at(name),
         }))
     }
 
     /// `obj.name`（非计算成员）。
-    fn member_dot(&self, obj: Atom, name: Atom) -> Expression<'a> {
+    fn member_dot(&self, obj: Ident, name: Atom) -> Expression<'a> {
         Expression::Member(self.alloc(MemberExpression {
             span: Span::DUMMY,
-            object: self.ident_ref(obj),
+            object: self.ident_ref_at(obj),
             property: MemberProperty::Ident(Ident::new(Span::DUMMY, name)),
             optional: false,
         }))
@@ -294,12 +299,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         &self,
         decl_span: Span,
         name: Ident,
+        parameter: Ident,
         stmts: wake_ecma_ast::AVec<'a, Statement<'a>>,
         init: Expression<'a>,
     ) -> Statement<'a> {
-        let atom = name.name;
         let mut params = self.new_vec::<Pattern>();
-        params.push(Pattern::Ident(self.alloc(Ident::new(Span::DUMMY, atom))));
+        params.push(Pattern::Ident(self.alloc(parameter)));
         let body = self.alloc(FunctionBody {
             span: Span::DUMMY,
             statements: stmts,
@@ -364,6 +369,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         Expression::Identifier(self.alloc(Ident::new(Span::DUMMY, name)))
     }
 
+    fn ident_ref_at(&self, ident: Ident) -> Expression<'a> {
+        Expression::Identifier(self.alloc(ident))
+    }
+
     fn str_lit(&self, value: Atom) -> Expression<'a> {
         Expression::StringLiteral(self.alloc(StringLiteral {
             span: Span::DUMMY,
@@ -383,16 +392,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// `E["member"]`（计算成员，键为字符串字面量）。
-    fn member_str(&self, obj: Atom, member: Atom) -> Expression<'a> {
+    fn member_str(&self, obj: Ident, member: Atom) -> Expression<'a> {
         let key = self.str_lit(member);
         self.member_expr_computed(obj, key)
     }
 
     /// `E[<key_expr>]`（计算成员）。
-    fn member_expr_computed(&self, obj: Atom, key: Expression<'a>) -> Expression<'a> {
+    fn member_expr_computed(&self, obj: Ident, key: Expression<'a>) -> Expression<'a> {
         Expression::Member(self.alloc(MemberExpression {
             span: Span::DUMMY,
-            object: self.ident_ref(obj),
+            object: self.ident_ref_at(obj),
             property: MemberProperty::Computed(key),
             optional: false,
         }))
@@ -416,27 +425,41 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 }
 
 /// 提取声明语句引入的名字（简单标识符）——用于命名空间 `export` 成员改写为 `N.name`。
-fn declared_names(s: &Statement) -> Vec<Atom> {
+fn declared_names(s: &Statement) -> Vec<Ident> {
     let mut names = Vec::new();
     match s {
         Statement::VariableDeclaration(d) => {
             for decl in d.declarations.iter() {
                 if let Pattern::Ident(id) = &decl.id {
-                    names.push(id.name);
+                    names.push(**id);
                 }
             }
         }
         Statement::FunctionDeclaration(f) => {
             if let Some(id) = f.id {
-                names.push(id.name);
+                names.push(id);
             }
         }
         Statement::ClassDeclaration(c) => {
             if let Some(id) = c.id {
-                names.push(id.name);
+                names.push(id);
             }
         }
         _ => {}
     }
     names
+}
+
+/// Give a parser-generated parameter a stable semantic occurrence distinct from the source
+/// declaration which contributed its spelling. The zero-width end anchor is deterministic,
+/// source-map safe, and remains unique for repeated/dotted namespace segments.
+fn transformed_parameter(source: Ident) -> Ident {
+    Ident::new(
+        if source.span.is_dummy() {
+            Span::DUMMY
+        } else {
+            Span::at(source.span.hi)
+        },
+        source.name,
+    )
 }

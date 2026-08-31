@@ -38,7 +38,54 @@
 
 ## M4d — 精确 Source Map
 
-Source Map 构建关闭压缩、mangle 和代码分割，以保证映射来源可解释。它面向问题排查，不等同于最终生产优化配置。
+Source Map 与生产压缩、确定性名字优化和代码分割可以同时启用。优化后的 mapped/unmapped 发射由同一
+typed token walk 完成，map 只是可选 sink，因此 JavaScript body 必须逐字节相同。`Source`/`Derived`
+origin 提供源位置，改名 occurrence 通过 V3 `names` 保留原标识符；无可靠来源的合成标点和 wrapper
+保持 unmapped。折叠、函数体内联、实参替换、可信 CSS 编辑和模块 wrapper 的细粒度映射分别以测试为
+兼容证据，未覆盖的来源关系不能仅凭 origin anchor 推断。
+
+## M4e — 压缩语义边界
+
+`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v12`），不要求第二个
+名字优化开关，也不因模块源码长度改变行为。这里的“Closure 风格”只表示 Wake 对 pass 排序、变更跟踪和收敛模型的架构选择；
+不兼容 Closure `ADVANCED`、Closure modules、externs、类型优化、全局属性 flattening 或逐字输出。
+普通 ESM/CommonJS、公开成员和宿主协议按 Wake 的局部可证明安全边界保留。实现只使用 workspace
+现有依赖和 Wake 自有语料，不复制、vendor 或下载第三方压缩器代码。
+
+“唯一管线”指生产调用只有 `optimize` 一个决策入口。Parser AST 与初始 semantic model 在入口一次性
+降低成 `TypedProgram`；此后 owned typed arena 是结构、binding、名字和 origin 的唯一可变事实源。
+`TypedAnalysis::rebuild` 从当前 live tree 重建 scope、读写、capture、CFG、确定初始化、effect 和 escape
+facts。相同 program revision 上复用分析；结构变化后在下一次 binding-sensitive pass 前重建，收敛时的
+当前分析供动态作用域判断与最终改名复用。typed codegen 也只接受 finalizer 验证后构造的
+`FinalizedTypedProgram`。
+
+固定点顺序为 primitive folding、控制流简化、封闭函数内联、单次变量内联、DCE、声明/sequence 合并和
+late peephole；完整轮次无变化才收敛，100 轮仍变化返回构建诊断。Direct `eval`/`with` 只冻结可见环境。
+若 decorated class 的 member 内 direct eval 会因 lowering wrapper 改变词法可见环境，只对该类返回明确
+装饰器 lowering 诊断；decorator/key 表达式与无关作用域不因此整模块退出。
+所有依赖“变短”才成立的局部候选使用 typed token cost 并要求不增长，未证明安全或更短的候选保留原形。
+模块图用稳定名称分别保存声明绑定保留与公开 export-key 观察，并独立携带 star 转发事实；bundler 将这些
+事实和 `ModuleId` 交给 optimizer，optimizer 只用 lowering 共用的 parser semantic model 把声明保留名解析为
+当前 `SymbolId`，公开观察名直接控制 getter。`SymbolId` 不跨 optimizer 边界或
+重新解析持久化。未提供 linker liveness 的
+preserved ESM 保留公开导出的本地名；只有带已验证 liveness 的 linked output 才能压缩这些本地名，并保持
+原 export key。
+
+define 回归保证赋值/update/delete/for-in/for-of 目标不被常量替换，对象 shorthand 会展开以保留
+属性 key。DCE 删空 if/loop/label/with 的必需 body 后仍生成合法空语句；export 前装饰器和 decorated
+default export 的绑定语义也有 parser/codegen 回归。
+
+Preserve ESM、Preserve CommonJS 与 bundled CommonJS 共用 typed module plan→seal→finalize 生命周期。
+Optimizer 在固定点前建立 import/export/request 与 runtime binding，固定点后只保留 live request，最终
+链接/chunk 事实到齐后再写入真实目标和 interop。Bundler/runtime 只选择 mode 并提供最终事实，codegen
+不重建 namespace/live-binding side-plan。普通 ESM/CJS、循环、顶层 await、default/namespace interop 和
+实时导出不能用 Closure whole-world 假设改写。
+
+Scope-concat 的 bare-block 安全判断只由 bundler 私有分析拥有；检测到 `var` 或 `this` 会保守保留
+IIFE。Codegen 不提供 concat policy，也不会因压缩重新解释 wrapper eligibility。
+
+原子切换不提供兼容 emitter、旧压缩器 feature flag 或静默未压缩 fallback。IR 不变量、可信编辑、非法
+linker liveness、模块 finalize 和不收敛错误都必须成为构建诊断。旧压缩器只允许以冻结体积数字存在。
 
 # M5 — 高级语法
 

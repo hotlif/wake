@@ -13,6 +13,7 @@ mod ts_value;
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::Arc;
 
 use bumpalo::Bump;
 use wake_common::{Atom, Diagnostic, FxHashMap, Interner, Span};
@@ -26,7 +27,7 @@ use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 /// 解析结果。
 pub struct ParseOutput {
     /// 自引用持有者（arena + AST）。
-    pub module: ModuleAst,
+    pub module: Arc<ModuleAst>,
     /// 解析时同步提取的依赖（DESIGN §4.4）。
     pub dependencies: Vec<Dependency>,
     /// 诊断（错误恢复模式下可能多条）。
@@ -101,14 +102,29 @@ fn parse_with_mode<const LOWER: bool>(
 
     // 源码指纹比构建后重新遍历 AST 更便宜；seed 覆盖所有会改变解析结果的配置输入。
     let source_hash = parse_fingerprint(source, source_type, options);
-    let module = ModuleAst::from_builder_prehashed(source_hash, |arena| {
-        let mut parser = Parser::<LOWER>::new(source, interner, arena, source_type, options);
-        let program = parser.parse_program();
-        *deps.borrow_mut() = std::mem::take(&mut parser.dependencies);
-        *diags.borrow_mut() = std::mem::take(&mut parser.diagnostics);
-        tla.set(parser.has_top_level_await);
-        program
-    });
+    let owned_source: Arc<str> = Arc::from(source);
+    let parser_source = Arc::clone(&owned_source);
+    let mut module = ModuleAst::from_source_builder_prehashed(
+        owned_source,
+        interner.identity(),
+        source_hash,
+        |arena| {
+            let mut parser = Parser::<LOWER>::new(
+                parser_source.as_ref(),
+                interner,
+                arena,
+                source_type,
+                options,
+            );
+            let program = parser.parse_program();
+            *deps.borrow_mut() = std::mem::take(&mut parser.dependencies);
+            *diags.borrow_mut() = std::mem::take(&mut parser.diagnostics);
+            tla.set(parser.has_top_level_await);
+            program
+        },
+    );
+    module.set_parser_had_errors(diags.borrow().iter().any(Diagnostic::is_error));
+    let module = Arc::new(module);
 
     ParseOutput {
         module,

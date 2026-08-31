@@ -29,10 +29,14 @@ wake bundle <ENTRY> --outfile <FILE>
 | `--cache` | 关闭 | 启用持久 bundle 缓存 |
 | `--config` | 自动发现 | 显式指定 `wake.config.toml` |
 
-首版只接受 `browser+iife` 与 `node+cjs`。`--minify` 和 `--sourcemap` 不能同时启用；
-CommonJS 同步入口图包含顶层 `await` 时构建失败，但动态导入后的异步模块可以使用顶层 `await`。
+首版只接受 `browser+iife` 与 `node+cjs`。`--minify` 和 `--sourcemap` 可以同时启用；生成映射不会
+选择另一套未压缩代码。CommonJS 同步入口图包含顶层 `await` 时构建失败，但动态导入后的异步模块
+可以使用顶层 `await`。
+
+`--minify` 使用 Wake 集中式的 Closure 风格有序 pass/固定点管线；它不等同于 Closure
+`ADVANCED`，也不接受 externs 或 whole-world 配置。
 
 ```sh
 wake bundle src/extension.ts --outfile dist/extension.js \
-  --platform node --external vscode --minify
+  --platform node --external vscode --minify --sourcemap
 ```

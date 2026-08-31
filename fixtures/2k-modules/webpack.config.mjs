@@ -1,8 +1,13 @@
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const fixtureDir = fileURLToPath(new URL('.', import.meta.url));
+
 export default {
   "mode": "production",
-  "entry": "C:\\Users\\zhang\\Desktop\\SourceCode\\RustProject\\wake\\fixtures\\2k-modules\\input\\entry.js",
+  "entry": join(fixtureDir, "input", "entry.js"),
   "output": {
-    "path": "C:\\Users\\zhang\\Desktop\\SourceCode\\RustProject\\wake\\fixtures\\2k-modules\\dist-webpack",
+    "path": join(fixtureDir, "dist-webpack"),
     "filename": "bundle.js",
     "clean": true
   },

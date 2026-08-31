@@ -20,11 +20,16 @@ CLI 与 Node API 是两种调用外壳；构建行为由 `wake_app` 统一。Wak
 
 ## 3.2 构建阶段
 
-应用构建采用 Scan → Link → Emit：Scan 解析依赖并建立记录，Link 计算活跃性与 chunk，Emit 生成 runtime、代码和资源。
+应用构建采用 Scan → Link/Chunk → Optimize/Codegen → Emit：Scan 解析依赖并建立记录，Link 以公开
+export 名称计算稳定的模块/绑定活跃性；bundler 把 `(ModuleId, export names)` 交给 Optimize。Optimize
+在单一入口建立 parser semantic model，用它解析本次程序的 `SymbolId` 并执行 typed lowering，随后报告
+仍保留的模块依赖；bundler 再据此保守收敛可达集合并组装 runtime、chunk、代码和资源。`SymbolId` 只在
+optimizer 内部属于当前 AST 生命周期，不是跨 crate 或持久缓存格式。
 
 ## 3.3 核心抽象
 
-编译核心通过 `FileSystem` 读取内容，通过 `Diagnostic` 报告问题；`ModuleAst` 持有 arena 生命周期；打包器只跨阶段传稳定记录和受控句柄。
+编译核心通过 `FileSystem` 读取内容，通过 `Diagnostic` 报告问题；parser 创建的 `ModuleAst` 持有 arena
+生命周期与精确 source，并记录创建其 `Atom` 的进程内 interner identity；打包器只跨阶段传稳定记录和受控句柄。
 
 # 4. ECMAScript 编译器
 
@@ -48,9 +53,61 @@ Lexer 按字节扫描，token 只保存类型、Span 和 ASI 换行状态。pars
 
 TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上下文中运行。`wake_ecma_transform` 不依赖 parser，只提供稳定的 lowering 规则与 AST helper；parser 可在仍掌握 cover grammar/作用域上下文时调用它们。转换复用原 Span，避免丢失诊断与 Source Map 来源。
 
-## 4.6 Codegen 与 Source Map
+## 4.6 Closure 风格优化管线
 
-Codegen 直接写字符串并根据优先级补括号。Source Map 记录生成位置到源码字节偏移；精确 source map 构建关闭会改变映射结构的压缩和分包路径。
+`wake_ecma_minify` 把 parser AST 与初始 semantic model 一次性降低为完整拥有所有权的 `TypedProgram`。
+它以稳定 `NodeId`、`ListId`、`NameId` 和当前程序内 `SymbolId` 表达结构与绑定，每个节点携带 `Source`、
+`Derived` 或 `Synthetic` origin。节点、child list、名字 spelling 和符号记录都由 typed arena 持有；
+`replace_node`、`splice_list`、`tombstone_subtree` 等结构操作修改当前树，`validate()` 检查所有 parent/child、
+节点类别和名字不变量。Parser AST 只提供一次 lowering 的输入；后续结构、名字和活跃性都以 owned
+typed IR 为事实源，codegen 不按 Span 或外部计划拼装重写。
+
+`OptimizeInput` 包含 parser 已验证的 defines、drop flags、保留名、当前程序上的
+`LinkerExportLiveness`、内部模块模式，以及 CSS-in-JS 等可信结构化编辑。`typed_edits.rs` 先把编辑解析为
+typed target 和 owned expression；目标不唯一、类型错误、重叠或 owner 错配都返回诊断。`optimize` 返回
+持有最终 `TypedProgram`、typed module plan、最终名字、保留依赖、稳定指纹和 pass 统计的
+`OptimizedProgram`。
+
+一次性验证之后，固定点按“常量传播/折叠 → 条件与退出点简化 → 已封闭函数/调用内联 → 单次使用变量
+内联 → 死控制流/赋值/声明清除 → 声明/sequence 合并 → late peephole”调度，统一 change tracker
+决定是否继续；100 轮仍不收敛返回包含模块和最后变更 pass 的诊断。Binding-sensitive pass 通过
+`TypedAnalysis::rebuild` 从当前 live tree 完整重建 lexical scope、引用读写、capture、CFG、确定初始化、
+effect 和 escape facts；相同 program revision 上复用当前分析，结构变化后才在下一次 binding-sensitive
+pass 前重建。固定点收敛时的当前分析继续供动态作用域判断、变量槽复用和最终符号改名使用。它不读取
+parser AST、旧 revision snapshot 或活跃 Span 集合。`LatePeephole` 只有在当前树分析证明求值安全时才省略表达式。
+
+所有“只有变短才值得做”的局部候选使用 typed token 成本，计入重复引用、名字、括号和 separator；
+闭包内联、常量/控制流替换、语句合并、安全属性和标识符改名只有在不增长时才提交。纯删除、合法性
+规范化与调用方显式请求的可信编辑不依赖收益判定。源码长度退让和旧运行时 fallback 不属于该架构。
+
+属性改名只处理类私有名和可证明封闭的局部对象字面量数据属性。动态访问、逃逸、反射、枚举、
+spread/rest、Proxy、delete、方法/accessor 或未知别名会使整个形状退出；公共类成员、DOM/React/Node
+宿主属性、`__proto__` 和协议名保留。该模型不采用 Closure `ADVANCED` 的 whole-world、externs 或
+类型假设，只对普通 ESM/CommonJS 做 Wake 自有的语义保持优化。
+
+标识符改名的模块边界由 linker 证明决定：没有 `LinkerExportLiveness` 的 preserved ESM 保留公开导出；
+有该契约的 linked output 可以删除或缩名未活跃本地 binding，同时保持原 export key。公开 export 名只在
+optimizer 内通过同一 parser semantic model 解析为当前模块符号；不会通过 Span 或裸局部名称猜测遮蔽关系。
+
+模块转换遵循 plan→optimize→seal→finalize。`plan_typed_modules` 在固定点前把 import/export、静态
+`require` 和 dynamic import 转为 typed request 与 runtime binding；`seal_typed_module_plan` 只保留最终 live
+tree 上的请求。最终链接/chunk 事实确定后，消费式 `finalize_owned_typed_modules` 写入真实目标和 interop，
+完成全 arena 校验并构造没有 pending request sentinel 的 `FinalizedTypedProgram` 类型状态。Preserve ESM、
+Preserve CJS 与 bundled CJS 共用这一结构化生命周期；
+外层不能注入另一套 namespace/live-read side-plan。Direct `eval`/`with` 的冻结范围由当前树分析决定。
+
+## 4.7 Codegen 与 Source Map
+
+`wake_ecma_codegen::typed` 直接遍历 finalizer 验证后构造的 `FinalizedTypedProgram`，根据 typed node
+类别与优先级写 token 和必要括号；它没有 parser AST 或 legacy optimization-table 输入，也不运行 DCE、
+内联、模块规划或改名。这个类型状态避免 emitter 紧接 finalizer 再做一次全 arena 校验。
+最短数字、字符串、空白和 token separator 由 emitter 负责。
+
+Mapped 与 unmapped 入口执行同一个 token walk，mapping 只是可选 sink，因此 `minify` 与 Source Map
+可以同时启用，且 map 收集不得改变 JavaScript body。`Source` 和带 anchor 的 `Derived` origin 映射回源；
+改名 name occurrence 把 original spelling 写入 V3 `names`；无可靠来源的合成标点和 wrapper 写 unmapped
+segment。折叠、内联、实参替换和模块 wrapper 的每类细粒度来源必须由独立测试证明，未验证的映射规则
+不作为兼容承诺。
 
 # 5. 解析与模块图
 
@@ -72,11 +129,18 @@ PnP 清单、data 或 lock 变化会清除清单、解析和模块拓扑缓存�
 
 ## 5.3 Tree Shaking
 
-Link 阶段从入口计算模块、导出和绑定活跃性。缓存摘要保存恢复该分析所需的稳定字符串和标志，不保存 `Atom` ID。
+Link 阶段从入口计算模块可达性，并分别保存稳定的声明绑定保留名、精确公开观察名和 plain
+`export *` 转发事实。模块 parse 后，bundler 把这些事实与 `ModuleId` 一起传给 `OptimizeInput`；优化器使用
+lowering 共用的 parser semantic model 将声明保留名解析为顶层 `SymbolId`，再按公开观察名生成 getter、
+删除未根化导出并报告仍保留的依赖说明符。死 re-export 只移除 namespace/getter，源模块请求仍按原顺序执行。
+Bundler 将保留依赖映射为排序去重的 `ModuleId`
+用于可达性收敛。缓存摘要保存恢复分析所需的稳定字符串和标志，不持久化 `Atom`/`SymbolId` 或 AST 指针。
 
 # 6. 打包与产物
 
-模块默认进入函数包装 runtime；满足条件的 ESM 可进入 concat/scope-hoist 块。循环、CJS `module.exports` 替换、导出冲突和不安全块语义会保守降级为独立 factory。
+模块默认进入函数包装 runtime；满足条件的 ESM 可进入 concat/scope-hoist 块。Bare-block eligibility 的
+保守 AST 扫描由 `wake_bundler::concat` 私有拥有：存在 `var` 或任何 `this` 即退回 IIFE；codegen 不导出
+这项分析。循环、CJS `module.exports` 替换、导出冲突和不安全块语义会保守降级为独立 factory。
 
 ## 6.1 CJS/ESM 互操作
 
@@ -84,13 +148,21 @@ runtime 为 ESM namespace、CommonJS exports、循环模块和异步模块维持
 Library preserve-modules 的每个 CommonJS 文件是独立执行单元，由 codegen 按实际引用在文件内
 去重注入 default/namespace interop helper，不能依赖入口先执行或应用 bundler runtime。
 
+为保留 ESM live binding，命名 import 的每次读取直接访问其 CommonJS namespace 属性，而不是从
+初始化时 `const` snapshot 读取。用作 call/tag 时，前置 sequence value 去掉 namespace receiver，使 `this`
+等同 ESM import binding 的值调用。Namespace import 则由 interop helper 物化一次并复用局部绑定，不在每次读取
+重建 wrapper。每个 import statement 的 namespace 名由 optimizer 内部计划：首选基于 declaration Span
+的稳定名，与用户绑定或自由引用冲突时按确定顺序加数字后缀。Library/runtime 只选择 preserve-CJS 模式，
+codegen 从 `OptimizedProgram` 读取 namespace 与实时访问表达式，避免任何 bundler/codegen side-plan 分叉。
+
 ## 6.1.1 顶层 await
 
 包含顶层 await 的模块及其同步导入方形成 async 子图。runtime 缓存执行 Promise，调用方等待同一生命周期，避免重复执行或捕获未完成导出。
 
 ## 6.2 Emit
 
-Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map。文件路径在跨平台输出前统一规范化。
+Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map。启用映射不会关闭压缩或
+代码分割，也不会改变不含 `sourceMappingURL` trailer 的 JS payload。文件路径在跨平台输出前统一规范化。
 Library emit 先生成确定性 staging 清单，再在稳定输出目录内跳过相同文件、逐文件原子替换变化、
 删除 stale 文件并在失败时回滚；不得整体 rename 已存在的输出目录。
 
@@ -120,7 +192,9 @@ Library emit 先生成确定性 staging 清单，再在稳定输出目录内跳�
 
 ## 10.1 工作规避
 
-Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要和生成体缓存减少重复解析与 codegen。依赖形状和绑定活跃性不变时复用上一 generation 的 link/chunk 规划；旧的内存摘要在成功 generation 后回收。持久缓存成功落盘即恢复 clean，并按访问新近度限制为 512 MiB/20 万条。
+Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要和优化/生成体缓存减少重复解析与
+codegen。依赖形状和绑定活跃性不变时复用上一 generation 的 link/chunk 规划；旧的内存摘要在成功
+generation 后回收。持久缓存成功落盘即恢复 clean，并按访问新近度限制为 512 MiB/20 万条。
 
 ## 10.2 并发模型
 
@@ -132,11 +206,14 @@ Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要�
 
 ## 10.4 Arena AST 生命周期
 
-AST 持有者放入 `Arc` 管理的任务值，下游只在受控闭包中借用。不得把 AST 引用、指针或 `Atom` 跨进程持久化。
+AST 持有者放入 `Arc` 管理的任务值，下游只在受控闭包中借用。Parser owner 同时保存 exact source 和
+interner identity；优化入口校验两者以阻止同长度错误 source 或另一张 interner 表与 AST 配对。不得把
+AST 引用、指针、`Atom`、`SymbolId` 或 interner identity 跨进程持久化。
 
 ## 10.5 执行器
 
-工作窃取执行器处理同层 parse/codegen 扇出。Loom 验证 single-flight 交错；循环依赖检测在同线程任务栈上拒绝递归环。
+工作窃取执行器处理同层 parse、optimize 和 body 扇出；source-map facts 是只依赖 body 的下游任务。
+Loom 验证 single-flight 交错；循环依赖检测在同线程任务栈上拒绝递归环。
 
 ## 10.6 性能预算
 
@@ -144,7 +221,18 @@ AST 持有者放入 `Arc` 管理的任务值，下游只在受控闭包中借用
 
 ## 10.7 缓存身份
 
-目标浏览器、JSX、define、生产选项和源码内容进入必要的缓存身份。缓存命中必须与冷构建产物等价。
+目标浏览器、JSX、源码内容、压缩器版本、defines/drop flags、图边界的声明保留名/公开观察名/star 事实、可信编辑和保留名
+进入相关输入。optimizer key 不含最终 chunk 编号，单独保存 retained module IDs；这些边收敛并重新规划
+chunk 后，final-layout key 才标识 JavaScript body。body 发射始终记录 mapping facts，二者在持久层独立
+存取；map 开关不进入 optimize/body 的输入、相等性或哈希。body metadata 同时保存 typed finalizer
+证明的 discarded static request 生成区间，供最终 eager 布局选择性替换；它参与 body hash 并随 mapping
+facts 持久化。当前 `wake-closure-minifier-v12` 与 schema 10 使旧路径产物自然 miss，不做格式迁移；当前
+AST 的 `SymbolId`/`NodeId` 只可进入本次 optimize/codegen 内部，不进入指纹或持久 key。缓存命中必须与
+冷构建产物等价。
+
+最终 map 合并按 placement 为 generated token 位置建立一次索引；模块局部 mapping 只进行精确位置与
+单列 separator 回退查询。禁止对每条 mapping 从 token 列表头重新扫描，否则大模块会退化为
+`O(mapping × token)`，并直接拖慢启用 Source Map 的代码分割与 lazy workspace 首次构建。
 
 ## 10.8 单机实现纪律
 
@@ -166,10 +254,13 @@ AST 持有者放入 `Arc` 管理的任务值，下游只在受控闭包中借用
 
 # 13. 风险与降级
 
-关键降级包括：增量引擎可关闭跨 revision 复用、危险 concat 回退独立 factory、Source Map 关闭压缩与分包、终端非 TTY 回退 plain 日志。任何性能优化都必须保留可对拍的正确路径。
+关键降级包括：增量引擎可关闭跨 revision 复用、危险 concat 回退独立 factory、单个无法证明安全的
+压缩候选保持原形、终端非 TTY 回退 plain 日志。Source Map
+不再关闭压缩或分包；优化表示不变量、可信编辑冲突或固定点不收敛返回构建诊断，不能静默输出旧路径
+或未压缩代码。Typed emitter 只消费最终 `TypedProgram`；不存在用于降级的 parser-AST/span emitter。
 
 # 14. 附录
 
 ## 14.1 依赖纪律
 
-编译核心外部依赖白名单在 workspace `Cargo.toml` 维护；网络、序列化、配置、终端和 Node 依赖限制在边缘 crate。新增依赖同时接受许可证检查。
+编译核心外部依赖白名单在 workspace `Cargo.toml` 维护；网络、序列化、配置、终端和 Node 依赖限制在边缘 crate。Closure 风格压缩重写只使用 workspace 现有依赖和 Wake 自有测试语料，不复制或下载第三方实现、测试、二进制或 fixture。新增依赖同时接受许可证检查。
