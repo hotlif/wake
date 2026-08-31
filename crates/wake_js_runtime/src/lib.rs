@@ -689,7 +689,25 @@ pub fn compile_commonjs_module_graph(
     entry: &Path,
     entry_source: &str,
 ) -> Result<CompiledCommonJsModuleGraph, RuntimeError> {
-    let compilation = compile_module_graph(entry, entry_source)?;
+    compile_commonjs_module_graph_interruptible(entry, entry_source, &|| false).map(|graph| {
+        graph.expect("the non-interruptible module-graph compiler cannot be cancelled")
+    })
+}
+
+/// Compile a CommonJS graph while allowing an owner to stop between module compilation units.
+///
+/// A cancelled compilation returns `Ok(None)`: cancellation is an orchestration outcome, not a
+/// malformed source diagnostic. The ordinary public entry point remains non-interruptible.
+#[doc(hidden)]
+pub fn compile_commonjs_module_graph_interruptible(
+    entry: &Path,
+    entry_source: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<CompiledCommonJsModuleGraph>, RuntimeError> {
+    let Some(compilation) = compile_module_graph_interruptible(entry, entry_source, is_cancelled)?
+    else {
+        return Ok(None);
+    };
     let modules = compilation.modules;
     let entry_id = module_id(entry);
     let graph_modules = modules
@@ -704,7 +722,7 @@ pub fn compile_commonjs_module_graph(
     let opaque_dependencies = graph_modules
         .iter()
         .any(|module| module.opaque_dependencies);
-    Ok(CompiledCommonJsModuleGraph {
+    Ok(Some(CompiledCommonJsModuleGraph {
         entry_id: entry_id.clone(),
         modules,
         manifest: ModuleGraphManifest {
@@ -713,7 +731,7 @@ pub fn compile_commonjs_module_graph(
             resolver_inputs: compilation.resolver_inputs,
             opaque_dependencies,
         },
-    })
+    }))
 }
 
 /// Emit an already compiled module graph for one fresh execution realm.
@@ -1139,16 +1157,30 @@ fn existing_resolver_inputs(fs: &dyn FileSystem, entry: &Path) -> Vec<PathBuf> {
     inputs.into_iter().collect()
 }
 
+#[cfg(test)]
 fn compile_module_graph(
     entry: &Path,
     entry_source: &str,
 ) -> Result<ModuleGraphCompilation, RuntimeError> {
+    compile_module_graph_interruptible(entry, entry_source, &|| false).map(|compilation| {
+        compilation.expect("the non-interruptible module-graph compiler cannot be cancelled")
+    })
+}
+
+fn compile_module_graph_interruptible(
+    entry: &Path,
+    entry_source: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<ModuleGraphCompilation>, RuntimeError> {
     let entry = canonical_module_path(entry);
     let context = ModuleResolutionContext::new(&entry)?;
     let mut pending = vec![(entry.clone(), Some(entry_source.to_string()))];
     let mut visited = BTreeSet::new();
     let mut modules = Vec::new();
     while let Some((path, supplied_source)) = pending.pop() {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let id = module_id(&path);
         if !visited.insert(id.clone()) {
             continue;
@@ -1198,6 +1230,9 @@ fn compile_module_graph(
             transpile_module_with_mappings(&path, &source)
                 .map_err(|error| context.wrap_error_for_path(error, &path))?
         };
+        if is_cancelled() {
+            return Ok(None);
+        }
         let code = transpiled.code;
         let mut resolutions = BTreeMap::new();
         let mut request_specifiers = BTreeMap::new();
@@ -1324,10 +1359,10 @@ fn compile_module_graph(
         });
     }
     modules.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(ModuleGraphCompilation {
+    Ok(Some(ModuleGraphCompilation {
         modules,
         resolver_inputs: context.resolver_inputs,
-    })
+    }))
 }
 
 fn contains_top_level_await(code: &str) -> bool {

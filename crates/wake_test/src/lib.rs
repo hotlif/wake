@@ -30,9 +30,12 @@ use base64::Engine;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use wake_common::SourceFile;
+#[cfg(test)]
+use wake_js_runtime::compile_commonjs_module_graph;
 use wake_js_runtime::{
     CompiledCommonJsGraphScript, CompiledCommonJsModuleGraph, JsRuntime, RuntimeError,
-    compile_commonjs_module_graph, emit_commonjs_graph_script, resolve_package_manifest,
+    compile_commonjs_module_graph_interruptible, emit_commonjs_graph_script,
+    resolve_package_manifest,
 };
 use wake_test_browser::{
     BrowserCancellationToken, BrowserDriver, BrowserError, BrowserKind, BrowserLaunchOptions,
@@ -722,8 +725,10 @@ fn run_tests_with_selection_cached(
         .map(|suite| {
             let identity = suite.identity(&root);
             cache.prepared.get(&identity).cloned().unwrap_or_else(|| {
-                let prepared = prepare_test(&root, suite);
-                cache.prepared.insert(identity, prepared.clone());
+                let prepared = prepare_test_interruptible(&root, suite, &cancellation);
+                if !cancellation.is_cancelled() {
+                    cache.prepared.insert(identity, prepared.clone());
+                }
                 prepared
             })
         })
@@ -4533,7 +4538,16 @@ impl PreparedTest {
     }
 }
 
+#[cfg(test)]
 fn prepare_test(root: &Path, discovered: DiscoveredTest) -> PreparedTest {
+    prepare_test_interruptible(root, discovered, &TestCancellationToken::default())
+}
+
+fn prepare_test_interruptible(
+    root: &Path,
+    discovered: DiscoveredTest,
+    cancellation: &TestCancellationToken,
+) -> PreparedTest {
     let path = discovered.path.clone();
     let identity_label =
         suite_identity_label(&normalize_path(&path), discovered.project.as_deref());
@@ -4558,17 +4572,26 @@ fn prepare_test(root: &Path, discovered: DiscoveredTest) -> PreparedTest {
         }
     };
     let source = suite_wrapper_source(root, &path, &discovered.config, &original_source);
-    let graph = compile_commonjs_module_graph(&entry_path, &source)
-        .map(Arc::new)
-        .map_err(|error| {
+    let graph = match compile_commonjs_module_graph_interruptible(&entry_path, &source, &|| {
+        cancellation.is_cancelled()
+    }) {
+        Ok(Some(graph)) => Ok(Arc::new(graph)),
+        Ok(None) => Err(PreparedGraphError {
+            code: "WAKE_TEST_CANCELLED",
+            message: "Wake test was cancelled while compiling its module graph".to_string(),
+            path: path.clone(),
+            recovery_watch_paths: Vec::new(),
+        }),
+        Err(error) => {
             let recovery_watch_paths = error.recovery_watch_paths().to_vec();
-            PreparedGraphError {
+            Err(PreparedGraphError {
                 code: "WAKE_TEST_RUNTIME",
                 message: error.to_string(),
-                path,
+                path: path.clone(),
                 recovery_watch_paths,
-            }
-        });
+            })
+        }
+    };
     PreparedTest {
         discovered,
         original_source,
