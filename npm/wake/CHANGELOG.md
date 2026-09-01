@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.26
+
+- Replaced the synthetic 2,000-module benchmark with a deterministic Northstar commerce application,
+  exact runtime oracles, and equivalent no-cache production builds for Wake, Vite, and webpack.
+- Reduced one-shot build time by deduplicating exact relative source loads, planning statement merges
+  linearly, and redirecting concatenated module requests in one pass.
+- Released terminal task state in parallel and switched the standalone Rust CLI to mimalloc while
+  preserving Node-host allocation, session behavior, task metrics, output bytes, and panic propagation.
+- Made bundle `durationMs` cover the complete synchronous lifecycle, including output finalization and
+  one-shot cleanup, so reported timings no longer omit return-path work.
+- Cut the measured Northstar build from 568 ms to 257 ms on the recorded Windows environment; Wake
+  took 0.59x Vite's 436 ms (41% less time) in the final run without using a persistent cache.
+
 ## 0.1.25
 
 - Replaced the legacy minifier with an owned typed optimizer and structural module/codegen pipeline,
