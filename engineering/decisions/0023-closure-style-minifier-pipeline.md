@@ -171,6 +171,13 @@ graph。它仍执行同一个 typed finalization/codegen 和诊断路径；启�
 session 时继续走既有 task/facts 边界。One-shot 是生命周期优化，不是关闭缓存的同义词，也不是第二套
 构建语义。
 
+所有 terminal body/map 请求 join 后，one-shot bundler 先消费而非 clone plan-owned optimizer/linker
+artifact，并删除只服务下一 generation 的 cell/summary owner。随后把最后一个 `Arc<Engine>` 移交给
+`Engine::release_one_shot`；该消费型边界用 `Arc::try_unwrap` 证明没有在飞 query，再把 input、memo、
+recomputer 和 task-lock 的 128 个 shard 移交现有有界 executor 并行析构。Session engine 不进入该路径。
+Wake CLI 使用 workspace 已批准的 mimalloc 作为进程全局分配器；library/Node 宿主不被 CLI 的 allocator
+选择隐式接管。
+
 CPU 型 parse/optimize/body 请求按输入顺序切成至多 `workers × 32` 个连续批次，再由 executor work stealing
 调度；批内和展平结果保持原顺序。I/O 型 resolve/load 使用独立且更保守的 batch limit，不能套用 CPU
 常量。`wake_turbo` 的 task memo、recomputer 和 task-lock 表使用 128 个 cache-padded shard，按稳定

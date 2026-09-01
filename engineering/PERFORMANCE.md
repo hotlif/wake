@@ -159,3 +159,36 @@ Source Map 合并必须对每个 module placement 只索引一次 generated toke
 5. 将性能红灯与正确性门禁分开，避免重试掩盖功能失败。
 
 在这些条件满足前，CI 保持 work-count + `--no-run` 门禁，性能 PR 在说明中附可复现耗时结果。
+
+# 8. 2026-08-31 Northstar one-shot 优化记录
+
+本次测量基于提交 `e896cff` 加当前 one-shot/scan/emit/allocator 工作树切片；环境为
+Windows NT 10.0.26200 x64、Intel i9-10900K（20 logical cores）、16 GiB RAM、
+`rustc 1.95.0 (59807616e)`、Node `v22.15.0`。电源模式与后台负载未由 runner 固定，因此这些数字是
+同一交互会话中的 A/B 证据，不是 CI 毫秒阈值。
+
+构建与正式对比命令：
+
+```powershell
+cargo +1.95.0 build --locked --offline --release -p wake_cli
+cd fixtures/2k-modules
+npm run bench
+```
+
+优化前正式 runner：Wake `568ms (550–595)` / `241.0MB`，Vite `480ms (469–493)`；优化后正式 runner：
+Wake `258ms (250–263)` / `235.0MB`，Vite `431ms (420–449)`。两轮均先 warmup，记录 5 个时间样本和
+2 个独立 RSS 样本。优化后 Wake 原始五次为 `252, 261, 263, 250, 263ms`；同轮 Vite 为
+`435, 423, 449, 431, 420ms`。runner 在计时外重新执行每个产物并与 committed source oracle 逐字节比较。
+
+另以 Wake/Vite 交替顺序各运行 10 次，优化后 Wake 为
+`249.2, 248.0, 258.2, 252.0, 258.4, 251.5, 250.0, 246.0, 250.2, 248.0ms`
+（mean `251.1ms`，median `250.1ms`）；Vite 为
+`438.6, 449.6, 458.3, 439.6, 426.7, 444.6, 433.4, 443.7, 433.9, 414.4ms`
+（mean `438.3ms`，median `439.1ms`）。该交错实验不替代正式 runner 的 runtime oracle/RSS 门禁。
+
+最终产物保持 `1200124 / 49576 / 23835 B`（raw / gzip-9 / Brotli-11），与优化前完全相同。
+`WAKE_TIMING=1` 的热样本把 scan 从约 `89–91ms` 降到 `46–52ms`、emit 从约 `34–40ms` 降到
+`18–21ms`，one-shot release 从隐式约 `125–160ms` 的尾部变为显式约 `10–11ms`；正式性能结论只使用
+未设置 `WAKE_TIMING` 的 runner 样本。
+保留 one-shot `task_exec_count()` 可观察语义并隔离并行析构 panic 后，最终 release 复测为
+Wake `257ms (248–269)` / `235.5MB`，Vite `436ms (426–442)` / `209.0MB`，产物字节仍完全不变。
