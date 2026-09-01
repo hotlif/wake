@@ -110,6 +110,23 @@ impl<V> Sharded<V> {
             f(v);
         }
     }
+
+    /// 把每个分片当前拥有的 map 移出，原分片留作空表。
+    ///
+    /// 只允许在调用方独占整个 [`Engine`] 时使用；这样既没有并发访问，也没有仍持有
+    /// per-task 锁的 single-flight。即使此前某个查询 panic 导致分片锁中毒，清理仍应取得
+    /// map 的所有权并完成析构，而不是把整棵瞬态任务图留给主线程串行 drop。
+    fn take_maps(&mut self) -> Vec<FxHashMap<TaskId, V>> {
+        self.shards
+            .iter_mut()
+            .map(|shard| {
+                let mut map = shard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *map)
+            })
+            .collect()
+    }
 }
 
 /// 输入 cell：文件内容、配置切片……由引擎递增分配、外部显式写入。
@@ -128,6 +145,38 @@ struct Memo {
     verified_at: Revision,
     changed_at: Revision,
     deps: Vec<RawVc>,
+}
+
+/// [`Engine::release_one_shot`] 已转移并析构的瞬态状态数量。
+///
+/// 计数用于阶段级性能诊断，也让调用方能验证预期的任务图已经真正释放。`drop_batches`
+/// 是提交到 [`Executor`] 的非空析构批次数；它至多为引擎分片数。
+#[cfg(not(loom))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OneShotReleaseStats {
+    pub input_cells: usize,
+    pub memo_entries: usize,
+    pub recomputer_entries: usize,
+    pub task_locks: usize,
+    pub drop_batches: usize,
+}
+
+#[cfg(not(loom))]
+struct OneShotDropBatch {
+    inputs: Vec<InputCell>,
+    memos: FxHashMap<TaskId, Memo>,
+    recomputers: FxHashMap<TaskId, Recompute>,
+    task_locks: FxHashMap<TaskId, Arc<Mutex<()>>>,
+}
+
+#[cfg(not(loom))]
+impl OneShotDropBatch {
+    fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+            && self.memos.is_empty()
+            && self.recomputers.is_empty()
+            && self.task_locks.is_empty()
+    }
 }
 
 /// 并发红绿增量引擎。共享只读（`&self` / `Arc<Self>`），内部状态经原子/锁/分片表管理。
@@ -243,6 +292,88 @@ impl Engine {
     /// [`Engine::new`]。
     pub fn new_one_shot() -> Engine {
         Self::with_mode(true)
+    }
+
+    /// 终结瞬态引擎，并在现有工作窃取执行器上并行析构其任务图。
+    ///
+    /// 这是一个**消费型安全点**：调用方必须已经 join 所有 query，并把最后一个
+    /// `Arc<Engine>` 的所有权传入。内部的 [`Arc::try_unwrap`] 会原子验证这一前置条件；
+    /// 任一 worker、宿主或并发请求仍持有强引用时，本方法会在移动任何状态前 panic。
+    /// 普通 red-green/session 引擎也会被拒绝，因其 memo 与 input 必须跨 generation 保留。
+    ///
+    /// 成功后先把 input 与 128 个 memo/recomputer/task-lock 分片移成独立批次，再由
+    /// `executor` 并行 drop。方法会等待全部批次完成后返回，因此返回即代表瞬态状态已经
+    /// 释放；消费掉 Engine 也使旧 [`Vc`] 无法再被误读。
+    #[cfg(not(loom))]
+    pub fn release_one_shot(self: Arc<Self>, executor: &Executor) -> OneShotReleaseStats {
+        assert!(
+            self.one_shot,
+            "wake_turbo: release_one_shot 只能用于 one-shot 引擎"
+        );
+        let mut engine = match Arc::try_unwrap(self) {
+            Ok(engine) => engine,
+            Err(_) => panic!(
+                "wake_turbo: release_one_shot 要求最后一个 Engine 强引用；必须先 join 所有 query"
+            ),
+        };
+
+        let inputs = std::mem::take(
+            engine
+                .inputs
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let memo_shards = engine.memos.take_maps();
+        let recomputer_shards = engine.recomputers.take_maps();
+        let task_lock_shards = engine.task_locks.take_maps();
+
+        debug_assert_eq!(memo_shards.len(), SHARD_COUNT);
+        debug_assert_eq!(recomputer_shards.len(), SHARD_COUNT);
+        debug_assert_eq!(task_lock_shards.len(), SHARD_COUNT);
+
+        let mut stats = OneShotReleaseStats {
+            input_cells: inputs.len(),
+            memo_entries: memo_shards.iter().map(FxHashMap::len).sum(),
+            recomputer_entries: recomputer_shards.iter().map(FxHashMap::len).sum(),
+            task_locks: task_lock_shards.iter().map(FxHashMap::len).sum(),
+            drop_batches: 0,
+        };
+
+        // 输入按连续块分散到相同的 128 个析构批次；memo/lock 本身已经按 TaskId 均匀分片。
+        // 移动 InputCell 不克隆其 Arc 值，主线程只承担 O(n) 的轻量所有权转移。
+        let input_batch_capacity = inputs.len().div_ceil(SHARD_COUNT);
+        let mut inputs = inputs.into_iter();
+        let mut batches = memo_shards
+            .into_iter()
+            .zip(recomputer_shards)
+            .zip(task_lock_shards)
+            .map(|((memos, recomputers), task_locks)| OneShotDropBatch {
+                inputs: inputs.by_ref().take(input_batch_capacity).collect(),
+                memos,
+                recomputers,
+                task_locks,
+            })
+            .filter(|batch| !batch.is_empty())
+            .collect::<Vec<_>>();
+        debug_assert!(inputs.next().is_none());
+
+        // 此处 Engine 只剩空容器；在提交重析构任务前先结束它，避免返回路径再次串行遍历。
+        drop(engine);
+        stats.drop_batches = batches.len();
+        let jobs = batches
+            .drain(..)
+            .map(|batch| {
+                move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(batch)))
+            })
+            .collect::<Vec<_>>();
+        let results = executor.parallel(jobs);
+        if let Some(payload) = results.into_iter().find_map(Result::err) {
+            // A cached user value may implement a panicking Drop. Keep that panic from escaping a
+            // worker (which would otherwise lose the completion message and strand `parallel`),
+            // but preserve normal Rust propagation after every independent batch has completed.
+            std::panic::resume_unwind(payload);
+        }
+        stats
     }
 
     /// 「无增量纯并行」降级模式的引擎（DESIGN §6 降级预案）。等价 [`Engine::new`] 后
