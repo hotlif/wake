@@ -336,6 +336,70 @@ mod exact_relative_prefetch_tests {
     }
 
     #[test]
+    fn duplicate_exact_edges_share_one_normalized_candidate_load() {
+        let fs = Arc::new(CountingFileSystem::default());
+        fs.insert(
+            "src/index.js",
+            "import { value as first } from './dep.js';\
+             import { value as second } from './nested/../dep.js';\
+             export const total = first + second;",
+        );
+        fs.insert("src/dep.js", "export const value = 1;");
+        let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 2);
+        assert_eq!(fs.reads("src/dep.js"), 1);
+        assert_eq!(fs.file_probes("src/dep.js"), 0);
+        assert_eq!(bundler.load_exec_count(), 2);
+        assert_eq!(bundler.resolve_exec_count(), 2);
+    }
+
+    #[test]
+    fn diamond_and_back_edge_share_successful_exact_loads_across_bfs_layers() {
+        let mut baseline = None;
+        for workers in [1, 4] {
+            let fs = Arc::new(CountingFileSystem::default());
+            fs.insert(
+                "src/index.js",
+                "import { left } from './left.js';\
+                 import { right } from './right.js';\
+                 export const total = left + right;",
+            );
+            fs.insert(
+                "src/left.js",
+                "import { shared } from './shared.js'; export const left = shared + 1;",
+            );
+            fs.insert(
+                "src/right.js",
+                "import { shared } from './shared.js'; export const right = shared + 2;",
+            );
+            fs.insert(
+                "src/shared.js",
+                "import './index.js'; export const shared = 10;",
+            );
+            let mut bundler = IncrementalBundler::new_one_shot(fs.clone());
+            bundler.set_test_thread_count(workers);
+            let output = bundler.build(Path::new("src/index.js"));
+
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            assert_eq!(output.module_count, 4);
+            assert_eq!(fs.reads("src/index.js"), 1, "workers={workers}");
+            assert_eq!(fs.reads("src/left.js"), 1, "workers={workers}");
+            assert_eq!(fs.reads("src/right.js"), 1, "workers={workers}");
+            assert_eq!(fs.reads("src/shared.js"), 1, "workers={workers}");
+            assert_eq!(bundler.load_exec_count(), 4, "workers={workers}");
+            assert_eq!(bundler.resolve_exec_count(), 5, "workers={workers}");
+            if let Some(expected) = &baseline {
+                assert_eq!(&output.bundle, expected, "workers={workers}");
+            } else {
+                baseline = Some(output.bundle);
+            }
+        }
+    }
+
+    #[test]
     fn non_one_shot_and_load_cached_builds_keep_the_canonical_resolver_path() {
         let regular_fs = exact_fixture();
         let mut regular = IncrementalBundler::new(regular_fs.clone());
@@ -1593,9 +1657,24 @@ impl IncrementalBundler {
             jsx_dev: self.jsx.dev,
             jsx_import_source: self.jsx.import_source,
         });
+        // Persistent and generation load caches have their own source/stamp ownership. Fuse exact
+        // resolution with loading only when this process can consume the source exactly once and
+        // no later generation needs a resolver/cache record.
+        let prefetch_exact_relative =
+            self.one_shot && self.cache.is_none() && !self.load_cache_enabled;
 
         let mut module_to_id: FxHashMap<ModuleIdentity, u32> =
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
+        // A successful source read proves that this exact physical candidate is available for the
+        // remainder of the one-shot build. Keep the logical identity alongside the normalized path:
+        // package identities may intentionally collapse different install locations, while loader
+        // failures and their canonical fallback diagnostics remain physical-path specific.
+        let mut successfully_loaded_candidates: FxHashMap<PathBuf, ModuleIdentity> =
+            if prefetch_exact_relative {
+                FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default())
+            } else {
+                FxHashMap::default()
+            };
         let mut next_id: u32 = 0;
         let mut modules: FxHashMap<u32, ModuleRec> =
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
@@ -1764,6 +1843,11 @@ impl IncrementalBundler {
             for (id, path, loaded, stamp, cached_content_key) in loaded_results {
                 match loaded {
                     Ok(loaded) => {
+                        if prefetch_exact_relative {
+                            successfully_loaded_candidates
+                                .entry(path.clone())
+                                .or_insert_with(|| self.resolver.module_identity(&path));
+                        }
                         let src = loaded.source.as_str();
                         let st = loaded.source_type;
                         let module_assets = loaded.assets.clone();
@@ -2069,87 +2153,181 @@ impl IncrementalBundler {
             let resolved_flat: Vec<ResolveResult> = if resolve_reqs.is_empty() {
                 Vec::new()
             } else {
-                // Persistent and generation load caches have their own source/stamp ownership.
-                // Fuse exact resolution with loading only when this process can consume the
-                // source exactly once and no later generation needs a resolver/cache record.
-                let prefetch_exact_relative =
-                    self.one_shot && self.cache.is_none() && !self.load_cache_enabled;
                 let tr = timing.then(std::time::Instant::now);
                 let mut slots: Vec<Option<ResolveResult>> = std::iter::repeat_with(|| None)
                     .take(resolve_reqs.len())
                     .collect();
-                let indexed = resolve_reqs.into_iter().enumerate().collect::<Vec<_>>();
-                let jobs: Vec<_> = into_bounded_batches(indexed, io_batch_limit(&self.exec))
+                self.resolve_exec_count
+                    .fetch_add(resolve_reqs.len() as u64, Ordering::Relaxed);
+
+                struct IndexedResolveRequest {
+                    index: usize,
+                    specifier: String,
+                    from_dir: PathBuf,
+                    kind: DependencyKind,
+                }
+
+                enum ResolveWork {
+                    Normal(IndexedResolveRequest),
+                    Exact {
+                        candidate: PathBuf,
+                        requests: Vec<IndexedResolveRequest>,
+                    },
+                }
+
+                struct ResolveWorkOutput {
+                    results: Vec<(usize, ResolveResult)>,
+                    successful_exact: Option<ResolvedModule>,
+                }
+
+                let mut work = Vec::<ResolveWork>::new();
+                // A normalized physical path has one deterministic ModuleIdentity for this
+                // resolver lifetime. Indexing the first `(identity, path)` work item by path avoids
+                // repeating package-identity lookup for duplicate edges without merging distinct
+                // physical package installations that share one logical identity.
+                let mut exact_work_by_path: FxHashMap<PathBuf, usize> = FxHashMap::default();
+                for (index, (specifier, from_dir, kind)) in resolve_reqs.into_iter().enumerate() {
+                    if is_external_specifier(&specifier, self.platform, &self.external_packages) {
+                        slots[index] = Some(ResolveResult::External(specifier));
+                        continue;
+                    }
+
+                    let candidate = prefetch_exact_relative
+                        .then(|| exact_relative_file_candidate(&specifier, &from_dir))
+                        .flatten()
+                        // Node rejects browser resources immediately after resolve; do not
+                        // read/transform one merely to emit that same diagnostic.
+                        .filter(|path| {
+                            self.platform != BuildPlatform::Node || !is_node_browser_resource(path)
+                        });
+                    let request = IndexedResolveRequest {
+                        index,
+                        specifier,
+                        from_dir,
+                        kind,
+                    };
+                    let Some(candidate) = candidate else {
+                        work.push(ResolveWork::Normal(request));
+                        continue;
+                    };
+
+                    if let Some(identity) = successfully_loaded_candidates.get(&candidate) {
+                        // A prior BFS layer already consumed this exact file successfully. Its
+                        // graph identity is known, so reopening it cannot add source ownership.
+                        slots[index] = Some(ResolveResult::Internal {
+                            module: ResolvedModule {
+                                identity: identity.clone(),
+                                path: candidate,
+                            },
+                            prefetched: None,
+                        });
+                        continue;
+                    }
+
+                    if let Some(&work_index) = exact_work_by_path.get(&candidate) {
+                        match &mut work[work_index] {
+                            ResolveWork::Exact { requests, .. } => requests.push(request),
+                            ResolveWork::Normal(_) => {
+                                unreachable!("exact work index must be exact")
+                            }
+                        }
+                    } else {
+                        let work_index = work.len();
+                        exact_work_by_path.insert(candidate.clone(), work_index);
+                        work.push(ResolveWork::Exact {
+                            candidate,
+                            requests: vec![request],
+                        });
+                    }
+                }
+
+                let jobs: Vec<_> = into_bounded_batches(work, io_batch_limit(&self.exec))
                     .into_iter()
                     .map(|batch| {
                         let resolver = Arc::clone(&self.resolver);
-                        let resolve_exec_count = self.resolve_exec_count.clone();
                         let load_exec_count = self.load_exec_count.clone();
                         let fs = Arc::clone(&self.fs);
                         let load_opts = Arc::clone(&load_opts);
                         let platform = self.platform;
-                        let external_packages = Arc::clone(&self.external_packages);
                         move || {
                             batch
                                 .into_iter()
-                                .map(|(index, (specifier, from_dir, kind))| {
-                                    resolve_exec_count.fetch_add(1, Ordering::Relaxed);
-                                    let resolved = if is_external_specifier(
-                                        &specifier,
-                                        platform,
-                                        &external_packages,
-                                    ) {
-                                        ResolveResult::External(specifier)
-                                    } else {
-                                        let resolve_normally = || {
-                                            let profile = resolution_profile(platform, kind);
-                                            match resolver.resolve_module_with_profile(
-                                                &specifier, &from_dir, &profile,
-                                            ) {
-                                                Ok(module) => ResolveResult::Internal {
-                                                    module,
-                                                    prefetched: None,
-                                                },
-                                                Err(_) => ResolveResult::Error,
-                                            }
+                                .map(|work| {
+                                    let resolve_normally = |request: IndexedResolveRequest| {
+                                        let profile = resolution_profile(platform, request.kind);
+                                        let resolved = match resolver.resolve_module_with_profile(
+                                            &request.specifier,
+                                            &request.from_dir,
+                                            &profile,
+                                        ) {
+                                            Ok(module) => ResolveResult::Internal {
+                                                module,
+                                                prefetched: None,
+                                            },
+                                            Err(_) => ResolveResult::Error,
                                         };
-                                        let candidate = prefetch_exact_relative
-                                            .then(|| {
-                                                exact_relative_file_candidate(&specifier, &from_dir)
-                                            })
-                                            .flatten()
-                                            // Node rejects browser resources immediately after
-                                            // resolve; do not read/transform one merely to emit
-                                            // that same diagnostic.
-                                            .filter(|path| {
-                                                platform != BuildPlatform::Node
-                                                    || !is_node_browser_resource(path)
-                                            });
-                                        if let Some(candidate) = candidate {
+                                        (request.index, resolved)
+                                    };
+
+                                    match work {
+                                        ResolveWork::Normal(request) => ResolveWorkOutput {
+                                            results: vec![resolve_normally(request)],
+                                            successful_exact: None,
+                                        },
+                                        ResolveWork::Exact {
+                                            candidate,
+                                            requests,
+                                        } => {
                                             load_exec_count.fetch_add(1, Ordering::Relaxed);
                                             match load_source(
                                                 fs.as_ref(),
                                                 &candidate,
                                                 load_opts.as_ref(),
                                             ) {
-                                                Ok(loaded) => ResolveResult::Internal {
-                                                    module: ResolvedModule {
+                                                Ok(loaded) => {
+                                                    // Keep package ownership discovery parallel
+                                                    // with the successful physical read. The
+                                                    // driver only groups normalized paths; it
+                                                    // must not serialize filesystem-backed
+                                                    // identity work for every unique module.
+                                                    let module = ResolvedModule {
                                                         identity: resolver
                                                             .module_identity(&candidate),
                                                         path: candidate,
-                                                    },
-                                                    prefetched: Some(Arc::new(loaded)),
-                                                },
+                                                    };
+                                                    let loaded = Arc::new(loaded);
+                                                    let results = requests
+                                                        .into_iter()
+                                                        .map(|request| {
+                                                            (
+                                                                request.index,
+                                                                ResolveResult::Internal {
+                                                                    module: module.clone(),
+                                                                    prefetched: Some(Arc::clone(
+                                                                        &loaded,
+                                                                    )),
+                                                                },
+                                                            )
+                                                        })
+                                                        .collect();
+                                                    ResolveWorkOutput {
+                                                        results,
+                                                        successful_exact: Some(module),
+                                                    }
+                                                }
                                                 // A speculative failure proves nothing. The
                                                 // canonical resolver+loader path owns TS twins,
                                                 // directories and all user-visible diagnostics.
-                                                Err(_) => resolve_normally(),
+                                                Err(_) => ResolveWorkOutput {
+                                                    results: requests
+                                                        .into_iter()
+                                                        .map(resolve_normally)
+                                                        .collect(),
+                                                    successful_exact: None,
+                                                },
                                             }
-                                        } else {
-                                            resolve_normally()
                                         }
-                                    };
-                                    (index, resolved)
+                                    }
                                 })
                                 .collect::<Vec<_>>()
                         }
@@ -2157,8 +2335,13 @@ impl IncrementalBundler {
                     .collect();
 
                 for batch in self.exec.parallel(jobs) {
-                    for (index, resolved) in batch {
-                        slots[index] = Some(resolved);
+                    for output in batch {
+                        if let Some(module) = output.successful_exact {
+                            successfully_loaded_candidates.insert(module.path, module.identity);
+                        }
+                        for (index, resolved) in output.results {
+                            slots[index] = Some(resolved);
+                        }
                     }
                 }
                 let out = slots

@@ -184,8 +184,9 @@ Resolver 以两个互补缓存压缩 package-root 探测：`package_owners` 把�
 
 当且仅当 one-shot、未启用持久缓存且未启用跨 generation load cache 时，显式 `./`/`../` 且带非空扩展名
 的依赖可尝试 exact relative resolve+load 预取。External 先分类，Node browser-resource 禁止预读；候选
-读取成功后用同一 resolver 产生 module identity，并把已加载 owner 移交 scan。任何读取失败都不是解析
-结论，必须回到普通 resolver + loader，以保留 TypeScript twin、目录入口、alias、PnP 和规范诊断。
+按规范化物理路径在同层聚合，读取成功后用同一 resolver 产生 module identity、共享同一 loaded owner，
+并在后续 BFS 层复用该成功结果。不同物理安装路径即使逻辑 identity 相同也不合并；失败不进入成功表，
+必须逐请求回到普通 resolver + loader，以保留 TypeScript twin、目录入口、alias、PnP 和规范诊断。
 
 ## Removal plan
 
