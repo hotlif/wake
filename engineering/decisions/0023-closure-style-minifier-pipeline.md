@@ -88,6 +88,10 @@ parser runtime helpers、降低装饰器、重建分析并建立 typed module pl
 或未压缩源码。最终阶段复用与收敛 revision 一致的分析，执行安全属性/私有名改名、无捕获且作用域可复用的变量槽分配和
 确定性标识符改名；名字直接写回 owned name occurrences。
 
+Statement merging 对同一 statement list 先建立一次不可变快照和互不重叠的 run 计划，再按原有从左到右
+顺序提交 splice。禁止每成功合并一个短 run 就重新复制整张 list；该实现细节不改变 pass 顺序、变更计数或
+固定点证明，只把长列表的规划工作约束为线性。
+
 Bundled CommonJS 的严格 trivial-effect 证明是同一调度器内的零轮固定点结果，不是第二套 minifier。只有
 module planning 已完成、可信编辑无变化、无绑定/作用域/调用/动态查找/挂起语法，且残余只包含已在紧凑
 emitter normal form 中的全局副作用时，调度器才跳过 fixed-point、后续 semantic rebuild 和 mangle。任何

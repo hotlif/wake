@@ -873,40 +873,28 @@ fn merge_declaration_runs(
     list: ListId,
     changes: &mut ChangeTracker,
 ) -> Result<(), TypedIrError> {
-    let mut index = 0;
-    loop {
-        let items = program
-            .list(list)
-            .map(|list| list.items().to_vec())
-            .unwrap_or_default();
-        if index >= items.len() {
-            break;
-        }
-        let Some(kind) = variable_kind(program, items[index]) else {
-            index += 1;
-            continue;
-        };
-        if kind.is_using() {
-            index += 1;
-            continue;
-        }
-        let mut end = index + 1;
-        while end < items.len() && variable_kind(program, items[end]) == Some(kind) {
-            end += 1;
-        }
-        if end - index < 2 {
-            index = end;
-            continue;
-        }
+    let items = program
+        .list(list)
+        .map(|list| list.items().to_vec())
+        .unwrap_or_default();
+    let runs = mergeable_runs(&items, |statement| {
+        variable_kind(program, statement).filter(|kind| !kind.is_using())
+    });
+    let mut removed_before = 0;
+    for run in runs {
+        let index = run.start - removed_before;
+        let end = run.end - removed_before;
+        let kind = variable_kind(program, items[run.start])
+            .expect("run was classified as a variable declaration");
 
         let origin = rewrite_origin(
             program
-                .node(items[index])
-                .ok_or_else(|| missing_node(items[index]))?
+                .node(items[run.start])
+                .ok_or_else(|| missing_node(items[run.start]))?
                 .origin(),
         );
         let mut declarators = Vec::new();
-        for declaration in &items[index..end] {
+        for declaration in &items[run.clone()] {
             let IrNodeData::VariableDeclaration { declarations, .. } = program
                 .node(*declaration)
                 .ok_or_else(|| missing_node(*declaration))?
@@ -928,8 +916,9 @@ fn merge_declaration_runs(
             Ok(IrNodeData::VariableDeclaration { kind, declarations })
         })?;
         program.splice_list(list, index..end, &[merged])?;
-        changes.record(end - index - 1);
-        index += 1;
+        let removed = run.len() - 1;
+        changes.record(removed);
+        removed_before += removed;
     }
     Ok(())
 }
@@ -939,41 +928,28 @@ fn merge_expression_runs(
     list: ListId,
     changes: &mut ChangeTracker,
 ) -> Result<(), TypedIrError> {
-    let mut index = 0;
-    loop {
-        let items = program
-            .list(list)
-            .map(|list| list.items().to_vec())
-            .unwrap_or_default();
-        if index >= items.len() {
-            break;
-        }
-        if expression_statement(program, items[index]).is_none()
-            || statement_is_directive(program, items[index])
-        {
-            index += 1;
-            continue;
-        }
-        let mut end = index + 1;
-        while end < items.len()
-            && expression_statement(program, items[end]).is_some()
-            && !statement_is_directive(program, items[end])
-        {
-            end += 1;
-        }
-        if end - index < 2 {
-            index = end;
-            continue;
-        }
+    let items = program
+        .list(list)
+        .map(|list| list.items().to_vec())
+        .unwrap_or_default();
+    let runs = mergeable_runs(&items, |statement| {
+        (expression_statement(program, statement).is_some()
+            && !statement_is_directive(program, statement))
+        .then_some(())
+    });
+    let mut removed_before = 0;
+    for run in runs {
+        let index = run.start - removed_before;
+        let end = run.end - removed_before;
 
         let origin = rewrite_origin(
             program
-                .node(items[index])
-                .ok_or_else(|| missing_node(items[index]))?
+                .node(items[run.start])
+                .ok_or_else(|| missing_node(items[run.start]))?
                 .origin(),
         );
         let mut expressions = Vec::new();
-        for statement in &items[index..end] {
+        for statement in &items[run.clone()] {
             let expression = expression_statement(program, *statement)
                 .expect("run was classified as expression statements");
             append_flat_sequence_clones(program, expression, &mut expressions)?;
@@ -989,10 +965,41 @@ fn merge_expression_runs(
             })
         })?;
         program.splice_list(list, index..end, &[merged])?;
-        changes.record(end - index - 1);
-        index += 1;
+        let removed = run.len() - 1;
+        changes.record(removed);
+        removed_before += removed;
     }
     Ok(())
+}
+
+fn mergeable_runs<T, K>(
+    items: &[T],
+    mut classify: impl FnMut(T) -> Option<K>,
+) -> Vec<std::ops::Range<usize>>
+where
+    T: Copy,
+    K: Copy + Eq,
+{
+    // Plan against one immutable snapshot. Applying the non-overlapping runs from left to right
+    // preserves the old rewrite order while avoiding a full statement-list clone after every
+    // successful splice.
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        let Some(kind) = classify(items[index]) else {
+            index += 1;
+            continue;
+        };
+        let mut end = index + 1;
+        while end < items.len() && classify(items[end]) == Some(kind) {
+            end += 1;
+        }
+        if end - index >= 2 {
+            runs.push(index..end);
+        }
+        index = end;
+    }
+    runs
 }
 
 fn append_flat_sequence_clones(
@@ -1574,6 +1581,69 @@ const c = null ?? 3;
                     if program.list(*expressions).unwrap().items().len() == 2
             )
         }));
+    }
+
+    #[test]
+    fn long_statement_run_planning_has_linear_classification_work() {
+        const GROUPS: usize = 8_192;
+        let items = (0..GROUPS * 3).collect::<Vec<_>>();
+        let classifications = std::cell::Cell::new(0usize);
+
+        let runs = mergeable_runs(&items, |item| {
+            classifications.set(classifications.get() + 1);
+            match item % 3 {
+                0 | 1 => Some(item / 3),
+                _ => None,
+            }
+        });
+
+        assert_eq!(runs.len(), GROUPS);
+        assert_eq!(runs.first(), Some(&(0..2)));
+        assert_eq!(runs.last(), Some(&((GROUPS - 1) * 3..(GROUPS - 1) * 3 + 2)));
+        assert!(
+            classifications.get() <= items.len() * 2,
+            "each item may terminate one run and start the next, but work must remain linear"
+        );
+    }
+
+    #[test]
+    fn statement_merging_handles_many_short_runs_in_one_long_list() {
+        use std::fmt::Write as _;
+
+        const GROUPS: usize = 512;
+        let mut source = String::with_capacity(GROUPS * 96);
+        for index in 0..GROUPS {
+            write!(
+                source,
+                "let a{index}=left({index});let b{index}=right({index});first({index});second({index});const barrier{index}={index};"
+            )
+            .unwrap();
+        }
+
+        let mut program = lower(&source);
+        let changes = run_typed_pass(
+            &mut program,
+            TypedPassOptions::default(),
+            TypedPassKind::StatementMerging,
+        )
+        .unwrap();
+
+        assert_eq!(changes, GROUPS * 2);
+        assert_eq!(
+            count(&program, |node| matches!(
+                node,
+                IrNodeData::VariableDeclaration { .. }
+            )),
+            GROUPS * 2
+        );
+        assert_eq!(
+            count(&program, |node| matches!(
+                node,
+                IrNodeData::SequenceExpression { .. }
+            )),
+            GROUPS
+        );
+        program.validate().unwrap();
     }
 
     #[test]
