@@ -1457,29 +1457,51 @@ fn execute_bundle(
     options: BundleOptions,
     cancellation: &CancellationToken,
 ) -> Result<BundleResult, WakeError> {
-    let options = resolve_bundle_options(options)?;
-    cancellation.check()?;
+    let timing = std::env::var_os("WAKE_TIMING").is_some();
     let started = Instant::now();
+    let phase_started = Instant::now();
+    let options = resolve_bundle_options(options)?;
+    let resolve_options_elapsed = phase_started.elapsed();
+    cancellation.check()?;
+    let phase_started = Instant::now();
     let prepared = prepare_build(&BuildOptions {
         project: options.project.clone(),
         entry: options.entry.clone(),
         write: false,
         ..BuildOptions::default()
     })?;
+    let prepare_elapsed = phase_started.elapsed();
     let lifetime = if options.cache {
         BundlerLifetime::Session
     } else {
         BundlerLifetime::OneShot
     };
+    let phase_started = Instant::now();
     let mut bundler = create_bundle_bundler(&prepared, &options, lifetime)?;
+    let create_elapsed = phase_started.elapsed();
+    let phase_started = Instant::now();
     let output = bundler.build(&prepared.entry);
     cancellation.check()?;
-    finish_bundle(
+    let build_elapsed = phase_started.elapsed();
+    let phase_started = Instant::now();
+    let mut result = finish_bundle(
         &prepared,
         &options,
         output,
         started.elapsed().as_secs_f64() * 1000.0,
-    )
+    )?;
+    let finish_elapsed = phase_started.elapsed();
+    let phase_started = Instant::now();
+    drop(bundler);
+    let drop_elapsed = phase_started.elapsed();
+    let total_elapsed = started.elapsed();
+    result.duration_ms = total_elapsed.as_secs_f64() * 1000.0;
+    if timing {
+        eprintln!(
+            "[wake-app-timing] resolve-options={resolve_options_elapsed:.1?} prepare={prepare_elapsed:.1?} create={create_elapsed:.1?} build={build_elapsed:.1?} finish={finish_elapsed:.1?} drop={drop_elapsed:.1?} total={total_elapsed:.1?}",
+        );
+    }
+    Ok(result)
 }
 
 fn resolve_bundle_options(options: BundleOptions) -> Result<ResolvedBundleOptions, WakeError> {
