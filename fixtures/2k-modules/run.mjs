@@ -1,192 +1,317 @@
 #!/usr/bin/env node
-// 2k-modules · wake vs Vite vs webpack 构建对比（时间 + 内存峰值 + 产物大小）。
-//
-// 计量口径（关键）：**时间与内存分开测，各用各的干净口径**——
-//  - 时间：直接 spawn 构建进程计墙钟，**不套** memwrap.ps1。因为内存包装器是一层 PowerShell 进程 +
-//    轮询循环，会给每次构建叠加 PowerShell 启动、Start-Process 和轮询开销。
-//    这个常数会主导更快的构建器并系统性压低差距，与把 node 产物验证计入构建时间是同类计量陷阱。
-//  - 内存：用 memwrap.ps1 包装采样峰值 WorkingSet，其墙钟含 PowerShell 开销，**只取内存不取时间**。
-import { execSync, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Northstar 2k modules: Wake vs Vite vs webpack production bundle benchmark.
+// Timing and memory are separate: timed samples spawn builds directly; memory wrappers' time is ignored.
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { cpus, totalmem } from 'node:os';
+import { extname, join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:zlib';
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const psWrap = join(__dirname, 'memwrap.ps1');
+const fixtureDir = fileURLToPath(new URL('.', import.meta.url));
+const repositoryDir = join(fixtureDir, '..', '..');
+const inputEntry = join(fixtureDir, 'input', 'entry.js');
+const projectManifestPath = join(fixtureDir, 'expected', 'project.json');
+const expectedStdoutPath = join(fixtureDir, 'expected', 'checksum.txt');
+const memoryWrapper = join(fixtureDir, 'memwrap.ps1');
 const TIME_RUNS = 5;
-const MEM_RUNS = 2;
-const expected = readFileSync(join(__dirname, 'expected', 'checksum.txt'), 'utf8').trim();
+const MEMORY_RUNS = 2;
+const COMMAND_TIMEOUT_MS = 300_000;
+const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+const BROWSER_TARGETS = 'Chrome/Edge 120 · Firefox 121 · Safari/iOS 17.2';
 
-function formatMs(ms) { return `${ms.toFixed(0)}ms`; }
-function formatBytes(bytes) {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+function fail(message, detail = '') {
+  process.stderr.write(`  ❌ ${message}\n`);
+  if (detail) process.stderr.write(detail.endsWith('\n') ? detail : `${detail}\n`);
+  process.exit(1);
+}
+
+function run(executable, args, options = {}) {
+  const result = spawnSync(executable, args, {
+    cwd: fixtureDir,
+    encoding: Object.hasOwn(options, 'encoding') ? options.encoding : 'utf8',
+    maxBuffer: MAX_BUFFER_BYTES,
+    stdio: options.stdio ?? 'pipe',
+    timeout: options.timeout ?? COMMAND_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) {
+    const stdout = Buffer.isBuffer(result.stdout) ? result.stdout.toString() : (result.stdout || '');
+    const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString() : (result.stderr || '');
+    fail(
+      `${options.label || executable} failed${result.status == null ? '' : ` (exit ${result.status})`}`,
+      `${stdout}${stderr}${result.error ? `${result.error.message}\n` : ''}`,
+    );
+  }
+  return result;
+}
+
+function cleanOutput(outDir) {
+  rmSync(outDir, { recursive: true, force: true });
+}
+
+function walkFiles(directory) {
+  if (!existsSync(directory)) return [];
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) files.push(...walkFiles(path));
+    else if (entry.isFile()) files.push(path);
+  }
+  return files.sort((a, b) => a.localeCompare(b));
+}
+
+function assertSingleJavaScript(name, outDir) {
+  const files = walkFiles(outDir);
+  const maps = files.filter((path) => path.endsWith('.map'));
+  const scripts = files.filter((path) => extname(path) === '.js');
+  if (maps.length !== 0) {
+    fail(`${name} emitted source maps although the benchmark disables them`, maps.join('\n'));
+  }
+  if (scripts.length !== 1) {
+    const listing = files.length === 0
+      ? '(output directory is empty)'
+      : files.map((path) => relative(outDir, path)).join('\n');
+    fail(`${name} must emit exactly one JavaScript artifact; found ${scripts.length}`, listing);
+  }
+  return scripts[0];
+}
+
+function executeJavaScript(label, path) {
+  return run(process.execPath, [path], { label, encoding: null, timeout: 30_000 }).stdout;
+}
+
+function assertExactStdout(label, actual, oracle) {
+  if (Buffer.compare(actual, oracle) !== 0) {
+    fail(
+      `${label} stdout differs from the source oracle`,
+      `expected (${oracle.length} bytes): ${JSON.stringify(oracle.toString())}\nactual (${actual.length} bytes): ${JSON.stringify(actual.toString())}`,
+    );
+  }
+}
+
+function verifyBuiltArtifact(tool, oracle) {
+  const script = assertSingleJavaScript(tool.name, tool.outDir);
+  assertExactStdout(`${tool.name} bundle`, executeJavaScript(`${tool.name} bundle`, script), oracle);
+  return script;
+}
+
+function build(tool) {
+  return run(tool.executable, tool.args, { label: `${tool.name} build` });
+}
+
+function timedBuild(tool, oracle) {
+  cleanOutput(tool.outDir);
+  const started = performance.now();
+  build(tool);
+  const elapsed = performance.now() - started;
+  verifyBuiltArtifact(tool, oracle);
+  return elapsed;
+}
+
+function windowsMemoryBuild(tool) {
+  const result = run('powershell', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', memoryWrapper,
+    tool.executable, ...tool.args,
+  ], { label: `${tool.name} memory sample` });
+  const match = result.stdout.match(/__PEAK_MB__:(\d+(?:\.\d+)?)/);
+  if (!match) fail(`${tool.name} memory wrapper did not report peak WorkingSet`, result.stdout);
+  return Number(match[1]);
+}
+
+function linuxMemoryBuild(tool) {
+  if (!existsSync('/usr/bin/time')) return null;
+  const result = run('/usr/bin/time', ['-v', tool.executable, ...tool.args], {
+    label: `${tool.name} memory sample`,
+  });
+  const match = result.stderr.match(/Maximum resident set size \(kbytes\):\s*(\d+)/);
+  if (!match) fail(`${tool.name} GNU time did not report maximum resident set size`, result.stderr);
+  return Number(match[1]) / 1024;
+}
+
+function macMemoryBuild(tool) {
+  if (!existsSync('/usr/bin/time')) return null;
+  const result = run('/usr/bin/time', ['-l', tool.executable, ...tool.args], {
+    label: `${tool.name} memory sample`,
+  });
+  const match = result.stderr.match(/^\s*(\d+)\s+maximum resident set size$/m);
+  if (!match) fail(`${tool.name} BSD time did not report maximum resident set size`, result.stderr);
+  return Number(match[1]) / (1024 * 1024);
+}
+
+function memoryBuild(tool, oracle) {
+  cleanOutput(tool.outDir);
+  let peakMb = null;
+  if (process.platform === 'win32') peakMb = windowsMemoryBuild(tool);
+  else if (process.platform === 'linux') peakMb = linuxMemoryBuild(tool);
+  else if (process.platform === 'darwin') peakMb = macMemoryBuild(tool);
+  if (peakMb == null) build(tool);
+  verifyBuiltArtifact(tool, oracle);
+  return peakMb;
 }
 
 function artifactStats(path) {
   const bytes = readFileSync(path);
-  const source = bytes.toString('utf8');
-  const count = (text) => source.split(text).length - 1;
   return {
     raw: bytes.length,
-    gzip: gzipSync(bytes, { level: 9 }).length,
+    gzip: gzipSync(bytes, { level: 9, mtime: 0 }).length,
     brotli: brotliCompressSync(bytes, {
-      params: {
-        [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
-      },
+      params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 },
     }).length,
-    wrappers: [...source.matchAll(/(?:^|[,;{])\d+:function\(/g)].length,
-    requires: count('__wake_require__'),
   };
 }
 
-// 纯构建墙钟（不套内存包装器）。
-function timeBuild(name, exe, args) {
-  const start = performance.now();
-  const r = spawnSync(exe, args, { cwd: __dirname, stdio: 'pipe', timeout: 300_000 });
-  const elapsed = performance.now() - start;
-  if (r.status !== 0) {
-    process.stderr.write((r.stdout?.toString() || '') + (r.stderr?.toString() || ''));
-    process.stderr.write(`  ❌ ${name} 构建失败: ${exe}\n`);
-    process.exit(1);
-  }
-  return elapsed;
+function mean(values) {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-// 峰值内存（memwrap.ps1 包装采样；只取内存，其墙钟含 PowerShell 开销故丢弃）。
-function memBuild(name, exe, args) {
-  const r = spawnSync('powershell', [
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psWrap, exe, ...args,
-  ], { cwd: __dirname, timeout: 300_000 });
-  if (r.status !== 0) {
-    process.stderr.write((r.stdout?.toString() || '') + (r.stderr?.toString() || ''));
-    process.stderr.write(`  ❌ ${name} 内存采样失败\n`);
-    process.exit(1);
-  }
-  const m = (r.stdout?.toString() || '').match(/__PEAK_MB__:(\d+)/);
-  if (!m) {
-    process.stderr.write(`  ❌ ${name} 内存采样未返回峰值\n`);
-    process.exit(1);
-  }
-  return parseInt(m[1]);
-}
-
-function verifyBundle(bundlePath) {
-  try {
-    const out = execSync(`node "${bundlePath}"`, { cwd: __dirname, stdio: 'pipe', timeout: 30_000 });
-    if (!out.toString().trim().includes(expected)) {
-      process.stderr.write(`  ❌ 输出不匹配! 期望: ${expected}\n`);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    process.stderr.write(`  ❌ 运行 bundle 失败: ${e.message}\n`);
-    return false;
-  }
-}
-
-function measure(name, exe, args, bundlePath) {
-  // warmup + 正确性验证
-  timeBuild(name, exe, args);
-  if (!verifyBundle(bundlePath)) process.exit(1);
-
-  // 时间（不套包装）
+function measure(tool, oracle) {
+  timedBuild(tool, oracle); // warmup
   const times = [];
-  for (let i = 0; i < TIME_RUNS; i++) {
-    times.push(timeBuild(name, exe, args));
-    process.stdout.write(`    time ${i + 1}/${TIME_RUNS}: ${formatMs(times.at(-1))}\n`);
+  for (let index = 0; index < TIME_RUNS; index++) {
+    times.push(timedBuild(tool, oracle));
+    process.stdout.write(`    time ${index + 1}/${TIME_RUNS}: ${formatMs(times.at(-1))}\n`);
   }
-  // 内存（套包装采样峰值）
-  const mems = [];
-  for (let i = 0; i < MEM_RUNS; i++) {
-    mems.push(memBuild(name, exe, args));
-    process.stdout.write(`    mem  ${i + 1}/${MEM_RUNS}: peak=${mems.at(-1)}MB\n`);
+
+  const memory = [];
+  for (let index = 0; index < MEMORY_RUNS; index++) {
+    const peak = memoryBuild(tool, oracle);
+    if (peak == null) break;
+    memory.push(peak);
+    process.stdout.write(`    mem  ${index + 1}/${MEMORY_RUNS}: peak=${formatMb(peak)}\n`);
   }
-  const avg = times.reduce((a, b) => a + b, 0) / times.length;
-  return { avg, min: Math.min(...times), max: Math.max(...times), avgMem: Math.round(mems.reduce((a, b) => a + b, 0) / mems.length) };
+
+  const script = assertSingleJavaScript(tool.name, tool.outDir);
+  return {
+    timing: { average: mean(times), min: Math.min(...times), max: Math.max(...times) },
+    averageMemoryMb: memory.length === 0 ? null : mean(memory),
+    artifact: artifactStats(script),
+  };
 }
 
-// ---- 1. generate ----
-const inputDir = join(__dirname, 'input');
-if (!existsSync(join(inputDir, 'src'))) {
-  console.log('[1/5] Generating synthetic modules...');
-  execSync('node generate.mjs', { cwd: __dirname, stdio: 'pipe', timeout: 120_000 });
-} else {
-  console.log('[1/5] Input modules already generated, skipping.');
+function readProjectManifest() {
+  let project;
+  try {
+    project = JSON.parse(readFileSync(projectManifestPath, 'utf8'));
+  } catch (error) {
+    fail(`cannot read generated project manifest ${projectManifestPath}`, error.message);
+  }
+  const valid = project?.schemaVersion === 1
+    && typeof project.project === 'string'
+    && Number.isInteger(project.modules?.total)
+    && project.modules.total > 0
+    && project.modules.categories
+    && Number.isInteger(project.source?.files)
+    && Number.isInteger(project.source?.bytes)
+    && Number.isInteger(project.source?.lines);
+  if (!valid) fail('expected/project.json does not match schemaVersion 1');
+  return project;
 }
 
-// ---- 2. tool paths ----
-const wakeBin = join(__dirname, '..', '..', 'target', 'release', 'wake.exe');
-const wakeOut = join(__dirname, 'dist-wake');
-const wakeBundle = join(wakeOut, 'bundle.js');
-const entry = join(__dirname, 'input', 'entry.js');
-const nodeExe = process.execPath;
-const viteEntry = join(__dirname, 'node_modules', 'vite', 'bin', 'vite.js');
-const viteCfg = join(__dirname, 'vite.config.mjs');
-const viteOut = join(__dirname, 'dist-vite');
-const viteBundle = join(viteOut, 'bundle.js');
-const wpEntry = join(__dirname, 'node_modules', 'webpack-cli', 'bin', 'cli.js');
-const webpackCfg = join(__dirname, 'webpack.config.mjs');
-const webpackOut = join(__dirname, 'dist-webpack');
-const webpackBundle = join(webpackOut, 'bundle.js');
+function formatMs(value) { return `${value.toFixed(0)}ms`; }
+function formatMb(value) { return `${value.toFixed(1)}MB`; }
+function formatBytes(value) {
+  if (value < 1024) return `${value}B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`;
+  return `${(value / (1024 * 1024)).toFixed(2)}MB`;
+}
 
-// ---- 3. wake ----
-console.log('[2/5] Building with wake...');
-const wakeStats = measure('wake', wakeBin, ['build', entry, '--outdir', wakeOut], wakeBundle);
-const wakeArtifact = artifactStats(wakeBundle);
+const wakeExecutable = join(
+  repositoryDir, 'target', 'release', process.platform === 'win32' ? 'wake.exe' : 'wake',
+);
+const viteExecutable = join(fixtureDir, 'node_modules', 'vite', 'bin', 'vite.js');
+const webpackExecutable = join(fixtureDir, 'node_modules', 'webpack-cli', 'bin', 'cli.js');
+for (const [name, path] of [
+  ['Wake release binary', wakeExecutable],
+  ['Vite CLI', viteExecutable],
+  ['webpack CLI', webpackExecutable],
+]) {
+  if (!existsSync(path)) fail(`${name} not found at ${path}`);
+}
 
-// ---- 4. Vite ----
-console.log('[3/5] Building with Vite...');
-const viteStats = measure('Vite', nodeExe, [viteEntry, 'build', '--config', viteCfg], viteBundle);
-const viteArtifact = artifactStats(viteBundle);
+console.log('[1/6] Regenerating deterministic Northstar sources...');
+run(process.execPath, [join(fixtureDir, 'generate.mjs')], {
+  label: 'Northstar generator', stdio: 'inherit', timeout: 120_000,
+});
+console.log('[2/6] Verifying project graph and source manifest...');
+run(process.execPath, [join(fixtureDir, 'verify-project.mjs')], {
+  label: 'Northstar project verifier', stdio: 'inherit', timeout: 120_000,
+});
 
-// ---- 5. webpack ----
-console.log('[4/5] Building with webpack...');
-const wpStats = measure('webpack', nodeExe, [wpEntry, '--config', webpackCfg], webpackBundle);
-const wpArtifact = artifactStats(webpackBundle);
+const project = readProjectManifest();
+const expectedStdout = readFileSync(expectedStdoutPath);
+const sourceStdout = executeJavaScript('Northstar source oracle', inputEntry);
+assertExactStdout('Northstar source', sourceStdout, expectedStdout);
 
-// ---- 6. results ----
-console.log('[5/5] Results');
-const results = [
-  { name: 'wake', stats: wakeStats, artifact: wakeArtifact },
-  { name: 'Vite', stats: viteStats, artifact: viteArtifact },
-  { name: 'webpack', stats: wpStats, artifact: wpArtifact },
+const tools = [
+  {
+    name: 'wake',
+    executable: wakeExecutable,
+    args: [
+      'bundle', inputEntry,
+      '--outfile', join(fixtureDir, 'dist-wake', 'bundle.js'),
+      '--platform', 'browser', '--format', 'iife', '--minify',
+      '--config', join(fixtureDir, 'wake.config.toml'),
+    ],
+    outDir: join(fixtureDir, 'dist-wake'),
+  },
+  {
+    name: 'Vite',
+    executable: process.execPath,
+    args: [viteExecutable, 'build', '--config', join(fixtureDir, 'vite.config.mjs')],
+    outDir: join(fixtureDir, 'dist-vite'),
+  },
+  {
+    name: 'webpack',
+    executable: process.execPath,
+    args: [webpackExecutable, '--config', join(fixtureDir, 'webpack.config.mjs')],
+    outDir: join(fixtureDir, 'dist-webpack'),
+  },
 ];
-const maxTime = Math.max(...results.map(({ stats }) => stats.avg));
-const maxMem = Math.max(...results.map(({ stats }) => stats.avgMem));
-const BAR = 20;
-const bar = (v, mx) => '█'.repeat(Math.max(1, Math.round((v / mx) * BAR))) + '░'.repeat(BAR - Math.max(1, Math.round((v / mx) * BAR)));
-const comparison = (candidate, baseline) => {
-  const ratio = candidate / baseline;
-  if (ratio >= 1) return `wake 快 ${ratio.toFixed(1)}×`;
-  return `wake 慢 ${(1 / ratio).toFixed(1)}×`;
-};
-const memoryComparison = (candidate, baseline) => {
-  const percent = Math.round(Math.abs(1 - baseline / candidate) * 100);
-  return candidate >= baseline ? `wake 少 ${percent}%` : `wake 多 ${percent}%`;
-};
 
-console.log(`\n${'─'.repeat(56)}`);
-console.log('  2k-modules · wake vs Vite vs webpack 构建对比');
-console.log('  真实业务项目风格 (2013 模块, ~2000 文件)');
-console.log('  时间=纯构建墙钟(不套内存包装器) · 内存=memwrap 采样峰值');
-console.log(`${'─'.repeat(56)}`);
-console.log(`\n  构建时间 (avg, 越小越好)`);
-for (const { name, stats } of results) {
-  const note = name === 'wake' ? '基准' : comparison(stats.avg, wakeStats.avg);
-  console.log(`    ${name.padEnd(8)} ${formatMs(stats.avg).padStart(7)}  ${bar(stats.avg, maxTime)}  ${note}`);
+const measured = [];
+for (const [index, tool] of tools.entries()) {
+  console.log(`[${index + 3}/6] Building with ${tool.name}...`);
+  measured.push({ name: tool.name, ...measure(tool, sourceStdout) });
 }
-console.log(`\n  内存峰值 (avg, 越小越好)`);
-for (const { name, stats } of results) {
-  const note = name === 'wake' ? '基准' : memoryComparison(stats.avgMem, wakeStats.avgMem);
-  console.log(`    ${name.padEnd(8)} ${`${stats.avgMem}MB`.padStart(7)}  ${bar(stats.avgMem, maxMem)}  ${note}`);
+
+console.log('[6/6] Results');
+const categories = Object.entries(project.modules.categories)
+  .map(([name, count]) => `${name}=${count}`)
+  .join(', ');
+console.log(`\n${'─'.repeat(72)}`);
+console.log(`  ${project.project} · Wake vs Vite vs webpack`);
+console.log(`  application modules=${project.modules.total} + entry wrapper · bundler inputs=${project.graph.bundlerModules}`);
+console.log(`  categories: ${categories}`);
+console.log(`  source=${project.source.files} files / ${formatBytes(project.source.bytes)} / ${project.source.lines} lines`);
+console.log(`  environment=${process.platform}-${process.arch} · Node ${process.version} · ${cpus()[0]?.model || 'unknown CPU'} · ${formatBytes(totalmem())} RAM`);
+console.log(`  targets=${BROWSER_TARGETS}`);
+console.log('  production minify · no source maps · no persistent cache · one JS artifact');
+console.log(`${'─'.repeat(72)}`);
+
+console.log('\n  Build time (average; min–max)');
+for (const result of measured) {
+  const { average, min, max } = result.timing;
+  console.log(`    ${result.name.padEnd(8)} ${formatMs(average).padStart(7)}  (${formatMs(min)}–${formatMs(max)})`);
 }
-console.log(`\n  产物大小 (raw / gzip -9 / brotli 11)`);
-for (const { name, artifact } of results) {
-  console.log(`    ${name.padEnd(8)} ${formatBytes(artifact.raw).padStart(8)} / ${formatBytes(artifact.gzip).padStart(8)} / ${formatBytes(artifact.brotli).padStart(8)}`);
+console.log('\n  Peak resident memory (average)');
+for (const result of measured) {
+  const memory = result.averageMemoryMb == null ? 'unavailable' : formatMb(result.averageMemoryMb);
+  console.log(`    ${result.name.padEnd(8)} ${memory.padStart(11)}`);
 }
-console.log(`  结构统计  wake wrappers=${wakeArtifact.wrappers} require-token=${wakeArtifact.requires}`);
-console.log(`${'─'.repeat(56)}\n`);
+console.log('\n  Final JavaScript size (raw / gzip-9 / brotli-11)');
+for (const result of measured) {
+  const { raw, gzip, brotli } = result.artifact;
+  console.log(`    ${result.name.padEnd(8)} ${formatBytes(raw).padStart(8)} / ${formatBytes(gzip).padStart(8)} / ${formatBytes(brotli).padStart(8)}  [${raw} / ${gzip} / ${brotli} B]`);
+}
+const wake = measured[0];
+console.log('\n  Relative to Wake');
+for (const result of measured.slice(1)) {
+  const timeRatio = result.timing.average / wake.timing.average;
+  const memoryRatio = wake.averageMemoryMb == null || result.averageMemoryMb == null
+    ? 'memory unavailable'
+    : `memory ${(result.averageMemoryMb / wake.averageMemoryMb).toFixed(2)}×`;
+  console.log(`    ${result.name.padEnd(8)} time ${timeRatio.toFixed(2)}× · ${memoryRatio}`);
+}
+console.log(`${'─'.repeat(72)}\n`);

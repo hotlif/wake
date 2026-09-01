@@ -7,9 +7,10 @@ const fixtureDir = fileURLToPath(new URL('.', import.meta.url));
 export default defineConfig({
   logLevel: 'error',
   build: {
-    target: 'esnext',
+    target: ['chrome120', 'edge120', 'firefox121', 'safari17.2', 'ios17.2'],
     outDir: resolve(fixtureDir, 'dist-vite'),
-    emptyOutDir: true,
+    // The benchmark runner removes this directory before it starts the timer.
+    emptyOutDir: false,
     sourcemap: false,
     minify: true,
     reportCompressedSize: false,
@@ -18,7 +19,7 @@ export default defineConfig({
       input: resolve(fixtureDir, 'input', 'entry.js'),
       output: {
         entryFileNames: 'bundle.js',
-        format: 'es',
+        format: 'iife',
         codeSplitting: false,
       },
     },

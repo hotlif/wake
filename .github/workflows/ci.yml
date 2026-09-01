@@ -398,6 +398,14 @@ jobs:
       - run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       # Shared runners are too noisy for a millisecond SLA. Gate deterministic avoided-work counts,
       # then compile Criterion benches so measurement surfaces cannot silently rot.
+      - run: corepack yarn fixture:2k:check
+      - name: Verify generated 2k fixture snapshots are current
+        run: >-
+          git diff --exit-code --
+          fixtures/2k-modules/input/entry.js
+          fixtures/2k-modules/input/package.json
+          fixtures/2k-modules/expected/checksum.txt
+          fixtures/2k-modules/expected/project.json
       - run: cargo test --locked --offline -p wake_bundler --test performance_invariants --release
         env:
           CARGO_NET_OFFLINE: "true"

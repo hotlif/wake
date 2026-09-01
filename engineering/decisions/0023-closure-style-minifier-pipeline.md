@@ -270,8 +270,8 @@ One-shot 省略的只是没有下一 generation 消费者的进程内元数据�
 release binary、机器、电源状态和后台负载；Wake 与 Vite 都启用生产 minify、关闭 Source Map，并使用
 runner 中冻结的各自产物格式/chunk 配置，Wake 不传 `--cache`。每个计时样本由直接 spawn 的新进程执行，
 因此不存在前一 generation 的内存 session；先 warmup 并运行 bundle 校验
-`modules=2013 hash=2876300985`，再记录 5 个纯构建墙钟
-原始样本及 avg/min/max。峰值内存另用 `memwrap.ps1` 运行 2 次，只报告 WorkingSet，不把 PowerShell 启动
+Northstar committed stdout oracle，再记录 5 个纯构建墙钟原始样本及 avg/min/max。峰值内存另用
+`memwrap.ps1` 运行 2 次，只报告 WorkingSet，不把 PowerShell 启动
 与轮询时间混入构建时间。产物同时记录 raw/gzip/brotli 和结构统计。
 
 “无缓存”在此仅表示没有持久缓存命中和前代 session 复用；one-shot engine 在单次构建内部的 typed value

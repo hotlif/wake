@@ -16,6 +16,7 @@
     "docs:dev": "cargo run -q -p wake_cli -- docs dev .",
     "docs:build": "cargo run -q -p wake_cli -- docs build .",
     "docs:check": "node scripts/check-docs.mjs",
+    "fixture:2k:check": "node fixtures/2k-modules/verify-project.mjs",
     "native:build": "cargo build -p wake_test_host -p wake_cli --release --locked --offline && yarn exec napi build --platform --release --strip --cwd crates/wake_node --output-dir ../../npm/wake --package-json-path ../../npm/wake/package.json --no-js --dts native.d.ts -- --locked --offline && node scripts/stage-test-host.mjs",
     "npm:test": "yarn npm:test:wake && yarn npm:test:css",
     "npm:test:wake": "wake test npm/wake/test/cli.test.mjs npm/wake/test/components-state.test.mjs npm/wake/test/console.test.mjs npm/wake/test/terminal.test.mjs && yarn npm:test:wake:addon",

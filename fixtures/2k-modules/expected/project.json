@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "project": "northstar-commerce-console",
+  "modules": {
+    "target": 2000,
+    "total": 2000,
+    "categories": {
+      "api": 240,
+      "api-group": 8,
+      "api-index": 1,
+      "components": 352,
+      "components-group": 11,
+      "components-index": 1,
+      "core": 16,
+      "locales": 240,
+      "locales-group": 8,
+      "locales-index": 1,
+      "metrics": 320,
+      "metrics-group": 10,
+      "metrics-index": 1,
+      "models": 320,
+      "models-group": 10,
+      "models-index": 1,
+      "pages": 80,
+      "pages-group": 4,
+      "pages-index": 1,
+      "root": 2,
+      "rules": 360,
+      "rules-group": 12,
+      "rules-index": 1
+    }
+  },
+  "graph": {
+    "entry": "application.js",
+    "reachable": 2000,
+    "bundlerModules": 2001,
+    "staticEdges": 5072,
+    "boundedContexts": 12,
+    "privateCrossDomainEdges": 0,
+    "importAllModules": 0,
+    "globalRegistrations": 0
+  },
+  "source": {
+    "files": 2000,
+    "bytes": 1556255,
+    "lines": 24569,
+    "treeHash": "6ef55f8f99061c5f427c4200af083426a4c9dd6b400855d64f8457457ba2fe3e"
+  },
+  "oracle": {
+    "project": "northstar-commerce-console",
+    "version": "2026.8",
+    "moduleCount": 2000,
+    "counts": {
+      "core": 16,
+      "api": 240,
+      "models": 320,
+      "rules": 360,
+      "metrics": 320,
+      "components": 352,
+      "locales": 240,
+      "pages": 80,
+      "aggregates": 70,
+      "roots": 2
+    },
+    "tenant": "northstar-eu",
+    "role": "operator",
+    "requests": {
+      "allowed": 192,
+      "denied": 48,
+      "first": "identity-get-001",
+      "digest": "7e3f92db",
+      "catalogDigest": "22c9f349"
+    },
+    "records": {
+      "total": 320,
+      "valid": 320,
+      "domains": {
+        "adm": 26,
+        "ana": 26,
+        "bil": 27,
+        "cat": 27,
+        "cus": 26,
+        "ful": 27,
+        "ide": 27,
+        "inv": 27,
+        "ord": 27,
+        "org": 27,
+        "pri": 27,
+        "sup": 26
+      },
+      "digest": "741ee97e"
+    },
+    "policies": {
+      "passed": 167,
+      "failed": 193,
+      "probe": true,
+      "digest": "b8ecdec3"
+    },
+    "analytics": {
+      "metrics": 320,
+      "aggregate": 49139090,
+      "digest": "efb04283"
+    },
+    "interface": {
+      "components": 352,
+      "pages": 54,
+      "routes": 54,
+      "matched": "page-026",
+      "nodes": 297,
+      "textHash": "ed1e31b8",
+      "componentDigest": "40325c5a",
+      "pageDigest": "ffa161cf",
+      "pageCatalogDigest": "10bebbcd"
+    },
+    "localization": {
+      "packs": 240,
+      "characters": 11020,
+      "digest": "9b8902f1"
+    },
+    "invoice": {
+      "id": "invoice-00001",
+      "subtotalMinor": 9524,
+      "discountMinor": 476,
+      "taxMinor": 746,
+      "totalMinor": 9794,
+      "status": "issued",
+      "issuedAt": "2026-08-31T09:30:04.000Z"
+    },
+    "fulfillment": {
+      "reservedUnits": 70,
+      "inventoryBefore": 5000,
+      "inventoryAfter": 4930,
+      "state": "fulfilled",
+      "workflow": [
+        "authenticated",
+        "quoted",
+        "inventory-reserved",
+        "invoiced",
+        "fulfilled"
+      ],
+      "rejectedTransition": "INVALID_TRANSITION",
+      "rejectedReservation": "INSUFFICIENT_INVENTORY",
+      "digest": "16ac86f5"
+    },
+    "state": {
+      "version": 2,
+      "processed": 320,
+      "alerts": 193,
+      "observedChanges": [
+        320,
+        320
+      ]
+    },
+    "telemetry": {
+      "events": 6,
+      "first": "workflow.authenticated"
+    },
+    "labelHash": "a9c6767a",
+    "validation": true,
+    "integrity": "d6d15e70"
+  }
+}

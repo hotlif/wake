@@ -1,7 +1,10 @@
 {
+  "private": true,
   "scripts": {
     "generate": "node generate.mjs",
-    "build:wake": "cargo run -r -p wake_cli -- build input/entry.js --outdir dist-wake",
+    "generate:update": "node generate.mjs --update-oracle",
+    "verify": "node verify-project.mjs",
+    "build:wake": "cargo run -r -p wake_cli -- bundle input/entry.js --outfile dist-wake/bundle.js --platform browser --format iife --minify --config wake.config.toml",
     "build:vite": "vite build --config vite.config.mjs",
     "build:webpack": "webpack --config webpack.config.mjs",
     "compare": "node run.mjs",
@@ -9,6 +12,7 @@
   },
   "devDependencies": {
     "vite": "^8.2.2",
+    "webpack": "^5.109.0",
     "webpack-cli": "^7.2.1"
   }
 }

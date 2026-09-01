@@ -1,5 +1,6 @@
 {
-  "type": "module",
+  "name": "northstar-commerce-console-fixture",
   "private": true,
-  "sideEffects": true
+  "type": "module",
+  "sideEffects": false
 }

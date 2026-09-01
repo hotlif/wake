@@ -33,20 +33,33 @@ fixtures/
 | `react-docs` | React 19+ 组件文档 | Wake 原生 MDX、Demo、Props API 与主题运行时 |
 | `react-docs-workspaces` | Docs 聚合站 | 一个主站 + 两个隔离工作台，覆盖 embedded/standalone 与 lazy/eager |
 | `react-components-yarn-pnp` | Yarn PnP Components | 隔离安装下的组件工作台、包产物与样式聚合验证 |
-| `2k-modules` | 合成压力测试 | 2000 模块二叉树 + 共享 util，用于跨工具性能对比 |
+| `2k-modules` | Northstar 业务压力项目 | 约 2000 个自然可达的商务控制台模块，用于 Wake、Vite、webpack 的无缓存生产构建对比 |
 
 ### `2k-modules` — 使用方式
 
 ```bash
-# 一键全自动：生成 + 构建(wake + webpack) + 计时对比
-cd fixtures/2k-modules && npm run bench
+# 首次准备：安装锁定依赖并构建本轮 Wake release 二进制
+cargo build --release -p wake_cli
+cd fixtures/2k-modules
+npm ci
+
+# 一键执行：强制重新生成、校验项目，再构建 Wake + Vite + webpack
+npm run bench
 
 # 分步执行
-cd fixtures/2k-modules && npm run generate    # 生成 2000 个合成模块
-npm run build:wake                            # wake 构建
-npm run build:webpack                         # webpack 构建（需已安装）
-npm run compare                               # 仅计时对比（不重新生成）
+npm run generate
+npm run generate:update    # 仅在审阅后显式更新 committed oracle
+npm run verify
+npm run build:wake
+npm run build:vite
+npm run build:webpack
+
+# compare 是同一严格 runner 的别名，也会重新生成和校验输入
+npm run compare
 
 # Criterion 基准（内存 FS，无需磁盘 IO）
 cd ../.. && cargo bench -p wake_bundler --bench bundle -- "bundle_2k"
 ```
+
+完整的数据集、正确性 oracle、单 bundle 公平性约束和测量口径见
+[`2k-modules/README.md`](2k-modules/README.md)。

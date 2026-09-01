@@ -62,16 +62,34 @@ cargo bench -p wake_bundler --bench bundle
 
 # 3. 2k modules 压力样例
 
-`fixtures/2k-modules` 生成约 2000 个模块的二叉依赖树和共享工具模块，用于观察完整磁盘 I/O、解析、链接、emit 与进程启动：
+`fixtures/2k-modules` 生成确定性的 Northstar 商务控制台项目。约 2000 个模块通过领域模型、规则、
+指标、组件、本地化和页面聚合形成自然可达的静态依赖图，用于观察完整磁盘 I/O、解析、链接、
+tree shaking、minify、emit 与进程启动：
 
 ```bash
+cargo build --release -p wake_cli
 cd fixtures/2k-modules
-npm install
-npm run generate
+npm ci
 npm run bench
 ```
 
-`npm run bench` 和 `npm run compare` 共用同一 runner，对 Wake、Vite 和 webpack 执行正确性校验、纯构建墙钟、峰值内存和产物大小比较。跨工具比较必须确认各方使用相同模式、source map、minify、缓存和输出清理策略；否则只能作为探索数据。
+`npm run bench` 和 `npm run compare` 共用同一严格 runner。每次测量前都强制执行生成器和
+`verify-project.mjs`，从 `expected/project.json` 读取模块数、类别和源码规模，并先执行源码得到精确
+stdout oracle。Wake、Vite 和 webpack 都面向 Chrome/Edge 120、Firefox 121、Safari/iOS 17.2，使用
+browser IIFE、生产 minify、无 Source Map、无持久缓存的单 JavaScript 产物；每个样本在计时开始前删除
+自己的输出目录，并关闭工具自身的重复清理。构建结束后要求唯一 `.js` 产物的 stdout 与源码逐字节相同；
+任何额外 JavaScript chunk 或 `.map` 都直接失败。
+
+普通 `generate`、`verify` 和 benchmark 只允许匹配 committed oracle，不得自动改写它；只有审阅业务、
+图摘要和全类别 digest 的变化后，才使用 `npm run generate:update` 显式更新 `expected/`。
+
+时间与内存分开测量：一轮预热后记录 5 个直接子进程墙钟样本；峰值常驻内存另测 2 次，Windows 使用
+PowerShell WorkingSet 采样，Linux 使用 `/usr/bin/time -v`，macOS 使用 `/usr/bin/time -l`，包装器墙钟
+不进入构建时间。最终唯一 JavaScript 产物按精确字节报告 raw、gzip level 9 和 Brotli quality 11。
+完整合同见 [`../fixtures/2k-modules/README.md`](../fixtures/2k-modules/README.md)。
+
+Northstar 替换了旧的全量 side-effect 注册语料，其依赖图、运行时 oracle、源码规模与可压缩性均已变化；
+ADR 0023/0024 中记录的旧 `modules=2013` 数字只保留为历史证据，不能与 Northstar 结果作前后性能或体积比较。
 
 # 4. 压缩器体积与工作量门禁
 

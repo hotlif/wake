@@ -137,7 +137,7 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 | `typescript-7` | Ubuntu、Windows / Node 24 + TypeScript 7 | TS7 CLI 版本、严格类型与 TS/TSX 兼容 fixture |
 | `miri` | Ubuntu / nightly | `wake_ecma_ast` 和 `wake_turbo` 手写 unsafe/内存模型 |
 | `loom` | Ubuntu / Rust 1.95 | single-flight 线程交错 |
-| `bench-smoke` | Ubuntu / Rust 1.95 | 全 benchmark 可编译 |
+| `bench-smoke` | Ubuntu / Rust 1.95 + Node 24 | 验证确定性 Northstar 2k 语料与 committed oracle、增量工作量门禁，并编译全部 benchmark |
 | `css` | Ubuntu / Rust 1.95 + Node 24 | 用本轮构建的 Wake CLI/host 跑 CSS runtime，并单独跑 Node realm 门禁 |
 | `node` | Windows / Node 24、26 | 原生绑定、API、类型、启动与 npm pack；Node 24 另跑 Yarn 4.16 PnP Components 门禁 |
 | `npm-package-artifacts` | Windows、Linux x64 / Node 24 | 从 Yarn PnP 源码安装构建 matching 主包、CSS 与平台 tarball |
@@ -225,7 +225,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 - `react-components-yarn-pnp`：只声明 Wake、React 和 React DOM 的 Components PnP 发布包门禁；
 - `react-docs`：MDX、Demo、Props、主题和组件工作台；
 - `react-docs-workspaces`：一个主站与两个隔离工作台的聚合生产构建；
-- `2k-modules`：生成式压力与跨工具测量。
+- `2k-modules`：确定性 Northstar 商务控制台，验证 2000 个应用模块全部可达、生成摘要和精确运行时 oracle，再对比 Wake、Vite 与 webpack 的无缓存生产构建。
 
 关键语义必须执行产物或在真实服务器中验证。仅检查 bundle 字符串适合局部形态断言，不能替代运行时回归。
 `wake_ecma_codegen/tests/typed_pipeline_acceptance.rs` 是 owned optimizer 的统一差分 harness：完全自有的

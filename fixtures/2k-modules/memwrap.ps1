@@ -5,9 +5,26 @@ param(
     [string[]]$ArgumentList
 )
 
-$argStr = $ArgumentList -join ' '
+function ConvertTo-ProcessArgument([string]$Argument) {
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
 
-$p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru
+    # Start-Process accepts one Windows command-line string. Preserve argument
+    # boundaries, embedded quotes, and trailing backslashes per CommandLineToArgvW.
+    $escaped = [regex]::Replace($Argument, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+$argStr = ($ArgumentList | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' '
+
+try {
+    $p = Start-Process -FilePath $Exe -ArgumentList $argStr -NoNewWindow -PassThru -ErrorAction Stop
+} catch {
+    Write-Error "failed to start benchmark process '$Exe': $($_.Exception.Message)"
+    exit 1
+}
 
 $peak = 0
 while (!$p.HasExited) {
