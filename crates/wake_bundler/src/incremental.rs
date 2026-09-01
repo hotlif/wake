@@ -4753,6 +4753,60 @@ fn for_each_require<F: FnMut(usize, u32, usize)>(body: &str, mut f: F) {
     }
 }
 
+/// Redirect exact generated `require_name(N)` calls whose canonical decimal IDs are in
+/// `redirected` to one target ID. This preserves the old textual rewrite contract, but performs
+/// one scan and one allocation instead of one full `String::replace` per merged module ID.
+fn redirect_require_targets(
+    body: &str,
+    require_name: &str,
+    redirected: &FxHashSet<u32>,
+    target: u32,
+) -> String {
+    if redirected.is_empty() {
+        return body.to_string();
+    }
+
+    let needle = format!("{require_name}(");
+    let target = target.to_string();
+    let bytes = body.as_bytes();
+    let mut search = 0;
+    let mut copied = 0;
+    let mut rewritten = None::<String>;
+    while let Some(relative) = body[search..].find(&needle) {
+        let start = search + relative;
+        let digits_start = start + needle.len();
+        let mut digits_end = digits_start;
+        while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+            digits_end += 1;
+        }
+        let digits = &body[digits_start..digits_end];
+        let canonical_decimal = !digits.is_empty()
+            && (digits.len() == 1 || !digits.starts_with('0'))
+            && digits_end < bytes.len()
+            && bytes[digits_end] == b')';
+        let redirect = canonical_decimal
+            .then(|| digits.parse::<u32>().ok())
+            .flatten()
+            .is_some_and(|id| redirected.contains(&id));
+        if redirect {
+            let output = rewritten.get_or_insert_with(|| String::with_capacity(body.len()));
+            output.push_str(&body[copied..digits_start]);
+            output.push_str(&target);
+            output.push(')');
+            copied = digits_end + 1;
+            search = copied;
+        } else {
+            search = digits_start;
+        }
+    }
+
+    let Some(mut output) = rewritten else {
+        return body.to_string();
+    };
+    output.push_str(&body[copied..]);
+    output
+}
+
 /// 尝试把 `abs` 处的 require 识别为 barrel re-export 并返回待删区间 `[const 起点, for 循环结束)`。
 /// 匹配：`const _wm{VAR} = __wake_require__(id);for (const _k in _wm{VAR}) if (_k !== "default") exports[_k] = _wm{VAR}[_k];`
 /// 全为**局部**（有界回看/前看）检测，故整趟 strip 保持 O(body)。逐字节复刻原逐-id 版的判定。
@@ -4922,8 +4976,8 @@ fn inline_regs_need_registry_temp(inline_regs: &[String]) -> bool {
 mod inline_reg_tests {
     use super::{
         append_inline_regs, exported_names, inline_regs_need_registry_temp,
-        replace_eager_discarded_static_requests, strip_hoisted_requires_and_barrels,
-        strip_standalone_requires,
+        redirect_require_targets, replace_eager_discarded_static_requests,
+        strip_hoisted_requires_and_barrels, strip_standalone_requires,
     };
     use wake_common::FxHashSet;
     use wake_ecma_codegen::GeneratedDiscardedStaticRequest;
@@ -5040,6 +5094,21 @@ mod inline_reg_tests {
             strip_hoisted_requires_and_barrels(standalone_text, &hoisted),
             standalone_text,
             "standalone request-shaped text is not a structural deletion proof"
+        );
+    }
+
+    #[test]
+    fn redirects_generated_require_ids_in_one_exact_textual_pass() {
+        let redirected = FxHashSet::from_iter([1, 42]);
+        let body = "_r(1);_r(11);const label=\"中文_r(42)\";_r(42);_r(01);_r(x);";
+
+        assert_eq!(
+            redirect_require_targets(body, "_r", &redirected, 2002),
+            "_r(2002);_r(11);const label=\"中文_r(2002)\";_r(2002);_r(01);_r(x);"
+        );
+        assert_eq!(
+            redirect_require_targets(body, "_r", &FxHashSet::default(), 2002),
+            body
         );
     }
 }
@@ -6068,14 +6137,8 @@ fn emit(
 
             // 把对已合并模块的 `_r(M)` 重定向到 concat 模块（独立模块保持自己的 id）。
             let redirect = |body: &str| -> String {
-                let mut nb = compact_body_names(body, &runtime_names);
-                for &mid in &merged_ids {
-                    nb = nb.replace(
-                        &format!("{}({mid})", runtime_names.require),
-                        &format!("{}({concat_id})", runtime_names.require),
-                    );
-                }
-                nb
+                let compact = compact_body_names(body, &runtime_names);
+                redirect_require_targets(&compact, &runtime_names.require, &merged_ids, concat_id)
             };
 
             // 构建最终模块表：入口 + stubs + 独立 CJS 模块 + 合并模块
