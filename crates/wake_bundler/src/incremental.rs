@@ -690,6 +690,8 @@ pub struct IncrementalBundler {
     /// The transient engine therefore stores cross-stage values without red/green fingerprints.
     one_shot: bool,
     one_shot_built: bool,
+    /// Task executions retained as an observable counter after a one-shot engine is consumed.
+    released_task_exec_count: u64,
     exec: Arc<Executor>,
     /// `Arc` 包裹：每层依赖 resolve 经工作窃取执行器**并行**（`Resolver` 现为 `Sync`，见其 `cache` 注释）。
     resolver: Arc<Resolver>,
@@ -891,6 +893,7 @@ impl IncrementalBundler {
             }),
             one_shot,
             one_shot_built: false,
+            released_task_exec_count: 0,
             exec: global_executor(),
             define: default_define,
             define_hash,
@@ -996,6 +999,7 @@ impl IncrementalBundler {
         } else {
             Engine::new()
         });
+        self.released_task_exec_count = 0;
         self.content_cells.clear();
         self.optimize_linker_cells.clear();
         self.emit_linker_cells.clear();
@@ -1352,7 +1356,8 @@ impl IncrementalBundler {
 
     /// 引擎累计任务执行次数（parse + codegen）。第二遍构建应不增 → 全管线缓存命中。
     pub fn task_exec_count(&self) -> u64 {
-        self.engine.exec_count()
+        self.released_task_exec_count
+            .saturating_add(self.engine.exec_count())
     }
 
     /// 实际执行 loader/文件读取的累计次数；load snapshot 命中不增加。
@@ -1981,6 +1986,7 @@ impl IncrementalBundler {
                 .collect();
             let engine = Arc::clone(&self.engine);
             let parsed_results = par_request_batched(&engine, &self.exec, requests);
+            drop(engine);
             // layer 索引天然稠密，直接槽位寻址比为每个模块建立哈希表更便宜。
             let mut parsed_by_idx: Vec<Option<ParsedLayerResult>> =
                 std::iter::repeat_with(|| None).take(layer.len()).collect();
@@ -2581,6 +2587,7 @@ impl IncrementalBundler {
                 .collect();
             let engine = Arc::clone(&self.engine);
             let results = par_request_batched(&engine, &self.exec, reqs);
+            drop(engine);
             for (&i, (pvc, parsed)) in need_parse.iter().zip(results) {
                 let rec = modules.get_mut(&plans[i].id).unwrap();
                 extend_module_diagnostics(&mut diagnostics, &parsed.diagnostics, &rec.path);
@@ -2663,6 +2670,7 @@ impl IncrementalBundler {
         let engine = Arc::clone(&self.engine);
         let t_optimize_start = timing.then(std::time::Instant::now);
         let optimized_results = par_request_batched(&engine, &self.exec, requests);
+        drop(engine);
         optimize_time +=
             t_optimize_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
         let mut timing_optimizer_modules = 0_usize;
@@ -2864,6 +2872,7 @@ impl IncrementalBundler {
                 .collect();
             let engine = Arc::clone(&self.engine);
             let results = par_request_batched(&engine, &self.exec, reqs);
+            drop(engine);
             for (&i, (parse_vc, parsed)) in late_need_parse.iter().zip(results) {
                 let rec = modules.get_mut(&plans[i].id).expect("late parse module");
                 extend_module_diagnostics(&mut diagnostics, &parsed.diagnostics, &rec.path);
@@ -2904,6 +2913,7 @@ impl IncrementalBundler {
         let engine = Arc::clone(&self.engine);
         let t_late_optimize_start = timing.then(std::time::Instant::now);
         let late_results = par_request_batched(&engine, &self.exec, late_requests);
+        drop(engine);
         optimize_time +=
             t_late_optimize_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
         for (&i, (optimized_vc, out)) in late_optimize.iter().zip(late_results) {
@@ -2929,18 +2939,20 @@ impl IncrementalBundler {
             .collect();
         let mut body_requests = Vec::with_capacity(body_miss.len());
         for &i in &body_miss {
-            let direct = (self.one_shot && !self.sourcemap).then(|| {
-                (
+            let direct = if self.one_shot && !self.sourcemap {
+                Some((
                     plans[i]
                         .optimized_artifact
-                        .clone()
+                        .take()
                         .expect("one-shot body miss optimizer value"),
                     plans[i]
                         .emit_linker_data
-                        .clone()
+                        .take()
                         .expect("one-shot final linker value"),
-                )
-            });
+                ))
+            } else {
+                None
+            };
             let optimized_vc = plans[i].optimized_vc;
             let emit_linker_vc = plans[i].emit_linker_vc;
             let interner = self.interner.clone();
@@ -2973,6 +2985,7 @@ impl IncrementalBundler {
         let engine = Arc::clone(&self.engine);
         let t_body_start = timing.then(std::time::Instant::now);
         let emitted = par_request_batched(&engine, &self.exec, body_requests);
+        drop(engine);
         body_time += t_body_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
         let mut timing_trivial_bodies = 0_usize;
         let mut timing_trivial_body_nanos = 0_u64;
@@ -3047,6 +3060,7 @@ impl IncrementalBundler {
             }
             let engine = Arc::clone(&self.engine);
             let maps = par_request_batched(&engine, &self.exec, map_requests);
+            drop(engine);
             for (&i, map) in body_miss.iter().zip(maps) {
                 map_of.insert(plans[i].id, map);
             }
@@ -3055,6 +3069,10 @@ impl IncrementalBundler {
             .iter()
             .map(|id| (*id, body_of[id].clone()))
             .collect();
+        // Terminal body/map consumers have taken every one-shot optimized artifact they need.
+        // Release plan-owned Arc clones before draining Engine memos so the parallel release owns
+        // the final deep AST drops instead of deferring them to this function's serial epilogue.
+        drop(plans);
 
         if self.extract_css && !collected_css.is_empty() {
             collected_css.retain(|(id, _)| live_id_set.contains(id));
@@ -3245,6 +3263,17 @@ impl IncrementalBundler {
         }
         output.assets = assets;
 
+        // Final output owns every string/map it needs. Remove local Arc owners before the
+        // one-shot Engine is drained so its shard jobs perform the final deep drops in parallel.
+        drop(bodies);
+        drop(body_of);
+        drop(map_of);
+        drop(discarded_static_requests_of);
+        drop(body_placements);
+        drop(block_infos);
+        drop(namespace_identity_ids);
+        drop(style_files);
+
         // 持久化缓存落盘（opt-in）：仅在无错误 **且本次新增过条目**（dirty）时写。
         // 全命中（未变）时缓存内容没变，跳过落盘——缓存文件常和 bundle 一样大，
         // 每次白写会让 `--cache` 的 I/O 反超它省下的 parse（实测小项目会更慢）。
@@ -3255,11 +3284,11 @@ impl IncrementalBundler {
             let _ = cache.store(path);
         }
 
+        let pre_release_total = t0.elapsed();
+        let emit_time = t_emit_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         if timing {
-            let total = t0.elapsed();
-            let emit_time = t_emit_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
             eprintln!(
-                "[wake-timing] 模块={} workers={} lifetime={} | scan={:.1?} (read={:.1?} resolve={:.1?}) | link={:.1?} | codegen={:.1?} (optimize={:.1?} body={:.1?}) | emit={:.1?} | 总={:.1?}",
+                "[wake-timing] 模块={} workers={} lifetime={} | scan={:.1?} (read={:.1?} resolve={:.1?}) | link={:.1?} | codegen={:.1?} (optimize={:.1?} body={:.1?}) | emit={:.1?} | pre-release={:.1?}",
                 ordered.len(),
                 self.exec.num_threads(),
                 if self.one_shot { "one-shot" } else { "session" },
@@ -3271,29 +3300,68 @@ impl IncrementalBundler {
                 optimize_time,
                 body_time,
                 emit_time,
-                total,
+                pre_release_total,
             );
         }
 
-        if !output.has_errors() {
-            let live_content: FxHashSet<u64> =
-                modules.values().map(|module| module.content_key).collect();
-            self.memory_summaries
-                .retain(|content_key, _| live_content.contains(content_key));
-            self.memory_parse_vcs
-                .retain(|content_key, _| live_content.contains(content_key));
-        }
-
-        if output.has_errors() || !self.load_cache_enabled {
+        if self.one_shot {
+            let release_started = std::time::Instant::now();
+            // These maps only describe a possible later generation. A one-shot bundler rejects a
+            // second build, so retaining them would merely serialize their destruction on the
+            // caller's return path.
+            self.content_cells.clear();
+            self.optimize_linker_cells.clear();
+            self.emit_linker_cells.clear();
+            self.css_codegen_cells.clear();
+            self.optimize_options_cells.clear();
+            self.memory_summaries.clear();
+            self.memory_parse_vcs.clear();
+            self.link_plan = None;
             self.stable_graph = None;
             self.topology_invalidated.store(true, Ordering::Release);
+            drop(modules);
+
+            // `build` is the terminal owner in one-shot mode. Replace the field with an empty
+            // inert engine so `release_one_shot` can consume the unique task graph Arc and spread
+            // its 128 shard drops across the existing bounded executor.
+            let engine = std::mem::replace(&mut self.engine, Arc::new(Engine::new_one_shot()));
+            self.released_task_exec_count = self
+                .released_task_exec_count
+                .saturating_add(engine.exec_count());
+            let release_stats = engine.release_one_shot(&self.exec);
+            let release_elapsed = release_started.elapsed();
+            if timing {
+                eprintln!(
+                    "[wake-release] inputs={} memos={} recomputers={} locks={} batches={} elapsed={release_elapsed:.1?} total={:.1?}",
+                    release_stats.input_cells,
+                    release_stats.memo_entries,
+                    release_stats.recomputer_entries,
+                    release_stats.task_locks,
+                    release_stats.drop_batches,
+                    t0.elapsed(),
+                );
+            }
         } else {
-            self.stable_graph = Some(StableModuleGraph {
-                entry: entry_norm,
-                next_id,
-                modules,
-            });
-            self.topology_invalidated.store(false, Ordering::Release);
+            if !output.has_errors() {
+                let live_content: FxHashSet<u64> =
+                    modules.values().map(|module| module.content_key).collect();
+                self.memory_summaries
+                    .retain(|content_key, _| live_content.contains(content_key));
+                self.memory_parse_vcs
+                    .retain(|content_key, _| live_content.contains(content_key));
+            }
+
+            if output.has_errors() || !self.load_cache_enabled {
+                self.stable_graph = None;
+                self.topology_invalidated.store(true, Ordering::Release);
+            } else {
+                self.stable_graph = Some(StableModuleGraph {
+                    entry: entry_norm,
+                    next_id,
+                    modules,
+                });
+                self.topology_invalidated.store(false, Ordering::Release);
+            }
         }
 
         output

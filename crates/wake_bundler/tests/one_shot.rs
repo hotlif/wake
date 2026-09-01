@@ -175,6 +175,11 @@ fn one_shot_rejects_a_second_build() {
     configure_production(&mut bundler, false);
     let first = bundler.build(Path::new("src/index.js"));
     assert!(!first.has_errors(), "{:?}", first.diagnostics);
+    let task_exec_count = bundler.task_exec_count();
+    assert!(
+        task_exec_count > 0,
+        "one-shot engine release must preserve its observable task count"
+    );
 
     let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = bundler.build(Path::new("src/index.js"));
@@ -184,4 +189,5 @@ fn one_shot_rejects_a_second_build() {
         panic_message(panic),
         "one-shot IncrementalBundler may only build once"
     );
+    assert_eq!(bundler.task_exec_count(), task_exec_count);
 }
