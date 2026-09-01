@@ -32,3 +32,4 @@ base64.workspace = true
 open.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+mimalloc.workspace = true
