@@ -4,29 +4,43 @@
 //! compiler. Generated modules live under .wake/docs/generated for dev and production parity.
 
 use markdown::mdast::{AttributeContent, AttributeValue, Node};
-use markdown::{Constructs, ParseOptions};
+use markdown::{Constructs, MdxSignal, ParseOptions};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
+use std::thread;
+use std::time::{Duration, Instant};
+use wake_common::{Interner, OwnedFileTree, OwnedFileTreeBuilder, ProjectedRelativePath, Span};
+use wake_ecma_ast::{DependencyKind, SourceType};
+use wake_ecma_lexer::{Keyword, Lexer, Token, TokenKind, tokenize};
+use wake_ecma_parser::parse;
 
 const RUNTIME_APP: &str = include_str!("../runtime/app.tsx");
 const RUNTIME_COMPONENTS: &str = include_str!("../runtime/components.tsx");
 const RUNTIME_COMPONENT_STATE: &str = include_str!("../runtime/components-state.mjs");
+const RUNTIME_ROUTES: &str = include_str!("../runtime/routes.mjs");
+const RUNTIME_SEARCH: &str = include_str!("../runtime/search.mjs");
 const RUNTIME_SITE_ENTRY: &str = include_str!("../runtime/site-entry.tsx");
 const RUNTIME_COMPONENTS_ENTRY: &str = include_str!("../runtime/components-entry.tsx");
 const RUNTIME_STYLE: &str = include_str!("../runtime/styles.css");
 const RUNTIME_COMPONENT_STYLE: &str = include_str!("../runtime/components.css");
 const MINIMUM_REACT_MAJOR: u64 = 19;
 static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static GENERATION_TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
+const GENERATION_COMMIT_LOCK_FILE: &str = ".wake-docs-generation.lock";
+const GENERATION_COMMIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const GENERATION_COMMIT_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildMode {
@@ -116,6 +130,23 @@ pub struct GeneratedProject {
     pub changed_files: Vec<PathBuf>,
 }
 
+/// An immutable documentation render that has not been published to the host filesystem.
+///
+/// Every generated module, including `manifest.json`, is owned by [`files`](Self::files). The
+/// entry is relative to that file tree so callers can mount it at a logical or physical root of
+/// their choosing.
+#[derive(Debug, Clone)]
+pub struct RenderedProject {
+    pub root: PathBuf,
+    pub files: OwnedFileTree,
+    pub entry_relative: ProjectedRelativePath,
+    pub watch_roots: Vec<PathBuf>,
+    pub routes: Vec<RouteInfo>,
+    pub mode: DocsMode,
+    pub demos: Vec<DemoDescriptor>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteInfo {
     pub id: String,
@@ -161,6 +192,7 @@ pub enum DocsError {
     InvalidConfig(String),
     PublicCollision(PathBuf),
     Api(PathBuf, String),
+    InvalidPagePath(PathBuf, String),
 }
 
 impl fmt::Display for DocsError {
@@ -202,6 +234,13 @@ impl fmt::Display for DocsError {
             ),
             Self::Api(path, error) => {
                 write!(f, "API docs failed for `{}`: {error}", path.display())
+            }
+            Self::InvalidPagePath(path, error) => {
+                write!(
+                    f,
+                    "invalid documentation page path `{}`: {error}",
+                    path.display()
+                )
             }
         }
     }
@@ -248,10 +287,245 @@ struct NavigationSection {
 
 #[derive(Debug)]
 struct CompiledPage {
+    identity: PageIdentity,
     route: RouteInfo,
-    module: String,
-    source_map: String,
+    search_text: String,
+    module_plan: PageModulePlan,
     api_entries: Vec<ApiEntry>,
+}
+
+#[derive(Debug)]
+struct PageModulePlan {
+    source: String,
+    rewritten_esm: RewrittenEsm,
+    body: Vec<RenderedNode>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RenderedPageModule {
+    code: String,
+    source_map: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageIdentity {
+    id: String,
+    source_file: String,
+    generated_module: String,
+    generated_map: String,
+    route_path: RoutePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutePath {
+    decoded: String,
+    encoded: String,
+}
+
+impl PageIdentity {
+    fn from_paths(root: &Path, source_dir: &Path, path: &Path) -> Result<Self, DocsError> {
+        let relative = path.strip_prefix(source_dir).map_err(|_| {
+            DocsError::InvalidPagePath(
+                path.to_path_buf(),
+                "page is outside the configured source directory".to_string(),
+            )
+        })?;
+        let source_relative = path.strip_prefix(root).map_err(|_| {
+            DocsError::InvalidPagePath(
+                path.to_path_buf(),
+                "page is outside the project root".to_string(),
+            )
+        })?;
+        let id = checked_slash_path(&relative.with_extension(""), path)?;
+        let source_file = checked_slash_path(source_relative, path)?;
+        let generated_module = checked_slash_path(
+            &Path::new("pages").join(relative).with_extension("tsx"),
+            path,
+        )?;
+        let generated_map = format!("{generated_module}.map");
+        let route_path = RoutePath::from_page_relative(relative, path)?;
+        Ok(Self {
+            id,
+            source_file,
+            generated_module,
+            generated_map,
+            route_path,
+        })
+    }
+}
+
+impl RoutePath {
+    fn from_page_relative(relative: &Path, source_path: &Path) -> Result<Self, DocsError> {
+        let mut route = relative.with_extension("");
+        if route.file_name().and_then(|value| value.to_str()) == Some("index") {
+            route.pop();
+        }
+        let mut decoded_segments = Vec::new();
+        let mut encoded_segments = Vec::new();
+        for component in route.components() {
+            let Component::Normal(segment) = component else {
+                return Err(DocsError::InvalidPagePath(
+                    source_path.to_path_buf(),
+                    "route must contain only normal relative path segments".to_string(),
+                ));
+            };
+            let segment = checked_identity_segment(segment, source_path)?;
+            if matches!(segment, "." | "..") {
+                return Err(DocsError::InvalidPagePath(
+                    source_path.to_path_buf(),
+                    "route contains an unsafe path segment".to_string(),
+                ));
+            }
+            decoded_segments.push(segment.to_string());
+            encoded_segments.push(percent_encode_route_segment(segment));
+        }
+        Ok(Self {
+            decoded: if decoded_segments.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", decoded_segments.join("/"))
+            },
+            encoded: if encoded_segments.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", encoded_segments.join("/"))
+            },
+        })
+    }
+
+    fn from_canonical_encoded(value: &str) -> Result<Self, DocsError> {
+        if value == "/" {
+            return Ok(Self {
+                decoded: "/".to_string(),
+                encoded: "/".to_string(),
+            });
+        }
+        if !value.starts_with('/') || value.ends_with('/') {
+            return Err(DocsError::InvalidConfig(format!(
+                "documentation route `{value}` is not canonical"
+            )));
+        }
+        let mut decoded_segments = Vec::new();
+        for encoded in value[1..].split('/') {
+            if encoded.is_empty() {
+                return Err(DocsError::InvalidConfig(format!(
+                    "documentation route `{value}` contains an empty segment"
+                )));
+            }
+            let decoded = percent_decode_route_segment(encoded).ok_or_else(|| {
+                DocsError::InvalidConfig(format!(
+                    "documentation route `{value}` has invalid percent encoding"
+                ))
+            })?;
+            if matches!(decoded.as_str(), "." | "..")
+                || decoded.contains('/')
+                || decoded.contains('\\')
+            {
+                return Err(DocsError::InvalidConfig(format!(
+                    "documentation route `{value}` contains an unsafe segment"
+                )));
+            }
+            if percent_encode_route_segment(&decoded) != encoded {
+                return Err(DocsError::InvalidConfig(format!(
+                    "documentation route `{value}` is not canonically encoded"
+                )));
+            }
+            decoded_segments.push(decoded);
+        }
+        Ok(Self {
+            decoded: format!("/{}", decoded_segments.join("/")),
+            encoded: value.to_string(),
+        })
+    }
+
+    fn decoded_relative_path(&self) -> PathBuf {
+        self.decoded
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect()
+    }
+}
+
+fn checked_slash_path(path: &Path, source_path: &Path) -> Result<String, DocsError> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        let Component::Normal(segment) = component else {
+            return Err(DocsError::InvalidPagePath(
+                source_path.to_path_buf(),
+                "identity path must contain only normal relative segments".to_string(),
+            ));
+        };
+        segments.push(checked_identity_segment(segment, source_path)?);
+    }
+    Ok(segments.join("/"))
+}
+
+fn checked_identity_segment<'a>(
+    segment: &'a OsStr,
+    source_path: &Path,
+) -> Result<&'a str, DocsError> {
+    let segment = segment.to_str().ok_or_else(|| {
+        DocsError::InvalidPagePath(
+            source_path.to_path_buf(),
+            "path segment is not valid UTF-8".to_string(),
+        )
+    })?;
+    if segment.contains(['/', '\\']) {
+        return Err(DocsError::InvalidPagePath(
+            source_path.to_path_buf(),
+            "path segment contains a platform-dependent separator".to_string(),
+        ));
+    }
+    Ok(segment)
+}
+
+fn percent_encode_route_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
+fn percent_decode_route_segment(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = decode_hex(*bytes.get(index + 1)?)?;
+            let low = decode_hex(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            if !bytes[index].is_ascii_alphanumeric()
+                && !matches!(bytes[index], b'-' | b'.' | b'_' | b'~')
+            {
+                return None;
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn decode_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -335,8 +609,74 @@ pub fn generate_with_mode(
     mode: BuildMode,
     docs_mode: DocsMode,
 ) -> Result<GeneratedProject, DocsError> {
+    generate_with_mode_in(
+        project_root,
+        Path::new(".wake/docs/generated"),
+        options,
+        mode,
+        docs_mode,
+    )
+}
+
+/// Generate into a caller-owned derived tree. Development orchestration uses this to build a
+/// candidate configuration without overwriting the accepted session's generated modules.
+pub fn generate_with_mode_in(
+    project_root: impl AsRef<Path>,
+    generated_dir: impl AsRef<Path>,
+    options: &DocsOptions,
+    mode: BuildMode,
+    docs_mode: DocsMode,
+) -> Result<GeneratedProject, DocsError> {
+    let inputs = prepare_render_inputs(project_root.as_ref(), options)?;
+    let generated_dir = absolute_from(&inputs.root, generated_dir.as_ref());
+    validate_generation_namespace(&inputs.root, &generated_dir)?;
+    let rendered = render_prepared(inputs, options, mode, docs_mode)?;
+    let generation = rendered_file_map(&rendered.files);
+    let changed_files = publish_generation(&rendered.root, &generated_dir, &generation)?;
+
+    Ok(GeneratedProject {
+        root: rendered.root.clone(),
+        generated_dir: generated_dir.clone(),
+        entry: generated_dir.join(rendered.entry_relative.as_path()),
+        aliases: vec![
+            ("@@wake/docs".to_string(), generated_dir),
+            ("@@wake/docs-project".to_string(), rendered.root),
+        ],
+        watch_roots: rendered.watch_roots,
+        routes: rendered.routes,
+        mode: rendered.mode,
+        demos: rendered.demos,
+        warnings: rendered.warnings,
+        changed_files,
+    })
+}
+
+/// Render the complete generated Docs project without observing or modifying a publication tree.
+///
+/// The returned files are immutable and self-contained. In particular, this function does not
+/// create or inspect `.wake/docs/generated`; callers choose whether and where to publish or mount
+/// the render.
+pub fn render_with_mode(
+    project_root: impl AsRef<Path>,
+    options: &DocsOptions,
+    mode: BuildMode,
+    docs_mode: DocsMode,
+) -> Result<RenderedProject, DocsError> {
+    let inputs = prepare_render_inputs(project_root.as_ref(), options)?;
+    render_prepared(inputs, options, mode, docs_mode)
+}
+
+struct RenderInputs {
+    root: PathBuf,
+    source_dir: PathBuf,
+}
+
+fn prepare_render_inputs(
+    project_root: &Path,
+    options: &DocsOptions,
+) -> Result<RenderInputs, DocsError> {
     validate_options(options)?;
-    let root = canonical_dir(project_root.as_ref())?;
+    let root = canonical_dir(project_root)?;
     validate_react_dependencies(&root)?;
     let source_dir = absolute_from(&root, &options.source_dir);
     if !source_dir.is_dir() {
@@ -346,9 +686,16 @@ pub fn generate_with_mode(
         ));
     }
     let source_dir = fs::canonicalize(&source_dir).unwrap_or(source_dir);
-    let generated_dir = root.join(".wake/docs/generated");
-    fs::create_dir_all(&generated_dir)
-        .map_err(|error| DocsError::Io(generated_dir.clone(), error.to_string()))?;
+    Ok(RenderInputs { root, source_dir })
+}
+
+fn render_prepared(
+    inputs: RenderInputs,
+    options: &DocsOptions,
+    mode: BuildMode,
+    docs_mode: DocsMode,
+) -> Result<RenderedProject, DocsError> {
+    let RenderInputs { root, source_dir } = inputs;
 
     let mut mdx_files = Vec::new();
     let mut demo_files = Vec::new();
@@ -366,9 +713,6 @@ pub fn generate_with_mode(
     }
     if docs_mode == DocsMode::Site {
         apply_navigation(&source_dir, &mut pages)?;
-        for (_, page) in &mut pages {
-            sync_page_metadata(page);
-        }
     }
     if mode == BuildMode::Production {
         pages.retain(|(_, page)| !page.route.draft);
@@ -376,31 +720,22 @@ pub fn generate_with_mode(
     ensure_unique_routes(&pages)?;
 
     let demos = compile_demos(&root, &source_dir, &demo_files, docs_mode)?;
-    let mut changed_files = Vec::new();
-    let mut generated_files = BTreeSet::new();
-    for (source_path, page) in &pages {
-        let relative = source_path.strip_prefix(&source_dir).map_err(|_| {
-            DocsError::InvalidConfig(format!(
-                "page `{}` is outside source_dir",
-                source_path.display()
-            ))
-        })?;
-        let output = generated_dir
-            .join("pages")
-            .join(relative)
-            .with_extension("tsx");
-        let map = output.with_extension("tsx.map");
-        if atomic_write_if_changed(&output, page.module.as_bytes())? {
-            changed_files.push(output.clone());
-        }
-        if atomic_write_if_changed(&map, page.source_map.as_bytes())? {
-            changed_files.push(map.clone());
-        }
-        generated_files.insert(output);
-        generated_files.insert(map);
+    let mut generation = RenderedFileTreeBuilder::new();
+    for (_, page) in &pages {
+        let rendered = page.render_module();
+        insert_generation_file(
+            &mut generation,
+            PathBuf::from(&page.identity.generated_module),
+            rendered.code.as_bytes(),
+        )?;
+        insert_generation_file(
+            &mut generation,
+            PathBuf::from(&page.identity.generated_map),
+            rendered.source_map.as_bytes(),
+        )?;
     }
     for demo in &demos {
-        let output = generated_dir.join("demo-source").join(&demo.source_module);
+        let output = Path::new("demo-source").join(&demo.source_module);
         let language = normalize_code_language(
             Path::new(&demo.id)
                 .extension()
@@ -413,10 +748,7 @@ pub fn generate_with_mode(
             js_string(&demo.source),
             js_string(&language)
         );
-        if atomic_write_if_changed(&output, module.as_bytes())? {
-            changed_files.push(output.clone());
-        }
-        generated_files.insert(output);
+        insert_generation_file(&mut generation, output, module.as_bytes())?;
     }
 
     let routes: Vec<_> = pages.iter().map(|(_, page)| page.route.clone()).collect();
@@ -424,12 +756,16 @@ pub fn generate_with_mode(
         .iter()
         .flat_map(|(_, page)| page.api_entries.iter())
         .collect();
-    let registry = render_registry(&source_dir, &pages, &demos, &api_entries)?;
+    let registry = render_registry(&pages, &demos, &api_entries);
+    let search_corpus = render_search_corpus(&pages);
     let config = render_config(&root, options, docs_mode)?;
     let mut fixed = vec![
         ("registry.ts", registry.as_str()),
+        ("search-corpus.ts", search_corpus.as_str()),
         ("config.tsx", config.as_str()),
         ("runtime/app.tsx", RUNTIME_APP),
+        ("runtime/routes.mjs", RUNTIME_ROUTES),
+        ("runtime/search.mjs", RUNTIME_SEARCH),
         ("runtime/styles.css", RUNTIME_STYLE),
     ];
     let entry_relative = match docs_mode {
@@ -448,25 +784,17 @@ pub fn generate_with_mode(
         }
     };
     for (relative, content) in fixed {
-        let path = generated_dir.join(relative);
-        if atomic_write_if_changed(&path, content.as_bytes())? {
-            changed_files.push(path.clone());
-        }
-        generated_files.insert(path);
+        insert_generation_file(&mut generation, PathBuf::from(relative), content.as_bytes())?;
     }
 
-    remove_stale_generated_files(&generated_dir, &generated_files, &mut changed_files)?;
-    let manifest_path = generated_dir.join("manifest.json");
-    let manifest_files: Vec<_> = generated_files
-        .iter()
-        .filter_map(|path| path.strip_prefix(&generated_dir).ok())
-        .map(slash_path)
-        .collect();
-    let manifest = serde_json::to_string_pretty(&json!({ "files": manifest_files }))
-        .expect("serializable manifest");
-    if atomic_write_if_changed(&manifest_path, manifest.as_bytes())? {
-        changed_files.push(manifest_path);
-    }
+    let manifest_files = generation.manifest_files();
+    let manifest = serde_json::to_vec_pretty(&GenerationManifest {
+        files: manifest_files,
+    })
+    .expect("serializable manifest");
+    insert_generation_file(&mut generation, PathBuf::from("manifest.json"), &manifest)?;
+    let files = generation.seal();
+    let entry_relative = projected_generation_path(Path::new(entry_relative))?;
 
     let mut watch_roots = vec![source_dir.clone(), root.join("src")];
     if let Some(preview) = &options.preview {
@@ -484,56 +812,38 @@ pub fn generate_with_mode(
         .flat_map(|demo| demo.warnings.iter().cloned())
         .collect();
 
-    Ok(GeneratedProject {
-        root: root.clone(),
-        generated_dir: generated_dir.clone(),
-        entry: generated_dir.join(entry_relative),
-        aliases: vec![
-            ("@@wake/docs".to_string(), generated_dir),
-            ("@@wake/docs-project".to_string(), root),
-        ],
+    Ok(RenderedProject {
+        root,
+        files,
+        entry_relative,
         watch_roots,
         routes,
         mode: docs_mode,
         demos: demo_descriptors,
         warnings,
-        changed_files,
     })
 }
 
-fn sync_page_metadata(page: &mut CompiledPage) {
-    const PREFIX: &str = "export const __wakeMeta = ";
-    let Some(start) = page.module.find(PREFIX) else {
-        return;
-    };
-    let value_start = start + PREFIX.len();
-    let Some(value_end) = page.module[value_start..].find(";\n") else {
-        return;
-    };
-    let value_end = value_start + value_end;
-    let metadata = serde_json::to_string(&page.route).expect("serializable route");
-    page.module.replace_range(value_start..value_end, &metadata);
-}
-
 fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledPage, DocsError> {
+    let identity = PageIdentity::from_paths(root, source_dir, path)?;
     let source = fs::read_to_string(path)
         .map_err(|error| DocsError::Io(path.to_path_buf(), error.to_string()))?;
-    let (esm, markdown_source) = extract_esm(&source);
     let mut constructs = Constructs::gfm();
     constructs.autolink = false;
     constructs.code_indented = false;
     constructs.html_flow = false;
     constructs.html_text = false;
     constructs.frontmatter = true;
-    constructs.mdx_esm = false;
+    constructs.mdx_esm = true;
     constructs.mdx_expression_flow = true;
     constructs.mdx_expression_text = true;
     constructs.mdx_jsx_flow = true;
     constructs.mdx_jsx_text = true;
     let ast = markdown::to_mdast(
-        &markdown_source,
+        &source,
         &ParseOptions {
             constructs,
+            mdx_esm_parse: Some(Box::new(parse_mdx_esm)),
             ..ParseOptions::default()
         },
     )
@@ -541,10 +851,8 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
     validate_compile_components(path, &ast)?;
 
     let frontmatter = find_frontmatter(path, &ast)?;
-    let headings = collect_headings(&ast);
-    let relative = path.strip_prefix(source_dir).map_err(|_| {
-        DocsError::InvalidConfig(format!("page `{}` is outside source_dir", path.display()))
-    })?;
+    let headings = HeadingPlan::from_ast(&ast).headings;
+    let search_text = collect_search_text(&ast);
     let title = frontmatter
         .title
         .clone()
@@ -566,7 +874,6 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
             format!("kind `{kind}` must be overview, tutorial, guide, reference, or component"),
         ));
     }
-    let slug = normalize_slug(&derive_slug(relative));
     let status = frontmatter.status.unwrap_or_else(|| "stable".to_string());
     if !matches!(
         status.as_str(),
@@ -577,10 +884,9 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
             format!("status `{status}` must be stable, beta, experimental, or deprecated"),
         ));
     }
-    let file = slash_path(path.strip_prefix(root).unwrap_or(path));
     let route = RouteInfo {
-        id: slash_path(relative.with_extension("")),
-        file,
+        id: identity.id.clone(),
+        file: identity.source_file.clone(),
         title,
         description: frontmatter.description,
         kind,
@@ -588,35 +894,76 @@ fn compile_page(root: &Path, source_dir: &Path, path: &Path) -> Result<CompiledP
         group_id: String::new(),
         section: String::new(),
         section_id: String::new(),
-        slug,
+        slug: identity.route_path.encoded.clone(),
         status,
         draft: frontmatter.draft,
         hidden: frontmatter.hidden,
         headings,
     };
 
-    let mut renderer = Renderer::new(&route.file);
+    let mut renderer = Renderer::new(&route.file, &route.headings);
     let body = renderer.render_root(&ast);
-    let rewritten_esm = rewrite_relative_imports(root, path, &esm);
-    let meta_json = serde_json::to_string(&route).expect("serializable route");
-    let mut module = format!(
-        "import {{ MdxPage, Demo, Demos, API, CodeBlock }} from \"@@wake/docs/runtime/app.tsx\";\n{rewritten_esm}\nexport const __wakeMeta = {meta_json};\nexport default function WakeMdxContent() {{\n  return <MdxPage meta={{__wakeMeta}}>\n{body}  </MdxPage>;\n}}\n"
-    );
-    let map_name = path
-        .with_extension("tsx.map")
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("page.tsx.map")
-        .to_string();
-    module.push_str(&format!("//# sourceMappingURL={map_name}\n"));
-    let source_map = render_source_map(path, &source, &module);
+    let rewritten_esm = rewrite_mdx_esm(root, path, &ast)?;
     let api_entries = collect_api_entries(root, path, &route.file, &ast)?;
     Ok(CompiledPage {
+        identity,
         route,
-        module,
-        source_map,
+        search_text,
+        module_plan: PageModulePlan {
+            source,
+            rewritten_esm,
+            body,
+        },
         api_entries,
     })
+}
+
+impl CompiledPage {
+    fn render_module(&self) -> RenderedPageModule {
+        self.module_plan.render(&self.identity, &self.route)
+    }
+}
+
+impl PageModulePlan {
+    fn render(&self, identity: &PageIdentity, route: &RouteInfo) -> RenderedPageModule {
+        let meta_json = serde_json::to_string(route).expect("serializable route");
+        let mut writer = ModuleWriter::new(&self.source);
+        writer.push_synthetic(
+            "import { MdxPage, Demo, Demos, API, CodeBlock } from \"@@wake/docs/runtime/app.tsx\";\n",
+        );
+        for fragment in &self.rewritten_esm.fragments {
+            match (fragment.source_offset, fragment.kind) {
+                (Some(offset), SourceFragmentKind::Exact) => {
+                    writer.push_exact(&fragment.text, offset);
+                }
+                (Some(offset), SourceFragmentKind::DerivedToken) => {
+                    writer.push_derived(&fragment.text, offset);
+                }
+                (None, _) => writer.push_synthetic(&fragment.text),
+            }
+        }
+        writer.push_synthetic(&format!(
+            "\nexport const __wakeMeta = {meta_json};\nexport default function WakeMdxContent() {{\n  return <MdxPage meta={{__wakeMeta}}>\n"
+        ));
+        for node in &self.body {
+            writer.push_synthetic("    ");
+            if let Some(offset) = node.source_offset {
+                writer.push_derived(&node.code, offset);
+            } else {
+                writer.push_synthetic(&node.code);
+            }
+            writer.push_synthetic("\n");
+        }
+        writer.push_synthetic("  </MdxPage>;\n}\n");
+        let map_name = Path::new(&identity.generated_map)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("page.tsx.map");
+        writer.push_synthetic(&format!("//# sourceMappingURL={map_name}\n"));
+        let source_map = writer.render_source_map(identity, &self.source);
+        let code = writer.finish();
+        RenderedPageModule { code, source_map }
+    }
 }
 
 fn find_frontmatter(path: &Path, ast: &Node) -> Result<Frontmatter, DocsError> {
@@ -778,23 +1125,58 @@ fn insert_navigation_page(
     Ok(())
 }
 
-fn collect_headings(ast: &Node) -> Vec<HeadingInfo> {
-    let mut headings = Vec::new();
+#[derive(Debug)]
+struct HeadingPlan {
+    headings: Vec<HeadingInfo>,
+}
+
+impl HeadingPlan {
+    fn from_ast(ast: &Node) -> Self {
+        let mut headings = Vec::new();
+        let mut allocated = BTreeMap::<String, usize>::new();
+        visit(ast, &mut |node| {
+            if let Node::Heading(heading) = node {
+                let title = heading
+                    .children
+                    .iter()
+                    .map(Node::to_string)
+                    .collect::<String>();
+                let base = slugify(&title);
+                let count = allocated.entry(base.clone()).or_default();
+                let id = if *count == 0 {
+                    base
+                } else {
+                    format!("{base}-{count}")
+                };
+                *count += 1;
+                headings.push(HeadingInfo {
+                    depth: heading.depth,
+                    id,
+                    title,
+                });
+            }
+        });
+        Self { headings }
+    }
+}
+
+fn collect_search_text(ast: &Node) -> String {
+    let mut search_text = String::new();
     visit(ast, &mut |node| {
-        if let Node::Heading(heading) = node {
-            let title = heading
-                .children
-                .iter()
-                .map(Node::to_string)
-                .collect::<String>();
-            headings.push(HeadingInfo {
-                depth: heading.depth,
-                id: slugify(&title),
-                title,
-            });
+        let value = match node {
+            Node::Text(value) => &value.value,
+            Node::InlineCode(value) => &value.value,
+            Node::Code(value) => &value.value,
+            _ => return,
+        };
+        for word in value.split_whitespace() {
+            if !search_text.is_empty() {
+                search_text.push(' ');
+            }
+            search_text.push_str(word);
         }
     });
-    headings
+    search_text
 }
 
 fn validate_compile_components(path: &Path, ast: &Node) -> Result<(), DocsError> {
@@ -1472,21 +1854,18 @@ fn parse_static_json_value(value: &str) -> Option<serde_json::Value> {
 }
 
 fn render_registry(
-    source_dir: &Path,
     pages: &[(PathBuf, CompiledPage)],
     demos: &[DemoInfo],
     api_entries: &[&ApiEntry],
-) -> Result<String, DocsError> {
+) -> String {
     let mut output = String::from("// Generated by Wake. Do not edit.\nexport const pages = [\n");
-    for (source_path, page) in pages {
-        let relative = source_path
-            .strip_prefix(source_dir)
-            .map_err(|_| DocsError::InvalidConfig("page escaped source_dir".to_string()))?
-            .with_extension("tsx");
+    for (_, page) in pages {
         let meta = serde_json::to_string(&page.route).expect("serializable route");
+        let route_path =
+            serde_json::to_string(&page.identity.route_path).expect("serializable route path");
         output.push_str(&format!(
-            "  {{ ...{meta}, load: () => import(\"@@wake/docs/pages/{}\") }},\n",
-            slash_path(relative)
+            "  {{ ...{meta}, routePath: {route_path}, load: () => import(\"@@wake/docs/{}\") }},\n",
+            page.identity.generated_module
         ));
     }
     output.push_str("] as const;\nexport const demos = [\n");
@@ -1514,7 +1893,19 @@ fn render_registry(
         .collect();
     output.push_str(&serde_json::to_string(&map).expect("serializable API docs"));
     output.push_str(" as const;\n");
-    Ok(output)
+    output
+}
+
+fn render_search_corpus(pages: &[(PathBuf, CompiledPage)]) -> String {
+    let corpus: BTreeMap<_, _> = pages
+        .iter()
+        .filter(|(_, page)| !page.route.hidden)
+        .map(|(_, page)| (page.route.id.as_str(), page.search_text.as_str()))
+        .collect();
+    format!(
+        "// Generated by Wake. Do not edit.\nexport const searchTextByPage = {} as const;\n",
+        serde_json::to_string(&corpus).expect("serializable search corpus")
+    )
 }
 
 fn render_config(
@@ -1577,25 +1968,34 @@ fn public_asset_url(base_path: &str, value: &str) -> String {
 
 struct Renderer<'a> {
     page_file: &'a str,
-    heading_ids: BTreeMap<String, usize>,
+    headings: &'a [HeadingInfo],
+    heading_index: usize,
+}
+
+#[derive(Debug)]
+struct RenderedNode {
+    code: String,
+    source_offset: Option<usize>,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(page_file: &'a str) -> Self {
+    fn new(page_file: &'a str, headings: &'a [HeadingInfo]) -> Self {
         Self {
             page_file,
-            heading_ids: BTreeMap::new(),
+            headings,
+            heading_index: 0,
         }
     }
 
-    fn render_root(&mut self, node: &Node) -> String {
-        let mut output = String::new();
+    fn render_root(&mut self, node: &Node) -> Vec<RenderedNode> {
+        let mut output = Vec::new();
         if let Some(children) = node.children() {
             for child in children {
                 if !matches!(child, Node::Toml(_) | Node::Yaml(_) | Node::MdxjsEsm(_)) {
-                    output.push_str("    ");
-                    output.push_str(&self.render(child));
-                    output.push('\n');
+                    output.push(RenderedNode {
+                        code: self.render(child),
+                        source_offset: child.position().map(|position| position.start.offset),
+                    });
                 }
             }
         }
@@ -1607,19 +2007,14 @@ impl<'a> Renderer<'a> {
             Node::Root(value) => self.render_children(&value.children),
             Node::Paragraph(value) => self.render_paragraph(&value.children),
             Node::Heading(value) => {
-                let title = value
-                    .children
-                    .iter()
-                    .map(Node::to_string)
-                    .collect::<String>();
-                let base = slugify(&title);
-                let count = self.heading_ids.entry(base.clone()).or_insert(0);
-                let id = if *count == 0 {
-                    base
-                } else {
-                    format!("{base}-{count}")
-                };
-                *count += 1;
+                let heading = self
+                    .headings
+                    .get(self.heading_index)
+                    .expect("heading plan and renderer traversal must stay aligned");
+                self.heading_index += 1;
+                debug_assert_eq!(heading.depth, value.depth);
+                let id = heading.id.clone();
+                let title = heading.title.clone();
                 let content = self.render_children(&value.children);
                 format!(
                     "<h{} id={} aria-label={}>{}<a className=\"heading-anchor\" href={} aria-label={}>#</a></h{}>",
@@ -2542,155 +2937,464 @@ fn render_expression(value: &str) -> String {
     }
 }
 
-fn extract_esm(source: &str) -> (String, String) {
-    let mut output = source.as_bytes().to_vec();
-    let mut esm = String::new();
-    let mut offset = 0;
-    let lines: Vec<&str> = source.split_inclusive('\n').collect();
-    let mut index = 0;
-    let mut fence: Option<(u8, usize)> = None;
-    while index < lines.len() {
-        let line = lines[index];
-        if let Some((marker, length)) = markdown_fence_marker(line) {
-            match fence {
-                Some((active, minimum)) if marker == active && length >= minimum => fence = None,
-                None => fence = Some((marker, length)),
-                _ => {}
+fn parse_mdx_esm(value: &str) -> MdxSignal {
+    let interner = Interner::new();
+    let parsed = parse(value, &interner, SourceType::Tsx);
+    let errors = parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return MdxSignal::Ok;
+    }
+
+    let error = errors
+        .iter()
+        .find(|diagnostic| diagnostic_offset(diagnostic) < value.len())
+        .copied()
+        .unwrap_or(errors[0]);
+    let message = error.message.clone();
+    if errors
+        .iter()
+        .all(|diagnostic| diagnostic_offset(diagnostic) >= value.len())
+    {
+        MdxSignal::Eof(message, Box::default(), Box::default())
+    } else {
+        MdxSignal::Error(
+            message,
+            diagnostic_offset(error).min(value.len()),
+            Box::default(),
+            Box::default(),
+        )
+    }
+}
+
+fn diagnostic_offset(diagnostic: &wake_common::Diagnostic) -> usize {
+    diagnostic
+        .labels
+        .iter()
+        .find(|label| label.primary)
+        .or_else(|| diagnostic.labels.first())
+        .map_or(0, |label| label.span.lo as usize)
+}
+
+#[derive(Debug)]
+struct SpecifierReplacement {
+    span: Span,
+    value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFragmentKind {
+    Exact,
+    DerivedToken,
+}
+
+#[derive(Debug)]
+struct SourceFragment {
+    text: String,
+    source_offset: Option<usize>,
+    kind: SourceFragmentKind,
+}
+
+#[derive(Debug)]
+struct RewrittenEsm {
+    fragments: Vec<SourceFragment>,
+}
+
+#[derive(Debug)]
+struct MdxEsmBlock {
+    value: String,
+    stops: Vec<(usize, usize)>,
+    source_start: usize,
+}
+
+fn rewrite_mdx_esm(root: &Path, page: &Path, ast: &Node) -> Result<RewrittenEsm, DocsError> {
+    let mut blocks = Vec::new();
+    visit(ast, &mut |node| {
+        if let Node::MdxjsEsm(esm) = node {
+            blocks.push(MdxEsmBlock {
+                value: esm.value.clone(),
+                stops: esm.stops.clone(),
+                source_start: esm
+                    .position
+                    .as_ref()
+                    .map_or(0, |position| position.start.offset),
+            });
+        }
+    });
+
+    let mut fragments = Vec::new();
+    for block in blocks {
+        let interner = Interner::new();
+        let parsed = parse(&block.value, &interner, SourceType::Tsx);
+        if let Some(error) = parsed
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.is_error())
+        {
+            return Err(DocsError::Mdx(page.to_path_buf(), error.message.clone()));
+        }
+        let (tokens, lexer_diagnostics) = tokenize(&block.value);
+        if let Some(error) = lexer_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.is_error())
+        {
+            return Err(DocsError::Mdx(page.to_path_buf(), error.message.clone()));
+        }
+        let lexer = Lexer::new(&block.value);
+        let mut replacements = Vec::new();
+        for dependency in parsed.dependencies {
+            if !matches!(
+                dependency.kind,
+                DependencyKind::Import | DependencyKind::ExportFrom | DependencyKind::DynamicImport
+            ) {
+                continue;
             }
-            offset += line.len();
-            index += 1;
-            continue;
+            let specifier = interner.resolve(dependency.specifier);
+            if !specifier.starts_with("./") && !specifier.starts_with("../") {
+                continue;
+            }
+            let Some(token) =
+                locate_dependency_specifier(&tokens, dependency.kind, dependency.span)
+            else {
+                return Err(DocsError::Mdx(
+                    page.to_path_buf(),
+                    format!(
+                        "could not locate the typed module specifier `{specifier}` in its parser span"
+                    ),
+                ));
+            };
+            if lexer.string_value(token.span).as_ref() != specifier {
+                return Err(DocsError::Mdx(
+                    page.to_path_buf(),
+                    format!(
+                        "typed module specifier `{specifier}` did not match its syntax-selected token"
+                    ),
+                ));
+            }
+            let resolved = normalize_path(&page.parent().unwrap_or(root).join(&specifier));
+            let Ok(relative) = resolved.strip_prefix(root) else {
+                continue;
+            };
+            let raw = token.span.slice(&block.value);
+            let quote = raw.chars().next().unwrap_or('"');
+            replacements.push(SpecifierReplacement {
+                span: token.span,
+                value: format!("{quote}@@wake/docs-project/{}{quote}", slash_path(relative)),
+            });
         }
-        if fence.is_some() {
-            offset += line.len();
-            index += 1;
-            continue;
+        replacements.sort_by_key(|replacement| replacement.span.lo);
+        replacements.dedup_by_key(|replacement| replacement.span);
+        let mut cursor = 0;
+        for replacement in replacements {
+            append_exact_esm_fragments(
+                &mut fragments,
+                &block,
+                cursor..replacement.span.lo as usize,
+            );
+            fragments.push(SourceFragment {
+                text: replacement.value,
+                source_offset: mdx_absolute_offset(&block, replacement.span.lo as usize),
+                kind: SourceFragmentKind::DerivedToken,
+            });
+            cursor = replacement.span.hi as usize;
         }
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("import ") && !trimmed.starts_with("export ") {
-            offset += line.len();
-            index += 1;
-            continue;
+        append_exact_esm_fragments(&mut fragments, &block, cursor..block.value.len());
+        if !block.value.ends_with('\n') {
+            fragments.push(SourceFragment {
+                text: "\n".to_string(),
+                source_offset: None,
+                kind: SourceFragmentKind::Exact,
+            });
         }
-        let start = offset;
-        let mut statement = String::new();
-        loop {
-            let current = lines[index];
-            statement.push_str(current);
-            offset += current.len();
-            index += 1;
-            if javascript_statement_complete(&statement) || index == lines.len() {
+    }
+    Ok(RewrittenEsm { fragments })
+}
+
+fn locate_dependency_specifier(
+    tokens: &[Token],
+    kind: DependencyKind,
+    dependency_span: Span,
+) -> Option<Token> {
+    let within = tokens
+        .iter()
+        .copied()
+        .filter(|token| dependency_span.contains(token.span))
+        .collect::<Vec<_>>();
+    match kind {
+        DependencyKind::Import => {
+            if let Some(token) = within
+                .iter()
+                .find(|token| token.kind == TokenKind::Str && token.span == dependency_span)
+            {
+                return Some(*token);
+            }
+            top_level_token_after(&within, TokenKind::Keyword(Keyword::From), TokenKind::Str)
+        }
+        DependencyKind::ExportFrom => {
+            top_level_token_after(&within, TokenKind::Keyword(Keyword::From), TokenKind::Str)
+        }
+        DependencyKind::DynamicImport => {
+            let import = within
+                .iter()
+                .position(|token| token.kind == TokenKind::Keyword(Keyword::Import))?;
+            let lparen = within[import + 1..]
+                .iter()
+                .position(|token| token.kind == TokenKind::LParen)?
+                + import
+                + 1;
+            within
+                .get(lparen + 1)
+                .copied()
+                .filter(|token| token.kind == TokenKind::Str)
+        }
+        DependencyKind::Require => None,
+    }
+}
+
+fn top_level_token_after(
+    tokens: &[Token],
+    marker: TokenKind,
+    expected: TokenKind,
+) -> Option<Token> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
+            TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                depth = depth.saturating_sub(1);
+            }
+            _ if depth == 0 && token.kind == marker => {
+                if let Some(candidate) = tokens
+                    .get(index + 1)
+                    .copied()
+                    .filter(|token| token.kind == expected)
+                {
+                    return Some(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn append_exact_esm_fragments(
+    fragments: &mut Vec<SourceFragment>,
+    block: &MdxEsmBlock,
+    range: std::ops::Range<usize>,
+) {
+    if range.is_empty() {
+        return;
+    }
+    let mut boundaries = vec![range.start];
+    boundaries.extend(
+        block
+            .stops
+            .iter()
+            .map(|(relative, _)| *relative)
+            .filter(|relative| range.start < *relative && *relative < range.end),
+    );
+    boundaries.push(range.end);
+    for pair in boundaries.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        fragments.push(SourceFragment {
+            text: block.value[start..end].to_string(),
+            source_offset: mdx_absolute_offset(block, start),
+            kind: SourceFragmentKind::Exact,
+        });
+    }
+}
+
+fn mdx_absolute_offset(block: &MdxEsmBlock, relative: usize) -> Option<usize> {
+    let mut selected = None;
+    for &(stop_relative, stop_absolute) in &block.stops {
+        if stop_relative > relative {
+            break;
+        }
+        selected = Some((stop_relative, stop_absolute));
+    }
+    selected
+        .map(|(stop_relative, stop_absolute)| stop_absolute + relative - stop_relative)
+        .or_else(|| Some(block.source_start + relative))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OriginalPoint {
+    line: i64,
+    column: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GeneratedSegment {
+    column: i64,
+    original: Option<OriginalPoint>,
+}
+
+#[derive(Debug)]
+struct ModuleWriter<'a> {
+    source: &'a str,
+    line_starts: Vec<usize>,
+    code: String,
+    line: usize,
+    column: i64,
+    mappings: Vec<Vec<GeneratedSegment>>,
+}
+
+impl<'a> ModuleWriter<'a> {
+    fn new(source: &'a str) -> Self {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        Self {
+            source,
+            line_starts,
+            code: String::new(),
+            line: 0,
+            column: 0,
+            mappings: vec![Vec::new()],
+        }
+    }
+
+    fn push_synthetic(&mut self, value: &str) {
+        self.push_raw(value);
+    }
+
+    fn push_exact(&mut self, value: &str, source_offset: usize) {
+        let mut cursor = 0;
+        while cursor < value.len() {
+            let end = value[cursor..]
+                .find('\n')
+                .map_or(value.len(), |relative| cursor + relative);
+            if end > cursor {
+                self.push_mapped_line(&value[cursor..end], source_offset + cursor);
+            }
+            if end == value.len() {
                 break;
             }
+            self.push_raw("\n");
+            cursor = end + 1;
         }
-        let end = offset;
-        esm.push_str(statement.trim());
-        esm.push('\n');
-        for byte in &mut output[start..end] {
-            if *byte != b'\n' && *byte != b'\r' {
-                *byte = b' ';
+    }
+
+    fn push_derived(&mut self, value: &str, source_offset: usize) {
+        if value.is_empty() {
+            return;
+        }
+        if let Some(newline) = value.find('\n') {
+            if newline > 0 {
+                self.push_mapped_line(&value[..newline], source_offset);
             }
+            self.push_raw(&value[newline..]);
+        } else {
+            self.push_mapped_line(value, source_offset);
         }
     }
-    (
-        esm,
-        String::from_utf8(output).expect("space replacement preserves UTF-8"),
-    )
-}
 
-fn markdown_fence_marker(line: &str) -> Option<(u8, usize)> {
-    let trimmed = line.trim_start_matches([' ', '\t']);
-    let marker = *trimmed.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let length = trimmed
-        .as_bytes()
-        .iter()
-        .take_while(|candidate| **candidate == marker)
-        .count();
-    (length >= 3).then_some((marker, length))
-}
-fn javascript_statement_complete(value: &str) -> bool {
-    let trimmed = value.trim_end();
-    balanced_javascript(trimmed)
-        && (trimmed.ends_with(';')
-            || trimmed.ends_with('}')
-            || (trimmed.starts_with("import ")
-                && (trimmed.ends_with('\'') || trimmed.ends_with('"'))))
-}
-
-fn balanced_javascript(value: &str) -> bool {
-    let mut stack = Vec::new();
-    let mut quote = None;
-    let mut escaped = false;
-    for ch in value.chars() {
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active {
-                quote = None;
-            }
-            continue;
+    fn push_mapped_line(&mut self, value: &str, source_offset: usize) {
+        debug_assert!(!value.contains('\n'));
+        if value.is_empty() {
+            return;
         }
-        if matches!(ch, '\'' | '"' | '`') {
-            quote = Some(ch);
-        } else if matches!(ch, '(' | '[' | '{') {
-            stack.push(ch);
-        } else if let Some(expected) = match ch {
-            ')' => Some('('),
-            ']' => Some('['),
-            '}' => Some('{'),
-            _ => None,
-        } && stack.pop() != Some(expected)
-        {
-            return false;
-        }
+        self.push_segment(Some(self.original_point(source_offset)));
+        self.push_raw(value);
+        self.push_segment(None);
     }
-    quote.is_none() && stack.is_empty()
-}
 
-fn rewrite_relative_imports(root: &Path, page: &Path, esm: &str) -> String {
-    let regex = Regex::new(r#"(["'])(\.\.?/[^"']+)(["'])"#).expect("valid specifier regex");
-    regex
-        .replace_all(esm, |captures: &regex::Captures<'_>| {
-            let resolved = normalize_path(&page.parent().unwrap_or(root).join(&captures[2]));
-            if let Ok(relative) = resolved.strip_prefix(root) {
-                format!(
-                    "{}@@wake/docs-project/{}{}",
-                    &captures[1],
-                    slash_path(relative),
-                    &captures[3]
-                )
+    fn push_raw(&mut self, value: &str) {
+        self.code.push_str(value);
+        for character in value.chars() {
+            if character == '\n' {
+                self.line += 1;
+                self.column = 0;
+                if self.mappings.len() <= self.line {
+                    self.mappings.push(Vec::new());
+                }
             } else {
-                captures[0].to_string()
+                self.column += character.len_utf16() as i64;
             }
-        })
-        .into_owned()
-}
-
-fn render_source_map(source_path: &Path, source: &str, module: &str) -> String {
-    let generated_lines = module.lines().count();
-    let source_lines = source.lines().count().max(1);
-    let mut mappings = String::new();
-    let mut previous_line = 0i64;
-    for line in 0..generated_lines {
-        if line > 0 {
-            mappings.push(';');
         }
-        let original = line.min(source_lines - 1) as i64;
-        for value in [0, 0, original - previous_line, 0] {
-            encode_vlq(value, &mut mappings);
-        }
-        previous_line = original;
     }
-    serde_json::to_string(&json!({
-        "version": 3, "file": "page.tsx", "sources": [slash_path(source_path)],
-        "sourcesContent": [source], "names": [], "mappings": mappings,
-    }))
-    .expect("serializable source map")
+
+    fn push_segment(&mut self, original: Option<OriginalPoint>) {
+        let segment = GeneratedSegment {
+            column: self.column,
+            original,
+        };
+        let line = &mut self.mappings[self.line];
+        if line.last().is_some_and(|last| last.column == self.column) {
+            *line.last_mut().expect("checked last segment") = segment;
+        } else {
+            line.push(segment);
+        }
+    }
+
+    fn original_point(&self, offset: usize) -> OriginalPoint {
+        let offset = offset.min(self.source.len());
+        let line = self.line_starts.partition_point(|start| *start <= offset) - 1;
+        let column = self.source[self.line_starts[line]..offset]
+            .encode_utf16()
+            .count();
+        OriginalPoint {
+            line: line as i64,
+            column: column as i64,
+        }
+    }
+
+    fn render_source_map(&self, identity: &PageIdentity, source: &str) -> String {
+        let line_count = self.code.lines().count();
+        let mut encoded = String::new();
+        let mut previous_source = 0i64;
+        let mut previous_original_line = 0i64;
+        let mut previous_original_column = 0i64;
+        for line_index in 0..line_count {
+            if line_index > 0 {
+                encoded.push(';');
+            }
+            let mut previous_generated_column = 0i64;
+            for (index, segment) in self
+                .mappings
+                .get(line_index)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if index > 0 {
+                    encoded.push(',');
+                }
+                encode_vlq(segment.column - previous_generated_column, &mut encoded);
+                previous_generated_column = segment.column;
+                if let Some(original) = segment.original {
+                    encode_vlq(-previous_source, &mut encoded);
+                    previous_source = 0;
+                    encode_vlq(original.line - previous_original_line, &mut encoded);
+                    previous_original_line = original.line;
+                    encode_vlq(original.column - previous_original_column, &mut encoded);
+                    previous_original_column = original.column;
+                }
+            }
+        }
+        serde_json::to_string(&json!({
+            "version": 3,
+            "file": identity.generated_module,
+            "sources": [identity.source_file],
+            "sourcesContent": [source],
+            "names": [],
+            "mappings": encoded,
+        }))
+        .expect("serializable source map")
+    }
+
+    fn finish(self) -> String {
+        self.code
+    }
 }
 
 fn encode_vlq(value: i64, output: &mut String) {
@@ -2815,37 +3519,778 @@ fn scan_files(
     Ok(())
 }
 
-fn remove_stale_generated_files(
-    generated_dir: &Path,
-    current: &BTreeSet<PathBuf>,
-    changed: &mut Vec<PathBuf>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationManifest {
+    files: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GenerationSnapshot {
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct RenderedFileTreeBuilder {
+    files: OwnedFileTreeBuilder,
+    manifest_files: BTreeSet<String>,
+}
+
+impl RenderedFileTreeBuilder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn manifest_files(&self) -> Vec<String> {
+        self.manifest_files.iter().cloned().collect()
+    }
+
+    fn seal(self) -> OwnedFileTree {
+        self.files.seal()
+    }
+}
+
+trait GenerationTransactionOps {
+    fn rename(&self, source: &Path, destination: &Path) -> std::io::Result<()>;
+    fn remove_tree(&self, path: &Path) -> std::io::Result<()>;
+}
+
+struct HostGenerationTransactionOps;
+
+impl GenerationTransactionOps for HostGenerationTransactionOps {
+    fn rename(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        fs::rename(source, destination)
+    }
+
+    fn remove_tree(&self, path: &Path) -> std::io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+}
+
+/// Acquires the persistent cross-process lock for one generated Docs namespace.
+///
+/// The lock file lives at the project `.wake` root, outside every replaceable `.wake/**/docs/generated`
+/// directory. It is deliberately retained after publication: unlinking a locked file would let a
+/// later process open a different inode and enter the transaction concurrently. Operating-system
+/// file locks are released automatically if a publisher exits unexpectedly.
+fn acquire_generation_commit_lock(lock_root: &Path) -> Result<fs::File, DocsError> {
+    let lock_path = lock_root.join(GENERATION_COMMIT_LOCK_FILE);
+    validate_generation_commit_lock_shape(&lock_path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| DocsError::Io(lock_path.clone(), error.to_string()))?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                validate_generation_commit_lock_shape(&lock_path)?;
+                let opened = same_file::Handle::from_file(
+                    file.try_clone()
+                        .map_err(|error| DocsError::Io(lock_path.clone(), error.to_string()))?,
+                )
+                .map_err(|error| DocsError::Io(lock_path.clone(), error.to_string()))?;
+                let named = same_file::Handle::from_path(&lock_path)
+                    .map_err(|error| DocsError::Io(lock_path.clone(), error.to_string()))?;
+                if opened != named {
+                    return Err(DocsError::InvalidConfig(format!(
+                        "generated Docs commit lock identity changed while acquiring it: {}",
+                        lock_path.display()
+                    )));
+                }
+                return Ok(file);
+            }
+            Err(error) => {
+                let error: std::io::Error = error.into();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(DocsError::Io(lock_path.clone(), error.to_string()));
+                }
+                let remaining = GENERATION_COMMIT_LOCK_TIMEOUT.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(DocsError::Io(
+                        lock_path,
+                        "timed out waiting for the generated Docs commit lock".to_string(),
+                    ));
+                }
+                thread::sleep(remaining.min(GENERATION_COMMIT_LOCK_RETRY));
+            }
+        }
+    }
+}
+
+fn validate_generation_commit_lock_shape(lock_path: &Path) -> Result<(), DocsError> {
+    match fs::symlink_metadata(lock_path) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(DocsError::InvalidConfig(format!(
+                    "generated Docs commit lock must be a physical regular file: {}",
+                    lock_path.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DocsError::Io(lock_path.to_path_buf(), error.to_string())),
+    }
+}
+
+fn insert_generation_file(
+    generation: &mut RenderedFileTreeBuilder,
+    relative: PathBuf,
+    content: &[u8],
 ) -> Result<(), DocsError> {
-    let manifest = generated_dir.join("manifest.json");
-    let Ok(source) = fs::read_to_string(&manifest) else {
-        return Ok(());
+    let name = generation_relative_name(&relative)?;
+    let relative = projected_generation_path(&relative)?;
+    generation
+        .files
+        .insert(relative, content.to_vec())
+        .map_err(|error| {
+            DocsError::InvalidConfig(format!(
+                "generated Docs output inventory is invalid: {error}"
+            ))
+        })?;
+    let inserted = generation.manifest_files.insert(name);
+    debug_assert!(inserted, "owned tree accepted a duplicate path identity");
+    Ok(())
+}
+
+fn projected_generation_path(relative: &Path) -> Result<ProjectedRelativePath, DocsError> {
+    ProjectedRelativePath::new(relative).map_err(|error| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs output contains an unsafe path: {error}"
+        ))
+    })
+}
+
+fn rendered_file_map(files: &OwnedFileTree) -> BTreeMap<PathBuf, Vec<u8>> {
+    files
+        .iter()
+        .map(|(relative, content)| (relative.as_path().to_path_buf(), content.to_vec()))
+        .collect()
+}
+
+fn generation_relative_name(relative: &Path) -> Result<String, DocsError> {
+    if relative.as_os_str().is_empty() {
+        return Err(DocsError::InvalidConfig(
+            "generated Docs output path must not be empty".to_string(),
+        ));
+    }
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs output contains an unsafe path: {}",
+                relative.display()
+            )));
+        };
+        let segment = segment.to_str().ok_or_else(|| {
+            DocsError::InvalidConfig(format!(
+                "generated Docs output path is not valid UTF-8: {}",
+                relative.display()
+            ))
+        })?;
+        if segment.is_empty()
+            || segment.contains(['/', '\\', ':'])
+            || segment.ends_with('.')
+            || segment.ends_with(' ')
+        {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs output contains an unsafe path: {}",
+                relative.display()
+            )));
+        }
+        segments.push(segment);
+    }
+    Ok(segments.join("/"))
+}
+
+fn manifest_relative_path(value: &str) -> Result<PathBuf, DocsError> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains(['\\', ':'])
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(DocsError::InvalidConfig(format!(
+            "generated Docs manifest contains an unsafe path: {value}"
+        )));
+    }
+    let relative = value.split('/').collect::<PathBuf>();
+    if generation_relative_name(&relative)? != value {
+        return Err(DocsError::InvalidConfig(format!(
+            "generated Docs manifest contains a non-canonical path: {value}"
+        )));
+    }
+    Ok(relative)
+}
+
+fn publish_generation(
+    project_root: &Path,
+    generated_dir: &Path,
+    generation: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<Vec<PathBuf>, DocsError> {
+    publish_generation_with_ops(
+        project_root,
+        generated_dir,
+        generation,
+        &HostGenerationTransactionOps,
+    )
+}
+
+fn publish_generation_with_ops(
+    project_root: &Path,
+    generated_dir: &Path,
+    generation: &BTreeMap<PathBuf, Vec<u8>>,
+    ops: &dyn GenerationTransactionOps,
+) -> Result<Vec<PathBuf>, DocsError> {
+    validate_generation_namespace(project_root, generated_dir)?;
+    validate_generation_files(generated_dir, generation)?;
+    let _transaction_guard = GENERATION_TRANSACTION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    validate_existing_generation_ancestors(project_root, generated_dir)?;
+    let lock_root = project_root.join(".wake");
+    ensure_physical_generation_directory(project_root, &lock_root)?;
+    let _commit_lock = acquire_generation_commit_lock(&lock_root)?;
+    // Lock acquisition is an observable filesystem operation. Revalidate the complete physical
+    // namespace while holding the project-wide cross-process guard before creating a possibly
+    // nested parent, or inspecting and replacing any accepted generation.
+    validate_existing_generation_ancestors(project_root, generated_dir)?;
+    let parent = generated_dir.parent().ok_or_else(|| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs directory has no parent: {}",
+            generated_dir.display()
+        ))
+    })?;
+    ensure_physical_generation_directory(project_root, parent)?;
+    let previous = inspect_generation_tree(generated_dir)?;
+    let changed_files = generation_changes(
+        generated_dir,
+        previous.as_ref().map(|snapshot| &snapshot.files),
+        generation,
+    );
+    if changed_files.is_empty() {
+        return Ok(changed_files);
+    }
+
+    let stage = tempfile::Builder::new()
+        .prefix(".wake-docs-next-")
+        .tempdir_in(parent)
+        .map_err(|error| DocsError::Io(parent.to_path_buf(), error.to_string()))?;
+    for (relative, content) in generation {
+        let output = stage.path().join(relative);
+        let output_parent = output.parent().unwrap_or(stage.path());
+        ensure_physical_generation_directory(stage.path(), output_parent)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(|error| DocsError::Io(output.clone(), error.to_string()))?;
+        file.write_all(content)
+            .and_then(|()| file.flush())
+            .map_err(|error| DocsError::Io(output.clone(), error.to_string()))?;
+    }
+    let staged = inspect_generation_tree(stage.path())?.ok_or_else(|| {
+        DocsError::InvalidConfig("generated Docs staging tree disappeared".to_string())
+    })?;
+    if staged.files != *generation {
+        return Err(DocsError::InvalidConfig(
+            "generated Docs staging tree does not match its render plan".to_string(),
+        ));
+    }
+
+    let current = inspect_generation_tree(generated_dir)?;
+    if current != previous {
+        return Err(DocsError::InvalidConfig(format!(
+            "generated Docs tree changed while its replacement was being staged: {}",
+            generated_dir.display()
+        )));
+    }
+
+    let backup = if previous.is_some() {
+        let path = vacant_generation_sibling(parent, ".wake-docs-previous-")?;
+        ops.rename(generated_dir, &path)
+            .map_err(|error| DocsError::Io(generated_dir.to_path_buf(), error.to_string()))?;
+        Some(path)
+    } else {
+        None
     };
-    let parsed: serde_json::Value = serde_json::from_str(&source).unwrap_or_default();
-    let Some(files) = parsed.get("files").and_then(serde_json::Value::as_array) else {
-        return Ok(());
-    };
-    for relative in files.iter().filter_map(serde_json::Value::as_str) {
-        let path = generated_dir.join(relative);
-        if !current.contains(&path) && path.is_file() {
-            fs::remove_file(&path)
-                .map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
-            changed.push(path);
+    if let Err(install_error) = ops.rename(stage.path(), generated_dir) {
+        if let Some(backup) = &backup
+            && let Err(restore_error) = ops.rename(backup, generated_dir)
+        {
+            return Err(DocsError::Io(
+                generated_dir.to_path_buf(),
+                format!(
+                    "failed to install generated Docs tree ({install_error}); failed to restore previous generation ({restore_error})"
+                ),
+            ));
+        }
+        return Err(DocsError::Io(
+            generated_dir.to_path_buf(),
+            install_error.to_string(),
+        ));
+    }
+
+    // The target now owns the committed generation. Cleanup must never turn a successful commit
+    // into an error observed by callers; a unique sibling can be reclaimed by later maintenance.
+    if let Some(backup) = &backup {
+        let _ = ops.remove_tree(backup);
+    }
+    Ok(changed_files)
+}
+
+fn vacant_generation_sibling(parent: &Path, prefix: &str) -> Result<PathBuf, DocsError> {
+    let reservation = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(parent)
+        .map_err(|error| DocsError::Io(parent.to_path_buf(), error.to_string()))?;
+    let path = reservation.path().to_path_buf();
+    reservation
+        .close()
+        .map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
+    Ok(path)
+}
+
+fn validate_existing_generation_ancestors(
+    project_root: &Path,
+    generated_dir: &Path,
+) -> Result<(), DocsError> {
+    let relative = strip_generation_prefix(project_root, generated_dir).ok_or_else(|| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs directory must stay inside the project root: {}",
+            generated_dir.display()
+        ))
+    })?;
+    let mut current = project_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs directory contains an unsafe component: {}",
+                generated_dir.display()
+            )));
+        };
+        validate_generation_directory_component(component, generated_dir)?;
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                    return Err(DocsError::InvalidConfig(format!(
+                        "generated Docs directory must not traverse a symbolic link, reparse point, or non-directory: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(DocsError::Io(current.clone(), error.to_string())),
         }
     }
     Ok(())
+}
+
+fn inspect_generation_tree(directory: &Path) -> Result<Option<GenerationSnapshot>, DocsError> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err(DocsError::InvalidConfig(format!(
+                    "generated Docs tree must be a physical directory: {}",
+                    directory.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DocsError::Io(directory.to_path_buf(), error.to_string())),
+    }
+    let is_empty = fs::read_dir(directory)
+        .map_err(|error| DocsError::Io(directory.to_path_buf(), error.to_string()))?
+        .next()
+        .is_none();
+    if is_empty {
+        return Ok(Some(GenerationSnapshot {
+            files: BTreeMap::new(),
+        }));
+    }
+    let mut files = BTreeMap::new();
+    collect_generation_files(directory, directory, &mut files)?;
+    validate_generation_files(directory, &files)?;
+    Ok(Some(GenerationSnapshot { files }))
+}
+
+fn collect_generation_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<(), DocsError> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| DocsError::Io(directory.to_path_buf(), error.to_string()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| DocsError::Io(directory.to_path_buf(), error.to_string()))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
+        if metadata_is_link_or_reparse_point(&metadata) {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs tree must not contain a symbolic link or reparse point: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            collect_generation_files(root, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs tree must contain only directories and regular files: {}",
+                path.display()
+            )));
+        }
+        if metadata_has_multiple_links(&path, &metadata)? {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs file must not have multiple hard links: {}",
+                path.display()
+            )));
+        }
+        let relative = path.strip_prefix(root).map_err(|_| {
+            DocsError::InvalidConfig(format!(
+                "generated Docs file escaped its generation tree: {}",
+                path.display()
+            ))
+        })?;
+        generation_relative_name(relative)?;
+        let content =
+            fs::read(&path).map_err(|error| DocsError::Io(path.clone(), error.to_string()))?;
+        if files.insert(relative.to_path_buf(), content).is_some() {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs tree contains a duplicate file identity: {}",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_generation_files(
+    directory: &Path,
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<(), DocsError> {
+    let mut physical_identities = BTreeMap::new();
+    for relative in files.keys() {
+        let name = generation_relative_name(relative)?;
+        let identity = generation_path_identity(&name);
+        if let Some(first) = physical_identities.insert(identity, name.clone()) {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs tree contains case-equivalent paths `{first}` and `{name}`"
+            )));
+        }
+    }
+    let manifest_path = Path::new("manifest.json");
+    let manifest_bytes = files.get(manifest_path).ok_or_else(|| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs tree is missing its manifest: {}",
+            directory.join(manifest_path).display()
+        ))
+    })?;
+    let manifest: GenerationManifest = serde_json::from_slice(manifest_bytes).map_err(|error| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs manifest is invalid at {}: {error}",
+            directory.join(manifest_path).display()
+        ))
+    })?;
+    let mut previous: Option<&str> = None;
+    let mut declared = BTreeSet::new();
+    let mut declared_identities = BTreeMap::new();
+    for value in &manifest.files {
+        if previous.is_some_and(|previous| previous >= value.as_str()) {
+            return Err(DocsError::InvalidConfig(
+                "generated Docs manifest file entries must be sorted and unique".to_string(),
+            ));
+        }
+        previous = Some(value);
+        let relative = manifest_relative_path(value)?;
+        if relative == manifest_path {
+            return Err(DocsError::InvalidConfig(
+                "generated Docs manifest must not list itself".to_string(),
+            ));
+        }
+        let identity = generation_path_identity(value);
+        if let Some(first) = declared_identities.insert(identity, value.clone()) {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs manifest contains case-equivalent paths `{first}` and `{value}`"
+            )));
+        }
+        declared.insert(relative);
+    }
+    let actual = files
+        .keys()
+        .filter(|relative| relative.as_path() != manifest_path)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual != declared {
+        return Err(DocsError::InvalidConfig(format!(
+            "generated Docs manifest does not exactly describe the physical file set at {}",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+fn generation_path_identity(value: &str) -> String {
+    value.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn generation_changes(
+    generated_dir: &Path,
+    previous: Option<&BTreeMap<PathBuf, Vec<u8>>>,
+    next: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Vec<PathBuf> {
+    let mut paths = previous
+        .into_iter()
+        .flat_map(BTreeMap::keys)
+        .chain(next.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    paths.retain(|relative| previous.and_then(|files| files.get(relative)) != next.get(relative));
+    paths
+        .into_iter()
+        .map(|relative| generated_dir.join(relative))
+        .collect()
+}
+
+fn ensure_physical_generation_directory(root: &Path, directory: &Path) -> Result<(), DocsError> {
+    let relative = strip_generation_prefix(root, directory).ok_or_else(|| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs directory must stay inside the project root: {}",
+            directory.display()
+        ))
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(DocsError::InvalidConfig(format!(
+                "generated Docs directory contains an unsafe component: {}",
+                directory.display()
+            )));
+        };
+        validate_generation_directory_component(component, directory)?;
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                    return Err(DocsError::InvalidConfig(format!(
+                        "generated Docs directory must not traverse a symbolic link or reparse point: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&current)
+                            .map_err(|error| DocsError::Io(current.clone(), error.to_string()))?;
+                        if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                            return Err(DocsError::InvalidConfig(format!(
+                                "generated Docs directory creation raced with a symbolic link, reparse point, or non-directory: {}",
+                                current.display()
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(DocsError::Io(current.clone(), error.to_string()));
+                    }
+                }
+            }
+            Err(error) => return Err(DocsError::Io(current.clone(), error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn validate_generation_namespace(root: &Path, directory: &Path) -> Result<(), DocsError> {
+    let relative = strip_generation_prefix(root, directory).ok_or_else(|| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs directory must stay inside the project root: {}",
+            directory.display()
+        ))
+    })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(component) => {
+                validate_generation_directory_component(component, directory)?;
+                Ok(component)
+            }
+            _ => Err(DocsError::InvalidConfig(format!(
+                "generated Docs directory contains an unsafe component: {}",
+                directory.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owns_namespace = components
+        .first()
+        .is_some_and(|value| generation_component_eq(value, OsStr::new(".wake")))
+        && components.len() >= 3
+        && generation_component_eq(components[components.len() - 2], OsStr::new("docs"))
+        && generation_component_eq(components[components.len() - 1], OsStr::new("generated"))
+        && components
+            .windows(2)
+            .filter(|pair| {
+                generation_component_eq(pair[0], OsStr::new("docs"))
+                    && generation_component_eq(pair[1], OsStr::new("generated"))
+            })
+            .count()
+            == 1;
+    if !owns_namespace {
+        return Err(DocsError::InvalidConfig(format!(
+            "generated Docs directory must be one non-nested Wake-owned `.wake/**/docs/generated` path: {}",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+fn strip_generation_prefix(root: &Path, path: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let root_components = root.components().collect::<Vec<_>>();
+        let path_components = path.components().collect::<Vec<_>>();
+        if root_components.len() > path_components.len()
+            || !root_components.iter().zip(&path_components).all(
+                |(root_component, path_component)| {
+                    generation_component_eq(root_component.as_os_str(), path_component.as_os_str())
+                },
+            )
+        {
+            return None;
+        }
+        Some(
+            path_components[root_components.len()..]
+                .iter()
+                .map(|component| component.as_os_str())
+                .collect(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn generation_component_eq(left: &OsStr, right: &OsStr) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        left.to_str()
+            .zip(right.to_str())
+            .is_some_and(|(left, right)| {
+                windows_component_identity(left) == windows_component_identity(right)
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn windows_component_identity(value: &str) -> String {
+    let value = value.strip_prefix(r"\\?\").unwrap_or(value);
+    let value = value.strip_prefix("UNC\\").unwrap_or(value);
+    value
+        .trim_start_matches(['\\', '/'])
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn validate_generation_directory_component(
+    component: &OsStr,
+    directory: &Path,
+) -> Result<(), DocsError> {
+    let component = component.to_str().ok_or_else(|| {
+        DocsError::InvalidConfig(format!(
+            "generated Docs directory is not valid UTF-8: {}",
+            directory.display()
+        ))
+    })?;
+    if component.contains(['/', '\\', ':']) || component.ends_with('.') || component.ends_with(' ')
+    {
+        return Err(DocsError::InvalidConfig(format!(
+            "generated Docs directory contains a non-portable component: {}",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+fn metadata_is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn metadata_has_multiple_links(path: &Path, metadata: &fs::Metadata) -> Result<bool, DocsError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let _ = path;
+        Ok(metadata.nlink() > 1)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let _ = metadata;
+        let file = fs::File::open(path)
+            .map_err(|error| DocsError::Io(path.to_path_buf(), error.to_string()))?;
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle stays open for the call and `information` points to a valid,
+        // writable `BY_HANDLE_FILE_INFORMATION` value.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(DocsError::Io(
+                path.to_path_buf(),
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        Ok(information.nNumberOfLinks > 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        let _ = metadata;
+        Ok(false)
+    }
 }
 
 fn atomic_write_if_changed(path: &Path, content: &[u8]) -> Result<bool, DocsError> {
     let _write_guard = ATOMIC_WRITE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if fs::read(path).is_ok_and(|current| current == content) {
-        return Ok(false);
-    }
+    let changed = !fs::read(path).is_ok_and(|current| current == content);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| DocsError::Io(parent.to_path_buf(), error.to_string()))?;
@@ -2885,7 +4330,7 @@ fn atomic_write_if_changed(path: &Path, content: &[u8]) -> Result<bool, DocsErro
         let _ = fs::remove_file(&temporary);
         return Err(DocsError::Io(path.to_path_buf(), error.to_string()));
     }
-    Ok(true)
+    Ok(changed)
 }
 
 /// Copy public after bundling, rejecting collisions with generated output.
@@ -2969,8 +4414,8 @@ pub fn write_route_shells(
     atomic_write_if_changed(&outdir.join("404.html"), not_found_html.as_bytes())?;
 
     for route in routes {
-        let relative = route.slug.trim_matches('/');
-        if relative.is_empty() {
+        let route_path = RoutePath::from_canonical_encoded(&route.slug)?;
+        if route_path.encoded == "/" {
             continue;
         }
         let description = if route.description.is_empty() {
@@ -2984,7 +4429,12 @@ pub fn write_route_shells(
             description,
             locale,
         );
-        atomic_write_if_changed(&outdir.join(relative).join("index.html"), html.as_bytes())?;
+        atomic_write_if_changed(
+            &outdir
+                .join(route_path.decoded_relative_path())
+                .join("index.html"),
+            html.as_bytes(),
+        )?;
     }
     Ok(())
 }
@@ -3088,23 +4538,6 @@ fn is_static_value(value: Option<&AttributeValue>) -> bool {
     }
 }
 
-fn derive_slug(relative: &Path) -> String {
-    let mut path = relative.with_extension("");
-    if path.file_name().and_then(|value| value.to_str()) == Some("index") {
-        path.pop();
-    }
-    format!("/{}", slash_path(path))
-}
-
-fn normalize_slug(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() || value == "/" {
-        "/".to_string()
-    } else {
-        format!("/{}", value.trim_matches('/'))
-    }
-}
-
 fn normalize_base(value: &str) -> String {
     if value.trim().is_empty() || value == "/" {
         "/".to_string()
@@ -3205,6 +4638,75 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DecodedMapping {
+        generated_column: i64,
+        original: Option<(i64, i64)>,
+    }
+
+    fn decode_test_mappings(value: &str) -> Vec<Vec<DecodedMapping>> {
+        let mut previous_source = 0;
+        let mut previous_line = 0;
+        let mut previous_column = 0;
+        value
+            .split(';')
+            .map(|line| {
+                let mut generated_column = 0;
+                line.split(',')
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| {
+                        let values = decode_test_segment(segment);
+                        generated_column += values[0];
+                        let original = if values.len() >= 4 {
+                            previous_source += values[1];
+                            previous_line += values[2];
+                            previous_column += values[3];
+                            assert_eq!(previous_source, 0, "Docs pages have one source");
+                            Some((previous_line, previous_column))
+                        } else {
+                            None
+                        };
+                        DecodedMapping {
+                            generated_column,
+                            original,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn decode_test_segment(segment: &str) -> Vec<i64> {
+        const BASE64: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = segment.as_bytes();
+        let mut index = 0;
+        let mut values = Vec::new();
+        while index < bytes.len() {
+            let mut shift = 0;
+            let mut encoded = 0u64;
+            loop {
+                let digit = BASE64
+                    .as_bytes()
+                    .iter()
+                    .position(|candidate| *candidate == bytes[index])
+                    .expect("valid base64 VLQ") as u64;
+                index += 1;
+                encoded |= (digit & 31) << shift;
+                shift += 5;
+                if digit & 32 == 0 {
+                    break;
+                }
+            }
+            let magnitude = (encoded >> 1) as i64;
+            values.push(if encoded & 1 == 1 {
+                -magnitude
+            } else {
+                magnitude
+            });
+        }
+        values
+    }
 
     #[test]
     fn component_preview_scopes_configured_accent_without_mutating_document_root() {
@@ -3362,6 +4864,799 @@ mod tests {
         generate(root, options, mode)
     }
 
+    fn raw_file_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() && !metadata_is_link_or_reparse_point(&metadata) {
+                    collect(root, &path, files);
+                } else if metadata.is_file() {
+                    files.insert(
+                        slash_path(path.strip_prefix(root).unwrap()),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files);
+        files
+    }
+
+    fn rendered_file_snapshot(rendered: &RenderedProject) -> BTreeMap<String, Vec<u8>> {
+        rendered
+            .files
+            .iter()
+            .map(|(relative, content)| (slash_path(relative.as_path()), content.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn render_is_independent_of_the_physical_generation_namespace() {
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        write_fixture_navigation(&root);
+        let wake_dir = root.join(".wake");
+
+        let first = render_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap();
+        assert!(
+            !wake_dir.exists(),
+            "pure render created the publication root"
+        );
+        assert!(!first.files.is_empty());
+
+        let generated_dir = wake_dir.join("docs/generated");
+        fs::create_dir_all(&generated_dir).unwrap();
+        fs::write(generated_dir.join("sentinel.txt"), "untouched").unwrap();
+        fs::write(
+            generated_dir.join("manifest.json"),
+            b"not a valid generation manifest",
+        )
+        .unwrap();
+        let before = raw_file_snapshot(&generated_dir);
+        let second = render_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered_file_snapshot(&second),
+            rendered_file_snapshot(&first)
+        );
+        assert_eq!(raw_file_snapshot(&generated_dir), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rendered_project_matches_legacy_physical_generation_and_metadata() {
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n\nBody.\n").unwrap();
+        write_fixture_navigation(&root);
+        let rendered = render_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap();
+        let generated = generate_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw_file_snapshot(&generated.generated_dir),
+            rendered_file_snapshot(&rendered)
+        );
+        assert_eq!(generated.root, rendered.root);
+        assert_eq!(
+            generated.entry,
+            generated
+                .generated_dir
+                .join(rendered.entry_relative.as_path())
+        );
+        assert_eq!(generated.watch_roots, rendered.watch_roots);
+        assert_eq!(generated.routes, rendered.routes);
+        assert_eq!(generated.mode, rendered.mode);
+        assert_eq!(generated.demos, rendered.demos);
+        assert_eq!(generated.warnings, rendered.warnings);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_render_leaves_the_previous_physical_generation_untouched() {
+        let root = fixture();
+        let page = root.join("docs/index.mdx");
+        fs::write(&page, "# Accepted\n").unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let before = raw_file_snapshot(&generated.generated_dir);
+
+        fs::write(&page, "+++\ntitle = [\n+++\n# Broken\n").unwrap();
+        let error = render_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DocsError::Frontmatter(_, _)), "{error}");
+        assert_eq!(raw_file_snapshot(&generated.generated_dir), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_generation_directory_rejects_user_and_external_trees_before_writing() {
+        let root = fixture();
+        write_fixture_navigation(&root);
+        let sentinel = root.join("src/sentinel.txt");
+        fs::write(&sentinel, "keep").unwrap();
+        let external = root.with_extension("outside");
+        let _ = fs::remove_dir_all(&external);
+
+        for generated_dir in [&root, &root.join("src"), &external] {
+            let error = generate_with_mode_in(
+                &root,
+                generated_dir,
+                &DocsOptions::default(),
+                BuildMode::Development,
+                DocsMode::Site,
+            )
+            .unwrap_err();
+            assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+            assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep");
+            assert!(!generated_dir.join("registry.ts").exists());
+        }
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(external);
+    }
+
+    #[test]
+    fn nested_generated_docs_namespace_is_rejected_before_writing() {
+        let root = fixture();
+        let outer = root.join(".wake/docs/generated");
+        let nested = outer.join("candidate/docs/generated");
+
+        let error = generate_with_mode_in(
+            &root,
+            &nested,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+        assert!(!outer.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_first_generation_directory_creation_is_idempotent() {
+        let root = fixture();
+        let wake_root = root.join(".wake");
+        let barrier = Arc::new(Barrier::new(16));
+        let workers = (0..16)
+            .map(|_| {
+                let root = root.clone();
+                let wake_root = wake_root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    ensure_physical_generation_directory(&root, &wake_root)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let metadata = fs::symlink_metadata(&wake_root).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata_is_link_or_reparse_point(&metadata));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_generation_validates_the_target_before_rendering_sources() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            "+++\ntitle = [\n+++\n# Broken\n",
+        )
+        .unwrap();
+
+        let error = generate_with_mode_in(
+            &root,
+            root.join("src"),
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generation_namespace_uses_windows_path_identity_without_allowing_ads() {
+        let root = Path::new(r"C:\Project");
+        assert!(
+            validate_generation_namespace(
+                root,
+                Path::new(r"\\?\c:\PROJECT\.WAKE\candidate\DOCS\GENERATED"),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_generation_namespace(
+                root,
+                Path::new(r"C:\Project\.wake\candidate:stream\docs\generated"),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_generation_namespace(
+                root,
+                Path::new(r"C:\Project-other\.wake\docs\generated"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_leaves_the_previous_generation_byte_identical() {
+        let root = fixture();
+        let generated = root.join(".wake/docs/generated");
+        fs::create_dir_all(&generated).unwrap();
+        let stale = generated.join("stale.ts");
+        fs::write(&stale, "keep until validation succeeds").unwrap();
+        fs::write(
+            generated.join("manifest.json"),
+            r#"{"files":["stale.ts","../../outside.txt"]}"#,
+        )
+        .unwrap();
+        let before = raw_file_snapshot(&generated);
+
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+        assert_eq!(raw_file_snapshot(&generated), before);
+        assert_eq!(
+            fs::read_to_string(stale).unwrap(),
+            "keep until validation succeeds"
+        );
+        let parent_entries = fs::read_dir(generated.parent().unwrap())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let parent_names = parent_entries
+            .iter()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            parent_names,
+            BTreeSet::from(["generated".to_string()]),
+            "unexpected generated Docs transaction sibling"
+        );
+        assert!(
+            root.join(".wake")
+                .join(GENERATION_COMMIT_LOCK_FILE)
+                .is_file()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_precreated_generation_directory_is_a_compatible_placeholder() {
+        let root = fixture();
+        let generated = root.join(".wake/docs/generated");
+        fs::create_dir_all(&generated).unwrap();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+
+        let result =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        assert_eq!(
+            result.generated_dir,
+            fs::canonicalize(generated.parent().unwrap())
+                .unwrap()
+                .join("generated")
+        );
+        assert!(generated.join("manifest.json").is_file());
+        assert!(generated.join("pages/index.tsx").is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_schema_order_paths_and_physical_set_are_strict() {
+        let directory = Path::new(".wake/docs/generated");
+        let invalid = [
+            (
+                BTreeMap::from([(
+                    PathBuf::from("manifest.json"),
+                    br#"{"files":[],"owner":"user"}"#.to_vec(),
+                )]),
+                "unknown field",
+            ),
+            (
+                BTreeMap::from([
+                    (PathBuf::from("a.ts"), b"a".to_vec()),
+                    (
+                        PathBuf::from("manifest.json"),
+                        br#"{"files":["z.ts","a.ts"]}"#.to_vec(),
+                    ),
+                    (PathBuf::from("z.ts"), b"z".to_vec()),
+                ]),
+                "sorted and unique",
+            ),
+            (
+                BTreeMap::from([
+                    (PathBuf::from("a.ts"), b"a".to_vec()),
+                    (
+                        PathBuf::from("manifest.json"),
+                        br#"{"files":["a.ts","a.ts"]}"#.to_vec(),
+                    ),
+                ]),
+                "sorted and unique",
+            ),
+            (
+                BTreeMap::from([
+                    (PathBuf::from("A.ts"), b"A".to_vec()),
+                    (PathBuf::from("a.ts"), b"a".to_vec()),
+                    (
+                        PathBuf::from("manifest.json"),
+                        br#"{"files":["A.ts","a.ts"]}"#.to_vec(),
+                    ),
+                ]),
+                "case-equivalent",
+            ),
+            (
+                BTreeMap::from([(
+                    PathBuf::from("manifest.json"),
+                    br#"{"files":["stream.ts:payload"]}"#.to_vec(),
+                )]),
+                "unsafe path",
+            ),
+        ];
+        for (files, expected) in invalid {
+            let error = validate_generation_files(directory, &files).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` diagnostic, got: {error}"
+            );
+        }
+
+        let extra = BTreeMap::from([
+            (PathBuf::from("extra.ts"), b"extra".to_vec()),
+            (PathBuf::from("manifest.json"), br#"{"files":[]}"#.to_vec()),
+        ]);
+        assert!(validate_generation_files(directory, &extra).is_err());
+    }
+
+    #[cfg(unix)]
+    fn generated_test_file_identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fs::metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[cfg(windows)]
+    fn generated_test_file_identity(path: &Path) -> (u32, u64) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let file = fs::File::open(path).unwrap();
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the fixture handle stays open and the output pointer is valid for the call.
+        assert_ne!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) },
+            0
+        );
+        (
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        )
+    }
+
+    #[test]
+    fn identical_generation_is_a_true_no_op_without_a_directory_swap() {
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        let first =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let tracked = first.generated_dir.join("registry.ts");
+        let identity = generated_test_file_identity(&tracked);
+        let second =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+
+        assert!(second.changed_files.is_empty());
+        assert_eq!(generated_test_file_identity(&tracked), identity);
+        assert_eq!(second.generated_dir, first.generated_dir);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publishing_a_new_generation_retires_stale_files_and_reports_logical_paths() {
+        let root = fixture();
+        let stale_source = root.join("docs/stale.mdx");
+        fs::write(&stale_source, "# Stale\n").unwrap();
+        let first =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let stale_module = first.generated_dir.join("pages/stale.tsx");
+        let stale_map = first.generated_dir.join("pages/stale.tsx.map");
+        assert!(stale_module.is_file());
+        assert!(stale_map.is_file());
+
+        fs::remove_file(stale_source).unwrap();
+        let second =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        assert!(!stale_module.exists());
+        assert!(!stale_map.exists());
+        assert!(second.changed_files.contains(&stale_module));
+        assert!(second.changed_files.contains(&stale_map));
+        assert!(
+            second
+                .changed_files
+                .iter()
+                .all(|path| path.starts_with(&first.generated_dir)),
+            "physical transaction names leaked into changed_files: {:?}",
+            second.changed_files
+        );
+        let manifest = fs::read_to_string(first.generated_dir.join("manifest.json")).unwrap();
+        assert!(!manifest.contains("stale"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_docs_publication_waits_for_a_separate_process_commit_lock() {
+        const PARENT_ENV: &str = "WAKE_TEST_DOCS_GENERATION_LOCK_PARENT";
+        const READY_ENV: &str = "WAKE_TEST_DOCS_GENERATION_LOCK_READY";
+        const RELEASE_ENV: &str = "WAKE_TEST_DOCS_GENERATION_LOCK_RELEASE";
+
+        let root = fixture();
+        let source = root.join("docs/index.mdx");
+        fs::write(&source, "# Before\n").unwrap();
+        let first =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let lock_root = root.join(".wake");
+        let ready = root.join("generation-lock-ready");
+        let release = root.join("generation-lock-release");
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::generation_commit_lock_process_helper",
+            ])
+            .env(PARENT_ENV, &lock_root)
+            .env(READY_ENV, &ready)
+            .env(RELEASE_ENV, &release)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_file() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("generated Docs lock helper exited before acquiring its lock: {status}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.is_file() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("generated Docs lock helper did not acquire its lock");
+        }
+
+        // Prove that this is an operating-system lock rather than only the in-process mutex.
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_root.join(GENERATION_COMMIT_LOCK_FILE))
+            .unwrap();
+        let lock_error: std::io::Error = contender.try_lock().unwrap_err().into();
+        assert_eq!(lock_error.kind(), std::io::ErrorKind::WouldBlock);
+
+        fs::write(source, "# After\n").unwrap();
+        let writer_root = root.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result = generate_fixture(
+                &writer_root,
+                &DocsOptions::default(),
+                BuildMode::Development,
+            );
+            completed_tx.send(()).unwrap();
+            result
+        });
+        let sibling_writer_root = root.clone();
+        let sibling_target = root.join(".wake/candidate/docs/generated");
+        let (sibling_completed_tx, sibling_completed_rx) = std::sync::mpsc::channel();
+        let sibling_writer = thread::spawn(move || {
+            let result = generate_with_mode_in(
+                &sibling_writer_root,
+                &sibling_target,
+                &DocsOptions::default(),
+                BuildMode::Development,
+                DocsMode::Site,
+            );
+            sibling_completed_tx.send(()).unwrap();
+            result
+        });
+        let publication_blocked = matches!(
+            completed_rx.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let sibling_publication_blocked = matches!(
+            sibling_completed_rx.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+
+        fs::write(&release, "release").unwrap();
+        let helper_status = child.wait().unwrap();
+        let second = writer.join().unwrap().unwrap();
+        let sibling = sibling_writer.join().unwrap().unwrap();
+        assert!(helper_status.success(), "generated Docs lock helper failed");
+        assert!(
+            publication_blocked,
+            "generated Docs publication bypassed the separate-process commit lock"
+        );
+        assert!(
+            sibling_publication_blocked,
+            "a sibling generated Docs publication bypassed the project commit lock"
+        );
+        assert!(!second.changed_files.is_empty());
+        assert_eq!(second.generated_dir, first.generated_dir);
+        assert!(sibling.generated_dir.ends_with("docs/generated"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn generated_docs_rejects_a_symbolic_commit_lock() {
+        let root = fixture();
+        let lock_root = root.join(".wake");
+        fs::create_dir_all(&lock_root).unwrap();
+        let external = root.join("external-lock-target");
+        fs::write(&external, "sentinel").unwrap();
+        let lock_path = lock_root.join(GENERATION_COMMIT_LOCK_FILE);
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&external, &lock_path);
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&external, &lock_path);
+        if link_result.is_err() {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+        assert_eq!(fs::read_to_string(external).unwrap(), "sentinel");
+        assert!(!root.join(".wake/docs/generated").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "invoked as a child process by the generated Docs commit lock regression"]
+    fn generation_commit_lock_process_helper() {
+        const PARENT_ENV: &str = "WAKE_TEST_DOCS_GENERATION_LOCK_PARENT";
+        const READY_ENV: &str = "WAKE_TEST_DOCS_GENERATION_LOCK_READY";
+        const RELEASE_ENV: &str = "WAKE_TEST_DOCS_GENERATION_LOCK_RELEASE";
+        let Some(parent) = std::env::var_os(PARENT_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var_os(READY_ENV).expect("missing ready path"));
+        let release = PathBuf::from(std::env::var_os(RELEASE_ENV).expect("missing release path"));
+        let _lock = acquire_generation_commit_lock(&parent).unwrap();
+        fs::write(ready, "ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !release.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(release.is_file(), "generated Docs lock helper timed out");
+    }
+
+    #[test]
+    fn hardlinked_generated_file_is_rejected_without_touching_its_other_name() {
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let external = root.join("external-sentinel.txt");
+        fs::write(&external, "external sentinel").unwrap();
+        let tracked = generated.generated_dir.join("registry.ts");
+        fs::remove_file(&tracked).unwrap();
+        fs::hard_link(&external, &tracked).unwrap();
+
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+        assert_eq!(fs::read_to_string(&external).unwrap(), "external sentinel");
+        assert_eq!(fs::read_to_string(&tracked).unwrap(), "external sentinel");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn symlinked_generated_file_is_rejected_without_touching_its_target() {
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let external = root.join("external-symlink-sentinel.txt");
+        fs::write(&external, "external sentinel").unwrap();
+        let tracked = generated.generated_dir.join("registry.ts");
+        fs::remove_file(&tracked).unwrap();
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&external, &tracked);
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&external, &tracked);
+        if let Err(error) = link_result {
+            #[cfg(windows)]
+            {
+                let _ = error;
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            #[cfg(unix)]
+            panic!("create fixture symlink: {error}");
+        }
+
+        let error =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap_err();
+        assert!(matches!(error, DocsError::InvalidConfig(_)), "{error}");
+        assert_eq!(fs::read_to_string(external).unwrap(), "external sentinel");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_generation_install_restores_the_previous_tree() {
+        struct FailSecondRename {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl GenerationTransactionOps for FailSecondRename {
+            fn rename(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+                if call == 2 {
+                    return Err(std::io::Error::other("injected install failure"));
+                }
+                fs::rename(source, destination)
+            }
+
+            fn remove_tree(&self, path: &Path) -> std::io::Result<()> {
+                fs::remove_dir_all(path)
+            }
+        }
+
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let before = raw_file_snapshot(&generated.generated_dir);
+        let mut next = inspect_generation_tree(&generated.generated_dir)
+            .unwrap()
+            .unwrap()
+            .files;
+        next.insert(
+            PathBuf::from("registry.ts"),
+            b"export const injected = true;\n".to_vec(),
+        );
+        let ops = FailSecondRename {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let error =
+            publish_generation_with_ops(&generated.root, &generated.generated_dir, &next, &ops)
+                .unwrap_err();
+        assert!(matches!(error, DocsError::Io(_, _)), "{error}");
+        assert_eq!(raw_file_snapshot(&generated.generated_dir), before);
+        assert_eq!(
+            ops.calls.load(Ordering::Relaxed),
+            3,
+            "restore was not attempted"
+        );
+        let leaked = fs::read_dir(generated.generated_dir.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with(".wake-docs-next-") || name.starts_with(".wake-docs-previous-")
+            })
+            .collect::<Vec<_>>();
+        assert!(leaked.is_empty(), "transaction siblings leaked: {leaked:?}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_failure_after_commit_does_not_report_a_failed_generation() {
+        struct FailCleanup;
+
+        impl GenerationTransactionOps for FailCleanup {
+            fn rename(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+                fs::rename(source, destination)
+            }
+
+            fn remove_tree(&self, _path: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected cleanup failure"))
+            }
+        }
+
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let mut next = inspect_generation_tree(&generated.generated_dir)
+            .unwrap()
+            .unwrap()
+            .files;
+        next.insert(
+            PathBuf::from("registry.ts"),
+            b"export const committed = true;\n".to_vec(),
+        );
+
+        let changed = publish_generation_with_ops(
+            &generated.root,
+            &generated.generated_dir,
+            &next,
+            &FailCleanup,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(generated.generated_dir.join("registry.ts")).unwrap(),
+            b"export const committed = true;\n"
+        );
+        assert_eq!(changed, vec![generated.generated_dir.join("registry.ts")]);
+        for entry in fs::read_dir(generated.generated_dir.parent().unwrap()).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".wake-docs-previous-")
+            {
+                fs::remove_dir_all(entry.path()).unwrap();
+            }
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn leaves_imports_inside_fenced_code_as_documentation_text() {
         let root = fixture();
@@ -3375,6 +5670,446 @@ mod tests {
         let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
         assert!(page.contains(r#"import \"./styles.css\";"#));
         assert!(!page.contains("@@wake/docs-project/docs/styles.css"));
+    }
+
+    #[test]
+    fn mdx_esm_rewrites_only_typed_module_specifiers() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            r#"import {
+  "../src/badge.tsx" as Badge,
+} from /* source boundary */ "../src/badge.tsx"
+
+import /* side-effect boundary */ "../src/side-effect.css"
+
+import data from "../src/data.json" with { type: "../src/data.json" }
+
+export {
+  "../src/button.tsx" as Button,
+} from /* export boundary */ "../src/button.tsx"
+
+export const lazy = () => import(
+  /* dynamic boundary */
+  "../src/lazy.tsx",
+  { with: { type: "../src/lazy.tsx" } }
+)
+
+export const computed = (name) => import("../src/" + name)
+export const ordinary = "../src/not-a-module.ts"
+export const template = `../src/not-a-template.ts`
+export const commented = /* "../src/not-a-comment.ts" */ Badge
+
+# Home
+
+Body.
+"#,
+        )
+        .unwrap();
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+
+        for rewritten in [
+            "@@wake/docs-project/src/badge.tsx",
+            "@@wake/docs-project/src/side-effect.css",
+            "@@wake/docs-project/src/data.json",
+            "@@wake/docs-project/src/button.tsx",
+            "@@wake/docs-project/src/lazy.tsx",
+        ] {
+            assert!(
+                page.contains(rewritten),
+                "missing rewrite: {rewritten}\n{page}"
+            );
+        }
+        for untouched in [
+            "../src/",
+            "../src/not-a-module.ts",
+            "../src/not-a-template.ts",
+            "../src/not-a-comment.ts",
+        ] {
+            assert!(
+                page.contains(untouched),
+                "ordinary JavaScript changed: {untouched}\n{page}"
+            );
+        }
+        for bait in [
+            r#""../src/badge.tsx" as Badge"#,
+            r#"type: "../src/data.json""#,
+            r#""../src/button.tsx" as Button"#,
+            r#"type: "../src/lazy.tsx""#,
+        ] {
+            assert!(
+                page.contains(bait),
+                "same-value bait changed: {bait}\n{page}"
+            );
+        }
+        assert!(
+            page.contains("<h1"),
+            "Markdown after multiline ESM was lost: {page}"
+        );
+    }
+
+    #[test]
+    fn duplicate_heading_metadata_matches_rendered_ids() {
+        let root = fixture();
+        fs::write(
+            root.join("docs/index.mdx"),
+            "# Home\n\n## Repeat\n\nFirst.\n\n## Repeat\n\nSecond.\n",
+        )
+        .unwrap();
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let route = &generated.routes[0];
+        assert_eq!(
+            route
+                .headings
+                .iter()
+                .map(|heading| heading.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["home", "repeat", "repeat-1"]
+        );
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+        for id in ["home", "repeat", "repeat-1"] {
+            assert!(
+                page.contains(&format!("id={{\"{id}\"}}")),
+                "missing DOM id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_space_hash_and_percent_routes_have_one_canonical_identity() {
+        let root = fixture();
+        let file_name = "100% # 中文.mdx";
+        fs::write(root.join("docs").join(file_name), "# Encoded route\n").unwrap();
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let route = &generated.routes[0];
+        let encoded = "/100%25%20%23%20%E4%B8%AD%E6%96%87";
+        assert_eq!(route.slug, encoded);
+        let registry = fs::read_to_string(generated.generated_dir.join("registry.ts")).unwrap();
+        assert!(registry.contains(&format!(r#""encoded":"{encoded}""#)));
+        assert!(registry.contains(r#""decoded":"/100% # 中文""#));
+        assert!(RUNTIME_APP.contains("routePathFromLocation"));
+        assert!(RUNTIME_ROUTES.contains("page.routePath.encoded"));
+
+        let outdir = root.join("dist");
+        fs::create_dir_all(&outdir).unwrap();
+        write_route_shells(
+            &outdir,
+            &generated.routes,
+            "<!doctype html><html><head><title>Docs</title></head><body></body></html>",
+            "Docs",
+            "Description",
+            "en",
+        )
+        .unwrap();
+        assert!(outdir.join("100% # 中文/index.html").is_file());
+        assert!(
+            !outdir
+                .join("100%25%20%23%20%E4%B8%AD%E6%96%87/index.html")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn route_codec_is_segment_safe_uppercase_and_not_double_encoded() {
+        let route = RoutePath::from_page_relative(
+            Path::new("100% # 中文.mdx"),
+            Path::new("docs/100% # 中文.mdx"),
+        )
+        .unwrap();
+        assert_eq!(route.decoded, "/100% # 中文");
+        assert_eq!(route.encoded, "/100%25%20%23%20%E4%B8%AD%E6%96%87");
+        assert_eq!(
+            RoutePath::from_canonical_encoded(&route.encoded).unwrap(),
+            route
+        );
+
+        let literal_percent =
+            RoutePath::from_page_relative(Path::new("100%25.mdx"), Path::new("docs/100%25.mdx"))
+                .unwrap();
+        assert_eq!(literal_percent.encoded, "/100%2525");
+        assert_eq!(
+            RoutePath::from_canonical_encoded(&literal_percent.encoded).unwrap(),
+            literal_percent
+        );
+
+        for invalid in ["/%", "/%2f", "/%2F", "/%5C", "/../x", "/a//b"] {
+            assert!(
+                RoutePath::from_canonical_encoded(invalid).is_err(),
+                "unsafe or non-canonical route was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn backslash_never_becomes_a_lossy_identity_or_unmatchable_route_segment() {
+        assert!(
+            checked_identity_segment(OsStr::new(r"bad\name"), Path::new("docs/page.mdx")).is_err(),
+            "a normal path component containing a backslash must be rejected"
+        );
+
+        match RoutePath::from_page_relative(
+            Path::new(r"bad\name.mdx"),
+            Path::new(r"docs/bad\name.mdx"),
+        ) {
+            Ok(route) => {
+                assert_eq!(route.decoded, "/bad/name");
+                assert_eq!(route.encoded, "/bad/name");
+            }
+            Err(DocsError::InvalidPagePath(_, message)) => {
+                assert!(message.contains("separator"));
+            }
+            Err(error) => panic!("unexpected route error: {error}"),
+        }
+
+        match checked_slash_path(Path::new(r"bad\name.mdx"), Path::new(r"docs/bad\name.mdx")) {
+            Ok(identity) => assert_eq!(identity, "bad/name.mdx"),
+            Err(DocsError::InvalidPagePath(_, message)) => {
+                assert!(message.contains("separator"));
+            }
+            Err(error) => panic!("unexpected identity error: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_utf8_page_segments_are_diagnosed_instead_of_lossily_colliding() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = PathBuf::from("project");
+        let source_dir = root.join("docs");
+        let invalid =
+            OsString::from_wide(&[0xD800, b'.' as u16, b'm' as u16, b'd' as u16, b'x' as u16]);
+        let error = PageIdentity::from_paths(&root, &source_dir, &source_dir.join(invalid))
+            .expect_err("non-UTF-8 page path must be rejected");
+        assert!(
+            matches!(error, DocsError::InvalidPagePath(_, message) if message.contains("UTF-8"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_page_segments_are_diagnosed_instead_of_lossily_colliding() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = PathBuf::from("project");
+        let source_dir = root.join("docs");
+        let invalid = OsString::from_vec(vec![0xff, b'.', b'm', b'd', b'x']);
+        let error = PageIdentity::from_paths(&root, &source_dir, &source_dir.join(invalid))
+            .expect_err("non-UTF-8 page path must be rejected");
+        assert!(
+            matches!(error, DocsError::InvalidPagePath(_, message) if message.contains("UTF-8"))
+        );
+    }
+
+    #[test]
+    fn page_source_maps_are_relative_deterministic_and_honest() {
+        let source = "import Badge from \"../src/badge.tsx\"\n\n# Home\n\nBody.\n";
+        let build = |root: &Path| {
+            fs::write(root.join("docs/index.mdx"), source).unwrap();
+            let generated =
+                generate_fixture(root, &DocsOptions::default(), BuildMode::Development).unwrap();
+            let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+            let map =
+                fs::read_to_string(generated.generated_dir.join("pages/index.tsx.map")).unwrap();
+            let registry = fs::read_to_string(generated.generated_dir.join("registry.ts")).unwrap();
+            (page, map, registry)
+        };
+        let first_root = fixture();
+        let second_root = fixture();
+        let first = build(&first_root);
+        let second = build(&second_root);
+        assert_eq!(first, second, "generated docs depend on checkout root");
+
+        let map: serde_json::Value = serde_json::from_str(&first.1).unwrap();
+        assert_eq!(map["file"], "pages/index.tsx");
+        assert_eq!(map["sources"], json!(["docs/index.mdx"]));
+        assert!(!first.1.contains(&slash_path(&first_root)));
+        assert!(!first.1.contains(&slash_path(&second_root)));
+
+        let lines = first.0.lines().collect::<Vec<_>>();
+        let mappings = map["mappings"]
+            .as_str()
+            .unwrap()
+            .split(';')
+            .collect::<Vec<_>>();
+        let decoded = decode_test_mappings(map["mappings"].as_str().unwrap());
+        assert_eq!(mappings.len(), lines.len());
+        assert!(
+            mappings[0].is_empty(),
+            "synthetic runtime import was mapped"
+        );
+        assert!(
+            mappings.last().is_some_and(|mapping| mapping.is_empty()),
+            "synthetic sourceMappingURL/trailing newline must stay unmapped"
+        );
+        let esm_line = lines
+            .iter()
+            .position(|line| line.contains("src/badge.tsx"))
+            .unwrap();
+        assert!(
+            !mappings[esm_line].is_empty(),
+            "copied ESM has no source mapping"
+        );
+        assert_eq!(
+            decoded[esm_line].first().copied(),
+            Some(DecodedMapping {
+                generated_column: 0,
+                original: Some((0, 0)),
+            }),
+            "ESM must point to its actual MDX token"
+        );
+        let generated_specifier = lines[esm_line].find('"').unwrap() as i64;
+        let original_specifier = source.find('"').unwrap() as i64;
+        assert_eq!(
+            decoded[esm_line]
+                .iter()
+                .find(|mapping| mapping.generated_column == generated_specifier)
+                .and_then(|mapping| mapping.original),
+            Some((0, original_specifier)),
+            "rewritten module specifier must map to the original string token"
+        );
+        let metadata_line = lines
+            .iter()
+            .position(|line| line.starts_with("export const __wakeMeta"))
+            .unwrap();
+        assert!(
+            mappings[metadata_line].is_empty(),
+            "synthetic metadata was mapped"
+        );
+        let heading_line = lines.iter().position(|line| line.contains("<h1")).unwrap();
+        assert!(
+            mappings[heading_line].contains(','),
+            "derived heading line must terminate with a generated-only segment"
+        );
+        assert_eq!(decoded[heading_line][0].generated_column, 4);
+        assert_eq!(decoded[heading_line][0].original, Some((2, 0)));
+        assert_eq!(
+            decoded[heading_line].last().unwrap().original,
+            None,
+            "the synthetic remainder of a rendered node must not inherit its source"
+        );
+    }
+
+    #[test]
+    fn unicode_and_long_final_metadata_keep_source_maps_aligned() {
+        let root = fixture();
+        let description = "跨语言路线🚀".repeat(2_048);
+        let source = format!(
+            "+++\ntitle = \"最终页面🧭\"\ndescription = \"{description}\"\n+++\n# 标题🙂\n\n正文。\n"
+        );
+        fs::write(root.join("docs/index.mdx"), &source).unwrap();
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+        let raw_map =
+            fs::read_to_string(generated.generated_dir.join("pages/index.tsx.map")).unwrap();
+        let map: serde_json::Value = serde_json::from_str(&raw_map).unwrap();
+        let mappings = map["mappings"]
+            .as_str()
+            .unwrap()
+            .split(';')
+            .collect::<Vec<_>>();
+        let decoded = decode_test_mappings(map["mappings"].as_str().unwrap());
+        let lines = page.lines().collect::<Vec<_>>();
+        let metadata_line = lines
+            .iter()
+            .position(|line| line.starts_with("export const __wakeMeta"))
+            .unwrap();
+        let heading_line = lines.iter().position(|line| line.contains("<h1")).unwrap();
+        let original_heading_line =
+            source.lines().position(|line| line == "# 标题🙂").unwrap() as i64;
+
+        assert_eq!(map["sourcesContent"], json!([source]));
+        assert_eq!(mappings.len(), lines.len());
+        assert!(mappings[metadata_line].is_empty());
+        assert_eq!(
+            decoded[heading_line]
+                .first()
+                .and_then(|mapping| mapping.original),
+            Some((original_heading_line, 0))
+        );
+        assert!(lines[metadata_line].contains(&description));
+    }
+
+    #[test]
+    fn lazy_search_corpus_comes_from_visible_markdown_ast_nodes() {
+        let root = fixture();
+        let page_path = root.join("docs/index.mdx");
+        fs::write(
+            &page_path,
+            r#"+++
+title = "Search"
+description = "frontmatter-only-marker"
++++
+
+import { Button as InvisibleImportMarker } from "../src/button.tsx"
+
+# Search heading
+
+Visible **body copy** with `--minify`.
+
+```bash
+wake build --release
+```
+
+<span>JSX visible text</span>
+
+{invisibleExpressionMarker}
+"#,
+        )
+        .unwrap();
+
+        let compiled = compile_page(&root, &root.join("docs"), &page_path).unwrap();
+        for expected in [
+            "Search heading",
+            "Visible",
+            "body copy",
+            "--minify",
+            "wake build --release",
+            "JSX visible text",
+        ] {
+            assert!(
+                compiled.search_text.contains(expected),
+                "missing search text fragment: {expected}"
+            );
+        }
+        for excluded in [
+            "frontmatter-only-marker",
+            "InvisibleImportMarker",
+            "invisibleExpressionMarker",
+        ] {
+            assert!(
+                !compiled.search_text.contains(excluded),
+                "non-visible AST content leaked into search text: {excluded}"
+            );
+        }
+        assert!(
+            !serde_json::to_string(&compiled.route)
+                .unwrap()
+                .contains("searchText")
+        );
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let registry = fs::read_to_string(generated.generated_dir.join("registry.ts")).unwrap();
+        let corpus = fs::read_to_string(generated.generated_dir.join("search-corpus.ts")).unwrap();
+        assert!(!registry.contains("searchText:"));
+        assert!(!registry.contains("--minify"));
+        assert!(corpus.contains("--minify"));
+        assert_eq!(
+            fs::read_to_string(generated.generated_dir.join("runtime/search.mjs")).unwrap(),
+            RUNTIME_SEARCH
+        );
     }
 
     #[test]
@@ -3692,6 +6427,67 @@ pages = ["build"]
     }
 
     #[test]
+    fn compiled_page_defers_module_render_until_navigation_is_final() {
+        let root = fixture();
+        let page_path = root.join("docs/index.mdx");
+        let source = "+++\ntitle = \"首页\"\n+++\n# Home\n";
+        fs::write(&page_path, source).unwrap();
+        fs::write(
+            root.join("docs/navigation.toml"),
+            "[[group]]\nid = \"guide\"\ntitle = \"最终导航\"\npages = [\"index\"]\n",
+        )
+        .unwrap();
+
+        let page = compile_page(&root, &root.join("docs"), &page_path).unwrap();
+        assert_eq!(page.route.group, "");
+        assert_eq!(page.module_plan.source, source);
+        let pre_navigation_metadata = serde_json::to_string(&page.route).unwrap();
+        let mut pages = vec![(page_path, page)];
+
+        apply_navigation(&root.join("docs"), &mut pages).unwrap();
+        let final_route = pages[0].1.route.clone();
+        let rendered = pages[0].1.render_module();
+        let registry = render_registry(&pages, &[], &[]);
+        let routes = pages
+            .iter()
+            .map(|(_, page)| page.route.clone())
+            .collect::<Vec<_>>();
+        let metadata = serde_json::to_string(&final_route).unwrap();
+
+        assert_eq!(routes, vec![final_route]);
+        assert!(
+            rendered
+                .code
+                .contains(&format!("export const __wakeMeta = {metadata};"))
+        );
+        assert!(!rendered.code.contains(&format!(
+            "export const __wakeMeta = {pre_navigation_metadata};"
+        )));
+        assert!(registry.contains(&format!("{{ ...{metadata}, routePath:")));
+        assert!(metadata.contains(r#""group":"最终导航""#));
+    }
+
+    #[test]
+    fn user_esm_that_contains_the_metadata_prefix_is_never_rewritten() {
+        let root = fixture();
+        let marker = "export const __wakeMeta = {\"owner\":\"user\"};\n";
+        fs::write(
+            root.join("docs/index.mdx"),
+            format!("export const userTemplate = `{marker}`;\n\n# Home\n"),
+        )
+        .unwrap();
+
+        let generated =
+            generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
+        let page = fs::read_to_string(generated.generated_dir.join("pages/index.tsx")).unwrap();
+        let route_metadata = serde_json::to_string(&generated.routes[0]).unwrap();
+
+        assert!(page.contains(&format!("export const userTemplate = `{marker}`;")));
+        assert!(page.contains(&format!("export const __wakeMeta = {route_metadata};")));
+        assert_eq!(page.matches("export const __wakeMeta = ").count(), 2);
+    }
+
+    #[test]
     fn rejects_retired_frontmatter_fields() {
         let root = fixture();
         fs::write(
@@ -3759,6 +6555,8 @@ pages = ["build"]
         let generated = generate(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         assert_eq!(generated.routes.len(), 2);
         assert!(generated.routes.iter().any(|route| route.hidden));
+        let corpus = fs::read_to_string(generated.generated_dir.join("search-corpus.ts")).unwrap();
+        assert!(!corpus.contains("Hidden"));
     }
 
     #[test]
@@ -3782,7 +6580,7 @@ pages = ["build"]
     }
 
     #[test]
-    fn page_edit_only_rewrites_the_page_and_its_source_map() {
+    fn page_edit_rewrites_the_page_source_map_and_lazy_search_corpus() {
         let root = fixture();
         let page = root.join("docs/index.mdx");
         fs::write(&page, "# Home\n\nFirst paragraph.\n").unwrap();
@@ -3806,6 +6604,7 @@ pages = ["build"]
             BTreeSet::from([
                 "pages/index.tsx".to_string(),
                 "pages/index.tsx.map".to_string(),
+                "search-corpus.ts".to_string(),
             ])
         );
     }
@@ -4065,6 +6864,10 @@ pages = ["build"]
                 .join("runtime/components-state.mjs")
                 .is_file()
         );
+        assert_eq!(
+            fs::read_to_string(generated.generated_dir.join("runtime/search.mjs")).unwrap(),
+            RUNTIME_SEARCH
+        );
         assert!(generated.entry.ends_with("runtime/components-entry.tsx"));
         assert!(
             !generated
@@ -4087,6 +6890,10 @@ pages = ["build"]
         assert!(entry.contains("runtime/app.tsx"));
         assert!(!entry.contains("ComponentsApp"));
         assert!(!entry.contains("components.css"));
+        assert_eq!(
+            fs::read_to_string(generated.generated_dir.join("runtime/search.mjs")).unwrap(),
+            RUNTIME_SEARCH
+        );
         assert!(
             !generated
                 .generated_dir

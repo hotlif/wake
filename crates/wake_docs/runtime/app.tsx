@@ -1,6 +1,8 @@
-import React, { Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
+import React, { Suspense, startTransition, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { apiDocs, demos, pages } from "@@wake/docs/registry.ts";
 import { Preview, siteConfig } from "@@wake/docs/config.tsx";
+import { docsRouteHref, findPageForPath, routePathFromLocation } from "./routes.mjs";
+import { createSearchIndex, searchDocs } from "./search.mjs";
 
 type Theme = "light" | "dark" | "system";
 type ResolvedTheme = "light" | "dark";
@@ -12,6 +14,45 @@ type NavGroup = { id: string; title: string; pages: PageRecord[]; sections: NavS
 
 const isChinese = siteConfig.locale.toLowerCase().startsWith("zh");
 const text = (english: string, chinese: string) => isChinese ? chinese : english;
+const pageLoads = new Map<string, Promise<any>>();
+const lazyPages = new Map<string, React.LazyExoticComponent<React.ComponentType>>();
+
+function loadPage(page: PageRecord): Promise<any> {
+  const cached = pageLoads.get(page.slug);
+  if (cached) return cached;
+  const pending = page.load().catch((reason) => {
+    pageLoads.delete(page.slug);
+    throw reason;
+  });
+  pageLoads.set(page.slug, pending);
+  return pending;
+}
+
+function lazyPage(page: PageRecord) {
+  const cached = lazyPages.get(page.slug);
+  if (cached) return cached;
+  const component = React.lazy(() => loadPage(page));
+  lazyPages.set(page.slug, component);
+  return component;
+}
+
+function docsHref(slug: string): string {
+  return docsRouteHref(siteConfig.basePath, slug) || "/";
+}
+
+function pageForPath(pathname: string): PageRecord | undefined {
+  return findPageForPath(pages, pathname);
+}
+
+function internalPageLink(anchor: HTMLAnchorElement): { page: PageRecord; slug: string } | null {
+  if (anchor.hasAttribute("download") || (anchor.target && anchor.target !== "_self")) return null;
+  const url = new URL(anchor.href, window.location.href);
+  if (url.origin !== window.location.origin || url.search) return null;
+  const routePath = routePathFromLocation(siteConfig.basePath, url.pathname);
+  if (!routePath) return null;
+  const page = pageForPath(routePath.encoded);
+  return page ? { page, slug: page.slug + url.hash } : null;
+}
 
 function focusableElements(container: HTMLElement) {
   return Array.from(container.querySelectorAll(
@@ -40,8 +81,10 @@ function trapDialogFocus(event: React.KeyboardEvent<HTMLElement>) {
 
 function useDialogFocus(open: boolean, initialFocus: { current: HTMLElement | null }) {
   const returnFocus = useRef<HTMLElement | null>(null);
+  const shouldRestore = useRef(true);
   useEffect(() => {
     if (!open) return;
+    shouldRestore.current = true;
     returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -49,10 +92,12 @@ function useDialogFocus(open: boolean, initialFocus: { current: HTMLElement | nu
     return () => {
       cancelAnimationFrame(focusFrame);
       document.body.style.overflow = previousOverflow;
+      if (!shouldRestore.current) return;
       const target = returnFocus.current;
       requestAnimationFrame(() => { if (target?.isConnected) target.focus(); });
     };
   }, [open, initialFocus]);
+  return useCallback(() => { shouldRestore.current = false; }, []);
 }
 
 function statusText(status: string): string {
@@ -97,8 +142,13 @@ function resolvedTheme(theme: Theme): ResolvedTheme {
 
 function useTheme() {
   const [theme, setTheme] = useState<Theme>(() => {
-    const saved = localStorage.getItem("wake-docs-theme");
-    return saved === "light" || saved === "dark" || saved === "system" ? saved : siteConfig.defaultTheme as Theme;
+    try {
+      const saved = localStorage.getItem("wake-docs-theme");
+      if (saved === "light" || saved === "dark" || saved === "system") return saved;
+    } catch {
+      // Storage can be disabled by browser privacy policies. The configured theme remains usable.
+    }
+    return siteConfig.defaultTheme as Theme;
   });
   const [resolved, setResolved] = useState<ResolvedTheme>(() => resolvedTheme(theme));
   useEffect(() => {
@@ -109,7 +159,7 @@ function useTheme() {
     return () => media.removeEventListener("change", update);
   }, [theme]);
   useEffect(() => {
-    localStorage.setItem("wake-docs-theme", theme);
+    try { localStorage.setItem("wake-docs-theme", theme); } catch { /* Keep theme changes session-local. */ }
     document.documentElement.lang = siteConfig.locale;
     document.documentElement.dataset.theme = resolved;
     if (siteConfig.accentColor) {
@@ -123,19 +173,8 @@ function useTheme() {
 }
 
 function appPath(): string {
-  const base = siteConfig.basePath === "/" ? "" : siteConfig.basePath.replace(/\/$/, "");
-  const pathname = window.location.pathname;
-  const relative = base && pathname.startsWith(base) ? pathname.slice(base.length) : pathname;
-  return "/" + relative.replace(/^\/+|\/+$/g, "");
-}
-
-function navigate(event: React.MouseEvent<HTMLAnchorElement>, href: string) {
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  event.preventDefault();
-  const next = siteConfig.basePath.replace(/\/$/, "") + (href === "/" ? "/" : href);
-  history.pushState(null, "", next);
-  window.dispatchEvent(new PopStateEvent("popstate"));
-  window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+  const routePath = routePathFromLocation(siteConfig.basePath, window.location.pathname);
+  return (routePath?.encoded || "/__wake-invalid-route__") + window.location.hash;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -205,8 +244,7 @@ function PagePager({ current }: { current: string }) {
   const next = index >= 0 && index < visiblePages.length - 1 ? visiblePages[index + 1] : undefined;
   const link = (page: PageRecord, direction: "previous" | "next") => <a
     className={"page-pager-link page-pager-" + direction}
-    href={siteConfig.basePath.replace(/\/$/, "") + page.slug}
-    onClick={(event) => navigate(event, page.slug)}
+    href={docsHref(page.slug)}
   >
     <small>{direction === "previous" ? text("Previous", "上一篇") : text("Next", "下一篇")}</small>
     <strong>{page.title}</strong>
@@ -219,7 +257,13 @@ function PagePager({ current }: { current: string }) {
 }
 
 export function MdxPage({ meta, children }: { meta: PageRecord; children: React.ReactNode }) {
-  useEffect(() => { updateDocumentMetadata(pageTitle(meta.title), meta.description || siteConfig.description); }, [meta.title, meta.description]);
+  useEffect(() => {
+    updateDocumentMetadata(pageTitle(meta.title), meta.description || siteConfig.description);
+    const ready = () => window.dispatchEvent(new CustomEvent("wake:page-ready", { detail: { slug: meta.slug, title: meta.title } }));
+    ready();
+    const frame = requestAnimationFrame(ready);
+    return () => cancelAnimationFrame(frame);
+  }, [meta.slug, meta.title, meta.description]);
   const crumbs = [meta.group, meta.section, meta.title]
     .filter(Boolean)
     .filter((crumb, index, values) => values.indexOf(crumb) === index);
@@ -227,7 +271,7 @@ export function MdxPage({ meta, children }: { meta: PageRecord; children: React.
     <header className="page-header">
       <nav className="breadcrumbs" aria-label={text("Breadcrumb", "面包屑")}>{crumbs.map((crumb, index) => <React.Fragment key={crumb}><span>{crumb}</span>{index < crumbs.length - 1 && <i aria-hidden="true">/</i>}</React.Fragment>)}</nav>
       {(meta.status !== "stable" || meta.draft) && <div className="eyebrow"><StatusBadge status={meta.status} />{meta.draft && <span className="status status-draft">{statusText("draft")}</span>}</div>}
-      <h1>{meta.title}</h1>
+      <h1 tabIndex={-1}>{meta.title}</h1>
       {meta.description && <p className="page-description">{meta.description}</p>}
     </header>
     <div className="mdx-content">{children}</div>
@@ -406,19 +450,24 @@ export function API({ source, symbol, __wakePage }: { source: string; symbol: st
 function Search({ open, close, go }: { open: boolean; close: () => void; go: (slug: string) => void }) {
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const [searchTextByPage, setSearchTextByPage] = useState<Record<string, string>>({});
+  const corpusRequested = useRef(false);
   const input = useRef<HTMLInputElement>(null);
-  useDialogFocus(open, input);
+  const suppressFocusRestore = useDialogFocus(open, input);
   useEffect(() => { if (open) { setQuery(""); setActive(0); } }, [open]);
+  useEffect(() => {
+    if (!open || corpusRequested.current) return;
+    corpusRequested.current = true;
+    import("@@wake/docs/search-corpus.ts")
+      .then((module) => setSearchTextByPage(module.searchTextByPage))
+      .catch(() => { corpusRequested.current = false; });
+  }, [open]);
   const sectionKind = text("Section", "章节");
   const propKind = text("Prop", "属性");
-  const index = useMemo(() => pages.filter((page) => !page.hidden).flatMap((page) => {
-    const apiProps = Object.entries(apiDocs as Record<string, any>).filter(([key]) => key.startsWith(page.file + "|")).flatMap(([, doc]) => doc.props.map((prop: any) => ({ name: prop.name, anchor: "api-" + doc.symbol })));
-    const location = [page.group, page.section].filter(Boolean).join(" / ");
-    return [{ title: page.title, detail: page.description, slug: page.slug, kind: location }, ...page.headings.filter((heading) => heading.depth > 1).map((heading) => ({ title: heading.title, detail: page.title + " · " + location, slug: page.slug + "#" + heading.id, kind: sectionKind })), ...apiProps.map((prop) => ({ title: prop.name, detail: page.title, slug: page.slug + "#" + prop.anchor, kind: propKind }))];
-  }), []);
-  const results = query.trim() ? index.filter((item) => (item.title + " " + item.detail + " " + item.kind).toLowerCase().includes(query.toLowerCase())).slice(0, 12) : index.filter((item) => item.kind !== sectionKind && item.kind !== propKind).slice(0, 8);
+  const index = useMemo(() => createSearchIndex(pages, apiDocs, { section: sectionKind, prop: propKind }, searchTextByPage), [sectionKind, propKind, searchTextByPage]);
+  const results = useMemo(() => searchDocs(index, query, query.trim() ? 12 : 8), [index, query]);
   useEffect(() => { if (open) document.getElementById("wake-search-result-" + active)?.scrollIntoView({ block: "nearest" }); }, [active, query, open]);
-  const choose = (slug: string) => { go(slug); close(); };
+  const choose = (slug: string) => { suppressFocusRestore(); go(slug); close(); };
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -434,9 +483,9 @@ function Search({ open, close, go }: { open: boolean; close: () => void; go: (sl
   if (!open) return null;
   return <div className="search-backdrop" role="presentation" onMouseDown={close}>
     <div id="wake-search-dialog" className="search-dialog" role="dialog" aria-modal="true" aria-label={text("Search documentation", "搜索文档")} onKeyDown={trapDialogFocus} onMouseDown={(event) => event.stopPropagation()}>
-      <div className="search-input"><span>⌕</span><input ref={input} value={query} onChange={(event) => { setQuery(event.target.value); setActive(0); }} onKeyDown={onKeyDown} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-controls="wake-search-results" aria-activedescendant={results[active] ? "wake-search-result-" + active : undefined} placeholder={text("Search pages, headings, and props…", "搜索页面、章节和属性…")} /><kbd>Esc</kbd></div>
-      <div className="search-results" id="wake-search-results" role="listbox">
-        {results.map((item, index) => <button id={"wake-search-result-" + index} className={index === active ? "active" : ""} role="option" aria-selected={index === active} type="button" key={item.slug + index} onMouseMove={() => setActive(index)} onClick={() => choose(item.slug)}><span><strong>{item.title}</strong><small>{item.detail}</small></span><em>{item.kind}</em></button>)}
+      <div className="search-input"><span aria-hidden="true">⌕</span><input ref={input} value={query} onChange={(event) => { setQuery(event.target.value); setActive(0); }} onKeyDown={onKeyDown} role="combobox" aria-label={text("Search documentation", "搜索文档")} aria-autocomplete="list" aria-expanded={open} aria-controls="wake-search-results" aria-activedescendant={results[active] ? "wake-search-result-" + active : undefined} placeholder={text("Search pages, headings, commands, and props…", "搜索页面、章节、命令和属性…")} /><kbd>Esc</kbd></div>
+      <div className="search-results" id="wake-search-results" role="listbox" aria-label={text("Search results", "搜索结果")}>
+        {results.map((item: any, index: number) => <div id={"wake-search-result-" + index} className={"search-result " + (index === active ? "active" : "")} role="option" aria-selected={index === active} key={item.slug + index} onMouseMove={() => setActive(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => choose(item.slug)}><span><strong>{item.title}</strong><small>{item.detail}</small></span><em>{item.kind}</em></div>)}
         {!results.length && <p className="empty-search">{text("No results for", "没有找到")} “{query}”</p>}
       </div>
     </div>
@@ -451,8 +500,8 @@ function ThemeButton({ theme, setTheme }: { theme: Theme; setTheme: (theme: Them
   return <button type="button" className="icon-button" onClick={() => setTheme(next[theme])} aria-label={label} title={label}>{icon}</button>;
 }
 
-function Logo() {
-  return <a className="brand" href={siteConfig.basePath} onClick={(event) => navigate(event, "/")}>
+function Logo({ onNavigate }: { onNavigate?: () => void }) {
+  return <a className="brand" href={docsHref("/")} onClick={onNavigate}>
     {siteConfig.logo ? <img src={siteConfig.logo} alt="" /> : <span className="brand-mark">W</span>}
     <span><strong>{siteConfig.title}</strong>{siteConfig.description && <small>{siteConfig.description}</small>}</span>
   </a>;
@@ -487,7 +536,7 @@ function Sidebar({ current, close }: { current: string; close?: () => void }) {
     }
   });
   useEffect(() => {
-    sessionStorage.setItem("wake-docs-user-expanded-sections", JSON.stringify([...expandedByUser]));
+    try { sessionStorage.setItem("wake-docs-user-expanded-sections", JSON.stringify([...expandedByUser])); } catch { /* Navigation still works without persistence. */ }
   }, [expandedByUser]);
   useEffect(() => {
     document.querySelector('.sidebar-nav a[aria-current="page"]')?.scrollIntoView({ block: "nearest" });
@@ -498,8 +547,8 @@ function Sidebar({ current, close }: { current: string; close?: () => void }) {
       key={page.slug}
       className={(active ? "active" : "") + (nested ? " nested" : "")}
       aria-current={active ? "page" : undefined}
-      href={siteConfig.basePath.replace(/\/$/, "") + page.slug}
-      onClick={(event) => { navigate(event, page.slug); close?.(); }}
+      href={docsHref(page.slug)}
+      onClick={() => close?.()}
     >
       <span>{page.title}</span>
     </a>;
@@ -553,10 +602,61 @@ function TableOfContents({ page }: { page: PageRecord }) {
   return <nav className="toc" aria-label={text("On this page", "本页目录")}><h2>{text("On this page", "本页目录")}</h2>{headings.map((heading, index) => <a className={(heading.depth === 3 ? "nested " : "") + (active === heading.id ? "active" : "")} aria-current={active === heading.id ? "location" : undefined} key={heading.id + index} href={"#" + heading.id}>{heading.title}</a>)}</nav>;
 }
 
+function MobileTableOfContents({ page }: { page: PageRecord }) {
+  const headings = page.headings.filter((heading) => heading.depth > 1 && heading.depth < 4);
+  const details = useRef<HTMLDetailsElement>(null);
+  if (!headings.length) return null;
+  return <details className="mobile-toc" ref={details}>
+    <summary><span>{text("On this page", "本页目录")}</span><small>{headings.length}</small></summary>
+    <nav aria-label={text("On this page", "本页目录")} onClick={(event) => {
+      if ((event.target as Element).closest("a[href]")) details.current?.removeAttribute("open");
+    }}>
+      {headings.map((heading, index) => <a className={heading.depth === 3 ? "nested" : ""} key={heading.id + index} href={"#" + heading.id}>{heading.title}</a>)}
+    </nav>
+  </details>;
+}
+
 function NotFound() {
   const description = text("The requested documentation page could not be found.", "找不到请求的文档页面。");
-  useEffect(() => { updateDocumentMetadata("404 · " + siteConfig.title, description); }, [description]);
-  return <div className="not-found"><span>404</span><h1>{text("Page not found", "页面不存在")}</h1><p>{text("The document may have moved or is still being written.", "文档可能已移动，或仍在编写中。")}</p><a href={siteConfig.basePath}>{text("Back to documentation", "返回文档首页")}</a></div>;
+  const title = text("Page not found", "页面不存在");
+  useEffect(() => {
+    updateDocumentMetadata("404 · " + siteConfig.title, description);
+    window.dispatchEvent(new CustomEvent("wake:page-ready", { detail: { slug: appPath().split("#")[0], title } }));
+  }, [description, title]);
+  return <div className="not-found"><span>404</span><h1 tabIndex={-1}>{title}</h1><p>{text("The document may have moved or is still being written.", "文档可能已移动，或仍在编写中。")}</p><a href={docsHref("/")}>{text("Back to documentation", "返回文档首页")}</a></div>;
+}
+
+function ReadingProgress() {
+  const progress = useRef<HTMLSpanElement>(null);
+  const [showBackToTop, setShowBackToTop] = useState(false);
+  useEffect(() => {
+    let frame = 0;
+    const update = () => {
+      const distance = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      if (progress.current) progress.current.style.transform = "scaleX(" + (distance ? Math.min(1, window.scrollY / distance) : 0) + ")";
+      const next = window.scrollY > Math.max(640, window.innerHeight * .75);
+      setShowBackToTop((current) => current === next ? current : next);
+    };
+    const schedule = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(update);
+    };
+    const resize = new ResizeObserver(schedule);
+    resize.observe(document.documentElement);
+    update();
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    return () => {
+      cancelAnimationFrame(frame);
+      resize.disconnect();
+      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+    };
+  }, []);
+  return <>
+    <div className="reading-progress" aria-hidden="true"><span ref={progress} /></div>
+    {showBackToTop && <button type="button" className="back-to-top" aria-label={text("Back to top", "返回顶部")} onClick={() => window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })}>↑</button>}
+  </>;
 }
 
 type DemoErrorBoundaryProps = {
@@ -659,12 +759,68 @@ export function App() {
   const [path, setPath] = useState(appPath);
   const [search, setSearch] = useState(false);
   const [drawer, setDrawer] = useState(false);
-  const [scrollProgress, setScrollProgress] = useState(0);
-  const [showBackToTop, setShowBackToTop] = useState(false);
+  const [announcement, setAnnouncement] = useState({ key: 0, message: "" });
   const drawerClose = useRef<HTMLButtonElement>(null);
-  useDialogFocus(drawer, drawerClose);
+  const pathRef = useRef(path);
+  const pendingNavigation = useRef<{ route: string; hash: string; focus: boolean } | null>(window.location.hash ? {
+    route: appPath().split("#")[0],
+    hash: window.location.hash.slice(1),
+    focus: false,
+  } : null);
+  const suppressDrawerFocusRestore = useDialogFocus(drawer, drawerClose);
+  useLayoutEffect(() => { pathRef.current = path; }, [path]);
+
+  const finishNavigation = useCallback((slug: string, title: string) => {
+    const pending = pendingNavigation.current;
+    const route = slug.split("#")[0].replace(/\/$/, "") || "/";
+    if (!pending || (pending.route.replace(/\/$/, "") || "/") !== route) return;
+    pendingNavigation.current = null;
+    requestAnimationFrame(() => {
+      let target: HTMLElement | null = null;
+      if (pending.hash) {
+        try { target = document.getElementById(decodeURIComponent(pending.hash)); } catch { target = document.getElementById(pending.hash); }
+      }
+      if (target) {
+        target.scrollIntoView({ block: "start" });
+      } else {
+        window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+        target = document.querySelector<HTMLElement>("#wake-docs-content h1") || document.getElementById("wake-docs-content");
+      }
+      if (pending.focus && target) {
+        if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+        target.focus({ preventScroll: true });
+        setAnnouncement((current) => ({ key: current.key + 1, message: text("Opened " + title, "已打开“" + title + "”") }));
+      }
+    });
+  }, []);
+
+  const go = useCallback((slug: string) => {
+    const [rawRoute, rawHash = ""] = slug.split("#", 2);
+    const route = rawRoute.replace(/\/$/, "") || "/";
+    const targetPage = pageForPath(route);
+    pendingNavigation.current = { route, hash: rawHash, focus: true };
+    const next = docsHref(route) + (rawHash ? "#" + rawHash : "");
+    if (window.location.pathname + window.location.hash !== next) history.pushState(null, "", next);
+    if (targetPage) void loadPage(targetPage).catch(() => {});
+    const currentRoute = pathRef.current.split("#")[0].replace(/\/$/, "") || "/";
+    if (currentRoute === route) {
+      setPath(appPath());
+      finishNavigation(route, targetPage?.title || siteConfig.title);
+    } else {
+      startTransition(() => setPath(appPath()));
+    }
+  }, [finishNavigation]);
+
   useEffect(() => {
-    const update = () => setPath(appPath());
+    const update = () => {
+      const nextPath = appPath();
+      const route = nextPath.split("#")[0].replace(/\/$/, "") || "/";
+      const targetPage = pageForPath(route);
+      const currentRoute = pathRef.current.split("#")[0].replace(/\/$/, "") || "/";
+      pendingNavigation.current = { route, hash: window.location.hash.slice(1), focus: true };
+      startTransition(() => setPath(nextPath));
+      if (currentRoute === route) finishNavigation(route, targetPage?.title || siteConfig.title);
+    };
     const keys = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setSearch(true); }
       if (event.key === "Escape") { setSearch(false); setDrawer(false); }
@@ -672,45 +828,51 @@ export function App() {
     window.addEventListener("popstate", update);
     window.addEventListener("keydown", keys);
     return () => { window.removeEventListener("popstate", update); window.removeEventListener("keydown", keys); };
-  }, []);
+  }, [finishNavigation]);
   useEffect(() => {
-    let frame = 0;
-    const update = () => {
-      const distance = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-      setScrollProgress(distance ? Math.min(1, window.scrollY / distance) : 0);
-      setShowBackToTop(window.scrollY > Math.max(640, window.innerHeight * .75));
+    const ready = (event: Event) => {
+      const detail = (event as CustomEvent<{ slug: string; title: string }>).detail;
+      if (detail) finishNavigation(detail.slug, detail.title);
     };
-    const schedule = () => {
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(update);
+    window.addEventListener("wake:page-ready", ready);
+    return () => window.removeEventListener("wake:page-ready", ready);
+  }, [finishNavigation]);
+  useEffect(() => {
+    const anchorFor = (event: Event) => event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
+    const preload = (event: Event) => {
+      const anchor = anchorFor(event);
+      if (!anchor) return;
+      const link = internalPageLink(anchor);
+      if (link) void loadPage(link.page).catch(() => {});
     };
-    const resize = new ResizeObserver(schedule);
-    resize.observe(document.documentElement);
-    update();
-    window.addEventListener("scroll", schedule, { passive: true });
-    window.addEventListener("resize", schedule);
+    const click = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const anchor = anchorFor(event);
+      if (!anchor) return;
+      const link = internalPageLink(anchor);
+      if (!link) return;
+      event.preventDefault();
+      go(link.slug);
+    };
+    document.addEventListener("click", click);
+    document.addEventListener("pointerover", preload, { passive: true });
+    document.addEventListener("focusin", preload);
     return () => {
-      cancelAnimationFrame(frame);
-      resize.disconnect();
-      window.removeEventListener("scroll", schedule);
-      window.removeEventListener("resize", schedule);
+      document.removeEventListener("click", click);
+      document.removeEventListener("pointerover", preload);
+      document.removeEventListener("focusin", preload);
     };
-  }, []);
+  }, [go]);
   const demoId = new URLSearchParams(window.location.search).get("__wake_demo");
   if (demoId) return <DemoFrame id={demoId} resolved={resolved} />;
   const routePath = path.split("#")[0].replace(/\/$/, "") || "/";
-  const page = pages.find((item) => item.slug.replace(/\/$/, "") === routePath) || (routePath === "/" ? pages[0] : undefined);
-  const LazyPage = useMemo(() => page ? React.lazy(page.load) : null, [page]);
-  const go = (slug: string) => {
-    const parts = slug.split("#");
-    const next = siteConfig.basePath.replace(/\/$/, "") + parts[0] + (parts[1] ? "#" + parts[1] : "");
-    history.pushState(null, "", next);
-    setPath(appPath());
-    requestAnimationFrame(() => parts[1] ? document.getElementById(parts[1])?.scrollIntoView() : window.scrollTo(0, 0));
-  };
+  const page = pageForPath(routePath);
+  const LazyPage = page ? lazyPage(page) : null;
   const searchShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘K" : "Ctrl K";
   return <div className="docs-shell">
-    <div className="reading-progress" aria-hidden="true"><span style={{ transform: "scaleX(" + scrollProgress + ")" }} /></div>
+    <a className="skip-link" href="#wake-docs-content">{text("Skip to content", "跳到正文")}</a>
+    <ReadingProgress />
+    <p className="sr-only" role="status" aria-live="polite" aria-atomic="true" key={announcement.key}>{announcement.message}</p>
     <header className="topbar">
       <button type="button" className="mobile-menu icon-button" aria-haspopup="dialog" aria-expanded={drawer} aria-controls="wake-docs-drawer" onClick={() => setDrawer(true)} aria-label={text("Open navigation", "打开导航")}>☰</button>
       <Logo />
@@ -721,10 +883,12 @@ export function App() {
       </div>
     </header>
     <aside className="sidebar"><Sidebar current={page?.slug || ""} /></aside>
-    {drawer && <div className="drawer-backdrop" onMouseDown={() => setDrawer(false)}><aside id="wake-docs-drawer" className="drawer" role="dialog" aria-modal="true" aria-label={text("Documentation navigation", "文档导航")} onKeyDown={trapDialogFocus} onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><Logo /><button ref={drawerClose} type="button" className="icon-button" onClick={() => setDrawer(false)} aria-label={text("Close navigation", "关闭导航")}>×</button></div><Sidebar current={page?.slug || ""} close={() => setDrawer(false)} /></aside></div>}
-    <main className="content"><Suspense fallback={<div className="page-loading"><span /></div>}>{LazyPage ? <LazyPage /> : <NotFound />}</Suspense></main>
+    {drawer && <div className="drawer-backdrop" onMouseDown={() => setDrawer(false)}><aside id="wake-docs-drawer" className="drawer" role="dialog" aria-modal="true" aria-label={text("Documentation navigation", "文档导航")} onKeyDown={trapDialogFocus} onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><Logo onNavigate={() => { suppressDrawerFocusRestore(); setDrawer(false); }} /><button ref={drawerClose} type="button" className="icon-button" onClick={() => setDrawer(false)} aria-label={text("Close navigation", "关闭导航")}>×</button></div><Sidebar current={page?.slug || ""} close={() => { suppressDrawerFocusRestore(); setDrawer(false); }} /></aside></div>}
+    <main className="content" id="wake-docs-content" tabIndex={-1}>
+      {page && <MobileTableOfContents page={page} />}
+      <Suspense fallback={<div className="page-loading" role="status"><span aria-hidden="true" /><span className="sr-only">{text("Loading page…", "正在加载页面…")}</span></div>}>{LazyPage ? <LazyPage /> : <NotFound />}</Suspense>
+    </main>
     <aside className="toc-column">{page && <TableOfContents page={page} />}</aside>
     <Search open={search} close={() => setSearch(false)} go={go} />
-    {showBackToTop && <button type="button" className="back-to-top" aria-label={text("Back to top", "返回顶部")} onClick={() => window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })}>↑</button>}
   </div>;
 }

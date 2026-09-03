@@ -14,7 +14,16 @@ markdown.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+same-file.workspace = true
+tempfile.workspace = true
 toml.workspace = true
+wake_common.workspace = true
+wake_ecma_ast.workspace = true
+wake_ecma_lexer.workspace = true
+wake_ecma_parser.workspace = true
 wake_tsdoc.workspace = true
 
 [dev-dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

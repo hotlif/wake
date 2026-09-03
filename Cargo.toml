@@ -43,6 +43,7 @@ rkyv = "0.8.17"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
+same-file = "1.0.6"
 # 声明式项目配置 wake.config.toml（仅 wake_config 使用，CLI 侧，非编译核心）。
 toml = "1.1.4"
 # 组件扫描 include/exclude 正则（仅 wake_scan 使用，CLI 侧，非编译核心）。

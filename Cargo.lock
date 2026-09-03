@@ -4387,10 +4387,17 @@ version = "0.1.26"
 dependencies = [
  "markdown",
  "regex",
+ "same-file",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
+ "wake_common",
+ "wake_ecma_ast",
+ "wake_ecma_lexer",
+ "wake_ecma_parser",
  "wake_tsdoc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
