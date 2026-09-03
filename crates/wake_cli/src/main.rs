@@ -7,7 +7,11 @@ use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use wake_common::{FileSystem, OsFileSystem, RenderStyle, SourceFile, render};
@@ -90,7 +94,12 @@ enum Command {
         #[command(subcommand)]
         command: LibraryCommand,
     },
-    /// Start the application development server and HMR.
+    /// Initialize Wake-native Module Federation project artifacts.
+    Federation {
+        #[command(subcommand)]
+        command: FederationCommand,
+    },
+    /// Start the application development server and Live Reload.
     Dev {
         /// Project root.
         #[arg(default_value = ".")]
@@ -338,6 +347,22 @@ enum LibraryCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum FederationCommand {
+    /// Create the stable TypeScript entry used by federation type synchronization.
+    Init {
+        /// Project directory, or a directory below the project root.
+        #[arg(default_value = ".")]
+        root: PathBuf,
+    },
+    /// Fetch and pin the exact production manifests and asset closures.
+    Lock {
+        /// Project directory, or a directory below the project root.
+        #[arg(default_value = ".")]
+        root: PathBuf,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BundlePlatformArg {
     Browser,
@@ -453,6 +478,14 @@ fn main() -> ExitCode {
                     .and_then(|()| cmd_library_docgen(&project, entry.as_deref(), ui)),
             }
         }
+        Command::Federation { command } => match command {
+            FederationCommand::Init { root } => {
+                ensure_static_mode(cli.ui).and_then(|()| cmd_federation_init(&root, ui))
+            }
+            FederationCommand::Lock { root } => {
+                ensure_static_mode(cli.ui).and_then(|()| cmd_federation_lock(&root, ui))
+            }
+        },
         Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port, ui, cli.ui),
         Command::Docs { command } => match command {
             DocsCommand::Dev { root, port, mode } => cmd_docs_dev(&root, port, mode, ui, cli.ui),
@@ -537,6 +570,62 @@ fn ensure_static_mode(mode: UiMode) -> Result<(), ExitCode> {
         Err(ExitCode::FAILURE)
     } else {
         Ok(())
+    }
+}
+
+fn cmd_federation_init(root: &Path, ui: Ui) -> Result<(), ExitCode> {
+    ui.header("federation init");
+    match wake_app::initialize_federation_types(root) {
+        Ok(result) => {
+            let status = if result.declaration == wake_app::FederationInitFileStatus::Unchanged
+                && result.types_index == wake_app::FederationInitFileStatus::Unchanged
+            {
+                "Already initialized"
+            } else {
+                "Initialized"
+            };
+            eprintln!(
+                "  {}  {status} federation types in {}",
+                ui.ok("✓"),
+                ui.accent(&result.project_root.display().to_string())
+            );
+            eprintln!();
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("wake: {error}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn cmd_federation_lock(root: &Path, ui: Ui) -> Result<(), ExitCode> {
+    ui.header("federation lock");
+    let result: Result<(PathBuf, usize), String> = (|| {
+        let (project_root, lock) = wake_app::generate_project_federation_lock(root)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        Ok((project_root, lock.remotes.len()))
+    })();
+    match result {
+        Ok((project_root, remotes)) => {
+            eprintln!(
+                "  {}  Locked {remotes} remote{} in {}",
+                ui.ok("✓"),
+                if remotes == 1 { "" } else { "s" },
+                ui.accent(
+                    &project_root
+                        .join("wake-federation.lock")
+                        .display()
+                        .to_string()
+                )
+            );
+            eprintln!();
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("wake: {error}");
+            Err(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -843,10 +932,9 @@ fn test_result_exit(result: &wake_app::TestRunResult) -> Result<(), ExitCode> {
 fn print_pretty_test_result(result: &wake_app::TestRunResult, ui: Ui) {
     for suite in &result.suites {
         let status = match suite.status {
-            wake_app::TestStatus::Passed => ui.ok("PASS"),
-            wake_app::TestStatus::Failed => ui.err("FAIL"),
-            wake_app::TestStatus::Skipped => ui.dim("SKIP"),
-            wake_app::TestStatus::Todo => ui.dim("TODO"),
+            wake_app::TestSuiteStatus::Passed => ui.ok("PASS"),
+            wake_app::TestSuiteStatus::Failed => ui.err("FAIL"),
+            wake_app::TestSuiteStatus::Skipped => ui.dim("SKIP"),
         };
         eprintln!("{status} {}", suite.path);
         for test in &suite.tests {
@@ -1110,12 +1198,17 @@ fn metrics_from_result(result: &wake_app::BuildResult) -> BuildMetrics {
         chunks: result
             .files
             .iter()
-            .filter(|file| file.kind == "chunk")
+            .filter(|file| file.kind == wake_app::OutputFileKind::Chunk)
             .count(),
         assets: result
             .files
             .iter()
-            .filter(|file| file.kind == "asset" || file.kind == "css")
+            .filter(|file| {
+                matches!(
+                    file.kind,
+                    wake_app::OutputFileKind::Asset | wake_app::OutputFileKind::Css
+                )
+            })
             .count(),
         duration_ms: result.duration_ms,
     }
@@ -1278,6 +1371,7 @@ fn cmd_build(
         cache,
         source_map: sourcemap,
         write: true,
+        federation: None,
     };
     match wake_app::build(options, &wake_app::CancellationToken::default()) {
         Ok(result) => {
@@ -1291,6 +1385,293 @@ fn cmd_build(
     }
 }
 
+enum BuildWatchNotification {
+    Paths(Vec<(PathBuf, bool)>),
+    Rescan,
+    BackendError { generation: u64, error: String },
+}
+
+fn create_build_watcher(
+    sender: std::sync::mpsc::Sender<BuildWatchNotification>,
+    failed_generation: Arc<AtomicU64>,
+    generation: u64,
+    cancellation: wake_app::CancellationToken,
+) -> Result<notify::RecommendedWatcher, String> {
+    notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
+        Ok(event) if event.need_rescan() => {
+            let _ = sender.send(BuildWatchNotification::Rescan);
+        }
+        Ok(event) if is_build_watch_event(&event) => {
+            let structural = is_build_watch_structural_event(&event);
+            let _ = sender.send(BuildWatchNotification::Paths(
+                event
+                    .paths
+                    .into_iter()
+                    .map(|path| (path, structural))
+                    .collect(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // Invalidate the coverage capability before queueing the diagnostic. The command
+            // loop may already have a rebuild pending, so queue ordering alone is not a fence.
+            revoke_build_watch_backend(&failed_generation, generation, &cancellation);
+            let _ = sender.send(BuildWatchNotification::BackendError {
+                generation,
+                error: format!("file watcher backend error: {error}"),
+            });
+        }
+    })
+    .map_err(|error| format!("cannot create file watcher: {error}"))
+}
+
+fn revoke_build_watch_backend(
+    failed_generation: &AtomicU64,
+    generation: u64,
+    cancellation: &wake_app::CancellationToken,
+) {
+    // Cancellation is generation-owned. A delayed callback from a retired watcher can revoke its
+    // own in-flight build, but cannot cancel work authorized by the successor generation.
+    revoke_build_watch_backend_with(failed_generation, generation, || cancellation.cancel());
+}
+
+fn revoke_build_watch_backend_with(
+    failed_generation: &AtomicU64,
+    generation: u64,
+    cancel: impl FnOnce(),
+) {
+    // Publish the capability revocation before cancel() waits for any in-flight output commit.
+    // This keeps a second queued rebuild from observing a live epoch during that wait.
+    failed_generation.fetch_max(generation, Ordering::Release);
+    cancel();
+}
+
+fn report_build_watch_failure(
+    state: &mut DashboardState,
+    dashboard: &Option<Dashboard>,
+    ui: &Ui,
+    error: &str,
+) {
+    state.error(format!("[WAKE_WATCH] {error}"));
+    if dashboard.is_none() {
+        eprintln!("  {}  [WAKE_WATCH] {error}", ui.err("✗"));
+    }
+}
+
+fn is_current_build_watch_backend_error(
+    active_generation: Option<u64>,
+    event_generation: u64,
+) -> bool {
+    active_generation == Some(event_generation)
+}
+
+#[derive(Default)]
+struct BuildWatchCoverageCapability {
+    installed: Option<(wake_app::WatchPlanSnapshot, u64)>,
+}
+
+impl BuildWatchCoverageCapability {
+    fn confirm(&mut self, plan: wake_app::WatchPlanSnapshot, backend_generation: u64) -> bool {
+        let next = (plan, backend_generation);
+        let changed = self.installed.as_ref() != Some(&next);
+        self.installed = Some(next);
+        changed
+    }
+
+    fn clear(&mut self) {
+        self.installed = None;
+    }
+
+    fn installed(
+        &self,
+        backend_generation: u64,
+        failed_generation: &AtomicU64,
+    ) -> Option<&wake_app::WatchPlanSnapshot> {
+        if failed_generation.load(Ordering::Acquire) >= backend_generation {
+            return None;
+        }
+        self.installed
+            .as_ref()
+            .filter(|(_, generation)| *generation == backend_generation)
+            .map(|(plan, _)| plan)
+    }
+
+    fn revision_for(
+        &self,
+        required: &wake_app::WatchPlanSnapshot,
+        backend_generation: u64,
+        failed_generation: &AtomicU64,
+    ) -> Option<wake_app::WatchPlanRevision> {
+        let installed = self.installed(backend_generation, failed_generation)?;
+        (installed.root == required.root
+            && installed.revision == required.revision
+            && required
+                .interests
+                .iter()
+                .all(|interest| installed.interests.contains(interest)))
+        .then_some(required.revision)
+    }
+
+    fn narrow_to(
+        &mut self,
+        plan: wake_app::WatchPlanSnapshot,
+        backend_generation: u64,
+        failed_generation: &AtomicU64,
+    ) -> bool {
+        let Some(installed) = self.installed(backend_generation, failed_generation) else {
+            return false;
+        };
+        if installed.root != plan.root
+            || plan.revision < installed.revision
+            || !plan
+                .interests
+                .iter()
+                .all(|interest| installed.interests.contains(interest))
+        {
+            return false;
+        }
+        self.installed = Some((plan, backend_generation));
+        true
+    }
+}
+
+fn build_watch_handoff_plan(
+    bootstrap: &wake_app::WatchPlanSnapshot,
+    context: &wake_app::WatchPlanSnapshot,
+) -> wake_app::WatchPlanSnapshot {
+    let mut interests = bootstrap
+        .interests
+        .iter()
+        .chain(&context.interests)
+        .cloned()
+        .collect::<Vec<_>>();
+    interests.sort();
+    interests.dedup();
+    wake_app::WatchPlanSnapshot {
+        revision: context.revision,
+        root: context.root.clone(),
+        interests,
+    }
+}
+
+fn current_build_watch_plan(
+    bootstrap: Option<&wake_app::BuildWatchBootstrap>,
+    context: Option<&wake_app::BuildContext>,
+    handoff: Option<&wake_app::WatchPlanSnapshot>,
+) -> wake_app::WatchPlanSnapshot {
+    if let Some(context) = context {
+        let context = context.watch_plan();
+        return handoff.map_or_else(
+            || context.clone(),
+            |bootstrap| build_watch_handoff_plan(bootstrap, &context),
+        );
+    }
+    bootstrap
+        .expect("a build watch without a context owns a bootstrap")
+        .watch_plan()
+}
+
+fn report_build_watch_app_error(
+    state: &mut DashboardState,
+    dashboard: &Option<Dashboard>,
+    ui: &Ui,
+    error: &wake_app::WakeError,
+) {
+    if error.diagnostics.is_empty() {
+        state.error(format!("[{}] {}", error.code, error.message));
+    } else {
+        for diagnostic in &error.diagnostics {
+            state.diagnostic(diagnostic.clone(), format_diagnostic_plain(diagnostic));
+        }
+    }
+    if dashboard.is_none() {
+        ui.app_error(error);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildWatchRebuildOutcome {
+    Succeeded,
+    Failed,
+    BackendLost,
+    CoveragePending,
+    RestartRequired,
+}
+
+fn execute_build_watch_rebuild(
+    context: &wake_app::BuildContext,
+    invalidation: wake_app::WatchInvalidation,
+    covered_revision: wake_app::WatchPlanRevision,
+    cancellation: wake_app::CancellationToken,
+    initial: bool,
+    state: &mut DashboardState,
+    dashboard: &mut Option<Dashboard>,
+    ui: &Ui,
+) -> BuildWatchRebuildOutcome {
+    let changed = match &invalidation {
+        wake_app::WatchInvalidation::Paths(paths) => paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        wake_app::WatchInvalidation::Rescan => vec!["<filesystem rescan>".to_owned()],
+    };
+    state.rebuilding(changed.clone(), None, None);
+    if let Some(active) = dashboard.as_mut() {
+        let _ = active.draw(state);
+    } else {
+        ui.rebuild_start(changed.len());
+    }
+
+    match context.rebuild_watch_at(invalidation, covered_revision, cancellation.clone()) {
+        Ok(result) => {
+            let metrics = metrics_from_result(&result);
+            state.built(metrics, initial, None, None);
+            if dashboard.is_some() {
+                record_successful_build_diagnostics(state, &result.diagnostics);
+            } else if initial {
+                ui.build_result("Initial build completed", &result, None);
+                eprintln!(
+                    "     {}  {}",
+                    ui.dim("Watching"),
+                    ui.accent("project source and exact control inputs")
+                );
+                eprintln!();
+            } else {
+                ui.rebuilt(metrics, false);
+                for diagnostic in &result.diagnostics {
+                    ui.diagnostic(diagnostic);
+                }
+            }
+            BuildWatchRebuildOutcome::Succeeded
+        }
+        Err(error) if error.code == "WAKE_WATCH_COVERAGE_PENDING" => {
+            BuildWatchRebuildOutcome::CoveragePending
+        }
+        Err(error) if error.code == "WAKE_DEV_RESTART_REQUIRED" => {
+            BuildWatchRebuildOutcome::RestartRequired
+        }
+        Err(error) if error.code == "WAKE_CANCELLED" && cancellation.is_cancelled() => {
+            BuildWatchRebuildOutcome::BackendLost
+        }
+        Err(error) => {
+            report_build_watch_app_error(state, dashboard, ui, &error);
+            BuildWatchRebuildOutcome::Failed
+        }
+    }
+}
+
+fn next_watch_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(Duration::from_secs(2))
+}
+
+fn build_watch_reconcile_needs_rescan(
+    newly_installed: bool,
+    coverage_changed: bool,
+    cleanup_only: bool,
+) -> bool {
+    newly_installed || (coverage_changed && !cleanup_only)
+}
+
 fn cmd_build_watch(
     entry: Option<&Path>,
     outdir: &Path,
@@ -1301,23 +1682,17 @@ fn cmd_build_watch(
 ) -> Result<(), ExitCode> {
     use std::sync::mpsc;
 
-    use notify::{RecursiveMode, Watcher};
-
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let watch_dir = {
-        let src = cwd.join("src");
-        if src.is_dir() { src } else { cwd.clone() }
-    };
     let mut state = DashboardState::new(
         "build --watch",
         &cwd,
         "WATCH",
-        format!("{} · writing {}", watch_dir.display(), outdir.display()),
+        format!("typed project inputs · writing {}", outdir.display()),
     );
-    state.set_endpoint(watch_dir.display().to_string());
+    state.set_endpoint("typed project inputs".to_string());
     let mut dashboard = start_dashboard(mode, &ui, &state)?;
 
-    let context = match wake_app::BuildContext::create(wake_app::BuildOptions {
+    let build_options = wake_app::BuildOptions {
         project: wake_app::ProjectOptions {
             cwd: Some(cwd.clone()),
             config_path: None,
@@ -1327,8 +1702,10 @@ fn cmd_build_watch(
         cache,
         source_map: sourcemap,
         write: true,
-    }) {
-        Ok(context) => context,
+        federation: None,
+    };
+    let mut bootstrap = match wake_app::BuildWatchBootstrap::create(build_options.clone()) {
+        Ok(bootstrap) => Some(bootstrap),
         Err(error) => {
             return Err(restore_for_error(
                 &mut dashboard,
@@ -1338,66 +1715,54 @@ fn cmd_build_watch(
             ));
         }
     };
+    if let wake_app::BuildWatchBootstrapState::Waiting { error, .. } = bootstrap
+        .as_ref()
+        .expect("build watch bootstrap exists")
+        .state()
+    {
+        report_build_watch_app_error(&mut state, &dashboard, &ui, &error);
+    }
+    let mut context: Option<wake_app::BuildContext> = None;
+    let mut handoff_plan: Option<wake_app::WatchPlanSnapshot> = None;
 
-    match context.rebuild(Vec::new(), wake_app::CancellationToken::default()) {
-        Ok(result) => {
-            state.built(metrics_from_result(&result), true, None, None);
-            if let Some(active) = dashboard.as_mut() {
-                let _ = active.draw(&state);
-            } else {
-                ui.build_result("Initial build completed", &result, None);
-                eprintln!(
-                    "     {}  {}",
-                    ui.dim("Watching"),
-                    ui.accent(&watch_dir.display().to_string())
-                );
-                eprintln!();
-            }
-        }
+    // The bootstrap is probe-only. Its complete recovery plan is installed before candidate
+    // generation or retained-session creation; a mandatory Rescan then revalidates that snapshot.
+    let (tx, rx) = mpsc::channel::<BuildWatchNotification>();
+    let failed_backend_generation = Arc::new(AtomicU64::new(0));
+    let mut next_backend_generation = 1_u64;
+    let mut last_watch_error = None;
+    let initial_backend_generation = next_backend_generation;
+    next_backend_generation = next_backend_generation.saturating_add(1);
+    let initial_backend_cancellation = wake_app::CancellationToken::default();
+    let (mut watcher, mut watcher_generation, mut watcher_cancellation) = match create_build_watcher(
+        tx.clone(),
+        Arc::clone(&failed_backend_generation),
+        initial_backend_generation,
+        initial_backend_cancellation.clone(),
+    ) {
+        Ok(watcher) => (
+            Some(watcher),
+            Some(initial_backend_generation),
+            Some(initial_backend_cancellation),
+        ),
         Err(error) => {
-            context.close();
-            return Err(restore_for_error(
-                &mut dashboard,
-                &ui,
-                "build --watch",
-                &error,
-            ));
+            report_build_watch_failure(&mut state, &dashboard, &ui, &error);
+            last_watch_error = Some(error);
+            (None, None, None)
         }
-    }
-
-    let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
-    let mut watcher =
-        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res
-                && is_source_event(&event)
-            {
-                let _ = tx.send(event.paths);
-            }
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                context.close();
-                if let Some(mut active) = dashboard.take() {
-                    active.restore();
-                    ui.header("build --watch");
-                }
-                eprintln!("  {}  Failed to create file watcher: {error}", ui.err("✗"));
-                return Err(ExitCode::FAILURE);
-            }
-        };
-    if let Err(error) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
-        context.close();
-        if let Some(mut active) = dashboard.take() {
-            active.restore();
-            ui.header("build --watch");
-        }
-        eprintln!(
-            "  {}  Failed to watch {}: {error}",
-            ui.err("✗"),
-            watch_dir.display()
-        );
-        return Err(ExitCode::FAILURE);
-    }
+    };
+    let mut registrations = wake_app::WatchRegistrationState::default();
+    let mut desired_plan = bootstrap
+        .as_ref()
+        .expect("build watch bootstrap exists")
+        .watch_plan();
+    let mut coverage = BuildWatchCoverageCapability::default();
+    let mut pending_invalidation: Option<wake_app::WatchInvalidation> = None;
+    let mut retry_at = Some(Instant::now());
+    let mut retry_delay = Duration::from_millis(100);
+    let mut recreate_backend = watcher.is_none();
+    let mut published_once = false;
+    let mut cleanup_only_reconcile = false;
     let shutdown = shutdown_signals().map_err(|error| {
         if let Some(mut active) = dashboard.take() {
             active.restore();
@@ -1414,11 +1779,10 @@ fn cmd_build_watch(
                 "Ctrl-C"
             };
             return finish_watch(
-                &context,
+                context.as_ref(),
                 &mut dashboard,
                 &mut state,
                 &ui,
-                &watch_dir,
                 reason,
                 Some(exit_code),
             );
@@ -1432,22 +1796,20 @@ fn cmd_build_watch(
             {
                 DashboardAction::Quit => {
                     return finish_watch(
-                        &context,
+                        context.as_ref(),
                         &mut dashboard,
                         &mut state,
                         &ui,
-                        &watch_dir,
                         "q",
                         None,
                     );
                 }
                 DashboardAction::Interrupt => {
                     return finish_watch(
-                        &context,
+                        context.as_ref(),
                         &mut dashboard,
                         &mut state,
                         &ui,
-                        &watch_dir,
                         "Ctrl-C",
                         Some(130),
                     );
@@ -1456,79 +1818,463 @@ fn cmd_build_watch(
             }
         }
 
+        // A watcher callback invalidates its generation before it queues the error diagnostic.
+        // Observe that fence before registration, activation, or a retained-context rebuild so a
+        // queued backend failure can never authorize publication through stale coverage.
+        if watcher_generation.is_some_and(|generation| {
+            failed_backend_generation.load(Ordering::Acquire) >= generation
+        }) {
+            watcher.take();
+            watcher_generation = None;
+            if let Some(cancellation) = watcher_cancellation.take() {
+                cancellation.cancel();
+            }
+            registrations.clear_after_backend_loss();
+            coverage.clear();
+            cleanup_only_reconcile = false;
+            pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+            recreate_backend = true;
+            retry_at = Some(Instant::now());
+            continue;
+        }
+
+        if retry_at.is_some_and(|retry| Instant::now() >= retry) {
+            if recreate_backend {
+                let backend_generation = next_backend_generation;
+                next_backend_generation = next_backend_generation.saturating_add(1);
+                let backend_cancellation = wake_app::CancellationToken::default();
+                match create_build_watcher(
+                    tx.clone(),
+                    Arc::clone(&failed_backend_generation),
+                    backend_generation,
+                    backend_cancellation.clone(),
+                ) {
+                    Ok(created) => {
+                        watcher = Some(created);
+                        watcher_generation = Some(backend_generation);
+                        watcher_cancellation = Some(backend_cancellation);
+                        registrations.clear_after_backend_loss();
+                        coverage.clear();
+                        cleanup_only_reconcile = false;
+                        recreate_backend = false;
+                    }
+                    Err(error) => {
+                        if last_watch_error.as_deref() != Some(error.as_str()) {
+                            report_build_watch_failure(&mut state, &dashboard, &ui, &error);
+                            last_watch_error = Some(error);
+                        }
+                        retry_at = Some(Instant::now() + retry_delay);
+                        retry_delay = next_watch_retry_delay(retry_delay);
+                        continue;
+                    }
+                }
+            }
+
+            desired_plan = current_build_watch_plan(
+                bootstrap.as_ref(),
+                context.as_ref(),
+                handoff_plan.as_ref(),
+            );
+            let Some(active_watcher) = watcher.as_mut() else {
+                coverage.clear();
+                recreate_backend = true;
+                retry_at = Some(Instant::now() + retry_delay);
+                retry_delay = next_watch_retry_delay(retry_delay);
+                continue;
+            };
+            match wake_app::reconcile_watch_interests(
+                active_watcher,
+                &mut registrations,
+                &desired_plan.interests,
+            ) {
+                Ok(outcome) => {
+                    for error in &outcome.cleanup_errors {
+                        if last_watch_error.as_deref() != Some(error.as_str()) {
+                            report_build_watch_failure(&mut state, &dashboard, &ui, error);
+                            last_watch_error = Some(error.clone());
+                        }
+                    }
+                    if !outcome.cleanup_errors.is_empty() {
+                        watcher.take();
+                        watcher_generation = None;
+                        if let Some(cancellation) = watcher_cancellation.take() {
+                            cancellation.cancel();
+                        }
+                        registrations.clear_after_backend_loss();
+                        coverage.clear();
+                        cleanup_only_reconcile = false;
+                        pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                        recreate_backend = true;
+                        retry_at = Some(Instant::now() + retry_delay);
+                        retry_delay = next_watch_retry_delay(retry_delay);
+                        continue;
+                    }
+                    if registrations.is_coverage_complete(&desired_plan.interests) {
+                        let newly_installed = coverage.confirm(
+                            desired_plan.clone(),
+                            watcher_generation.expect("a reconciled watcher has a generation"),
+                        );
+                        if build_watch_reconcile_needs_rescan(
+                            newly_installed,
+                            outcome.coverage_changed,
+                            cleanup_only_reconcile,
+                        ) {
+                            pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                        }
+                    } else {
+                        coverage.clear();
+                        cleanup_only_reconcile = false;
+                    }
+                    if outcome.cleanup_errors.is_empty()
+                        && registrations.is_converged(&desired_plan.interests)
+                    {
+                        retry_at = None;
+                        retry_delay = Duration::from_millis(100);
+                        last_watch_error = None;
+                        cleanup_only_reconcile = false;
+                    } else {
+                        retry_at = Some(Instant::now() + retry_delay);
+                        retry_delay = next_watch_retry_delay(retry_delay);
+                    }
+                }
+                Err(error) => {
+                    watcher.take();
+                    watcher_generation = None;
+                    if let Some(cancellation) = watcher_cancellation.take() {
+                        cancellation.cancel();
+                    }
+                    registrations.clear_after_backend_loss();
+                    coverage.clear();
+                    cleanup_only_reconcile = false;
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    recreate_backend = true;
+                    let error = error.to_string();
+                    if last_watch_error.as_deref() != Some(error.as_str()) {
+                        report_build_watch_failure(&mut state, &dashboard, &ui, &error);
+                        last_watch_error = Some(error);
+                    }
+                    retry_at = Some(Instant::now() + retry_delay);
+                    retry_delay = next_watch_retry_delay(retry_delay);
+                }
+            }
+        }
+
+        if let Some(invalidation) = pending_invalidation.take() {
+            if !registrations.is_coverage_complete(&desired_plan.interests) {
+                pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                retry_at = Some(Instant::now());
+                continue;
+            }
+
+            if context.is_none() {
+                let required = bootstrap
+                    .as_ref()
+                    .expect("a watch without a context owns a bootstrap")
+                    .watch_plan();
+                let Some(active_generation) = watcher_generation else {
+                    coverage.clear();
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    retry_at = Some(Instant::now());
+                    continue;
+                };
+                let Some(covered_revision) =
+                    coverage.revision_for(&required, active_generation, &failed_backend_generation)
+                else {
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    retry_at = Some(Instant::now());
+                    continue;
+                };
+                if failed_backend_generation.load(Ordering::Acquire) >= active_generation {
+                    coverage.clear();
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    retry_at = Some(Instant::now());
+                    continue;
+                }
+                let activation = bootstrap
+                    .as_mut()
+                    .expect("a watch without a context owns a bootstrap")
+                    .activate_at(covered_revision);
+                match activation {
+                    Ok(activated) => {
+                        handoff_plan = Some(
+                            bootstrap
+                                .as_ref()
+                                .expect("activated bootstrap remains available for handoff")
+                                .watch_plan(),
+                        );
+                        context = Some(activated);
+                        bootstrap = None;
+                        desired_plan =
+                            current_build_watch_plan(None, context.as_ref(), handoff_plan.as_ref());
+                        coverage.clear();
+                        pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                        retry_at = Some(Instant::now());
+                    }
+                    Err(error) if error.code == "WAKE_WATCH_COVERAGE_PENDING" => {
+                        desired_plan = bootstrap
+                            .as_ref()
+                            .expect("coverage-pending bootstrap remains active")
+                            .watch_plan();
+                        coverage.clear();
+                        pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                        retry_at = Some(Instant::now());
+                    }
+                    Err(error) => {
+                        report_build_watch_app_error(&mut state, &dashboard, &ui, &error);
+                        let latest = bootstrap
+                            .as_ref()
+                            .expect("waiting bootstrap remains active")
+                            .watch_plan();
+                        if latest != desired_plan {
+                            desired_plan = latest;
+                            coverage.clear();
+                            pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                            retry_at = Some(Instant::now());
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let required = context
+                .as_ref()
+                .expect("active build watch context")
+                .watch_plan();
+            let Some(active_generation) = watcher_generation else {
+                coverage.clear();
+                pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                retry_at = Some(Instant::now());
+                continue;
+            };
+            let Some(covered_revision) =
+                coverage.revision_for(&required, active_generation, &failed_backend_generation)
+            else {
+                coverage.clear();
+                pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                retry_at = Some(Instant::now());
+                continue;
+            };
+            if failed_backend_generation.load(Ordering::Acquire) >= active_generation {
+                coverage.clear();
+                pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                retry_at = Some(Instant::now());
+                continue;
+            }
+            let Some(build_cancellation) = watcher_cancellation.clone() else {
+                coverage.clear();
+                pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                retry_at = Some(Instant::now());
+                continue;
+            };
+            let outcome = execute_build_watch_rebuild(
+                context.as_ref().expect("active build watch context"),
+                invalidation,
+                covered_revision,
+                build_cancellation,
+                !published_once,
+                &mut state,
+                &mut dashboard,
+                &ui,
+            );
+            let mut shrink_only = false;
+            match outcome {
+                BuildWatchRebuildOutcome::Succeeded => {
+                    published_once = true;
+                    handoff_plan = None;
+                    shrink_only = true;
+                }
+                BuildWatchRebuildOutcome::CoveragePending => {
+                    coverage.clear();
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    retry_at = Some(Instant::now());
+                }
+                BuildWatchRebuildOutcome::BackendLost => {
+                    watcher.take();
+                    watcher_generation = None;
+                    if let Some(cancellation) = watcher_cancellation.take() {
+                        cancellation.cancel();
+                    }
+                    registrations.clear_after_backend_loss();
+                    coverage.clear();
+                    cleanup_only_reconcile = false;
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    recreate_backend = true;
+                    retry_delay = Duration::from_millis(100);
+                    retry_at = Some(Instant::now() + retry_delay);
+                }
+                BuildWatchRebuildOutcome::RestartRequired => {
+                    if let Some(active) = context.take() {
+                        active.close();
+                    }
+                    handoff_plan = None;
+                    match wake_app::BuildWatchBootstrap::create(build_options.clone()) {
+                        Ok(next) => {
+                            if let wake_app::BuildWatchBootstrapState::Waiting { error, .. } =
+                                next.state()
+                            {
+                                report_build_watch_app_error(&mut state, &dashboard, &ui, &error);
+                            }
+                            bootstrap = Some(next);
+                            coverage.clear();
+                            pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                            retry_at = Some(Instant::now());
+                        }
+                        Err(error) => {
+                            return Err(restore_for_error(
+                                &mut dashboard,
+                                &ui,
+                                "build --watch",
+                                &error,
+                            ));
+                        }
+                    }
+                }
+                BuildWatchRebuildOutcome::Failed => {}
+            }
+
+            let latest = current_build_watch_plan(
+                bootstrap.as_ref(),
+                context.as_ref(),
+                handoff_plan.as_ref(),
+            );
+            if latest != desired_plan {
+                // The bootstrap/context union remains installed through the first successful
+                // publication. Afterwards reconciliation can safely shrink to context ownership.
+                desired_plan = latest.clone();
+                if shrink_only
+                    && watcher_generation.is_some_and(|generation| {
+                        coverage.narrow_to(latest, generation, &failed_backend_generation)
+                    })
+                {
+                    // Removing bootstrap-only registrations creates no observation gap. Reconcile
+                    // cleanup without scheduling a second initial build.
+                    cleanup_only_reconcile = true;
+                    retry_at = Some(Instant::now());
+                } else {
+                    coverage.clear();
+                    pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+                    retry_at = Some(Instant::now());
+                }
+            }
+            continue;
+        }
+
         let next = if dashboard.is_some() {
             rx.try_recv().ok()
         } else {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(paths) => Some(paths),
+                Ok(event) => Some(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return finish_watch(
-                        &context,
+                        context.as_ref(),
                         &mut dashboard,
                         &mut state,
                         &ui,
-                        &watch_dir,
                         "watcher closed",
                         None,
                     );
                 }
             }
         };
-        let Some(mut changed) = next else {
+        let Some(next) = next else {
             continue;
         };
 
+        let mut changed_events = Vec::new();
+        let mut needs_rescan = false;
+        let mut backend_error = None;
+        match next {
+            BuildWatchNotification::Paths(events) => changed_events.extend(events),
+            BuildWatchNotification::Rescan => needs_rescan = true,
+            BuildWatchNotification::BackendError { generation, error } => {
+                backend_error = Some((generation, error));
+            }
+        }
         std::thread::sleep(Duration::from_millis(30));
-        while let Ok(paths) = rx.try_recv() {
-            changed.extend(paths);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                BuildWatchNotification::Paths(events) => changed_events.extend(events),
+                BuildWatchNotification::Rescan => needs_rescan = true,
+                BuildWatchNotification::BackendError { generation, error } => {
+                    backend_error = Some((generation, error));
+                }
+            }
+        }
+        // The atomic fence may already have retired a generation and successfully installed its
+        // successor. A delayed diagnostic from that old backend is stale state, not a new failure
+        // of the recovered watcher.
+        if let Some((generation, error)) = backend_error
+            && is_current_build_watch_backend_error(watcher_generation, generation)
+        {
+            if last_watch_error.as_deref() != Some(error.as_str()) {
+                report_build_watch_failure(&mut state, &dashboard, &ui, &error);
+                last_watch_error = Some(error);
+            }
+            watcher.take();
+            watcher_generation = None;
+            if let Some(cancellation) = watcher_cancellation.take() {
+                cancellation.cancel();
+            }
+            registrations.clear_after_backend_loss();
+            coverage.clear();
+            cleanup_only_reconcile = false;
+            pending_invalidation = Some(wake_app::WatchInvalidation::Rescan);
+            recreate_backend = true;
+            retry_delay = Duration::from_millis(100);
+            retry_at = Some(Instant::now() + retry_delay);
+            continue;
+        }
+
+        let Some(active_generation) = watcher_generation else {
+            continue;
+        };
+        let Some(installed) = coverage.installed(active_generation, &failed_backend_generation)
+        else {
+            // Coverage is incomplete. A successful timed reconciliation always follows with a
+            // Rescan, so events observed through partial coverage do not become false evidence.
+            continue;
+        };
+        let mut changed = Vec::new();
+        for (path, structural) in changed_events {
+            if installed
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&path, structural))
+            {
+                if structural {
+                    needs_rescan = true;
+                } else {
+                    changed.push(path);
+                }
+            }
         }
         changed.sort();
         changed.dedup();
-        state.rebuilding(
-            changed
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
-            None,
-            None,
-        );
-        if let Some(active) = dashboard.as_mut() {
-            let _ = active.draw(&state);
+        pending_invalidation = if needs_rescan {
+            Some(wake_app::WatchInvalidation::Rescan)
+        } else if changed.is_empty() {
+            None
         } else {
-            ui.rebuild_start(changed.len());
-        }
+            Some(wake_app::WatchInvalidation::Paths(changed))
+        };
+    }
+}
 
-        match context.rebuild(changed, wake_app::CancellationToken::default()) {
-            Ok(result) => {
-                let metrics = metrics_from_result(&result);
-                state.built(metrics, false, None, None);
-                if dashboard.is_none() {
-                    ui.rebuilt(metrics, false);
-                }
-            }
-            Err(error) => {
-                if error.diagnostics.is_empty() {
-                    state.error(format!("[{}] {}", error.code, error.message));
-                } else {
-                    for diagnostic in &error.diagnostics {
-                        state.diagnostic(diagnostic.clone(), format_diagnostic_plain(diagnostic));
-                    }
-                }
-                if dashboard.is_none() {
-                    ui.app_error(&error);
-                }
-            }
-        }
+fn record_successful_build_diagnostics(
+    state: &mut DashboardState,
+    diagnostics: &[wake_app::DiagnosticInfo],
+) {
+    for diagnostic in diagnostics {
+        state.diagnostic(diagnostic.clone(), format_diagnostic_plain(diagnostic));
     }
 }
 
 fn finish_watch(
-    context: &wake_app::BuildContext,
+    context: Option<&wake_app::BuildContext>,
     dashboard: &mut Option<Dashboard>,
     state: &mut DashboardState,
     ui: &Ui,
-    watch_dir: &Path,
     reason: &str,
     exit_code: Option<u8>,
 ) -> Result<(), ExitCode> {
@@ -1536,7 +2282,9 @@ fn finish_watch(
     if let Some(active) = dashboard.as_mut() {
         let _ = active.draw(state);
     }
-    context.close();
+    if let Some(context) = context {
+        context.close();
+    }
     state.stopped();
     if let Some(mut active) = dashboard.take() {
         let _ = active.draw(state);
@@ -1545,7 +2293,7 @@ fn finish_watch(
     ui.final_summary(
         "Watch stopped",
         "Watch",
-        &watch_dir.display().to_string(),
+        "typed project inputs",
         state.rebuilds,
         state.runtime(),
         reason,
@@ -1556,43 +2304,20 @@ fn finish_watch(
     }
 }
 
-fn is_source_event(event: &notify::Event) -> bool {
+fn is_build_watch_event(event: &notify::Event) -> bool {
     use notify::EventKind;
     matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) && event.paths.iter().any(|path| {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(is_watched_ext)
-    })
+    )
 }
 
-fn is_watched_ext(extension: &str) -> bool {
+fn is_build_watch_structural_event(event: &notify::Event) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
     matches!(
-        extension,
-        "ts" | "tsx"
-            | "js"
-            | "jsx"
-            | "mts"
-            | "cts"
-            | "json"
-            | "css"
-            | "raw"
-            | "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "svg"
-            | "webp"
-            | "avif"
-            | "ico"
-            | "bmp"
-            | "woff"
-            | "woff2"
-            | "ttf"
-            | "otf"
-            | "eot"
+        event.kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
     )
 }
 
@@ -1629,7 +2354,8 @@ fn cmd_dev(
     ui: Ui,
     mode: UiMode,
 ) -> Result<(), ExitCode> {
-    let mut state = DashboardState::new("dev", root, "LOCAL", "HMR · source maps · watching");
+    let mut state =
+        DashboardState::new("dev", root, "LOCAL", "Live reload · source maps · watching");
     let mut dashboard = start_dashboard(mode, &ui, &state)?;
     let server = match wake_app::start_dev_server(wake_app::DevServerOptions {
         project: wake_app::ProjectOptions {
@@ -1640,6 +2366,7 @@ fn cmd_dev(
         host: None,
         port: Some(port),
         open: None,
+        federation: None,
     }) {
         Ok(server) => server,
         Err(error) => {
@@ -1663,9 +2390,9 @@ fn cmd_docs_dev(
         "docs dev"
     };
     let watch = if components {
-        "Demo · Controls · HMR · watching"
+        "Demo · Controls · Live reload · watching"
     } else {
-        "MDX · HMR · search index · watching"
+        "MDX · Live reload · search index · watching"
     };
     let mut state = DashboardState::new(command, root, "LOCAL", watch);
     let mut dashboard = start_dashboard(ui_mode, &ui, &state)?;
@@ -1679,6 +2406,7 @@ fn cmd_docs_dev(
             host: None,
             port,
             open: None,
+            federation: None,
         },
         docs_mode.into(),
     ) {
@@ -1876,6 +2604,11 @@ fn apply_server_events(
                 current,
                 failed_names,
             } => state.workspace_state(total, loaded, failed, current, failed_names),
+            wake_app::DevServerEvent::FederationUpdated { .. } => {
+                // The browser-side dev coordinator owns remount-versus-reload behavior. The
+                // dashboard deliberately keeps its current build metrics until the following
+                // structured rebuild event arrives.
+            }
             wake_app::DevServerEvent::Closed => state.stopped(),
         }
     }
@@ -2098,6 +2831,216 @@ fn cmd_tokenize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn watch_plan(
+        revision: u64,
+        root: &Path,
+        interests: Vec<wake_app::WatchInterest>,
+    ) -> wake_app::WatchPlanSnapshot {
+        wake_app::WatchPlanSnapshot {
+            revision: wake_app::WatchPlanRevision(revision),
+            root: root.to_path_buf(),
+            interests,
+        }
+    }
+
+    #[test]
+    fn build_watch_capability_requires_complete_coverage_and_is_cleared_on_backend_loss() {
+        let root = Path::new("project");
+        let backend_generation = 11;
+        let required = watch_plan(
+            3,
+            root,
+            vec![wake_app::WatchInterest::tree(root.join("src"))],
+        );
+        let mut capability = BuildWatchCoverageCapability::default();
+        let failed_generation = AtomicU64::new(0);
+        assert_eq!(
+            capability.revision_for(&required, backend_generation, &failed_generation),
+            None
+        );
+
+        capability.confirm(watch_plan(3, root, Vec::new()), backend_generation);
+        assert_eq!(
+            capability.revision_for(&required, backend_generation, &failed_generation),
+            None
+        );
+
+        capability.confirm(required.clone(), backend_generation);
+        assert_eq!(
+            capability.revision_for(&required, backend_generation, &failed_generation),
+            Some(wake_app::WatchPlanRevision(3))
+        );
+        assert_eq!(
+            capability.revision_for(&required, backend_generation + 1, &failed_generation,),
+            None,
+            "coverage from a failed backend generation is not transferable"
+        );
+        let wrong_revision = watch_plan(4, root, required.interests.clone());
+        assert_eq!(
+            capability.revision_for(&wrong_revision, backend_generation, &failed_generation),
+            None,
+            "an installed snapshot cannot attest a superseding revision"
+        );
+        let wrong_root = watch_plan(3, Path::new("other-project"), required.interests.clone());
+        assert_eq!(
+            capability.revision_for(&wrong_root, backend_generation, &failed_generation),
+            None,
+            "coverage is scoped to the plan root"
+        );
+        let failed_backend_cancellation = wake_app::CancellationToken::default();
+        let successor_cancellation = wake_app::CancellationToken::default();
+        revoke_build_watch_backend(
+            &failed_generation,
+            backend_generation,
+            &failed_backend_cancellation,
+        );
+        assert!(failed_backend_cancellation.is_cancelled());
+        assert!(
+            !successor_cancellation.is_cancelled(),
+            "a stale generation cannot cancel its successor"
+        );
+        let watermark = Arc::new(AtomicU64::new(0));
+        let worker_watermark = Arc::clone(&watermark);
+        let (cancel_entered_tx, cancel_entered_rx) = std::sync::mpsc::channel();
+        let (cancel_release_tx, cancel_release_rx) = std::sync::mpsc::channel();
+        let revoke = std::thread::spawn(move || {
+            revoke_build_watch_backend_with(&worker_watermark, backend_generation, || {
+                cancel_entered_tx.send(()).unwrap();
+                cancel_release_rx.recv().unwrap();
+            });
+        });
+        cancel_entered_rx.recv().unwrap();
+        assert_eq!(
+            watermark.load(Ordering::Acquire),
+            backend_generation,
+            "the backend watermark must be visible before cancellation waits on a commit"
+        );
+        cancel_release_tx.send(()).unwrap();
+        revoke.join().unwrap();
+        assert_eq!(
+            capability.revision_for(&required, backend_generation, &failed_generation),
+            None,
+            "the callback's atomic backend revocation wins over queued rebuild work"
+        );
+        capability.clear();
+        assert_eq!(
+            capability.revision_for(&required, backend_generation, &failed_generation),
+            None
+        );
+        assert!(is_current_build_watch_backend_error(
+            Some(backend_generation),
+            backend_generation
+        ));
+        assert!(
+            !is_current_build_watch_backend_error(Some(backend_generation + 1), backend_generation),
+            "a delayed error from a retired backend must not poison recovered state"
+        );
+    }
+
+    #[test]
+    fn build_watch_handoff_retains_bootstrap_coverage_until_context_ownership() {
+        let root = Path::new("project");
+        let bootstrap_interest = wake_app::WatchInterest::exact_file(root.join("wake.config.toml"));
+        let context_interest = wake_app::WatchInterest::tree(root.join("src"));
+        let bootstrap = watch_plan(7, root, vec![bootstrap_interest.clone()]);
+        let context = watch_plan(2, root, vec![context_interest.clone()]);
+        let handoff = build_watch_handoff_plan(&bootstrap, &context);
+        assert_eq!(handoff.revision, context.revision);
+        assert!(handoff.interests.contains(&bootstrap_interest));
+        assert!(handoff.interests.contains(&context_interest));
+
+        let mut capability = BuildWatchCoverageCapability::default();
+        let backend_generation = 5;
+        let failed_generation = AtomicU64::new(0);
+        capability.confirm(handoff, backend_generation);
+        assert_eq!(
+            capability.revision_for(&context, backend_generation, &failed_generation),
+            Some(context.revision)
+        );
+        assert!(capability.narrow_to(context.clone(), backend_generation, &failed_generation));
+        assert!(
+            !capability.confirm(context.clone(), backend_generation),
+            "a bootstrap-only shrink must not schedule another build"
+        );
+        assert!(
+            !build_watch_reconcile_needs_rescan(false, true, true),
+            "registration cleanup after handoff must not schedule a duplicate build"
+        );
+        assert!(build_watch_reconcile_needs_rescan(false, true, false));
+
+        let mut forward = BuildWatchCoverageCapability::default();
+        let installed = watch_plan(
+            2,
+            root,
+            vec![bootstrap_interest.clone(), context_interest.clone()],
+        );
+        forward.confirm(installed, backend_generation);
+        let committed = watch_plan(3, root, vec![context_interest]);
+        assert!(
+            forward.narrow_to(committed.clone(), backend_generation, &failed_generation),
+            "a successful candidate may advance revision while shrinking accepted coverage"
+        );
+        assert!(!forward.narrow_to(
+            watch_plan(2, root, committed.interests.clone()),
+            backend_generation,
+            &failed_generation
+        ));
+        assert!(!forward.narrow_to(
+            watch_plan(4, Path::new("other-project"), committed.interests),
+            backend_generation,
+            &failed_generation
+        ));
+        capability.clear();
+        assert_eq!(
+            capability.revision_for(&context, backend_generation, &failed_generation),
+            None
+        );
+    }
+
+    #[test]
+    fn federation_init_command_parses_default_and_explicit_roots() {
+        let default = Cli::try_parse_from(["wake", "federation", "init"]).unwrap();
+        let Command::Federation {
+            command: FederationCommand::Init { root },
+        } = default.command
+        else {
+            panic!("expected federation init command");
+        };
+        assert_eq!(root, PathBuf::from("."));
+
+        let explicit =
+            Cli::try_parse_from(["wake", "federation", "init", "packages/catalog"]).unwrap();
+        let Command::Federation {
+            command: FederationCommand::Init { root },
+        } = explicit.command
+        else {
+            panic!("expected federation init command");
+        };
+        assert_eq!(root, PathBuf::from("packages/catalog"));
+    }
+
+    #[test]
+    fn federation_lock_command_parses_default_and_explicit_roots() {
+        let default = Cli::try_parse_from(["wake", "federation", "lock"]).unwrap();
+        let Command::Federation {
+            command: FederationCommand::Lock { root },
+        } = default.command
+        else {
+            panic!("expected federation lock command");
+        };
+        assert_eq!(root, PathBuf::from("."));
+
+        let explicit =
+            Cli::try_parse_from(["wake", "federation", "lock", "packages/shell"]).unwrap();
+        let Command::Federation {
+            command: FederationCommand::Lock { root },
+        } = explicit.command
+        else {
+            panic!("expected federation lock command");
+        };
+        assert_eq!(root, PathBuf::from("packages/shell"));
+    }
 
     #[test]
     fn test_error_category_only_applies_to_the_actual_test_subcommand() {

@@ -259,9 +259,14 @@ impl Ui {
     }
 
     pub fn diagnostic(&self, diagnostic: &wake_app::DiagnosticInfo) {
+        let marker = match diagnostic.severity.as_str() {
+            "error" => self.err("✗"),
+            "warning" => self.warn("!"),
+            _ => self.accent("·"),
+        };
         for (index, line) in self.format_diagnostic(diagnostic).lines().enumerate() {
             if index == 0 {
-                eprintln!("  {}  {}", self.err("✗"), self.bold(line));
+                eprintln!("  {marker}  {}", self.bold(line));
             } else {
                 eprintln!("     {line}");
             }

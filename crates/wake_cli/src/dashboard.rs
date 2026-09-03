@@ -1602,7 +1602,8 @@ mod tests {
 
     #[test]
     fn full_dashboard_contains_brand_metrics_and_controls() {
-        let mut state = DashboardState::new("dev", Path::new("demo"), "LOCAL", "HMR · watching");
+        let mut state =
+            DashboardState::new("dev", Path::new("demo"), "LOCAL", "Live reload · watching");
         state.set_endpoint("http://127.0.0.1:5173/");
         state.built(
             BuildMetrics {
@@ -1699,7 +1700,7 @@ mod tests {
             "docs dev",
             Path::new("demo"),
             "LOCAL",
-            "MDX · HMR · watching",
+            "MDX · Live reload · watching",
         );
         for event in contract["events"].as_array().unwrap() {
             match event["type"].as_str().unwrap() {

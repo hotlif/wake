@@ -1,6 +1,7 @@
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn fixture_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/hello-esm/src/index.js")
@@ -154,6 +155,109 @@ fn bundle_writes_exact_node_commonjs_outfile_without_web_outputs() {
         "{mapped_code}"
     );
     assert!(root.join("mapped.js.map").is_file());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "wake_cli_build_watch_recovery_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(root.join("wake.config.toml"), "[html\n").unwrap();
+    std::fs::write(
+        root.join("src/index.js"),
+        "export const recovered = true;\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .current_dir(&root)
+        .args(["--ui", "plain", "build", "--watch", "--outdir", "dist"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let stayed_alive = child.try_wait().unwrap().is_none();
+    let untouched_before_recovery = !root.join(".wake").exists() && !root.join("dist").exists();
+
+    std::fs::write(
+        root.join("wake.config.toml"),
+        "[html]\nentry = \"src/index.js\"\n",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !root.join("dist/index.html").is_file() {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let recovered = root.join("dist/index.html").is_file();
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(stayed_alive, "watch exited on recoverable TOML: {stderr}");
+    assert!(
+        untouched_before_recovery,
+        "watch touched generated/output state before coverage: {stderr}"
+    );
+    assert!(
+        recovered,
+        "watch did not recover after valid TOML: {stderr}"
+    );
+    assert!(stderr.contains("WAKE_CONFIG"), "{stderr}");
+    assert!(stderr.contains("Initial build completed"), "{stderr}");
+}
+
+#[test]
+fn unavailable_persistent_cache_is_one_non_fatal_cli_warning() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "wake_cli_cache_warning_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"private":true}"#).unwrap();
+    std::fs::write(root.join("src/index.js"), "export const answer = 42;\n").unwrap();
+    // A directory at the optional cache-file path forces both load and store I/O failures without
+    // making the required `.wake` generation directory itself invalid. The real build must still
+    // complete, and both details must be collapsed into one cache warning.
+    std::fs::create_dir_all(root.join(".wake/bundle-cache.bin")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .current_dir(&root)
+        .args([
+            "--ui",
+            "plain",
+            "bundle",
+            "src/index.js",
+            "--outfile",
+            "dist/bundle.js",
+            "--cache",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(root.join("dist/bundle.js").is_file());
+    assert_eq!(stderr.matches("WAKE_CACHE").count(), 1, "{stderr}");
+    assert!(stderr.contains("WARNING"), "{stderr}");
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -355,4 +459,142 @@ fn build_error_prints_numbered_source_code_frame() {
     assert!(stderr.contains("3 | const broken = ;"), "{stderr}");
     assert!(stderr.contains('^'), "{stderr}");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn federation_fixture(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "wake_cli_federation_{name}_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+#[test]
+fn federation_init_discovers_root_and_is_idempotent() {
+    let root = federation_fixture("init");
+    let nested = root.join("packages/catalog/src");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        root.join("wake.config.toml"),
+        "[federation]\nenabled = true\nname = 'shell'\n",
+    )
+    .unwrap();
+
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_wake"))
+            .args([
+                "--ui",
+                "plain",
+                "federation",
+                "init",
+                nested.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("wake-federation.d.ts")).unwrap(),
+        "/// <reference path=\"./.wake/federation/types/index.d.ts\" />\n"
+    );
+    let index = std::fs::read_to_string(root.join(".wake/federation/types/index.d.ts")).unwrap();
+    assert_eq!(
+        index,
+        "// Managed by `wake dev`; remote federation declarations are synchronized here.\n"
+    );
+    assert!(!index.contains(": any"), "{index}");
+
+    let second = invoke();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("Already initialized"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn federation_init_fails_closed_on_conflicting_generated_file() {
+    let root = federation_fixture("conflict");
+    let types = root.join(".wake/federation/types");
+    std::fs::create_dir_all(&types).unwrap();
+    std::fs::write(
+        root.join("wake.config.toml"),
+        "[federation]\nenabled = true\nname = 'shell'\n",
+    )
+    .unwrap();
+    let index = types.join("index.d.ts");
+    std::fs::write(&index, "declare module 'owned-by-user';\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args([
+            "--ui",
+            "plain",
+            "federation",
+            "init",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WAKE_FED_INIT_CONFLICT"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(index).unwrap(),
+        "declare module 'owned-by-user';\n"
+    );
+    assert!(!root.join("wake-federation.d.ts").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn federation_init_requires_an_enabled_project_config() {
+    let root = federation_fixture("disabled");
+    std::fs::write(root.join("wake.config.toml"), "[federation]\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args([
+            "--ui",
+            "plain",
+            "federation",
+            "init",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WAKE_FED_INIT_CONFIG"), "{stderr}");
+    assert!(stderr.contains("federation.enabled = true"), "{stderr}");
+    assert!(!root.join("wake-federation.d.ts").exists());
+    assert!(!root.join(".wake").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn federation_init_help_describes_the_stable_types_entry() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["federation", "init", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stable TypeScript entry"), "{stdout}");
+    assert!(stdout.contains("[ROOT]"), "{stdout}");
 }
