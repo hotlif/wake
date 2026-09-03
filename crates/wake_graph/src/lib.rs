@@ -178,6 +178,24 @@ pub struct NamedImport {
     pub imported: Atom,
 }
 
+/// Linker-owned lowering plan for one plain `export *` declaration, in source order.
+///
+/// `Exact` is available only when the complete transitive export surface is owned by Wake and can
+/// be resolved without runtime inspection. `Runtime` is the conservative boundary for CommonJS,
+/// external, or otherwise opaque targets. Explicit exports are listed for the runtime fallback so
+/// source order can never let a star overwrite them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportStarPlan {
+    pub specifier: String,
+    pub resolution: ExportStarResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportStarResolution {
+    Exact(Vec<Atom>),
+    Runtime { excluded: Vec<Atom> },
+}
+
 /// 从一个模块的 AST 提取绑定级活跃性信息。
 pub fn collect_module_liveness(program: &Program, interner: &Interner) -> ModuleLiveness {
     let mut ml = ModuleLiveness::default();
@@ -454,7 +472,6 @@ pub enum LiveResult {
     Names {
         retained: FxHashSet<Atom>,
         observed: FxHashSet<Atom>,
-        preserve_export_star: bool,
     },
 }
 
@@ -480,40 +497,264 @@ enum Ev {
     All(u32),
 }
 
-/// 模块 `m` 经 `export *` 可达的模块闭包（含自身）。BFS + visited 去重（环安全），按模块 memoize。
-fn splat_closure<'b>(
-    idx: &FxHashMap<u32, LiveIdx>,
-    m: u32,
-    memo: &'b mut FxHashMap<u32, FxHashSet<u32>>,
-) -> &'b FxHashSet<u32> {
-    memo.entry(m).or_insert_with(|| {
-        let mut set = FxHashSet::default();
-        let mut stack = vec![m];
-        while let Some(x) = stack.pop() {
-            if set.insert(x)
-                && let Some(mi) = idx.get(&x)
-            {
-                for &t in &mi.splat_targets {
-                    stack.push(t);
-                }
-            }
-        }
-        set
-    });
-    memo.get(&m).unwrap()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ResolvedBinding {
+    Local(u32, Atom),
+    Namespace(u32),
+    OpaqueExplicit(u32, Atom),
 }
 
-/// `x` 是否被 `m`（含其 `export *` 透传闭包）静态提供为具名导出。
-/// 注：`export *` 不透传 `default`，此处不特判——多保留（安全），仅极少见的 barrel+default 组合下略过度保留。
-fn resolves_export(
-    idx: &FxHashMap<u32, LiveIdx>,
-    m: u32,
-    x: Atom,
-    memo: &mut FxHashMap<u32, FxHashSet<u32>>,
-) -> bool {
-    splat_closure(idx, m, memo)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportResolution {
+    Missing,
+    Resolved(ResolvedBinding),
+    Ambiguous,
+}
+
+fn resolve_export_binding(
+    idx: &FxHashMap<u32, LiveIdx<'_>>,
+    resolve: &dyn Fn(u32, &str) -> Option<u32>,
+    module: u32,
+    name: Atom,
+    resolve_set: &mut FxHashSet<(u32, Atom)>,
+) -> ExportResolution {
+    if !resolve_set.insert((module, name)) {
+        return ExportResolution::Missing;
+    }
+    let Some(info) = idx.get(&module) else {
+        resolve_set.remove(&(module, name));
+        return ExportResolution::Missing;
+    };
+
+    let direct = if let Some(local) = info.local_exports.get(&name).copied() {
+        Some(ExportResolution::Resolved(ResolvedBinding::Local(
+            module,
+            local.unwrap_or(name),
+        )))
+    } else if let Some((specifier, imported)) = info.reexport_named.get(&name).copied() {
+        Some(resolve(module, specifier).map_or(
+            ExportResolution::Resolved(ResolvedBinding::OpaqueExplicit(module, name)),
+            |target| resolve_export_binding(idx, resolve, target, imported, resolve_set),
+        ))
+    } else {
+        info.ns_reexports.get(&name).copied().map(|specifier| {
+            ExportResolution::Resolved(resolve(module, specifier).map_or(
+                ResolvedBinding::OpaqueExplicit(module, name),
+                ResolvedBinding::Namespace,
+            ))
+        })
+    };
+    if let Some(direct) = direct {
+        resolve_set.remove(&(module, name));
+        return direct;
+    }
+
+    let mut found = None;
+    for &target in &info.splat_targets {
+        match resolve_export_binding(idx, resolve, target, name, resolve_set) {
+            ExportResolution::Missing => {}
+            ExportResolution::Ambiguous => {
+                resolve_set.remove(&(module, name));
+                return ExportResolution::Ambiguous;
+            }
+            ExportResolution::Resolved(binding) => match found {
+                None => found = Some(binding),
+                Some(previous) if previous == binding => {}
+                Some(_) => {
+                    resolve_set.remove(&(module, name));
+                    return ExportResolution::Ambiguous;
+                }
+            },
+        }
+    }
+    resolve_set.remove(&(module, name));
+    found.map_or(ExportResolution::Missing, ExportResolution::Resolved)
+}
+
+fn collect_exported_names(
+    idx: &FxHashMap<u32, LiveIdx<'_>>,
+    module: u32,
+    default_export: Atom,
+    visited: &mut FxHashSet<u32>,
+    names: &mut FxHashSet<Atom>,
+) {
+    if !visited.insert(module) {
+        return;
+    }
+    let Some(info) = idx.get(&module) else {
+        return;
+    };
+    names.extend(
+        info.provides
+            .iter()
+            .copied()
+            .filter(|name| *name != default_export),
+    );
+    for &target in &info.splat_targets {
+        collect_exported_names(idx, target, default_export, visited, names);
+    }
+}
+
+fn liveness_index<'a>(
+    mods: &'a FxHashMap<u32, &ModuleLiveness>,
+    resolve: &dyn Fn(u32, &str) -> Option<u32>,
+) -> FxHashMap<u32, LiveIdx<'a>> {
+    let mut idx = FxHashMap::default();
+    for (&module, &liveness) in mods {
+        let decl_names = liveness.decls.iter().map(|(name, _)| *name).collect();
+        let decl_refs = liveness
+            .decls
+            .iter()
+            .map(|(name, refs)| (*name, refs))
+            .collect();
+        let named = liveness
+            .named_imports
+            .iter()
+            .map(|import| (import.local, (import.spec.as_str(), import.imported)))
+            .collect();
+        let namespace = liveness
+            .namespace_imports
+            .iter()
+            .map(|(local, specifier)| (*local, specifier.as_str()))
+            .collect();
+        let local_exports = liveness.exports.iter().copied().collect();
+        let reexport_named = liveness
+            .reexport_named
+            .iter()
+            .map(|(exported, specifier, imported)| (*exported, (specifier.as_str(), *imported)))
+            .collect();
+        let ns_reexports = liveness
+            .ns_reexports
+            .iter()
+            .map(|(name, specifier)| (*name, specifier.as_str()))
+            .collect();
+        let mut provides = FxHashSet::default();
+        provides.extend(liveness.exports.iter().map(|(name, _)| *name));
+        provides.extend(liveness.reexport_named.iter().map(|(name, _, _)| *name));
+        provides.extend(liveness.ns_reexports.iter().map(|(name, _)| *name));
+        let splat_targets = liveness
+            .reexport_star
+            .iter()
+            .filter_map(|specifier| resolve(module, specifier))
+            .collect();
+        idx.insert(
+            module,
+            LiveIdx {
+                decl_names,
+                decl_refs,
+                named,
+                namespace,
+                local_exports,
+                reexport_named,
+                ns_reexports,
+                provides,
+                splat_targets,
+            },
+        );
+    }
+    idx
+}
+
+/// Resolve every plain `export *` to the exact names it owns whenever its complete transitive ESM
+/// surface is available. The returned vectors follow source order, and each exact name is assigned
+/// to the earliest star edge that resolves to the module's unique final binding.
+pub fn compute_export_star_plans(
+    mods: &FxHashMap<u32, &ModuleLiveness>,
+    resolve: &dyn Fn(u32, &str) -> Option<u32>,
+    statically_analyzable_esm: &FxHashSet<u32>,
+    default_export: Atom,
+) -> FxHashMap<u32, Vec<ExportStarPlan>> {
+    let idx = liveness_index(mods, resolve);
+    let mut closed: FxHashSet<u32> = statically_analyzable_esm
         .iter()
-        .any(|t| idx.get(t).is_some_and(|mi| mi.provides.contains(&x)))
+        .copied()
+        .filter(|module| idx.contains_key(module))
+        .collect();
+    loop {
+        let rejected: Vec<u32> = closed
+            .iter()
+            .copied()
+            .filter(|module| {
+                mods.get(module).is_some_and(|liveness| {
+                    liveness.reexport_star.iter().any(|specifier| {
+                        resolve(*module, specifier).is_none_or(|target| !closed.contains(&target))
+                    })
+                })
+            })
+            .collect();
+        if rejected.is_empty() {
+            break;
+        }
+        for module in rejected {
+            closed.remove(&module);
+        }
+    }
+
+    let mut output = FxHashMap::default();
+    for (&module, &liveness) in mods {
+        let explicit = idx
+            .get(&module)
+            .map(|info| info.provides.clone())
+            .unwrap_or_default();
+        let mut claimed = FxHashSet::default();
+        let mut plans = Vec::with_capacity(liveness.reexport_star.len());
+        for specifier in &liveness.reexport_star {
+            let resolution = closed
+                .contains(&module)
+                .then(|| resolve(module, specifier))
+                .flatten()
+                .filter(|target| closed.contains(target))
+                .map_or_else(
+                    || {
+                        let excluded: Vec<_> = explicit.iter().copied().collect();
+                        ExportStarResolution::Runtime { excluded }
+                    },
+                    |target| {
+                        let mut candidates = FxHashSet::default();
+                        collect_exported_names(
+                            &idx,
+                            target,
+                            default_export,
+                            &mut FxHashSet::default(),
+                            &mut candidates,
+                        );
+                        let candidates: Vec<_> = candidates.into_iter().collect();
+                        let mut names = Vec::new();
+                        for name in candidates {
+                            if explicit.contains(&name) || claimed.contains(&name) {
+                                continue;
+                            }
+                            let root = resolve_export_binding(
+                                &idx,
+                                resolve,
+                                module,
+                                name,
+                                &mut FxHashSet::default(),
+                            );
+                            let edge = resolve_export_binding(
+                                &idx,
+                                resolve,
+                                target,
+                                name,
+                                &mut FxHashSet::default(),
+                            );
+                            if matches!((root, edge), (ExportResolution::Resolved(left), ExportResolution::Resolved(right)) if left == right)
+                            {
+                                claimed.insert(name);
+                                names.push(name);
+                            }
+                        }
+                        ExportStarResolution::Exact(names)
+                    },
+                );
+            plans.push(ExportStarPlan {
+                specifier: specifier.clone(),
+                resolution,
+            });
+        }
+        output.insert(module, plans);
+    }
+    output
 }
 
 /// 绑定级全程序活跃性 mark-sweep。返回每个模块的「活导出」结论（供 codegen tree-shaking）。
@@ -531,67 +772,12 @@ pub fn compute_live_keep(
     entry_id: u32,
     force_all: &FxHashSet<u32>,
 ) -> FxHashMap<u32, LiveResult> {
-    // 建每模块索引（借用 mods）。
-    let mut idx: FxHashMap<u32, LiveIdx> = FxHashMap::default();
-    for (&m, &ml) in mods.iter() {
-        let mut decl_names = FxHashSet::default();
-        let mut decl_refs = FxHashMap::default();
-        for (name, refs) in &ml.decls {
-            decl_names.insert(*name);
-            decl_refs.insert(*name, refs);
-        }
-        let mut named = FxHashMap::default();
-        for ni in &ml.named_imports {
-            named.insert(ni.local, (ni.spec.as_str(), ni.imported));
-        }
-        let mut namespace = FxHashMap::default();
-        for (local, spec) in &ml.namespace_imports {
-            namespace.insert(*local, spec.as_str());
-        }
-        let mut local_exports = FxHashMap::default();
-        for (name, local) in &ml.exports {
-            local_exports.insert(*name, *local);
-        }
-        let mut reexport_named = FxHashMap::default();
-        for (exported, spec, imp) in &ml.reexport_named {
-            reexport_named.insert(*exported, (spec.as_str(), *imp));
-        }
-        let mut ns_reexports = FxHashMap::default();
-        for (name, spec) in &ml.ns_reexports {
-            ns_reexports.insert(*name, spec.as_str());
-        }
-        let mut provides: FxHashSet<Atom> = FxHashSet::default();
-        provides.extend(local_exports.keys().copied());
-        provides.extend(reexport_named.keys().copied());
-        provides.extend(ns_reexports.keys().copied());
-        let splat_targets: Vec<u32> = ml
-            .reexport_star
-            .iter()
-            .filter_map(|s| resolve(m, s))
-            .collect();
-        idx.insert(
-            m,
-            LiveIdx {
-                decl_names,
-                decl_refs,
-                named,
-                namespace,
-                local_exports,
-                reexport_named,
-                ns_reexports,
-                provides,
-                splat_targets,
-            },
-        );
-    }
+    let idx = liveness_index(mods, resolve);
 
     let mut all_used: FxHashSet<u32> = FxHashSet::default();
     let mut live: FxHashMap<u32, FxHashSet<Atom>> = FxHashMap::default();
     // consumed[m]：被以具名方式请求（Export）的导出名——用于 re-export 行的保留判定。
     let mut consumed: FxHashMap<u32, FxHashSet<Atom>> = FxHashMap::default();
-    // splat 闭包 memo（resolves_export 用）。
-    let mut closure_memo: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
-
     let mut wl: Vec<Ev> = Vec::new();
     wl.push(Ev::All(entry_id));
     for &m in force_all {
@@ -666,14 +852,25 @@ pub fn compute_live_keep(
                     }
                     // None：非门控导出（default 表达式等）——输出阶段恒保留。
                 } else {
-                    // 本模块未直接提供 → 尝试 `export *` 名级解析：只把该名传给**确实提供它**的
-                    // splat 目标；无任何目标提供 → 未知/动态，保守全保留本模块。
+                    // 本模块未直接提供 → 只沿着解析到同一最终绑定的 star 边传播。冲突、缺失或
+                    // opaque 目标无法形成唯一绑定，继续走保守 All。
                     let targets = mi.splat_targets.clone();
                     let mut any = false;
-                    for t in targets {
-                        if resolves_export(&idx, t, name, &mut closure_memo) {
-                            wl.push(Ev::Export(t, name));
-                            any = true;
+                    if let ExportResolution::Resolved(root) =
+                        resolve_export_binding(&idx, resolve, m, name, &mut FxHashSet::default())
+                    {
+                        for t in targets {
+                            if resolve_export_binding(
+                                &idx,
+                                resolve,
+                                t,
+                                name,
+                                &mut FxHashSet::default(),
+                            ) == ExportResolution::Resolved(root)
+                            {
+                                wl.push(Ev::Export(t, name));
+                                any = true;
+                            }
                         }
                     }
                     if !any {
@@ -724,7 +921,6 @@ pub fn compute_live_keep(
         let consumed_m = consumed.get(&m);
         let mut names: FxHashSet<Atom> = FxHashSet::default();
         let observed = consumed_m.cloned().unwrap_or_default();
-        let mut preserve_export_star = false;
         // 本地导出：局部绑定活 → 保留导出行；非门控恒保留。
         for (name, local) in &ml.exports {
             let keep = match local {
@@ -752,15 +948,22 @@ pub fn compute_live_keep(
         // a side-effect-only barrel and codegen may erase the forwarding object.
         if let (Some(mi), Some(consumed_m)) = (idx.get(&m), consumed_m) {
             for &name in consumed_m {
-                if !mi.provides.contains(&name)
-                    && mi
-                        .splat_targets
-                        .iter()
-                        .copied()
-                        .any(|target| resolves_export(&idx, target, name, &mut closure_memo))
+                if mi.provides.contains(&name) {
+                    continue;
+                }
+                if let ExportResolution::Resolved(root) =
+                    resolve_export_binding(&idx, resolve, m, name, &mut FxHashSet::default())
+                    && mi.splat_targets.iter().copied().any(|target| {
+                        resolve_export_binding(
+                            &idx,
+                            resolve,
+                            target,
+                            name,
+                            &mut FxHashSet::default(),
+                        ) == ExportResolution::Resolved(root)
+                    })
                 {
                     names.insert(name);
-                    preserve_export_star = true;
                 }
             }
         }
@@ -769,7 +972,6 @@ pub fn compute_live_keep(
             LiveResult::Names {
                 retained: names,
                 observed,
-                preserve_export_star,
             },
         );
     }
@@ -930,17 +1132,11 @@ mod tests {
         let resolve = |_module: u32, specifier: &str| (specifier == "library").then_some(1);
         let keep = compute_live_keep(&mods, &resolve, 0, &FxHashSet::default());
 
-        let LiveResult::Names {
-            retained,
-            observed,
-            preserve_export_star,
-        } = &keep[&1]
-        else {
+        let LiveResult::Names { retained, observed } = &keep[&1] else {
             panic!("library should retain exact liveness")
         };
         assert_eq!(retained, &FxHashSet::from_iter([kept, dead_alias]));
         assert_eq!(observed, &FxHashSet::from_iter([kept]));
-        assert!(!preserve_export_star);
     }
 
     #[test]
@@ -1081,7 +1277,6 @@ mod tests {
         let LiveResult::Names {
             retained: barrel_names,
             observed,
-            preserve_export_star,
         } = &keep[&1]
         else {
             panic!("barrel 应保持精确名级活跃性，而不是退化为 All")
@@ -1092,7 +1287,6 @@ mod tests {
             "barrel 必须且只需保留 fa 的 export-star 转发"
         );
         assert_eq!(observed, &FxHashSet::from_iter([fa]));
-        assert!(*preserve_export_star);
 
         match &keep[&2] {
             LiveResult::Names { retained, .. } => assert!(retained.contains(&fa), "a.fa 应活"),
@@ -1102,5 +1296,138 @@ mod tests {
             LiveResult::Names { retained, .. } => assert!(!retained.contains(&fb), "b.fb 应死"),
             LiveResult::All => panic!("b 不应被整体 All（名级解析应只命中 a）"),
         }
+    }
+
+    #[test]
+    fn export_star_plan_excludes_explicit_and_ambiguous_names() {
+        let interner = Interner::new();
+        let value = interner.intern("value");
+        let only_a = interner.intern("onlyA");
+        let only_b = interner.intern("onlyB");
+        let default = interner.intern("default");
+        let a = ModuleLiveness {
+            exports: vec![(value, Some(value)), (only_a, Some(only_a))],
+            ..Default::default()
+        };
+        let b = ModuleLiveness {
+            exports: vec![(value, Some(value)), (only_b, Some(only_b))],
+            ..Default::default()
+        };
+        let ambiguous = ModuleLiveness {
+            reexport_star: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let explicit = ModuleLiveness {
+            reexport_named: vec![(value, "b".into(), value)],
+            reexport_star: vec!["a".into()],
+            ..Default::default()
+        };
+        let mods = FxHashMap::from_iter([(0, &ambiguous), (1, &a), (2, &b), (3, &explicit)]);
+        let resolve = |module, specifier: &str| match (module, specifier) {
+            (0 | 3, "a") => Some(1),
+            (0 | 3, "b") => Some(2),
+            _ => None,
+        };
+        let plans = compute_export_star_plans(
+            &mods,
+            &resolve,
+            &FxHashSet::from_iter([0, 1, 2, 3]),
+            default,
+        );
+
+        assert_eq!(
+            plans[&0],
+            vec![
+                ExportStarPlan {
+                    specifier: "a".into(),
+                    resolution: ExportStarResolution::Exact(vec![only_a]),
+                },
+                ExportStarPlan {
+                    specifier: "b".into(),
+                    resolution: ExportStarResolution::Exact(vec![only_b]),
+                },
+            ]
+        );
+        assert_eq!(
+            plans[&3],
+            vec![ExportStarPlan {
+                specifier: "a".into(),
+                resolution: ExportStarResolution::Exact(vec![only_a]),
+            }]
+        );
+    }
+
+    #[test]
+    fn export_star_plan_deduplicates_one_binding_and_closes_cycles() {
+        let interner = Interner::new();
+        let value = interner.intern("value");
+        let a_name = interner.intern("a");
+        let b_name = interner.intern("b");
+        let default = interner.intern("default");
+        let source = ModuleLiveness {
+            exports: vec![(value, Some(value))],
+            ..Default::default()
+        };
+        let left = ModuleLiveness {
+            reexport_star: vec!["source".into()],
+            ..Default::default()
+        };
+        let right = ModuleLiveness {
+            reexport_star: vec!["source".into()],
+            ..Default::default()
+        };
+        let diamond = ModuleLiveness {
+            reexport_star: vec!["left".into(), "right".into()],
+            ..Default::default()
+        };
+        let cycle_a = ModuleLiveness {
+            exports: vec![(a_name, Some(a_name))],
+            reexport_star: vec!["cycle-b".into()],
+            ..Default::default()
+        };
+        let cycle_b = ModuleLiveness {
+            exports: vec![(b_name, Some(b_name))],
+            reexport_star: vec!["cycle-a".into()],
+            ..Default::default()
+        };
+        let mods = FxHashMap::from_iter([
+            (0, &diamond),
+            (1, &left),
+            (2, &right),
+            (3, &source),
+            (4, &cycle_a),
+            (5, &cycle_b),
+        ]);
+        let resolve = |module, specifier: &str| match (module, specifier) {
+            (0, "left") => Some(1),
+            (0, "right") => Some(2),
+            (1 | 2, "source") => Some(3),
+            (4, "cycle-b") => Some(5),
+            (5, "cycle-a") => Some(4),
+            _ => None,
+        };
+        let plans = compute_export_star_plans(
+            &mods,
+            &resolve,
+            &FxHashSet::from_iter([0, 1, 2, 3, 4, 5]),
+            default,
+        );
+
+        assert_eq!(
+            plans[&0][0].resolution,
+            ExportStarResolution::Exact(vec![value])
+        );
+        assert_eq!(
+            plans[&0][1].resolution,
+            ExportStarResolution::Exact(Vec::new())
+        );
+        assert_eq!(
+            plans[&4][0].resolution,
+            ExportStarResolution::Exact(vec![b_name])
+        );
+        assert_eq!(
+            plans[&5][0].resolution,
+            ExportStarResolution::Exact(vec![a_name])
+        );
     }
 }
