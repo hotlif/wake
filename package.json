@@ -34,6 +34,7 @@
     "yarn:lock:check": "node scripts/check-yarn-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
+    "rusty-v8:prepare:test": "node --test scripts/rusty-v8-archive-path.test.mjs",
     "vscode:css:check": "yarn workspace crab-css check",
     "versions:check": "node scripts/check-versions.mjs"
   },

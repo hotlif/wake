@@ -8,6 +8,7 @@ import {
   PLATFORM_CONTRACTS,
   verifyRustyV8Archive,
 } from './native-package-contract.mjs'
+import { materializeRustyV8ArchiveForEnvironment } from './rusty-v8-archive-path.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 
@@ -78,9 +79,17 @@ if (!existsSync(destination)) {
 }
 
 verifyRustyV8Archive(destination, contract)
+const environmentArchive = materializeRustyV8ArchiveForEnvironment(
+  destination,
+  process.env,
+)
+verifyRustyV8Archive(environmentArchive, contract)
 if (process.env.GITHUB_ENV) {
-  await appendFile(process.env.GITHUB_ENV, `RUSTY_V8_ARCHIVE=${destination}\n`)
+  await appendFile(
+    process.env.GITHUB_ENV,
+    `RUSTY_V8_ARCHIVE=${environmentArchive}\n`,
+  )
 }
 console.log(
-  `Verified Rusty V8 ${contract.rustyV8Archive.sha256} at ${destination}`,
+  `Verified Rusty V8 ${contract.rustyV8Archive.sha256} at ${environmentArchive}`,
 )

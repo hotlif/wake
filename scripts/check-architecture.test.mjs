@@ -1422,6 +1422,7 @@ test('embedded V8 conformance uses one immutable selected Test262 ES2024 manifes
   assert.match(runner, /'--offline'/)
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   assert.match(ci, /corepack yarn test262:es2024/)
+  assert.match(ci, /corepack yarn rusty-v8:prepare:test/)
   assert.match(ci, /prepare-rusty-v8\.mjs --target x86_64-unknown-linux-gnu/)
   assert.match(ci, /browser-conformance:/)
   for (const platform of [
@@ -1555,6 +1556,7 @@ test('architecture CI fetches the complete lock graph before its offline target-
   const job = ci.slice(start, end)
   const markers = [
     'corepack yarn install --immutable --check-cache',
+    'corepack yarn rusty-v8:prepare:test',
     'cargo fetch --locked',
     'node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu',
     'cargo build -p wake_test_host -p wake_cli --locked --offline',
@@ -1750,6 +1752,11 @@ test('Crab CSS editor tests use only the freshly built Wake CLI and sibling host
   assert.deepEqual(
     architecturePolicy.dependencyProvenance.networkFreeBuild.offlineCargoBuildFiles,
     ['.github/workflows/release-npm.yml', '.github/workflows/vscode-css.yml'],
+  )
+  assert.equal(
+    workflow.match(/scripts\/rusty-v8-archive-path\*\.mjs/g)?.length,
+    2,
+    'both VSIX path filters must include the Rusty V8 archive identity helper',
   )
   assert.match(binaryResolver, /process\.env\.WAKE_BIN/)
   assert.match(binaryResolver, /isAbsolute\(wakeBinary\)/)

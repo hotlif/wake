@@ -129,6 +129,7 @@ jobs:
           key: architecture
       - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
+      - run: corepack yarn rusty-v8:prepare:test
       # The architecture checker runs `cargo tree --target all --offline`; fetch the
       # complete locked graph before preparing only the Linux rusty_v8 archive.
       - run: cargo fetch --locked
