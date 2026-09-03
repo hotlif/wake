@@ -116,6 +116,8 @@ export async function assertComponentsRuntime(entryPath) {
     const exportedIcon = new RegExp(
       `(?:${escapeRegExp(bindings.exportsName)}\\.SlidersHorizontal\\s*=` +
         `|Object\\.defineProperty\\(\\s*${escapeRegExp(bindings.exportsName)}\\s*,` +
+        `|${escapeRegExp(bindings.requireName)}\\.objectDefineProperty\\(\\s*` +
+        `${escapeRegExp(bindings.exportsName)}\\s*,` +
         `\\s*["']SlidersHorizontal["'])`,
     )
     return requiredIcon.test(source) && exportedIcon.test(source)

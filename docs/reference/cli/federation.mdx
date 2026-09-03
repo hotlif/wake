@@ -1,0 +1,40 @@
++++
+title = "Federation CLI"
+description = "初始化远程类型入口并锁定生产 Federation Manifest"
+kind = "reference"
+status = "stable"
++++
+
+# Federation CLI
+
+## 初始化类型入口
+
+```bash
+wake federation init [ROOT]
+```
+
+命令向上查找启用了 Federation 的 `wake.config.toml`，创建 `wake-federation.d.ts` 与
+`.wake/federation/types/index.d.ts`。重复执行保持字节不变；如果同名文件不是 Wake 生成的内容，
+命令会拒绝覆盖。
+
+把 `wake-federation.d.ts` 纳入项目的 TypeScript include。远程声明按 remote 和 `buildId` 分目录，
+稳定索引只引用当前完整同步的一组声明，因此代码与类型不会悄悄跨 build 混用。
+
+## 生成生产 lock
+
+```bash
+wake federation lock [ROOT]
+```
+
+命令只接受 HTTPS 生产 Manifest，验证 JSON MIME、schema/runtime ABI、remote 名、origin allowlist、
+响应大小及 SHA-384，并解析 remote entry、exposes、CSS、异步 chunk、Source Map、shared fallback 与
+类型文件的完整资源闭包。成功后原子写入 `wake-federation.lock`；任何 remote 失败都不会回退或保留
+一份看似成功的新 lock。
+
+每个 remote lock 条目会写入必需的 `hasExposes` 事实。值为 `true` 时必须同时锁定与该 build 绑定的
+类型摘要；值为 `false` 的 shared-only remote 可以不发布类型。缺少该字段、公开 expose 缺类型，或
+Manifest 中任一 singleton shared offer/requirement 缺少确定性的 `policy.owner`，都会拒绝生成或消费
+生产 lock。Manifest 的 SHA-384 会把 expose presence 与具体 singleton owner 一同绑定到 lock。
+
+生产 `wake build` 要求 lock 中的 Manifest URL、`buildId`、Manifest 摘要、类型摘要和允许资源集合
+与配置一致。浏览器仍会逐资源执行完整性、MIME、CORS、超时和大小检查。

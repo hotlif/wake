@@ -10,7 +10,7 @@ import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/comp
 # 开发服务器
 
 <ResultPanel title="完成后">
-  本地 HTTP、HMR WebSocket 和文件监听全部在线，终端给出可访问地址。
+  本地 HTTP、Live Reload WebSocket 和文件监听全部在线，终端给出可访问地址。
 </ResultPanel>
 
 ## 启动
@@ -21,13 +21,14 @@ npx wake dev . --port 5173
 
 <StepFlow>
   <Step number="01" title="构建">解析当前入口，输出可读的开发诊断。</Step>
-  <Step number="02" title="服务">启动 HTTP 与 HMR WebSocket。</Step>
+  <Step number="02" title="服务">启动 HTTP 与 Live Reload WebSocket。</Step>
   <Step number="03" title="监听">文件变化只让受影响模块失效。</Step>
 </StepFlow>
 
 ## 验证方式
 
-修改组件文本、CSS 和一个依赖模块；页面与样式应更新，控制台不应重复执行副作用。
+修改组件文本、CSS 和一个依赖模块；每次成功重建后浏览器都会刷新整个页面。页面 state 会重置，
+入口和模块顶层副作用会在新文档中重新执行。
 
 ## 常见错误
 
@@ -38,6 +39,6 @@ npx wake dev . --port 5173
 ## 下一步
 
 <NextActions>
-  <NextLink href="/app/hmr" title="理解热更新" description="保持组件状态并判断刷新边界。" />
+  <NextLink href="/app/live-reload" title="理解 Live Reload" description="区分服务端增量重建与浏览器整页刷新。" />
   <NextLink href="/app/aliases-and-proxy" title="连接后端 API" description="配置源码别名与开发代理。" />
 </NextActions>

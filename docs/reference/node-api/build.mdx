@@ -20,7 +20,69 @@ const result = await build({ cwd: process.cwd(), outdir: "dist", cache: true });
 console.log(result.files);
 ```
 
-## `bundle(options)`
+启用 `cache` 时，持久层只保存由真实源码内容派生的摘要和生成结果，不保存源码或文件时间戳。
+缓存损坏、I/O 或并发提交问题不会拒绝 Promise，而是在成功结果的 `diagnostics` 中返回最多一条
+`code: "WAKE_CACHE"` warning；缺失和 schema 不兼容保持静默。
+
+`outdir` 必须是新目录、空目录，或带有匹配 `.wake-output.json` 的 Wake 应用输出目录。项目根、
+项目祖先、包含入口的目录、符号链接和 Windows reparse point 会以 `WAKE_CONFIG` 拒绝。非空的
+未标记旧目录不会被自动接管；升级时请先确认并删除旧产物，或改用新的空目录。应用、Federation、
+HTML 与 manifest 在同盘 staging 中全部成功后才提交，失败会保留上一份有效输出。
+
+浏览器应用可通过 `federation` 覆盖或提供同构的 Wake-native Federation 配置。Node API 使用
+camelCase 字段；`enabled: true` 时 `name` 必填：
+
+```ts
+const react18 = {
+  scope: "react18",
+  requiredVersion: "^18.3.0",
+  singleton: true,
+  strict: true,
+  coherenceGroup: "react18",
+  owner: "shell",
+} as const;
+
+await build({
+  cwd: process.cwd(),
+  federation: {
+    enabled: true,
+    name: "shell",
+    remotes: {
+      catalog: {
+        manifestUrl: "https://catalog.example.com/wake-federation.json",
+        allowedOrigins: ["https://catalog.example.com"],
+        devFollow: false,
+      },
+    },
+    exposes: {
+      "./Button": {
+        entry: "src/button.tsx",
+        mode: "host-rendered",
+        scope: "react18",
+        shadow: "none",
+        allowGlobalCss: false,
+      },
+    },
+    shared: {
+      react: react18,
+      "react/jsx-runtime": react18,
+      "react/jsx-dev-runtime": react18,
+      "react-dom": react18,
+      "react-dom/client": react18,
+    },
+  },
+});
+```
+
+该选项只支持 browser/Wake-native 构建；remote 通过字面量动态 `import("catalog/Button")`
+加载，不提供 Webpack/Rspack ABI、静态远程导入或 Node/SSR federation。
+`host-rendered` expose 必须在同一 scope 完整声明 React、两个 JSX runtime、React DOM 及
+`react-dom/client`，五项使用同一个 singleton coherence group 与一致的 owner。它默认只允许
+CSS Modules 与 Wake CSS-in-JS；同步或异步 closure 中的普通 `.css` 会使构建以
+`FED_CONFIG_INVALID` 失败。只有明确接受样式进入宿主 document 时才设置
+`allowGlobalCss: true`；该字段不写入 Federation Manifest。
+
+## `bundle(options?)`
 
 返回独立的 `BundleResult`，其中 `code` 始终存在。省略 `outfile` 时只在内存中返回；设置后
 原子写入该文件且不生成 HTML、manifest 或其他 Web 应用产物。`platform: "node"` 会默认
@@ -49,7 +111,9 @@ Node 平台自动外置 Node 内置模块。显式 external 必须是裸 npm 包
 兼容模式，Node API 不新增 externs 或 whole-world 选项。
 启用 `sourceMap` 时，内存构建通过 `result.sourceMap` 返回映射；设置 `outfile` 后还会原子写入
 `<outfile>.map`、返回 `result.sourceMapFile`，并在 JavaScript 末尾写入对应的
-`sourceMappingURL`。
+`sourceMappingURL`。JavaScript 与 map 属于同一次集合事务；任一安装失败都会恢复旧集合。
+`outfile` 或 map 与本轮实际读取的入口、传递依赖、配置、package/PnP 文件或其物理 alias 重合时，
+Promise 以 `WAKE_OUTPUT_COLLISION` 拒绝。`sourceMap: false` 不会删除无法证明归属的相邻旧 map。
 
 ## `buildLibrary(options)`
 
@@ -66,7 +130,9 @@ console.log(result.esmEntry, result.cjsEntry, result.declarationEntry, result.cs
 
 原生解析组件包的 `token.toml`，并把 TypeScript 写到 `[build].output`。`configPath`
 相对 `cwd` 解析，默认是 `token.toml`。递归导入支持 Yarn PnP 与传统 `node_modules`；
-循环、缺失 `$ref`、非法配置和写盘失败都会拒绝 Promise，已有输出不会被半成品覆盖。
+循环、缺失 `$ref`、非法配置和写盘失败都会拒绝 Promise，已有输出不会被半成品覆盖。输出若与
+根/递归 token 配置、resolver 读取的 package/PnP 元数据或 archive 是同一文件或 alias，则以
+`WAKE_OUTPUT_COLLISION` 拒绝且输入字节不变。
 
 ```ts
 const result = await generateCssToken({
@@ -82,7 +148,9 @@ console.log(result.outputFile);
 
 使用与 `wake library docgen` 相同的 Rust 后端生成 `public/docgen.json`。`entry` 相对 `cwd`
 解析；省略时先读取 `package.json.docgen.entry`，再追踪 `src/index.ts` 的默认导出。解析、
-公开 props 类型推断或写盘失败都会拒绝 Promise，且不会覆盖上一份有效输出。
+公开 props 类型推断或写盘失败都会拒绝 Promise，且不会覆盖上一份有效输出。入口解析和递归类型
+解析会返回实际读取 provenance；`public/docgen.json` 与任一输入或物理 alias 重合时以
+`WAKE_OUTPUT_COLLISION` 拒绝。
 
 ```ts
 const result = await generateDocgen({

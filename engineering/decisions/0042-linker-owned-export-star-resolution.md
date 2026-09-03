@@ -11,8 +11,8 @@ time and defining non-configurable getters immediately. That representation did 
 information to implement ESM resolution: an explicit export must override every star regardless of
 source order, conflicting star bindings are ambiguous, two paths to the same final binding are not
 ambiguous, and a cycle cannot discover names from a partially initialized namespace object.
-This refines the star-observability portion of [ADR 0024](0024-linker-owned-export-liveness.md)
-after [ADR 0033](0033-typed-runtime-emission-boundaries.md) moved emission facts to structured typed
+This refines the star-observability portion of [ADR 0024](0024-linker-proven-barrel-compaction.md)
+after [ADR 0033](0033-structured-module-emit-provenance.md) moved emission facts to structured typed
 boundaries.
 
 ## Decision

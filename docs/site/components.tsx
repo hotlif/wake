@@ -1,6 +1,6 @@
 import React from "react";
 
-export type VisualName = "home" | "hmr" | "build" | "dynamic-css";
+export type VisualName = "home" | "live-reload" | "build" | "dynamic-css";
 export type FeatureIconName =
   | "app"
   | "style"
@@ -53,12 +53,12 @@ function TechnicalVisual({ name, alt, decorative = false }: { name: VisualName; 
         <Node x={502} y={124} width={104} label="Assets" />
       </>;
       break;
-    case "hmr":
+    case "live-reload":
       content = <>
         <Node x={28} y={76} width={136} label="File change" />
-        <Node x={252} y={76} width={136} label="Module update" accent />
-        <Node x={476} y={76} width={136} label="Browser state" />
-        <Arrow d="M164 95H252" /><Arrow d="M388 95H476" /><Arrow d="M544 122C544 171 96 171 96 122" />
+        <Node x={252} y={76} width={136} label="Incremental build" accent />
+        <Node x={476} y={76} width={136} label="Page reload" />
+        <Arrow d="M164 95H252" /><Arrow d="M388 95H476" />
       </>;
       break;
     case "build":

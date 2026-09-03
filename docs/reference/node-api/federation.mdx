@@ -1,0 +1,43 @@
++++
+title = "Node.js Federation 控制面 API"
+description = "初始化类型入口并生成经过校验的生产 Federation lock"
+kind = "reference"
+status = "stable"
++++
+
+# Node.js Federation 控制面 API
+
+Rust CLI 与 npm CLI 都通过这里的应用服务执行 Federation 控制面操作；文件所有权、错误码、
+冲突处理和 lock 校验不会因入口不同而分叉。
+
+## `initializeFederation(options)`
+
+```ts
+import { initializeFederation } from "@crab-dev/wake";
+
+const result = await initializeFederation({ cwd: process.cwd() });
+console.log(result.declarationPath, result.declaration);
+```
+
+该函数向上查找启用了 Federation 的 `wake.config.toml`，以 no-clobber 方式创建
+`wake-federation.d.ts` 和 `.wake/federation/types/index.d.ts`。每个状态是 `created` 或
+`unchanged`。在任何写入前会检查两个目标；遇到用户自有内容时以
+`WAKE_FED_INIT_CONFLICT` 拒绝并保留原文件。配置和 I/O 失败分别使用
+`WAKE_FED_INIT_CONFIG` 与 `WAKE_FED_INIT_IO`。
+
+## `generateFederationLock(options)`
+
+```ts
+import { generateFederationLock } from "@crab-dev/wake";
+
+const result = await generateFederationLock({ cwd: process.cwd() });
+console.log(result.lockPath, result.remotes);
+```
+
+该函数加载项目配置、抓取并验证全部 HTTPS Manifest 及其资源闭包，然后原子发布
+`wake-federation.lock`。返回值同时包含 `projectRoot`、`lockPath`、remote 数量和已写入的
+结构化 `lock`。Manifest、origin、schema、runtime ABI、完整性、MIME、大小、类型或 singleton
+owner 任一校验失败时 Promise 会拒绝，已有 lock 不会被半成品替换。
+
+两个 API 都接受 `cwd` 和 `signal`。取消使用 `WAKE_CANCELLED`；其他 Federation 失败保留公开
+`FED_*` 错误码，调用方可以与 `build()` 使用同一 `WakeError` 分支。

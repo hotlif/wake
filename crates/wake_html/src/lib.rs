@@ -3,7 +3,8 @@
 //! 旧实现使用 `react-dom/server` 的 `renderToString` 对 `bootstrap.tsx` 做 SSR 生成外壳；wake 无
 //! JS 运行时，改为 **Vite 式静态外壳 + 资源注入**：取用户 `public/index.html`（或内置默认外壳），
 //! 在 `</head>` 前注入 `<script defer>`（JS chunk）与 `<link rel="stylesheet">`（CSS 产物），
-//! 资源 URL 前缀 `public_path`。dev 下 CSS 经运行时 `<style>` 注入（利于 HMR），`styles` 为空；
+//! 资源 URL 前缀 `public_path`。dev 下 CSS 经运行时 `<style>` 注入并随整页 Live Reload 重新求值，
+//! `styles` 为空；
 //! prod（`enable_css_extraction`）抽取为 `.css` 产物后 `styles` 非空，在此注入 `<link>`。
 //!
 //! 纯字符串处理，无依赖。

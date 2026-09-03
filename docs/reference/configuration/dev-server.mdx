@@ -40,3 +40,7 @@ ws = false
 | `path_rewrite` | 转发前的路径替换表 |
 
 代理仅用于开发，不写入生产产物。生产转发由部署平台配置。
+
+Live Reload 在开发服务器中始终启用：成功重建后浏览器刷新整个页面，构建失败时显示诊断且不刷新。
+它不是模块 HMR，也没有 `hmr`、`hot` 或 `live_reload` 配置项。`[dev_server]` 出现未列出的字段会
+作为配置错误拒绝，不会被静默忽略。参见 [Live Reload](/app/live-reload)。

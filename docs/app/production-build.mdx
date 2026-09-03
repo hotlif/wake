@@ -41,6 +41,10 @@ npx wake build --outdir dist
 
 不要依赖具体哈希文件名，也不要把旧 dist 与新构建混合部署。
 
+Wake 只会更新带有自身 `.wake-output.json` 标记的非空目录。升级后首次遇到未标记的旧 `dist`
+时，先确认它仅含可丢弃构建产物并删除该目录，再重新构建；Wake 不会冒险猜测目录所有权。
+不要把项目根、源码目录或共享文件目录作为 `--outdir`。
+
 ## 下一步
 
 <NextActions>

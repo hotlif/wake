@@ -15,7 +15,7 @@ pages = ["app/project-structure", "app/react-typescript"]
 [[group.section]]
 id = "development"
 title = "开发"
-pages = ["app/dev-server", "app/hmr", "app/aliases-and-proxy"]
+pages = ["app/dev-server", "app/live-reload", "app/aliases-and-proxy"]
 
 [[group.section]]
 id = "build"
@@ -64,12 +64,12 @@ pages = ["reference/configuration/project", "reference/configuration/test", "ref
 [[group.section]]
 id = "cli"
 title = "CLI"
-pages = ["reference/cli/build", "reference/cli/test", "reference/cli/bundle", "reference/cli/library", "reference/cli/dev", "reference/cli/docs"]
+pages = ["reference/cli/build", "reference/cli/test", "reference/cli/bundle", "reference/cli/library", "reference/cli/dev", "reference/cli/federation", "reference/cli/docs"]
 
 [[group.section]]
 id = "node-api"
 title = "Node.js API"
-pages = ["reference/node-api/build", "reference/node-api/test", "reference/node-api/dev-server", "reference/node-api/docs"]
+pages = ["reference/node-api/build", "reference/node-api/federation", "reference/node-api/test", "reference/node-api/dev-server", "reference/node-api/docs"]
 
 [[group.section]]
 id = "language"

@@ -23,12 +23,16 @@ wake library build [PROJECT] [--entry src/index.ts]
 `$ref(name)` 展开成带 fallback 的 CSS 变量。
 
 缺失引用、循环导入、非法 CSS 前缀、无效 TOML 或写盘错误都返回非零；失败不会覆盖上一份
-有效输出。Yarn PnP（包括 zip 包）与传统 `node_modules` 均受支持。
+有效输出。生成目标不能与根 `token.toml`、递归导入配置、解析时读取的 package/PnP 元数据或
+archive 是同一物理文件或 alias；碰撞以 `WAKE_OUTPUT_COLLISION` 失败，且输入保持不变。Yarn
+PnP（包括 zip 包）与传统 `node_modules` 均受支持。
 
 `docgen` 的入口优先级是 `--entry`、`package.json` 的 `docgen.entry`，最后是从
 `src/index.ts` 的默认导出沿 import、re-export 和局部别名追踪。它原子写入紧凑且确定性的
 `public/docgen.json`，保持 react-docgen 的 `displayName`、`description`、`props`、
 `tsType` 和 `defaultValue` 消费结构。公开 props 无法安全确定时命令严格失败。
+Docgen 会保留递归类型解析的实际读取清单；固定输出若与入口、索引、package 配置或传递类型源
+重合，也会在写入前以 `WAKE_OUTPUT_COLLISION` 拒绝。
 
 `build` 生成 `esm/index.mjs`、`cjs/index.cjs`、`declarations/index.d.ts`，有静态样式时再生成
 `css/index.css`。裸包保持 external，本地源码进入真实 ESM/CJS 保留模块图。全部输出先在包根的

@@ -1,0 +1,67 @@
++++
+title = "Live Reload"
+description = "理解 Wake 的增量重建与整页自动刷新边界"
+kind = "guide"
+status = "stable"
++++
+
+import { NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from "../site/components.tsx"
+
+# Live Reload
+
+<ResultPanel title="完成后">
+  源码修改成功重建后，浏览器刷新整个页面并加载最新产物；页面内存状态会重新创建。
+</ResultPanel>
+
+<VisualFigure visual="live-reload" alt="文件变化触发增量重建，然后浏览器刷新整个文档" caption="Wake 在服务端复用增量构建，但浏览器端执行整页刷新。" />
+
+Wake 当前提供 Live Reload，不提供模块级 HMR。开发服务器会复用上一代模块图，只重建受影响的
+编译任务；成功发布新产物后，浏览器收到 `reload` 消息并调用 `location.reload()`。
+
+因此 React state、滚动位置和其他页面内存状态不会由 Wake 保留。`import.meta.hot` 始终编译为
+`false`，也没有 `accept`、`dispose` 或 React Fast Refresh API。
+
+## 更新顺序
+
+<StepFlow>
+  <Step number="01" title="监听">文件监听器合并同一批变化。</Step>
+  <Step number="02" title="重建">长期 BuildSession 失效并增量生成完整候选。</Step>
+  <Step number="03" title="发布">构建成功后原子替换服务中的产物。</Step>
+  <Step number="04" title="刷新">目标挂载收到 reload 消息，浏览器重新加载页面。</Step>
+</StepFlow>
+
+构建失败时不会发布半成品，也不会刷新页面；浏览器显示诊断 overlay。修复错误并成功重建后，
+overlay 清除并执行一次整页刷新。
+
+## Federation 更新
+
+Federation 的 `types-only`、`isolated-remount` 和 `full-reload` 是独立的版本化协议。
+`isolated-remount` 可以只重建隔离组件，但它不表示普通应用具备模块 HMR。
+
+开发页面会通过 Federation 更新 WebSocket 申领仍在使用的 remote build，因此旧组件的 lazy chunk 在
+页面存活时仍可加载。每个 remote 连接最多保留 8 个活跃 build；超过边界、连接落后或所需 build 已在
+断线期间回收时，Wake 会明确刷新该页面，而不会让 dynamic import 悬空。没有浏览器租约的 remote 只
+保留最近两代作为 Manifest 到 entry 的短竞态窗口。重连时服务端 build/generation 与页面已接受状态
+不一致也只刷新该页面；不同 remote 的消息通道彼此隔离。这些是内部恢复边界，没有可配置的 HMR 开关。
+
+裁剪后的 build asset 返回 `410 Gone` 和版本化恢复控制。浏览器只在控制中的 remote/build 与自己本次
+请求完全匹配且 generation 严格更新时刷新；equal-generation、无效或跨 remote 响应只作为网络错误
+处理，不会刷新其他页面。Wake 保留的 Federation 路径缺失时直接 404，不会回退到 public 文件或 SPA。
+
+## 验证方式
+
+打开应用后先改变一个输入框、展开状态或滚动位置，再修改会显示在页面上的源码。成功重建后应看到
+新内容，但先前的页面状态会重置；浏览器网络工具可同时观察到 `/__wake_live_reload` 的 `reload`
+消息和一次新的文档请求。制造一个编译错误时应只显示诊断，不应请求新文档；修复后才刷新一次。
+
+## 没有自动刷新时
+
+检查终端是否观察到目标文件、浏览器是否连接 `/__wake_live_reload`，以及构建是否仍有错误。
+多挂载 Docs 只会向发生变化的目标挂载发送刷新消息。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/app/aliases-and-proxy" title="配置别名与代理" description="让日常导入和 API 请求更稳定。" />
+  <NextLink href="/reference/troubleshooting" title="继续排错" description="按症状查找权威诊断路径。" />
+</NextActions>

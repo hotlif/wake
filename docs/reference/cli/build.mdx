@@ -21,6 +21,18 @@ wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap]
 | `--watch` | 关闭 | 构建后持续监听 |
 | `--sourcemap` | 关闭 | 输出与生产压缩、代码分割兼容的 source map |
 
+`--cache` 只缓存可重建的派生结果。Wake 每个新进程仍读取并哈希真实源码；缓存缺失或 schema
+不兼容会静默重建，损坏、I/O 或并发提交问题会在一次构建中合并为最多一条非致命
+`WAKE_CACHE` warning。一次性构建以及 `--watch` 的 plain/TUI 成功结果都会保留该诊断。
+
+Wake 只会替换新目录、空目录，或带有匹配 `.wake-output.json` 所有权标记的应用输出目录。
+项目根、项目祖先、包含入口的目录以及符号链接或 Windows reparse point 会以 `WAKE_CONFIG`
+拒绝。升级后若旧 `dist` 非空但尚无标记，请先确认并删除旧产物，或选择一个新的空目录；Wake
+不会根据文件名猜测并接管已有目录。
+
+应用、Federation、HTML 与 manifest 会先完整写入同盘 staging。全部步骤成功后才替换上一份
+输出；构建或写盘失败会保留最后一次成功发布的目录。
+
 生产构建继续使用 Wake 集中式的 Closure 风格有序 pass/固定点压缩管线；`--sourcemap` 增加映射
 文件和对应 trailer，不会切换到另一套未压缩产物，也不会改变不含 trailer 的 JavaScript 主体。
 “Closure 风格”描述调度架构，不代表 Closure `ADVANCED` 输出，也没有 externs/Advanced 选项。

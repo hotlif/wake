@@ -21,9 +21,44 @@ server.on("diagnostic", (diagnostic) => console.error(diagnostic));
 await server.waitUntilClosed();
 ```
 
-`DevServer` 事件包括 `rebuildStart`、`rebuilt`、`diagnostic`、`workspaceState` 和 `closed`。
+`startDevServer()` 也接受与 `build()` 相同的 `FederationOptions`。Remote 的 `devFollow: true`
+允许开发环境跟随新的 build ID；这不会放宽生产 lock 或 origin 校验：
+
+```ts
+const server = await startDevServer({
+  federation: {
+    enabled: true,
+    name: "shell",
+    remotes: {
+      catalog: {
+        manifestUrl: "http://localhost:4174/wake-federation.json",
+        allowedOrigins: ["http://localhost:4174"],
+        devFollow: true,
+      },
+    },
+  },
+});
+```
+
+启动时 Wake 会先对全部 remote 做一次 fail-closed 类型同步。随后只低频探测 `devFollow: true`
+remote 的 Manifest；`buildId` 或类型 hash 变化时才重新下载、校验全部声明，并原子替换稳定 editor
+index。刷新失败会保留旧 index、发送 `diagnostic` 并继续重试。`devFollow: false` 不参与探测，
+其 Manifest SHA-384、`buildId` 与类型完整性必须匹配 `wake-federation.lock`。
+
+开发页会在应用 bundle 前加载稳定的 Federation bootstrap。配置 shared 时，bootstrap 先安装
+Broker，开发入口再注册宿主 provider、冻结 share context，随后才异步执行应用，避免 React
+消费者在依赖选择完成前运行。entry 与 async chunk 通过 HTTP `SourceMap` header 暴露映射，
+不会为了调试改写 JavaScript body。
+
+`DevServer` 事件包括 `rebuildStart`、`rebuilt`、`diagnostic`、`workspaceState`、
+`federationUpdated` 和 `closed`。`federationUpdated` 报告 remote、旧/新 build ID、变化 exposes、
+类型 hash 与 `types-only`、`isolated-remount` 或 `full-reload` 动作。
 聚合 Docs 的重建事件可带 `workspace`、`basePath`；`workspaceState` 报告总数、已加载数、
 失败数、当前加载目标和失败名称。普通应用服务器不会发送工作区状态。
+
+普通应用成功重建后，内置浏览器客户端通过 Live Reload 刷新整个页面；React state 和其他页面内存
+状态会重新创建。`DevServerOptions` 没有 `hmr`、`hot` 或 `liveReload` 开关，传入未知字段会以
+`WAKE_CONFIG` 拒绝。Federation 的三种更新动作是独立协议，不代表普通模块可以热替换。
 
 `unref()` 允许 Node 在没有其他任务时退出；`close()` 返回服务真正关闭后的 Promise。
 

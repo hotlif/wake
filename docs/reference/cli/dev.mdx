@@ -17,9 +17,11 @@ wake dev [ROOT] [--entry FILE] [--port PORT]
 | --- | --- | --- |
 | `ROOT` | `.` | 项目根或其内部路径 |
 | `--entry` | 配置入口 | 覆盖当前开发入口 |
-| `--port` | `5173` | HTTP 与 HMR 监听端口 |
+| `--port` | `5173` | HTTP 与 Live Reload WebSocket 监听端口 |
 
 host、自动打开和 API 代理来自 `[dev_server]`。命令常驻直到收到关闭信号；端口已占用时启动失败，不会自动选择随机端口。
+
+Wake 当前在服务端执行增量重建，在浏览器端执行整页 Live Reload；没有 HMR 开关或模块热替换 API。
 
 ## 交互式终端
 

@@ -11,7 +11,7 @@ Wake 是一套 Rust 原生的 Web 构建工具，将 JavaScript / TypeScript 编
 | --- | --- |
 | 编译 | 原生解析和转换 JavaScript、TypeScript、JSX 与 TSX |
 | 生产构建 | Tree Shaking、无效模块消除、压缩、动态导入分包、CSS 抽取及内容哈希 |
-| 开发服务器 | 常驻增量构建、文件监听、HMR 和 API 代理 |
+| 开发服务器 | 常驻增量构建、文件监听、整页自动刷新（Live Reload）和 API 代理 |
 | 资源管线 | 小资源内联、大资源独立输出，并生成 HTML 与 `manifest.json` |
 | Wake Docs | 从 MDX、React Demo、Props 类型和 JSDoc 构建静态技术文档站 |
 | 多种入口 | 原生 CLI、Node.js API，以及隔离在 `experimental` 子路径下的编译器原语 |
@@ -114,7 +114,7 @@ wake [--no-color] [--ui auto|tui|plain] <COMMAND>
 | 命令 | 用途 |
 | --- | --- |
 | `wake build [ENTRY]` | 创建生产构建，默认输出到 `dist` |
-| `wake dev [ROOT]` | 启动应用开发服务器和 HMR |
+| `wake dev [ROOT]` | 启动应用开发服务器和 Live Reload |
 | `wake docs dev [ROOT] [--mode site\|components]` | 启动文档站或组件工作台开发服务器 |
 | `wake docs build [ROOT] [--mode site\|components]` | 创建可部署的静态文档站或组件工作台 |
 | `wake parse <FILE>` | 解析源码并打印 AST |
@@ -236,7 +236,7 @@ crates/
 ├─ wake_graph        # 模块依赖图
 ├─ wake_bundler      # Bundle、chunk 和增量构建会话
 ├─ wake_turbo        # 并发增量计算引擎
-├─ wake_dev_server   # HTTP 开发服务器、监听与 HMR
+├─ wake_dev_server   # HTTP 开发服务器、监听与 Live Reload
 ├─ wake_docs         # MDX、Demo、Props API 和静态文档生成
 ├─ wake_app          # CLI 与 Node 共用的应用层
 ├─ wake_cli          # wake 命令行程序

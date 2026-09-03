@@ -1,6 +1,6 @@
 +++
 title = "项目配置"
-description = "查询项目根、入口、别名、React、TypeScript、define 和浏览器目标"
+description = "查询项目根、入口、别名、Federation、React、TypeScript、define 和浏览器目标"
 kind = "reference"
 status = "stable"
 +++
@@ -17,7 +17,7 @@ Wake 从命令目标向上寻找 `wake.config.toml`。配置使用静态 TOML，
 | `public_path` | 设置生产资源公开前缀 |
 | `browserslist` | 声明输出浏览器目标 |
 | `browserslist_options` | 控制 Browserslist 查询行为 |
-| `define` | 构建时替换全局常量 |
+| `define` | 构建时替换全局常量；不能覆盖保留能力标记 `import.meta.hot` |
 | `alias` | 把导入前缀映射到项目路径 |
 | `component_scan` | 声明组件源码扫描规则 |
 | `dev_server` | 开发服务器配置，见[开发服务器配置](/reference/configuration/dev-server) |
@@ -25,6 +25,7 @@ Wake 从命令目标向上寻找 `wake.config.toml`。配置使用静态 TOML，
 | `hooks` | 声明式启动文件路径调整 |
 | `typescript` | TypeScript 转换选项 |
 | `react` | React JSX 转换选项 |
+| `federation` | Wake-native 浏览器模块联邦配置 |
 | `docs` | Wake Docs 配置，见[Wake Docs 配置](/reference/configuration/docs) |
 | `test` | 原生测试配置，见[测试配置](/reference/configuration/test) |
 | `transforms` | 显式启用或禁用语法转换 |
@@ -43,6 +44,179 @@ jsx_import_source = "react"
 enabled = true
 only_remove_type_imports = false
 ```
+
+## Module Federation
+
+Federation 是浏览器 CSR 的 Wake-native 协议，不兼容 Webpack/Rspack container ABI。默认关闭；
+启用时必须提供页面内唯一的容器 `name`。远程模块只能通过字面量动态导入
+（例如 `import("catalog/Button")`）或 Federation runtime 加载；静态 `import`、`require()`、
+Node、SSR 和 Worker 构建不在 v1 范围内。
+
+```toml
+[federation]
+enabled = true
+name = "shell"
+
+[federation.remotes.catalog]
+manifest_url = "https://catalog.example.com/wake-federation.json"
+allowed_origins = ["https://catalog.example.com", "https://cdn.example.com"]
+dev_follow = true
+
+[federation.exposes."./Button"]
+entry = "src/button.tsx"
+mode = "host-rendered"
+scope = "react18"
+shadow = "none"
+# 默认 false；仅在明确接受宿主 document 全局样式污染时开启
+allow_global_css = false
+
+[federation.exposes.LegacyCard]
+entry = "src/legacy-card.tsx"
+mode = "isolated"
+scope = "react17"
+# isolated 默认 shadow = "open"
+
+[federation.shared.react]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+fallback = false
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared."react/jsx-runtime"]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+fallback = false
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared."react/jsx-dev-runtime"]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+fallback = false
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared.react-dom]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+fallback = false
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared."react-dom/client"]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+fallback = false
+coherence_group = "react18"
+owner = "shell"
+```
+
+远程名必须是 ASCII 标识符；Manifest 必须是绝对 `http://` 或 `https://` URL，
+`allowed_origins` 只接受 origin，不能包含路径、查询、fragment 或凭据。开发服务器在
+`dev_follow = true` 时跟随新的 remote build；生产构建仍以 federation lock 为准。
+
+Expose key 可写成 `Button` 或 `./Button`，两者都会规范为 Manifest 使用的 `./Button`，因此不能同时声明。
+`mode` 有以下边界：
+
+| mode | scope | Shadow DOM | CSS 边界 | 边界 |
+| --- | --- | --- | --- | --- |
+| `generic` | 可选 | 仅 `none` | 不施加组件样式策略 | 普通模块命名空间 |
+| `host-rendered` | 必填 | 仅 `none` | 默认仅 CSS Modules 与 Wake CSS-in-JS | 进入宿主 React tree，使用宿主冻结的 coherence group |
+| `isolated` | 必填且不能为 `default` | `open`（可省略） | CSS 在隔离 root 中加载 | 独立 root，只传递结构化 props、事件和 DOM slots |
+
+`isolated` 的 props 与事件 detail 只接受由 own、enumerable data properties 组成的有限数字、
+字符串、布尔值、`null`、稠密数组和 plain object；函数、symbol、循环、accessor、React Element/ref
+以及额外数组属性都会在执行 remote lifecycle 前失败，getter 不会被调用。Slots 必须是 plain record
+中的真实 DOM `Node`；React value、函数、accessor 或伪造的 Node-like 对象不能跨越该边界。
+
+`shared` 只处理显式列出的依赖。`scope` 默认 `default`，`fallback` 默认开启；`strict = true`
+必须同时给出 `required_version`。设置 `coherence_group` 的依赖必须是 singleton，以保证
+`react`、JSX runtime 与 renderer 等依赖作为一个原子组选择。宿主候选优先于已加载 remote，
+只有两者都不兼容时才加载当前 remote 的 fallback。生产环境中的 singleton 必须显式设置
+`owner` 为宿主 `name` 或一个已配置 remote，避免首次导航顺序决定 React 等关键依赖的实例。
+
+`host-rendered` expose 的 scope 必须完整列出 `react`、`react/jsx-runtime`、
+`react/jsx-dev-runtime`、`react-dom`、`react-dom/client`。五项必须全部设置 `singleton = true`，
+使用同一个非空 `coherence_group`，并且要么都省略 `owner`，要么使用同一个 `owner`；缺项或
+策略分裂会在配置和 Manifest 校验阶段直接失败。`generic` 与 `isolated` 不要求这套五项完整组。
+
+`host-rendered` expose 的同步和异步 chunk closure 默认拒绝普通、未作用域的 `.css`，包括依赖包
+自动注入的样式；检测到后构建以 `FED_CONFIG_INVALID` 失败。`.module.css` 与 Wake CSS-in-JS
+（包括显式 `globalStyle`）可以直接使用。只有在组件契约明确接受样式进入宿主 document 时，才为该
+expose 设置 `allow_global_css = true`。该开关仅用于 Wake producer 的构建门禁，不进入 Manifest。
+
+首次接入时运行 `wake federation init .` 创建稳定的 `wake-federation.d.ts` 引用入口；开发类型
+会写入 `.wake/federation/types/<remote>/<buildId>/index.d.ts`，稳定索引通过原子替换更新。`wake dev`
+只探测 `dev_follow = true` 的 Manifest，revision 变化后执行全 remote fail-closed 同步；失败保留旧索引并
+持续重试。`dev_follow = false` 不探测，且启动时声明必须与 `wake-federation.lock` 的 Manifest、build 和
+类型摘要一致。发布前
+运行 `wake federation lock .` 拉取并校验所有生产 Manifest，生成包含 `buildId`、Manifest 与类型
+SHA-384 以及完整 asset closure 的 `wake-federation.lock`。生产构建拒绝缺失或不匹配的 lock。
+Lock 中的必需 `hasExposes` 字段来自已校验 Manifest：公开了 expose 的 remote 必须有同 build 类型，
+shared-only remote 则可省略类型。生产 lock 还会拒绝任何未声明 `policy.owner` 的 singleton shared
+offer 或 requirement，避免首次导航顺序决定关键依赖 owner。
+
+### Federation CSP、CORS 与 SRI
+
+Wake 生成的开发和生产 bootstrap 会在首次创建页面级 broker 前查找自己的
+`<script type="module" src="…">` 元素，并读取其 `.nonce`。服务端或 HTML 模板只要把本次响应的
+nonce 写入该 module script，后续 Wake 创建的 remote `<script>` 与 `<link rel="stylesheet">` 就会
+继承同一个值。找不到 nonce 时保持原有行为，不会生成占位 nonce。
+
+宿主也可在 bootstrap 之前用一个已被 nonce 授权的 inline script 显式提供 nonce；显式值优先于
+module script 上的值：
+
+```html
+<script nonce="SERVER_NONCE">
+  Object.defineProperty(globalThis, Symbol.for("wake.federation.runtime-options.v1"), {
+    value: Object.freeze({ nonce: document.currentScript.nonce }),
+    configurable: false,
+    writable: false,
+  });
+</script>
+```
+
+这个稳定 Symbol 只接受 plain 或 null-prototype 对象，并且必须只有一个符合 CSP base64/base64url
+语法的 `nonce` data property。额外的 `global`、`transport`、mode、limit、symbol key、accessor，
+以及空值或非法 nonce 都会在 broker 创建前以 `FED_CONFIG_INVALID` 失败。它不能扩大 runtime 权限；
+bootstrap 本身仍须由 `script-src` 的 nonce、`'self'` 或部署策略明确授权。
+
+部署 CSP 时至少按实际 remote 与开发端点配置以下边界：
+
+- `script-src` 授权 Wake bootstrap 和 remote module scripts；如果策略不使用 `'strict-dynamic'`，还要
+  显式列出 remote HTTPS origins。
+- `style-src` 授权 remote CSS origins；Wake 会同时把 nonce 写入动态 stylesheet link。
+- `connect-src` 授权 remote Manifest/asset metadata 请求，开发模式还要授权 Federation 更新使用的
+  `ws:` 或 `wss:` endpoint。
+
+Manifest 与跨源资源仍必须返回正确 CORS 响应；remote entry、expose、lazy JS 与 CSS 会继续接受固定
+MIME、大小和逐资源 SHA-384 SRI 校验。CSP、origin allowlist、production lock 与 SRI 是叠加约束，
+彼此不能替代；SRI 只验证发布内容未被替换，不提供代码沙箱。
+
+Wake development remote 会为浏览器仍在使用的 build 保留 versioned lease。若页面断线太久且请求的
+旧 build 已回收，asset 的 HEAD/GET 返回 `410 Gone`；响应同时提供 `Wake-Federation-*` 恢复头，并用
+`Access-Control-Expose-Headers` 暴露给跨 origin 宿主。只有 remote、过期 build、当前 build 与
+generation 全部匹配且 generation 严格推进的请求页面会执行 full reload；equal-generation 控制不会
+刷新。自定义 dev proxy/CDN 不得移除这些响应头，也不应
+把 410 改写为 404 或 HTML。每连接最多 8 个活跃 build，超过时显式刷新；该内部上限没有配置项，且不
+改变 production Manifest/lock 的页面缓存语义。多挂载 dev server 的 enabled Federation
+`container_name` 必须唯一，每个 remote 使用隔离的更新通道；production registration mode 始终使
+Manifest 中的 development metadata 保持非激活状态。
+
+Wake Federation v1 暂不创建或接收 Trusted Types policy，浏览器 transport 仍以字符串设置动态
+`script.src`/`link.href`。启用 `require-trusted-types-for 'script'` 的页面不在 v1 支持范围内；不要通过
+宽松的 default policy 绕过这一边界。
 
 ## HTML、转换与浏览器
 
@@ -74,5 +248,8 @@ only_remove_type_imports = false
 ## 加载与错误
 
 所有相对路径以配置文件所在目录为基准，再应用 `root_dir`。找不到 `wake.config.toml` 时使用默认配置；文件存在但无法读取、TOML 无效或 Browserslist 查询失败时，Wake 终止并报告对应文件，不会静默回退。
+
+`import.meta.hot` 是 Wake 保留的能力标记并始终编译为 `false`。它不能出现在 `[define]` 中；
+Wake 当前提供整页 [Live Reload](/app/live-reload)，不提供模块替换 API。
 
 开发服务器字段见[开发服务器配置](/reference/configuration/dev-server)，文档字段见[Wake Docs 配置](/reference/configuration/docs)。

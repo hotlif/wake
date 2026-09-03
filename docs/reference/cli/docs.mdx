@@ -22,6 +22,9 @@ wake docs build [ROOT] [--outdir DIR] [--base PATH] [--mode site|components]
 `--base` 临时覆盖 `[docs].base_path`。`site` 构建 MDX 文档站；`components` 启动或构建 Demo 工作台，不扫描 MDX 页面。
 
 构建命令会验证导航、页面、Demo 和 API，然后为每个公开路由生成 HTML shell。输出目录默认来自 Wake Docs 配置或 `docs-dist`。
+单站和聚合构建都先在同盘 staging 中生成 bundle、路由 shell 与 public 资源，全部成功后再提交。
+输出目录必须是新的、空的，或带有 Docs 产品 `.wake-output.json` 标记；Wake 不会清理非空的
+未标记目录，也不会通过符号链接或 Windows reparse point 发布。
 
 当站点配置了 `[[docs.workspace]]` 时，默认 `site` 命令会聚合全部匹配工作区。生产构建
 总是构建全部工作台，并在全部成功后事务式发布；开发服务器在同一端口按挂载路径提供
