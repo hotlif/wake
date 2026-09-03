@@ -4237,8 +4237,10 @@ dependencies = [
 name = "wake_cache"
 version = "0.1.26"
 dependencies = [
+ "tempfile",
  "wake_common",
  "wake_turbo",
+ "xxhash-rust",
 ]
 
 [[package]]

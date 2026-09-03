@@ -9,5 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+tempfile.workspace = true
 wake_common.workspace = true
 wake_turbo.workspace = true
+xxhash-rust.workspace = true

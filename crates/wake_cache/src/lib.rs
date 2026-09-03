@@ -1,34 +1,42 @@
 //! wake_cache — wake_turbo 任务图与产物的**持久化层**（DESIGN §10.3 / PLAN §7.1）。
 //!
-//! 目标：让一个**全新进程**的冷构建跳过未变模块的源码读取、parse、optimize 与 body emit——把五类数据落盘：
+//! 目标：让一个**全新进程**在读取并哈希真实源码后跳过未变模块的 parse、optimize 与 body emit——
+//! 把四类可重建的派生数据落盘：
 //!
-//! - **路径快照**：`path → (mtime, size, content_key, source)`，元数据命中时只 stat 一次。
-//!   源码从单个缓存文件恢复，避免 Windows 对数千个小文件逐个触盘。
 //! - **模块摘要**（`ModuleSummary`）：`content_key → (deps, uses, 顶层 await 标志)`。`content_key = hash(源类型 ‖ 源文本)`。
 //!   有它就能不 parse 直接建依赖图、算 Tree Shaking 保留集。
-//! - **优化事实**（`retained_module_ids`）：以不含最终 chunk 编号的 optimizer key 存储；驱动先
+//! - **优化事实**（`retained_requests`）：以不含最终 chunk 编号的 optimizer key 存储稳定说明符；驱动先
 //!   收敛这些边并重新规划 chunk，再形成 body key。
 //! - **codegen 产物**（`body`）：`(content_key, optimizer_key, final_layout_key) → String`。
-//! - **source-map 映射事实**（`mappings`）：与 `body` 使用相同产物键但独立存取；body 发射始终
-//!   记录并持久化它们，因此之后启用 source map 不需要重新 parse、optimize 或 emit body。
+//! - **模块发射元数据**（`mappings`）：source-map 段、生成请求范围和运行时绑定名与 `body` 使用
+//!   相同产物键但独立存取；body 发射始终记录并持久化它们。
 //!
 //! **健壮性**：值全是 `String`/`Vec`/整数——**绝不落 `ModuleAst`（自引用 arena）也绝不落 `Atom`**
 //! （interner id 跨进程无意义；说明符已在此前解成 `String`）。这正是 PLAN「Atom 不落盘」的落地。
-//! 常规文件变化会改变 mtime 或 size，从而重新读取并由 `content_key` 做内容级失效。若外部工具刻意
-//! 保留同一 mtime 与 size 却替换内容，需要清理缓存；这是用一次 stat 换取跨进程免读源码的明确取舍。
-//! CSS、JSON、资源和依赖邻接文件系统状态的 loader 不使用路径快照。
+//! 持久层不保存路径、文件元数据或源码快照。每个新进程都从 loader 读取真实源码并计算
+//! `content_key`，因此保留 mtime/size 的外部编辑也不会复用陈旧源码。
 //!
-//! **格式**：手写小端二进制 + `MAGIC`+`SCHEMA` 头；schema 不符（wake 自身的 parse/codegen 语义
-//! 变更时应 bump `SCHEMA`）直接当空缓存忽略。rkyv 的零拷贝是更大规模时的优化，可后续替换（API 不变）。
+//! **格式**：32-byte 小端 envelope（`MAGIC`、`SCHEMA`、payload length、XXH3-128 checksum）+
+//! 有界手写 payload。schema 不符是正常 miss；当代 schema 的损坏、I/O 与存储事务失败由调用方以
+//! 非致命缓存诊断呈现。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use tempfile::NamedTempFile;
+use xxhash_rust::xxh3::Xxh3;
 
 /// 缓存文件魔数。
 const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
-const SCHEMA: u32 = 10;
+const SCHEMA: u32 = 13;
+const HEADER_LEN: usize = 32;
 
 /// Persistent caches are an optimization, so bounded retention is preferable to allowing edited
 /// content versions to grow without limit for the lifetime of a project. The limits are deliberately
@@ -36,6 +44,114 @@ const SCHEMA: u32 = 10;
 /// unbounded amount of memory and disk.
 const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 200_000;
+const MAX_CACHE_ITEMS: usize = 4_000_000;
+const MAX_CACHE_OWNED_BYTES: usize = 512 * 1024 * 1024;
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheDecodeError {
+    TruncatedHeader,
+    InvalidMagic,
+    PayloadLengthOverflow,
+    PayloadTooLarge { declared: u64, maximum: usize },
+    PayloadLengthMismatch { declared: u64, actual: usize },
+    TrailingBytes,
+    ChecksumMismatch,
+    BudgetExceeded(&'static str),
+    AllocationFailed(&'static str),
+    InvalidUtf8,
+    InvalidTag { field: &'static str, value: u8 },
+    InvalidValue(&'static str),
+    DuplicateKey(&'static str),
+    TruncatedPayload,
+}
+
+impl fmt::Display for CacheDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for CacheDecodeError {}
+
+#[derive(Debug)]
+pub enum CacheLoadOutcome {
+    Loaded(Box<BuildCache>),
+    Missing,
+    Incompatible { found_schema: u32 },
+    Corrupt(CacheDecodeError),
+    Io(io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStoreStage {
+    CreateDirectory,
+    OpenLock,
+    Lock,
+    Reload,
+    Encode,
+    CreateTemporary,
+    WriteTemporary,
+    FlushTemporary,
+    SyncTemporary,
+    Replace,
+}
+
+#[derive(Debug)]
+pub enum CacheStoreError {
+    Io {
+        stage: CacheStoreStage,
+        source: io::Error,
+    },
+    Encode(CacheEncodeError),
+}
+
+impl CacheStoreError {
+    fn io(stage: CacheStoreStage, source: io::Error) -> Self {
+        Self::Io { stage, source }
+    }
+}
+
+impl fmt::Display for CacheStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { stage, source } => write!(formatter, "{stage:?}: {source}"),
+            Self::Encode(error) => write!(formatter, "encode: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CacheStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Encode(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheEncodeError {
+    BudgetExceeded(&'static str),
+    LengthOverflow(&'static str),
+    AllocationFailed,
+    InvalidValue(&'static str),
+}
+
+impl fmt::Display for CacheEncodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for CacheEncodeError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStoreReport {
+    pub repaired_corrupt_latest: bool,
+    pub dropped_conflicts: usize,
+}
 
 #[derive(Clone, Copy)]
 struct CacheLimits {
@@ -102,21 +218,7 @@ pub struct ModuleSummary {
     pub liveness: CachedLiveness,
     pub concat_is_esm: bool,
     pub concat_block_safe: bool,
-}
-
-/// 原文件元数据。命中时无需重新读取该小文件；`content_key` 仍负责内容级缓存寻址。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileStamp {
-    pub size: u64,
-    pub modified_ns: u128,
-}
-
-/// 路径索引命中项。源码随单个缓存文件顺序读取，避免 Windows 对大量源文件逐个触盘。
-#[derive(Clone, Debug)]
-pub struct CachedSource {
-    pub stamp: FileStamp,
-    pub content_key: u64,
-    pub source: Arc<str>,
+    pub concat_observes_commonjs_bindings: bool,
 }
 
 /// One module-local source-map segment. Keeping only integers across the persistent-cache
@@ -134,12 +236,106 @@ pub struct CachedMapping {
     pub is_unmapped: bool,
 }
 
-/// One proof-carrying generated request range stored with its byte-identical module body.
+/// Semantic use of a codegen-owned internal request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CachedDiscardedStaticRequest {
+pub enum CachedModuleRequestRole {
+    Value,
+    DiscardedStatic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CachedModuleRequestKind {
+    StaticImport,
+    DynamicImport,
+    Require,
+}
+
+impl CachedModuleRequestKind {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::StaticImport => 0,
+            Self::DynamicImport => 1,
+            Self::Require => 2,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::StaticImport),
+            1 => Some(Self::DynamicImport),
+            2 => Some(Self::Require),
+            _ => None,
+        }
+    }
+}
+
+/// Stable optimizer-retained request identity. Numeric graph IDs never cross this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CachedRetainedRequest {
+    pub specifier: String,
+    pub kind: CachedModuleRequestKind,
+}
+
+impl CachedModuleRequestRole {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Value => 0,
+            Self::DiscardedStatic => 1,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Value),
+            1 => Some(Self::DiscardedStatic),
+            _ => None,
+        }
+    }
+}
+
+/// One proof-carrying generated target-literal range stored with its byte-identical module body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedModuleRequest {
     pub start: u32,
     pub end: u32,
-    pub target_module_id: u32,
+    pub specifier: String,
+    pub kind: CachedModuleRequestKind,
+    pub role: CachedModuleRequestRole,
+}
+
+/// Stable emitted names for one module factory's runtime-owned bindings.
+///
+/// These names are codegen facts, not values that the cache may reconstruct from generated text.
+/// They therefore travel with the byte-identical body and its other module-local metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedModuleRuntimeCapabilities {
+    pub meta_url: bool,
+    pub external_require: bool,
+    pub promise_resolve: bool,
+    pub object_assign: bool,
+    pub object_keys: bool,
+    pub object_define_property: bool,
+    pub runtime_import: bool,
+    pub shared: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedModuleRuntimeNames {
+    pub module: String,
+    pub exports: String,
+    pub require: String,
+    pub capabilities: CachedModuleRuntimeCapabilities,
+}
+
+impl Default for CachedModuleRuntimeNames {
+    fn default() -> Self {
+        Self {
+            module: "module".into(),
+            exports: "exports".into(),
+            require: "__wake_require__".into(),
+            capabilities: CachedModuleRuntimeCapabilities::default(),
+        }
+    }
 }
 
 /// Complete module-local emission metadata stored independently from the JavaScript body.
@@ -147,30 +343,23 @@ pub struct CachedDiscardedStaticRequest {
 pub struct CachedModuleMappings {
     pub mappings: Vec<CachedMapping>,
     pub names: Vec<String>,
-    pub discarded_static_requests: Vec<CachedDiscardedStaticRequest>,
-}
-
-#[derive(Clone, Debug)]
-struct PathEntry {
-    variant: u64,
-    cached: CachedSource,
+    pub generated_module_requests: Vec<CachedModuleRequest>,
+    pub runtime_names: CachedModuleRuntimeNames,
 }
 
 /// 持久化构建缓存：摘要表 + 产物表。
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BuildCache {
     summaries: HashMap<u64, ModuleSummary>,
-    /// 规范路径 → 文件元数据、配置变体、内容键与源码快照。
-    paths: HashMap<PathBuf, PathEntry>,
     /// codegen 产物体。存 `Arc<String>`：命中返回引用计数自增而非整体拷贝，
     /// 与 bundler 拼接侧的 `Arc<String>` 同构，消除全命中路径的两次全 bundle memcpy。
     bodies: HashMap<u128, Arc<String>>,
-    /// Optimizer-reported internal dependency targets. These stable numeric IDs are sorted and
-    /// deduplicated by the bundler before crossing the persistent boundary.
-    retained_module_ids: HashMap<u128, Arc<Vec<u32>>>,
-    /// Source-map mapping facts are cached independently from JavaScript bodies. New body entries
-    /// are committed atomically with their facts; schema 10 naturally misses legacy entries which
-    /// lack generated request-range metadata.
+    /// Optimizer-reported internal dependency requests. Stable source specifiers, never one
+    /// process's graph traversal IDs, cross the persistent boundary.
+    retained_requests: HashMap<u128, Arc<Vec<CachedRetainedRequest>>>,
+    /// Module-local emission facts are cached independently from JavaScript bodies. New body
+    /// entries are committed atomically with their facts; schema 13 naturally misses legacy entries
+    /// which lack generated request-range or runtime-binding metadata.
     mappings: HashMap<u128, Arc<CachedModuleMappings>>,
     /// 命中计数（诊断/测试用）。
     pub summary_hits: u64,
@@ -181,11 +370,16 @@ pub struct BuildCache {
     /// fresh build is touched before the next store, while untouched entries are precisely the best
     /// eviction candidates from the previous process.
     access_clock: u64,
-    path_access: HashMap<PathBuf, u64>,
     summary_access: HashMap<u64, u64>,
     body_access: HashMap<u128, u64>,
     retained_dependency_access: HashMap<u128, u64>,
     mapping_access: HashMap<u128, u64>,
+    /// Keys authored by this process since load. Store merges only this overlay into the latest
+    /// locked snapshot, so a stale writer cannot resurrect entries another writer evicted.
+    authored_summaries: HashSet<u64>,
+    authored_bodies: HashSet<u128>,
+    authored_retained_requests: HashSet<u128>,
+    authored_mappings: HashSet<u128>,
     /// 本次构建是否往缓存写过新条目。全命中（未变）时为 `false` → 跳过落盘，
     /// 免掉「重写 = 缓存体量」大小的磁盘 I/O（缓存文件常和 bundle 一样大）。
     dirty: bool,
@@ -197,88 +391,84 @@ impl BuildCache {
         BuildCache::default()
     }
 
-    /// 从磁盘加载。文件不存在 / 损坏 / schema 不符 → 返回空缓存（缓存永远可重建，容错优先）。
-    pub fn load(path: &Path) -> BuildCache {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let mut cache = Self::decode(&bytes).unwrap_or_default();
-                // Older Wake versions could leave an arbitrarily large monolithic file. Compact
-                // immediately so the next successful build commits it back under the current
-                // budget; cache misses remain a correctness-neutral fallback.
-                cache.compact(CacheLimits::default());
-                cache
+    /// Load a bounded schema-13 cache without collapsing normal misses, corruption, and I/O.
+    pub fn load(path: &Path) -> CacheLoadOutcome {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return CacheLoadOutcome::Missing;
             }
-            Err(_) => BuildCache::default(),
-        }
-    }
-
-    /// 原子落盘（临时文件 + rename，避开 Windows Defender 扫描锁；同 CLI 写产物的手法）。
-    pub fn store(&mut self, path: &Path) -> std::io::Result<()> {
-        self.compact(CacheLimits::default());
-        let bytes = self.encode();
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        let result = match std::fs::rename(&tmp, path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                std::fs::write(path, &bytes).map_err(|_| e)
-            }
+            Err(error) => return CacheLoadOutcome::Io(error),
         };
-        if result.is_ok() {
-            // `dirty` describes mutations since the last durable commit. Keeping it set after a
-            // successful store makes every later cache-hit build rewrite the complete cache file.
-            self.dirty = false;
-        }
-        result
+        load_open_file(file)
     }
 
-    /// 查询路径源码快照；配置变体不一致时视为 miss。
-    pub fn cached_source(&mut self, path: &Path, variant: u64) -> Option<CachedSource> {
-        let cached = self
-            .paths
-            .get(path)
-            .filter(|entry| entry.variant == variant)
-            .map(|entry| entry.cached.clone());
-        if cached.is_some() {
-            let access = self.next_access();
-            self.path_access.insert(path.to_path_buf(), access);
-        }
-        cached
+    /// Merge with the latest cache under an OS lock and atomically replace the durable file.
+    pub fn store(&mut self, path: &Path) -> Result<CacheStoreReport, CacheStoreError> {
+        self.store_inner(path, LOCK_WAIT_TIMEOUT, || Ok(()))
     }
 
-    /// 更新路径索引。内容完全相同时不置 dirty，避免全命中构建重写缓存文件。
-    pub fn put_source(
+    fn store_inner(
         &mut self,
         path: &Path,
-        stamp: FileStamp,
-        variant: u64,
-        content_key: u64,
-        source: &str,
-    ) {
-        let access = self.next_access();
-        self.path_access.insert(path.to_path_buf(), access);
-        let unchanged = self.paths.get(path).is_some_and(|entry| {
-            entry.variant == variant
-                && entry.cached.stamp == stamp
-                && entry.cached.content_key == content_key
-                && entry.cached.source.as_ref() == source
-        });
-        if unchanged {
-            return;
-        }
-        self.paths.insert(
-            path.to_path_buf(),
-            PathEntry {
-                variant,
-                cached: CachedSource {
-                    stamp,
-                    content_key,
-                    source: Arc::from(source),
-                },
-            },
-        );
-        self.dirty = true;
+        lock_timeout: Duration,
+        before_replace: impl FnOnce() -> io::Result<()>,
+    ) -> Result<CacheStoreReport, CacheStoreError> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::CreateDirectory, error))?;
+
+        let lock_path = companion_lock_path(path);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::OpenLock, error))?;
+        acquire_lock(&lock_file, lock_timeout)
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::Lock, error))?;
+
+        let mut report = CacheStoreReport::default();
+        let latest = match Self::load(path) {
+            CacheLoadOutcome::Loaded(cache) => *cache,
+            CacheLoadOutcome::Missing | CacheLoadOutcome::Incompatible { .. } => Self::new(),
+            CacheLoadOutcome::Corrupt(_) => {
+                report.repaired_corrupt_latest = true;
+                Self::new()
+            }
+            CacheLoadOutcome::Io(error) => {
+                return Err(CacheStoreError::io(CacheStoreStage::Reload, error));
+            }
+        };
+        let (mut committed, dropped_conflicts) = self.merge_with_latest(latest);
+        report.dropped_conflicts = dropped_conflicts;
+        committed.compact(CacheLimits::default());
+        let bytes = committed.encode().map_err(CacheStoreError::Encode)?;
+
+        let mut temporary = NamedTempFile::new_in(parent)
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::CreateTemporary, error))?;
+        temporary
+            .write_all(&bytes)
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::WriteTemporary, error))?;
+        temporary
+            .flush()
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::FlushTemporary, error))?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::SyncTemporary, error))?;
+        before_replace().map_err(|error| CacheStoreError::io(CacheStoreStage::Replace, error))?;
+        temporary
+            .persist(path)
+            .map_err(|error| CacheStoreError::io(CacheStoreStage::Replace, error.error))?;
+
+        committed.dirty = false;
+        *self = committed;
+        Ok(report)
     }
 
     /// 查模块摘要（命中计数 +1）。
@@ -297,6 +487,7 @@ impl BuildCache {
         self.summary_access.insert(content_key, access);
         if self.summaries.get(&content_key) != Some(&summary) {
             self.summaries.insert(content_key, summary);
+            self.authored_summaries.insert(content_key);
             self.dirty = true;
         }
     }
@@ -317,7 +508,8 @@ impl BuildCache {
         b
     }
 
-    pub fn put_body(&mut self, key: u128, body: Arc<String>) {
+    #[cfg(test)]
+    fn put_body(&mut self, key: u128, body: Arc<String>) {
         let access = self.next_access();
         self.body_access.insert(key, access);
         if self
@@ -326,32 +518,40 @@ impl BuildCache {
             .is_none_or(|current| current.as_str() != body.as_str())
         {
             self.bodies.insert(key, body);
+            self.authored_bodies.insert(key);
             self.dirty = true;
         }
     }
 
     /// Query optimizer-owned internal dependency edges by optimizer key (independent of body
     /// layout and source-map requests).
-    pub fn retained_module_ids(&mut self, key: u128) -> Option<Arc<Vec<u32>>> {
-        let ids = self.retained_module_ids.get(&key).cloned();
-        if ids.is_some() {
+    pub fn retained_requests(&mut self, key: u128) -> Option<Arc<Vec<CachedRetainedRequest>>> {
+        let requests = self.retained_requests.get(&key).cloned();
+        if requests.is_some() {
             self.retained_dependency_hits += 1;
             let access = self.next_access();
             self.retained_dependency_access.insert(key, access);
         }
-        ids
+        requests
     }
 
-    pub fn put_retained_module_ids(&mut self, key: u128, ids: Arc<Vec<u32>>) {
-        debug_assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    pub fn put_retained_requests(&mut self, key: u128, requests: Arc<Vec<CachedRetainedRequest>>) {
+        debug_assert!({
+            let mut seen = std::collections::HashSet::new();
+            requests.iter().all(|request| {
+                !request.specifier.is_empty()
+                    && seen.insert((request.specifier.as_str(), request.kind))
+            })
+        });
         let access = self.next_access();
         self.retained_dependency_access.insert(key, access);
         if self
-            .retained_module_ids
+            .retained_requests
             .get(&key)
-            .is_none_or(|current| current.as_ref() != ids.as_ref())
+            .is_none_or(|current| current.as_ref() != requests.as_ref())
         {
-            self.retained_module_ids.insert(key, ids);
+            self.retained_requests.insert(key, requests);
+            self.authored_retained_requests.insert(key);
             self.dirty = true;
         }
     }
@@ -367,7 +567,8 @@ impl BuildCache {
         mappings
     }
 
-    pub fn put_mappings(&mut self, key: u128, mappings: Arc<CachedModuleMappings>) {
+    #[cfg(test)]
+    fn put_mappings(&mut self, key: u128, mappings: Arc<CachedModuleMappings>) {
         let access = self.next_access();
         self.mapping_access.insert(key, access);
         if self
@@ -376,16 +577,127 @@ impl BuildCache {
             .is_none_or(|current| current.as_ref() != mappings.as_ref())
         {
             self.mappings.insert(key, mappings);
+            self.authored_mappings.insert(key);
+            self.dirty = true;
+        }
+    }
+
+    /// Commit one generated body and its provenance metadata as a single authored cache fact.
+    pub fn put_emission(
+        &mut self,
+        key: u128,
+        body: Arc<String>,
+        mappings: Arc<CachedModuleMappings>,
+    ) {
+        let access = self.next_access();
+        self.body_access.insert(key, access);
+        self.mapping_access.insert(key, access);
+        let changed = self
+            .bodies
+            .get(&key)
+            .is_none_or(|current| current.as_str() != body.as_str())
+            || self
+                .mappings
+                .get(&key)
+                .is_none_or(|current| current.as_ref() != mappings.as_ref());
+        if changed {
+            self.bodies.insert(key, body);
+            self.mappings.insert(key, mappings);
+            self.authored_bodies.insert(key);
+            self.authored_mappings.insert(key);
             self.dirty = true;
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
-            && self.summaries.is_empty()
+        self.summaries.is_empty()
             && self.bodies.is_empty()
-            && self.retained_module_ids.is_empty()
+            && self.retained_requests.is_empty()
             && self.mappings.is_empty()
+    }
+
+    fn merge_with_latest(&self, mut latest: BuildCache) -> (BuildCache, usize) {
+        let mut conflicts = 0;
+        merge_map(
+            &mut latest.summaries,
+            &self.summaries,
+            &self.authored_summaries,
+            &mut conflicts,
+        );
+        merge_map(
+            &mut latest.retained_requests,
+            &self.retained_requests,
+            &self.authored_retained_requests,
+            &mut conflicts,
+        );
+
+        let mut body_keys = BTreeSet::new();
+        body_keys.extend(self.authored_bodies.iter().copied());
+        body_keys.extend(self.authored_mappings.iter().copied());
+        for key in body_keys {
+            match merge_body_group(
+                latest.bodies.get(&key),
+                latest.mappings.get(&key),
+                self.authored_bodies
+                    .contains(&key)
+                    .then(|| self.bodies.get(&key))
+                    .flatten(),
+                self.authored_mappings
+                    .contains(&key)
+                    .then(|| self.mappings.get(&key))
+                    .flatten(),
+            ) {
+                Some((body, mappings)) => {
+                    if let Some(body) = body {
+                        latest.bodies.insert(key, body);
+                    } else {
+                        latest.bodies.remove(&key);
+                    }
+                    if let Some(mappings) = mappings {
+                        latest.mappings.insert(key, mappings);
+                    } else {
+                        latest.mappings.remove(&key);
+                    }
+                }
+                None => {
+                    latest.bodies.remove(&key);
+                    latest.mappings.remove(&key);
+                    conflicts += 1;
+                }
+            }
+        }
+
+        latest.access_clock = latest.access_clock.max(self.access_clock);
+        merge_access(&mut latest.summary_access, &self.summary_access);
+        merge_access(&mut latest.body_access, &self.body_access);
+        merge_access(
+            &mut latest.retained_dependency_access,
+            &self.retained_dependency_access,
+        );
+        merge_access(&mut latest.mapping_access, &self.mapping_access);
+        latest
+            .summary_access
+            .retain(|key, _| latest.summaries.contains_key(key));
+        latest
+            .body_access
+            .retain(|key, _| latest.bodies.contains_key(key));
+        latest
+            .retained_dependency_access
+            .retain(|key, _| latest.retained_requests.contains_key(key));
+        latest
+            .mapping_access
+            .retain(|key, _| latest.mappings.contains_key(key));
+
+        latest.summary_hits = self.summary_hits;
+        latest.body_hits = self.body_hits;
+        latest.retained_dependency_hits = self.retained_dependency_hits;
+        latest.mapping_hits = self.mapping_hits;
+        latest.authored_summaries.clear();
+        latest.authored_bodies.clear();
+        latest.authored_retained_requests.clear();
+        latest.authored_mappings.clear();
+        latest.dirty = true;
+        (latest, conflicts)
     }
 
     fn next_access(&mut self) -> u64 {
@@ -394,24 +706,24 @@ impl BuildCache {
     }
 
     fn estimated_size(&self) -> usize {
-        let paths = self
-            .paths
-            .iter()
-            .map(|(path, entry)| path.to_string_lossy().len() + entry.cached.source.len() + 64);
         let summaries = self.summaries.values().map(summary_estimated_size);
         let bodies = self.bodies.values().map(|body| body.len() + 32);
-        let retained_module_ids = self
-            .retained_module_ids
-            .values()
-            .map(|ids| ids.len() * std::mem::size_of::<u32>() + 32);
+        let retained_requests = self.retained_requests.values().map(|requests| {
+            requests
+                .iter()
+                .map(|request| {
+                    request.specifier.len() + std::mem::size_of::<CachedModuleRequestKind>()
+                })
+                .sum::<usize>()
+                + 32
+        });
         let mappings = self
             .mappings
             .values()
             .map(|mappings| cached_mappings_estimated_size(mappings));
-        paths
-            .chain(summaries)
+        summaries
             .chain(bodies)
-            .chain(retained_module_ids)
+            .chain(retained_requests)
             .chain(mappings)
             .sum::<usize>()
             + 64
@@ -423,39 +735,24 @@ impl BuildCache {
     fn compact(&mut self, limits: CacheLimits) {
         #[derive(Clone)]
         enum Key {
-            Path(PathBuf),
             Summary(u64),
-            Body(u128),
             RetainedDependencies(u128),
-            Mapping(u128),
+            Emission(u128),
         }
 
+        let mut emission_keys = BTreeSet::new();
+        emission_keys.extend(self.bodies.keys().copied());
+        emission_keys.extend(self.mappings.keys().copied());
         let mut candidates = Vec::with_capacity(
-            self.paths.len()
-                + self.summaries.len()
-                + self.bodies.len()
-                + self.retained_module_ids.len()
-                + self.mappings.len(),
+            self.summaries.len() + self.retained_requests.len() + emission_keys.len(),
         );
-        candidates.extend(self.paths.keys().map(|key| {
-            (
-                self.path_access.get(key).copied().unwrap_or(0),
-                Key::Path(key.clone()),
-            )
-        }));
         candidates.extend(self.summaries.keys().map(|&key| {
             (
                 self.summary_access.get(&key).copied().unwrap_or(0),
                 Key::Summary(key),
             )
         }));
-        candidates.extend(self.bodies.keys().map(|&key| {
-            (
-                self.body_access.get(&key).copied().unwrap_or(0),
-                Key::Body(key),
-            )
-        }));
-        candidates.extend(self.retained_module_ids.keys().map(|&key| {
+        candidates.extend(self.retained_requests.keys().map(|&key| {
             (
                 self.retained_dependency_access
                     .get(&key)
@@ -464,11 +761,16 @@ impl BuildCache {
                 Key::RetainedDependencies(key),
             )
         }));
-        candidates.extend(self.mappings.keys().map(|&key| {
-            (
-                self.mapping_access.get(&key).copied().unwrap_or(0),
-                Key::Mapping(key),
-            )
+        candidates.extend(emission_keys.into_iter().map(|key| {
+            let access = self
+                .body_access
+                .get(&key)
+                .into_iter()
+                .chain(self.mapping_access.get(&key))
+                .copied()
+                .max()
+                .unwrap_or(0);
+            (access, Key::Emission(key))
         }));
         // Oldest first. Tie-breakers do not affect correctness; stable key ordering makes retained
         // contents deterministic for a fixed cache state.
@@ -476,60 +778,64 @@ impl BuildCache {
             left.0
                 .cmp(&right.0)
                 .then_with(|| match (&left.1, &right.1) {
-                    (Key::Path(a), Key::Path(b)) => a.cmp(b),
                     (Key::Summary(a), Key::Summary(b)) => a.cmp(b),
-                    (Key::Body(a), Key::Body(b)) => a.cmp(b),
                     (Key::RetainedDependencies(a), Key::RetainedDependencies(b)) => a.cmp(b),
-                    (Key::Mapping(a), Key::Mapping(b)) => a.cmp(b),
-                    (Key::Path(_), _) => std::cmp::Ordering::Less,
+                    (Key::Emission(a), Key::Emission(b)) => a.cmp(b),
                     (Key::Summary(_), _) => std::cmp::Ordering::Less,
-                    (Key::Body(_), Key::RetainedDependencies(_) | Key::Mapping(_)) => {
-                        std::cmp::Ordering::Less
-                    }
-                    (Key::RetainedDependencies(_), Key::Mapping(_)) => std::cmp::Ordering::Less,
+                    (Key::RetainedDependencies(_), Key::Emission(_)) => std::cmp::Ordering::Less,
                     _ => std::cmp::Ordering::Greater,
                 })
         });
 
-        let mut entries = candidates.len();
+        let mut entries = self
+            .summaries
+            .len()
+            .saturating_add(self.bodies.len())
+            .saturating_add(self.retained_requests.len())
+            .saturating_add(self.mappings.len());
         let mut bytes = self.estimated_size();
         for (_, key) in candidates {
             if entries <= limits.max_entries && bytes <= limits.max_bytes {
                 break;
             }
-            let removed = match key {
-                Key::Path(key) => {
-                    self.path_access.remove(&key);
-                    self.paths
-                        .remove(&key)
-                        .map(|entry| key.to_string_lossy().len() + entry.cached.source.len() + 64)
-                }
+            let (removed_entries, removed_bytes) = match key {
                 Key::Summary(key) => {
                     self.summary_access.remove(&key);
-                    self.summaries
+                    let bytes = self
+                        .summaries
                         .remove(&key)
-                        .map(|entry| summary_estimated_size(&entry))
-                }
-                Key::Body(key) => {
-                    self.body_access.remove(&key);
-                    self.bodies.remove(&key).map(|entry| entry.len() + 32)
+                        .map_or(0, |entry| summary_estimated_size(&entry));
+                    (usize::from(bytes > 0), bytes)
                 }
                 Key::RetainedDependencies(key) => {
                     self.retained_dependency_access.remove(&key);
-                    self.retained_module_ids
-                        .remove(&key)
-                        .map(|entry| entry.len() * std::mem::size_of::<u32>() + 32)
+                    let bytes = self.retained_requests.remove(&key).map_or(0, |entry| {
+                        entry
+                            .iter()
+                            .map(|request| {
+                                request.specifier.len()
+                                    + std::mem::size_of::<CachedModuleRequestKind>()
+                            })
+                            .sum::<usize>()
+                            + 32
+                    });
+                    (usize::from(bytes > 0), bytes)
                 }
-                Key::Mapping(key) => {
+                Key::Emission(key) => {
+                    self.body_access.remove(&key);
                     self.mapping_access.remove(&key);
-                    self.mappings
-                        .remove(&key)
-                        .map(|entry| cached_mappings_estimated_size(&entry))
+                    let body = self.bodies.remove(&key);
+                    let mappings = self.mappings.remove(&key);
+                    let removed_entries =
+                        usize::from(body.is_some()) + usize::from(mappings.is_some());
+                    let removed_bytes = body.map_or(0, |entry| entry.len() + 32)
+                        + mappings.map_or(0, |entry| cached_mappings_estimated_size(&entry));
+                    (removed_entries, removed_bytes)
                 }
             };
-            if let Some(removed) = removed {
-                entries -= 1;
-                bytes = bytes.saturating_sub(removed);
+            if removed_entries > 0 {
+                entries = entries.saturating_sub(removed_entries);
+                bytes = bytes.saturating_sub(removed_bytes);
                 self.dirty = true;
             }
         }
@@ -537,129 +843,213 @@ impl BuildCache {
 
     // —— 编解码（手写小端二进制）——
 
-    fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(4096);
-        b.extend_from_slice(MAGIC);
-        put_u32(&mut b, SCHEMA);
-        // path index
-        put_u32(&mut b, self.paths.len() as u32);
-        for (path, entry) in &self.paths {
-            put_str(&mut b, &path.to_string_lossy());
-            put_u64(&mut b, entry.variant);
-            put_u64(&mut b, entry.cached.stamp.size);
-            put_u128(&mut b, entry.cached.stamp.modified_ns);
-            put_u64(&mut b, entry.cached.content_key);
-            put_str(&mut b, &entry.cached.source);
-        }
-        // summaries
-        put_u32(&mut b, self.summaries.len() as u32);
-        for (k, s) in &self.summaries {
-            put_u64(&mut b, *k);
-            put_u32(&mut b, s.deps.len() as u32);
-            for d in &s.deps {
-                put_str(&mut b, &d.specifier);
-                b.push(d.kind);
-                put_u32(&mut b, d.lo);
-                put_u32(&mut b, d.hi);
-            }
-            put_u32(&mut b, s.uses.len() as u32);
-            for u in &s.uses {
-                put_str(&mut b, &u.specifier);
-                b.push(u.all as u8);
-                b.push(u.reexport as u8);
-                put_u32(&mut b, u.names.len() as u32);
-                for n in &u.names {
-                    put_str(&mut b, n);
-                }
-            }
-            b.push(s.has_top_level_await as u8);
-            put_liveness(&mut b, &s.liveness);
-            b.push(s.concat_is_esm as u8);
-            b.push(s.concat_block_safe as u8);
-        }
-        // bodies
-        put_u32(&mut b, self.bodies.len() as u32);
-        for (k, body) in &self.bodies {
-            put_u128(&mut b, *k);
-            put_str(&mut b, body);
-        }
-        // optimizer-owned retained internal dependency targets
-        put_u32(&mut b, self.retained_module_ids.len() as u32);
-        for (key, ids) in &self.retained_module_ids {
-            put_u128(&mut b, *key);
-            put_u32(&mut b, ids.len() as u32);
-            for id in ids.iter() {
-                put_u32(&mut b, *id);
-            }
-        }
-        // source maps (kept separate so body-only builds do not require map entries)
-        put_u32(&mut b, self.mappings.len() as u32);
-        for (key, mappings) in &self.mappings {
-            put_u128(&mut b, *key);
-            put_u32(&mut b, mappings.mappings.len() as u32);
-            for mapping in &mappings.mappings {
-                put_u32(&mut b, mapping.gen_line);
-                put_u32(&mut b, mapping.gen_col);
-                put_u32(&mut b, mapping.src_index);
-                put_u32(&mut b, mapping.src_offset);
-                put_u32(&mut b, mapping.name_index.unwrap_or(u32::MAX));
-                b.push(mapping.is_unmapped as u8);
-            }
-            put_u32(&mut b, mappings.names.len() as u32);
-            for name in &mappings.names {
-                put_str(&mut b, name);
-            }
-            put_u32(&mut b, mappings.discarded_static_requests.len() as u32);
-            for request in &mappings.discarded_static_requests {
-                put_u32(&mut b, request.start);
-                put_u32(&mut b, request.end);
-                put_u32(&mut b, request.target_module_id);
-            }
-        }
-        b
+    fn encode(&self) -> Result<Vec<u8>, CacheEncodeError> {
+        let payload = self.encode_payload()?;
+        let payload_len = u64::try_from(payload.len())
+            .map_err(|_| CacheEncodeError::LengthOverflow("payload"))?;
+        let mut prefix = [0_u8; 16];
+        prefix[..4].copy_from_slice(MAGIC);
+        prefix[4..8].copy_from_slice(&SCHEMA.to_le_bytes());
+        prefix[8..16].copy_from_slice(&payload_len.to_le_bytes());
+        let checksum = envelope_checksum(&prefix, &payload);
+
+        let total = HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(CacheEncodeError::LengthOverflow("cache file"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|_| CacheEncodeError::AllocationFailed)?;
+        bytes.extend_from_slice(&prefix);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
     }
 
-    fn decode(bytes: &[u8]) -> Option<BuildCache> {
-        let mut c = Cursor { b: bytes, pos: 0 };
-        if c.take(4)? != MAGIC {
-            return None;
+    fn encode_payload(&self) -> Result<Vec<u8>, CacheEncodeError> {
+        if self
+            .bodies
+            .keys()
+            .any(|key| !self.mappings.contains_key(key))
+            || self
+                .mappings
+                .keys()
+                .any(|key| !self.bodies.contains_key(key))
+        {
+            return Err(CacheEncodeError::InvalidValue(
+                "incomplete body and mappings provenance",
+            ));
         }
-        if c.u32()? != SCHEMA {
-            return None; // schema 变更 → 忽略旧缓存
+        let top_entries = self
+            .summaries
+            .len()
+            .checked_add(self.bodies.len())
+            .and_then(|value| value.checked_add(self.retained_requests.len()))
+            .and_then(|value| value.checked_add(self.mappings.len()))
+            .ok_or(CacheEncodeError::LengthOverflow("top-level entries"))?;
+        if top_entries > MAX_CACHE_ENTRIES {
+            return Err(CacheEncodeError::BudgetExceeded("top-level entries"));
         }
+
+        let mut b = Vec::new();
+        b.try_reserve(4096)
+            .map_err(|_| CacheEncodeError::AllocationFailed)?;
+        let mut budget = EncodeBudget::default();
+
+        let summary_keys = sorted_keys(&self.summaries)?;
+        put_len(&mut b, summary_keys.len(), "summaries")?;
+        for key in summary_keys {
+            let summary = &self.summaries[&key];
+            put_u64(&mut b, key)?;
+            budget.claim_items(summary.deps.len())?;
+            put_len(&mut b, summary.deps.len(), "dependencies")?;
+            for dependency in &summary.deps {
+                if dependency.kind > 3 || dependency.lo > dependency.hi {
+                    return Err(CacheEncodeError::InvalidValue("dependency"));
+                }
+                put_str(&mut b, &dependency.specifier)?;
+                put_u8(&mut b, dependency.kind)?;
+                put_u32(&mut b, dependency.lo)?;
+                put_u32(&mut b, dependency.hi)?;
+            }
+            budget.claim_items(summary.uses.len())?;
+            put_len(&mut b, summary.uses.len(), "uses")?;
+            for usage in &summary.uses {
+                put_str(&mut b, &usage.specifier)?;
+                put_bool(&mut b, usage.all)?;
+                put_bool(&mut b, usage.reexport)?;
+                budget.claim_items(usage.names.len())?;
+                put_strings(&mut b, &usage.names)?;
+            }
+            put_bool(&mut b, summary.has_top_level_await)?;
+            put_liveness(&mut b, &summary.liveness, &mut budget)?;
+            put_bool(&mut b, summary.concat_is_esm)?;
+            put_bool(&mut b, summary.concat_block_safe)?;
+            put_bool(&mut b, summary.concat_observes_commonjs_bindings)?;
+        }
+
+        let body_keys = sorted_keys(&self.bodies)?;
+        put_len(&mut b, body_keys.len(), "bodies")?;
+        for key in body_keys {
+            put_u128(&mut b, key)?;
+            put_str(&mut b, &self.bodies[&key])?;
+        }
+
+        let retained_keys = sorted_keys(&self.retained_requests)?;
+        put_len(&mut b, retained_keys.len(), "retained requests")?;
+        for key in retained_keys {
+            let requests = &self.retained_requests[&key];
+            put_u128(&mut b, key)?;
+            budget.claim_items(requests.len())?;
+            put_len(&mut b, requests.len(), "retained request list")?;
+            let mut seen = HashSet::new();
+            seen.try_reserve(requests.len())
+                .map_err(|_| CacheEncodeError::AllocationFailed)?;
+            for request in requests.iter() {
+                if request.specifier.is_empty()
+                    || !seen.insert((request.specifier.as_str(), request.kind))
+                {
+                    return Err(CacheEncodeError::InvalidValue("retained request"));
+                }
+                put_str(&mut b, &request.specifier)?;
+                put_u8(&mut b, request.kind.as_u8())?;
+            }
+        }
+
+        let mapping_keys = sorted_keys(&self.mappings)?;
+        put_len(&mut b, mapping_keys.len(), "mapping entries")?;
+        for key in mapping_keys {
+            let module = &self.mappings[&key];
+            put_u128(&mut b, key)?;
+            budget.claim_items(module.mappings.len())?;
+            put_len(&mut b, module.mappings.len(), "mappings")?;
+            for mapping in &module.mappings {
+                if (!mapping.is_unmapped
+                    && mapping
+                        .name_index
+                        .is_some_and(|index| index as usize >= module.names.len()))
+                    || (mapping.is_unmapped && mapping.name_index.is_some())
+                {
+                    return Err(CacheEncodeError::InvalidValue("mapping name index"));
+                }
+                put_u32(&mut b, mapping.gen_line)?;
+                put_u32(&mut b, mapping.gen_col)?;
+                put_u32(&mut b, mapping.src_index)?;
+                put_u32(&mut b, mapping.src_offset)?;
+                put_u32(&mut b, mapping.name_index.unwrap_or(u32::MAX))?;
+                put_bool(&mut b, mapping.is_unmapped)?;
+            }
+            budget.claim_items(module.names.len())?;
+            put_strings(&mut b, &module.names)?;
+            budget.claim_items(module.generated_module_requests.len())?;
+            put_len(
+                &mut b,
+                module.generated_module_requests.len(),
+                "generated module requests",
+            )?;
+            if module
+                .generated_module_requests
+                .windows(2)
+                .any(|pair| pair[0].end > pair[1].start)
+                || module
+                    .generated_module_requests
+                    .iter()
+                    .any(|request| !valid_cached_module_request(request))
+                || !valid_cached_module_runtime_names(&module.runtime_names)
+                || !generated_requests_match_body(
+                    self.bodies.get(&key).map(|body| body.as_str()),
+                    &module.generated_module_requests,
+                )
+            {
+                return Err(CacheEncodeError::InvalidValue("module mappings"));
+            }
+            for request in &module.generated_module_requests {
+                put_u32(&mut b, request.start)?;
+                put_u32(&mut b, request.end)?;
+                put_str(&mut b, &request.specifier)?;
+                put_u8(&mut b, request.kind.as_u8())?;
+                put_u8(&mut b, request.role.as_u8())?;
+            }
+            put_str(&mut b, &module.runtime_names.module)?;
+            put_str(&mut b, &module.runtime_names.exports)?;
+            put_str(&mut b, &module.runtime_names.require)?;
+            let capabilities = &module.runtime_names.capabilities;
+            put_bool(&mut b, capabilities.meta_url)?;
+            put_bool(&mut b, capabilities.external_require)?;
+            put_bool(&mut b, capabilities.promise_resolve)?;
+            put_bool(&mut b, capabilities.object_assign)?;
+            put_bool(&mut b, capabilities.object_keys)?;
+            put_bool(&mut b, capabilities.object_define_property)?;
+            put_bool(&mut b, capabilities.runtime_import)?;
+            put_bool(&mut b, capabilities.shared)?;
+        }
+        Ok(b)
+    }
+
+    fn decode_payload(bytes: &[u8]) -> Result<BuildCache, CacheDecodeError> {
+        let mut c = Cursor::new(bytes);
         let mut cache = BuildCache::default();
-        let n_paths = c.u32()?;
-        for _ in 0..n_paths {
-            let path = PathBuf::from(c.str()?);
-            let variant = c.u64()?;
-            let stamp = FileStamp {
-                size: c.u64()?,
-                modified_ns: c.u128()?,
-            };
-            let content_key = c.u64()?;
-            let source: Arc<str> = Arc::from(c.str()?);
-            cache.paths.insert(
-                path,
-                PathEntry {
-                    variant,
-                    cached: CachedSource {
-                        stamp,
-                        content_key,
-                        source,
-                    },
-                },
-            );
-        }
-        let n_sum = c.u32()?;
-        for _ in 0..n_sum {
+
+        let summary_count = c.count()?;
+        c.reserve_map(&mut cache.summaries, summary_count, "summaries")?;
+        for _ in 0..summary_count {
             let key = c.u64()?;
-            let n_deps = c.u32()?;
-            let mut deps = Vec::with_capacity(n_deps as usize);
-            for _ in 0..n_deps {
+            let dependency_count = c.count()?;
+            let mut deps = c.vec_with_capacity(dependency_count, "dependencies")?;
+            for _ in 0..dependency_count {
                 let specifier = c.str()?;
                 let kind = c.u8()?;
+                if kind > 3 {
+                    return Err(CacheDecodeError::InvalidTag {
+                        field: "dependency kind",
+                        value: kind,
+                    });
+                }
                 let lo = c.u32()?;
                 let hi = c.u32()?;
+                if lo > hi {
+                    return Err(CacheDecodeError::InvalidValue("dependency span"));
+                }
                 deps.push(CachedDep {
                     specifier,
                     kind,
@@ -667,65 +1057,84 @@ impl BuildCache {
                     hi,
                 });
             }
-            let n_uses = c.u32()?;
-            let mut uses = Vec::with_capacity(n_uses as usize);
-            for _ in 0..n_uses {
-                let specifier = c.str()?;
-                let all = c.u8()? != 0;
-                let reexport = c.u8()? != 0;
-                let n_names = c.u32()?;
-                let mut names = Vec::with_capacity(n_names as usize);
-                for _ in 0..n_names {
-                    names.push(c.str()?);
-                }
+            let use_count = c.count()?;
+            let mut uses = c.vec_with_capacity(use_count, "uses")?;
+            for _ in 0..use_count {
                 uses.push(CachedUse {
-                    specifier,
-                    all,
-                    reexport,
-                    names,
+                    specifier: c.str()?,
+                    all: c.strict_bool("use all")?,
+                    reexport: c.strict_bool("use reexport")?,
+                    names: c.strings()?,
                 });
             }
-            let has_top_level_await = c.u8()? != 0;
-            let liveness = c.liveness()?;
-            let concat_is_esm = c.u8()? != 0;
-            let concat_block_safe = c.u8()? != 0;
-            cache.summaries.insert(
-                key,
-                ModuleSummary {
-                    deps,
-                    uses,
-                    has_top_level_await,
-                    liveness,
-                    concat_is_esm,
-                    concat_block_safe,
-                },
-            );
-        }
-        let n_bodies = c.u32()?;
-        for _ in 0..n_bodies {
-            let key = c.u128()?;
-            let body = c.str()?;
-            cache.bodies.insert(key, Arc::new(body));
-        }
-        let n_retained_dependency_entries = c.u32()?;
-        for _ in 0..n_retained_dependency_entries {
-            let key = c.u128()?;
-            let count = c.u32()?;
-            let mut ids = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                ids.push(c.u32()?);
+            let summary = ModuleSummary {
+                deps,
+                uses,
+                has_top_level_await: c.strict_bool("top-level await")?,
+                liveness: c.liveness()?,
+                concat_is_esm: c.strict_bool("concat esm")?,
+                concat_block_safe: c.strict_bool("concat block safety")?,
+                concat_observes_commonjs_bindings: c.strict_bool("concat CommonJS observation")?,
+            };
+            if cache.summaries.insert(key, summary).is_some() {
+                return Err(CacheDecodeError::DuplicateKey("summary"));
             }
-            if !ids.windows(2).all(|pair| pair[0] < pair[1]) {
-                return None;
-            }
-            cache.retained_module_ids.insert(key, Arc::new(ids));
         }
-        let n_mapping_entries = c.u32()?;
-        for _ in 0..n_mapping_entries {
+
+        let body_count = c.count()?;
+        c.reserve_map(&mut cache.bodies, body_count, "bodies")?;
+        for _ in 0..body_count {
             let key = c.u128()?;
-            let count = c.u32()?;
-            let mut mappings = Vec::with_capacity(count as usize);
-            for _ in 0..count {
+            let body = Arc::new(c.str()?);
+            if cache.bodies.insert(key, body).is_some() {
+                return Err(CacheDecodeError::DuplicateKey("body"));
+            }
+        }
+
+        let retained_count = c.count()?;
+        c.reserve_map(
+            &mut cache.retained_requests,
+            retained_count,
+            "retained request entries",
+        )?;
+        for _ in 0..retained_count {
+            let key = c.u128()?;
+            let request_count = c.count()?;
+            let mut requests = c.vec_with_capacity(request_count, "retained requests")?;
+            for _ in 0..request_count {
+                let specifier = c.str()?;
+                let value = c.u8()?;
+                let kind = CachedModuleRequestKind::from_u8(value).ok_or(
+                    CacheDecodeError::InvalidTag {
+                        field: "retained request kind",
+                        value,
+                    },
+                )?;
+                requests.push(CachedRetainedRequest { specifier, kind });
+            }
+            let mut seen = c.set_with_capacity(request_count, "retained request set")?;
+            if requests.iter().any(|request| {
+                request.specifier.is_empty()
+                    || !seen.insert((request.specifier.as_str(), request.kind))
+            }) {
+                return Err(CacheDecodeError::InvalidValue("retained request"));
+            }
+            if cache
+                .retained_requests
+                .insert(key, Arc::new(requests))
+                .is_some()
+            {
+                return Err(CacheDecodeError::DuplicateKey("retained request"));
+            }
+        }
+
+        let mapping_entry_count = c.count()?;
+        c.reserve_map(&mut cache.mappings, mapping_entry_count, "mapping entries")?;
+        for _ in 0..mapping_entry_count {
+            let key = c.u128()?;
+            let mapping_count = c.count()?;
+            let mut mappings = c.vec_with_capacity(mapping_count, "mappings")?;
+            for _ in 0..mapping_count {
                 mappings.push(CachedMapping {
                     gen_line: c.u32()?,
                     gen_col: c.u32()?,
@@ -735,23 +1144,54 @@ impl BuildCache {
                         u32::MAX => None,
                         index => Some(index),
                     },
-                    is_unmapped: c.u8()? != 0,
+                    is_unmapped: c.strict_bool("unmapped mapping")?,
                 });
             }
-            let name_count = c.u32()?;
-            let mut names = Vec::with_capacity(name_count as usize);
-            for _ in 0..name_count {
-                names.push(c.str()?);
-            }
-            let request_count = c.u32()?;
-            let mut discarded_static_requests = Vec::with_capacity(request_count as usize);
-            for _ in 0..request_count {
-                discarded_static_requests.push(CachedDiscardedStaticRequest {
-                    start: c.u32()?,
-                    end: c.u32()?,
-                    target_module_id: c.u32()?,
+            let names = c.strings()?;
+            let generated_count = c.count()?;
+            let mut generated_module_requests =
+                c.vec_with_capacity(generated_count, "generated module requests")?;
+            for _ in 0..generated_count {
+                let start = c.u32()?;
+                let end = c.u32()?;
+                let specifier = c.str()?;
+                let kind_value = c.u8()?;
+                let kind = CachedModuleRequestKind::from_u8(kind_value).ok_or(
+                    CacheDecodeError::InvalidTag {
+                        field: "generated request kind",
+                        value: kind_value,
+                    },
+                )?;
+                let role_value = c.u8()?;
+                let role = CachedModuleRequestRole::from_u8(role_value).ok_or(
+                    CacheDecodeError::InvalidTag {
+                        field: "generated request role",
+                        value: role_value,
+                    },
+                )?;
+                generated_module_requests.push(CachedModuleRequest {
+                    start,
+                    end,
+                    specifier,
+                    kind,
+                    role,
                 });
             }
+            let runtime_names = CachedModuleRuntimeNames {
+                module: c.str()?,
+                exports: c.str()?,
+                require: c.str()?,
+                capabilities: CachedModuleRuntimeCapabilities {
+                    meta_url: c.strict_bool("meta URL capability")?,
+                    external_require: c.strict_bool("external require capability")?,
+                    promise_resolve: c.strict_bool("Promise.resolve capability")?,
+                    object_assign: c.strict_bool("Object.assign capability")?,
+                    object_keys: c.strict_bool("Object.keys capability")?,
+                    object_define_property: c.strict_bool("Object.defineProperty capability")?,
+                    runtime_import: c.strict_bool("runtime import capability")?,
+                    shared: c.strict_bool("shared capability")?,
+                },
+            };
             if mappings.iter().any(|mapping| {
                 (!mapping.is_unmapped
                     && mapping
@@ -759,28 +1199,360 @@ impl BuildCache {
                         .is_some_and(|index| index as usize >= names.len()))
                     || (mapping.is_unmapped && mapping.name_index.is_some())
             }) {
-                return None;
+                return Err(CacheDecodeError::InvalidValue("mapping name index"));
             }
-            if discarded_static_requests
+            if generated_module_requests
                 .windows(2)
                 .any(|pair| pair[0].end > pair[1].start)
-                || discarded_static_requests
+                || generated_module_requests
                     .iter()
-                    .any(|request| request.start >= request.end)
+                    .any(|request| !valid_cached_module_request(request))
+                || !valid_cached_module_runtime_names(&runtime_names)
             {
-                return None;
+                return Err(CacheDecodeError::InvalidValue("module mappings"));
             }
-            cache.mappings.insert(
-                key,
-                Arc::new(CachedModuleMappings {
-                    mappings,
-                    names,
-                    discarded_static_requests,
-                }),
-            );
+            if cache
+                .mappings
+                .insert(
+                    key,
+                    Arc::new(CachedModuleMappings {
+                        mappings,
+                        names,
+                        generated_module_requests,
+                        runtime_names,
+                    }),
+                )
+                .is_some()
+            {
+                return Err(CacheDecodeError::DuplicateKey("mapping"));
+            }
         }
-        Some(cache)
+        if !c.is_eof() {
+            return Err(CacheDecodeError::TrailingBytes);
+        }
+        if cache
+            .bodies
+            .keys()
+            .any(|key| !cache.mappings.contains_key(key))
+            || cache.mappings.iter().any(|(key, mappings)| {
+                !cache.bodies.contains_key(key)
+                    || !generated_requests_match_body(
+                        cache.bodies.get(key).map(|body| body.as_str()),
+                        &mappings.generated_module_requests,
+                    )
+            })
+        {
+            return Err(CacheDecodeError::InvalidValue(
+                "body and mappings provenance",
+            ));
+        }
+        Ok(cache)
     }
+}
+
+fn load_open_file(mut file: File) -> CacheLoadOutcome {
+    let mut prefix = [0_u8; 8];
+    if let Err(error) = file.read_exact(&mut prefix) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            CacheLoadOutcome::Corrupt(CacheDecodeError::TruncatedHeader)
+        } else {
+            CacheLoadOutcome::Io(error)
+        };
+    }
+    if &prefix[..4] != MAGIC {
+        return CacheLoadOutcome::Corrupt(CacheDecodeError::InvalidMagic);
+    }
+    let schema = u32::from_le_bytes(prefix[4..8].try_into().expect("fixed schema bytes"));
+    if schema != SCHEMA {
+        return CacheLoadOutcome::Incompatible {
+            found_schema: schema,
+        };
+    }
+
+    let mut tail = [0_u8; HEADER_LEN - 8];
+    if let Err(error) = file.read_exact(&mut tail) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            CacheLoadOutcome::Corrupt(CacheDecodeError::TruncatedHeader)
+        } else {
+            CacheLoadOutcome::Io(error)
+        };
+    }
+    let declared = u64::from_le_bytes(tail[..8].try_into().expect("fixed payload length bytes"));
+    if declared > MAX_CACHE_BYTES as u64 {
+        return CacheLoadOutcome::Corrupt(CacheDecodeError::PayloadTooLarge {
+            declared,
+            maximum: MAX_CACHE_BYTES,
+        });
+    }
+    let payload_len = match usize::try_from(declared) {
+        Ok(length) => length,
+        Err(_) => {
+            return CacheLoadOutcome::Corrupt(CacheDecodeError::PayloadLengthOverflow);
+        }
+    };
+    let read_limit = match declared.checked_add(1) {
+        Some(limit) => limit,
+        None => return CacheLoadOutcome::Corrupt(CacheDecodeError::PayloadLengthOverflow),
+    };
+    let mut payload = Vec::new();
+    if payload
+        .try_reserve_exact(payload_len.saturating_add(1))
+        .is_err()
+    {
+        return CacheLoadOutcome::Corrupt(CacheDecodeError::AllocationFailed("payload"));
+    }
+    if let Err(error) = file.take(read_limit).read_to_end(&mut payload) {
+        return CacheLoadOutcome::Io(error);
+    }
+    if payload.len() < payload_len {
+        return CacheLoadOutcome::Corrupt(CacheDecodeError::PayloadLengthMismatch {
+            declared,
+            actual: payload.len(),
+        });
+    }
+    if payload.len() > payload_len {
+        return CacheLoadOutcome::Corrupt(CacheDecodeError::TrailingBytes);
+    }
+
+    let expected = u128::from_le_bytes(tail[8..].try_into().expect("fixed checksum bytes"));
+    let mut checksum_prefix = [0_u8; 16];
+    checksum_prefix[..8].copy_from_slice(&prefix);
+    checksum_prefix[8..].copy_from_slice(&tail[..8]);
+    if envelope_checksum(&checksum_prefix, &payload) != expected {
+        return CacheLoadOutcome::Corrupt(CacheDecodeError::ChecksumMismatch);
+    }
+    match BuildCache::decode_payload(&payload) {
+        Ok(cache) => CacheLoadOutcome::Loaded(Box::new(cache)),
+        Err(error) => CacheLoadOutcome::Corrupt(error),
+    }
+}
+
+fn envelope_checksum(prefix: &[u8; 16], payload: &[u8]) -> u128 {
+    let mut hasher = Xxh3::new();
+    hasher.update(prefix);
+    hasher.update(payload);
+    hasher.digest128()
+}
+
+fn companion_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
+fn acquire_lock(file: &File, timeout: Duration) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let error: io::Error = error.into();
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "timed out waiting for persistent cache lock",
+                    ));
+                }
+                thread::sleep(remaining.min(LOCK_RETRY_INTERVAL));
+            }
+        }
+    }
+}
+
+fn merge_map<K, V>(
+    latest: &mut HashMap<K, V>,
+    local: &HashMap<K, V>,
+    authored: &HashSet<K>,
+    conflicts: &mut usize,
+) where
+    K: Copy + Eq + std::hash::Hash,
+    V: Clone + PartialEq,
+{
+    for &key in authored {
+        let Some(local_value) = local.get(&key) else {
+            continue;
+        };
+        match latest.get(&key) {
+            Some(latest_value) if latest_value != local_value => {
+                latest.remove(&key);
+                *conflicts += 1;
+            }
+            Some(_) => {}
+            None => {
+                latest.insert(key, local_value.clone());
+            }
+        }
+    }
+}
+
+fn merge_access<K>(latest: &mut HashMap<K, u64>, local: &HashMap<K, u64>)
+where
+    K: Copy + Eq + std::hash::Hash,
+{
+    for (&key, &access) in local {
+        latest
+            .entry(key)
+            .and_modify(|current| *current = (*current).max(access))
+            .or_insert(access);
+    }
+}
+
+type BodyGroup = (Option<Arc<String>>, Option<Arc<CachedModuleMappings>>);
+
+fn merge_body_group(
+    latest_body: Option<&Arc<String>>,
+    latest_mappings: Option<&Arc<CachedModuleMappings>>,
+    local_body: Option<&Arc<String>>,
+    local_mappings: Option<&Arc<CachedModuleMappings>>,
+) -> Option<BodyGroup> {
+    if latest_body
+        .zip(local_body)
+        .is_some_and(|(latest, local)| latest != local)
+        || latest_mappings
+            .zip(local_mappings)
+            .is_some_and(|(latest, local)| latest != local)
+    {
+        return None;
+    }
+
+    let latest_complete = latest_body.is_some() && latest_mappings.is_some();
+    let local_complete = local_body.is_some() && local_mappings.is_some();
+    if latest_complete {
+        return Some((latest_body.cloned(), latest_mappings.cloned()));
+    }
+    if local_complete {
+        return Some((local_body.cloned(), local_mappings.cloned()));
+    }
+
+    let complementary = (latest_body.is_some()
+        && latest_mappings.is_none()
+        && local_body.is_none()
+        && local_mappings.is_some())
+        || (latest_body.is_none()
+            && latest_mappings.is_some()
+            && local_body.is_some()
+            && local_mappings.is_none());
+    if complementary {
+        return None;
+    }
+    Some((
+        local_body.cloned().or_else(|| latest_body.cloned()),
+        local_mappings.cloned().or_else(|| latest_mappings.cloned()),
+    ))
+}
+
+fn valid_cached_module_runtime_names(names: &CachedModuleRuntimeNames) -> bool {
+    is_safe_ascii_js_binding_identifier(&names.module)
+        && is_safe_ascii_js_binding_identifier(&names.exports)
+        && is_safe_ascii_js_binding_identifier(&names.require)
+        && names.module != names.exports
+        && names.module != names.require
+        && names.exports != names.require
+}
+
+fn is_safe_ascii_js_binding_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || matches!(first, b'_' | b'$'))
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+    {
+        return false;
+    }
+
+    // Module factories may be async and their body may establish strict mode. Keep the persistent
+    // boundary conservative by rejecting keywords and strict-mode restricted binding names.
+    !matches!(
+        name,
+        "arguments"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "eval"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "interface"
+            | "let"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+fn generated_requests_match_body(body: Option<&str>, requests: &[CachedModuleRequest]) -> bool {
+    if requests.is_empty() {
+        return true;
+    }
+    let Some(body) = body else {
+        return false;
+    };
+    let mut previous_end = 0usize;
+    for request in requests {
+        let start = request.start as usize;
+        let end = request.end as usize;
+        if start < previous_end || start >= end {
+            return false;
+        }
+        let Some(literal) = body.get(start..end) else {
+            return false;
+        };
+        let Some(target) = literal.parse::<u32>().ok() else {
+            return false;
+        };
+        if literal != target.to_string() || request.specifier.is_empty() {
+            return false;
+        }
+        previous_end = end;
+    }
+    true
+}
+
+fn valid_cached_module_request(request: &CachedModuleRequest) -> bool {
+    request.start < request.end
+        && !request.specifier.is_empty()
+        && (request.role != CachedModuleRequestRole::DiscardedStatic
+            || request.kind == CachedModuleRequestKind::StaticImport)
 }
 
 fn summary_estimated_size(summary: &ModuleSummary) -> usize {
@@ -843,114 +1615,355 @@ fn cached_mappings_estimated_size(mappings: &CachedModuleMappings) -> usize {
     mappings.mappings.len() * std::mem::size_of::<CachedMapping>()
         + mappings.names.iter().map(String::len).sum::<usize>()
         + mappings.names.len() * std::mem::size_of::<String>()
-        + mappings.discarded_static_requests.len()
-            * std::mem::size_of::<CachedDiscardedStaticRequest>()
+        + mappings.generated_module_requests.len() * std::mem::size_of::<CachedModuleRequest>()
+        + std::mem::size_of::<CachedModuleRuntimeNames>()
+        + mappings.runtime_names.module.len()
+        + mappings.runtime_names.exports.len()
+        + mappings.runtime_names.require.len()
+        + std::mem::size_of::<CachedModuleRuntimeCapabilities>()
         + 32
 }
 
 // —— 写原语 ——
-fn put_u32(b: &mut Vec<u8>, v: u32) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-fn put_u64(b: &mut Vec<u8>, v: u64) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-fn put_u128(b: &mut Vec<u8>, v: u128) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-fn put_str(b: &mut Vec<u8>, s: &str) {
-    put_u32(b, s.len() as u32);
-    b.extend_from_slice(s.as_bytes());
+
+#[derive(Default)]
+struct EncodeBudget {
+    items: usize,
 }
 
-fn put_strings(b: &mut Vec<u8>, values: &[String]) {
-    put_u32(b, values.len() as u32);
+impl EncodeBudget {
+    fn claim_items(&mut self, count: usize) -> Result<(), CacheEncodeError> {
+        self.items = self
+            .items
+            .checked_add(count)
+            .ok_or(CacheEncodeError::LengthOverflow("nested items"))?;
+        if self.items > MAX_CACHE_ITEMS {
+            return Err(CacheEncodeError::BudgetExceeded("nested items"));
+        }
+        Ok(())
+    }
+}
+
+fn sorted_keys<K, V>(map: &HashMap<K, V>) -> Result<Vec<K>, CacheEncodeError>
+where
+    K: Copy + Ord,
+{
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(map.len())
+        .map_err(|_| CacheEncodeError::AllocationFailed)?;
+    keys.extend(map.keys().copied());
+    keys.sort_unstable();
+    Ok(keys)
+}
+
+fn append_bytes(b: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CacheEncodeError> {
+    let next = b
+        .len()
+        .checked_add(bytes.len())
+        .ok_or(CacheEncodeError::LengthOverflow("payload"))?;
+    if next > MAX_CACHE_BYTES {
+        return Err(CacheEncodeError::BudgetExceeded("payload bytes"));
+    }
+    b.try_reserve(bytes.len())
+        .map_err(|_| CacheEncodeError::AllocationFailed)?;
+    b.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn put_u8(b: &mut Vec<u8>, value: u8) -> Result<(), CacheEncodeError> {
+    append_bytes(b, &[value])
+}
+
+fn put_bool(b: &mut Vec<u8>, value: bool) -> Result<(), CacheEncodeError> {
+    put_u8(b, u8::from(value))
+}
+
+fn put_u32(b: &mut Vec<u8>, value: u32) -> Result<(), CacheEncodeError> {
+    append_bytes(b, &value.to_le_bytes())
+}
+
+fn put_u64(b: &mut Vec<u8>, value: u64) -> Result<(), CacheEncodeError> {
+    append_bytes(b, &value.to_le_bytes())
+}
+
+fn put_u128(b: &mut Vec<u8>, value: u128) -> Result<(), CacheEncodeError> {
+    append_bytes(b, &value.to_le_bytes())
+}
+
+fn put_len(b: &mut Vec<u8>, length: usize, field: &'static str) -> Result<(), CacheEncodeError> {
+    let value = u32::try_from(length).map_err(|_| CacheEncodeError::LengthOverflow(field))?;
+    put_u32(b, value)
+}
+
+fn put_str(b: &mut Vec<u8>, value: &str) -> Result<(), CacheEncodeError> {
+    put_len(b, value.len(), "string")?;
+    append_bytes(b, value.as_bytes())
+}
+
+fn put_strings(b: &mut Vec<u8>, values: &[String]) -> Result<(), CacheEncodeError> {
+    put_len(b, values.len(), "string list")?;
     for value in values {
-        put_str(b, value);
+        put_str(b, value)?;
     }
+    Ok(())
 }
 
-fn put_liveness(b: &mut Vec<u8>, l: &CachedLiveness) {
-    put_u32(b, l.decls.len() as u32);
-    for (name, refs) in &l.decls {
-        put_str(b, name);
-        put_strings(b, refs);
+fn put_liveness(
+    b: &mut Vec<u8>,
+    liveness: &CachedLiveness,
+    budget: &mut EncodeBudget,
+) -> Result<(), CacheEncodeError> {
+    budget.claim_items(liveness.decls.len())?;
+    put_len(b, liveness.decls.len(), "liveness declarations")?;
+    for (name, references) in &liveness.decls {
+        put_str(b, name)?;
+        budget.claim_items(references.len())?;
+        put_strings(b, references)?;
     }
-    put_strings(b, &l.root_refs);
-    put_u32(b, l.named_imports.len() as u32);
-    for import in &l.named_imports {
-        put_str(b, &import.local);
-        put_str(b, &import.spec);
-        put_str(b, &import.imported);
+    budget.claim_items(liveness.root_refs.len())?;
+    put_strings(b, &liveness.root_refs)?;
+    budget.claim_items(liveness.named_imports.len())?;
+    put_len(b, liveness.named_imports.len(), "named imports")?;
+    for import in &liveness.named_imports {
+        put_str(b, &import.local)?;
+        put_str(b, &import.spec)?;
+        put_str(b, &import.imported)?;
     }
-    put_u32(b, l.namespace_imports.len() as u32);
-    for (local, spec) in &l.namespace_imports {
-        put_str(b, local);
-        put_str(b, spec);
+    budget.claim_items(liveness.namespace_imports.len())?;
+    put_len(b, liveness.namespace_imports.len(), "namespace imports")?;
+    for (local, specifier) in &liveness.namespace_imports {
+        put_str(b, local)?;
+        put_str(b, specifier)?;
     }
-    put_strings(b, &l.reexport_star);
-    put_u32(b, l.ns_reexports.len() as u32);
-    for (name, spec) in &l.ns_reexports {
-        put_str(b, name);
-        put_str(b, spec);
+    budget.claim_items(liveness.reexport_star.len())?;
+    put_strings(b, &liveness.reexport_star)?;
+    budget.claim_items(liveness.ns_reexports.len())?;
+    put_len(b, liveness.ns_reexports.len(), "namespace reexports")?;
+    for (name, specifier) in &liveness.ns_reexports {
+        put_str(b, name)?;
+        put_str(b, specifier)?;
     }
-    put_u32(b, l.reexport_named.len() as u32);
-    for (name, spec, imported) in &l.reexport_named {
-        put_str(b, name);
-        put_str(b, spec);
-        put_str(b, imported);
+    budget.claim_items(liveness.reexport_named.len())?;
+    put_len(b, liveness.reexport_named.len(), "named reexports")?;
+    for (name, specifier, imported) in &liveness.reexport_named {
+        put_str(b, name)?;
+        put_str(b, specifier)?;
+        put_str(b, imported)?;
     }
-    put_u32(b, l.exports.len() as u32);
-    for (name, local) in &l.exports {
-        put_str(b, name);
-        b.push(local.is_some() as u8);
+    budget.claim_items(liveness.exports.len())?;
+    put_len(b, liveness.exports.len(), "exports")?;
+    for (name, local) in &liveness.exports {
+        put_str(b, name)?;
+        put_bool(b, local.is_some())?;
         if let Some(local) = local {
-            put_str(b, local);
+            put_str(b, local)?;
         }
     }
+    Ok(())
 }
 
 // —— 读游标 ——
-struct Cursor<'a> {
-    b: &'a [u8],
-    pos: usize,
+
+#[derive(Default)]
+struct DecodeBudget {
+    entries: usize,
+    items: usize,
+    owned_bytes: usize,
 }
+
+impl DecodeBudget {
+    fn claim_entries(&mut self, count: usize) -> Result<(), CacheDecodeError> {
+        self.entries = self
+            .entries
+            .checked_add(count)
+            .ok_or(CacheDecodeError::BudgetExceeded("top-level entries"))?;
+        if self.entries > MAX_CACHE_ENTRIES {
+            return Err(CacheDecodeError::BudgetExceeded("top-level entries"));
+        }
+        Ok(())
+    }
+
+    fn claim_items(&mut self, count: usize) -> Result<(), CacheDecodeError> {
+        self.items = self
+            .items
+            .checked_add(count)
+            .ok_or(CacheDecodeError::BudgetExceeded("nested items"))?;
+        if self.items > MAX_CACHE_ITEMS {
+            return Err(CacheDecodeError::BudgetExceeded("nested items"));
+        }
+        Ok(())
+    }
+
+    fn claim_owned(&mut self, bytes: usize) -> Result<(), CacheDecodeError> {
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(bytes)
+            .ok_or(CacheDecodeError::BudgetExceeded("owned bytes"))?;
+        if self.owned_bytes > MAX_CACHE_OWNED_BYTES {
+            return Err(CacheDecodeError::BudgetExceeded("owned bytes"));
+        }
+        Ok(())
+    }
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    budget: DecodeBudget,
+}
+
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.b.get(self.pos..self.pos + n)?;
-        self.pos += n;
-        Some(s)
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            budget: DecodeBudget::default(),
+        }
     }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], CacheDecodeError> {
+        let end = self
+            .position
+            .checked_add(count)
+            .ok_or(CacheDecodeError::TruncatedPayload)?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(CacheDecodeError::TruncatedPayload)?;
+        self.position = end;
+        Ok(value)
     }
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+
+    fn is_eof(&self) -> bool {
+        self.position == self.bytes.len()
     }
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+
+    fn u8(&mut self) -> Result<u8, CacheDecodeError> {
+        Ok(self.take(1)?[0])
     }
-    fn u128(&mut self) -> Option<u128> {
-        Some(u128::from_le_bytes(self.take(16)?.try_into().ok()?))
+
+    fn strict_bool(&mut self, field: &'static str) -> Result<bool, CacheDecodeError> {
+        let value = self.u8()?;
+        match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(CacheDecodeError::InvalidTag { field, value }),
+        }
     }
-    fn str(&mut self) -> Option<String> {
-        let n = self.u32()? as usize;
-        let s = self.take(n)?;
-        String::from_utf8(s.to_vec()).ok()
+
+    fn u32(&mut self) -> Result<u32, CacheDecodeError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| CacheDecodeError::TruncatedPayload)?,
+        ))
     }
-    fn strings(&mut self) -> Option<Vec<String>> {
-        let n = self.u32()? as usize;
-        (0..n).map(|_| self.str()).collect()
+
+    fn u64(&mut self) -> Result<u64, CacheDecodeError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| CacheDecodeError::TruncatedPayload)?,
+        ))
     }
-    fn liveness(&mut self) -> Option<CachedLiveness> {
-        let decl_count = self.u32()? as usize;
-        let mut decls = Vec::with_capacity(decl_count);
-        for _ in 0..decl_count {
+
+    fn u128(&mut self) -> Result<u128, CacheDecodeError> {
+        Ok(u128::from_le_bytes(
+            self.take(16)?
+                .try_into()
+                .map_err(|_| CacheDecodeError::TruncatedPayload)?,
+        ))
+    }
+
+    fn count(&mut self) -> Result<usize, CacheDecodeError> {
+        usize::try_from(self.u32()?).map_err(|_| CacheDecodeError::PayloadLengthOverflow)
+    }
+
+    fn str(&mut self) -> Result<String, CacheDecodeError> {
+        let length = self.count()?;
+        self.budget.claim_owned(length)?;
+        let bytes = self.take(length)?;
+        let value = std::str::from_utf8(bytes).map_err(|_| CacheDecodeError::InvalidUtf8)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(length)
+            .map_err(|_| CacheDecodeError::AllocationFailed("string"))?;
+        owned.push_str(value);
+        Ok(owned)
+    }
+
+    fn vec_with_capacity<T>(
+        &mut self,
+        count: usize,
+        field: &'static str,
+    ) -> Result<Vec<T>, CacheDecodeError> {
+        self.budget.claim_items(count)?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(CacheDecodeError::BudgetExceeded("owned bytes"))?;
+        self.budget.claim_owned(bytes)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| CacheDecodeError::AllocationFailed(field))?;
+        Ok(values)
+    }
+
+    fn reserve_map<K, V>(
+        &mut self,
+        map: &mut HashMap<K, V>,
+        count: usize,
+        field: &'static str,
+    ) -> Result<(), CacheDecodeError>
+    where
+        K: Eq + std::hash::Hash,
+    {
+        self.budget.claim_entries(count)?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<(K, V)>())
+            .ok_or(CacheDecodeError::BudgetExceeded("owned bytes"))?;
+        self.budget.claim_owned(bytes)?;
+        map.try_reserve(count)
+            .map_err(|_| CacheDecodeError::AllocationFailed(field))
+    }
+
+    fn set_with_capacity<T>(
+        &mut self,
+        count: usize,
+        field: &'static str,
+    ) -> Result<HashSet<T>, CacheDecodeError>
+    where
+        T: Eq + std::hash::Hash,
+    {
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(CacheDecodeError::BudgetExceeded("owned bytes"))?;
+        self.budget.claim_owned(bytes)?;
+        let mut values = HashSet::new();
+        values
+            .try_reserve(count)
+            .map_err(|_| CacheDecodeError::AllocationFailed(field))?;
+        Ok(values)
+    }
+
+    fn strings(&mut self) -> Result<Vec<String>, CacheDecodeError> {
+        let count = self.count()?;
+        let mut values = self.vec_with_capacity(count, "string list")?;
+        for _ in 0..count {
+            values.push(self.str()?);
+        }
+        Ok(values)
+    }
+
+    fn liveness(&mut self) -> Result<CachedLiveness, CacheDecodeError> {
+        let declaration_count = self.count()?;
+        let mut decls = self.vec_with_capacity(declaration_count, "liveness declarations")?;
+        for _ in 0..declaration_count {
             decls.push((self.str()?, self.strings()?));
         }
         let root_refs = self.strings()?;
-        let import_count = self.u32()? as usize;
-        let mut named_imports = Vec::with_capacity(import_count);
+        let import_count = self.count()?;
+        let mut named_imports = self.vec_with_capacity(import_count, "named imports")?;
         for _ in 0..import_count {
             named_imports.push(CachedNamedImport {
                 local: self.str()?,
@@ -958,34 +1971,35 @@ impl<'a> Cursor<'a> {
                 imported: self.str()?,
             });
         }
-        let namespace_count = self.u32()? as usize;
-        let mut namespace_imports = Vec::with_capacity(namespace_count);
+        let namespace_count = self.count()?;
+        let mut namespace_imports = self.vec_with_capacity(namespace_count, "namespace imports")?;
         for _ in 0..namespace_count {
             namespace_imports.push((self.str()?, self.str()?));
         }
         let reexport_star = self.strings()?;
-        let ns_count = self.u32()? as usize;
-        let mut ns_reexports = Vec::with_capacity(ns_count);
-        for _ in 0..ns_count {
+        let namespace_reexport_count = self.count()?;
+        let mut ns_reexports =
+            self.vec_with_capacity(namespace_reexport_count, "namespace reexports")?;
+        for _ in 0..namespace_reexport_count {
             ns_reexports.push((self.str()?, self.str()?));
         }
-        let named_count = self.u32()? as usize;
-        let mut reexport_named = Vec::with_capacity(named_count);
-        for _ in 0..named_count {
+        let named_reexport_count = self.count()?;
+        let mut reexport_named = self.vec_with_capacity(named_reexport_count, "named reexports")?;
+        for _ in 0..named_reexport_count {
             reexport_named.push((self.str()?, self.str()?, self.str()?));
         }
-        let export_count = self.u32()? as usize;
-        let mut exports = Vec::with_capacity(export_count);
+        let export_count = self.count()?;
+        let mut exports = self.vec_with_capacity(export_count, "exports")?;
         for _ in 0..export_count {
             let name = self.str()?;
-            let local = if self.u8()? != 0 {
+            let local = if self.strict_bool("export local")? {
                 Some(self.str()?)
             } else {
                 None
             };
             exports.push((name, local));
         }
-        Some(CachedLiveness {
+        Ok(CachedLiveness {
             decls,
             root_refs,
             named_imports,
@@ -1001,6 +2015,64 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn envelope(payload: &[u8]) -> Vec<u8> {
+        let mut prefix = [0_u8; 16];
+        prefix[..4].copy_from_slice(MAGIC);
+        prefix[4..8].copy_from_slice(&SCHEMA.to_le_bytes());
+        prefix[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+        bytes.extend_from_slice(&prefix);
+        bytes.extend_from_slice(&envelope_checksum(&prefix, payload).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn load_bytes(bytes: &[u8]) -> CacheLoadOutcome {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        std::fs::write(&path, bytes).unwrap();
+        BuildCache::load(&path)
+    }
+
+    fn loaded(outcome: CacheLoadOutcome) -> BuildCache {
+        match outcome {
+            CacheLoadOutcome::Loaded(cache) => *cache,
+            other => panic!("expected loaded cache, got {other:?}"),
+        }
+    }
+
+    fn empty_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, 0).unwrap();
+        put_u32(&mut payload, 0).unwrap();
+        put_u32(&mut payload, 0).unwrap();
+        put_u32(&mut payload, 0).unwrap();
+        payload
+    }
+
+    fn put_empty_summary(payload: &mut Vec<u8>, key: u64) {
+        put_u64(payload, key).unwrap();
+        put_u32(payload, 0).unwrap();
+        put_u32(payload, 0).unwrap();
+        put_bool(payload, false).unwrap();
+        put_liveness(
+            payload,
+            &CachedLiveness::default(),
+            &mut EncodeBudget::default(),
+        )
+        .unwrap();
+        put_bool(payload, false).unwrap();
+        put_bool(payload, false).unwrap();
+        put_bool(payload, false).unwrap();
+    }
+
+    fn retained(specifier: &str, kind: CachedModuleRequestKind) -> CachedRetainedRequest {
+        CachedRetainedRequest {
+            specifier: specifier.into(),
+            kind,
+        }
+    }
 
     fn sample() -> BuildCache {
         let mut c = BuildCache::new();
@@ -1026,15 +2098,19 @@ mod tests {
                 },
                 concat_is_esm: true,
                 concat_block_safe: true,
+                concat_observes_commonjs_bindings: false,
             },
         );
         c.put_body(
             0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
-            Arc::new("exports.x = 1;".to_string()),
+            Arc::new("9;exports.x = 1;".to_string()),
         );
-        c.put_retained_module_ids(
+        c.put_retained_requests(
             0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
-            Arc::new(vec![2, 9]),
+            Arc::new(vec![
+                retained("./a.js", CachedModuleRequestKind::StaticImport),
+                retained("./z.js", CachedModuleRequestKind::Require),
+            ]),
         );
         c.put_mappings(
             0x1234_5678_9ABC_DEF0_1111_2222_3333_4444,
@@ -1058,22 +2134,23 @@ mod tests {
                     },
                 ],
                 names: vec!["descriptiveName".into()],
-                discarded_static_requests: vec![CachedDiscardedStaticRequest {
+                generated_module_requests: vec![CachedModuleRequest {
                     start: 0,
-                    end: 7,
-                    target_module_id: 9,
+                    end: 1,
+                    specifier: "./dep.js".into(),
+                    kind: CachedModuleRequestKind::StaticImport,
+                    role: CachedModuleRequestRole::DiscardedStatic,
                 }],
+                runtime_names: CachedModuleRuntimeNames {
+                    module: "$module".into(),
+                    exports: "_exports2".into(),
+                    require: "require$3".into(),
+                    capabilities: CachedModuleRuntimeCapabilities {
+                        meta_url: true,
+                        ..CachedModuleRuntimeCapabilities::default()
+                    },
+                },
             }),
-        );
-        c.put_source(
-            Path::new("src/index.js"),
-            FileStamp {
-                size: 19,
-                modified_ns: 42,
-            },
-            7,
-            0xDEAD_BEEF,
-            "export const x=1;",
         );
         c
     }
@@ -1081,8 +2158,14 @@ mod tests {
     #[test]
     fn roundtrip_encode_decode() {
         let c = sample();
-        let bytes = c.encode();
-        let mut back = BuildCache::decode(&bytes).expect("decode");
+        let bytes = c.encode().unwrap();
+        assert_eq!(&bytes[..4], MAGIC);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 13);
+        assert_eq!(
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize,
+            bytes.len() - HEADER_LEN
+        );
+        let mut back = loaded(load_bytes(&bytes));
         assert_eq!(
             back.summary(0xDEAD_BEEF).unwrap().deps[0].specifier,
             "./a.js"
@@ -1110,16 +2193,19 @@ mod tests {
             back.body(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
                 .as_deref()
                 .map(String::as_str),
-            Some("exports.x = 1;")
+            Some("9;exports.x = 1;")
         );
         assert!(back.body(0).is_none());
         assert_eq!(
-            back.retained_module_ids(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+            back.retained_requests(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
                 .expect("cached retained dependencies")
                 .as_slice(),
-            [2, 9]
+            [
+                retained("./a.js", CachedModuleRequestKind::StaticImport),
+                retained("./z.js", CachedModuleRequestKind::Require),
+            ]
         );
-        assert!(back.retained_module_ids(0).is_none());
+        assert!(back.retained_requests(0).is_none());
         assert_eq!(
             back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
                 .expect("cached mappings")
@@ -1142,30 +2228,44 @@ mod tests {
         assert_eq!(
             back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
                 .expect("cached mappings")
-                .discarded_static_requests,
-            [CachedDiscardedStaticRequest {
+                .generated_module_requests,
+            [CachedModuleRequest {
                 start: 0,
-                end: 7,
-                target_module_id: 9,
+                end: 1,
+                specifier: "./dep.js".into(),
+                kind: CachedModuleRequestKind::StaticImport,
+                role: CachedModuleRequestRole::DiscardedStatic,
             }]
         );
+        assert_eq!(
+            back.mappings(0x1234_5678_9ABC_DEF0_1111_2222_3333_4444)
+                .expect("cached mappings")
+                .runtime_names,
+            CachedModuleRuntimeNames {
+                module: "$module".into(),
+                exports: "_exports2".into(),
+                require: "require$3".into(),
+                capabilities: CachedModuleRuntimeCapabilities {
+                    meta_url: true,
+                    ..CachedModuleRuntimeCapabilities::default()
+                },
+            }
+        );
         assert!(back.mappings(0).is_none());
-        let source = back
-            .cached_source(Path::new("src/index.js"), 7)
-            .expect("path source");
-        assert_eq!(source.stamp.modified_ns, 42);
-        assert_eq!(source.content_key, 0xDEAD_BEEF);
-        assert_eq!(source.source.as_ref(), "export const x=1;");
-        assert!(back.cached_source(Path::new("src/index.js"), 8).is_none());
     }
 
     #[test]
-    fn bad_magic_or_schema_is_empty() {
-        assert!(BuildCache::decode(b"XXXX....").is_none());
-        // 正确 magic 但错 schema。
+    fn bad_magic_and_schema_have_distinct_outcomes() {
+        assert!(matches!(
+            load_bytes(b"XXXX................."),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::InvalidMagic)
+        ));
         let mut bytes = MAGIC.to_vec();
-        put_u32(&mut bytes, SCHEMA + 1);
-        assert!(BuildCache::decode(&bytes).is_none());
+        bytes.extend_from_slice(&(SCHEMA + 1).to_le_bytes());
+        assert!(matches!(
+            load_bytes(&bytes),
+            CacheLoadOutcome::Incompatible { found_schema } if found_schema == SCHEMA + 1
+        ));
     }
 
     #[test]
@@ -1174,7 +2274,7 @@ mod tests {
         let path = dir.join("wake_cache_roundtrip_test.bin");
         let mut cache = sample();
         cache.store(&path).unwrap();
-        let mut loaded = BuildCache::load(&path);
+        let mut loaded = loaded(BuildCache::load(&path));
         assert_eq!(loaded.summary(0xDEAD_BEEF).unwrap().deps[0].kind, 2);
         let _ = std::fs::remove_file(&path);
     }
@@ -1197,6 +2297,7 @@ mod tests {
         assert!(!cache.is_dirty());
 
         cache.put_body(99, Arc::new("changed".to_string()));
+        cache.put_mappings(99, Arc::new(CachedModuleMappings::default()));
         assert!(cache.is_dirty());
         cache.store(&path).unwrap();
         assert!(!cache.is_dirty());
@@ -1244,13 +2345,22 @@ mod tests {
         let mut cache = BuildCache::new();
         cache.put_body(7, Arc::new("body".into()));
         assert!(cache.body(7).is_some());
-        assert!(cache.retained_module_ids(7).is_none());
+        assert!(cache.retained_requests(7).is_none());
         assert!(cache.mappings(7).is_none());
 
-        cache.put_retained_module_ids(7, Arc::new(vec![2, 11]));
+        cache.put_retained_requests(
+            7,
+            Arc::new(vec![
+                retained("./a.js", CachedModuleRequestKind::StaticImport),
+                retained("./b.js", CachedModuleRequestKind::DynamicImport),
+            ]),
+        );
         assert_eq!(
-            cache.retained_module_ids(7).expect("edges").as_slice(),
-            [2, 11]
+            cache.retained_requests(7).expect("edges").as_slice(),
+            [
+                retained("./a.js", CachedModuleRequestKind::StaticImport),
+                retained("./b.js", CachedModuleRequestKind::DynamicImport),
+            ]
         );
 
         cache.put_mappings(
@@ -1275,7 +2385,8 @@ mod tests {
                     },
                 ],
                 names: vec!["original".into()],
-                discarded_static_requests: Vec::new(),
+                generated_module_requests: Vec::new(),
+                runtime_names: CachedModuleRuntimeNames::default(),
             }),
         );
         assert!(cache.body(7).is_some());
@@ -1286,8 +2397,598 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_generated_request_metadata_evicts_the_body_pair() {
+        let mut cache = BuildCache::new();
+        cache.put_body(7, Arc::new("x".into()));
+        cache.put_mappings(
+            7,
+            Arc::new(CachedModuleMappings {
+                generated_module_requests: vec![CachedModuleRequest {
+                    start: 0,
+                    end: 1,
+                    specifier: "./dep.js".into(),
+                    kind: CachedModuleRequestKind::StaticImport,
+                    role: CachedModuleRequestRole::Value,
+                }],
+                ..CachedModuleMappings::default()
+            }),
+        );
+
+        assert!(matches!(
+            cache.encode(),
+            Err(CacheEncodeError::InvalidValue("module mappings"))
+        ));
+    }
+
+    #[test]
+    fn module_runtime_names_default_to_canonical_bindings() {
+        assert_eq!(
+            CachedModuleRuntimeNames::default(),
+            CachedModuleRuntimeNames {
+                module: "module".into(),
+                exports: "exports".into(),
+                require: "__wake_require__".into(),
+                capabilities: CachedModuleRuntimeCapabilities::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_module_runtime_names_reject_the_persistent_cache() {
+        let malformed = [
+            CachedModuleRuntimeNames {
+                module: String::new(),
+                ..CachedModuleRuntimeNames::default()
+            },
+            CachedModuleRuntimeNames {
+                exports: "module".into(),
+                ..CachedModuleRuntimeNames::default()
+            },
+            CachedModuleRuntimeNames {
+                module: "1module".into(),
+                ..CachedModuleRuntimeNames::default()
+            },
+            CachedModuleRuntimeNames {
+                exports: "wake-exports".into(),
+                ..CachedModuleRuntimeNames::default()
+            },
+            CachedModuleRuntimeNames {
+                require: "请求".into(),
+                ..CachedModuleRuntimeNames::default()
+            },
+            CachedModuleRuntimeNames {
+                module: "class".into(),
+                ..CachedModuleRuntimeNames::default()
+            },
+        ];
+
+        for runtime_names in malformed {
+            let mut cache = BuildCache::new();
+            cache.put_emission(
+                7,
+                Arc::new("body".into()),
+                Arc::new(CachedModuleMappings {
+                    runtime_names,
+                    ..CachedModuleMappings::default()
+                }),
+            );
+            assert!(matches!(
+                cache.encode(),
+                Err(CacheEncodeError::InvalidValue("module mappings"))
+            ));
+        }
+    }
+
+    #[test]
+    fn discarded_static_role_requires_a_static_import_on_encode_and_decode() {
+        for kind in [
+            CachedModuleRequestKind::DynamicImport,
+            CachedModuleRequestKind::Require,
+        ] {
+            let mut cache = BuildCache::new();
+            cache.put_emission(
+                7,
+                Arc::new("0".into()),
+                Arc::new(CachedModuleMappings {
+                    generated_module_requests: vec![CachedModuleRequest {
+                        start: 0,
+                        end: 1,
+                        specifier: "role-kind-sentinel".into(),
+                        kind,
+                        role: CachedModuleRequestRole::DiscardedStatic,
+                    }],
+                    ..CachedModuleMappings::default()
+                }),
+            );
+            assert!(matches!(
+                cache.encode(),
+                Err(CacheEncodeError::InvalidValue("module mappings"))
+            ));
+        }
+
+        let mut cache = BuildCache::new();
+        cache.put_emission(
+            7,
+            Arc::new("0".into()),
+            Arc::new(CachedModuleMappings {
+                generated_module_requests: vec![CachedModuleRequest {
+                    start: 0,
+                    end: 1,
+                    specifier: "role-kind-sentinel".into(),
+                    kind: CachedModuleRequestKind::StaticImport,
+                    role: CachedModuleRequestRole::DiscardedStatic,
+                }],
+                ..CachedModuleMappings::default()
+            }),
+        );
+        let mut bytes = cache.encode().unwrap();
+        let sentinel = b"role-kind-sentinel";
+        let start = bytes
+            .windows(sentinel.len())
+            .position(|window| window == sentinel)
+            .expect("encoded request specifier");
+        let kind = start + sentinel.len();
+        assert_eq!(bytes[kind], CachedModuleRequestKind::StaticImport.as_u8());
+        assert_eq!(
+            bytes[kind + 1],
+            CachedModuleRequestRole::DiscardedStatic.as_u8()
+        );
+        bytes[kind] = CachedModuleRequestKind::DynamicImport.as_u8();
+        let mut checksum_prefix = [0_u8; 16];
+        checksum_prefix.copy_from_slice(&bytes[..16]);
+        let checksum = envelope_checksum(&checksum_prefix, &bytes[HEADER_LEN..]);
+        bytes[16..HEADER_LEN].copy_from_slice(&checksum.to_le_bytes());
+
+        assert!(matches!(
+            load_bytes(&bytes),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::InvalidValue("module mappings"))
+        ));
+    }
+
+    #[test]
+    fn runtime_capability_flags_use_strict_persistent_encodings() {
+        let mut valid_false = Cursor::new(&[0]);
+        assert_eq!(valid_false.strict_bool("test"), Ok(false));
+        let mut valid_true = Cursor::new(&[1]);
+        assert_eq!(valid_true.strict_bool("test"), Ok(true));
+        let mut malformed_bool = Cursor::new(&[2]);
+        assert!(matches!(
+            malformed_bool.strict_bool("test"),
+            Err(CacheDecodeError::InvalidTag {
+                field: "test",
+                value: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn checksum_rejects_a_valid_utf8_body_bit_flip() {
+        let mut bytes = sample().encode().unwrap();
+        let marker = b"exports.x";
+        let offset = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("body marker");
+        bytes[offset] = b'f';
+        assert!(matches!(
+            load_bytes(&bytes),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn deterministic_encoding_ignores_hash_map_insertion_order() {
+        fn build(order: &[u64]) -> BuildCache {
+            let mut cache = BuildCache::new();
+            for &key in order {
+                cache.put_summary(
+                    key,
+                    ModuleSummary {
+                        has_top_level_await: key % 2 == 0,
+                        ..ModuleSummary::default()
+                    },
+                );
+                cache.put_retained_requests(
+                    key as u128,
+                    Arc::new(vec![retained(
+                        &format!("./{key}.js"),
+                        CachedModuleRequestKind::StaticImport,
+                    )]),
+                );
+                cache.put_emission(
+                    key as u128,
+                    Arc::new(format!("body-{key}")),
+                    Arc::new(CachedModuleMappings::default()),
+                );
+            }
+            cache
+        }
+
+        assert_eq!(
+            build(&[3, 1, 2]).encode().unwrap(),
+            build(&[2, 1, 3]).encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn declared_and_semantic_trailing_bytes_are_rejected() {
+        let mut declared_trailing = envelope(&empty_payload());
+        declared_trailing.push(0);
+        assert!(matches!(
+            load_bytes(&declared_trailing),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::TrailingBytes)
+        ));
+
+        let mut payload = empty_payload();
+        payload.push(0);
+        assert!(matches!(
+            load_bytes(&envelope(&payload)),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn strict_decoder_rejects_invalid_bool_and_dependency_kind() {
+        let mut invalid_bool = Vec::new();
+        put_u32(&mut invalid_bool, 1).unwrap();
+        put_u64(&mut invalid_bool, 7).unwrap();
+        put_u32(&mut invalid_bool, 0).unwrap();
+        put_u32(&mut invalid_bool, 0).unwrap();
+        put_u8(&mut invalid_bool, 2).unwrap();
+        assert!(matches!(
+            load_bytes(&envelope(&invalid_bool)),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::InvalidTag {
+                field: "top-level await",
+                value: 2
+            })
+        ));
+
+        let mut invalid_kind = Vec::new();
+        put_u32(&mut invalid_kind, 1).unwrap();
+        put_u64(&mut invalid_kind, 7).unwrap();
+        put_u32(&mut invalid_kind, 1).unwrap();
+        put_str(&mut invalid_kind, "./dep.js").unwrap();
+        put_u8(&mut invalid_kind, 4).unwrap();
+        put_u32(&mut invalid_kind, 0).unwrap();
+        put_u32(&mut invalid_kind, 1).unwrap();
+        assert!(matches!(
+            load_bytes(&envelope(&invalid_kind)),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::InvalidTag {
+                field: "dependency kind",
+                value: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_top_level_keys_are_corrupt() {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, 2).unwrap();
+        put_empty_summary(&mut payload, 9);
+        put_empty_summary(&mut payload, 9);
+        put_u32(&mut payload, 0).unwrap();
+        put_u32(&mut payload, 0).unwrap();
+        put_u32(&mut payload, 0).unwrap();
+        assert!(matches!(
+            load_bytes(&envelope(&payload)),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::DuplicateKey("summary"))
+        ));
+    }
+
+    #[test]
+    fn aggregate_budget_and_cursor_overflow_fail_without_allocating() {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, u32::MAX).unwrap();
+        assert!(matches!(
+            load_bytes(&envelope(&payload)),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::BudgetExceeded("top-level entries"))
+        ));
+
+        let mut cursor = Cursor {
+            bytes: &[],
+            position: usize::MAX,
+            budget: DecodeBudget::default(),
+        };
+        assert_eq!(cursor.take(1), Err(CacheDecodeError::TruncatedPayload));
+
+        let mut nested = Vec::new();
+        put_u32(&mut nested, 1).unwrap();
+        put_u64(&mut nested, 1).unwrap();
+        put_u32(&mut nested, u32::MAX).unwrap();
+        assert!(matches!(
+            load_bytes(&envelope(&nested)),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::BudgetExceeded("nested items"))
+        ));
+    }
+
+    #[test]
+    fn oversized_declared_payload_is_rejected_before_reading_it() {
+        let mut prefix = [0_u8; HEADER_LEN];
+        prefix[..4].copy_from_slice(MAGIC);
+        prefix[4..8].copy_from_slice(&SCHEMA.to_le_bytes());
+        prefix[8..16].copy_from_slice(&((MAX_CACHE_BYTES as u64) + 1).to_le_bytes());
+        assert!(matches!(
+            load_bytes(&prefix),
+            CacheLoadOutcome::Corrupt(CacheDecodeError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_writers_merge_only_authored_disjoint_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut seed = BuildCache::new();
+        seed.put_summary(1, ModuleSummary::default());
+        seed.store(&path).unwrap();
+
+        let mut first = loaded(BuildCache::load(&path));
+        let mut second = loaded(BuildCache::load(&path));
+        first.put_summary(
+            2,
+            ModuleSummary {
+                has_top_level_await: true,
+                ..ModuleSummary::default()
+            },
+        );
+        second.put_summary(
+            3,
+            ModuleSummary {
+                concat_is_esm: true,
+                ..ModuleSummary::default()
+            },
+        );
+        first.store(&path).unwrap();
+        second.store(&path).unwrap();
+
+        let mut merged = loaded(BuildCache::load(&path));
+        assert!(merged.summary(1).is_some());
+        assert!(merged.summary(2).is_some());
+        assert!(merged.summary(3).is_some());
+    }
+
+    #[test]
+    fn concurrent_writers_are_serialized_by_the_companion_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut seed = BuildCache::new();
+        seed.put_summary(1, ModuleSummary::default());
+        seed.store(&path).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writers = [2_u64, 3].map(|key| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut cache = loaded(BuildCache::load(&path));
+                cache.put_summary(
+                    key,
+                    ModuleSummary {
+                        has_top_level_await: key == 2,
+                        concat_is_esm: key == 3,
+                        ..ModuleSummary::default()
+                    },
+                );
+                barrier.wait();
+                cache.store(&path).unwrap();
+            })
+        });
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let mut merged = loaded(BuildCache::load(&path));
+        assert!(merged.summary(1).is_some());
+        assert!(merged.summary(2).is_some());
+        assert!(merged.summary(3).is_some());
+    }
+
+    #[test]
+    fn held_companion_lock_times_out_without_replacing_or_committing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut seed = BuildCache::new();
+        seed.put_summary(1, ModuleSummary::default());
+        seed.store(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let mut writer = loaded(BuildCache::load(&path));
+        writer.put_summary(
+            2,
+            ModuleSummary {
+                has_top_level_await: true,
+                ..ModuleSummary::default()
+            },
+        );
+        let held_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(companion_lock_path(&path))
+            .unwrap();
+        held_lock.lock().unwrap();
+
+        let started = Instant::now();
+        let error = writer
+            .store_inner(&path, Duration::from_millis(40), || Ok(()))
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            error,
+            CacheStoreError::Io {
+                stage: CacheStoreStage::Lock,
+                source,
+            } if source.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(writer.is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_resurrect_a_conflict_removed_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut seed = BuildCache::new();
+        seed.put_summary(1, ModuleSummary::default());
+        seed.store(&path).unwrap();
+
+        let mut remover = loaded(BuildCache::load(&path));
+        let mut stale = loaded(BuildCache::load(&path));
+        remover.put_summary(
+            1,
+            ModuleSummary {
+                has_top_level_await: true,
+                ..ModuleSummary::default()
+            },
+        );
+        assert_eq!(remover.store(&path).unwrap().dropped_conflicts, 1);
+        stale.put_summary(2, ModuleSummary::default());
+        stale.store(&path).unwrap();
+
+        let mut merged = loaded(BuildCache::load(&path));
+        assert!(merged.summary(1).is_none());
+        assert!(merged.summary(2).is_some());
+    }
+
+    #[test]
+    fn body_and_mapping_conflicts_or_complementary_halves_drop_the_group() {
+        let mut latest = BuildCache::new();
+        latest.put_body(7, Arc::new("latest".into()));
+        let mut local = BuildCache::new();
+        local.put_mappings(7, Arc::new(CachedModuleMappings::default()));
+        let (merged, conflicts) = local.merge_with_latest(latest);
+        assert_eq!(conflicts, 1);
+        assert!(!merged.bodies.contains_key(&7));
+        assert!(!merged.mappings.contains_key(&7));
+
+        let mut latest = BuildCache::new();
+        latest.put_emission(
+            8,
+            Arc::new("one".into()),
+            Arc::new(CachedModuleMappings::default()),
+        );
+        let mut local = BuildCache::new();
+        local.put_emission(
+            8,
+            Arc::new("two".into()),
+            Arc::new(CachedModuleMappings::default()),
+        );
+        let (merged, conflicts) = local.merge_with_latest(latest);
+        assert_eq!(conflicts, 1);
+        assert!(!merged.bodies.contains_key(&8));
+        assert!(!merged.mappings.contains_key(&8));
+    }
+
+    #[test]
+    fn corrupt_latest_is_repaired_by_atomic_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/cache.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"corrupt").unwrap();
+        let mut cache = sample();
+        let report = cache.store(&path).unwrap();
+        assert!(report.repaired_corrupt_latest);
+        assert!(!cache.is_dirty());
+        assert!(matches!(
+            BuildCache::load(&path),
+            CacheLoadOutcome::Loaded(_)
+        ));
+        assert!(companion_lock_path(&path).is_file());
+    }
+
+    #[test]
+    fn encode_failure_preserves_old_file_and_dirty_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut baseline = sample();
+        baseline.store(&path).unwrap();
+        let old = std::fs::read(&path).unwrap();
+
+        let mut invalid = loaded(BuildCache::load(&path));
+        invalid.put_summary(
+            99,
+            ModuleSummary {
+                deps: vec![CachedDep {
+                    specifier: "./bad.js".into(),
+                    kind: 9,
+                    lo: 0,
+                    hi: 1,
+                }],
+                ..ModuleSummary::default()
+            },
+        );
+        assert!(matches!(
+            invalid.store(&path),
+            Err(CacheStoreError::Encode(CacheEncodeError::InvalidValue(
+                "dependency"
+            )))
+        ));
+        assert!(invalid.is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
+
+    #[test]
+    fn failure_after_sync_before_replace_preserves_old_file_and_dirty_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut baseline = sample();
+        baseline.store(&path).unwrap();
+        let old = std::fs::read(&path).unwrap();
+
+        let mut changed = loaded(BuildCache::load(&path));
+        changed.put_summary(99, ModuleSummary::default());
+        let error = changed
+            .store_inner(&path, LOCK_WAIT_TIMEOUT, || {
+                Err(io::Error::other("injected before replace"))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CacheStoreError::Io {
+                stage: CacheStoreStage::Replace,
+                ..
+            }
+        ));
+        assert!(changed.is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
+
+    #[test]
+    fn emission_compaction_is_atomic() {
+        let mut cache = BuildCache::new();
+        for key in 0..3 {
+            cache.put_emission(
+                key,
+                Arc::new(format!("body-{key}")),
+                Arc::new(CachedModuleMappings::default()),
+            );
+        }
+        assert!(cache.body(0).is_some());
+        assert!(cache.mappings(0).is_some());
+        cache.compact(CacheLimits {
+            max_bytes: usize::MAX,
+            max_entries: 2,
+        });
+        assert_eq!(cache.bodies.len(), 1);
+        assert_eq!(cache.mappings.len(), 1);
+        assert_eq!(
+            cache.bodies.keys().copied().collect::<BTreeSet<_>>(),
+            cache.mappings.keys().copied().collect()
+        );
+        assert!(cache.bodies.contains_key(&0));
+    }
+
+    #[test]
     fn missing_file_is_empty() {
-        let loaded = BuildCache::load(Path::new("does/not/exist.bin"));
-        assert!(loaded.is_empty());
+        assert!(matches!(
+            BuildCache::load(Path::new("does/not/exist.bin")),
+            CacheLoadOutcome::Missing
+        ));
+    }
+
+    #[test]
+    fn directory_load_is_an_io_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            BuildCache::load(directory.path()),
+            CacheLoadOutcome::Io(_)
+        ));
     }
 }
