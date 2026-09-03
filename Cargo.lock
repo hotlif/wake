@@ -4227,6 +4227,7 @@ dependencies = [
  "wake_ecma_parser",
  "wake_ecma_semantic",
  "wake_ecma_transform",
+ "wake_federation_contract",
  "wake_graph",
  "wake_resolver",
  "wake_turbo",

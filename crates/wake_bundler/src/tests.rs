@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use wake_common::{MemoryFileSystem, OsFileSystem};
+use wake_common::{Diagnostic, MemoryFileSystem, OsFileSystem, Severity};
 use wake_ecma_transform::TargetEnv;
 
-use crate::{BuildPlatform, Bundler, IncrementalBundler, ModuleFormat};
+use crate::{BuildOutput, BuildPlatform, Bundler, IncrementalBundler, ModuleFormat};
 
 /// 一个多模块 ESM fixture：index 依赖 math + msg。
 fn fixture() -> MemoryFileSystem {
@@ -20,6 +20,14 @@ fn fixture() -> MemoryFileSystem {
         ("src/math.js", "export function add(a, b) { return a + b; }"),
         ("src/msg.js", "export default 'hello';"),
     ])
+}
+
+fn wake_cache_diagnostics(output: &BuildOutput) -> Vec<&Diagnostic> {
+    output
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code.as_deref() == Some("WAKE_CACHE"))
+        .collect()
 }
 
 #[test]
@@ -37,7 +45,7 @@ fn bundles_multi_module_esm() {
     assert!(out.bundle.contains("function add(a, b)"), "{}", out.bundle);
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"add\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"add\"")
     );
     assert!(
         out.bundle
@@ -45,11 +53,11 @@ fn bundles_multi_module_esm() {
     );
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"default\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"default\"")
     );
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"result\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"result\"")
     );
 }
 
@@ -68,7 +76,7 @@ fn incremental_bundles_correctly() {
     assert!(out.bundle.contains("function add(a, b)"), "{}", out.bundle);
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"add\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"add\"")
     );
     assert!(
         out.bundle
@@ -76,12 +84,48 @@ fn incremental_bundles_correctly() {
     );
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"default\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"default\"")
     );
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"result\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"result\"")
     );
+}
+
+#[test]
+fn retained_rebuild_replans_export_star_names_after_a_source_edit() {
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import * as barrel from './barrel.js'; export const result = Object.keys(barrel).sort().join(',');",
+        ),
+        ("src/barrel.js", "export * from './values.js';"),
+        (
+            "src/values.js",
+            "export const value = 'value'; export const sibling = 'sibling';",
+        ),
+    ]));
+    let mut retained = IncrementalBundler::new(fs.clone());
+    retained.enable_tree_shaking().enable_minify();
+    let first = retained.build(Path::new("src/index.js"));
+    assert!(!first.has_errors(), "{:?}", first.diagnostics);
+
+    fs.insert(
+        "src/values.js",
+        b"export const value = 'value'; export const sibling = 'sibling'; export const late = 'late';"
+            .to_vec(),
+    );
+    retained.invalidate_paths(&[PathBuf::from("src/values.js")], false);
+    let rebuilt = retained.build(Path::new("src/index.js"));
+    assert!(!rebuilt.has_errors(), "{:?}", rebuilt.diagnostics);
+    assert_ne!(rebuilt.bundle, first.bundle);
+    assert!(rebuilt.bundle.contains("\"late\""), "{}", rebuilt.bundle);
+
+    let mut fresh = IncrementalBundler::new(fs);
+    fresh.enable_tree_shaking().enable_minify();
+    let fresh = fresh.build(Path::new("src/index.js"));
+    assert!(!fresh.has_errors(), "{:?}", fresh.diagnostics);
+    assert_eq!(rebuilt.bundle, fresh.bundle);
 }
 
 #[test]
@@ -178,12 +222,12 @@ fn minify_emits_live_getters_for_identifier_export_names() {
     assert!(
         output
             .bundle
-            .contains("Object.defineProperty($,\"answer\",{enumerable:!0,get:function(){return"),
+            .contains("__wake_require__.objectDefineProperty(exports,\"answer\",{enumerable:!0,get:function(){return"),
         "{}",
         output.bundle
     );
     assert!(
-        !output.bundle.contains("$[\"answer\"]"),
+        !output.bundle.contains("exports[\"answer\"]"),
         "{}",
         output.bundle
     );
@@ -223,6 +267,24 @@ fn minified_single_chunk_runtime_omits_the_unused_registry_temporary() {
         !output.bundle.contains("var _m={};return function"),
         "a one-module bundle must not emit an unreachable empty concat factory:\n{}",
         output.bundle
+    );
+}
+
+#[test]
+fn minify_preserves_a_missing_entry_diagnostic_without_allocating_a_concat_factory() {
+    let mut bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::new()));
+    bundler.enable_minify();
+
+    let output = bundler.build(Path::new("src/missing.js"));
+
+    assert!(output.has_errors());
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0300")),
+        "{:?}",
+        output.diagnostics
     );
 }
 
@@ -322,25 +384,33 @@ fn minify_only_mangles_proven_local_properties_and_class_private_names() {
 }
 
 #[test]
-fn minify_owned_corpus_never_grows_and_improves_in_aggregate() {
+fn minify_owned_corpus_stays_within_structured_runtime_baseline() {
+    // ADR0033 moved compiler-owned Object operations behind an explicit runtime capability. The
+    // per-body member calls and one capability installation add bytes to small ESM fixtures, while
+    // deleting the unconditional legacy interop helpers and other optimizer wins offset part of
+    // that cost. Keep both baselines visible so a future size change has to explain its direction:
+    // constants +53, control_flow +24, closure +63, large_module_names -35; aggregate +105 bytes.
     let cases = [
         (
             "constants",
             "const folded = 1 + 2 * 3; const unused = 9; export const result = folded;"
                 .to_string(),
             489usize,
+            542usize,
         ),
         (
             "control_flow",
             "function choose(flag) { if (flag) return 10; return 20; } export const result = choose(true);"
                 .to_string(),
             515,
+            539,
         ),
         (
             "closure",
             "function outer(longArgument) { const capturedValue = longArgument + 1; return function inner(secondLongArgument) { return capturedValue + secondLongArgument; }; } export const result = outer(2)(3);"
                 .to_string(),
             546,
+            609,
         ),
         (
             "large_module_names",
@@ -349,28 +419,32 @@ fn minify_owned_corpus_never_grows_and_improves_in_aggregate() {
                 "x".repeat(5000)
             ),
             613,
+            578,
         ),
     ];
 
-    let legacy_total: usize = cases.iter().map(|(_, _, size)| size).sum();
+    let legacy_total: usize = cases.iter().map(|(_, _, legacy, _)| legacy).sum();
+    let structured_total: usize = cases.iter().map(|(_, _, _, structured)| structured).sum();
     let mut optimized_total = 0usize;
-    for (name, source, legacy_size) in cases {
+    for (name, source, legacy_size, structured_size) in cases {
         let fs = MemoryFileSystem::from_files([("src/index.js", source)]);
         let mut bundler = IncrementalBundler::new(Arc::new(fs));
         bundler.enable_minify();
         let output = bundler.build(Path::new("src/index.js"));
         assert!(!output.has_errors(), "{:?}", output.diagnostics);
         assert!(
-            output.bundle.len() <= legacy_size,
-            "{name} grew from {legacy_size} to {} bytes:\n{}",
+            output.bundle.len() <= structured_size,
+            "{name} exceeded its structured-runtime ceiling {structured_size} (legacy={legacy_size}, delta={:+}) with {} bytes:\n{}",
+            structured_size as isize - legacy_size as isize,
             output.bundle.len(),
             output.bundle
         );
         optimized_total += output.bundle.len();
     }
+    assert_eq!(structured_total as isize - legacy_total as isize, 105);
     assert!(
-        optimized_total < legacy_total,
-        "owned corpus must shrink in aggregate: legacy={legacy_total}, optimized={optimized_total}"
+        optimized_total <= structured_total,
+        "owned corpus exceeded structured runtime baseline: legacy={legacy_total}, structured={structured_total}, optimized={optimized_total}"
     );
 }
 
@@ -785,7 +859,7 @@ fn default_bundle_lowers_import_meta_for_classic_script_chunks() {
     assert!(!out.bundle.contains("import.meta"), "{}", out.bundle);
     assert!(
         out.bundle
-            .contains("const url = __wake_require__.metaUrl();"),
+            .contains("const url = __wake_require__$1.metaUrl();"),
         "validated non-primitive defines are emitted as a structured expression: {}",
         out.bundle
     );
@@ -901,10 +975,15 @@ fn node_builtin_is_externalized() {
         "Node 内置应外部化而非报错: {:?}",
         out.diagnostics
     );
-    // 保留为外部 require（未改写为 __wake_require__）。
-    assert!(out.bundle.contains("require(\"fs\")"), "{}", out.bundle);
+    // 外部请求通过 closed runtime service 发出，不进入内部模块 id 图。
     assert!(
-        out.bundle.contains("require(\"node:path\")"),
+        out.bundle.contains("__wake_require__.external(\"fs\")"),
+        "{}",
+        out.bundle
+    );
+    assert!(
+        out.bundle
+            .contains("__wake_require__.external(\"node:path\")"),
         "{}",
         out.bundle
     );
@@ -928,7 +1007,11 @@ fn node_commonjs_bundle_keeps_explicit_external_and_strict_entry_export() {
         ]));
     let out = bundler.build(Path::new("src/index.ts"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
-    assert!(out.bundle.contains("require(\"vscode\")"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("__wake_require__.external(\"vscode\")"),
+        "{}",
+        out.bundle
+    );
     assert!(out.bundle.contains("module.exports = __wake_entry__"));
     assert!(!out.bundle.contains("root.__wake_entry__"));
 }
@@ -959,7 +1042,8 @@ fn external_package_matches_subpaths_but_not_similar_package_names() {
     let out = bundler.build(Path::new("src/index.ts"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert!(
-        out.bundle.contains("require(\"vscode/languages\")"),
+        out.bundle
+            .contains("__wake_require__.external(\"vscode/languages\")"),
         "{}",
         out.bundle
     );
@@ -996,9 +1080,804 @@ fn platform_format_and_external_changes_invalidate_a_long_lived_bundler() {
     let node = bundler.build(Path::new("src/index.js"));
     assert!(!node.has_errors(), "{:?}", node.diagnostics);
     assert!(!node.bundle.contains("INTERNAL_HOST_API"));
-    assert!(node.bundle.contains("require(\"host-api\")"));
+    assert!(
+        node.bundle
+            .contains("__wake_require__.external(\"host-api\")")
+    );
     assert!(node.bundle.contains("module.exports = __wake_entry__"));
     assert!(!node.bundle.contains("root.__wake_entry__"));
+}
+
+#[test]
+fn federation_dynamic_import_is_owned_by_the_page_broker() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export async function load(){return import('catalog/Button')}",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.set_federation_remotes(vec!["catalog".into()]);
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.module_count, 1);
+    assert!(
+        output
+            .bundle
+            .contains("__wake_require__.runtimeImport(\"catalog/Button\")"),
+        "{}",
+        output.bundle
+    );
+    assert!(
+        output.bundle.contains("Symbol.for(\"wake.federation.v1\")"),
+        "{}",
+        output.bundle
+    );
+    assert!(!output.bundle.contains("import(\"catalog/Button\")"));
+}
+
+#[test]
+fn federation_static_import_and_require_are_rejected_with_source_labels() {
+    for source in [
+        "import Button from 'catalog/Button';export default Button",
+        "module.exports=require('catalog/Button')",
+    ] {
+        let fs = MemoryFileSystem::from_files([("src/index.js", source)]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        bundler.set_federation_remotes(vec!["catalog".into()]);
+
+        let output = bundler.build(Path::new("src/index.js"));
+        let diagnostic = output
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_deref() == Some("FED_STATIC_REMOTE_UNSUPPORTED"))
+            .unwrap_or_else(|| panic!("missing federation diagnostic: {:?}", output.diagnostics));
+
+        assert!(output.has_errors());
+        assert!(!diagnostic.labels.is_empty(), "{diagnostic:?}");
+        assert_eq!(
+            diagnostic
+                .path
+                .as_deref()
+                .map(|path| path.replace('\\', "/")),
+            Some("src/index.js".to_owned())
+        );
+    }
+}
+
+#[test]
+fn federation_remote_matching_requires_an_explicit_container_boundary() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export const load=()=>import('catalogue/Button')",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.set_federation_remotes(vec!["catalog".into()]);
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(output.has_errors());
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0301")),
+        "{:?}",
+        output.diagnostics
+    );
+    assert!(!output.bundle.contains("runtimeImport"));
+}
+
+#[test]
+fn federation_expose_exports_are_isolated_from_container_local_module_ids() {
+    let build = |container: &str, value: &str| {
+        let fs = MemoryFileSystem::from_files([(
+            "src/index.js",
+            format!("export const value={value:?}"),
+        )]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        bundler.set_federation_entry_export(container, "./Widget");
+        let output = bundler.build(Path::new("src/index.js"));
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.entry().module_ids, vec![0]);
+        output.bundle
+    };
+    let alpha = build("alpha", "A");
+    let beta = build("beta", "B");
+
+    assert!(alpha.contains("wake.federation.exposes.v1"), "{alpha}");
+    assert!(beta.contains("wake.federation.exposes.v1"), "{beta}");
+    assert!(!alpha.contains("root.__wake_entry__ = __wake_entry__"));
+    assert!(!beta.contains("root.__wake_entry__ = __wake_entry__"));
+
+    if node_available() {
+        let script = format!(
+            "{alpha}\n{beta}\nconst r=globalThis[Symbol.for('wake.federation.exposes.v1')];process.stdout.write(r.alpha['./Widget'].value+r.beta['./Widget'].value);"
+        );
+        let executed = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("node must execute isolated federation containers");
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&executed.stdout), "AB");
+
+        let build_revision = |value: &str| {
+            let fs = MemoryFileSystem::from_files([(
+                "src/revision.js",
+                format!("export const value={value:?}"),
+            )]);
+            let mut bundler = IncrementalBundler::new(Arc::new(fs));
+            bundler.set_federation_build_scoped_entry_export("catalog", "./Widget");
+            let output = bundler.build(Path::new("src/revision.js"));
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            output.bundle
+        };
+        let old = build_revision("OLD");
+        let new = build_revision("NEW");
+        assert!(old.contains("import.meta.url"), "{old}");
+        assert!(
+            new.contains("__wake_federation_asset_context__.buildId"),
+            "{new}"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("old.mjs"), old).unwrap();
+        std::fs::write(directory.path().join("new.mjs"), new).unwrap();
+        std::fs::write(
+            directory.path().join("runner.mjs"),
+            r#"const contexts=new Map();
+Object.defineProperty(globalThis,Symbol.for('wake.federation.asset-contexts.v1'),{value:contexts});
+const oldUrl=new URL('./old.mjs',import.meta.url).href;
+const newUrl=new URL('./new.mjs',import.meta.url).href;
+contexts.set(oldUrl,Object.freeze({name:'catalog',buildId:'old-build',generation:0}));
+contexts.set(newUrl,Object.freeze({name:'catalog',buildId:'new-build',generation:0}));
+await import(newUrl);
+await import(oldUrl);
+const registry=globalThis[Symbol.for('wake.federation.exposes.v1')].catalog;
+process.stdout.write(registry['old-build']['./Widget'].value+registry['new-build']['./Widget'].value);
+"#,
+        )
+        .unwrap();
+        let executed = std::process::Command::new("node")
+            .arg(directory.path().join("runner.mjs"))
+            .output()
+            .expect("node must execute build-scoped federation containers");
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&executed.stdout), "OLDNEW");
+
+        let identical = {
+            let fs = MemoryFileSystem::from_files([
+                (
+                    "src/identical.js",
+                    "globalThis.__identicalBuildExecutions=(globalThis.__identicalBuildExecutions||0)+1;export const instance=globalThis.__identicalBuildExecutions;export const load=()=>import('./identical-lazy.js')",
+                ),
+                ("src/identical-lazy.js", "export const lazy=true"),
+            ]);
+            let mut bundler = IncrementalBundler::new(Arc::new(fs));
+            bundler
+                .enable_code_splitting()
+                .set_federation_build_scoped_entry_export("catalog", "./Widget");
+            let output = bundler.build(Path::new("src/identical.js"));
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            output.entry().code.clone()
+        };
+        assert!(
+            identical.contains("wake.federation.bundle-runtimes.v1"),
+            "{identical}"
+        );
+        let identical_dir = tempfile::tempdir().unwrap();
+        std::fs::write(identical_dir.path().join("b1.mjs"), &identical).unwrap();
+        std::fs::write(identical_dir.path().join("b2.mjs"), &identical).unwrap();
+        std::fs::write(
+            identical_dir.path().join("runner.mjs"),
+            r#"const contexts=new Map();
+Object.defineProperty(globalThis,Symbol.for('wake.federation.asset-contexts.v1'),{value:contexts});
+const b1Url=new URL('./b1.mjs',import.meta.url).href;
+const b2Url=new URL('./b2.mjs',import.meta.url).href;
+contexts.set(b1Url,Object.freeze({name:'catalog',buildId:'b1',generation:1}));
+contexts.set(b2Url,Object.freeze({name:'catalog',buildId:'b2',generation:2}));
+await import(b2Url);
+await import(b1Url);
+const exposed=globalThis[Symbol.for('wake.federation.exposes.v1')].catalog;
+const runtimes=globalThis[Symbol.for('wake.federation.bundle-runtimes.v1')];
+const runtimeBuilds=[...runtimes.values()].map(slot=>slot.runtime.federation.buildId).sort();
+process.stdout.write(JSON.stringify({b1:exposed.b1['./Widget'].instance,b2:exposed.b2['./Widget'].instance,executions:globalThis.__identicalBuildExecutions,runtimeBuilds}));
+"#,
+        )
+        .unwrap();
+        let executed = std::process::Command::new("node")
+            .arg(identical_dir.path().join("runner.mjs"))
+            .output()
+            .expect("node must isolate byte-identical federation builds");
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        let observed: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+        assert_eq!(observed["b2"], 1);
+        assert_eq!(observed["b1"], 2);
+        assert_eq!(observed["executions"], 2);
+        assert_eq!(observed["runtimeBuilds"], serde_json::json!(["b1", "b2"]));
+    }
+}
+
+#[test]
+fn build_scoped_federation_delegates_remote_and_asset_loads_with_requester_identity() {
+    let fs = MemoryFileSystem::from_files([
+        ("src/index.js", "export const local=()=>import('./lazy.js')"),
+        (
+            "src/lazy.js",
+            "export const remote=()=>import('catalog/Other')",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_code_splitting()
+        .set_federation_remotes(vec!["catalog".into()])
+        .set_federation_build_scoped_entry_export("shell", "./__wake_container__")
+        .set_federation_expose_roots(vec![("lazy".into(), "./Widget".into())]);
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    let entry = &output.entry().code;
+    assert!(entry.contains("loadFederatedAsset"), "{entry}");
+    assert!(
+        entry.contains("fileName: file, kind: \"javascript\""),
+        "{entry}"
+    );
+    assert!(entry.contains("fileName: file, kind: \"css\""), "{entry}");
+    assert!(
+        entry.contains("broker.loadRemote(specifier,{name:__wake_federation_asset_context__.name,buildId:__wake_federation_asset_context__.buildId,expose:expose})"),
+        "{entry}"
+    );
+    assert!(!entry.contains("{requester:"), "{entry}");
+    assert!(entry.contains("1: \"./Widget\""), "{entry}");
+    let lazy = output
+        .chunks
+        .iter()
+        .find(|chunk| chunk.name == "lazy")
+        .unwrap();
+    assert!(
+        lazy.code
+            .contains("runtimeImport(\"catalog/Other\", \"./Widget\")")
+            || lazy
+                .code
+                .contains("runtimeImport(\"catalog/Other\",\"./Widget\")"),
+        "{}",
+        lazy.code
+    );
+}
+
+#[test]
+fn nested_federation_runtime_import_identity_is_typed_and_persistent_cache_stable() {
+    let files = || {
+        MemoryFileSystem::from_files([
+            ("src/index.js", "export const local=()=>import('./lazy.js')"),
+            (
+                "src/lazy.js",
+                "export function nested(){return()=>import('catalog/Other')}",
+            ),
+        ])
+    };
+
+    for minify in [false, true] {
+        let unique = format!(
+            "wake_pcache_federation_emit_{}_{}_{}.bin",
+            std::process::id(),
+            minify,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos(),
+        );
+        let cache_path = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_file(&cache_path);
+        let build = |expose: &str| {
+            let mut bundler = IncrementalBundler::new(Arc::new(files()));
+            bundler
+                .enable_code_splitting()
+                .set_federation_remotes(vec!["catalog".into()])
+                .set_federation_build_scoped_entry_export("shell", "./__wake_container__")
+                .set_federation_expose_roots(vec![("lazy".into(), expose.into())])
+                .enable_persistent_cache(cache_path.clone());
+            if minify {
+                bundler.enable_minify();
+            }
+            let output = bundler.build(Path::new("src/index.js"));
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            (bundler, output)
+        };
+        let lazy_code = |output: &BuildOutput| {
+            output
+                .chunks
+                .iter()
+                .find(|chunk| chunk.name == "lazy")
+                .expect("lazy chunk")
+                .code
+                .clone()
+        };
+
+        let (_, cold) = build("./Widget");
+        assert!(
+            lazy_code(&cold).contains("runtimeImport(\"catalog/Other\", \"./Widget\")")
+                || lazy_code(&cold).contains("runtimeImport(\"catalog/Other\",\"./Widget\")"),
+            "{}",
+            lazy_code(&cold)
+        );
+
+        let (warm_bundler, warm) = build("./Widget");
+        assert_eq!(
+            warm_bundler.task_exec_count(),
+            0,
+            "body cache should be warm"
+        );
+        assert_eq!(lazy_code(&warm), lazy_code(&cold));
+
+        let (changed_bundler, changed) = build("./Other");
+        assert!(
+            changed_bundler.task_exec_count() > 0,
+            "expose identity participates in the body cache key"
+        );
+        assert!(
+            lazy_code(&changed).contains("runtimeImport(\"catalog/Other\", \"./Other\")")
+                || lazy_code(&changed).contains("runtimeImport(\"catalog/Other\",\"./Other\")"),
+            "{}",
+            lazy_code(&changed)
+        );
+
+        let _ = std::fs::remove_file(cache_path);
+    }
+}
+
+#[test]
+fn minified_build_scoped_remote_import_passes_a_direct_container_identity() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "export const load=()=>import('catalog/Other')",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_minify()
+        .set_federation_remotes(vec!["catalog".into()])
+        .set_federation_build_scoped_entry_export("shell", "./Widget");
+
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    let entry = &output.entry().code;
+    assert!(
+        entry.contains("loadRemote(s,{name:__wake_federation_asset_context__.name,buildId:__wake_federation_asset_context__.buildId,expose:x})"),
+        "{entry}"
+    );
+    assert!(!entry.contains("{requester:"), "{entry}");
+}
+
+#[test]
+fn build_scoped_local_development_loads_only_unowned_application_chunks_from_its_origin() {
+    let fs = MemoryFileSystem::from_files([
+        ("src/index.js", "export const app=()=>import('./app.js')"),
+        (
+            "src/app.js",
+            "globalThis.__localAppExecutions=(globalThis.__localAppExecutions||0)+1;export const value='APP';export const load=()=>import('./lazy.js')",
+        ),
+        (
+            "src/lazy.js",
+            "globalThis.__localLazyExecutions=(globalThis.__localLazyExecutions||0)+1;export const value='LAZY'",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_code_splitting()
+        .set_federation_build_scoped_entry_export("shell", "./__wake_container__");
+
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(
+        output
+            .entry()
+            .code
+            .contains("W.federation.developmentLocal === true && expose === undefined"),
+        "{}",
+        output.entry().code
+    );
+    if !node_available() {
+        eprintln!("node unavailable; structural local-development assertion completed");
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("entry.mjs"), &output.entry().code).unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"type":"module"}"#,
+    )
+    .unwrap();
+    for chunk in output.chunks.iter().filter(|chunk| !chunk.is_entry) {
+        std::fs::write(directory.path().join(&chunk.file_name), &chunk.code).unwrap();
+    }
+    std::fs::write(
+        directory.path().join("runner.mjs"),
+        r#"const contexts=new Map();
+Object.defineProperty(globalThis,Symbol.for('wake.federation.asset-contexts.v1'),{value:contexts});
+const brokerRequests=[];
+Object.defineProperty(globalThis,Symbol.for('wake.federation.v1'),{value:{
+  loadFederatedAsset(request){brokerRequests.push(request);throw new Error('local application asset reached broker')}
+}});
+const head={appendChild(node){import(node.src).then(()=>node.onload(),error=>node.onerror(error))}};
+Object.defineProperty(globalThis,'document',{value:{
+  createElement(){return {}},head,documentElement:head,getElementsByTagName(){return []}
+}});
+const entryUrl=new URL('./entry.mjs',import.meta.url).href;
+contexts.set(entryUrl,Object.freeze({name:'shell',buildId:'local-build',generation:1,fileName:'bundle.js',kind:'javascript',developmentLocal:true}));
+await import(entryUrl);
+const loaders=globalThis[Symbol.for('wake.federation.exposes.v1')].shell['local-build']['./__wake_container__'];
+const app=await loaders.app();
+const lazy=await app.load();
+const localFiles=[...contexts.values()].filter(context=>context.developmentLocal).map(context=>context.fileName).sort();
+process.stdout.write(JSON.stringify({brokerRequests,localFiles,values:[app.value,lazy.value],appExecutions:globalThis.__localAppExecutions,lazyExecutions:globalThis.__localLazyExecutions}));
+"#,
+    )
+    .unwrap();
+    let executed = std::process::Command::new("node")
+        .arg(directory.path().join("runner.mjs"))
+        .output()
+        .expect("node must execute local development application chunks");
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    let observed: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert_eq!(observed["brokerRequests"], serde_json::json!([]));
+    assert_eq!(observed["values"], serde_json::json!(["APP", "LAZY"]));
+    assert_eq!(observed["appExecutions"], 1);
+    assert_eq!(observed["lazyExecutions"], 1);
+    let local_files = observed["localFiles"].as_array().unwrap();
+    assert_eq!(local_files.len(), 3, "{observed:#}");
+    assert!(local_files.iter().any(|file| file == "bundle.js"));
+    assert!(
+        output
+            .chunks
+            .iter()
+            .filter(|chunk| !chunk.is_entry)
+            .all(|chunk| local_files.iter().any(|file| file == &chunk.file_name))
+    );
+}
+
+#[test]
+fn concurrent_federation_exposes_keep_lazy_assets_in_their_own_closure() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "export const a=()=>import('./a.js');export const b=()=>import('./b.js');export const app=()=>import('./app.js')",
+        ),
+        (
+            "src/a.js",
+            "import {common} from './common.js';import {preview} from './preview-shared.js';export const value='A'+common+preview;export const load=()=>import('./a-lazy.js')",
+        ),
+        (
+            "src/b.js",
+            "import {common} from './common.js';export const value='B'+common;export const load=()=>import('./b-lazy.js')",
+        ),
+        (
+            "src/common.js",
+            "globalThis.__commonExecutions=(globalThis.__commonExecutions||0)+1;export const common='C'",
+        ),
+        (
+            "src/app.js",
+            "import {preview} from './preview-shared.js';export const app='APP'+preview",
+        ),
+        (
+            "src/preview-shared.js",
+            "globalThis.__previewSharedExecutions=(globalThis.__previewSharedExecutions||0)+1;export const preview='P'",
+        ),
+        ("src/a-lazy.js", "export const lazy='A-LAZY'"),
+        ("src/b-lazy.js", "export const lazy='B-LAZY'"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_code_splitting()
+        .set_federation_build_scoped_entry_export("catalog", "./__wake_container__")
+        .set_federation_expose_roots(vec![("a".into(), "./A".into()), ("b".into(), "./B".into())]);
+
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    let common = output
+        .chunks
+        .iter()
+        .find(|chunk| chunk.code.contains("__commonExecutions"))
+        .expect("shared common chunk");
+    let preview_shared = output
+        .chunks
+        .iter()
+        .find(|chunk| chunk.code.contains("__previewSharedExecutions"))
+        .expect("chunk shared by an expose and the standalone app");
+    assert!(!output.entry().code.contains("__wakeSetExpose"));
+    assert!(output.entry().code.contains(&format!(
+            "{}: \"./A\"",
+            output
+                .chunks
+                .iter()
+                .find(|chunk| chunk.name == "a")
+                .unwrap()
+                .chunk_id
+        )));
+    assert!(output.entry().code.contains(&format!(
+            "{}: \"./B\"",
+            output
+                .chunks
+                .iter()
+                .find(|chunk| chunk.name == "b")
+                .unwrap()
+                .chunk_id
+        )));
+    assert!(
+        !output
+            .entry()
+            .code
+            .contains(&format!("{}: \"./", common.chunk_id)),
+        "shared dependency must not inherit the first expose owner: {}",
+        output.entry().code
+    );
+
+    if !node_available() {
+        eprintln!("node unavailable; structural concurrent-expose assertions completed");
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("entry.mjs"), &output.entry().code).unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"type":"module"}"#,
+    )
+    .unwrap();
+    for chunk in output.chunks.iter().filter(|chunk| !chunk.is_entry) {
+        std::fs::write(directory.path().join(&chunk.file_name), &chunk.code).unwrap();
+    }
+    let runner = r#"const contexts=new Map();
+Object.defineProperty(globalThis,Symbol.for('wake.federation.asset-contexts.v1'),{value:contexts});
+const requests=[];
+const broker={
+  async loadFederatedAsset(request){
+    requests.push({...request});
+    const url=new URL('./'+request.fileName,import.meta.url).href;
+    contexts.set(url,Object.freeze({name:request.name,buildId:request.buildId,generation:1,...(request.expose===undefined?{}:{expose:request.expose})}));
+    await import(url);
+  }
+};
+Object.defineProperty(globalThis,Symbol.for('wake.federation.v1'),{value:broker});
+const entryUrl=new URL('./entry.mjs',import.meta.url).href;
+contexts.set(entryUrl,Object.freeze({name:'catalog',buildId:'build-1',generation:1}));
+await import(entryUrl);
+const loaders=globalThis[Symbol.for('wake.federation.exposes.v1')].catalog['build-1']['./__wake_container__'];
+const [a,b,app]=await Promise.all([loaders.a(),loaders.b(),loaders.app()]);
+const [aLazy,bLazy]=await Promise.all([a.load(),b.load()]);
+process.stdout.write(JSON.stringify({requests,commonExecutions:globalThis.__commonExecutions,previewSharedExecutions:globalThis.__previewSharedExecutions,values:[a.value,b.value,app.app,aLazy.lazy,bLazy.lazy]}));
+"#;
+    std::fs::write(directory.path().join("runner.mjs"), runner).unwrap();
+    let executed = std::process::Command::new("node")
+        .arg(directory.path().join("runner.mjs"))
+        .output()
+        .expect("node must execute concurrent federation exposes");
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    let observed: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert_eq!(observed["commonExecutions"], 1);
+    assert_eq!(observed["previewSharedExecutions"], 1);
+    assert_eq!(
+        observed["values"],
+        serde_json::json!(["ACP", "BC", "APPP", "A-LAZY", "B-LAZY"])
+    );
+
+    let expose_for = |name: &str| {
+        let file = &output
+            .chunks
+            .iter()
+            .find(|chunk| chunk.name == name)
+            .unwrap()
+            .file_name;
+        observed["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["fileName"] == *file)
+            .and_then(|request| request.get("expose"))
+            .cloned()
+    };
+    assert_eq!(expose_for("a"), Some(serde_json::json!("./A")));
+    assert_eq!(expose_for("a-lazy"), Some(serde_json::json!("./A")));
+    assert_eq!(expose_for("b"), Some(serde_json::json!("./B")));
+    assert_eq!(expose_for("b-lazy"), Some(serde_json::json!("./B")));
+    let common_request = observed["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| request["fileName"] == common.file_name)
+        .expect("shared common chunk request");
+    assert!(common_request.get("expose").is_none(), "{common_request}");
+    let preview_request = observed["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| request["fileName"] == preview_shared.file_name)
+        .expect("preview shared chunk request");
+    assert!(preview_request.get("expose").is_none(), "{preview_request}");
+    assert!(
+        observed["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| { request["name"] == "catalog" && request["buildId"] == "build-1" })
+    );
+}
+
+#[test]
+fn federation_shared_dependency_is_externalized_and_read_from_initialized_context() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "import React from 'react';export const version=React.version",
+    )]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_federation_entry_export("catalog", "./Widget")
+        .set_federation_shared(vec![("react".into(), "react".into(), "react18".into())]);
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(
+        output.module_count, 1,
+        "shared React must not enter the remote graph"
+    );
+    assert!(
+        output
+            .bundle
+            .contains("__wake_require__.shared(\"react\", \"react18\")"),
+        "{}",
+        output.bundle
+    );
+    assert!(output.bundle.contains("wake.federation.share-contexts.v1"));
+
+    if node_available() {
+        let script = format!(
+            "globalThis[Symbol.for('wake.federation.share-contexts.v1')]={{catalog:{{getSync:(key,scope)=>{{if(key!=='react'||scope!=='react18')throw new Error('bad request');return {{__esModule:true,default:{{version:'18.3'}}}}}}}}}};{}const r=globalThis[Symbol.for('wake.federation.exposes.v1')];process.stdout.write(r.catalog['./Widget'].version);",
+            output.bundle
+        );
+        let executed = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("node must execute a shared federation bundle");
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&executed.stdout), "18.3");
+    }
+}
+
+#[test]
+fn federation_shared_fallback_resolves_interdependent_members_locally() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "export const fallback=()=>import('./fallback.js');export const app=()=>import('./app.js');",
+        ),
+        (
+            "src/fallback.js",
+            "import {a} from 'shared-a';import {b} from 'shared-b';export const value=a+b;",
+        ),
+        (
+            "src/app.js",
+            "import {a} from 'shared-a';export const value=a;",
+        ),
+        (
+            "node_modules/shared-a/package.json",
+            r#"{"name":"shared-a","version":"1.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/shared-a/index.js",
+            "import * as peer from 'shared-b';export const a=typeof peer;",
+        ),
+        (
+            "node_modules/shared-b/package.json",
+            r#"{"name":"shared-b","version":"1.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/shared-b/index.js",
+            "import * as peer from 'shared-a';export const b=typeof peer;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_federation_build_scoped_entry_export("catalog", "./__wake_container__")
+        .set_federation_shared(vec![
+            ("shared-a".into(), "shared-a".into(), "group".into()),
+            ("shared-b".into(), "shared-b".into(), "group".into()),
+        ])
+        .set_federation_shared_fallback_roots(vec![PathBuf::from("src/fallback.js")])
+        .enable_code_splitting();
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    let fallback = output
+        .chunks
+        .iter()
+        .find(|chunk| chunk.name == "fallback")
+        .expect("explicit SharedFallback dynamic root");
+    assert!(
+        !fallback.code.contains("__wake_require__.shared("),
+        "fallback members must be local: {}",
+        fallback.code
+    );
+    let app = output
+        .chunks
+        .iter()
+        .find(|chunk| chunk.name == "app")
+        .expect("ordinary application dynamic root");
+    assert!(
+        app.code
+            .contains("__wake_require__.shared(\"shared-a\", \"group\")"),
+        "ordinary consumers must still use the broker bridge: {}",
+        app.code
+    );
+}
+
+#[test]
+fn federation_shared_fallback_rejects_a_module_reached_in_both_resolution_contexts() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import './ambiguous.js';export const fallback=()=>import('./fallback.js');",
+        ),
+        ("src/fallback.js", "export * from './ambiguous.js';"),
+        (
+            "src/ambiguous.js",
+            "import {value} from 'shared-a';export {value};",
+        ),
+        (
+            "node_modules/shared-a/package.json",
+            r#"{"name":"shared-a","version":"1.0.0","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/shared-a/index.js",
+            "export const value='shared';",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .set_federation_build_scoped_entry_export("catalog", "./__wake_container__")
+        .set_federation_shared(vec![("shared-a".into(), "shared-a".into(), "group".into())])
+        .set_federation_shared_fallback_roots(vec![PathBuf::from("src/fallback.js")])
+        .enable_code_splitting();
+
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(output.has_errors(), "ambiguous graph must fail closed");
+    assert!(
+        output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("FED_CONFIG_INVALID")
+                && diagnostic
+                    .message
+                    .contains("both broker and SharedFallback")
+        }),
+        "{:?}",
+        output.diagnostics
+    );
 }
 
 #[test]
@@ -1317,13 +2196,19 @@ fn cjs_interop_fixture() -> MemoryFileSystem {
 fn cjs_interop_structure() {
     let out = IncrementalBundler::new(Arc::new(cjs_interop_fixture())).build(Path::new("index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
-    // 默认导入走 interop helper。
-    assert!(out.bundle.contains("__wake_interop_default("));
-    assert!(out.bundle.contains("__wake_interop_star("));
+    // Default interop is an inline marker check; namespace interop uses the closed Object service.
+    assert!(out.bundle.contains(".__esModule ?"), "{}", out.bundle);
+    assert!(
+        out.bundle.contains("__wake_require__.objectAssign({},"),
+        "{}",
+        out.bundle
+    );
+    assert!(!out.bundle.contains("__wake_interop_default"));
+    assert!(!out.bundle.contains("__wake_interop_star"));
     // ESM 入口标记 __esModule；纯 CJS 的 lib 不标记（整个 bundle 只此一处 defineProperty 标记）。
     assert_eq!(
         out.bundle
-            .matches("Object.defineProperty(exports, \"__esModule\"")
+            .matches("__wake_require__.objectDefineProperty(exports, \"__esModule\"")
             .count(),
         1,
         "只有 ESM 模块 index 应被标记 __esModule，纯 CJS 的 lib 不标记"
@@ -1490,7 +2375,7 @@ fn typescript_project_erases_types() {
     assert!(!out.bundle.contains("<T extends"), "残留泛型");
     assert!(
         out.bundle
-            .contains("Object.defineProperty(exports, \"result\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"result\"")
     );
 }
 
@@ -4426,6 +5311,346 @@ fn crab_component_styles_auto_import_in_dependency_order() {
     assert!(skeleton < card, "依赖样式应先于父组件样式:\n{css}");
 }
 
+fn crab_legacy_runtime_fixture() -> MemoryFileSystem {
+    MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import esm, { forwarded, lure } from '@crab-dev/rc-esm';\n\
+             const cjs = require('@crab-dev/rc-cjs/cjs/index.cjs');\n\
+             export const result = [esm, forwarded('forwarded', 'ok'), cjs, lure].join('|');",
+        ),
+        (
+            "node_modules/@crab-dev/rc-esm/package.json",
+            r#"{"name":"@crab-dev/rc-esm","version":"1.0.0","module":"esm/index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-esm/esm/index.mjs",
+            "import { cx } from '@linaria/core';\n\
+             export { cx as forwarded } from '@linaria/core';\n\
+             const stringBait = '@linaria/core';\n\
+             const templateBait = `@linaria/core`;\n\
+             const regexBait = /@linaria\\/core/;\n\
+             // require('@linaria/core') is only a comment.\n\
+             export const lure = stringBait === templateBait && regexBait.test(stringBait);\n\
+             export default cx('esm', 'ok');",
+        ),
+        (
+            "node_modules/@crab-dev/rc-cjs/package.json",
+            r#"{"name":"@crab-dev/rc-cjs","version":"1.0.0","main":"cjs/index.cjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-cjs/cjs/index.cjs",
+            "const { cx } = require('@linaria/core'); module.exports = cx('cjs', 'ok');",
+        ),
+        (
+            "node_modules/@crab-dev/css/package.json",
+            r#"{"name":"@crab-dev/css","version":"2.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/css/index.mjs",
+            "export function cx(a, b) { return 'CRAB_RUNTIME:' + a + '-' + b; }",
+        ),
+        (
+            "node_modules/@linaria/core/package.json",
+            r#"{"name":"@linaria/core","version":"6.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/@linaria/core/index.mjs",
+            "export function cx(a, b) { return 'LINARIA_RUNTIME:' + a + '-' + b; }",
+        ),
+        (
+            "alias-css.mjs",
+            "export function cx() { return 'ALIAS_MUST_NOT_WIN'; }",
+        ),
+    ])
+}
+
+fn crab_legacy_runtime_bundler() -> IncrementalBundler {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_legacy_runtime_fixture()));
+    let mut options = wake_resolver::ResolveOptions::default();
+    options
+        .alias
+        .push(("@crab-dev/css".to_string(), PathBuf::from("alias-css.mjs")));
+    bundler.set_resolve_options(options);
+    bundler
+}
+
+#[test]
+fn crab_public_entry_static_esm_and_cjs_resolve_to_css_with_cold_retained_equivalence() {
+    let mut retained = crab_legacy_runtime_bundler();
+    retained.enable_load_cache();
+    let first = retained.build(Path::new("src/index.js"));
+    let second = retained.build(Path::new("src/index.js"));
+    let cold = crab_legacy_runtime_bundler().build(Path::new("src/index.js"));
+
+    for output in [&first, &second, &cold] {
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.module_count, 4, "entry + two components + Crab CSS");
+        assert!(output.bundle.contains("CRAB_RUNTIME:"), "{}", output.bundle);
+        assert!(
+            !output.bundle.contains("LINARIA_RUNTIME:"),
+            "the predecessor package must not enter the static component graph: {}",
+            output.bundle
+        );
+        assert!(
+            !output.bundle.contains("ALIAS_MUST_NOT_WIN"),
+            "the host-owned target must bypass source aliases: {}",
+            output.bundle
+        );
+    }
+    assert_eq!(second.bundle, first.bundle, "retained build must be stable");
+    assert_eq!(
+        cold.bundle, first.bundle,
+        "cold and retained builds must agree"
+    );
+
+    let mut minified_bundler = crab_legacy_runtime_bundler();
+    minified_bundler.enable_minify();
+    let minified = minified_bundler.build(Path::new("src/index.js"));
+    assert!(!minified.has_errors(), "{:?}", minified.diagnostics);
+    assert!(
+        minified.bundle.contains("CRAB_RUNTIME:"),
+        "{}",
+        minified.bundle
+    );
+    assert!(!minified.bundle.contains("LINARIA_RUNTIME:"));
+    assert!(!minified.bundle.contains("ALIAS_MUST_NOT_WIN"));
+
+    if !node_available() {
+        eprintln!("node unavailable; skipping Crab legacy runtime execution proof");
+        return;
+    }
+    let unique = format!(
+        "wake_crab_legacy_runtime_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (mode, output) in [("readable", &second), ("minified", &minified)] {
+        let bundle_path = dir.join(format!("{mode}.cjs"));
+        std::fs::write(&bundle_path, &output.bundle).unwrap();
+        let script = format!(
+            "const result=require({:?}).result;\n\
+             if(result!=='CRAB_RUNTIME:esm-ok|CRAB_RUNTIME:forwarded-ok|CRAB_RUNTIME:cjs-ok|true'){{console.error(result);process.exit(2)}}",
+            bundle_path.to_string_lossy()
+        );
+        let executed = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            executed.status.success(),
+            "{mode}: stderr={} bundle={}",
+            String::from_utf8_lossy(&executed.stderr),
+            output.bundle
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn crab_public_entry_resolution_is_identical_after_persistent_cache_restore() {
+    let cache_path = std::env::temp_dir().join(format!(
+        "wake_crab_resolution_cache_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut cold = crab_legacy_runtime_bundler();
+    cold.enable_persistent_cache(cache_path.clone());
+    let cold_output = cold.build(Path::new("src/index.js"));
+    assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
+
+    let mut warm = crab_legacy_runtime_bundler();
+    warm.enable_persistent_cache(cache_path.clone());
+    let warm_output = warm.build(Path::new("src/index.js"));
+    assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+    assert_eq!(
+        warm_output.bundle, cold_output.bundle,
+        "cache summaries must retain the original specifier/kind while resolution remaps again"
+    );
+    assert_eq!(
+        warm.task_exec_count(),
+        0,
+        "persistent restore may skip parse/optimize/codegen without skipping package resolution"
+    );
+    let _ = std::fs::remove_file(cache_path);
+}
+
+#[test]
+fn crab_resolution_bridge_rejects_application_third_party_internal_and_directory_spoofs() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import { cx } from '@linaria/core';\n\
+             import third from 'other-ui';\n\
+             import internal from '@crab-dev/rc-real/esm/internal.mjs';\n\
+             import nested from '@crab-dev/rc-real/dist/esm/index.mjs';\n\
+             import spoof from '@crab-dev/rc-spoof';\n\
+             export const result = [cx('app','ok'), third, internal, nested, spoof].join('|');",
+        ),
+        (
+            "node_modules/other-ui/package.json",
+            r#"{"name":"other-ui","version":"1.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/other-ui/index.mjs",
+            "import { cx } from '@linaria/core'; export default cx('third','ok');",
+        ),
+        (
+            "node_modules/@crab-dev/rc-real/package.json",
+            r#"{"name":"@crab-dev/rc-real","version":"1.0.0","module":"esm/index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-real/esm/internal.mjs",
+            "import { cx } from '@linaria/core'; export default cx('internal','ok');",
+        ),
+        (
+            "node_modules/@crab-dev/rc-real/dist/esm/index.mjs",
+            "import { cx } from '@linaria/core'; export default cx('nested','ok');",
+        ),
+        (
+            "node_modules/@crab-dev/rc-spoof/package.json",
+            r#"{"name":"not-a-crab-component","version":"1.0.0","module":"esm/index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-spoof/esm/index.mjs",
+            "import { cx } from '@linaria/core'; export default cx('spoof','ok');",
+        ),
+        (
+            "node_modules/@linaria/core/package.json",
+            r#"{"name":"@linaria/core","version":"6.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/@linaria/core/index.mjs",
+            "export function cx(a, b) { return 'LINARIA_RUNTIME:' + a + '-' + b; }",
+        ),
+        (
+            "node_modules/@crab-dev/css/package.json",
+            r#"{"name":"@crab-dev/css","version":"2.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/css/index.mjs",
+            "export function cx(a, b) { return 'CRAB_RUNTIME:' + a + '-' + b; }",
+        ),
+    ]);
+    let out = IncrementalBundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("LINARIA_RUNTIME:"), "{}", out.bundle);
+    assert!(!out.bundle.contains("CRAB_RUNTIME:"), "{}", out.bundle);
+
+    if !node_available() {
+        return;
+    }
+    let dir =
+        std::env::temp_dir().join(format!("wake_crab_bridge_negative_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bundle.cjs");
+    std::fs::write(&path, &out.bundle).unwrap();
+    let script = format!(
+        "const result=require({:?}).result;\n\
+         const expected='LINARIA_RUNTIME:app-ok|LINARIA_RUNTIME:third-ok|LINARIA_RUNTIME:internal-ok|LINARIA_RUNTIME:nested-ok|LINARIA_RUNTIME:spoof-ok';\n\
+         if(result!==expected){{console.error(result);process.exit(2)}}",
+        path.to_string_lossy()
+    );
+    let executed = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "stderr={} bundle={}",
+        String::from_utf8_lossy(&executed.stderr),
+        out.bundle
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn crab_public_entry_dynamic_import_remains_linaria_owned() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import { load } from '@crab-dev/rc-dynamic'; export const result = load();",
+        ),
+        (
+            "node_modules/@crab-dev/rc-dynamic/package.json",
+            r#"{"name":"@crab-dev/rc-dynamic","version":"1.0.0","module":"esm/index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/rc-dynamic/esm/index.mjs",
+            "export function load() { return import('@linaria/core').then(function(runtime) { return runtime.cx('dynamic', 'ok'); }); }",
+        ),
+        (
+            "node_modules/@linaria/core/package.json",
+            r#"{"name":"@linaria/core","version":"6.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/@linaria/core/index.mjs",
+            "export function cx(a, b) { return 'LINARIA_RUNTIME:' + a + '-' + b; }",
+        ),
+        (
+            "node_modules/@crab-dev/css/package.json",
+            r#"{"name":"@crab-dev/css","version":"2.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            "node_modules/@crab-dev/css/index.mjs",
+            "export function cx(a, b) { return 'CRAB_RUNTIME:' + a + '-' + b; }",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_code_splitting();
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(
+        out.chunks.len(),
+        2,
+        "Linaria dynamic import must remain async"
+    );
+    assert!(
+        out.chunks
+            .iter()
+            .any(|chunk| chunk.code.contains("LINARIA_RUNTIME:")),
+        "dynamic target must be Linaria-owned"
+    );
+    assert!(
+        out.chunks
+            .iter()
+            .all(|chunk| !chunk.code.contains("CRAB_RUNTIME:")),
+        "dynamic import is outside the compatibility bridge"
+    );
+
+    if !node_available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("wake_crab_dynamic_{}", std::process::id()));
+    let entry = write_chunks(&out, &dir);
+    let script = format!(
+        "require({:?}).result.then(function(value){{if(value!=='LINARIA_RUNTIME:dynamic-ok'){{console.error(value);process.exit(2)}}}}).catch(function(error){{console.error(error);process.exit(3)}})",
+        entry.to_string_lossy()
+    );
+    let executed = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "stderr={} entry={}",
+        String::from_utf8_lossy(&executed.stderr),
+        out.bundle
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn css_bundle_runs_in_node() {
     if std::process::Command::new("node")
@@ -4794,7 +6019,7 @@ fn code_splitting_emits_async_chunk() {
     assert!(out.bundle.contains("__wake__.f = "), "{}", out.bundle);
     assert!(
         !out.bundle
-            .contains("Object.defineProperty(exports, \"value\""),
+            .contains("__wake_require__.objectDefineProperty(exports, \"value\""),
         "lazy 不应在 entry chunk:\n{}",
         out.bundle
     );
@@ -4803,7 +6028,7 @@ fn code_splitting_emits_async_chunk() {
     assert!(
         async_chunk
             .code
-            .contains("Object.defineProperty(exports, \"value\"")
+            .contains("__wake_require__.objectDefineProperty(exports, \"value\"")
     );
     assert!(
         !async_chunk.code.contains(".js"),
@@ -4943,8 +6168,13 @@ fn minified_code_splitting_uses_esm_marker_for_complete_cjs_interop() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert_eq!(out.chunks.len(), 3, "entry + ESM/CJS dynamic chunks");
     assert!(
-        out.bundle.contains("m&&m.__esModule?m.default:m"),
-        "分割 runtime 必须按 ESM marker 解析 default import:\n{}",
+        out.bundle.contains(".__esModule?") && out.bundle.contains(".default:"),
+        "default interop 必须内联按 ESM marker 分支:\n{}",
+        out.bundle
+    );
+    assert!(
+        !out.bundle.contains("__wake_interop_default"),
+        "split entry 不应重新引入已删除的 default helper:\n{}",
         out.bundle
     );
     assert!(
@@ -5138,7 +6368,8 @@ fn inline_import_when_target_in_entry() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert_eq!(out.chunks.len(), 1, "目标在 entry 闭包 → 单包");
     assert!(
-        out.bundle.contains("Promise.resolve(__wake_require__("),
+        out.bundle
+            .contains("__wake_require__.promiseResolve(__wake_require__("),
         "应内联而非切 chunk:\n{}",
         out.bundle
     );
@@ -5387,9 +6618,128 @@ fn fixture_with_msg(msg: &str) -> MemoryFileSystem {
 }
 
 #[test]
+fn persistent_cache_missing_and_incompatible_files_are_silent() {
+    for incompatible in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("cache.bin");
+        if incompatible {
+            let mut header = b"WKC1".to_vec();
+            header.extend_from_slice(&u32::MAX.to_le_bytes());
+            std::fs::write(&cache_path, header).unwrap();
+        }
+
+        let mut bundler = IncrementalBundler::new(Arc::new(fixture()));
+        bundler.enable_persistent_cache(cache_path);
+        let output = bundler.build(Path::new("src/index.js"));
+
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert!(
+            wake_cache_diagnostics(&output).is_empty(),
+            "normal cache misses must be silent: {:?}",
+            output.diagnostics
+        );
+    }
+}
+
+#[test]
+fn persistent_cache_corruption_and_io_warn_once_without_failing_the_build() {
+    let corrupt_directory = tempfile::tempdir().unwrap();
+    let corrupt_path = corrupt_directory.path().join("cache.bin");
+    std::fs::write(&corrupt_path, b"corrupt").unwrap();
+    let mut corrupt = IncrementalBundler::new(Arc::new(fixture()));
+    corrupt.enable_persistent_cache(corrupt_path.clone());
+    let corrupt_output = corrupt.build(Path::new("src/index.js"));
+    let warnings = wake_cache_diagnostics(&corrupt_output);
+    assert!(
+        !corrupt_output.has_errors(),
+        "{:?}",
+        corrupt_output.diagnostics
+    );
+    assert_eq!(warnings.len(), 1, "{:?}", corrupt_output.diagnostics);
+    assert_eq!(warnings[0].severity, Severity::Warning);
+    assert_eq!(
+        warnings[0].path.as_deref(),
+        Some(corrupt_path.to_string_lossy().as_ref())
+    );
+    assert!(warnings[0].notes.iter().any(|note| note.contains("损坏")));
+    assert!(
+        warnings[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("原子替换"))
+    );
+
+    let mut repaired = IncrementalBundler::new(Arc::new(fixture()));
+    repaired.enable_persistent_cache(corrupt_path);
+    let repaired_output = repaired.build(Path::new("src/index.js"));
+    assert!(
+        wake_cache_diagnostics(&repaired_output).is_empty(),
+        "the repaired cache must load silently: {:?}",
+        repaired_output.diagnostics
+    );
+    assert_eq!(repaired.task_exec_count(), 0);
+
+    let io_directory = tempfile::tempdir().unwrap();
+    let io_path = io_directory.path().join("cache-as-directory");
+    std::fs::create_dir(&io_path).unwrap();
+    let mut io_failure = IncrementalBundler::new(Arc::new(fixture()));
+    io_failure.enable_persistent_cache(io_path.clone());
+    let io_output = io_failure.build(Path::new("src/index.js"));
+    let warnings = wake_cache_diagnostics(&io_output);
+    assert!(!io_output.has_errors(), "{:?}", io_output.diagnostics);
+    assert_eq!(warnings.len(), 1, "{:?}", io_output.diagnostics);
+    assert_eq!(warnings[0].severity, Severity::Warning);
+    assert_eq!(
+        warnings[0].path.as_deref(),
+        Some(io_path.to_string_lossy().as_ref())
+    );
+    assert!(warnings[0].notes.iter().any(|note| note.contains("I/O")));
+    assert!(warnings[0].notes.iter().any(|note| note.contains("写入")));
+}
+
+#[test]
+fn persistent_cache_store_failure_retries_dirty_state_on_the_next_build() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache_path = directory.path().join("cache.bin");
+    let lock_path = directory.path().join("cache.bin.lock");
+    std::fs::create_dir(&lock_path).unwrap();
+
+    let mut bundler = IncrementalBundler::new(Arc::new(fixture()));
+    bundler.enable_persistent_cache(cache_path.clone());
+    let failed_store = bundler.build(Path::new("src/index.js"));
+    let warnings = wake_cache_diagnostics(&failed_store);
+    assert!(!failed_store.has_errors(), "{:?}", failed_store.diagnostics);
+    assert_eq!(warnings.len(), 1, "{:?}", failed_store.diagnostics);
+    assert!(
+        warnings[0]
+            .notes
+            .iter()
+            .any(|note| { note.contains("写入") && note.contains("后续构建将重试") })
+    );
+    assert!(!cache_path.exists());
+
+    std::fs::remove_dir(&lock_path).unwrap();
+    let retried = bundler.build(Path::new("src/index.js"));
+    assert!(!retried.has_errors(), "{:?}", retried.diagnostics);
+    assert!(
+        wake_cache_diagnostics(&retried).is_empty(),
+        "successful retry must be silent: {:?}",
+        retried.diagnostics
+    );
+    assert!(cache_path.is_file());
+
+    let mut warm = IncrementalBundler::new(Arc::new(fixture()));
+    warm.enable_persistent_cache(cache_path);
+    let warm_output = warm.build(Path::new("src/index.js"));
+    assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+    assert!(wake_cache_diagnostics(&warm_output).is_empty());
+    assert_eq!(warm.task_exec_count(), 0);
+}
+
+#[test]
 fn persistent_cache_skips_parse_and_codegen_on_fresh_process() {
-    let cache_path = std::env::temp_dir().join("wake_pcache_fresh.bin");
-    let _ = std::fs::remove_file(&cache_path);
+    let directory = tempfile::tempdir().unwrap();
+    let cache_path = directory.path().join("cache.bin");
 
     // 参照：无缓存产物。
     let ref_out = IncrementalBundler::new(Arc::new(fixture())).build(Path::new("src/index.js"));
@@ -5406,6 +6756,7 @@ fn persistent_cache_skips_parse_and_codegen_on_fresh_process() {
         9,
         "首遍冷缓存：3 parse + 3 optimize + 3 body"
     );
+    assert_eq!(b1.load_exec_count(), 3, "冷缓存必须真实读取全部源码");
 
     // 第二遍：**全新 bundler（新引擎，内存 memo 为空）**，从磁盘载入热缓存。
     let mut b2 = IncrementalBundler::new(Arc::new(fixture()));
@@ -5418,54 +6769,239 @@ fn persistent_cache_skips_parse_and_codegen_on_fresh_process() {
         0,
         "热缓存：parse + codegen 全部跳过（磁盘命中），零引擎任务"
     );
-
-    let _ = std::fs::remove_file(&cache_path);
+    assert_eq!(
+        b2.load_exec_count(),
+        3,
+        "fresh process 必须真实读取源码，再以 content hash 命中派生缓存"
+    );
 }
 
 #[test]
-fn persistent_cache_restores_discarded_static_request_ranges_for_final_layout() {
+fn persistent_cache_isolated_by_css_in_js_mode() {
     let unique = format!(
-        "wake_pcache_request_ranges_{}_{}.bin",
+        "wake_pcache_css_in_js_variant_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock must be after Unix epoch")
             .as_nanos(),
     );
-    let cache_path = std::env::temp_dir().join(unique);
+    let root = std::env::temp_dir().join(unique);
+    let package = root.join("node_modules/@crab-dev/css");
+    let source = root.join("src");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(package.join("package.json"), CRAB_CSS_PKG_JSON).unwrap();
+    std::fs::write(package.join("index.js"), CRAB_CSS_INDEX).unwrap();
+    std::fs::write(
+        source.join("index.tsx"),
+        "import { css } from '@crab-dev/css';\n\
+         export const box = css`color: rebeccapurple;`;",
+    )
+    .unwrap();
+    let entry = source.join("index.tsx");
+    let cache_path = root.join("cache.bin");
+
+    // Process one writes derived facts with CSS-in-JS disabled.
+    let mut disabled = IncrementalBundler::new(Arc::new(OsFileSystem));
+    disabled
+        .enable_dead_module_elimination()
+        .enable_persistent_cache(cache_path.clone());
+    let disabled_output = disabled.build(&entry);
+    assert!(
+        !disabled_output.has_errors(),
+        "{:?}",
+        disabled_output.diagnostics
+    );
+    assert!(
+        disabled_output
+            .bundle
+            .contains("css should be compiled away"),
+        "disabled build must retain the runtime module: {}",
+        disabled_output.bundle
+    );
+
+    // Process two changes only the semantic CSS mode while reusing the same disk cache.
+    let mut cached_enabled = IncrementalBundler::new(Arc::new(OsFileSystem));
+    cached_enabled
+        .enable_css_in_js()
+        .enable_dead_module_elimination()
+        .enable_persistent_cache(cache_path.clone());
+    let cached_output = cached_enabled.build(&entry);
+
+    // A third, cache-free process is the semantic oracle for CSS-in-JS enabled output.
+    let mut cold_enabled = IncrementalBundler::new(Arc::new(OsFileSystem));
+    cold_enabled
+        .enable_css_in_js()
+        .enable_dead_module_elimination();
+    let cold_output = cold_enabled.build(&entry);
+
+    assert!(
+        !cached_output.has_errors(),
+        "{:?}",
+        cached_output.diagnostics
+    );
+    assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
+
+    assert_eq!(
+        cached_enabled.load_exec_count(),
+        cold_enabled.load_exec_count(),
+        "changing CSS-in-JS mode must not reuse derived facts carrying the other mode's content key"
+    );
+    assert!(
+        cached_enabled.load_exec_count() > 0,
+        "the enabled build must load real sources before querying derived facts"
+    );
+
+    assert_eq!(
+        cached_output
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect::<Vec<_>>(),
+        cold_output
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect::<Vec<_>>(),
+        "cached and cold diagnostics must match"
+    );
+    assert_eq!(cached_output.bundle, cold_output.bundle);
+    assert_eq!(cached_output.module_count, cold_output.module_count);
+    assert_eq!(
+        cached_output.updated_module_count,
+        cold_output.updated_module_count
+    );
+    assert_eq!(
+        cached_output.cached_module_count,
+        cold_output.cached_module_count
+    );
+    assert_eq!(cached_output.entry_chunk, cold_output.entry_chunk);
+    assert_eq!(cached_output.chunks.len(), cold_output.chunks.len());
+    for (cached, cold) in cached_output.chunks.iter().zip(&cold_output.chunks) {
+        assert_eq!(cached.name, cold.name);
+        assert_eq!(cached.file_name, cold.file_name);
+        assert_eq!(cached.code, cold.code);
+        assert_eq!(cached.kind, cold.kind);
+        assert_eq!(cached.is_entry, cold.is_entry);
+        assert_eq!(cached.chunk_id, cold.chunk_id);
+        assert_eq!(cached.module_ids, cold.module_ids);
+        assert_eq!(cached.imports, cold.imports);
+        assert_eq!(cached.dynamic_imports, cold.dynamic_imports);
+        assert_eq!(cached.styles, cold.styles);
+        assert_eq!(cached.source_map, cold.source_map);
+    }
+    assert_eq!(cached_output.assets.len(), cold_output.assets.len());
+    for (cached, cold) in cached_output.assets.iter().zip(&cold_output.assets) {
+        assert_eq!(cached.file_name, cold.file_name);
+        assert_eq!(cached.bytes, cold.bytes);
+        assert_eq!(cached.is_css, cold.is_css);
+        assert_eq!(cached.owner_module_ids, cold.owner_module_ids);
+        assert_eq!(
+            cached.unscoped_css_owner_module_ids,
+            cold.unscoped_css_owner_module_ids
+        );
+    }
+    assert!(
+        !cached_output.bundle.contains("css should be compiled away"),
+        "enabled build must eliminate the consumed runtime module"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn generated_request_shaped_user_data_survives_readable_and_minified_persistent_cache() {
     let files = || {
         MemoryFileSystem::from_files([
             (
                 "src/index.js",
-                "import './a.js';import './b.js';export default globalThis.__reg.a+globalThis.__reg.b;",
+                r#"import { next } from './middle.js';
+const text='exports|module.exports|__wake_require__(7)|_r(42)';
+const template=`exports|module.exports|__wake_require__(7)|_r(42)`;
+/* exports|module.exports|__wake_require__(7)|_r(42) */
+const comment='/* exports|module.exports|__wake_require__(7)|_r(42) */';
+const regex=/exports\|module\.exports\|__wake_require__\(7\)\|_r\(42\)/;
+globalThis.__structuredEmitOrder.push('entry');
+export default JSON.stringify([globalThis.__structuredEmitOrder,text,template,comment,regex.source,next]);"#,
             ),
             (
-                "src/a.js",
-                "globalThis.__reg||(globalThis.__reg={});globalThis.__reg.a=1;",
+                "src/middle.js",
+                "import { value } from './leaf.js';globalThis.__structuredEmitOrder.push('middle');export const next=value+1;",
             ),
             (
-                "src/b.js",
-                "globalThis.__reg||(globalThis.__reg={});globalThis.__reg.b=2;",
+                "src/leaf.js",
+                "globalThis.__structuredEmitOrder=['leaf'];export const value=41;",
             ),
         ])
     };
+    let marker = "exports|module.exports|__wake_require__(7)|_r(42)";
+    let expected = serde_json::json!([
+        ["leaf", "middle", "entry"],
+        marker,
+        marker,
+        format!("/* {marker} */"),
+        r"exports\|module\.exports\|__wake_require__\(7\)\|_r\(42\)",
+        42,
+    ])
+    .to_string();
 
-    let mut cold = IncrementalBundler::new(Arc::new(files()));
-    cold.enable_minify()
-        .enable_persistent_cache(cache_path.clone());
-    let cold_output = cold.build(Path::new("src/index.js"));
-    assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
-    assert!(cold_output.bundle.contains("0,0"), "{}", cold_output.bundle);
+    for minify in [false, true] {
+        let unique = format!(
+            "wake_pcache_structured_emit_{}_{}_{}.bin",
+            std::process::id(),
+            minify,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos(),
+        );
+        let cache_path = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_file(&cache_path);
 
-    let mut warm = IncrementalBundler::new(Arc::new(files()));
-    warm.enable_minify()
-        .enable_persistent_cache(cache_path.clone());
-    let warm_output = warm.build(Path::new("src/index.js"));
-    assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
-    assert_eq!(warm.task_exec_count(), 0, "all module artifacts should hit");
-    assert_eq!(warm_output.bundle, cold_output.bundle);
+        let configure = |bundler: &mut IncrementalBundler| {
+            bundler
+                .set_platform(BuildPlatform::Node)
+                .set_module_format(ModuleFormat::CommonJs)
+                .enable_persistent_cache(cache_path.clone());
+            if minify {
+                bundler.enable_minify();
+            }
+        };
 
-    let _ = std::fs::remove_file(cache_path);
+        let mut cold = IncrementalBundler::new(Arc::new(files()));
+        configure(&mut cold);
+        let cold_output = cold.build(Path::new("src/index.js"));
+        assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
+        assert_eq!(cold_output.module_count, 3);
+
+        let mut warm = IncrementalBundler::new(Arc::new(files()));
+        configure(&mut warm);
+        let warm_output = warm.build(Path::new("src/index.js"));
+        assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+        assert_eq!(warm.task_exec_count(), 0, "all module artifacts should hit");
+        assert_eq!(warm_output.bundle, cold_output.bundle);
+
+        if node_available() {
+            let expected_literal = serde_json::to_string(&expected).unwrap();
+            for bundle in [&cold_output.bundle, &warm_output.bundle] {
+                let executed = std::process::Command::new("node")
+                    .arg("-e")
+                    .arg(format!(
+                        "{bundle}\nconst value=module.exports.default??module.exports;const expected={expected_literal};if(value!==expected){{console.error(JSON.stringify({{value,expected}}));process.exit(2)}}"
+                    ))
+                    .output()
+                    .expect("node must execute structured emit cache fixture");
+                assert!(
+                    executed.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&executed.stderr)
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(cache_path);
+    }
 }
 
 #[test]
@@ -5685,7 +7221,7 @@ fn persistent_source_map_cache_is_independent_from_module_body_cache() {
 }
 
 #[test]
-fn persistent_unmapped_build_primes_body_and_mapping_facts_for_a_mapped_build() {
+fn persistent_emission_atomically_primes_body_and_mapping_facts_for_a_mapped_build() {
     let unique = format!(
         "wake_pcache_unmapped_then_mapped_{}_{}.bin",
         std::process::id(),
@@ -5729,17 +7265,9 @@ fn persistent_unmapped_build_primes_body_and_mapping_facts_for_a_mapped_build() 
 }
 
 #[test]
-fn persistent_path_index_skips_unchanged_os_source_reads() {
-    let unique = format!(
-        "wake_path_index_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-    );
-    let root = std::env::temp_dir().join(unique);
-    std::fs::create_dir_all(&root).unwrap();
+fn persistent_cache_reads_same_stamp_source_before_reusing_derived_facts() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
     let entry = root.join("index.js");
     let dep = root.join("dep.js");
     std::fs::write(
@@ -5754,24 +7282,53 @@ fn persistent_path_index_skips_unchanged_os_source_reads() {
     let out1 = b1.build(&entry);
     assert!(!out1.has_errors(), "{:?}", out1.diagnostics);
     assert_eq!(b1.load_exec_count(), 2);
-    let mut b2 = IncrementalBundler::new(Arc::new(OsFileSystem));
-    b2.enable_persistent_cache(cache_path.clone());
-    let out2 = b2.build(&entry);
-    assert!(!out2.has_errors(), "{:?}", out2.diagnostics);
-    assert_eq!(out2.bundle, out1.bundle);
-    assert_eq!(b2.load_exec_count(), 0, "热缓存应只 stat，不重新读取源码");
-    std::fs::write(&dep, "export const value = 4300;").unwrap();
-    let mut b3 = IncrementalBundler::new(Arc::new(OsFileSystem));
-    b3.enable_persistent_cache(cache_path);
-    let out3 = b3.build(&entry);
-    assert!(!out3.has_errors(), "{:?}", out3.diagnostics);
-    assert_eq!(b3.load_exec_count(), 1, "只有变化的依赖需要重新读取");
-    assert!(out3.bundle.contains("4300"), "产物必须反映源码变化");
-    let _ = std::fs::remove_dir_all(root);
+
+    let original = std::fs::metadata(&dep).unwrap();
+    let original_modified = original.modified().unwrap();
+    std::fs::write(&dep, "export const value = 99;").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&dep)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        .unwrap();
+    let replaced = std::fs::metadata(&dep).unwrap();
+    assert_eq!(replaced.len(), original.len(), "fixture must preserve size");
+    assert_eq!(
+        replaced.modified().unwrap(),
+        original_modified,
+        "fixture must preserve mtime"
+    );
+
+    let mut cached = IncrementalBundler::new(Arc::new(OsFileSystem));
+    cached.enable_persistent_cache(cache_path);
+    let cached_output = cached.build(&entry);
+    assert!(
+        !cached_output.has_errors(),
+        "{:?}",
+        cached_output.diagnostics
+    );
+    assert_eq!(
+        cached.load_exec_count(),
+        2,
+        "a fresh process must read every source before hashing it"
+    );
+    assert!(
+        cached.task_exec_count() > 0,
+        "changed content must recompute"
+    );
+    assert!(
+        cached_output.bundle.contains("99"),
+        "output must use the replaced source: {}",
+        cached_output.bundle
+    );
+
+    let cold_output = IncrementalBundler::new(Arc::new(OsFileSystem)).build(&entry);
+    assert_eq!(cached_output.bundle, cold_output.bundle);
 }
 
 #[test]
-fn crab_component_style_add_and_delete_bypass_cross_process_source_snapshot() {
+fn crab_component_style_add_and_delete_are_observed_across_persistent_cache() {
     let unique = format!(
         "wake_crab_style_cache_{}_{}",
         std::process::id(),
@@ -5803,7 +7360,7 @@ fn crab_component_style_add_and_delete_bypass_cross_process_source_snapshot() {
     let entry = src_dir.join("index.js");
     let cache_path = root.join("cache.bin");
 
-    // 第一进程：CSS 尚不存在。组件入口也不能进入路径源码快照。
+    // 第一进程：CSS 尚不存在，loader 读取入口和组件模块。
     let mut without_css = IncrementalBundler::new(Arc::new(OsFileSystem));
     without_css
         .enable_persistent_cache(cache_path.clone())
@@ -5836,11 +7393,11 @@ fn crab_component_style_add_and_delete_bypass_cross_process_source_snapshot() {
     assert!(css.contains(".rc-button-cache-added"), "{css}");
     assert_eq!(
         with_css.load_exec_count(),
-        2,
-        "热缓存只可恢复项目入口；组件入口与新 CSS 必须真实加载"
+        3,
+        "fresh process 必须真实加载项目入口、组件入口与新增 CSS"
     );
 
-    // 第三进程：删除 CSS。组件入口必须再次真实加载，不能恢复带旧 import 的派生源码。
+    // 第三进程：删除 CSS。真实加载组件入口后不得保留带旧 import 的派生源码。
     std::fs::remove_file(&style_path).unwrap();
     let mut deleted_css = IncrementalBundler::new(Arc::new(OsFileSystem));
     deleted_css
@@ -5854,8 +7411,8 @@ fn crab_component_style_add_and_delete_bypass_cross_process_source_snapshot() {
     );
     assert_eq!(
         deleted_css.load_exec_count(),
-        1,
-        "删除 CSS 后应只真实加载组件入口"
+        2,
+        "删除 CSS 后仍应真实加载项目入口与组件入口"
     );
 
     let _ = std::fs::remove_dir_all(root);
@@ -5944,6 +7501,53 @@ fn persistent_cache_preserves_tree_shaking_output() {
     let _ = std::fs::remove_file(cache_path);
 }
 
+#[test]
+fn persistent_cache_preserves_static_export_star_resolution() {
+    fn export_star_fixture() -> MemoryFileSystem {
+        MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "import * as barrel from './barrel.js'; export const result = [barrel.value, barrel.sibling];",
+            ),
+            (
+                "src/barrel.js",
+                "export * from './values.js'; export { value } from './values.js';",
+            ),
+            (
+                "src/values.js",
+                "export const value = 'value'; export const sibling = 'sibling';",
+            ),
+        ])
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let cache_path = directory.path().join("export-star.bin");
+    let mut cold = IncrementalBundler::new(Arc::new(export_star_fixture()));
+    cold.enable_tree_shaking()
+        .enable_minify()
+        .enable_persistent_cache(cache_path.clone());
+    let cold = cold.build(Path::new("src/index.js"));
+    assert!(!cold.has_errors(), "{:?}", cold.diagnostics);
+    assert!(
+        !cold.bundle.contains("objectKeys"),
+        "an internal ESM star must use its static linker plan: {}",
+        cold.bundle
+    );
+
+    let mut warm = IncrementalBundler::new(Arc::new(export_star_fixture()));
+    warm.enable_tree_shaking()
+        .enable_minify()
+        .enable_persistent_cache(cache_path);
+    let warm_output = warm.build(Path::new("src/index.js"));
+    assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+    assert_eq!(warm_output.bundle, cold.bundle);
+    assert_eq!(
+        warm.task_exec_count(),
+        0,
+        "the stable export-star plan must preserve fresh-process cache hits"
+    );
+}
+
 // ============================================================
 // Yarn PnP（Plug'n'Play）解析（hermetic：内存 FS 模拟 PnP 项目，不依赖真实 Yarn 缓存）
 // ============================================================
@@ -6022,6 +7626,108 @@ fn pnp_fixture() -> MemoryFileSystem {
             "export function sub() { return 1; }".to_string(),
         ),
     ])
+}
+
+fn crab_legacy_pnp_fixture(component_declares_css: bool) -> MemoryFileSystem {
+    let mut component_dependencies = vec![serde_json::json!(["@crab-dev/rc-alert", "npm:1.0.0"])];
+    if component_declares_css {
+        component_dependencies.push(serde_json::json!(["@crab-dev/css", "npm:2.0.0"]));
+    }
+    let pnp_data = serde_json::json!({
+        "enableTopLevelFallback": false,
+        "fallbackExclusionList": [],
+        "fallbackPool": [],
+        "packageRegistryData": [
+            [serde_json::Value::Null, [[serde_json::Value::Null, {
+                "packageLocation": "./",
+                "packageDependencies": [["@crab-dev/rc-alert", "npm:1.0.0"]],
+                "linkType": "SOFT"
+            }]]],
+            ["@crab-dev/rc-alert", [["npm:1.0.0", {
+                "packageLocation": "./.pnp-store/rc-alert/",
+                "packageDependencies": component_dependencies,
+                "linkType": "HARD"
+            }]]],
+            ["@crab-dev/css", [["npm:2.0.0", {
+                "packageLocation": "./.pnp-store/crab-css/",
+                "packageDependencies": [["@crab-dev/css", "npm:2.0.0"]],
+                "linkType": "HARD"
+            }]]]
+        ]
+    });
+    let pnp_cjs = format!(
+        "#!/usr/bin/env node\nconst RAW_RUNTIME_STATE =\n'{}';\n",
+        pnp_data
+    );
+    MemoryFileSystem::from_files([
+        (".pnp.cjs", pnp_cjs.as_str()),
+        (
+            "src/index.js",
+            "import value from '@crab-dev/rc-alert'; export { value };",
+        ),
+        (
+            ".pnp-store/rc-alert/package.json",
+            r#"{"name":"@crab-dev/rc-alert","version":"1.0.0","module":"esm/index.mjs"}"#,
+        ),
+        (
+            ".pnp-store/rc-alert/esm/index.mjs",
+            "import { cx } from '@linaria/core'; export default cx('pnp', 'ok');",
+        ),
+        (
+            ".pnp-store/crab-css/package.json",
+            r#"{"name":"@crab-dev/css","version":"2.0.0","module":"index.mjs"}"#,
+        ),
+        (
+            ".pnp-store/crab-css/index.mjs",
+            "export function cx(a, b) { return 'PNP_CRAB:' + a + '-' + b; }",
+        ),
+        (
+            "alias-css.mjs",
+            "export function cx() { return 'ALIAS_MUST_NOT_WIN'; }",
+        ),
+    ])
+}
+
+#[test]
+fn crab_legacy_runtime_uses_the_component_pnp_dependency() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_legacy_pnp_fixture(true)));
+    let mut options = wake_resolver::ResolveOptions::default();
+    options
+        .alias
+        .push(("@crab-dev/css".to_string(), PathBuf::from("alias-css.mjs")));
+    bundler.set_resolve_options(options);
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(bundler.is_pnp(), "fixture must activate PnP");
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.bundle.contains("PNP_CRAB:"), "{}", out.bundle);
+    assert!(!out.bundle.contains("ALIAS_MUST_NOT_WIN"), "{}", out.bundle);
+}
+
+#[test]
+fn crab_legacy_runtime_keeps_pnp_undeclared_authoritative_over_alias() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_legacy_pnp_fixture(false)));
+    let mut options = wake_resolver::ResolveOptions::default();
+    options
+        .alias
+        .push(("@crab-dev/css".to_string(), PathBuf::from("alias-css.mjs")));
+    bundler.set_resolve_options(options);
+    let out = bundler.build(Path::new("src/index.js"));
+    assert!(bundler.is_pnp(), "fixture must activate PnP");
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code.as_deref() == Some("WAKE0301"))
+        .expect("undeclared mapped dependency must be diagnosed");
+    assert!(
+        diagnostic.message.contains("@linaria/core"),
+        "source-facing diagnostic must retain the original specifier: {diagnostic:?}"
+    );
+    assert!(
+        diagnostic.notes.iter().any(|note| {
+            note.contains("@crab-dev/css") && note.contains("issuer 未声明该依赖")
+        }),
+        "resolver-owned PnpDependency::Undeclared reason must survive: {diagnostic:?}"
+    );
 }
 
 /// PnP 包位置不含 `node_modules`：验证 JSX 兼容识别基于 package identity，而非目录布局。
@@ -6829,7 +8535,141 @@ fn minified_code_and_source_maps_are_deterministic_across_worker_counts() {
     for (serial_asset, parallel_asset) in serial.assets.iter().zip(&parallel.assets) {
         assert_eq!(serial_asset.file_name, parallel_asset.file_name);
         assert_eq!(serial_asset.bytes, parallel_asset.bytes);
+        assert_eq!(
+            serial_asset.owner_module_ids,
+            parallel_asset.owner_module_ids
+        );
+        assert_eq!(
+            serial_asset.unscoped_css_owner_module_ids,
+            parallel_asset.unscoped_css_owner_module_ids
+        );
     }
+}
+
+#[test]
+fn binary_asset_owners_union_duplicate_css_importers_and_are_worker_deterministic() {
+    let build = |threads| {
+        let fs = MemoryFileSystem::new();
+        fs.insert(
+            "src/index.js",
+            "export const alpha=()=>import('./alpha.js');export const beta=()=>import('./beta.js')",
+        );
+        fs.insert(
+            "src/alpha.js",
+            "import './alpha.css';export const value='alpha'",
+        );
+        fs.insert(
+            "src/beta.js",
+            "import './beta.css';export const value='beta'",
+        );
+        fs.insert(
+            "src/alpha.css",
+            "@font-face{font-family:x;src:url('./shared.woff2')} .alpha{background:url('./alpha.png')}",
+        );
+        fs.insert(
+            "src/beta.css",
+            "@font-face{font-family:x;src:url('./shared.woff2')} .beta{background:url('./beta.png')}",
+        );
+        fs.insert("src/shared.woff2", vec![7_u8; 64]);
+        fs.insert("src/alpha.png", vec![1_u8; 64]);
+        fs.insert("src/beta.png", vec![2_u8; 64]);
+        let mut bundler = IncrementalBundler::new(Arc::new(fs));
+        bundler
+            .set_test_thread_count(threads)
+            .set_asset_inline_limit(0)
+            .enable_css_extraction()
+            .enable_code_splitting();
+        bundler.build(Path::new("src/index.js"))
+    };
+
+    let serial = build(1);
+    let parallel = build(4);
+    assert!(!serial.has_errors(), "{:?}", serial.diagnostics);
+    assert!(!parallel.has_errors(), "{:?}", parallel.diagnostics);
+    assert_eq!(serial.assets.len(), parallel.assets.len());
+    for (serial_asset, parallel_asset) in serial.assets.iter().zip(&parallel.assets) {
+        assert_eq!(serial_asset.file_name, parallel_asset.file_name);
+        assert_eq!(serial_asset.bytes, parallel_asset.bytes);
+        assert_eq!(serial_asset.is_css, parallel_asset.is_css);
+        assert_eq!(
+            serial_asset.owner_module_ids,
+            parallel_asset.owner_module_ids
+        );
+        assert_eq!(
+            serial_asset.unscoped_css_owner_module_ids,
+            parallel_asset.unscoped_css_owner_module_ids
+        );
+    }
+
+    let shared = serial
+        .assets
+        .iter()
+        .find(|asset| asset.file_name.ends_with(".woff2"))
+        .expect("shared font asset");
+    for css in serial.assets.iter().filter(|asset| asset.is_css) {
+        assert_eq!(
+            css.unscoped_css_owner_module_ids, css.owner_module_ids,
+            "ordinary CSS owners must be marked unscoped"
+        );
+    }
+    assert_eq!(
+        shared.owner_module_ids.len(),
+        2,
+        "the same content file emitted by two CSS modules must union both owners"
+    );
+    let owner_chunks = serial
+        .chunks
+        .iter()
+        .filter(|chunk| {
+            chunk
+                .module_ids
+                .iter()
+                .any(|id| shared.owner_module_ids.contains(id))
+        })
+        .map(|chunk| chunk.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(owner_chunks.contains(&"alpha"), "{owner_chunks:?}");
+    assert!(owner_chunks.contains(&"beta"), "{owner_chunks:?}");
+
+    let private = serial
+        .assets
+        .iter()
+        .filter(|asset| asset.file_name.ends_with(".png"))
+        .collect::<Vec<_>>();
+    assert_eq!(private.len(), 2);
+    assert!(
+        private
+            .iter()
+            .all(|asset| asset.owner_module_ids.len() == 1),
+        "private image ownership must stay local: {:?}",
+        private
+            .iter()
+            .map(|asset| (&asset.file_name, &asset.owner_module_ids))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn extracted_css_modules_are_scoped_metadata() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "import styles from './button.module.css';export default styles.button",
+        ),
+        ("src/button.module.css", ".button { color: rebeccapurple; }"),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler.enable_css_extraction();
+    let output = bundler.build(Path::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    let css = output
+        .assets
+        .iter()
+        .find(|asset| asset.is_css)
+        .expect("CSS Module asset");
+    assert!(!css.owner_module_ids.is_empty());
+    assert!(css.unscoped_css_owner_module_ids.is_empty());
 }
 
 /// `sources` 路径规整：去 Windows `\\?\` 扩展长度前缀、相对化、统一正斜杠。
@@ -7119,6 +8959,86 @@ fn css_in_js_dev_injects_style_tag() {
 }
 
 #[test]
+fn crab_css_dev_empty_style_emits_removal_only_after_a_successful_rebuild() {
+    let fs = Arc::new(crab_css_fixture(
+        "import { globalStyle } from '@crab-dev/css';\n\
+         globalStyle`body { color: rebeccapurple; }`;\n\
+         export const answer = 42;",
+    ));
+    let mut bundler = IncrementalBundler::new(fs.clone());
+    bundler.enable_css_in_js();
+
+    let first = bundler.build(Path::new("src/index.tsx"));
+    assert!(!first.has_errors(), "{:?}", first.diagnostics);
+    assert!(first.bundle.contains("createElement(\"style\")"));
+    assert!(first.bundle.contains("color: rebeccapurple"));
+    let style_id = |bundle: &str| {
+        let start = bundle.find("\"crab-css-").expect("style registry id") + 1;
+        let tail = &bundle[start..];
+        tail[..tail.find('"').expect("closing style registry id quote")].to_string()
+    };
+    let first_style_id = style_id(&first.bundle);
+
+    fs.insert(
+        "src/index.tsx",
+        "import { globalStyle } from '@crab-dev/css';\n\
+         globalStyle`body { color: ${compute()}; }`;\n\
+         export const answer = 42;",
+    );
+    let failed = bundler.build(Path::new("src/index.tsx"));
+    assert!(failed.has_errors(), "{:?}", failed.diagnostics);
+    assert!(
+        !failed.bundle.contains("document.__wake_css_styles__"),
+        "a failed rebuild must not carry any style update: {}",
+        failed.bundle
+    );
+
+    fs.insert(
+        "src/index.tsx",
+        "import { globalStyle } from '@crab-dev/css';\n\
+         globalStyle``;\n\
+         export const answer = 42;",
+    );
+    let empty = bundler.build(Path::new("src/index.tsx"));
+    assert!(!empty.has_errors(), "{:?}", empty.diagnostics);
+    assert!(
+        empty.bundle.contains("delete __wake_cij_registry__"),
+        "a successful empty style must remove the module's stable style slot: {}",
+        empty.bundle
+    );
+    assert!(!empty.bundle.contains("createElement(\"style\")"));
+    assert_eq!(
+        style_id(&empty.bundle),
+        first_style_id,
+        "the removal tombstone must target the previous successful style slot"
+    );
+    assert_eq!(
+        empty.bundle.matches("var __wake_cij_owners__").count(),
+        1,
+        "only the direct marker module may emit a style update"
+    );
+}
+
+#[test]
+fn crab_css_dev_runtime_only_module_does_not_emit_a_style_update() {
+    let mut bundler = IncrementalBundler::new(Arc::new(crab_css_fixture(
+        "import { createVar, assignVars } from '@crab-dev/css';\n\
+         const accent = createVar('accent');\n\
+         export const style = assignVars({ [accent]: 'rebeccapurple' });",
+    )));
+    bundler.enable_css_in_js();
+
+    let output = bundler.build(Path::new("src/index.tsx"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert!(output.bundle.contains("assignVars"), "{}", output.bundle);
+    assert!(
+        !output.bundle.contains("document.__wake_css_styles__"),
+        "a module without a style-producing template must not touch the registry: {}",
+        output.bundle
+    );
+}
+
+#[test]
 fn css_in_js_disabled_leaves_source_untouched() {
     let out = IncrementalBundler::new(Arc::new(crab_css_token_fixture()))
         .build(Path::new("src/index.tsx"));
@@ -7211,7 +9131,7 @@ fn crab_css_dev_is_deterministic_and_runtime_scopes_style_registry_slots() {
     assert_eq!(
         style_id(&rebuilt.bundle),
         first_id,
-        "one bundler must retain its HMR registry slot"
+        "one retained bundler must keep the same development style registry slot"
     );
 
     let mut same_input = IncrementalBundler::new(Arc::new(crab_css_fixture(
@@ -7693,73 +9613,260 @@ fn css_in_js_cross_module_class_reference() {
         "跨模块类名引用未生效\nbase={base_cls}\ncss={css}"
     );
 }
-/// Runtime factory parameters must avoid identifiers that remain in the emitted module. Import
-/// aliases replaced by optimizer-owned live namespace reads no longer reserve those names.
+/// Factory parameters come from typed runtime symbols. User bindings keep their source spelling
+/// (including direct-eval visibility), while a concat candidate with different runtime names stays
+/// in its own factory. Persistent hits must restore the same body+name contract.
 #[test]
-fn runtime_factory_names_avoid_existing_import_bindings() {
+fn typed_runtime_contract_preserves_colliding_eval_and_literal_data_across_cache() {
+    const LITERAL: &str = "exports|module.exports|__wake_require__(7)|_r(42)|__wake_interop_default|__wake_interop_star|__wake_require__.metaUrl";
+    const TEMPLATE: &str = "中文:exports|module.exports|__wake_require__(7)|_r(42)";
+    const REGEXP_SOURCE: &str = r"exports|module\.exports|__wake_require__\(7\)|_r\(42\)";
+    let files = || {
+        MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "import {value} from './dep.js';\
+                 const module=4;const exports=5;const __wake_require__=6;\
+                 const literal='exports|module.exports|__wake_require__(7)|_r(42)|__wake_interop_default|__wake_interop_star|__wake_require__.metaUrl';\
+                 const template=`中文:exports|module.exports|__wake_require__(7)|_r(42)`;\
+                 const pattern=/exports|module\\.exports|__wake_require__\\(7\\)|_r\\(42\\)/;\
+                 const url=import.meta.url;\
+                 export default [value+eval('module+exports+__wake_require__'),literal,template,pattern.source,url];",
+            ),
+            (
+                "src/dep.js",
+                "const module=1;const exports=2;const __wake_require__=3;export const value=eval('module+exports+__wake_require__');",
+            ),
+        ])
+    };
+
+    for minify in [false, true] {
+        let cache_path = std::env::temp_dir().join(format!(
+            "wake_runtime_names_{}_{}_{}.bin",
+            std::process::id(),
+            minify,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&cache_path);
+        let configure = |bundler: &mut IncrementalBundler| {
+            bundler
+                .set_platform(BuildPlatform::Node)
+                .set_module_format(ModuleFormat::CommonJs)
+                .enable_persistent_cache(cache_path.clone());
+            if minify {
+                bundler.enable_minify();
+            }
+        };
+
+        let mut cold = IncrementalBundler::new(Arc::new(files()));
+        configure(&mut cold);
+        let cold_output = cold.build(Path::new("src/index.js"));
+        assert!(!cold_output.has_errors(), "{:?}", cold_output.diagnostics);
+
+        let mut warm = IncrementalBundler::new(Arc::new(files()));
+        configure(&mut warm);
+        let warm_output = warm.build(Path::new("src/index.js"));
+        assert!(!warm_output.has_errors(), "{:?}", warm_output.diagnostics);
+        assert_eq!(warm.task_exec_count(), 0, "body cache should be warm");
+        assert_eq!(warm_output.bundle, cold_output.bundle);
+        assert!(
+            cold_output.bundle.contains("module$1")
+                && cold_output.bundle.contains("exports$1")
+                && cold_output.bundle.contains("__wake_require__$1"),
+            "typed factory names must avoid source bindings without rewriting them:\n{}",
+            &cold_output.bundle[..cold_output.bundle.len().min(1800)]
+        );
+        if minify {
+            assert!(
+                !cold_output
+                    .bundle
+                    .contains("function __wake_interop_default(")
+                    && !cold_output.bundle.contains("function __wake_interop_star("),
+                "user data must not manufacture compiler-owned interop capabilities:\n{}",
+                cold_output.bundle
+            );
+            assert!(
+                cold_output.bundle.contains("r.metaUrl=function()"),
+                "the surviving typed import.meta.url edit must install the compact runtime service:\n{}",
+                cold_output.bundle
+            );
+        }
+
+        if node_available() {
+            for bundle in [&cold_output.bundle, &warm_output.bundle] {
+                let expected = serde_json::to_string(&serde_json::json!([
+                    21,
+                    LITERAL,
+                    TEMPLATE,
+                    REGEXP_SOURCE,
+                    ""
+                ]))
+                .unwrap();
+                let run = std::process::Command::new("node")
+                    .arg("-e")
+                    .arg(format!(
+                        "{bundle}\nconst value=module.exports.default??module.exports;if(JSON.stringify(value)!=={expected:?}){{console.error(value);process.exit(2)}}"
+                    ))
+                    .output()
+                    .expect("node must execute runtime-name fixture");
+                assert!(
+                    run.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(cache_path);
+    }
+}
+
+#[test]
+fn mixed_runtime_names_keep_only_the_noncanonical_member_out_of_concat() {
     let fs = MemoryFileSystem::from_files([
         (
-            "src/dep.js",
-            "export const a=1;export const b=2;export const c=3;",
+            "src/index.js",
+            "import {left} from './collision.js';import {right} from './canonical.js';export default left+right;",
         ),
         (
-            "src/index.js",
-            "import {a as m,b as $,c as _r} from './dep.js';export default m+$+_r;",
+            "src/collision.js",
+            "const module=1;const exports=2;const __wake_require__=3;export const left=eval('module+exports+__wake_require__');",
         ),
+        ("src/canonical.js", "export const right=7;"),
     ]);
-    let mut b = IncrementalBundler::new(Arc::new(fs));
-    b.enable_minify();
-    let out = b.build(Path::new("src/index.js"));
-    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_minify()
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs);
+    let output = bundler.build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
 
     assert!(
-        !out.bundle.contains("const m =")
-            && !out.bundle.contains("const $ =")
-            && !out.bundle.contains("const _r ="),
-        "optimizer-owned live import reads must remove the obsolete alias bindings:\n{}",
-        &out.bundle[..out.bundle.len().min(1200)]
+        output
+            .bundle
+            .contains("1:function(module$1,exports$1,__wake_require__$1)"),
+        "the noncanonical member must retain its own typed factory:\n{}",
+        output.bundle
     );
     assert!(
-        out.bundle.contains("r.m=t;r.c=c"),
-        "runtime should expose module and cache namespaces:\n{}",
-        &out.bundle[..out.bundle.len().min(1200)]
+        output
+            .bundle
+            .contains("3:function(module,exports,__wake_require__)"),
+        "the canonical sibling should still enter the synthetic concat factory:\n{}",
+        output.bundle
+    );
+    assert!(
+        !output.bundle.contains("2:function("),
+        "the canonical source module must not retain a redundant factory:\n{}",
+        output.bundle
     );
 
-    if std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return;
+    if node_available() {
+        let run = std::process::Command::new("node")
+            .arg("-e")
+            .arg(format!(
+                "{}\nconst value=module.exports.default??module.exports;if(value!==13)process.exit(2)",
+                output.bundle
+            ))
+            .output()
+            .expect("node must execute mixed runtime-name concat fixture");
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
-    let dir = std::env::temp_dir().join("wake_runtime_names_regression");
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("bundle.cjs");
-    std::fs::write(&p, &out.bundle).unwrap();
-    let syntax = std::process::Command::new("node")
-        .arg("--check")
-        .arg(&p)
-        .output()
-        .unwrap();
+}
+
+/// Direct eval can observe and mutate the CommonJS wrapper bindings without an identifier node for
+/// `module` or `exports` in the parser tree. Such a hybrid ESM must retain its own factory; otherwise
+/// scope concat would let the eval mutate the entry module's exports. The structural summary and
+/// emitted body must remain paired across a persistent-cache hit.
+#[test]
+fn direct_eval_hybrid_keeps_commonjs_owner_across_persistent_cache() {
+    let files = || {
+        MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "import {value} from './hybrid.js';export default value;",
+            ),
+            (
+                "src/hybrid.js",
+                "export const value=eval('module.exports.extra=5');",
+            ),
+        ])
+    };
+    let cache_path = std::env::temp_dir().join(format!(
+        "wake_direct_eval_concat_{}_{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must follow Unix epoch")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&cache_path);
+    let build = || {
+        let mut bundler = IncrementalBundler::new(Arc::new(files()));
+        bundler
+            .enable_minify()
+            .set_platform(BuildPlatform::Node)
+            .set_module_format(ModuleFormat::CommonJs)
+            .enable_persistent_cache(cache_path.clone());
+        let output = bundler.build(Path::new("src/index.js"));
+        (bundler, output)
+    };
+
+    let (_, cold) = build();
+    assert!(!cold.has_errors(), "{:?}", cold.diagnostics);
+    let (warm_bundler, warm) = build();
+    assert!(!warm.has_errors(), "{:?}", warm.diagnostics);
+    assert_eq!(
+        warm_bundler.task_exec_count(),
+        0,
+        "body cache should be warm"
+    );
+    assert_eq!(warm.bundle, cold.bundle);
     assert!(
-        syntax.status.success(),
-        "{}",
-        String::from_utf8_lossy(&syntax.stderr)
+        cold.bundle
+            .contains("1:function(module,exports,__wake_require__)"),
+        "the direct-eval hybrid must retain an independent factory:\n{}",
+        cold.bundle
     );
-    let script = format!(
-        "const r=require({:?});if((r.default??r)!==6)process.exit(2);",
-        p.to_string_lossy()
-    );
-    let run = std::process::Command::new("node")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+
+    if node_available() {
+        let dir = std::env::temp_dir().join(format!(
+            "wake_direct_eval_concat_run_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must follow Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (index, bundle) in [&cold.bundle, &warm.bundle].into_iter().enumerate() {
+            let bundle_path = dir.join(format!("bundle-{index}.cjs"));
+            std::fs::write(&bundle_path, bundle).unwrap();
+            let script = format!(
+                "const value=require({:?});if(value.default!==5||Object.prototype.hasOwnProperty.call(value,'extra')){{console.error(value);process.exit(2)}}",
+                bundle_path.to_string_lossy()
+            );
+            let output = std::process::Command::new("node")
+                .arg("-e")
+                .arg(script)
+                .output()
+                .expect("execute direct-eval concat fixture");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    let _ = std::fs::remove_file(cache_path);
 }
 
 #[test]
@@ -7807,10 +9914,7 @@ fn destructured_export_uses_the_mangled_binding_name() {
 }
 
 /// 回归：`module.exports = X` 形态的 CJS 模块在 minify 路径下必须真正导出。
-///
-/// 曾因 `compact_body_names` 把 `module.exports` 改写成 `m.$`（`$` 是 exports 的**值**，
-/// `m` 才是 module）导致赋值落到无关属性上，模块导出恒为空对象——任何
-/// `module.exports = X` 形态的 CJS 包整包失效。
+/// Factory 形参和 typed codegen 共享规范名称，不对生成 body 做二次全文改写。
 #[test]
 fn cjs_module_exports_assignment_survives_minify() {
     let fs = MemoryFileSystem::from_files([
@@ -7834,8 +9938,8 @@ fn cjs_module_exports_assignment_survives_minify() {
         &out.bundle[..out.bundle.len().min(800)]
     );
     assert!(
-        out.bundle.contains("m.exports="),
-        "`module.exports` 应改写为 `m.exports`:\n{}",
+        out.bundle.contains("module.exports="),
+        "typed codegen 与规范 factory 形参应直接共享 `module.exports`:\n{}",
         &out.bundle[..out.bundle.len().min(800)]
     );
 
@@ -8073,12 +10177,12 @@ fn crab_css_keyframes_and_global_style_are_extracted() {
     let out = b.build(Path::new("src/index.tsx"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
 
-    let css = out
-        .assets
-        .iter()
-        .find(|a| a.is_css)
-        .map(|a| String::from_utf8(a.bytes.clone()).unwrap())
-        .expect("应产出 CSS");
+    let css_asset = out.assets.iter().find(|a| a.is_css).expect("应产出 CSS");
+    assert!(
+        css_asset.unscoped_css_owner_module_ids.is_empty(),
+        "explicit Wake CSS-in-JS globalStyle is not an implicit raw CSS import"
+    );
+    let css = String::from_utf8(css_asset.bytes.clone()).unwrap();
 
     let animation = css
         .split("@keyframes ")
@@ -8752,9 +10856,10 @@ fn public_path_injected_into_chunk_loader() {
         "entry chunk 应注入 publicPath:\n{}",
         out.bundle
     );
-    // 注入点与消费点对齐：运行时确实用 publicPath 拼 chunk 的 script.src。
+    // 注入点与消费点对齐：运行时先用 publicPath 拼普通 chunk URL，再赋给 script.src。
     assert!(
-        out.bundle.contains("s.src = W.publicPath + file;"),
+        out.bundle.contains("var url = W.publicPath + file;")
+            && out.bundle.contains("s.src = url;"),
         "运行时应用 publicPath 拼 chunk URL:\n{}",
         out.bundle
     );
@@ -9012,7 +11117,8 @@ fn top_level_await_minified_bundle_runs_in_node() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     // 含顶层 await → 退出模块合并，回到逐模块注册表 + async 包装。
     assert!(
-        out.bundle.contains("async function(m,$,_r)"),
+        out.bundle
+            .contains("async function(module,exports,__wake_require__)"),
         "minify 路径应有 async 包装:\n{}",
         out.bundle
     );

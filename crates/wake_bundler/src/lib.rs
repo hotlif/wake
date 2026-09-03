@@ -10,17 +10,22 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use wake_common::{Diagnostic, FileSystem, FxHashMap};
-use wake_ecma_codegen::ModuleLinker;
+use wake_common::{Diagnostic, FileSystem};
+use wake_ecma_codegen::ModuleRequestKind;
 
 mod chunk;
 mod concat;
-pub mod incremental;
+mod generation;
+mod incremental;
 pub mod library;
 mod loader;
 mod session;
-pub use incremental::IncrementalBundler;
-pub use session::{BuildOptions, BuildRequest, BuildSession};
+pub use generation::BuildGeneration;
+pub(crate) use incremental::IncrementalBundler;
+pub use session::{
+    BuildOptions, BuildRequest, BuildSession, FederationBuildPlan, FederationEntryExport,
+    JsxOptions,
+};
 // 供 CLI 组装别名而无需直接依赖 wake_resolver。
 pub use wake_resolver::ResolveOptions;
 
@@ -91,6 +96,17 @@ pub struct OutputAsset {
     pub bytes: Vec<u8>,
     /// 是否为抽取的 CSS（`true` → HTML 注入 `<link>`；`false` → 二进制资源）。
     pub is_css: bool,
+    /// 直接产出此文件的模块 id（升序、去重）。
+    ///
+    /// 二进制模块和 CSS `url()` 都可能产出带外文件；同一内容文件被多个模块引用时只写盘
+    /// 一次，但必须保留所有 owner，供 federation 按 expose 的 chunk/module closure 精确授权。
+    /// id 只在当前 [`BuildOutput`] 内有意义，不可作为跨构建身份。
+    pub owner_module_ids: Vec<u32>,
+    /// 此 CSS 文件中来自普通、未作用域 `.css` 模块的 owner id（升序、去重）。
+    ///
+    /// `.module.css` 与 Wake CSS-in-JS 不进入该集合。Federation producer 用它对
+    /// `host-rendered` expose 做构建期全局样式门禁；二进制资产恒为空。
+    pub unscoped_css_owner_module_ids: Vec<u32>,
 }
 
 /// 一个产物 chunk（DESIGN §6.3）。
@@ -112,6 +128,8 @@ pub struct OutputChunk {
     pub module_ids: Vec<u32>,
     /// 依赖的其它 chunk 文件名（须先加载；供 manifest）。
     pub imports: Vec<String>,
+    /// 此 chunk 内动态 import 可到达的目标 chunk 文件名（供 federation asset closure）。
+    pub dynamic_imports: Vec<String>,
     /// 在该 JavaScript chunk 执行前必须激活的抽取 CSS 文件。入口由 HTML 加载，异步
     /// chunk 由 Wake runtime 的 chunk manifest 加载。
     pub styles: Vec<String>,
@@ -165,6 +183,7 @@ pub(crate) fn single_chunk(
         chunk_id: 0,
         module_ids,
         imports: Vec::new(),
+        dynamic_imports: Vec::new(),
         styles: Vec::new(),
         source_map: None, // 由调用方（IncrementalBundler）在启用 sourcemap 时回填
     };
@@ -197,60 +216,31 @@ impl Bundler {
     }
 }
 
-const SMALL_LINKER_LOOKUP: usize = 8;
-
-pub(crate) enum SpecifierLookup<'a> {
-    Slice(&'a [(String, u32)]),
-    Map(FxHashMap<&'a str, u32>),
+/// Stable request identity. Equal specifier bytes may resolve differently under import and
+/// require conditions, so the kind is part of every linker key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ModuleRequestKey {
+    pub(crate) specifier: String,
+    pub(crate) kind: ModuleRequestKind,
 }
 
-impl<'a> SpecifierLookup<'a> {
-    pub(crate) fn new(entries: &'a [(String, u32)]) -> Self {
-        if entries.len() <= SMALL_LINKER_LOOKUP {
-            Self::Slice(entries)
-        } else {
-            Self::Map(
-                entries
-                    .iter()
-                    .map(|(specifier, id)| (specifier.as_str(), *id))
-                    .collect(),
-            )
-        }
-    }
-
-    fn get(&self, specifier: &str) -> Option<u32> {
-        match self {
-            Self::Slice(entries) => entries
-                .iter()
-                .find_map(|(candidate, id)| (candidate == specifier).then_some(*id)),
-            Self::Map(entries) => entries.get(specifier).copied(),
+impl ModuleRequestKey {
+    pub(crate) fn new(specifier: impl Into<String>, kind: ModuleRequestKind) -> Self {
+        Self {
+            specifier: specifier.into(),
+            kind,
         }
     }
 }
 
-pub(crate) struct Linker<'a> {
-    pub(crate) map: SpecifierLookup<'a>,
-    /// 动态 import 说明符 → async/shared chunk id（代码分割，6.5）。空 = 不分割。
-    pub(crate) dyn_chunk: SpecifierLookup<'a>,
-    /// 本模块依赖里属于 async 子图（顶层 await 传染）的模块 id。空 = 无顶层 await。
-    pub(crate) async_ids: &'a [u32],
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ResolvedModuleRequest {
+    pub(crate) request: ModuleRequestKey,
+    pub(crate) module_id: u32,
 }
 
-impl ModuleLinker for Linker<'_> {
-    fn module_id(&self, specifier: &str) -> Option<u32> {
-        self.map.get(specifier)
-    }
-    fn dynamic_chunk(&self, specifier: &str) -> Option<u32> {
-        self.dyn_chunk.get(specifier)
-    }
-    fn is_async_module(&self, id: u32) -> bool {
-        self.async_ids.contains(&id)
-    }
-}
-
-/// mini runtime 前半（模块注册表定义之前）。含 CJS interop helper（DESIGN §6.1）：
-/// `__wake_interop_default` 让 `import X from 'cjs'` 对纯 CJS 取整个 exports、对转译 ESM 取 `.default`；
-/// `__wake_interop_star` 为 `import * as ns` 提供 namespace（纯 CJS 补 `default` = 整个 exports）。
+/// mini runtime 前半（模块注册表定义之前）。Module interop is emitted structurally by the
+/// typed finalizer; live runtime services are appended from paired capability metadata.
 pub(crate) const PRELUDE: &str = r#"(function(root) {
 var __wake_cache__ = {};
 function __wake_require__(id) {
@@ -261,17 +251,6 @@ function __wake_require__(id) {
   __wake_modules__[id].call(module.exports, module, module.exports, __wake_require__);
   return module.exports;
 }
-function __wake_interop_default(m) { return m && m.__esModule ? m.default : m; }
-function __wake_interop_star(m) {
-  if (m && m.__esModule) return m;
-  var ns = {};
-  if (m != null) { for (var k in m) if (Object.prototype.hasOwnProperty.call(m, k) && k !== "default") ns[k] = m[k]; }
-  ns.default = m;
-  return ns;
-}
-__wake_require__.metaUrl = function () {
-  return typeof document !== "undefined" ? document.baseURI : "";
-};
 "#;
 
 /// mini runtime 前半的 **async 变体**：产物含顶层 await 时启用（DESIGN §6.1.1）。
@@ -294,17 +273,6 @@ function __wake_require__(id) {
   }
   return module.exports;
 }
-function __wake_interop_default(m) { return m && m.__esModule ? m.default : m; }
-function __wake_interop_star(m) {
-  if (m && m.__esModule) return m;
-  var ns = {};
-  if (m != null) { for (var k in m) if (Object.prototype.hasOwnProperty.call(m, k) && k !== "default") ns[k] = m[k]; }
-  ns.default = m;
-  return ns;
-}
-__wake_require__.metaUrl = function () {
-  return typeof document !== "undefined" ? document.baseURI : "";
-};
 "#;
 
 /// mini runtime 后半（入口执行之后，导出到 module.exports 或全局）。

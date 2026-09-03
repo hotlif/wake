@@ -7,11 +7,10 @@
 //! chunks still have to reparse.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use wake_bundler::{BuildOutput, IncrementalBundler};
+use wake_bundler::{BuildOptions, BuildOutput, BuildRequest, BuildSession};
 use wake_common::{Interner, MemoryFileSystem};
 use wake_ecma_ast::expr::{
     ArrowBody, AssignmentOperator, BinaryOperator, ClassMember, Expression, LogicalOperator,
@@ -52,14 +51,15 @@ fn build(fixture: Fixture, minify: bool, source_map: bool) -> BuildOutput {
     for (path, source) in fixture.files {
         fs.insert(path, source.as_bytes().to_vec());
     }
-    let mut bundler = IncrementalBundler::new(Arc::new(fs));
-    if minify {
-        bundler.enable_minify();
-    }
-    if source_map {
-        bundler.enable_sourcemap();
-    }
-    let output = bundler.build(Path::new(fixture.entry));
+    let output = BuildSession::new_one_shot(
+        Arc::new(fs),
+        BuildOptions {
+            minify,
+            source_map,
+            ..BuildOptions::default()
+        },
+    )
+    .build_once(BuildRequest::new(fixture.entry));
     assert!(
         !output.has_errors(),
         "[{} / minify={minify} / map={source_map}] build failed: {:?}",

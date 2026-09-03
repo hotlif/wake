@@ -17,7 +17,7 @@
 //! id 分配走确定性 BFS（层序 + 依赖序），`par_request` 保序返回 → 两遍相同构建 id 相同 →
 //! linker cell 稳定 → 缓存命中不受并行影响。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,34 +25,40 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_utils::CachePadded;
 use wake_cache::{
-    BuildCache, CachedDep, CachedDiscardedStaticRequest, CachedLiveness, CachedMapping,
-    CachedModuleMappings, CachedNamedImport, CachedUse, FileStamp, ModuleSummary,
+    BuildCache, CacheLoadOutcome, CachedDep, CachedLiveness, CachedMapping, CachedModuleMappings,
+    CachedModuleRequest, CachedModuleRequestKind, CachedModuleRequestRole,
+    CachedModuleRuntimeCapabilities, CachedModuleRuntimeNames, CachedNamedImport,
+    CachedRetainedRequest, CachedUse, ModuleSummary,
 };
 use wake_common::{
-    Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, SourceFile, Span, fs::normalize,
+    Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, Label, Severity, SourceFile, Span,
+    fs::normalize,
 };
-use wake_ecma_ast::{
-    DependencyKind, Expression, MemberProperty, ModuleAst, Program, SourceType, Statement,
-    UnaryOperator,
+use wake_compiler_core::{
+    CompilerBackend, CompilerDiagnostic, CompilerMappings, CompilerStage as CoreCompilerStage,
+    GeneratedModuleRequest as CoreGeneratedModuleRequest,
+    GeneratedModuleRequestRole as CoreGeneratedModuleRequestRole, LifetimeMode,
+    MapMode as CompilerMapMode, ModuleFinalizeFacts, ModuleRequestKind as CoreModuleRequestKind,
+    OptimizeLinkFacts, OptimizeOptions as CompilerOptimizeOptions,
+    OptimizedModule as CompilerOptimizedModule, ParseInput as CompilerParseInput,
+    ParsedDependencyKind as CoreParsedDependencyKind, ParsedModule as CompilerParsedModule,
+    PreparedDefines, RuntimeNames as CompilerRuntimeNames, TransformEdits,
 };
+use wake_ecma_ast::{DependencyKind, ModuleAst, Program, SourceType};
 use wake_ecma_codegen::{
-    GeneratedDiscardedStaticRequest, Mapping, ModuleMappings, SourceMap,
-    codegen_optimized_with_map_and_requests,
+    GeneratedModuleRequest, GeneratedModuleRequestRole, GeneratedModuleRuntimeCapabilities,
+    GeneratedModuleRuntimeNames, Mapping, ModuleMappings, ModuleRequestKind, SourceMap,
 };
-use wake_ecma_minify::{
-    ConstVal, LinkerExportLiveness, NodeOrigin, OptimizeDependency, OptimizeInput,
-    OptimizedProgram, PIPELINE_VERSION, SyntheticReason, TrustedExpression, TrustedExpressionEdit,
-    ValidatedDefine, optimize, optimize_one_shot,
-};
-use wake_ecma_parser::{parse, parse_with};
-use wake_ecma_transform::{FeatureSet, TargetEnv};
+use wake_ecma_minify::LinkerExportStar;
+use wake_ecma_transform::TargetEnv;
+use wake_federation_contract::ErrorCode as FederationErrorCode;
 use wake_graph::{
-    ImportUse, LiveResult, ModuleLiveness, NamedImport, collect_module_liveness,
-    collect_static_uses, compute_live_keep,
+    ExportStarResolution, ImportUse, LiveResult, ModuleLiveness, NamedImport,
+    collect_module_liveness, collect_static_uses, compute_export_star_plans, compute_live_keep,
 };
 use wake_resolver::{
-    ModuleIdentity, ResolutionEnvironment, ResolutionProfile, ResolveOptions, ResolvedModule,
-    Resolver,
+    ModuleIdentity, ResolutionEnvironment, ResolutionProfile, ResolveError, ResolveOptions,
+    ResolvedModule, Resolver,
 };
 use wake_turbo::{Engine, Executor, TaskArg, TaskId, Vc, global_executor, query};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -60,25 +66,32 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::chunk::{ChunkGraph, ModuleEdges, compute_chunk_graph};
 use crate::concat::{ConcatBlockInfo, scan_concat_block_info};
 use crate::loader::{
-    LoadOptions, Loaded, cached_source_type, is_asset_path, load_source, push_js_string,
+    LoadOptions, Loaded, crab_component_package_dir, is_asset_path, is_css_module_path,
+    is_css_path, load_source, push_js_string,
 };
 use crate::{
-    BuildOutput, BuildPlatform, ChunkKind, Linker, ModuleFormat, OutputAsset, OutputChunk,
-    POSTLUDE, POSTLUDE_COMMONJS, PRELUDE, PRELUDE_ASYNC, SpecifierLookup, path_to_slash,
+    BuildOutput, BuildPlatform, ChunkKind, ModuleFormat, ModuleRequestKey, OutputAsset,
+    OutputChunk, POSTLUDE, POSTLUDE_COMMONJS, PRELUDE, PRELUDE_ASYNC, ResolvedModuleRequest,
+    path_to_slash,
 };
 
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
 type Content = Arc<str>;
 
 /// 「说明符 → 内部模块 id」映射（dep 顺序确定，指纹稳定）。
-type DepIds = Vec<(String, u32)>;
+type DepIds = Vec<ResolvedModuleRequest>;
 type LoadedResult = (
     u32,
     PathBuf,
     std::io::Result<Arc<Loaded>>,
-    Option<FileStamp>,
-    Option<u64>,
+    FederationResolutionContext,
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FederationResolutionContext {
+    Broker,
+    SharedFallback,
+}
 enum ResolveResult {
     Internal {
         module: ResolvedModule,
@@ -87,7 +100,14 @@ enum ResolveResult {
         prefetched: Option<Arc<Loaded>>,
     },
     External(String),
-    Error,
+    Federation(String),
+    Shared {
+        specifier: String,
+        share_key: String,
+        scope: String,
+    },
+    ForbiddenFederation(String),
+    Error(ResolveError),
 }
 type CodegenExecCounts = Arc<[CachePadded<AtomicU64>]>;
 
@@ -96,24 +116,6 @@ type CodegenExecCounts = Arc<[CachePadded<AtomicU64>]>;
 const IO_BATCHES_PER_WORKER: usize = 4;
 const CPU_BATCHES_PER_WORKER: usize = 32;
 const CODEGEN_COUNTER_SHARDS: usize = 64;
-
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified_ns = metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some(FileStamp {
-        size: metadata.len(),
-        modified_ns,
-    })
-}
-
-fn persistent_source_variant(jsx_salt: u64, target_fingerprint: u64) -> u64 {
-    target_fingerprint ^ jsx_salt.rotate_left(23) ^ 0x7061_7468_2d76_3200
-}
 
 fn new_codegen_exec_counts() -> CodegenExecCounts {
     (0..CODEGEN_COUNTER_SHARDS)
@@ -265,6 +267,10 @@ mod exact_relative_prefetch_tests {
     }
 
     impl FileSystem for CountingFileSystem {
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.inner.canonicalize(path)
+        }
+
         fn read_to_string(&self, path: &Path) -> io::Result<String> {
             Self::record(&self.reads, path);
             self.inner.read_to_string(path)
@@ -400,7 +406,7 @@ mod exact_relative_prefetch_tests {
     }
 
     #[test]
-    fn non_one_shot_and_load_cached_builds_keep_the_canonical_resolver_path() {
+    fn only_retained_generation_loading_disables_one_shot_exact_prefetch() {
         let regular_fs = exact_fixture();
         let mut regular = IncrementalBundler::new(regular_fs.clone());
         let regular_output = regular.build(Path::new("src/index.js"));
@@ -421,6 +427,19 @@ mod exact_relative_prefetch_tests {
             cached_output.diagnostics
         );
         assert!(cached_fs.file_probes("src/dep.js") > 0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let persistent_fs = exact_fixture();
+        let mut persistent = IncrementalBundler::new_one_shot(persistent_fs.clone());
+        persistent.enable_persistent_cache(directory.path().join("cache.bin"));
+        let persistent_output = persistent.build(Path::new("src/index.js"));
+        assert!(
+            !persistent_output.has_errors(),
+            "{:?}",
+            persistent_output.diagnostics
+        );
+        assert_eq!(persistent_fs.reads("src/dep.js"), 1);
+        assert_eq!(persistent_fs.file_probes("src/dep.js"), 0);
     }
 
     #[test]
@@ -499,6 +518,55 @@ mod exact_relative_prefetch_tests {
     }
 }
 
+#[cfg(test)]
+mod persistent_cache_warning_tests {
+    use wake_common::{MemoryFileSystem, Severity};
+
+    use super::*;
+
+    #[test]
+    fn stale_writer_conflict_is_one_non_fatal_build_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("cache.bin");
+        let mut bundler = IncrementalBundler::new(Arc::new(MemoryFileSystem::from_files([(
+            "src/index.js",
+            "export const value = 1;",
+        )])));
+        bundler.enable_persistent_cache(cache_path.clone());
+        bundler
+            .cache
+            .as_mut()
+            .expect("enabled cache")
+            .put_summary(7, ModuleSummary::default());
+
+        let mut competing = BuildCache::new();
+        competing.put_summary(
+            7,
+            ModuleSummary {
+                has_top_level_await: true,
+                ..ModuleSummary::default()
+            },
+        );
+        competing.store(&cache_path).unwrap();
+
+        let output = bundler.build(Path::new("src/index.js"));
+        let warnings: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.as_deref() == Some("WAKE_CACHE"))
+            .collect();
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(warnings.len(), 1, "{:?}", output.diagnostics);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert!(
+            warnings[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("冲突") && note.contains('1'))
+        );
+    }
+}
+
 #[derive(Clone)]
 struct MemoryScanSummary {
     persisted: Arc<ModuleSummary>,
@@ -517,6 +585,7 @@ struct StableModuleGraph {
 struct LinkPlan {
     fingerprint: u64,
     keep: FxHashMap<u32, Option<ExportKeep>>,
+    export_stars: FxHashMap<u32, Vec<LinkerExportStar>>,
 }
 
 /// Stable linker facts crossing into one optimizer task. Declaration retention and public-name
@@ -525,7 +594,6 @@ struct LinkPlan {
 struct ExportKeep {
     retained_export_names: Vec<String>,
     observed_export_names: Vec<String>,
-    preserve_export_star: bool,
 }
 
 /// scan 阶段单模块的解析结果：(依赖, 顶层 await 标志, 已 parse 的 AST 持有者, parse 任务句柄)。
@@ -560,8 +628,9 @@ struct OptimizeLinkerData {
     /// Source specifiers whose resolved internal target contains ESM syntax. The optimizer turns
     /// these stable link facts into parser-generation SymbolId replacements; SymbolIds themselves
     /// never enter this persisted/hashable boundary.
-    internal_esm_deps: Vec<String>,
+    internal_esm_deps: Vec<ModuleRequestKey>,
     export_keep: Option<ExportKeep>,
+    export_stars: Vec<LinkerExportStar>,
 }
 
 /// Final body-emission link facts, created only after optimizer-retained edges have converged and
@@ -569,7 +638,13 @@ struct OptimizeLinkerData {
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 struct EmitLinkerData {
     deps: DepIds,
-    dyn_chunks: Vec<(String, u32)>,
+    dyn_chunks: DepIds,
+    /// Literal dynamic imports owned by the page-level federation broker.
+    runtime_imports: Vec<String>,
+    /// Immutable expose identity of the final chunk containing this module. When present, typed
+    /// codegen emits it as the second runtime-import argument; it is part of the body identity.
+    runtime_import_expose: Option<String>,
+    shared_imports: Vec<(ModuleRequestKey, String, String)>,
     /// 本模块依赖里属于 **async 子图**（顶层 await 传染）的模块 id（升序去重）。
     /// codegen 据此把静态导入点写成 `(await __wake_require__(id))`。进指纹 → async 归属变化精确重跑。
     async_deps: Vec<u32>,
@@ -610,9 +685,9 @@ impl std::hash::Hash for CssCodegenInput {
 #[derive(Clone, Debug)]
 struct OptimizeOptionsInput {
     define: Vec<(String, String)>,
-    /// Parser-validated form of `define`. This is a deterministic function of `define`; custom
-    /// equality/hash below deliberately use the raw strings as the stable Turbo identity.
-    validated_define: Result<Vec<ValidatedDefine>, String>,
+    /// Compiler-owned prepared form of `define`. Custom equality/hash deliberately use only the
+    /// raw strings as the stable Turbo identity; this backend-bound value never enters a cache key.
+    prepared_defines: Result<PreparedDefines, String>,
     minify: bool,
     drop_console: bool,
     drop_debugger: bool,
@@ -647,6 +722,9 @@ impl Hash for OptimizeOptionsInput {
 /// `parse` 任务的输出：AST 持有者 + 源文本 + 依赖（说明符已解为 `String`）+ 诊断。
 /// 作为引擎 cell 值，须 `Send + Sync + 'static`（`ModuleAst` 已具备）+ 指纹。
 pub struct ParsedModule {
+    /// Opaque compiler-owned parse result. The surrounding fields are the existing bundler view
+    /// used by graph, CSS and semantic analysis; both views originate from this single parse.
+    compiler: CompilerParsedModule,
     pub ast: Arc<ModuleAst>,
     /// 原始源文本（minify 简化器需要读取 span 对应的源码文本）。
     pub source: Arc<str>,
@@ -662,6 +740,75 @@ pub struct ParsedDep {
     pub specifier: String,
     pub kind: DependencyKind,
     pub span: Span,
+}
+
+/// Return the resolver-owned target for one parser-owned dependency edge.
+///
+/// Some immutable, already-published Crab component entrypoints still request Linaria's small
+/// class-name runtime. The compatibility boundary is deliberately narrower than source text:
+/// only a parser-proven static ESM or CommonJS dependency of a verified public component entry is
+/// resolved to Crab CSS. The [`ParsedDep`] itself remains unchanged, so linker/codegen identity,
+/// diagnostics, cache summaries, and source maps continue to use the exact source specifier.
+fn crab_component_dependency_resolution_target(
+    public_component_entry: bool,
+    dependency: &ParsedDep,
+) -> &str {
+    if public_component_entry
+        && dependency.specifier == "@linaria/core"
+        && matches!(
+            dependency.kind,
+            DependencyKind::Import | DependencyKind::ExportFrom | DependencyKind::Require
+        )
+    {
+        "@crab-dev/css"
+    } else {
+        &dependency.specifier
+    }
+}
+
+#[cfg(test)]
+mod crab_component_resolution_target_tests {
+    use super::{ParsedDep, crab_component_dependency_resolution_target};
+    use wake_common::Span;
+    use wake_ecma_ast::DependencyKind;
+
+    fn dependency(specifier: &str, kind: DependencyKind) -> ParsedDep {
+        ParsedDep {
+            specifier: specifier.to_owned(),
+            kind,
+            span: Span::new(0, 0),
+        }
+    }
+
+    #[test]
+    fn maps_only_parser_owned_static_edges_of_verified_public_entries() {
+        for kind in [
+            DependencyKind::Import,
+            DependencyKind::ExportFrom,
+            DependencyKind::Require,
+        ] {
+            let dependency = dependency("@linaria/core", kind);
+            assert_eq!(
+                crab_component_dependency_resolution_target(true, &dependency),
+                "@crab-dev/css"
+            );
+            assert_eq!(
+                crab_component_dependency_resolution_target(false, &dependency),
+                "@linaria/core"
+            );
+        }
+
+        let dynamic = dependency("@linaria/core", DependencyKind::DynamicImport);
+        assert_eq!(
+            crab_component_dependency_resolution_target(true, &dynamic),
+            "@linaria/core"
+        );
+        let subpath = dependency("@linaria/core/runtime", DependencyKind::Import);
+        assert_eq!(
+            crab_component_dependency_resolution_target(true, &subpath),
+            "@linaria/core/runtime"
+        );
+    }
 }
 
 fn same_dependency_shape(old: &[ParsedDep], new: &[ParsedDep]) -> bool {
@@ -684,6 +831,7 @@ impl std::hash::Hash for ParsedModule {
 pub struct IncrementalBundler {
     fs: Arc<dyn FileSystem>,
     resolution_environment: Arc<ResolutionEnvironment>,
+    compiler: CompilerBackend,
     interner: Arc<Interner>,
     engine: Arc<Engine>,
     /// CLI/library one-shot builds never advance the in-memory task graph to a second generation.
@@ -701,6 +849,23 @@ pub struct IncrementalBundler {
     platform: BuildPlatform,
     module_format: ModuleFormat,
     external_packages: Arc<[String]>,
+    /// Explicit remote container names. Only `name/expose` literal dynamic imports are captured.
+    federation_remotes: Arc<[String]>,
+    /// Exact source request → public share key/scope. Sharing is never inferred from all packages.
+    federation_shared: Arc<[(String, String, String)]>,
+    /// Explicit synthetic SharedFallback entry roots. Their static closure resolves allowlisted
+    /// shared requests locally so one coherence group can initialize atomically before a broker
+    /// share context exists.
+    federation_shared_fallback_roots: Arc<[PathBuf]>,
+    /// Optional remote-expose identity for the entry namespace emitted by this container build.
+    federation_entry_export: Option<(String, String)>,
+    /// Build-scoped federation entries derive their immutable identity from the broker-installed
+    /// execution context for `import.meta.url`. Development/application entries keep the legacy
+    /// page-scoped registry shape.
+    federation_entry_export_build_scoped: bool,
+    /// Synthetic expose wrapper chunk name → canonical expose key. Used only to bind emitted
+    /// runtime requests to an immutable manifest closure; parsing/linking remain policy-free.
+    federation_expose_roots: Arc<[(String, String)]>,
     /// 规范化路径 → 内容输入 cell（跨构建保留）。
     content_cells: FxHashMap<PathBuf, Vc<Content>>,
     /// 规范化路径 → linker 输入 cell（跨构建保留）。
@@ -751,6 +916,10 @@ pub struct IncrementalBundler {
     /// 落盘路径见 `cache_path`。默认 `None`——默认构建路径与产物逐字节不变、性能不受影响。
     cache: Option<BuildCache>,
     cache_path: Option<PathBuf>,
+    /// Cache loading happens when the option is enabled, before a build output exists. Carry its
+    /// non-fatal issue into exactly the next build so all cache problems can be rendered as one
+    /// build-scoped `WAKE_CACHE` warning.
+    pending_cache_warning: Option<String>,
     /// Yarn PnP 检测状态：`None` = 首次 build 前未检测；`Some(b)` = 已检测（`b`=是否为 PnP 项目）。
     /// 首次 build 时按入口向上探 `.pnp.cjs`，命中则包裹 zip 感知 fs + 切 PnP 解析器。
     pnp_detected: Option<bool>,
@@ -787,12 +956,13 @@ pub struct IncrementalBundler {
     jsx: JsxRuntimeOptions,
     /// 目标环境指纹。即使 pass 尚未覆盖某语法，目标变化也不能复用旧转换缓存。
     target_fingerprint: u64,
-    transform_features: FeatureSet,
+    target: TargetEnv,
 }
 
 /// 扫描完成的一个模块记录。
 struct ModuleRec {
     path: PathBuf,
+    federation_resolution_context: FederationResolutionContext,
     /// 内容键 `hash(源类型 ‖ 源文本)`——跨进程稳定，作缓存主键。
     content_key: u64,
     source_type: SourceType,
@@ -803,6 +973,10 @@ struct ModuleRec {
     dep_ids: DepIds,
     /// 已明确外置的宿主依赖。它们不进入模块图，但属于 link 与缓存身份。
     external_deps: Vec<String>,
+    /// 已由 federation broker 接管的字面量动态请求。
+    runtime_imports: Vec<String>,
+    /// Original request → (share key, scope) for runtime-owned shared dependencies.
+    shared_imports: Vec<(ModuleRequestKey, String, String)>,
     /// 绑定级活跃性（Tree Shaking 用；仅 prod + 新 parse 的模块有；缓存摘要命中 → `None` → 保守全保留）。
     liveness: Option<Arc<ModuleLiveness>>,
     /// 单包 concat 块安全信息（`{}` vs IIFE；缓存摘要命中 → `None` → 保守走 IIFE + 不加 strict）。
@@ -818,6 +992,7 @@ struct ModuleRec {
 struct LayerItem {
     id: u32,
     path: PathBuf,
+    federation_resolution_context: FederationResolutionContext,
     content_vc: Vc<Content>,
     source_type: SourceType,
     content_key: u64,
@@ -835,6 +1010,7 @@ struct LayerItem {
 struct PendingModule {
     id: u32,
     path: PathBuf,
+    federation_resolution_context: FederationResolutionContext,
     content_key: u64,
     source_type: SourceType,
     content_vc: Vc<Content>,
@@ -877,15 +1053,24 @@ impl IncrementalBundler {
         let define_hash = hash_define(&default_define);
         let default_target = TargetEnv::default();
         let resolution_environment = Arc::new(ResolutionEnvironment::new(fs));
+        let compiler = CompilerBackend::new();
+        let interner = compiler.interner_owner();
         IncrementalBundler {
             resolver: resolution_environment.resolver(),
             resolve_options: ResolveOptions::default(),
             platform: BuildPlatform::Browser,
             module_format: ModuleFormat::Iife,
             external_packages: Arc::from(Vec::<String>::new()),
+            federation_remotes: Arc::from(Vec::<String>::new()),
+            federation_shared: Arc::from(Vec::<(String, String, String)>::new()),
+            federation_shared_fallback_roots: Arc::from(Vec::<PathBuf>::new()),
+            federation_entry_export: None,
+            federation_entry_export_build_scoped: false,
+            federation_expose_roots: Arc::from(Vec::<(String, String)>::new()),
             fs: resolution_environment.file_system(),
             resolution_environment,
-            interner: Arc::new(Interner::new()),
+            compiler,
+            interner,
             engine: Arc::new(if one_shot {
                 Engine::new_one_shot()
             } else {
@@ -923,6 +1108,7 @@ impl IncrementalBundler {
             share_threshold: 2,
             cache: None,
             cache_path: None,
+            pending_cache_warning: None,
             pnp_detected: None,
             extract_css: false,
             asset_inline_limit: usize::MAX,
@@ -936,7 +1122,7 @@ impl IncrementalBundler {
             project_root: None,
             jsx: JsxRuntimeOptions::default(),
             target_fingerprint: default_target.fingerprint(),
-            transform_features: default_target.required_features(),
+            target: default_target,
         }
     }
 
@@ -960,7 +1146,7 @@ impl IncrementalBundler {
             self.reset_parse_graph();
         }
         self.target_fingerprint = fingerprint;
-        self.transform_features = target.required_features();
+        self.target = target;
         self
     }
 
@@ -988,6 +1174,90 @@ impl IncrementalBundler {
         packages.dedup();
         if self.external_packages.as_ref() != packages.as_slice() {
             self.external_packages = packages.into();
+            self.reset_parse_graph();
+        }
+        self
+    }
+
+    /// Configure the explicit remote container names recognized by the linker.
+    ///
+    /// This is an internal build view of the public federation contract: manifests, origin policy,
+    /// and shared dependency policy stay outside the resolver hot path. Changing the set rebuilds
+    /// the retained graph because the same source edge changes from a filesystem dependency to a
+    /// runtime-owned target.
+    pub fn set_federation_remotes(&mut self, mut remotes: Vec<String>) -> &mut Self {
+        remotes.sort();
+        remotes.dedup();
+        if self.federation_remotes.as_ref() != remotes.as_slice() {
+            self.federation_remotes = remotes.into();
+            self.reset_parse_graph();
+        }
+        self
+    }
+
+    /// Publish this build's entry namespace under a container/expose identity instead of the
+    /// legacy page-global application entry slot. Numeric module IDs remain private to this
+    /// bundle's closure.
+    pub fn set_federation_entry_export(
+        &mut self,
+        container: impl Into<String>,
+        expose: impl Into<String>,
+    ) -> &mut Self {
+        self.federation_entry_export = Some((container.into(), expose.into()));
+        self.federation_entry_export_build_scoped = false;
+        self
+    }
+
+    /// Publish an immutable remote build's entry under `[container][buildId][expose]`.
+    ///
+    /// The emitted module must execute through the federation broker. The broker installs an
+    /// execution context keyed by the exact asset URL before evaluating it; this prevents two
+    /// builds of the same container from sharing factories or namespaces.
+    pub fn set_federation_build_scoped_entry_export(
+        &mut self,
+        container: impl Into<String>,
+        expose: impl Into<String>,
+    ) -> &mut Self {
+        self.federation_entry_export = Some((container.into(), expose.into()));
+        self.federation_entry_export_build_scoped = true;
+        self
+    }
+
+    /// Bind synthetic dynamic-root chunk names to canonical expose keys.
+    pub fn set_federation_expose_roots(&mut self, mut exposes: Vec<(String, String)>) -> &mut Self {
+        exposes.sort();
+        exposes.dedup();
+        self.federation_expose_roots = exposes.into();
+        self
+    }
+
+    /// Configure the explicit shared dependency allowlist for a remote container build.
+    pub fn set_federation_shared(
+        &mut self,
+        mut shared: Vec<(String, String, String)>,
+    ) -> &mut Self {
+        shared.sort();
+        shared.dedup();
+        if self.federation_shared.as_ref() != shared.as_slice() {
+            self.federation_shared = shared.into();
+            self.reset_parse_graph();
+        }
+        self
+    }
+
+    /// Mark synthetic SharedFallback entry modules whose complete static closure must resolve
+    /// allowlisted shared requests locally. Ordinary Application/Expose modules retain the
+    /// broker-owned shared lowering. A physical module reached through both contexts is rejected
+    /// during graph construction because its dependency semantics would otherwise be ambiguous.
+    pub fn set_federation_shared_fallback_roots(&mut self, roots: Vec<PathBuf>) -> &mut Self {
+        let mut roots = roots
+            .into_iter()
+            .map(|root| normalize(&root))
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        if self.federation_shared_fallback_roots.as_ref() != roots.as_slice() {
+            self.federation_shared_fallback_roots = roots.into();
             self.reset_parse_graph();
         }
         self
@@ -1049,7 +1319,7 @@ impl IncrementalBundler {
     }
 
     /// 启用 prod CSS 抽取（WAKE-COMPATIBILITY §M3）：CSS 不注入 `<style>`，聚合为独立 `.css` 产物
-    /// （见 [`BuildOutput::assets`]）。dev 保持关闭（运行时 `<style>` 注入利于 HMR）。
+    /// （见 [`BuildOutput::assets`]）。dev 保持关闭，让整页 Live Reload 后由运行时重新注入样式。
     pub fn enable_css_extraction(&mut self) -> &mut Self {
         self.extract_css = true;
         self
@@ -1137,9 +1407,9 @@ impl IncrementalBundler {
                         state.insert(id, 0);
                         stack.push((id, true));
                         if let Some(rec) = modules.get(&id) {
-                            for (_, dep) in rec.dep_ids.iter() {
-                                if !state.contains_key(dep) {
-                                    stack.push((*dep, false));
+                            for dependency in &rec.dep_ids {
+                                if !state.contains_key(&dependency.module_id) {
+                                    stack.push((dependency.module_id, false));
                                 }
                             }
                         }
@@ -1166,8 +1436,11 @@ impl IncrementalBundler {
                 let Some(dep_id) = rec
                     .dep_ids
                     .iter()
-                    .find(|(s, _)| *s == specifier)
-                    .map(|(_, d)| *d)
+                    .find(|dependency| {
+                        dependency.request.specifier == specifier
+                            && dependency.request.kind == ModuleRequestKind::StaticImport
+                    })
+                    .map(|dependency| dependency.module_id)
                 else {
                     continue;
                 };
@@ -1198,8 +1471,11 @@ impl IncrementalBundler {
                 let Some(dep_id) = rec
                     .dep_ids
                     .iter()
-                    .find(|(specifier, _)| *specifier == reexport.specifier)
-                    .map(|(_, dep_id)| *dep_id)
+                    .find(|dependency| {
+                        dependency.request.specifier == reexport.specifier
+                            && dependency.request.kind == ModuleRequestKind::StaticImport
+                    })
+                    .map(|dependency| dependency.module_id)
                 else {
                     continue;
                 };
@@ -1261,8 +1537,11 @@ impl IncrementalBundler {
     ///
     /// 该口径会**改变解析出的依赖说明符**，故已混入 `content_key`（见 [`content_key_of`]）——
     /// dev 与 prod 的模块摘要缓存彼此隔离，不会交叉复用。
-    pub fn set_jsx_runtime(&mut self, dev: bool, import_source: &'static str) -> &mut Self {
-        let next = JsxRuntimeOptions { dev, import_source };
+    pub fn set_jsx_runtime(&mut self, dev: bool, import_source: impl Into<Arc<str>>) -> &mut Self {
+        let next = JsxRuntimeOptions {
+            dev,
+            import_source: import_source.into(),
+        };
         if self.jsx != next {
             self.reset_parse_graph();
             // loader 会在 React production 下为错误发布的 jsxDEV 依赖生成兼容入口；
@@ -1298,7 +1577,8 @@ impl IncrementalBundler {
         self
     }
 
-    /// 是否已启用 Yarn PnP（供 CLI 日志用；须在 `build()`/`enable_pnp` 之后查询）。
+    /// 是否已启用 Yarn PnP（须在 `build()`/`enable_pnp` 之后查询）。
+    #[cfg(test)]
     pub fn is_pnp(&self) -> bool {
         self.pnp_detected == Some(true)
     }
@@ -1306,12 +1586,27 @@ impl IncrementalBundler {
     /// 启用持久化构建缓存（PLAN §7.1）：从 `path` 载入既有缓存；构建结束 `store` 回盘。
     /// 让全新进程的冷构建跳过未变模块的 parse + codegen（「冷启动首跑毫秒级」）。opt-in。
     pub fn enable_persistent_cache(&mut self, path: PathBuf) -> &mut Self {
-        self.cache = Some(BuildCache::load(&path));
+        let (cache, warning) = match BuildCache::load(&path) {
+            CacheLoadOutcome::Loaded(cache) => (*cache, None),
+            CacheLoadOutcome::Missing | CacheLoadOutcome::Incompatible { .. } => {
+                (BuildCache::new(), None)
+            }
+            CacheLoadOutcome::Corrupt(error) => (
+                BuildCache::new(),
+                Some(format!("载入持久化缓存时发现损坏：{error}")),
+            ),
+            CacheLoadOutcome::Io(error) => (
+                BuildCache::new(),
+                Some(format!("载入持久化缓存时发生 I/O 错误：{error}")),
+            ),
+        };
+        self.cache = Some(cache);
         self.cache_path = Some(path);
+        self.pending_cache_warning = warning;
         self
     }
 
-    /// 启用 Tree Shaking（移除未用导出，PLAN §6.6）。prod build 用；dev 保持关闭利于 HMR。
+    /// 启用 Tree Shaking（移除未用导出，PLAN §6.6）。prod build 用；dev 保持关闭以缩短增量重建。
     pub fn enable_tree_shaking(&mut self) -> &mut Self {
         self.tree_shaking = true;
         self
@@ -1320,12 +1615,6 @@ impl IncrementalBundler {
     /// 启用代码分割（动态 import 切 async chunk，PLAN §6.5）。
     pub fn enable_code_splitting(&mut self) -> &mut Self {
         self.code_splitting = true;
-        self
-    }
-
-    /// Force a single production chunk when a caller explicitly prefers one JavaScript artifact.
-    pub fn disable_code_splitting(&mut self) -> &mut Self {
-        self.code_splitting = false;
         self
     }
 
@@ -1360,7 +1649,7 @@ impl IncrementalBundler {
             .saturating_add(self.engine.exec_count())
     }
 
-    /// 实际执行 loader/文件读取的累计次数；load snapshot 命中不增加。
+    /// 实际执行 loader/文件读取的累计次数；generation 内存加载缓存命中不增加。
     pub fn load_exec_count(&self) -> u64 {
         self.load_exec_count.load(Ordering::Relaxed)
     }
@@ -1381,6 +1670,11 @@ impl IncrementalBundler {
     /// 由 generation-aware `BuildSession` 启用。直接打包器保持每次读取文件的兼容语义。
     pub(crate) fn enable_load_cache(&mut self) {
         self.load_cache_enabled = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_cache_enabled_for_test(&self) -> bool {
+        self.load_cache_enabled
     }
 
     /// 通知文件系统 generation 已变化。内容 cell 会在下一次扫描时按文本精确更新；
@@ -1445,6 +1739,10 @@ impl IncrementalBundler {
                 .invalidate_paths(normalized.iter().map(PathBuf::as_path));
             self.topology_invalidated.store(true, Ordering::Release);
         }
+    }
+
+    pub(crate) fn file_system_view(&self) -> Arc<dyn FileSystem> {
+        Arc::clone(&self.fs)
     }
 
     /// 刷新上一 generation 中 loader snapshot 已失效的模块。
@@ -1518,7 +1816,7 @@ impl IncrementalBundler {
             let content_key = content_key_of(
                 &loaded.source,
                 loaded.source_type,
-                self.jsx,
+                &self.jsx,
                 self.target_fingerprint,
                 self.css_in_js,
                 &path,
@@ -1538,11 +1836,11 @@ impl IncrementalBundler {
             .map(|item| {
                 let cell = item.content_vc;
                 let st = item.loaded.source_type;
-                let interner = self.interner.clone();
-                let jsx = self.jsx;
-                let transform_features = self.transform_features;
+                let compiler = self.compiler.clone();
+                let jsx = self.jsx.clone();
+                let target = self.target.clone();
                 let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&item.path)));
-                move || parse_request(cell, interner, st, jsx, transform_features, file_name)
+                move || parse_request(cell, compiler, st, jsx, target, file_name)
             })
             .collect();
         let engine = Arc::clone(&self.engine);
@@ -1567,18 +1865,14 @@ impl IncrementalBundler {
             } else {
                 Vec::new()
             };
-            let liveness = (self.cache.is_some()
-                || self.load_cache_enabled
-                || self.tree_shaking
-                || self.minify)
-                .then(|| {
-                    Arc::new(parsed.ast.with_ast(|p| {
-                        collect_module_liveness_with_css(p, self.interner.as_ref(), self.css_in_js)
-                    }))
-                });
+            let liveness = Some(Arc::new(parsed.ast.with_ast(|p| {
+                collect_module_liveness_with_css(p, self.interner.as_ref(), self.css_in_js)
+            })));
             // Target-kind facts are required by linked import semantics in readable and minified
             // builds alike, not just by minified scope concatenation.
-            let block_info = parsed.ast.with_ast(scan_concat_block_info);
+            let block_info = parsed
+                .ast
+                .with_ast(|program| scan_concat_block_info(program, &self.interner));
 
             self.memory_parse_vcs.insert(item.content_key, parse_vc);
             if parsed.diagnostics.is_empty() && (self.cache.is_some() || self.load_cache_enabled) {
@@ -1592,6 +1886,7 @@ impl IncrementalBundler {
                     liveness: runtime_liveness_to_cached(live, &self.interner),
                     concat_is_esm: block_info.is_esm,
                     concat_block_safe: block_info.block_safe,
+                    concat_observes_commonjs_bindings: block_info.observes_commonjs_bindings,
                 });
                 self.memory_summaries.insert(
                     item.content_key,
@@ -1648,6 +1943,8 @@ impl IncrementalBundler {
         let mut read_time = std::time::Duration::ZERO;
 
         let mut diagnostics = Vec::new();
+        let mut cache_warnings: Vec<String> =
+            self.pending_cache_warning.take().into_iter().collect();
         let entry_norm = normalize(entry);
 
         // uses 只进缓存摘要（Tree Shaking 的 keep 集走绑定级 liveness，不读 uses），无缓存则白算。
@@ -1660,13 +1957,12 @@ impl IncrementalBundler {
             asset_inline_limit: self.asset_inline_limit,
             public_path: self.public_path.clone(),
             jsx_dev: self.jsx.dev,
-            jsx_import_source: self.jsx.import_source,
+            jsx_import_source: self.jsx.import_source.clone(),
         });
-        // Persistent and generation load caches have their own source/stamp ownership. Fuse exact
-        // resolution with loading only when this process can consume the source exactly once and
-        // no later generation needs a resolver/cache record.
-        let prefetch_exact_relative =
-            self.one_shot && self.cache.is_none() && !self.load_cache_enabled;
+        // Persistent artifacts never own source bytes. A one-shot build can therefore fuse exact
+        // relative resolution with the real source read even when persistent caching is enabled.
+        // Only the generation load cache needs the canonical resolver path for future reuse.
+        let prefetch_exact_relative = self.one_shot && !self.load_cache_enabled;
 
         let mut module_to_id: FxHashMap<ModuleIdentity, u32> =
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
@@ -1685,9 +1981,20 @@ impl IncrementalBundler {
             FxHashMap::with_capacity_and_hasher(self.last_module_count, Default::default());
         let entry_identity = self.resolver.module_identity(&entry_norm);
         let entry_id = assign_id(&mut module_to_id, &mut next_id, entry_identity);
-        let mut frontier: Vec<(u32, PathBuf, Option<Arc<Loaded>>)> =
-            vec![(entry_id, entry_norm.clone(), None)];
-        let mut collected_assets: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut module_resolution_contexts = FxHashMap::default();
+        module_resolution_contexts.insert(entry_id, FederationResolutionContext::Broker);
+        let mut frontier: Vec<(
+            u32,
+            PathBuf,
+            Option<Arc<Loaded>>,
+            FederationResolutionContext,
+        )> = vec![(
+            entry_id,
+            entry_norm.clone(),
+            None,
+            FederationResolutionContext::Broker,
+        )];
+        let mut collected_assets: Vec<(u32, String, Vec<u8>)> = Vec::new();
         let mut collected_css: Vec<(u32, String)> = Vec::new();
 
         // 普通内容编辑：取出上一成功 generation 的图，只刷新 loader snapshot 缺失的模块。
@@ -1722,7 +2029,13 @@ impl IncrementalBundler {
                 let Some(loaded) = cache.get(&rec.path) else {
                     continue;
                 };
-                collected_assets.extend(loaded.assets.iter().cloned());
+                collected_assets.extend(
+                    loaded
+                        .assets
+                        .iter()
+                        .cloned()
+                        .map(|(name, bytes)| (id, name, bytes)),
+                );
                 if let Some(css) = &loaded.css {
                     collected_css.push((id, css.clone()));
                 }
@@ -1741,10 +2054,12 @@ impl IncrementalBundler {
             // 结果按输入顺序返回（`Executor::parallel` 保序）→ 后续串行建 cell/查缓存的顺序、
             // assign_id 与产物收集序完全不变 → 产物逐字节一致。读完再做 `&mut self` 的 cell/缓存
             // 记账（这些依赖共享可变状态，本就该串行；它们很便宜）。
-            let frontier_items: Vec<(u32, PathBuf, Option<Arc<Loaded>>)> =
-                std::mem::take(&mut frontier);
-            let persistent_variant =
-                persistent_source_variant(self.jsx.salt(), self.target_fingerprint);
+            let frontier_items: Vec<(
+                u32,
+                PathBuf,
+                Option<Arc<Loaded>>,
+                FederationResolutionContext,
+            )> = std::mem::take(&mut frontier);
             let tr = timing.then(std::time::Instant::now);
             let loaded_results: Vec<LoadedResult> = {
                 let mut slots: Vec<Option<LoadedResult>> = std::iter::repeat_with(|| None)
@@ -1753,22 +2068,17 @@ impl IncrementalBundler {
                 let mut misses = Vec::new();
                 {
                     let cache = self.load_cache.lock().unwrap();
-                    for (index, (id, path, prefetched)) in frontier_items.into_iter().enumerate() {
+                    for (index, (id, path, prefetched, resolution_context)) in
+                        frontier_items.into_iter().enumerate()
+                    {
                         if let Some(loaded) = prefetched {
-                            slots[index] = Some((id, path, Ok(loaded), None, None));
+                            slots[index] = Some((id, path, Ok(loaded), resolution_context));
                         } else if self.load_cache_enabled
                             && let Some(loaded) = cache.get(&path).cloned()
                         {
-                            slots[index] = Some((id, path, Ok(loaded), None, None));
+                            slots[index] = Some((id, path, Ok(loaded), resolution_context));
                         } else {
-                            let persistent = self.cache.as_mut().and_then(|persistent_cache| {
-                                cached_source_type(self.fs.as_ref(), &path).map(|source_type| {
-                                    let cached =
-                                        persistent_cache.cached_source(&path, persistent_variant);
-                                    (source_type, cached)
-                                })
-                            });
-                            misses.push((index, id, path, persistent));
+                            misses.push((index, id, path, resolution_context));
                         }
                     }
                 }
@@ -1785,35 +2095,11 @@ impl IncrementalBundler {
                         move || {
                             batch
                                 .into_iter()
-                                .map(|(index, id, path, persistent)| {
-                                    let stamp = persistent.as_ref().and_then(|_| file_stamp(&path));
-                                    let restored = persistent.and_then(|(source_type, cached)| {
-                                        cached.filter(|cached| Some(cached.stamp) == stamp).map(
-                                            |cached| {
-                                                (
-                                                    Arc::new(Loaded {
-                                                        source: cached.source.as_ref().to_owned(),
-                                                        source_type,
-                                                        assets: Vec::new(),
-                                                        css: None,
-                                                    }),
-                                                    cached.content_key,
-                                                )
-                                            },
-                                        )
-                                    });
-                                    let (loaded, cached_content_key) =
-                                        if let Some((restored, key)) = restored {
-                                            (Ok(restored), Some(key))
-                                        } else {
-                                            load_exec_count.fetch_add(1, Ordering::Relaxed);
-                                            (
-                                                load_source(fs.as_ref(), &path, opts.as_ref())
-                                                    .map(Arc::new),
-                                                None,
-                                            )
-                                        };
-                                    (index, id, path, loaded, stamp, cached_content_key)
+                                .map(|(index, id, path, resolution_context)| {
+                                    load_exec_count.fetch_add(1, Ordering::Relaxed);
+                                    let loaded = load_source(fs.as_ref(), &path, opts.as_ref())
+                                        .map(Arc::new);
+                                    (index, id, path, loaded, resolution_context)
                                 })
                                 .collect::<Vec<_>>()
                         }
@@ -1826,13 +2112,13 @@ impl IncrementalBundler {
                     .load_cache_enabled
                     .then(|| self.load_cache.lock().unwrap());
                 for batch in batches {
-                    for (index, id, path, loaded, stamp, cached_content_key) in batch {
+                    for (index, id, path, loaded, resolution_context) in batch {
                         if let Some(cache) = cache.as_mut()
                             && let Ok(value) = &loaded
                         {
                             cache.insert(path.clone(), value.clone());
                         }
-                        slots[index] = Some((id, path, loaded, stamp, cached_content_key));
+                        slots[index] = Some((id, path, loaded, resolution_context));
                     }
                 }
                 slots
@@ -1845,7 +2131,7 @@ impl IncrementalBundler {
             }
 
             let mut layer: Vec<LayerItem> = Vec::new();
-            for (id, path, loaded, stamp, cached_content_key) in loaded_results {
+            for (id, path, loaded, resolution_context) in loaded_results {
                 match loaded {
                     Ok(loaded) => {
                         if prefetch_exact_relative {
@@ -1859,28 +2145,24 @@ impl IncrementalBundler {
                         let css = loaded.css.clone();
                         // 带外产物：超阈值资源文件（JS import 的资源 + CSS `url()` 引出的
                         // 字体/图片）+ prod 抽取的 CSS 文本（按模块 id 记序）。
-                        collected_assets.extend(module_assets);
+                        collected_assets.extend(
+                            module_assets
+                                .into_iter()
+                                .map(|(name, bytes)| (id, name, bytes)),
+                        );
                         if let Some(text) = css {
                             collected_css.push((id, text));
                         }
-                        // content_key 仅缓存启用时需要（缓存主键）；否则跳过 xxh3。
-                        let content_key = cached_content_key.unwrap_or_else(|| {
-                            if self.cache.is_some() || self.load_cache_enabled {
-                                content_key_of(
-                                    src,
-                                    st,
-                                    self.jsx,
-                                    self.target_fingerprint,
-                                    self.css_in_js,
-                                    &path,
-                                )
-                            } else {
-                                0
-                            }
-                        });
-                        if let (Some(stamp), Some(cache)) = (stamp, self.cache.as_mut()) {
-                            cache.put_source(&path, stamp, persistent_variant, content_key, src);
-                        }
+                        // Link plans include the complete export surface, so retained builds need a
+                        // real content identity even when no body/load cache is enabled.
+                        let content_key = content_key_of(
+                            src,
+                            st,
+                            &self.jsx,
+                            self.target_fingerprint,
+                            self.css_in_js,
+                            &path,
+                        );
 
                         let content_vc = self.content_cell(&path, src);
                         let disk_cached = self
@@ -1894,6 +2176,7 @@ impl IncrementalBundler {
                         layer.push(LayerItem {
                             id,
                             path,
+                            federation_resolution_context: resolution_context,
                             content_vc,
                             source_type: st,
                             content_key,
@@ -1933,30 +2216,26 @@ impl IncrementalBundler {
                 .filter(|(_, it)| it.cached.is_none())
                 .map(|(i, _)| i)
                 .collect();
-            let analyze_liveness =
-                self.cache.is_some() || self.load_cache_enabled || self.tree_shaking || self.minify;
+            // Export facts are also the correctness source for static `export *` resolution, so
+            // they are required even when declaration tree shaking and minification are disabled.
+            let analyze_liveness = true;
             let requests: Vec<_> = to_parse
                 .iter()
                 .map(|&i| {
                     let cell = layer[i].content_vc;
                     let st = layer[i].source_type;
+                    let compiler = self.compiler.clone();
                     let interner = self.interner.clone();
-                    let jsx = self.jsx;
+                    let jsx = self.jsx.clone();
                     let css_in_js = self.css_in_js;
-                    let transform_features = self.transform_features;
+                    let target = self.target.clone();
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
                     let file_name = jsx
                         .dev
                         .then(|| Arc::<str>::from(path_to_slash(&layer[i].path)));
                     move || {
-                        let (parse_vc, parsed) = parse_request(
-                            cell,
-                            interner.clone(),
-                            st,
-                            jsx,
-                            transform_features,
-                            file_name,
-                        );
+                        let (parse_vc, parsed) =
+                            parse_request(cell, compiler, st, jsx, target, file_name);
                         // 三项只读分析共享一次 AST holder 访问，并留在 parse worker 上并行执行。
                         let (uses, liveness, block_info) = parsed.ast.with_ast(|program| {
                             let uses = if need_uses {
@@ -1971,7 +2250,8 @@ impl IncrementalBundler {
                                     css_in_js,
                                 ))
                             });
-                            let block_info = Some(scan_concat_block_info(program));
+                            let block_info =
+                                Some(scan_concat_block_info(program, interner.as_ref()));
                             (uses, liveness, block_info)
                         });
                         ParsedLayerResult {
@@ -2005,11 +2285,18 @@ impl IncrementalBundler {
 
             // —— Pass 1：串行取预分析结果 + 缓存记账 + 收集 resolve 请求 ——
             let mut pending: Vec<PendingModule> = Vec::with_capacity(layer.len());
-            let mut resolve_reqs: Vec<(String, PathBuf, DependencyKind)> = Vec::new();
+            let mut resolve_reqs: Vec<(
+                String,
+                String,
+                PathBuf,
+                DependencyKind,
+                FederationResolutionContext,
+            )> = Vec::new();
             for (i, it) in layer.into_iter().enumerate() {
                 let LayerItem {
                     id,
                     path,
+                    federation_resolution_context,
                     content_vc,
                     source_type,
                     content_key,
@@ -2045,6 +2332,8 @@ impl IncrementalBundler {
                         let block_info = Some(memory_block_info.unwrap_or(ConcatBlockInfo {
                             is_esm: sum.concat_is_esm,
                             block_safe: sum.concat_block_safe,
+                            observes_commonjs_bindings: sum
+                                .concat_observes_commonjs_bindings,
                         }));
                         (
                             memory_deps.unwrap_or_else(|| {
@@ -2085,6 +2374,8 @@ impl IncrementalBundler {
                                 liveness: runtime_liveness_to_cached(live, &self.interner),
                                 concat_is_esm: block.is_esm,
                                 concat_block_safe: block.block_safe,
+                                concat_observes_commonjs_bindings: block
+                                    .observes_commonjs_bindings,
                             });
                             self.memory_summaries.insert(
                                 content_key,
@@ -2112,37 +2403,47 @@ impl IncrementalBundler {
                 };
 
                 let from_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                // Loader style discovery and legacy-runtime resolution must share this exact
+                // manifest-backed public-entry predicate. Compute it once per issuer; dependency
+                // syntax itself comes exclusively from parser-owned `ParsedDep` records.
+                let public_component_entry =
+                    crab_component_package_dir(self.fs.as_ref(), &path).is_some();
                 // resolve 请求按依赖序压入（Pass 2 按同序消费）。
                 for dep in deps.iter() {
-                    resolve_reqs.push((dep.specifier.clone(), from_dir.clone(), dep.kind));
+                    resolve_reqs.push((
+                        dep.specifier.clone(),
+                        crab_component_dependency_resolution_target(public_component_entry, dep)
+                            .to_owned(),
+                        from_dir.clone(),
+                        dep.kind,
+                        federation_resolution_context,
+                    ));
                 }
                 // 绑定级活跃性同时承载 minified concat 的 namespace identity 事实；
                 // SymbolId 只在当前 parse 世代内解析，持久化边界仍只存公开名与说明符。
                 let liveness = cached_liveness.or_else(|| {
-                    if self.tree_shaking || self.minify {
-                        parsed_opt.as_ref().map(|p| {
-                            Arc::new(p.ast.with_ast(|prog| {
-                                collect_module_liveness_with_css(
-                                    prog,
-                                    self.interner.as_ref(),
-                                    self.css_in_js,
-                                )
-                            }))
-                        })
-                    } else {
-                        None
-                    }
+                    parsed_opt.as_ref().map(|p| {
+                        Arc::new(p.ast.with_ast(|prog| {
+                            collect_module_liveness_with_css(
+                                prog,
+                                self.interner.as_ref(),
+                                self.css_in_js,
+                            )
+                        }))
+                    })
                 });
                 // ESM target kind is required by import interop in every linked mode; block safety
                 // is consumed only by minified concat but is cheap to retain from the same scan.
                 let block_info = cached_block_info.or_else(|| {
-                    parsed_opt
-                        .as_ref()
-                        .map(|p| p.ast.with_ast(scan_concat_block_info))
+                    parsed_opt.as_ref().map(|p| {
+                        p.ast
+                            .with_ast(|program| scan_concat_block_info(program, &self.interner))
+                    })
                 });
                 pending.push(PendingModule {
                     id,
                     path,
+                    federation_resolution_context,
                     content_key,
                     source_type,
                     content_vc,
@@ -2168,7 +2469,10 @@ impl IncrementalBundler {
 
                 struct IndexedResolveRequest {
                     index: usize,
-                    specifier: String,
+                    /// Internal resolver target; differs only for the bounded Crab bridge.
+                    resolution_specifier: String,
+                    /// Host-owned targets bypass source aliases but still obey issuer PnP.
+                    internal_package_target: bool,
                     from_dir: PathBuf,
                     kind: DependencyKind,
                 }
@@ -2192,14 +2496,49 @@ impl IncrementalBundler {
                 // repeating package-identity lookup for duplicate edges without merging distinct
                 // physical package installations that share one logical identity.
                 let mut exact_work_by_path: FxHashMap<PathBuf, usize> = FxHashMap::default();
-                for (index, (specifier, from_dir, kind)) in resolve_reqs.into_iter().enumerate() {
-                    if is_external_specifier(&specifier, self.platform, &self.external_packages) {
+                for (
+                    index,
+                    (specifier, resolution_specifier, from_dir, kind, resolution_context),
+                ) in resolve_reqs.into_iter().enumerate()
+                {
+                    let has_internal_resolution_target = specifier != resolution_specifier;
+                    if !has_internal_resolution_target
+                        && is_federation_specifier(&specifier, &self.federation_remotes)
+                    {
+                        slots[index] = Some(
+                            if kind == DependencyKind::DynamicImport
+                                && self.platform == BuildPlatform::Browser
+                            {
+                                ResolveResult::Federation(specifier)
+                            } else {
+                                ResolveResult::ForbiddenFederation(specifier)
+                            },
+                        );
+                        continue;
+                    }
+                    if !has_internal_resolution_target
+                        && resolution_context == FederationResolutionContext::Broker
+                        && let Some((_, share_key, scope)) = self
+                            .federation_shared
+                            .iter()
+                            .find(|(request, _, _)| request == &specifier)
+                    {
+                        slots[index] = Some(ResolveResult::Shared {
+                            specifier,
+                            share_key: share_key.clone(),
+                            scope: scope.clone(),
+                        });
+                        continue;
+                    }
+                    if !has_internal_resolution_target
+                        && is_external_specifier(&specifier, self.platform, &self.external_packages)
+                    {
                         slots[index] = Some(ResolveResult::External(specifier));
                         continue;
                     }
 
                     let candidate = prefetch_exact_relative
-                        .then(|| exact_relative_file_candidate(&specifier, &from_dir))
+                        .then(|| exact_relative_file_candidate(&resolution_specifier, &from_dir))
                         .flatten()
                         // Node rejects browser resources immediately after resolve; do not
                         // read/transform one merely to emit that same diagnostic.
@@ -2208,7 +2547,8 @@ impl IncrementalBundler {
                         });
                     let request = IndexedResolveRequest {
                         index,
-                        specifier,
+                        resolution_specifier,
+                        internal_package_target: has_internal_resolution_target,
                         from_dir,
                         kind,
                     };
@@ -2261,16 +2601,25 @@ impl IncrementalBundler {
                                 .map(|work| {
                                     let resolve_normally = |request: IndexedResolveRequest| {
                                         let profile = resolution_profile(platform, request.kind);
-                                        let resolved = match resolver.resolve_module_with_profile(
-                                            &request.specifier,
-                                            &request.from_dir,
-                                            &profile,
-                                        ) {
+                                        let resolution = if request.internal_package_target {
+                                            resolver.resolve_internal_package_with_profile(
+                                                &request.resolution_specifier,
+                                                &request.from_dir,
+                                                &profile,
+                                            )
+                                        } else {
+                                            resolver.resolve_module_with_profile(
+                                                &request.resolution_specifier,
+                                                &request.from_dir,
+                                                &profile,
+                                            )
+                                        };
+                                        let resolved = match resolution {
                                             Ok(module) => ResolveResult::Internal {
                                                 module,
                                                 prefetched: None,
                                             },
-                                            Err(_) => ResolveResult::Error,
+                                            Err(error) => ResolveResult::Error(error),
                                         };
                                         (request.index, resolved)
                                     };
@@ -2360,12 +2709,18 @@ impl IncrementalBundler {
                 out
             };
             // —— Pass 2：串行按「模块序×依赖序」消费 resolve 结果，assign_id + 建图 + 建 ModuleRec ——
-            let mut next: Vec<(u32, PathBuf, Option<Arc<Loaded>>)> = Vec::new();
+            let mut next: Vec<(
+                u32,
+                PathBuf,
+                Option<Arc<Loaded>>,
+                FederationResolutionContext,
+            )> = Vec::new();
             let mut flat_idx = 0usize;
             for pm in pending {
                 let PendingModule {
                     id,
                     path,
+                    federation_resolution_context,
                     content_key,
                     source_type,
                     content_vc,
@@ -2378,6 +2733,8 @@ impl IncrementalBundler {
                 } = pm;
                 let mut dep_ids: DepIds = Vec::new();
                 let mut external_deps = Vec::new();
+                let mut runtime_imports = Vec::new();
+                let mut shared_imports = Vec::new();
                 for dep in deps.iter() {
                     let resolved = &resolved_flat[flat_idx];
                     flat_idx += 1;
@@ -2407,19 +2764,82 @@ impl IncrementalBundler {
                                 &mut next_id,
                                 resolved.identity.clone(),
                             );
+                            let target_context = if self
+                                .federation_shared_fallback_roots
+                                .binary_search(&resolved.path)
+                                .is_ok()
+                            {
+                                FederationResolutionContext::SharedFallback
+                            } else {
+                                federation_resolution_context
+                            };
+                            if let Some(previous_context) =
+                                module_resolution_contexts.get(&did).copied()
+                                && previous_context != target_context
+                            {
+                                diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "federation module `{}` is reachable through both broker and SharedFallback resolution contexts",
+                                        resolved.path.display()
+                                    ))
+                                    .with_code(FederationErrorCode::ConfigInvalid.as_str())
+                                    .with_path(path.to_string_lossy().into_owned())
+                                    .with_primary(
+                                        dep.span,
+                                        "this edge would give one physical module conflicting shared-dependency semantics",
+                                    )
+                                    .with_note(
+                                        "keep SharedFallback package modules private to the fallback root or split the ambiguous module",
+                                    ),
+                                );
+                            } else {
+                                module_resolution_contexts.insert(did, target_context);
+                            }
                             if !known {
                                 next.push((
                                     did,
                                     resolved.path.clone(),
                                     prefetched.as_ref().map(Arc::clone),
+                                    target_context,
                                 ));
                             }
-                            dep_ids.push((dep.specifier.clone(), did));
+                            dep_ids.push(ResolvedModuleRequest {
+                                request: ModuleRequestKey::new(
+                                    dep.specifier.clone(),
+                                    dep.kind.into(),
+                                ),
+                                module_id: did,
+                            });
                         }
                         ResolveResult::External(specifier) => {
                             external_deps.push(specifier.clone());
                         }
-                        ResolveResult::Error => diagnostics.push(
+                        ResolveResult::Federation(specifier) => {
+                            runtime_imports.push(specifier.clone());
+                        }
+                        ResolveResult::Shared {
+                            specifier,
+                            share_key,
+                            scope,
+                        } => {
+                            shared_imports.push((
+                                ModuleRequestKey::new(specifier.clone(), dep.kind.into()),
+                                share_key.clone(),
+                                scope.clone(),
+                            ));
+                        }
+                        ResolveResult::ForbiddenFederation(specifier) => diagnostics.push(
+                            Diagnostic::error(format!(
+                                "远程模块 `{specifier}` 只能通过字面量 import() 异步加载"
+                            ))
+                            .with_code(FederationErrorCode::StaticRemoteUnsupported.as_str())
+                            .with_path(path.to_string_lossy().into_owned())
+                            .with_primary(dep.span, "此远程请求不是受支持的浏览器动态导入")
+                            .with_note(
+                                "请改用 import(\"remote/expose\")；静态 import、require() 和 Node 构建不支持 federation",
+                            ),
+                        ),
+                        ResolveResult::Error(error) => diagnostics.push(
                             Diagnostic::error(format!(
                                 "无法从 `{}` 解析依赖 `{}`",
                                 path.display(),
@@ -2427,7 +2847,8 @@ impl IncrementalBundler {
                             ))
                             .with_code("WAKE0301")
                             .with_path(path.to_string_lossy().into_owned())
-                            .with_primary(dep.span, "此依赖"),
+                            .with_primary(dep.span, "此依赖")
+                            .with_note(error.to_string()),
                         ),
                     }
                 }
@@ -2446,12 +2867,15 @@ impl IncrementalBundler {
                     id,
                     ModuleRec {
                         path,
+                        federation_resolution_context,
                         content_key,
                         source_type,
                         content_vc,
                         deps,
                         dep_ids,
                         external_deps,
+                        runtime_imports,
+                        shared_imports,
                         liveness,
                         block_info,
                         has_top_level_await,
@@ -2467,22 +2891,24 @@ impl IncrementalBundler {
         let t_link_start = timing.then(std::time::Instant::now);
 
         let link_fingerprint = self.link_plan_fingerprint(&modules, entry_id, next_id);
-        let keep = if let Some(plan) = self
+        let (keep, export_stars) = if let Some(plan) = self
             .link_plan
             .as_ref()
             .filter(|plan| plan.fingerprint == link_fingerprint)
         {
             self.link_plan_reuse_count.fetch_add(1, Ordering::Relaxed);
-            plan.keep.clone()
+            (plan.keep.clone(), plan.export_stars.clone())
         } else {
             // —— Link：Tree Shaking. Top-level-await propagation and chunk ownership are computed
             // only after optimizer-retained dependency edges have converged. ——
             let keep = self.compute_keep_exports(&modules, entry_id, next_id);
+            let export_stars = self.compute_export_star_lowering(&modules);
             self.link_plan = Some(LinkPlan {
                 fingerprint: link_fingerprint,
                 keep: keep.clone(),
+                export_stars: export_stars.clone(),
             });
-            keep
+            (keep, export_stars)
         };
         let link_time = t_link_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let t_codegen_start = timing.then(std::time::Instant::now);
@@ -2513,15 +2939,15 @@ impl IncrementalBundler {
                 let rec = &modules[&id];
                 (rec.path.clone(), rec.dep_ids.clone(), rec.content_key)
             };
-            let mut internal_esm_deps: Vec<String> = dep_ids
+            let mut internal_esm_deps: Vec<ModuleRequestKey> = dep_ids
                 .iter()
-                .filter(|(_, target)| {
+                .filter(|dependency| {
                     modules
-                        .get(target)
+                        .get(&dependency.module_id)
                         .and_then(|module| module.block_info)
                         .is_some_and(|info| info.is_esm)
                 })
-                .map(|(specifier, _)| specifier.clone())
+                .map(|dependency| dependency.request.clone())
                 .collect();
             internal_esm_deps.sort_unstable();
             internal_esm_deps.dedup();
@@ -2530,16 +2956,29 @@ impl IncrementalBundler {
                 deps: dep_ids,
                 internal_esm_deps,
                 export_keep: keep.get(&id).cloned().flatten(),
+                export_stars: export_stars.get(&id).cloned().unwrap_or_default(),
             };
             let optimize_linker_hash = hash_optimize_linker(&data);
             let optimize_key = ((content_key as u128) << 64)
                 | ((optimize_linker_hash ^ self.define_hash ^ optimizer_salt) as u128);
-            let cached_retained_module_ids = if cij_active {
+            let cached_retained_requests = if cij_active {
                 None
             } else {
                 self.cache
                     .as_mut()
-                    .and_then(|cache| cache.retained_module_ids(optimize_key))
+                    .and_then(|cache| cache.retained_requests(optimize_key))
+                    .and_then(|requests| {
+                        let mut retained = Vec::with_capacity(requests.len());
+                        for request in requests.iter() {
+                            let kind = module_request_kind(request.kind);
+                            let dependency = data.deps.iter().find(|dependency| {
+                                dependency.request.specifier == request.specifier
+                                    && dependency.request.kind == kind
+                            })?;
+                            retained.push(dependency.clone());
+                        }
+                        Some(Arc::new(retained))
+                    })
             };
             let optimize_linker_vc = self.optimize_linker_cell(&path, data);
             plans.push(CgPlan {
@@ -2551,14 +2990,15 @@ impl IncrementalBundler {
                 optimize_linker_vc,
                 optimized_vc: None,
                 optimized_artifact: None,
-                retained_module_ids: cached_retained_module_ids,
+                retained_requests: cached_retained_requests,
                 body_key: 0,
                 emit_linker_vc: None,
                 emit_linker_data: None,
                 body_vc: None,
                 cached_body: None,
                 cached_map: None,
-                cached_discarded_static_requests: None,
+                cached_generated_module_requests: None,
+                cached_runtime_names: None,
             });
         }
 
@@ -2567,7 +3007,7 @@ impl IncrementalBundler {
         let need_parse: Vec<usize> = plans
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.retained_module_ids.is_none() && modules[&p.id].parse_vc.is_none())
+            .filter(|(_, p)| p.retained_requests.is_none() && modules[&p.id].parse_vc.is_none())
             .map(|(i, _)| i)
             .collect();
         if !need_parse.is_empty() {
@@ -2577,12 +3017,12 @@ impl IncrementalBundler {
                     let rec = &modules[&plans[i].id];
                     let cell = rec.content_vc;
                     let st = rec.source_type;
-                    let interner = self.interner.clone();
-                    let jsx = self.jsx;
-                    let transform_features = self.transform_features;
+                    let compiler = self.compiler.clone();
+                    let jsx = self.jsx.clone();
+                    let target = self.target.clone();
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
                     let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&rec.path)));
-                    move || parse_request(cell, interner, st, jsx, transform_features, file_name)
+                    move || parse_request(cell, compiler, st, jsx, target, file_name)
                 })
                 .collect();
             let engine = Arc::clone(&self.engine);
@@ -2609,20 +3049,23 @@ impl IncrementalBundler {
         let optimize_miss: Vec<usize> = plans
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.retained_module_ids.is_none())
+            .filter(|(_, p)| p.retained_requests.is_none())
             .map(|(i, _)| i)
             .collect();
-        // User-provided define text is parsed once for this build, never once per module. The raw
-        // form remains in the Vc identity; the validated form is carried in the same input cell so
-        // a long-lived task cannot retain stale trusted edits after configuration changes.
-        let validated_define = validate_defines(&self.define);
+        // User-provided define text is parsed by the compiler core once for this build, never once
+        // per module. The raw form remains the Vc/cache identity; the opaque prepared form is bound
+        // to this bundler's backend/interner and cannot be reused with different raw options.
+        let prepared_defines = self
+            .compiler
+            .prepare_defines(&self.define)
+            .map_err(|error| error.message().to_owned());
         let mut requests = Vec::with_capacity(optimize_miss.len());
         for &i in &optimize_miss {
             let parse_vc = modules[&plans[i].id]
                 .parse_vc
                 .expect("optimizer miss must be parsed");
             let linker_vc = plans[i].optimize_linker_vc;
-            let interner = self.interner.clone();
+            let compiler = self.compiler.clone();
             let id = plans[i].id;
             let cij = cij_scopes.get(&id).cloned();
             // dev（未开抽取）时把 CSS 以 `<style>` 注入模块体；prod 带出聚合。
@@ -2649,7 +3092,7 @@ impl IncrementalBundler {
                 &plans[i].path,
                 OptimizeOptionsInput {
                     define: self.define.iter().cloned().collect(),
-                    validated_define: validated_define.clone(),
+                    prepared_defines: prepared_defines.clone(),
                     minify: self.minify,
                     drop_console: self.drop_console,
                     drop_debugger: self.drop_debugger,
@@ -2663,7 +3106,7 @@ impl IncrementalBundler {
                     linker_vc,
                     css_input_vc,
                     options_input_vc,
-                    interner,
+                    compiler,
                 )
             });
         }
@@ -2675,30 +3118,45 @@ impl IncrementalBundler {
             t_optimize_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
         let mut timing_optimizer_modules = 0_usize;
         let mut timing_optimizer_iterations = 0_usize;
-        let mut timing_optimizer_passes = Vec::<(&'static str, usize, usize)>::new();
+        let mut timing_optimizer_passes = Vec::<(String, usize, usize)>::new();
         for (&i, (optimized_vc, out)) in optimize_miss.iter().zip(optimized_results) {
             if timing && let Some(optimized) = &out.optimized {
                 timing_optimizer_modules += 1;
-                timing_optimizer_iterations += optimized.stats().iterations;
-                for pass in &optimized.stats().passes {
+                timing_optimizer_iterations += optimized.statistics().iterations();
+                for pass in optimized.statistics().passes() {
                     if let Some((_, runs, changes)) = timing_optimizer_passes
                         .iter_mut()
-                        .find(|(name, _, _)| *name == pass.pass.name())
+                        .find(|(name, _, _)| name == pass.name())
                     {
-                        *runs += pass.runs;
-                        *changes += pass.changes;
+                        *runs += pass.runs();
+                        *changes += pass.changes();
                     } else {
-                        timing_optimizer_passes.push((pass.pass.name(), pass.runs, pass.changes));
+                        timing_optimizer_passes.push((
+                            pass.name().to_owned(),
+                            pass.runs(),
+                            pass.changes(),
+                        ));
                     }
                 }
             }
             if out.optimized.is_some()
                 && let Some(c) = self.cache.as_mut()
             {
-                c.put_retained_module_ids(plans[i].optimize_key, out.retained_module_ids.clone());
+                c.put_retained_requests(
+                    plans[i].optimize_key,
+                    Arc::new(
+                        out.retained_requests
+                            .iter()
+                            .map(|dependency| CachedRetainedRequest {
+                                specifier: dependency.request.specifier.clone(),
+                                kind: cached_request_kind(dependency.request.kind),
+                            })
+                            .collect(),
+                    ),
+                );
             }
             extend_module_diagnostics(&mut diagnostics, &out.diagnostics, &plans[i].path);
-            plans[i].retained_module_ids = Some(out.retained_module_ids.clone());
+            plans[i].retained_requests = Some(out.retained_requests.clone());
             plans[i].optimized_vc = Some(optimized_vc);
             if self.one_shot && !self.sourcemap {
                 plans[i].optimized_artifact = Some(out);
@@ -2716,35 +3174,25 @@ impl IncrementalBundler {
                 timing_optimizer_iterations as f64 / timing_optimizer_modules as f64,
             );
         }
-        let retained_edges: Vec<(u32, Arc<Vec<u32>>)> = plans
-            .iter()
-            .map(|plan| {
-                (
-                    plan.id,
-                    plan.retained_module_ids
-                        .as_ref()
-                        .expect("retained facts")
-                        .clone(),
-                )
-            })
-            .collect();
+        let retained_edges = retained_module_edges(&modules, &plans);
 
         // —— Retained-edge convergence and fresh chunk planning. ——
-        let (live, final_edges) = if self.dead_module_elimination {
-            let live = live_modules(&retained_edges, entry_id);
-            let edges = retained_module_edges(&modules, &retained_edges, &live);
-            (live, edges)
+        let live = if self.dead_module_elimination {
+            live_modules(&retained_edges, entry_id)
         } else {
-            (
-                ordered.iter().copied().collect::<FxHashSet<_>>(),
-                build_module_edges(&modules),
-            )
+            ordered.iter().copied().collect::<FxHashSet<_>>()
         };
+        let mut final_edges = retained_edges;
+        final_edges.retain(|module, _| live.contains(module));
         let chunk_graph = if self.code_splitting {
             compute_chunk_graph(&final_edges, entry_id, self.share_threshold)
         } else {
             None
         };
+        let federation_expose_of_chunk = chunk_graph
+            .as_ref()
+            .map(|graph| federation_chunk_exposes(graph, &self.federation_expose_roots))
+            .unwrap_or_default();
         let async_ids = async_module_ids_with_edges(&modules, &final_edges);
         if self.module_format == ModuleFormat::CommonJs {
             if async_ids.contains(&entry_id) {
@@ -2761,32 +3209,32 @@ impl IncrementalBundler {
                 );
             } else {
                 for (&module_id, module) in modules.iter().filter(|(id, _)| live.contains(id)) {
-                    let retained_targets = final_edges
+                    for request in final_edges
                         .get(&module_id)
-                        .map(|edges| edges.static_targets.as_slice())
-                        .unwrap_or_default();
-                    let targets = module
-                        .dep_ids
-                        .iter()
-                        .map(|(specifier, id)| (specifier.as_str(), *id))
-                        .collect::<FxHashMap<_, _>>();
-                    for dependency in &module.deps {
-                        if dependency.kind == DependencyKind::Require
-                            && targets
-                                .get(dependency.specifier.as_str())
-                                .is_some_and(|target| {
-                                    retained_targets.contains(target) && async_ids.contains(target)
-                                })
-                        {
-                            diagnostics.push(
-                                Diagnostic::error(
-                                    "CommonJS require() 不能同步加载包含顶层 await 的模块",
-                                )
-                                .with_code("WAKE0304")
-                                .with_path(path_to_slash(&module.path))
-                                .with_primary(dependency.span, "此 require() 指向异步模块"),
-                            );
-                        }
+                        .into_iter()
+                        .flat_map(|edges| &edges.requests)
+                        .filter(|request| {
+                            request.request.kind == ModuleRequestKind::Require
+                                && async_ids.contains(&request.module_id)
+                        })
+                    {
+                        let span = module
+                            .deps
+                            .iter()
+                            .find(|dependency| {
+                                dependency.kind == DependencyKind::Require
+                                    && dependency.specifier == request.request.specifier
+                            })
+                            .map(|dependency| dependency.span)
+                            .unwrap_or(Span::DUMMY);
+                        diagnostics.push(
+                            Diagnostic::error(
+                                "CommonJS require() 不能同步加载包含顶层 await 的模块",
+                            )
+                            .with_code("WAKE0304")
+                            .with_path(path_to_slash(&module.path))
+                            .with_primary(span, "此 require() 指向异步模块"),
+                        );
                     }
                 }
             }
@@ -2805,40 +3253,58 @@ impl IncrementalBundler {
         // mapping facts, even for an unmapped request, so later map enablement never re-emits JS.
         for plan in plans.iter_mut().filter(|plan| live.contains(&plan.id)) {
             let rec = &modules[&plan.id];
-            let mut async_deps: Vec<u32> = rec
-                .dep_ids
+            let edges = &final_edges[&plan.id];
+            let mut async_deps: Vec<u32> = edges
+                .requests
                 .iter()
-                .map(|(_, target)| *target)
+                .filter(|request| request.request.kind == ModuleRequestKind::StaticImport)
+                .map(|request| request.module_id)
                 .filter(|target| async_ids.contains(target))
                 .collect();
             async_deps.sort_unstable();
             async_deps.dedup();
             let emit_data = EmitLinkerData {
                 deps: rec.dep_ids.clone(),
-                dyn_chunks: dyn_chunks_of(rec, chunk_graph.as_ref()),
+                dyn_chunks: dyn_chunks_of(edges, chunk_graph.as_ref()),
+                runtime_imports: rec.runtime_imports.clone(),
+                runtime_import_expose: (!rec.runtime_imports.is_empty())
+                    .then(|| {
+                        chunk_graph
+                            .as_ref()
+                            .and_then(|graph| graph.module_chunk.get(&plan.id))
+                            .and_then(|chunk| federation_expose_of_chunk.get(chunk))
+                            .cloned()
+                    })
+                    .flatten(),
+                shared_imports: rec.shared_imports.clone(),
                 async_deps,
                 no_esmodule,
             };
             let emit_hash = hash_emit_linker(&emit_data);
-            plan.body_key = ((plan.content_key as u128) << 64)
-                | ((plan.optimize_linker_hash ^ self.define_hash ^ optimizer_salt ^ emit_hash)
-                    as u128);
+            plan.body_key = body_key_of(
+                plan.content_key,
+                plan.optimize_linker_hash,
+                self.define_hash,
+                optimizer_salt,
+                emit_hash,
+            );
             if self.one_shot && !self.sourcemap {
                 plan.emit_linker_data = Some(Arc::new(emit_data.clone()));
             }
-            plan.emit_linker_vc = Some(self.emit_linker_cell(&plan.path, emit_data));
             if !cij_active && let Some(cache) = self.cache.as_mut() {
                 let body = cache.body(plan.body_key);
                 let mappings = cache.mappings(plan.body_key);
-                if body.is_some() && mappings.is_some() {
-                    plan.cached_body = body;
-                    if let Some(mappings) = mappings {
-                        let (map, requests) = module_metadata_from_cache(mappings);
-                        plan.cached_map = Some(map);
-                        plan.cached_discarded_static_requests = requests;
-                    }
+                if let (Some(body), Some(mappings)) = (body, mappings)
+                    && let Some((map, requests, runtime_names)) =
+                        module_metadata_from_cache(&body, &emit_data.deps, mappings)
+                {
+                    plan.cached_body = Some(body);
+                    plan.cached_map = Some(map);
+                    plan.cached_generated_module_requests = requests;
+                    plan.cached_runtime_names = Some(runtime_names);
                 }
             }
+            plan.emit_linker_vc = Some(self.emit_linker_cell(&plan.path, emit_data));
         }
 
         // A retained-fact hit can still have a missing body (for example after bounded cache
@@ -2863,11 +3329,11 @@ impl IncrementalBundler {
                     let rec = &modules[&plans[i].id];
                     let cell = rec.content_vc;
                     let st = rec.source_type;
-                    let interner = self.interner.clone();
-                    let jsx = self.jsx;
-                    let transform_features = self.transform_features;
+                    let compiler = self.compiler.clone();
+                    let jsx = self.jsx.clone();
+                    let target = self.target.clone();
                     let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&rec.path)));
-                    move || parse_request(cell, interner, st, jsx, transform_features, file_name)
+                    move || parse_request(cell, compiler, st, jsx, target, file_name)
                 })
                 .collect();
             let engine = Arc::clone(&self.engine);
@@ -2886,13 +3352,13 @@ impl IncrementalBundler {
                 .parse_vc
                 .expect("late optimizer parse");
             let linker_vc = plans[i].optimize_linker_vc;
-            let interner = self.interner.clone();
+            let compiler = self.compiler.clone();
             let css_input_vc = self.css_codegen_cell(&plans[i].path, CssCodegenInput::default());
             let options_input_vc = self.optimize_options_cell(
                 &plans[i].path,
                 OptimizeOptionsInput {
                     define: self.define.iter().cloned().collect(),
-                    validated_define: validated_define.clone(),
+                    prepared_defines: prepared_defines.clone(),
                     minify: self.minify,
                     drop_console: self.drop_console,
                     drop_debugger: self.drop_debugger,
@@ -2906,7 +3372,7 @@ impl IncrementalBundler {
                     linker_vc,
                     css_input_vc,
                     options_input_vc,
-                    interner,
+                    compiler,
                 )
             });
         }
@@ -2918,8 +3384,8 @@ impl IncrementalBundler {
             t_late_optimize_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
         for (&i, (optimized_vc, out)) in late_optimize.iter().zip(late_results) {
             debug_assert_eq!(
-                plans[i].retained_module_ids.as_deref().map(Vec::as_slice),
-                Some(out.retained_module_ids.as_slice()),
+                plans[i].retained_requests.as_deref().map(Vec::as_slice),
+                Some(out.retained_requests.as_slice()),
                 "persisted retained facts must match recomputed optimizer output"
             );
             extend_module_diagnostics(&mut diagnostics, &out.diagnostics, &plans[i].path);
@@ -2955,7 +3421,7 @@ impl IncrementalBundler {
             };
             let optimized_vc = plans[i].optimized_vc;
             let emit_linker_vc = plans[i].emit_linker_vc;
-            let interner = self.interner.clone();
+            let compiler = self.compiler.clone();
             let codegen_exec_counts = self.codegen_exec_counts.clone();
             let codegen_counter_shard = plans[i].id as usize & (CODEGEN_COUNTER_SHARDS - 1);
             body_requests.push(move || {
@@ -2965,7 +3431,7 @@ impl IncrementalBundler {
                         Arc::new(emit_body(
                             &artifact,
                             &data,
-                            &interner,
+                            &compiler,
                             &codegen_exec_counts,
                             codegen_counter_shard,
                         )),
@@ -2974,7 +3440,7 @@ impl IncrementalBundler {
                     let (body_vc, body) = emit_body_request(
                         optimized_vc.expect("body miss optimizer value"),
                         emit_linker_vc.expect("final linker value"),
-                        interner,
+                        compiler,
                         codegen_exec_counts,
                         codegen_counter_shard,
                     );
@@ -2992,11 +3458,12 @@ impl IncrementalBundler {
         let mut timing_full_body_nanos = 0_u64;
         let mut body_of: FxHashMap<u32, Arc<String>> = FxHashMap::default();
         let mut map_of: FxHashMap<u32, Arc<ModuleMappings>> = FxHashMap::default();
-        let mut discarded_static_requests_of: FxHashMap<
-            u32,
-            Arc<Vec<GeneratedDiscardedStaticRequest>>,
-        > = FxHashMap::default();
+        let mut generated_module_requests_of: FxHashMap<u32, Arc<Vec<GeneratedModuleRequest>>> =
+            FxHashMap::default();
+        let mut runtime_names_of: FxHashMap<u32, GeneratedModuleRuntimeNames> =
+            FxHashMap::default();
         for (&i, (body_vc, out)) in body_miss.iter().zip(emitted) {
+            extend_module_diagnostics(&mut diagnostics, &out.diagnostics, &plans[i].path);
             if timing {
                 if out.sealed_trivial {
                     timing_trivial_bodies += 1;
@@ -3010,12 +3477,13 @@ impl IncrementalBundler {
             if out.cacheable
                 && let Some(cache) = self.cache.as_mut()
             {
-                cache.put_body(plans[i].body_key, out.code.clone());
-                cache.put_mappings(
+                cache.put_emission(
                     plans[i].body_key,
+                    out.code.clone(),
                     Arc::new(cached_mappings_from_module(
                         &out.mapping_facts,
-                        &out.discarded_static_requests,
+                        &out.generated_module_requests,
+                        &out.runtime_names,
                     )),
                 );
             }
@@ -3024,9 +3492,10 @@ impl IncrementalBundler {
             }
             plans[i].body_vc = body_vc;
             body_of.insert(plans[i].id, out.code.clone());
-            if !out.discarded_static_requests.is_empty() {
-                discarded_static_requests_of
-                    .insert(plans[i].id, out.discarded_static_requests.clone());
+            runtime_names_of.insert(plans[i].id, out.runtime_names.clone());
+            if !out.generated_module_requests.is_empty() {
+                generated_module_requests_of
+                    .insert(plans[i].id, out.generated_module_requests.clone());
             }
         }
         if timing && !body_miss.is_empty() {
@@ -3043,8 +3512,11 @@ impl IncrementalBundler {
             if let Some(body) = &plan.cached_body {
                 body_of.insert(plan.id, body.clone());
             }
-            if let Some(requests) = &plan.cached_discarded_static_requests {
-                discarded_static_requests_of.insert(plan.id, requests.clone());
+            if let Some(requests) = &plan.cached_generated_module_requests {
+                generated_module_requests_of.insert(plan.id, requests.clone());
+            }
+            if let Some(runtime_names) = &plan.cached_runtime_names {
+                runtime_names_of.insert(plan.id, runtime_names.clone());
             }
             if self.sourcemap
                 && let Some(map) = &plan.cached_map
@@ -3080,6 +3552,7 @@ impl IncrementalBundler {
         let (style_assets, style_files) = if self.extract_css {
             build_style_artifacts(
                 &modules,
+                &final_edges,
                 entry_id,
                 chunk_graph.as_ref(),
                 &mut collected_css,
@@ -3098,7 +3571,20 @@ impl IncrementalBundler {
             .iter()
             .filter_map(|(&id, rec)| rec.block_info.map(|bi| (id, bi)))
             .collect();
-        let namespace_identity_ids = namespace_identity_module_ids(&modules);
+        let namespace_identity_ids = namespace_identity_module_ids(&modules, &final_edges);
+        let concat_export_names_by_id = modules
+            .iter()
+            .map(|(&id, module)| (id, concat_export_names(module, &self.interner)))
+            .collect::<FxHashMap<_, _>>();
+        let runtime_capabilities = union_runtime_capabilities(runtime_names_of.values());
+        let has_runtime_imports = runtime_capabilities.runtime_import;
+        let has_shared_imports = runtime_capabilities.shared;
+        if has_shared_imports && self.federation_entry_export.is_none() {
+            diagnostics.push(
+                Diagnostic::error("shared runtime imports require a federation expose identity")
+                    .with_code(FederationErrorCode::ConfigInvalid.as_str()),
+            );
+        }
 
         // Source maps are orthogonal to optimization. The emitter records the exact final byte
         // placement of every surviving source body fragment; merge_bundle_map then conservatively
@@ -3111,15 +3597,20 @@ impl IncrementalBundler {
             None => {
                 let bundle = emit(
                     &bodies,
+                    &final_edges,
                     entry_id,
                     self.minify,
-                    no_esmodule,
                     &block_infos,
+                    &concat_export_names_by_id,
                     &namespace_identity_ids,
                     &async_ids,
-                    &discarded_static_requests_of,
-                    &self.exec,
+                    &generated_module_requests_of,
+                    &runtime_names_of,
                     self.module_format,
+                    has_runtime_imports,
+                    has_shared_imports,
+                    self.federation_entry_export.as_ref(),
+                    self.federation_entry_export_build_scoped,
                     want_map.then_some(&mut body_placements),
                 );
                 let mut o =
@@ -3169,7 +3660,7 @@ impl IncrementalBundler {
                 o
             }
             Some(g) => {
-                let token = build_token(&normalize(entry), live_ids.len());
+                let token = build_token(&normalize(entry), &bodies);
                 let mut chunk_placements: FxHashMap<u32, Vec<BodyPlacement>> = FxHashMap::default();
                 let (mut chunks, entry_chunk) = emit_chunks(
                     &bodies,
@@ -3179,7 +3670,13 @@ impl IncrementalBundler {
                     &self.public_path,
                     self.content_hash,
                     &async_ids,
+                    &runtime_names_of,
                     &style_files,
+                    has_runtime_imports,
+                    has_shared_imports,
+                    self.federation_entry_export.as_ref(),
+                    self.federation_entry_export_build_scoped,
+                    &self.federation_expose_roots,
                     want_map.then_some(&mut chunk_placements),
                 );
                 if let Some(name) = self.entry_chunk_name.as_deref() {
@@ -3251,15 +3748,26 @@ impl IncrementalBundler {
 
         // —— 带外产物：超阈值资源（按文件名去重）+ prod 聚合 CSS（模块 id 升序 = BFS 发现序）——
         let mut assets: Vec<OutputAsset> = style_assets;
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        for (name, bytes) in collected_assets {
-            if seen.insert(name.clone()) {
+        let mut asset_indexes: FxHashMap<String, usize> = FxHashMap::default();
+        for (owner_module_id, name, bytes) in collected_assets {
+            if let Some(index) = asset_indexes.get(&name).copied() {
+                let asset = &mut assets[index];
+                debug_assert_eq!(asset.bytes, bytes, "content-addressed asset name collision");
+                asset.owner_module_ids.push(owner_module_id);
+            } else {
+                asset_indexes.insert(name.clone(), assets.len());
                 assets.push(OutputAsset {
                     file_name: name,
                     bytes,
                     is_css: false,
+                    owner_module_ids: vec![owner_module_id],
+                    unscoped_css_owner_module_ids: Vec::new(),
                 });
             }
+        }
+        for asset in &mut assets {
+            asset.owner_module_ids.sort_unstable();
+            asset.owner_module_ids.dedup();
         }
         output.assets = assets;
 
@@ -3268,7 +3776,8 @@ impl IncrementalBundler {
         drop(bodies);
         drop(body_of);
         drop(map_of);
-        drop(discarded_static_requests_of);
+        drop(generated_module_requests_of);
+        drop(runtime_names_of);
         drop(body_placements);
         drop(block_infos);
         drop(namespace_identity_ids);
@@ -3281,7 +3790,37 @@ impl IncrementalBundler {
             && let (Some(cache), Some(path)) = (&mut self.cache, &self.cache_path)
             && cache.is_dirty()
         {
-            let _ = cache.store(path);
+            match cache.store(path) {
+                Ok(report) => {
+                    if report.repaired_corrupt_latest {
+                        cache_warnings.push("已原子替换损坏的持久化缓存文件".to_string());
+                    }
+                    if report.dropped_conflicts > 0 {
+                        cache_warnings.push(format!(
+                            "并发写入存在冲突，已丢弃 {} 组不一致缓存事实",
+                            report.dropped_conflicts
+                        ));
+                    }
+                }
+                Err(error) => {
+                    cache_warnings.push(format!(
+                        "写入持久化缓存失败：{error}；内存缓存保持待写，后续构建将重试"
+                    ));
+                }
+            }
+        }
+        if !cache_warnings.is_empty() {
+            let path = self
+                .cache_path
+                .as_deref()
+                .expect("cache warnings require an enabled persistent cache");
+            let mut diagnostic = Diagnostic::warning("持久化构建缓存出现问题；本次构建已继续")
+                .with_code("WAKE_CACHE")
+                .with_path(path.to_string_lossy().into_owned());
+            for warning in cache_warnings {
+                diagnostic = diagnostic.with_note(warning);
+            }
+            output.diagnostics.push(diagnostic);
         }
 
         let pre_release_total = t0.elapsed();
@@ -3436,6 +3975,67 @@ impl IncrementalBundler {
     /// Link 阶段：算每个模块的「保留导出名」（`None` = 不 shake，全保留）。
     ///
     /// 从入口出发累计跨模块导出使用（DESIGN §5.3 / PLAN §6.6）：入口全保留；`import *` /
+    fn compute_export_star_lowering(
+        &self,
+        modules: &FxHashMap<u32, ModuleRec>,
+    ) -> FxHashMap<u32, Vec<LinkerExportStar>> {
+        let spec_to_id: FxHashMap<u32, FxHashMap<String, u32>> = modules
+            .iter()
+            .map(|(&id, rec)| {
+                (
+                    id,
+                    rec.dep_ids
+                        .iter()
+                        .filter(|dependency| {
+                            dependency.request.kind == ModuleRequestKind::StaticImport
+                        })
+                        .map(|dependency| {
+                            (dependency.request.specifier.clone(), dependency.module_id)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let resolve = |module: u32, specifier: &str| {
+            spec_to_id
+                .get(&module)
+                .and_then(|requests| requests.get(specifier))
+                .copied()
+        };
+        let liveness: FxHashMap<u32, &ModuleLiveness> = modules
+            .iter()
+            .filter_map(|(&id, module)| module.liveness.as_deref().map(|facts| (id, facts)))
+            .collect();
+        let esm: FxHashSet<u32> = modules
+            .iter()
+            .filter_map(|(&id, module)| {
+                module
+                    .block_info
+                    .is_some_and(|info| info.is_esm)
+                    .then_some(id)
+            })
+            .collect();
+        compute_export_star_plans(&liveness, &resolve, &esm, self.interner.intern("default"))
+            .into_iter()
+            .map(|(module, plans)| {
+                let plans = plans
+                    .into_iter()
+                    .map(|plan| match plan.resolution {
+                        ExportStarResolution::Exact(names) => LinkerExportStar::exact(
+                            plan.specifier,
+                            names.into_iter().map(|name| self.interner.resolve(name)),
+                        ),
+                        ExportStarResolution::Runtime { excluded } => LinkerExportStar::runtime(
+                            plan.specifier,
+                            excluded.into_iter().map(|name| self.interner.resolve(name)),
+                        ),
+                    })
+                    .collect();
+                (module, plans)
+            })
+            .collect()
+    }
+
     /// 动态 `import()` / `require()` 目标全保留；具名 import 累加具体名。
     /// `export *` (ReexportAll) 仅在下游消费本模块导出时才传播至目标——避免 barrel 文件
     /// 无条件把整棵 re-export 子树全部标记为 Used::All。
@@ -3466,7 +4066,12 @@ impl IncrementalBundler {
                     id,
                     rec.dep_ids
                         .iter()
-                        .map(|(s, t)| (s.clone(), *t))
+                        .filter(|dependency| {
+                            dependency.request.kind == ModuleRequestKind::StaticImport
+                        })
+                        .map(|dependency| {
+                            (dependency.request.specifier.clone(), dependency.module_id)
+                        })
                         .collect::<FxHashMap<String, u32>>(),
                 )
             })
@@ -3494,10 +4099,14 @@ impl IncrementalBundler {
                     dep.kind,
                     DependencyKind::DynamicImport | DependencyKind::Require
                 );
-                if (dyn_or_req || !has_live)
-                    && let Some(tid) = resolve(id, &dep.specifier)
-                {
-                    force_all.insert(tid);
+                if dyn_or_req || !has_live {
+                    let kind: ModuleRequestKind = dep.kind.into();
+                    if let Some(tid) = rec.dep_ids.iter().find_map(|request| {
+                        (request.request.specifier == dep.specifier && request.request.kind == kind)
+                            .then_some(request.module_id)
+                    }) {
+                        force_all.insert(tid);
+                    }
                 }
             }
         }
@@ -3506,11 +4115,7 @@ impl IncrementalBundler {
 
         for &id in modules.keys() {
             let k = match live_keep.get(&id) {
-                Some(LiveResult::Names {
-                    retained,
-                    observed,
-                    preserve_export_star,
-                }) => {
+                Some(LiveResult::Names { retained, observed }) => {
                     let resolve_names = |atoms: &FxHashSet<_>| {
                         let mut names: Vec<String> = atoms
                             .iter()
@@ -3522,7 +4127,6 @@ impl IncrementalBundler {
                     Some(ExportKeep {
                         retained_export_names: resolve_names(retained),
                         observed_export_names: resolve_names(observed),
-                        preserve_export_star: *preserve_export_star,
                     })
                 }
                 // `All` 或不在结果里（缺绑定分析）→ 保守全保留。
@@ -3549,6 +4153,9 @@ impl IncrementalBundler {
         self.platform.hash(&mut hasher);
         self.module_format.hash(&mut hasher);
         self.external_packages.hash(&mut hasher);
+        self.federation_remotes.hash(&mut hasher);
+        self.federation_shared.hash(&mut hasher);
+        self.federation_shared_fallback_roots.hash(&mut hasher);
 
         let mut ids = modules.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
@@ -3556,8 +4163,11 @@ impl IncrementalBundler {
             let module = &modules[&id];
             id.hash(&mut hasher);
             path_to_slash(&module.path).hash(&mut hasher);
+            module.federation_resolution_context.hash(&mut hasher);
             module.dep_ids.hash(&mut hasher);
             module.external_deps.hash(&mut hasher);
+            module.runtime_imports.hash(&mut hasher);
+            module.shared_imports.hash(&mut hasher);
             module.has_top_level_await.hash(&mut hasher);
             // The owned summary contains dependency kinds and binding liveness without retaining
             // AST/arena state. Equal semantic summaries deliberately reuse the plan even when a
@@ -3594,6 +4204,14 @@ fn resolution_profile(platform: BuildPlatform, kind: DependencyKind) -> Resoluti
         conditions,
         main_fields,
     }
+}
+
+fn is_federation_specifier(specifier: &str, remotes: &[String]) -> bool {
+    remotes.iter().any(|remote| {
+        specifier
+            .strip_prefix(remote)
+            .is_some_and(|expose| expose.starts_with('/') && expose.len() > 1)
+    })
 }
 
 fn is_external_specifier(specifier: &str, platform: BuildPlatform, packages: &[String]) -> bool {
@@ -3699,19 +4317,21 @@ struct CgPlan {
     optimized_vc: Option<Vc<OptimizeArtifact>>,
     /// One-shot terminal emission consumes this Arc directly instead of re-entering the task graph.
     optimized_artifact: Option<Arc<OptimizeArtifact>>,
-    retained_module_ids: Option<Arc<Vec<u32>>>,
+    retained_requests: Option<Arc<Vec<ResolvedModuleRequest>>>,
     body_key: u128,
     emit_linker_vc: Option<Vc<EmitLinkerData>>,
     emit_linker_data: Option<Arc<EmitLinkerData>>,
     body_vc: Option<Vc<EmittedBody>>,
     cached_body: Option<Arc<String>>,
     cached_map: Option<Arc<ModuleMappings>>,
-    cached_discarded_static_requests: Option<Arc<Vec<GeneratedDiscardedStaticRequest>>>,
+    cached_generated_module_requests: Option<Arc<Vec<GeneratedModuleRequest>>>,
+    cached_runtime_names: Option<GeneratedModuleRuntimeNames>,
 }
 
 fn cached_mappings_from_module(
     mappings: &ModuleMappings,
-    discarded_static_requests: &[GeneratedDiscardedStaticRequest],
+    generated_module_requests: &[GeneratedModuleRequest],
+    runtime_names: &GeneratedModuleRuntimeNames,
 ) -> CachedModuleMappings {
     CachedModuleMappings {
         mappings: mappings
@@ -3727,23 +4347,88 @@ fn cached_mappings_from_module(
             })
             .collect(),
         names: mappings.names.clone(),
-        discarded_static_requests: discarded_static_requests
+        generated_module_requests: generated_module_requests
             .iter()
-            .map(|request| CachedDiscardedStaticRequest {
+            .map(|request| CachedModuleRequest {
                 start: request.start,
                 end: request.end,
-                target_module_id: request.target_module_id,
+                specifier: request.specifier.clone(),
+                kind: cached_request_kind(request.kind),
+                role: match request.role {
+                    GeneratedModuleRequestRole::Value => CachedModuleRequestRole::Value,
+                    GeneratedModuleRequestRole::DiscardedStatic => {
+                        CachedModuleRequestRole::DiscardedStatic
+                    }
+                },
             })
             .collect(),
+        runtime_names: CachedModuleRuntimeNames {
+            module: runtime_names.module.clone(),
+            exports: runtime_names.exports.clone(),
+            require: runtime_names.require.clone(),
+            capabilities: CachedModuleRuntimeCapabilities {
+                meta_url: runtime_names.capabilities.meta_url,
+                external_require: runtime_names.capabilities.external_require,
+                promise_resolve: runtime_names.capabilities.promise_resolve,
+                object_assign: runtime_names.capabilities.object_assign,
+                object_keys: runtime_names.capabilities.object_keys,
+                object_define_property: runtime_names.capabilities.object_define_property,
+                runtime_import: runtime_names.capabilities.runtime_import,
+                shared: runtime_names.capabilities.shared,
+            },
+        },
     }
 }
 
-fn module_metadata_from_cache(
-    mappings: Arc<CachedModuleMappings>,
-) -> (
+type RestoredModuleMetadata = (
     Arc<ModuleMappings>,
-    Option<Arc<Vec<GeneratedDiscardedStaticRequest>>>,
-) {
+    Option<Arc<Vec<GeneratedModuleRequest>>>,
+    GeneratedModuleRuntimeNames,
+);
+
+fn module_metadata_from_cache(
+    body: &str,
+    deps: &[ResolvedModuleRequest],
+    mappings: Arc<CachedModuleMappings>,
+) -> Option<RestoredModuleMetadata> {
+    let generated_module_requests = mappings
+        .generated_module_requests
+        .iter()
+        .map(|request| {
+            let kind = module_request_kind(request.kind);
+            if request.role == CachedModuleRequestRole::DiscardedStatic
+                && kind != ModuleRequestKind::StaticImport
+            {
+                return None;
+            }
+            let target_module_id = deps.iter().find_map(|dependency| {
+                (dependency.request.specifier == request.specifier
+                    && dependency.request.kind == kind)
+                    .then_some(dependency.module_id)
+            })?;
+            Some(GeneratedModuleRequest {
+                start: request.start,
+                end: request.end,
+                target_module_id,
+                role: match request.role {
+                    CachedModuleRequestRole::Value => GeneratedModuleRequestRole::Value,
+                    CachedModuleRequestRole::DiscardedStatic => {
+                        GeneratedModuleRequestRole::DiscardedStatic
+                    }
+                },
+                specifier: request.specifier.clone(),
+                kind,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if !generated_module_requests_are_valid(
+        body,
+        generated_module_requests
+            .iter()
+            .map(|request| (request.start, request.end, request.target_module_id)),
+    ) {
+        return None;
+    }
     let module_mappings = Arc::new(ModuleMappings {
         mappings: mappings
             .mappings
@@ -3759,20 +4444,80 @@ fn module_metadata_from_cache(
             .collect(),
         names: mappings.names.clone(),
     });
-    let requests = (!mappings.discarded_static_requests.is_empty()).then(|| {
-        Arc::new(
-            mappings
-                .discarded_static_requests
-                .iter()
-                .map(|request| GeneratedDiscardedStaticRequest {
-                    start: request.start,
-                    end: request.end,
-                    target_module_id: request.target_module_id,
-                })
-                .collect(),
-        )
-    });
-    (module_mappings, requests)
+    let requests =
+        (!generated_module_requests.is_empty()).then(|| Arc::new(generated_module_requests));
+    let runtime_names = GeneratedModuleRuntimeNames {
+        module: mappings.runtime_names.module.clone(),
+        exports: mappings.runtime_names.exports.clone(),
+        require: mappings.runtime_names.require.clone(),
+        capabilities: GeneratedModuleRuntimeCapabilities {
+            meta_url: mappings.runtime_names.capabilities.meta_url,
+            external_require: mappings.runtime_names.capabilities.external_require,
+            promise_resolve: mappings.runtime_names.capabilities.promise_resolve,
+            object_assign: mappings.runtime_names.capabilities.object_assign,
+            object_keys: mappings.runtime_names.capabilities.object_keys,
+            object_define_property: mappings.runtime_names.capabilities.object_define_property,
+            runtime_import: mappings.runtime_names.capabilities.runtime_import,
+            shared: mappings.runtime_names.capabilities.shared,
+        },
+    };
+    Some((module_mappings, requests, runtime_names))
+}
+
+fn cached_request_kind(kind: ModuleRequestKind) -> CachedModuleRequestKind {
+    match kind {
+        ModuleRequestKind::StaticImport => CachedModuleRequestKind::StaticImport,
+        ModuleRequestKind::DynamicImport => CachedModuleRequestKind::DynamicImport,
+        ModuleRequestKind::Require => CachedModuleRequestKind::Require,
+    }
+}
+
+fn module_request_kind(kind: CachedModuleRequestKind) -> ModuleRequestKind {
+    match kind {
+        CachedModuleRequestKind::StaticImport => ModuleRequestKind::StaticImport,
+        CachedModuleRequestKind::DynamicImport => ModuleRequestKind::DynamicImport,
+        CachedModuleRequestKind::Require => ModuleRequestKind::Require,
+    }
+}
+
+fn union_runtime_capabilities<'a>(
+    runtimes: impl IntoIterator<Item = &'a GeneratedModuleRuntimeNames>,
+) -> GeneratedModuleRuntimeCapabilities {
+    let mut union = GeneratedModuleRuntimeCapabilities::default();
+    for runtime in runtimes {
+        let capabilities = &runtime.capabilities;
+        union.meta_url |= capabilities.meta_url;
+        union.external_require |= capabilities.external_require;
+        union.promise_resolve |= capabilities.promise_resolve;
+        union.object_assign |= capabilities.object_assign;
+        union.object_keys |= capabilities.object_keys;
+        union.object_define_property |= capabilities.object_define_property;
+        union.runtime_import |= capabilities.runtime_import;
+        union.shared |= capabilities.shared;
+    }
+    union
+}
+
+fn generated_module_requests_are_valid(
+    body: &str,
+    requests: impl IntoIterator<Item = (u32, u32, u32)>,
+) -> bool {
+    let mut previous_end = 0usize;
+    for (start, end, target_module_id) in requests {
+        let start = start as usize;
+        let end = end as usize;
+        if start < previous_end || start >= end {
+            return false;
+        }
+        let Some(literal) = body.get(start..end) else {
+            return false;
+        };
+        if literal != target_module_id.to_string() {
+            return false;
+        }
+        previous_end = end;
+    }
+    true
 }
 
 fn extend_module_diagnostics(
@@ -3794,10 +4539,30 @@ fn extend_module_diagnostics(
 fn content_key_of(
     src: &str,
     st: SourceType,
-    jsx: JsxRuntimeOptions,
+    jsx: &JsxRuntimeOptions,
     target_fingerprint: u64,
     css_in_js: bool,
     path: &Path,
+) -> u64 {
+    content_key_with_parse_version(
+        src,
+        st,
+        jsx,
+        target_fingerprint,
+        css_in_js,
+        path,
+        wake_compiler_core::PARSE_PIPELINE_VERSION,
+    )
+}
+
+fn content_key_with_parse_version(
+    src: &str,
+    st: SourceType,
+    jsx: &JsxRuntimeOptions,
+    target_fingerprint: u64,
+    css_in_js: bool,
+    path: &Path,
+    parse_pipeline_version: &str,
 ) -> u64 {
     let mut seed = match st {
         SourceType::Module => 1,
@@ -3806,6 +4571,7 @@ fn content_key_of(
         SourceType::Tsx => 4,
         SourceType::Jsx => 5,
     };
+    seed ^= xxh3_64_with_seed(parse_pipeline_version.as_bytes(), 0x7061_7273_652d_7631);
     // JSX 口径改变解析产出的依赖（`react/jsx-runtime` ↔ `react/jsx-dev-runtime`），
     // 必须参与主键，否则跨 dev/prod 复用摘要会带错依赖。
     seed ^= jsx.salt() ^ target_fingerprint;
@@ -3836,18 +4602,18 @@ fn collect_module_liveness_with_css(
 }
 
 /// JSX 运行时口径（随 bundler 恒定，传入 parse 任务）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JsxRuntimeOptions {
     pub(crate) dev: bool,
-    /// `jsxImportSource`；`'static` 是因为其取值来自配置且在构建期恒定（`Box::leak` 或字面量）。
-    pub(crate) import_source: &'static str,
+    /// Owned `jsxImportSource`; sessions never leak configuration strings to satisfy task bounds.
+    pub(crate) import_source: Arc<str>,
 }
 
 impl Default for JsxRuntimeOptions {
     fn default() -> Self {
         JsxRuntimeOptions {
             dev: false,
-            import_source: "react",
+            import_source: Arc::from("react"),
         }
     }
 }
@@ -3881,7 +4647,10 @@ fn hash_emit_linker(data: &EmitLinkerData) -> u64 {
 /// invalidation. The pipeline version applies even to an unminified request because the optimizer
 /// still validates and applies trusted edits before emission.
 fn optimizer_config_salt(minify: bool, drop_console: bool, drop_debugger: bool) -> u64 {
-    let version = xxh3_64_with_seed(PIPELINE_VERSION.as_bytes(), 0x9E37_79B9_7F4A_7C15);
+    let version = xxh3_64_with_seed(
+        wake_compiler_core::OPTIMIZER_PIPELINE_VERSION.as_bytes(),
+        0x9E37_79B9_7F4A_7C15,
+    );
     xxh3_64_with_seed(
         &[
             u8::from(minify),
@@ -3892,189 +4661,90 @@ fn optimizer_config_salt(minify: bool, drop_console: bool, drop_debugger: bool) 
     )
 }
 
+fn body_key_of(
+    content_key: u64,
+    optimize_linker_hash: u64,
+    define_hash: u64,
+    optimizer_salt: u64,
+    emit_hash: u64,
+) -> u128 {
+    body_key_with_emit_version(
+        content_key,
+        optimize_linker_hash,
+        define_hash,
+        optimizer_salt,
+        emit_hash,
+        wake_compiler_core::EMIT_PIPELINE_VERSION,
+    )
+}
+
+fn body_key_with_emit_version(
+    content_key: u64,
+    optimize_linker_hash: u64,
+    define_hash: u64,
+    optimizer_salt: u64,
+    emit_hash: u64,
+    emit_pipeline_version: &str,
+) -> u128 {
+    let emit_version_salt =
+        xxh3_64_with_seed(emit_pipeline_version.as_bytes(), 0x656d_6974_2d76_3100);
+    ((content_key as u128) << 64)
+        | ((optimize_linker_hash ^ define_hash ^ optimizer_salt ^ emit_hash ^ emit_version_salt)
+            as u128)
+}
+
+#[cfg(test)]
+mod pipeline_cache_identity_tests {
+    use std::path::Path;
+
+    use wake_ecma_ast::SourceType;
+
+    use super::{JsxRuntimeOptions, body_key_with_emit_version, content_key_with_parse_version};
+
+    #[test]
+    fn parse_pipeline_version_invalidates_the_content_key() {
+        let jsx = JsxRuntimeOptions::default();
+        let baseline = content_key_with_parse_version(
+            "export const answer = 42;",
+            SourceType::Module,
+            &jsx,
+            17,
+            false,
+            Path::new("src/entry.js"),
+            "parse-v1",
+        );
+        let changed = content_key_with_parse_version(
+            "export const answer = 42;",
+            SourceType::Module,
+            &jsx,
+            17,
+            false,
+            Path::new("src/entry.js"),
+            "parse-v2",
+        );
+
+        assert_ne!(baseline, changed);
+    }
+
+    #[test]
+    fn emit_pipeline_version_invalidates_only_the_body_identity_layer() {
+        let baseline = body_key_with_emit_version(11, 13, 17, 19, 23, "emit-v1");
+        let changed = body_key_with_emit_version(11, 13, 17, 19, 23, "emit-v2");
+
+        assert_ne!(baseline, changed);
+        assert_eq!(
+            baseline,
+            body_key_with_emit_version(11, 13, 17, 19, 23, "emit-v1")
+        );
+    }
+}
+
 /// define 表指纹（固定种子 SipHash，跨进程稳定）——混入产物缓存键，使 define 变化精确失效缓存。
 fn hash_define(define: &[(String, String)]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     define.hash(&mut h);
     h.finish()
-}
-
-/// Parse configuration-provided define values once per build before they enter the optimizer.
-/// The parser wrapper proves the complete value is one expression, so statement/comment injection
-/// and trailing tokens become diagnostics. The optimizer owns the eventual grouping bytes;
-/// syntax-level primitives alone enter constant folding.
-fn validate_defines(define: &[(String, String)]) -> Result<Vec<ValidatedDefine>, String> {
-    let interner = Interner::new();
-    let mut seen = FxHashSet::default();
-    let mut validated = Vec::with_capacity(define.len());
-
-    for (key, value) in define {
-        if key.is_empty() || key.trim() != key || !seen.insert(key.clone()) {
-            return Err(format!(
-                "define key `{key}` must be a unique, non-empty static member chain"
-            ));
-        }
-
-        let key_source = format!("const __wake_define_key__=({key});");
-        let parsed_key = parse(&key_source, &interner, SourceType::Module);
-        if parsed_key.has_errors()
-            || !parsed_key
-                .module
-                .with_ast(|program| define_initializer(program).is_some_and(is_static_define_key))
-        {
-            return Err(format!(
-                "define key `{key}` must be an identifier, meta-property, or dot member chain{}",
-                parse_error_suffix(&parsed_key.diagnostics)
-            ));
-        }
-
-        if value.trim().is_empty() {
-            return Err(format!("define `{key}` has an empty expression"));
-        }
-        let value_source = format!("const __wake_define_value__=({value});");
-        let parsed_value = parse(&value_source, &interner, SourceType::Script);
-        if parsed_value.has_errors() {
-            return Err(format!(
-                "define `{key}` is not one valid JavaScript expression{}",
-                parse_error_suffix(&parsed_value.diagnostics)
-            ));
-        }
-        let Some(primitive) = parsed_value.module.with_ast(|program| {
-            define_initializer(program)
-                .map(|expression| primitive_define_value(expression, &interner))
-        }) else {
-            return Err(format!(
-                "define `{key}` is not one valid JavaScript expression"
-            ));
-        };
-
-        let entry = if let Some(primitive) = primitive {
-            ValidatedDefine::primitive(key.clone(), primitive)
-        } else {
-            // `TrustedExpression` deliberately accepts only an expression program, never the
-            // temporary variable declaration used above to classify primitive values. Grouping
-            // keeps object/class/function expressions unambiguous while the parser still proves
-            // that all configured bytes belong to one expression.
-            let expression_source = format!("({value})");
-            let parsed_expression = parse(&expression_source, &interner, SourceType::Script);
-            let expression =
-                TrustedExpression::from_parsed_program(&parsed_expression.module, &interner);
-            if !expression.is_valid() {
-                return Err(format!(
-                    "define `{key}` could not be lowered into one owned expression"
-                ));
-            }
-            ValidatedDefine::expression(key.clone(), expression)
-        };
-        validated.push(entry);
-    }
-
-    Ok(validated)
-}
-
-fn define_initializer<'ast>(program: &'ast Program<'ast>) -> Option<Expression<'ast>> {
-    if program.body.len() != 1 {
-        return None;
-    }
-    let Statement::VariableDeclaration(declaration) = program.body[0] else {
-        return None;
-    };
-    if declaration.declarations.len() != 1 {
-        return None;
-    }
-    declaration.declarations[0].init
-}
-
-fn is_static_define_key(expression: Expression<'_>) -> bool {
-    match expression {
-        Expression::Identifier(_) | Expression::MetaProperty(_) => true,
-        Expression::Member(member) if !member.optional => {
-            matches!(member.property, MemberProperty::Ident(_))
-                && is_static_define_key(member.object)
-        }
-        _ => false,
-    }
-}
-
-fn primitive_define_value(expression: Expression<'_>, interner: &Interner) -> Option<ConstVal> {
-    match expression {
-        Expression::NumberLiteral(literal) => Some(ConstVal::Num(literal.value)),
-        Expression::StringLiteral(literal) => Some(ConstVal::Str(interner.resolve(literal.value))),
-        Expression::BooleanLiteral(literal) => Some(ConstVal::Bool(literal.value)),
-        Expression::NullLiteral(_) => Some(ConstVal::Null),
-        Expression::Identifier(identifier) => match interner.resolve(identifier.name).as_str() {
-            "undefined" => Some(ConstVal::Undefined),
-            "NaN" => Some(ConstVal::Num(f64::NAN)),
-            "Infinity" => Some(ConstVal::Num(f64::INFINITY)),
-            _ => None,
-        },
-        Expression::Unary(unary) => {
-            let argument = primitive_define_value(unary.argument, interner)?;
-            match (unary.operator, argument) {
-                (UnaryOperator::Minus, ConstVal::Num(value)) => Some(ConstVal::Num(-value)),
-                (UnaryOperator::Plus, ConstVal::Num(value)) => Some(ConstVal::Num(value)),
-                (UnaryOperator::LogicalNot, value) => Some(ConstVal::Bool(!value.truthy())),
-                (UnaryOperator::Void, _) => Some(ConstVal::Undefined),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn parse_error_suffix(diagnostics: &[Diagnostic]) -> String {
-    diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.is_error())
-        .map(|diagnostic| format!(": {}", diagnostic.message))
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod define_validation_tests {
-    use wake_ecma_minify::ValidatedDefineValue;
-
-    use super::*;
-
-    #[test]
-    fn define_values_are_parsed_and_primitives_are_typed() {
-        let values = validate_defines(&[
-            ("DEBUG".into(), "false".into()),
-            ("process.env.MODE".into(), "'production'".into()),
-            ("CONFIG".into(), "{answer: 42}".into()),
-        ])
-        .expect("valid definitions");
-
-        assert!(matches!(
-            values[0].value,
-            ValidatedDefineValue::Primitive(ConstVal::Bool(false))
-        ));
-        assert!(matches!(
-            &values[1].value,
-            ValidatedDefineValue::Primitive(ConstVal::Str(value)) if value == "production"
-        ));
-        assert!(matches!(
-            &values[2].value,
-            ValidatedDefineValue::Expression(value) if value.source() == "{answer: 42}"
-        ));
-    }
-
-    #[test]
-    fn define_validation_rejects_non_static_keys_and_statement_injection() {
-        assert!(validate_defines(&[("config[key]".into(), "1".into())]).is_err());
-        assert!(
-            validate_defines(&[("DEBUG".into(), "false);globalThis.injected=true".into())])
-                .is_err()
-        );
-        assert!(
-            validate_defines(&[
-                ("DEBUG".into(), "true".into()),
-                ("DEBUG".into(), "false".into())
-            ])
-            .is_err()
-        );
-    }
 }
 
 fn dep_kind_to_u8(k: DependencyKind) -> u8 {
@@ -4085,12 +4755,13 @@ fn dep_kind_to_u8(k: DependencyKind) -> u8 {
         DependencyKind::Require => 3,
     }
 }
-fn u8_to_dep_kind(v: u8) -> DependencyKind {
+fn u8_to_dep_kind(v: u8) -> Option<DependencyKind> {
     match v {
-        0 => DependencyKind::Import,
-        1 => DependencyKind::ExportFrom,
-        2 => DependencyKind::DynamicImport,
-        _ => DependencyKind::Require,
+        0 => Some(DependencyKind::Import),
+        1 => Some(DependencyKind::ExportFrom),
+        2 => Some(DependencyKind::DynamicImport),
+        3 => Some(DependencyKind::Require),
+        _ => None,
     }
 }
 
@@ -4105,7 +4776,8 @@ fn parsed_dep_to_cached(d: &ParsedDep) -> CachedDep {
 fn cached_dep_to_parsed(d: &CachedDep) -> ParsedDep {
     ParsedDep {
         specifier: d.specifier.clone(),
-        kind: u8_to_dep_kind(d.kind),
+        kind: u8_to_dep_kind(d.kind)
+            .expect("wake_cache schema validation must reject unknown dependency kinds"),
         span: Span::new(d.lo, d.hi),
     }
 }
@@ -4225,10 +4897,10 @@ fn cached_liveness_to_runtime(l: &CachedLiveness, interner: &Interner) -> Module
 /// parse 请求（在 worker 线程的 `enter` 上下文内执行）：登记 parse 任务、返回句柄 + 结果。
 fn parse_request(
     cell: Vc<Content>,
-    interner: Arc<Interner>,
+    compiler: CompilerBackend,
     source_type: SourceType,
     jsx: JsxRuntimeOptions,
-    transform_features: FeatureSet,
+    target: TargetEnv,
     file_name: Option<Arc<str>>,
 ) -> (Vc<ParsedModule>, Arc<ParsedModule>) {
     // Target/JSX changes rebuild the in-memory parse graph in their setters. JSX and target
@@ -4237,10 +4909,10 @@ fn parse_request(
     let vc = query(id, move || {
         parse_module(
             cell,
-            &interner,
+            &compiler,
             source_type,
-            jsx,
-            transform_features,
+            jsx.clone(),
+            target.clone(),
             file_name.clone(),
         )
     });
@@ -4248,12 +4920,25 @@ fn parse_request(
     (vc, arc)
 }
 
-/// Optimizer task output. The owned program is process-local; only stable retained target ids are
-/// persisted. Hashing uses the optimizer's stable fingerprint rather than arena addresses.
+/// Optimizer task output. The owned program and numeric target IDs are process-local; only stable
+/// retained request specifiers are persisted. Hashing uses the optimizer's stable fingerprint
+/// rather than arena addresses.
+#[derive(Clone, Hash)]
+enum ModuleStyleUpdate {
+    /// The module has no successful direct Crab CSS marker result. Dev runtime state is untouched.
+    Absent,
+    /// The module still owns its stable style slot, but its successful CSS result is now empty.
+    Remove,
+    /// The module owns a non-empty style payload that must be inserted or updated.
+    Upsert(Arc<String>),
+}
+
 struct OptimizeArtifact {
-    optimized: Option<Arc<OptimizedProgram>>,
-    retained_module_ids: Arc<Vec<u32>>,
-    css: Option<Arc<String>>,
+    optimized: Option<Arc<CompilerOptimizedModule>>,
+    /// Source-ordered request kind + current-generation target. Persistent conversion drops the
+    /// numeric target and stores only the stable key.
+    retained_requests: Arc<Vec<ResolvedModuleRequest>>,
+    style_update: ModuleStyleUpdate,
     inject_style: bool,
     style_seed: Option<String>,
     diagnostics: Vec<Diagnostic>,
@@ -4265,8 +4950,8 @@ impl Hash for OptimizeArtifact {
             .as_ref()
             .map(|program| program.fingerprint())
             .hash(state);
-        self.retained_module_ids.hash(state);
-        self.css.hash(state);
+        self.retained_requests.hash(state);
+        self.style_update.hash(state);
         self.inject_style.hash(state);
         self.style_seed.hash(state);
         for diagnostic in &self.diagnostics {
@@ -4280,8 +4965,10 @@ impl Hash for OptimizeArtifact {
 pub(crate) struct EmittedBody {
     pub(crate) code: Arc<String>,
     pub(crate) mapping_facts: Arc<ModuleMappings>,
-    pub(crate) discarded_static_requests: Arc<Vec<GeneratedDiscardedStaticRequest>>,
+    pub(crate) generated_module_requests: Arc<Vec<GeneratedModuleRequest>>,
+    pub(crate) runtime_names: GeneratedModuleRuntimeNames,
     pub(crate) css: Option<Arc<String>>,
+    diagnostics: Vec<Diagnostic>,
     cacheable: bool,
     /// WAKE_TIMING-only aggregation payload; deliberately excluded from the task fingerprint.
     sealed_trivial: bool,
@@ -4305,8 +4992,12 @@ impl Hash for EmittedBody {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.code.hash(state);
         hash_module_mappings(&self.mapping_facts, state);
-        self.discarded_static_requests.hash(state);
+        self.generated_module_requests.hash(state);
+        self.runtime_names.hash(state);
         self.css.hash(state);
+        for diagnostic in &self.diagnostics {
+            format!("{diagnostic:?}").hash(state);
+        }
         self.cacheable.hash(state);
     }
 }
@@ -4324,9 +5015,19 @@ mod emitted_body_hash_tests {
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::sync::Arc;
 
-    use wake_ecma_codegen::{GeneratedDiscardedStaticRequest, Mapping, ModuleMappings};
+    use wake_compiler_core::{
+        CompilerBackend, LifetimeMode, OptimizeLinkFacts, OptimizeOptions, ParseInput, SourceType,
+        TransformEdits,
+    };
+    use wake_ecma_codegen::{
+        GeneratedModuleRequest, GeneratedModuleRequestRole, GeneratedModuleRuntimeNames, Mapping,
+        ModuleMappings, ModuleRequestKind,
+    };
 
-    use super::EmittedBody;
+    use super::{
+        EmitLinkerData, EmittedBody, ModuleStyleUpdate, OptimizeArtifact, emit_body,
+        new_codegen_exec_counts,
+    };
 
     fn fingerprint(body: &EmittedBody) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -4348,8 +5049,10 @@ mod emitted_body_hash_tests {
                 }],
                 names: vec![name.into()],
             }),
-            discarded_static_requests: Arc::new(Vec::new()),
+            generated_module_requests: Arc::new(Vec::new()),
+            runtime_names: GeneratedModuleRuntimeNames::canonical(),
             css: None,
+            diagnostics: Vec::new(),
             cacheable: true,
             sealed_trivial: false,
             codegen_nanos: 0,
@@ -4372,17 +5075,97 @@ mod emitted_body_hash_tests {
     }
 
     #[test]
-    fn discarded_static_request_ranges_participate_in_the_body_fingerprint() {
+    fn generated_module_request_ranges_participate_in_the_body_fingerprint() {
         let baseline = body(None, "descriptiveName");
         let mut changed = body(None, "descriptiveName");
-        Arc::make_mut(&mut changed.discarded_static_requests).push(
-            GeneratedDiscardedStaticRequest {
-                start: 0,
-                end: 3,
-                target_module_id: 7,
-            },
-        );
+        Arc::make_mut(&mut changed.generated_module_requests).push(GeneratedModuleRequest {
+            start: 0,
+            end: 3,
+            target_module_id: 7,
+            kind: ModuleRequestKind::StaticImport,
+            role: GeneratedModuleRequestRole::Value,
+            specifier: "./dep.js".into(),
+        });
         assert_ne!(fingerprint(&baseline), fingerprint(&changed));
+    }
+
+    #[test]
+    fn runtime_factory_names_participate_in_the_body_fingerprint() {
+        let baseline = body(None, "descriptiveName");
+        let mut changed = body(None, "descriptiveName");
+        changed.runtime_names.exports = "exports$1".into();
+        assert_ne!(fingerprint(&baseline), fingerprint(&changed));
+    }
+
+    #[test]
+    fn runtime_capabilities_participate_in_the_body_fingerprint() {
+        let baseline = body(None, "descriptiveName");
+        let mut changed = body(None, "descriptiveName");
+        changed.runtime_names.capabilities.meta_url = true;
+        assert_ne!(fingerprint(&baseline), fingerprint(&changed));
+    }
+
+    fn optimized_artifact(backend: &CompilerBackend, source: &str) -> OptimizeArtifact {
+        let parsed = backend
+            .parse_module(ParseInput::new(source, SourceType::Module))
+            .expect("fixture must parse");
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics());
+        let optimized = backend
+            .optimize_module(
+                &parsed,
+                &OptimizeOptions::bundled_commonjs(),
+                &OptimizeLinkFacts::default(),
+                &TransformEdits::default(),
+                LifetimeMode::Retained,
+            )
+            .expect("fixture must optimize");
+        OptimizeArtifact {
+            optimized: Some(optimized),
+            retained_requests: Arc::new(Vec::new()),
+            style_update: ModuleStyleUpdate::Absent,
+            inject_style: false,
+            style_seed: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn invalid_retained_finalization_is_a_noncacheable_diagnostic() {
+        let backend = CompilerBackend::new();
+        let artifact = optimized_artifact(&backend, "import('remote');");
+        let data = EmitLinkerData {
+            runtime_imports: vec!["remote".into()],
+            runtime_import_expose: Some(String::new()),
+            ..EmitLinkerData::default()
+        };
+
+        let emitted = emit_body(&artifact, &data, &backend, &new_codegen_exec_counts(), 0);
+
+        assert!(!emitted.cacheable);
+        assert!(emitted.code.is_empty());
+        assert_eq!(emitted.diagnostics.len(), 1);
+        assert!(
+            emitted.diagnostics[0]
+                .message
+                .contains("runtime dynamic request")
+        );
+    }
+
+    #[test]
+    fn invalid_unretained_finalization_facts_are_ignored() {
+        let backend = CompilerBackend::new();
+        let artifact = optimized_artifact(&backend, "export const answer = 42;");
+        let data = EmitLinkerData {
+            runtime_imports: vec!["dead-remote".into()],
+            runtime_import_expose: Some(String::new()),
+            ..EmitLinkerData::default()
+        };
+
+        let emitted = emit_body(&artifact, &data, &backend, &new_codegen_exec_counts(), 0);
+
+        assert!(emitted.cacheable);
+        assert!(emitted.diagnostics.is_empty());
+        assert!(!emitted.code.is_empty());
     }
 }
 
@@ -4391,7 +5174,7 @@ fn optimize_request(
     linker_vc: Vc<OptimizeLinkerData>,
     css_input_vc: Vc<CssCodegenInput>,
     options_input_vc: Vc<OptimizeOptionsInput>,
-    interner: Arc<Interner>,
+    compiler: CompilerBackend,
 ) -> (Vc<OptimizeArtifact>, Arc<OptimizeArtifact>) {
     let id = TaskId::of(
         "wake_bundler",
@@ -4407,18 +5190,13 @@ fn optimize_request(
         let parsed = parse_vc.read();
         let css_input = css_input_vc.read();
         let options = options_input_vc.read();
-        let minify = options.minify;
-        let drop_console = options.drop_console;
-        let drop_debugger = options.drop_debugger;
-        let module_name = &options.module_name;
-        let one_shot = options.one_shot;
-        let define = match &options.validated_define {
-            Ok(define) => define,
+        let prepared_defines = match &options.prepared_defines {
+            Ok(prepared) => prepared,
             Err(message) => {
                 return OptimizeArtifact {
                     optimized: None,
-                    retained_module_ids: Arc::new(Vec::new()),
-                    css: None,
+                    retained_requests: Arc::new(Vec::new()),
+                    style_update: ModuleStyleUpdate::Absent,
                     inject_style: css_input.inject_style,
                     style_seed: css_input.seed.clone(),
                     diagnostics: vec![Diagnostic::error(format!(
@@ -4428,133 +5206,165 @@ fn optimize_request(
             }
         };
         let data = linker_vc.read();
-        // The graph communicates its stable, persisted export-name keep set at the module
-        // boundary. The optimizer resolves those module-local names to semantic SymbolIds and
-        // computes the rooted declaration closure before it commits binding removals; codegen
-        // only consumes those proofs.
-        let keep = data.export_keep.as_ref();
-        // 所有 codegen 配置都来自 Vc input；同一 bundler 实例在 build 之间切换 dev/prod 时会
-        // 精确失效模块体，持久缓存仍由 body_key 的对应盐隔离。
-        parsed.ast.with_ast(|program| {
-            // —— `@crab-dev/css` 静态编译：先生成可信结构化编辑，再交给 optimizer ——
-            // 产出「标签模板 span → 类名字面量」替换 + 本模块抽取的 CSS。
+        let interner = compiler.interner();
+        let cij = parsed.ast.with_ast(|program| {
             let imported: wake_css_in_js::value::Scope = css_input.scope.iter().cloned().collect();
-            let cij = css_input.seed.as_deref().map(|seed| {
-                wake_css_in_js::transform(program, &interner, &parsed.source, seed, &imported)
-            });
+            css_input.seed.as_deref().map(|seed| {
+                wake_css_in_js::transform(program, interner, &parsed.source, seed, &imported)
+            })
+        });
 
-            let mut optimize_input = OptimizeInput::new(&parsed.source);
-            optimize_input.minify = minify;
-            // Bundled ESM is lowered through the same CommonJS-shaped registry as preserved CJS
-            // artifacts. Let the optimizer own import namespace allocation and rewrite named /
-            // default reads by semantic SymbolId so they remain live across module cycles instead
-            // of becoming initialization-time property snapshots.
-            optimize_input.set_bundled_commonjs(true);
-            optimize_input
-                .set_bundled_internal_esm_dependencies(data.internal_esm_deps.iter().cloned());
-            optimize_input.defines = define.clone();
-            optimize_input.drop_console = drop_console;
-            optimize_input.drop_debugger = drop_debugger;
-            optimize_input.module_name = Some(module_name.clone());
-            optimize_input.dependencies = parsed
-                .deps
-                .iter()
-                .map(|dependency| OptimizeDependency {
-                    specifier: dependency.specifier.clone(),
-                    origin: if dependency.span.is_dummy() {
-                        NodeOrigin::Synthetic {
-                            anchor: None,
-                            reason: SyntheticReason::LoweringGenerated,
-                        }
-                    } else {
-                        NodeOrigin::Source(dependency.span)
-                    },
-                })
-                .collect();
-            optimize_input.reserved_names = vec!["m".into(), "$".into(), "_r".into()];
-            // `None` is the optimizer's explicit "preserve every public export" contract. Exact
-            // linker sets cross the boundary only as stable public names; the optimizer resolves
-            // them to parser-generation SymbolIds through the same semantic model used by owned
-            // lowering, so no duplicate parser analysis or process-local ID escapes this task.
-            optimize_input.linker_liveness = keep.map(|keep| {
-                LinkerExportLiveness::from_parts(
-                    data.module_id,
-                    keep.retained_export_names.iter().cloned(),
-                    keep.observed_export_names.iter().cloned(),
-                    keep.preserve_export_star,
-                )
-            });
-            if let Some(result) = &cij {
-                for (&span, replacement) in &result.replacements {
-                    let parsed_replacement = parse(replacement, &interner, SourceType::Module);
-                    optimize_input.add_expression_edit(TrustedExpressionEdit::from_parsed_program(
-                        span,
-                        &parsed_replacement.module,
-                        &interner,
-                    ));
+        let mut optimize_options = CompilerOptimizeOptions::bundled_commonjs();
+        optimize_options.minify = options.minify;
+        optimize_options.defines = options.define.clone();
+        optimize_options.drop_console = options.drop_console;
+        optimize_options.drop_debugger = options.drop_debugger;
+        optimize_options.module_name = Some(options.module_name.clone());
+        optimize_options.reserved_names =
+            vec!["module".into(), "exports".into(), "__wake_require__".into()];
+
+        let mut link_facts = OptimizeLinkFacts::default();
+        for request in &data.internal_esm_deps {
+            link_facts.add_internal_esm_request(
+                request.specifier.clone(),
+                core_module_request_kind(request.kind),
+            );
+        }
+        for star in &data.export_stars {
+            match star.resolution() {
+                wake_ecma_minify::LinkerExportStarResolution::Exact(names) => {
+                    link_facts
+                        .add_exact_export_star(star.specifier().to_owned(), names.iter().cloned());
                 }
-                optimize_input
-                    .extend_statement_removals(result.removable_import_spans.iter().copied());
-                optimize_input
-                    .extend_binding_removals(result.removable_import_binding_spans.iter().copied());
-            }
-
-            let optimized = match if one_shot {
-                optimize_one_shot(parsed.ast.clone(), &interner, &optimize_input)
-            } else {
-                optimize(parsed.ast.clone(), &interner, &optimize_input)
-            } {
-                Ok(optimized) => optimized,
-                Err(error) => {
-                    let mut diagnostics = cij
-                        .as_ref()
-                        .map(|result| result.diagnostics.clone())
-                        .unwrap_or_default();
-                    diagnostics.push(Diagnostic::error(error.to_string()));
-                    return OptimizeArtifact {
-                        optimized: None,
-                        retained_module_ids: Arc::new(Vec::new()),
-                        css: None,
-                        inject_style: css_input.inject_style,
-                        style_seed: css_input.seed.clone(),
-                        diagnostics,
-                    };
+                wake_ecma_minify::LinkerExportStarResolution::Runtime { excluded } => {
+                    link_facts.add_runtime_export_star(
+                        star.specifier().to_owned(),
+                        excluded.iter().cloned(),
+                    );
                 }
-            };
-            let mut retained_module_ids: Vec<u32> = optimized
-                .retained_dependencies()
-                .iter()
-                .filter_map(|dependency| {
-                    data.deps.iter().find_map(|(specifier, id)| {
-                        (specifier == &dependency.specifier).then_some(*id)
-                    })
-                })
-                .collect();
-            retained_module_ids.sort_unstable();
-            retained_module_ids.dedup();
-
-            let css = cij
-                .as_ref()
-                .filter(|result| !result.css.is_empty())
-                .map(|result| Arc::new(result.css.clone()));
-            OptimizeArtifact {
-                optimized: Some(Arc::new(optimized)),
-                retained_module_ids: Arc::new(retained_module_ids),
-                css,
-                inject_style: css_input.inject_style,
-                style_seed: css_input.seed.clone(),
-                diagnostics: cij.map(|result| result.diagnostics).unwrap_or_default(),
             }
-        })
+        }
+        if let Some(keep) = &data.export_keep {
+            link_facts.set_export_liveness(
+                data.module_id,
+                keep.retained_export_names.iter().cloned(),
+                keep.observed_export_names.iter().cloned(),
+            );
+        }
+
+        let mut edits = TransformEdits::default();
+        if let Some(result) = &cij {
+            for (&span, replacement) in &result.replacements {
+                edits.replace_expression(span, replacement.clone());
+            }
+            for &span in &result.removable_import_spans {
+                edits.remove_statement(span);
+            }
+            for &span in &result.removable_import_binding_spans {
+                edits.remove_binding(span);
+            }
+        }
+
+        let lifetime = if options.one_shot {
+            LifetimeMode::OneShot
+        } else {
+            LifetimeMode::Retained
+        };
+        let optimized = match compiler.optimize_module_with_prepared_defines(
+            &parsed.compiler,
+            &optimize_options,
+            prepared_defines,
+            &link_facts,
+            &edits,
+            lifetime,
+        ) {
+            Ok(optimized) => optimized,
+            Err(error) => {
+                let mut diagnostics = cij
+                    .as_ref()
+                    .map(|result| result.diagnostics.clone())
+                    .unwrap_or_default();
+                let message = if error.stage() == CoreCompilerStage::Configuration {
+                    format!("invalid define configuration: {}", error.message())
+                } else {
+                    error.message().to_owned()
+                };
+                diagnostics.push(Diagnostic::error(message));
+                return OptimizeArtifact {
+                    optimized: None,
+                    retained_requests: Arc::new(Vec::new()),
+                    style_update: ModuleStyleUpdate::Absent,
+                    inject_style: css_input.inject_style,
+                    style_seed: css_input.seed.clone(),
+                    diagnostics,
+                };
+            }
+        };
+
+        let retained_requests = optimized
+            .retained_requests()
+            .iter()
+            .filter_map(|request| {
+                let key = ModuleRequestKey::new(
+                    request.specifier.clone(),
+                    bundler_module_request_kind(request.kind),
+                );
+                data.deps
+                    .iter()
+                    .find(|dependency| dependency.request == key)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+
+        let style_update = match cij.as_ref() {
+            Some(result)
+                if result.owns_style_slot
+                    && !result
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.is_error()) =>
+            {
+                if result.css.is_empty() {
+                    ModuleStyleUpdate::Remove
+                } else {
+                    ModuleStyleUpdate::Upsert(Arc::new(result.css.clone()))
+                }
+            }
+            None | Some(_) => ModuleStyleUpdate::Absent,
+        };
+        OptimizeArtifact {
+            optimized: Some(optimized),
+            retained_requests: Arc::new(retained_requests),
+            style_update,
+            inject_style: css_input.inject_style,
+            style_seed: css_input.seed.clone(),
+            diagnostics: cij.map(|result| result.diagnostics).unwrap_or_default(),
+        }
     });
     let value = vc.read();
     (vc, value)
 }
 
+const fn core_module_request_kind(kind: ModuleRequestKind) -> CoreModuleRequestKind {
+    match kind {
+        ModuleRequestKind::StaticImport => CoreModuleRequestKind::StaticImport,
+        ModuleRequestKind::DynamicImport => CoreModuleRequestKind::DynamicImport,
+        ModuleRequestKind::Require => CoreModuleRequestKind::Require,
+    }
+}
+
+const fn bundler_module_request_kind(kind: CoreModuleRequestKind) -> ModuleRequestKind {
+    match kind {
+        CoreModuleRequestKind::StaticImport => ModuleRequestKind::StaticImport,
+        CoreModuleRequestKind::DynamicImport => ModuleRequestKind::DynamicImport,
+        CoreModuleRequestKind::Require => ModuleRequestKind::Require,
+    }
+}
+
 fn emit_body_request(
     optimized_vc: Vc<OptimizeArtifact>,
     linker_vc: Vc<EmitLinkerData>,
-    interner: Arc<Interner>,
+    compiler: CompilerBackend,
     codegen_exec_counts: CodegenExecCounts,
     codegen_counter_shard: usize,
 ) -> (Vc<EmittedBody>, Arc<EmittedBody>) {
@@ -4569,7 +5379,7 @@ fn emit_body_request(
         emit_body(
             &artifact,
             &data,
-            &interner,
+            &compiler,
             &codegen_exec_counts,
             codegen_counter_shard,
         )
@@ -4581,7 +5391,7 @@ fn emit_body_request(
 fn emit_body(
     artifact: &OptimizeArtifact,
     data: &EmitLinkerData,
-    interner: &Interner,
+    compiler: &CompilerBackend,
     codegen_exec_counts: &[CachePadded<AtomicU64>],
     codegen_counter_shard: usize,
 ) -> EmittedBody {
@@ -4590,45 +5400,204 @@ fn emit_body(
         return EmittedBody {
             code: Arc::new(String::new()),
             mapping_facts: Arc::new(ModuleMappings::default()),
-            discarded_static_requests: Arc::new(Vec::new()),
+            generated_module_requests: Arc::new(Vec::new()),
+            runtime_names: GeneratedModuleRuntimeNames::canonical(),
             css: None,
+            diagnostics: Vec::new(),
             cacheable: false,
             sealed_trivial: false,
             codegen_nanos: 0,
         };
     };
-    let linker = Linker {
-        map: SpecifierLookup::new(&data.deps),
-        dyn_chunk: SpecifierLookup::new(&data.dyn_chunks),
-        async_ids: &data.async_deps,
-    };
     let sealed_trivial = optimized.can_emit_sealed_without_finalization(data.no_esmodule);
+    let finalize_facts = compiler_finalize_facts(data, optimized.retained_requests());
     let codegen_started = std::time::Instant::now();
-    let (mut code, mappings, discarded_static_requests) =
-        codegen_optimized_with_map_and_requests(optimized, interner, &linker, data.no_esmodule);
+    // Mapping facts remain unconditional so source-map enablement stays a downstream-only task.
+    let emission =
+        match compiler.emit_module(optimized, &finalize_facts, CompilerMapMode::SourceMap) {
+            Ok(emission) => emission,
+            Err(error) => {
+                let codegen_nanos = codegen_started
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                return EmittedBody {
+                    code: Arc::new(String::new()),
+                    mapping_facts: Arc::new(ModuleMappings::default()),
+                    generated_module_requests: Arc::new(Vec::new()),
+                    runtime_names: GeneratedModuleRuntimeNames::canonical(),
+                    css: None,
+                    diagnostics: vec![Diagnostic::error(format!(
+                        "compiler finalization failed: {}",
+                        error.message()
+                    ))],
+                    cacheable: false,
+                    sealed_trivial: false,
+                    codegen_nanos,
+                };
+            }
+        };
     let codegen_nanos = codegen_started
         .elapsed()
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64;
-    if artifact.inject_style
-        && let Some(css) = &artifact.css
-    {
-        append_style_injection(
-            &mut code,
-            css,
-            artifact.style_seed.as_deref().unwrap_or("module"),
-        );
+    let (mut code, mappings, generated_module_requests, runtime_names) = emission.into_parts();
+    let mappings = compiler_mappings_to_codegen(
+        mappings.expect("bundled source-map emission must retain mapping facts"),
+    );
+    let generated_module_requests = generated_module_requests
+        .into_iter()
+        .map(compiler_generated_request_to_codegen)
+        .collect();
+    let runtime_names = compiler_runtime_names_to_codegen(
+        runtime_names.expect("bundled CommonJS emission must expose runtime names"),
+    );
+    if artifact.inject_style {
+        match &artifact.style_update {
+            ModuleStyleUpdate::Absent => {}
+            ModuleStyleUpdate::Remove => append_style_injection(
+                &mut code,
+                None,
+                artifact.style_seed.as_deref().unwrap_or("module"),
+                &runtime_names.require,
+            ),
+            ModuleStyleUpdate::Upsert(css) => append_style_injection(
+                &mut code,
+                Some(css),
+                artifact.style_seed.as_deref().unwrap_or("module"),
+                &runtime_names.require,
+            ),
+        }
     }
+    let css = (!artifact.inject_style)
+        .then(|| match &artifact.style_update {
+            ModuleStyleUpdate::Upsert(css) => Some(css.clone()),
+            ModuleStyleUpdate::Absent | ModuleStyleUpdate::Remove => None,
+        })
+        .flatten();
     EmittedBody {
         code: Arc::new(code),
         mapping_facts: Arc::new(mappings),
-        discarded_static_requests: Arc::new(discarded_static_requests),
-        css: (!artifact.inject_style)
-            .then(|| artifact.css.clone())
-            .flatten(),
+        generated_module_requests: Arc::new(generated_module_requests),
+        runtime_names,
+        css,
+        diagnostics: Vec::new(),
         cacheable: true,
         sealed_trivial,
         codegen_nanos,
+    }
+}
+
+fn compiler_finalize_facts(
+    data: &EmitLinkerData,
+    retained_requests: &[wake_compiler_core::ModuleRequest],
+) -> ModuleFinalizeFacts {
+    let retained = |specifier: &str, kind: ModuleRequestKind| {
+        retained_requests.iter().any(|request| {
+            request.specifier == specifier && request.kind == core_module_request_kind(kind)
+        })
+    };
+    let mut facts = ModuleFinalizeFacts::default();
+    for dependency in data
+        .deps
+        .iter()
+        .filter(|dependency| retained(&dependency.request.specifier, dependency.request.kind))
+    {
+        let dynamic_chunk = (dependency.request.kind == ModuleRequestKind::DynamicImport)
+            .then(|| {
+                data.dyn_chunks.iter().find_map(|chunk| {
+                    (chunk.request == dependency.request).then_some(chunk.module_id)
+                })
+            })
+            .flatten();
+        facts.resolve_internal(
+            dependency.request.specifier.clone(),
+            core_module_request_kind(dependency.request.kind),
+            dependency.module_id,
+            data.async_deps.contains(&dependency.module_id),
+            dynamic_chunk,
+        );
+    }
+    for (request, share_key, scope) in data
+        .shared_imports
+        .iter()
+        .filter(|(request, _, _)| retained(&request.specifier, request.kind))
+    {
+        facts.resolve_runtime_shared(
+            request.specifier.clone(),
+            core_module_request_kind(request.kind),
+            share_key.clone(),
+            scope.clone(),
+        );
+    }
+    // Preserve the old finalizer's defensive overlap precedence: runtime dynamic wins over shared,
+    // which wins over internal. The resolver normally makes these sets disjoint.
+    for specifier in data
+        .runtime_imports
+        .iter()
+        .filter(|specifier| retained(specifier, ModuleRequestKind::DynamicImport))
+    {
+        facts.resolve_runtime_dynamic(
+            specifier.clone(),
+            specifier.clone(),
+            data.runtime_import_expose.clone(),
+        );
+    }
+    facts.set_no_esmodule(data.no_esmodule);
+    facts
+}
+
+fn compiler_mappings_to_codegen(mappings: CompilerMappings) -> ModuleMappings {
+    ModuleMappings {
+        mappings: mappings
+            .mappings
+            .into_iter()
+            .map(|mapping| Mapping {
+                gen_line: mapping.generated_line,
+                gen_col: mapping.generated_column,
+                src_index: mapping.source_index,
+                src_offset: mapping.source_offset,
+                name_index: mapping.name_index,
+                is_unmapped: mapping.is_unmapped,
+            })
+            .collect(),
+        names: mappings.names,
+    }
+}
+
+fn compiler_generated_request_to_codegen(
+    request: CoreGeneratedModuleRequest,
+) -> GeneratedModuleRequest {
+    GeneratedModuleRequest {
+        start: request.start,
+        end: request.end,
+        target_module_id: request.target_module_id,
+        role: match request.role {
+            CoreGeneratedModuleRequestRole::Value => GeneratedModuleRequestRole::Value,
+            CoreGeneratedModuleRequestRole::DiscardedStatic => {
+                GeneratedModuleRequestRole::DiscardedStatic
+            }
+        },
+        specifier: request.request.specifier,
+        kind: bundler_module_request_kind(request.request.kind),
+    }
+}
+
+fn compiler_runtime_names_to_codegen(names: CompilerRuntimeNames) -> GeneratedModuleRuntimeNames {
+    GeneratedModuleRuntimeNames {
+        module: names.module,
+        exports: names.exports,
+        require: names.require,
+        capabilities: GeneratedModuleRuntimeCapabilities {
+            meta_url: names.capabilities.meta_url,
+            external_require: names.capabilities.external_require,
+            promise_resolve: names.capabilities.promise_resolve,
+            object_assign: names.capabilities.object_assign,
+            object_keys: names.capabilities.object_keys,
+            object_define_property: names.capabilities.object_define_property,
+            runtime_import: names.capabilities.runtime_import,
+            shared: names.capabilities.shared,
+        },
     }
 }
 
@@ -4645,24 +5614,86 @@ fn source_map_facts_request(body_vc: Vc<EmittedBody>) -> Arc<ModuleMappings> {
 /// 相同模块路径也不会互相覆盖，动态 chunk 则自然复用入口 runtime 的 owner。
 ///
 /// `typeof document` 守卫使 SSR / node 下静默跳过。
-fn append_style_injection(js: &mut String, css: &str, module_id: &str) {
+fn append_style_injection(
+    js: &mut String,
+    css: Option<&str>,
+    module_id: &str,
+    runtime_require: &str,
+) {
     let style_id = format!("crab-css-{:016x}", stable_text_hash(module_id));
     js.push_str("\nif (typeof document !== \"undefined\") {\n");
     js.push_str("  var __wake_cij_owners__ = document.__wake_css_styles__ || (document.__wake_css_styles__ = new WeakMap());\n");
-    js.push_str("  var __wake_cij_registry__ = __wake_cij_owners__.get(__wake_require__);\n");
-    js.push_str("  if (!__wake_cij_registry__) { __wake_cij_registry__ = {}; __wake_cij_owners__.set(__wake_require__, __wake_cij_registry__); }\n");
+    js.push_str("  var __wake_cij_registry__ = __wake_cij_owners__.get(");
+    js.push_str(runtime_require);
+    js.push_str(");\n");
+    js.push_str(
+        "  if (!__wake_cij_registry__) { __wake_cij_registry__ = {}; __wake_cij_owners__.set(",
+    );
+    js.push_str(runtime_require);
+    js.push_str(", __wake_cij_registry__); }\n");
     js.push_str("  var __wake_cij_id__ = ");
     crate::loader::push_js_string(js, &style_id);
     js.push_str(";\n  var __wake_cij__ = __wake_cij_registry__[__wake_cij_id__];\n");
-    if css.is_empty() {
-        js.push_str("  if (__wake_cij__) { if (__wake_cij__.remove) __wake_cij__.remove(); delete __wake_cij_registry__[__wake_cij_id__]; }\n");
-    } else {
+    if let Some(css) = css {
+        debug_assert!(
+            !css.is_empty(),
+            "empty CSS is represented by a remove tombstone"
+        );
         js.push_str("  if (!__wake_cij__) { __wake_cij__ = document.createElement(\"style\"); __wake_cij_registry__[__wake_cij_id__] = __wake_cij__; document.head.appendChild(__wake_cij__); }\n");
         js.push_str("  __wake_cij__.textContent = ");
         crate::loader::push_js_string(js, css);
         js.push_str(";\n");
+    } else {
+        js.push_str("  if (__wake_cij__) { if (__wake_cij__.remove) __wake_cij__.remove(); delete __wake_cij_registry__[__wake_cij_id__]; }\n");
     }
     js.push_str("}\n");
+}
+
+#[cfg(test)]
+mod style_injection_tests {
+    use std::process::Command;
+
+    use super::append_style_injection;
+
+    #[test]
+    fn removal_tombstone_deletes_the_existing_runtime_slot() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node unavailable; skipping Crab CSS style tombstone runtime test");
+            return;
+        }
+
+        let mut script = String::from(
+            r#"const styles = [];
+const document = {
+  head: { appendChild(style) { styles.push(style); } },
+  createElement() {
+    return { textContent: '', removed: false, remove() { this.removed = true; } };
+  },
+};
+function __wake_require__() {}
+"#,
+        );
+        append_style_injection(
+            &mut script,
+            Some("body { color: rebeccapurple; }"),
+            "src/index.tsx",
+            "__wake_require__",
+        );
+        script.push_str(
+            "if (styles.length !== 1 || !styles[0].textContent.includes('rebeccapurple')) process.exit(2);\n",
+        );
+        append_style_injection(&mut script, None, "src/index.tsx", "__wake_require__");
+        script.push_str(
+            "if (!styles[0].removed || Object.keys(__wake_cij_registry__).length !== 0) process.exit(3);\n",
+        );
+
+        let executed = Command::new("node").arg("-e").arg(script).output().unwrap();
+        assert!(
+            executed.status.success(),
+            "style tombstone runtime failed: {}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+    }
 }
 
 fn stable_text_hash(text: &str) -> u64 {
@@ -4677,41 +5708,95 @@ fn stable_text_hash(text: &str) -> u64 {
 /// parse 任务体：读内容 cell（登记依赖）→ 解析（TS 模式跳过类型）→ 依赖句柄解为字符串。
 fn parse_module(
     cell: Vc<Content>,
-    interner: &Interner,
+    compiler: &CompilerBackend,
     source_type: SourceType,
     jsx: JsxRuntimeOptions,
-    transform_features: FeatureSet,
+    target: TargetEnv,
     file_name: Option<Arc<str>>,
 ) -> ParsedModule {
     let src = cell.read(); // Arc<Content>；读取即登记对内容 cell 的依赖
-    let text: &str = &src;
-    let out = parse_with(
-        text,
-        interner,
-        source_type,
-        wake_ecma_parser::ParseOptions {
-            jsx_import_source: jsx.import_source,
-            jsx_dev: jsx.dev,
-            file_name: file_name.as_deref().unwrap_or(""),
-            transform_features,
-        },
-    );
     let source: Arc<str> = (*src).clone();
-    let deps = out
-        .dependencies
+    let compiler_module = match compiler.parse_module(
+        CompilerParseInput::new(source.as_ref(), source_type)
+            .with_target(target)
+            .with_jsx(
+                jsx.import_source.as_ref(),
+                jsx.dev,
+                file_name.as_deref().unwrap_or(""),
+            ),
+    ) {
+        Ok(module) => module,
+        Err(error) => {
+            // Turbo's parse task has an infallible cell shape. Retain a valid empty compiler
+            // owner only as a carrier for this terminal diagnostic; scan stops before optimize.
+            let placeholder = compiler
+                .parse_module(CompilerParseInput::new("", source_type))
+                .expect("an empty module always fits parser span limits");
+            return ParsedModule {
+                ast: placeholder.ast_owner(),
+                source,
+                deps: Vec::new(),
+                diagnostics: vec![Diagnostic::error(format!(
+                    "compiler parse failed: {}",
+                    error.message()
+                ))],
+                has_top_level_await: false,
+                compiler: placeholder,
+            };
+        }
+    };
+    let deps = compiler_module
+        .dependencies()
         .iter()
-        .map(|d| ParsedDep {
-            specifier: interner.resolve(d.specifier),
-            kind: d.kind,
-            span: d.span,
+        .map(|dependency| ParsedDep {
+            specifier: dependency.specifier().to_owned(),
+            kind: match dependency.kind() {
+                CoreParsedDependencyKind::Import => DependencyKind::Import,
+                CoreParsedDependencyKind::ExportFrom => DependencyKind::ExportFrom,
+                CoreParsedDependencyKind::DynamicImport => DependencyKind::DynamicImport,
+                CoreParsedDependencyKind::Require => DependencyKind::Require,
+            },
+            span: dependency.span(),
         })
         .collect();
+    let diagnostics = compiler_module
+        .diagnostics()
+        .iter()
+        .map(compiler_diagnostic_to_wake)
+        .collect();
     ParsedModule {
-        ast: out.module,
+        ast: compiler_module.ast_owner(),
         source,
         deps,
-        diagnostics: out.diagnostics,
-        has_top_level_await: out.has_top_level_await,
+        diagnostics,
+        has_top_level_await: compiler_module.has_top_level_await(),
+        compiler: compiler_module,
+    }
+}
+
+fn compiler_diagnostic_to_wake(diagnostic: &CompilerDiagnostic) -> Diagnostic {
+    Diagnostic {
+        severity: match diagnostic.severity() {
+            wake_compiler_core::DiagnosticSeverity::Error => Severity::Error,
+            wake_compiler_core::DiagnosticSeverity::Warning => Severity::Warning,
+            wake_compiler_core::DiagnosticSeverity::Note => Severity::Note,
+            wake_compiler_core::DiagnosticSeverity::Help => Severity::Help,
+        },
+        code: diagnostic
+            .code()
+            .map(|code| std::borrow::Cow::Owned(code.to_owned())),
+        message: diagnostic.message().to_owned(),
+        path: diagnostic.path().map(str::to_owned),
+        labels: diagnostic
+            .labels()
+            .iter()
+            .map(|label| Label {
+                span: label.span(),
+                message: label.message().map(str::to_owned),
+                primary: label.is_primary(),
+            })
+            .collect(),
+        notes: diagnostic.notes().to_vec(),
     }
 }
 
@@ -4719,21 +5804,17 @@ fn parse_module(
 ///
 /// 边是在源 AST/IR 上按 span 判活后产生的结构化数据；发射后代码的字符串、注释或字面量
 /// 不参与模块可达性判定。
-fn live_modules(edges: &[(u32, Arc<Vec<u32>>)], entry_id: u32) -> FxHashSet<u32> {
-    let edges: FxHashMap<u32, &[u32]> = edges
-        .iter()
-        .map(|(id, targets)| (*id, targets.as_slice()))
-        .collect();
+fn live_modules(edges: &FxHashMap<u32, ModuleEdges>, entry_id: u32) -> FxHashSet<u32> {
     let mut live: FxHashSet<u32> = FxHashSet::default();
     let mut stack = vec![entry_id];
     while let Some(id) = stack.pop() {
         if !live.insert(id) {
             continue;
         }
-        if let Some(refs) = edges.get(&id) {
-            for &r in *refs {
-                if !live.contains(&r) {
-                    stack.push(r);
+        if let Some(module_edges) = edges.get(&id) {
+            for request in &module_edges.requests {
+                if !live.contains(&request.module_id) {
+                    stack.push(request.module_id);
                 }
             }
         }
@@ -4743,453 +5824,258 @@ fn live_modules(edges: &[(u32, Arc<Vec<u32>>)], entry_id: u32) -> FxHashSet<u32>
 
 #[cfg(test)]
 mod retained_dependency_liveness_tests {
-    use std::sync::Arc;
+    use wake_common::{FxHashMap, FxHashSet};
+    use wake_ecma_codegen::ModuleRequestKind;
 
-    use wake_common::FxHashSet;
+    use super::{ModuleEdges, ModuleRequestKey, ResolvedModuleRequest, live_modules};
 
-    use super::live_modules;
+    fn edge(targets: &[u32]) -> ModuleEdges {
+        ModuleEdges {
+            requests: targets
+                .iter()
+                .map(|target| ResolvedModuleRequest {
+                    request: ModuleRequestKey::new(
+                        format!("./{target}.js"),
+                        ModuleRequestKind::StaticImport,
+                    ),
+                    module_id: *target,
+                })
+                .collect(),
+            static_targets: targets.to_vec(),
+            dyn_targets: Vec::new(),
+            stem: String::new(),
+        }
+    }
 
     #[test]
     fn follows_only_structured_optimizer_edges() {
-        let edges = vec![
-            (0, Arc::new(vec![1, 2])),
-            (1, Arc::new(vec![3])),
-            (2, Arc::new(Vec::new())),
-            (3, Arc::new(vec![2])),
+        let edges = FxHashMap::from_iter([
+            (0, edge(&[1, 2])),
+            (1, edge(&[3])),
+            (2, edge(&[])),
+            (3, edge(&[2])),
             // A generated body could contain text resembling a require for this module, but no
             // structured edge reaches it, so it must remain dead.
-            (99, Arc::new(vec![0])),
-        ];
+            (99, edge(&[0])),
+        ]);
 
         assert_eq!(live_modules(&edges, 0), FxHashSet::from_iter([0, 1, 2, 3]));
     }
 
     #[test]
     fn cycles_terminate_and_keep_each_reachable_module_once() {
-        let edges = vec![(4, Arc::new(vec![5])), (5, Arc::new(vec![4]))];
+        let edges = FxHashMap::from_iter([(4, edge(&[5])), (5, edge(&[4]))]);
         assert_eq!(live_modules(&edges, 4), FxHashSet::from_iter([4, 5]));
     }
 }
 
-/// 检测模块 body 是否仅含 `__reg` 副作用（无 exports、无 require、无局部声明）。
-fn is_pure_reg_body(body: &str) -> bool {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    if trimmed.contains("exports[") || trimmed.contains("exports.") {
-        return false;
-    }
-    if trimmed.contains("__wake_require__") {
-        return false;
-    }
-    if !trimmed.contains("globalThis.__reg") {
-        return false;
-    }
-    // 不可含任何局部声明——内联到同一作用域会导致 Identifier 重复声明错误。
-    if trimmed.contains("let ") || trimmed.contains("const ") || trimmed.contains("var ") {
-        return false;
-    }
-    if trimmed.contains("function ") || trimmed.contains("async ") || trimmed.contains("class ") {
-        return false;
-    }
-    true
-}
-
-/// 遍历 body 中每个 `__wake_require__(N)` 调用，回调 `(require 起始字节偏移 abs, id, 右括号后一位 call_end)`。
-/// 只匹配 `(` 后为纯十进制数字且紧跟 `)` 的形式（codegen 产出的 require 调用恒如此）。
-/// 单遍 O(body) 扫描——替代「对全部候选 id 各扫一遍」的 O(id 数 × body) 反模式。
-fn for_each_require<F: FnMut(usize, u32, usize)>(body: &str, mut f: F) {
-    const NEEDLE: &str = "__wake_require__(";
-    let bytes = body.as_bytes();
-    let mut search = 0;
-    while let Some(rel) = body[search..].find(NEEDLE) {
-        let abs = search + rel;
-        let after = abs + NEEDLE.len();
-        let mut end = after;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        if end > after
-            && end < bytes.len()
-            && bytes[end] == b')'
-            && let Ok(id) = body[after..end].parse::<u32>()
-        {
-            f(abs, id, end + 1); // end 指向 ')'，call_end = 其后一位
-        }
-        search = after;
-    }
-}
-
-/// Redirect exact generated `require_name(N)` calls whose canonical decimal IDs are in
-/// `redirected` to one target ID. This preserves the old textual rewrite contract, but performs
-/// one scan and one allocation instead of one full `String::replace` per merged module ID.
-fn redirect_require_targets(
+/// Redirect only numeric target literal ranges proven by the typed finalizer and emitted by the
+/// same codegen walk as `body`. The whole fact set is validated before the first splice; malformed
+/// or stale cache metadata makes this optimization a conservative module-wide no-op.
+fn redirect_generated_request_targets(
     body: &str,
-    require_name: &str,
+    requests: &[GeneratedModuleRequest],
     redirected: &FxHashSet<u32>,
     target: u32,
 ) -> String {
-    if redirected.is_empty() {
-        return body.to_string();
+    if requests.is_empty() || redirected.is_empty() {
+        return body.to_owned();
+    }
+    if requests.iter().any(|request| {
+        request.role == GeneratedModuleRequestRole::DiscardedStatic
+            && request.kind != ModuleRequestKind::StaticImport
+    }) {
+        return body.to_owned();
+    }
+    if !generated_module_requests_are_valid(
+        body,
+        requests
+            .iter()
+            .map(|request| (request.start, request.end, request.target_module_id)),
+    ) {
+        return body.to_owned();
+    }
+    if !requests
+        .iter()
+        .any(|request| redirected.contains(&request.target_module_id))
+    {
+        return body.to_owned();
     }
 
-    let needle = format!("{require_name}(");
-    let target = target.to_string();
-    let bytes = body.as_bytes();
-    let mut search = 0;
-    let mut copied = 0;
-    let mut rewritten = None::<String>;
-    while let Some(relative) = body[search..].find(&needle) {
-        let start = search + relative;
-        let digits_start = start + needle.len();
-        let mut digits_end = digits_start;
-        while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
-            digits_end += 1;
+    let replacement = target.to_string();
+    let mut output = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    for request in requests {
+        if !redirected.contains(&request.target_module_id) {
+            continue;
         }
-        let digits = &body[digits_start..digits_end];
-        let canonical_decimal = !digits.is_empty()
-            && (digits.len() == 1 || !digits.starts_with('0'))
-            && digits_end < bytes.len()
-            && bytes[digits_end] == b')';
-        let redirect = canonical_decimal
-            .then(|| digits.parse::<u32>().ok())
-            .flatten()
-            .is_some_and(|id| redirected.contains(&id));
-        if redirect {
-            let output = rewritten.get_or_insert_with(|| String::with_capacity(body.len()));
-            output.push_str(&body[copied..digits_start]);
-            output.push_str(&target);
-            output.push(')');
-            copied = digits_end + 1;
-            search = copied;
-        } else {
-            search = digits_start;
-        }
+        let start = request.start as usize;
+        let end = request.end as usize;
+        output.push_str(&body[cursor..start]);
+        output.push_str(&replacement);
+        cursor = end;
     }
-
-    let Some(mut output) = rewritten else {
-        return body.to_string();
-    };
-    output.push_str(&body[copied..]);
+    output.push_str(&body[cursor..]);
     output
 }
 
-/// 尝试把 `abs` 处的 require 识别为 barrel re-export 并返回待删区间 `[const 起点, for 循环结束)`。
-/// 匹配：`const _wm{VAR} = __wake_require__(id);for (const _k in _wm{VAR}) if (_k !== "default") exports[_k] = _wm{VAR}[_k];`
-/// 全为**局部**（有界回看/前看）检测，故整趟 strip 保持 O(body)。逐字节复刻原逐-id 版的判定。
-fn try_barrel(body: &str, bytes: &[u8], abs: usize, call_end: usize) -> Option<(usize, usize)> {
-    // require 前必须是 ` = `（空格=空格）。
-    if abs < 3 || bytes.get(abs - 3..abs) != Some(b" = ") {
-        return None;
-    }
-    // ` = ` 之前是 VAR 数字。
-    let var_end = abs - 3;
-    let mut ds = var_end;
-    while ds > 0 && bytes[ds - 1].is_ascii_digit() {
-        ds -= 1;
-    }
-    if ds == var_end {
-        return None; // 无数字
-    }
-    // VAR 数字前应是 `_wm`，再前 `const `。
-    if ds < 3 || bytes.get(ds - 3..ds) != Some(b"_wm") {
-        return None;
-    }
-    let wm_start = ds - 3;
-    if wm_start < 6 || bytes.get(wm_start - 6..wm_start) != Some(b"const ") {
-        return None;
-    }
-    let const_start = wm_start - 6;
-    let var_name = &body[wm_start..var_end]; // `_wm{digits}`
-    // require 后需 `;`，随后（可跳前导空白）紧跟精确的 for 展开。
-    if call_end >= bytes.len() || bytes[call_end] != b';' {
-        return None;
-    }
-    let mut fstart = call_end + 1;
-    while fstart < bytes.len() && bytes[fstart].is_ascii_whitespace() {
-        fstart += 1;
-    }
-    let for_pat = format!(
-        "for (const _k in {var_name}) if (_k !== \"default\") exports[_k] = {var_name}[_k];"
-    );
-    if body[fstart..].starts_with(&for_pat) {
-        Some((const_start, fstart + for_pat.len()))
-    } else {
-        None
-    }
-}
-
-/// 移除对 hoisted 模块的 generated barrel re-export 整段：
-/// `const _wmX = __wake_require__(N);for (..._wmX...)`。
-///
-/// 独立 static request 的删除已由 typed finalizer + generated byte range 拥有；不能在这里
-/// 从文本猜测，否则 `";__wake_require__(N);"` 之类的用户字符串会被误删。
-///
-/// 原实现对每个 hoisted id（可达上千）各 `format!`+全串 `find`/重建一遍——O(id 数 × body)，且被少数
-/// 引用极多候选的巨型 barrel/聚合模块放大到几十毫秒。此版单遍扫描每个 require 调用，就地按局部上下文
-/// 分类 generated barrel，收集**互不相交**的删除区间后一次性重建。
-fn strip_hoisted_requires_and_barrels(body: &str, hoisted: &FxHashSet<u32>) -> String {
-    let bytes = body.as_bytes();
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
-    for_each_require(body, |abs, id, call_end| {
-        if !hoisted.contains(&id) {
-            return;
-        }
-        // barrel 优先（其 require 前置为 ` = `，天然非独立）。
-        if let Some(span) = try_barrel(body, bytes, abs, call_end) {
-            cuts.push(span);
-        }
-    });
-    if cuts.is_empty() {
-        return body.to_string();
-    }
-    // 按起点排序并跳过重叠（区间本应互不相交，合并仅为稳健）。一次性重建。
-    cuts.sort_unstable_by_key(|c| c.0);
-    let mut out = String::with_capacity(body.len());
-    let mut pos = 0;
-    for (s, e) in cuts {
-        if s > pos {
-            out.push_str(&body[pos..s]);
-            pos = e;
-        } else if e > pos {
-            pos = e;
-        }
-    }
-    out.push_str(&body[pos..]);
-    out
-}
-
-/// 紧凑 __reg body 格式：去空格、逗号分隔 → webpack 风格
-fn compact_reg_body(body: &str) -> String {
-    let mut s = body.replace(" || (", "||(").replace(" = {});", "={});");
-    s = s.replace(";globalThis.__reg.", ",globalThis.__reg.");
-    s = s.replace(" = ", "=");
-    s
-}
-
-/// If `body` is exactly the generated registry bootstrap followed by one numeric property
-/// assignment, return the `property=number` tail. Callers may only cache the registry object across
-/// exact bodies in the same uninterrupted run.
-fn exact_reg_assignment(body: &str) -> Option<&str> {
-    const PREFIX: &str = "globalThis.__reg||(globalThis.__reg={}),";
-    let assignment = body.trim_end_matches(';').strip_prefix(PREFIX)?;
-    let value = assignment.strip_prefix("globalThis.__reg.")?;
-    let (property, number) = value.split_once('=')?;
-    if property.is_empty()
-        || !property
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
-        || number.is_empty()
-        || !number
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-' | b'e' | b'E'))
-    {
-        return None;
-    }
-    Some(value)
-}
-
-/// 输出非空的内联 registry body，并仅在实际输出项之间添加逗号。
-///
-/// hoist 候选模块的 body 在剥离 require/barrel 语句后可能为空。如果按原候选下标添加
-/// 分隔符，会生成 `;,,,;` 这样的非法 JavaScript。
-fn append_inline_regs(out: &mut String, inline_regs: &[String]) {
-    let mut emitted = false;
-    let mut registry_ready = false;
-
-    for reg in inline_regs {
-        let compact = compact_reg_body(reg);
-        let compact = compact.trim().trim_end_matches(';').trim_end();
-        if compact.is_empty() {
-            continue;
-        }
-
-        if emitted {
-            out.push(',');
-        } else {
-            out.push(';');
-            emitted = true;
-        }
-
-        if let Some(assignment) = exact_reg_assignment(compact) {
-            if registry_ready {
-                out.push_str("q.");
-                out.push_str(assignment);
-            } else {
-                out.push_str("q=globalThis.__reg||(globalThis.__reg={}),q.");
-                out.push_str(assignment);
-                registry_ready = true;
-            }
-        } else {
-            out.push_str(compact);
-            registry_ready = false;
-        }
-    }
-
-    if emitted {
-        out.push(';');
-    }
-}
-
-fn inline_regs_need_registry_temp(inline_regs: &[String]) -> bool {
-    inline_regs.iter().any(|reg| {
-        let compact = compact_reg_body(reg);
-        let compact = compact.trim().trim_end_matches(';').trim_end();
-        exact_reg_assignment(compact).is_some()
-    })
-}
-
 #[cfg(test)]
-mod inline_reg_tests {
+mod generated_request_tests {
+    use std::sync::Arc;
+
     use super::{
-        append_inline_regs, exported_names, inline_regs_need_registry_temp,
-        redirect_require_targets, replace_eager_discarded_static_requests,
-        strip_hoisted_requires_and_barrels, strip_standalone_requires,
+        ModuleRequestKey, ResolvedModuleRequest, module_metadata_from_cache,
+        redirect_generated_request_targets,
+    };
+    use wake_cache::{
+        CachedModuleMappings, CachedModuleRequest, CachedModuleRequestKind, CachedModuleRequestRole,
     };
     use wake_common::FxHashSet;
-    use wake_ecma_codegen::GeneratedDiscardedStaticRequest;
+    use wake_ecma_codegen::{
+        GeneratedModuleRequest, GeneratedModuleRequestRole, ModuleRequestKind,
+    };
+
+    fn request(body: &str, needle: &str, target_module_id: u32) -> GeneratedModuleRequest {
+        let call = body.find(needle).expect("request call");
+        let literal = needle.find(char::is_numeric).expect("numeric target");
+        let start = call + literal;
+        let end = start + target_module_id.to_string().len();
+        GeneratedModuleRequest {
+            start: start as u32,
+            end: end as u32,
+            target_module_id,
+            kind: ModuleRequestKind::StaticImport,
+            role: GeneratedModuleRequestRole::Value,
+            specifier: format!("./{target_module_id}.js"),
+        }
+    }
 
     #[test]
-    fn replaces_only_proven_requests_to_eager_targets_without_rewriting_sequence_grammar() {
-        let body = "__wake_require__(1),value,__wake_require__(2);";
-        let first_end = "__wake_require__(1)".len();
-        let second_start = body.find("__wake_require__(2)").unwrap();
+    fn redirects_only_typed_literal_ranges_and_preserves_user_text_byte_for_byte() {
+        let body = concat!(
+            "__wake_require__(1);",
+            "const s='exports|module.exports|__wake_require__(7)|_r(42)';",
+            "const t=`exports|module.exports|__wake_require__(7)|_r(42)`;",
+            "/* exports|module.exports|__wake_require__(7)|_r(42) */",
+            "const r=/exports\\|module\\.exports\\|__wake_require__\\(7\\)\\|_r\\(42\\)/;",
+            "__wake_require__(42);"
+        );
         let requests = [
-            GeneratedDiscardedStaticRequest {
-                start: 0,
-                end: first_end as u32,
-                target_module_id: 1,
-            },
-            GeneratedDiscardedStaticRequest {
-                start: second_start as u32,
-                end: (second_start + "__wake_require__(2)".len()) as u32,
-                target_module_id: 2,
-            },
+            request(body, "__wake_require__(1)", 1),
+            request(body, "__wake_require__(42);", 42),
         ];
-        let eager = FxHashSet::from_iter([1]);
-
-        assert_eq!(
-            replace_eager_discarded_static_requests(body, &requests, &eager),
-            "0,value,__wake_require__(2);"
-        );
-        assert_eq!(
-            replace_eager_discarded_static_requests(
-                body,
-                &[GeneratedDiscardedStaticRequest {
-                    start: 20,
-                    end: 10,
-                    target_module_id: 1,
-                }],
-                &eager,
-            ),
-            body,
-            "malformed cached metadata must make the optimization a no-op"
-        );
-    }
-
-    #[test]
-    fn skips_empty_registry_bodies_without_leaving_commas() {
-        let regs = vec![
-            String::new(),
-            " ;;;".to_string(),
-            "globalThis.__reg || (globalThis.__reg = {});globalThis.__reg.a = 1;".to_string(),
-            "  ".to_string(),
-            "globalThis.__reg || (globalThis.__reg = {});globalThis.__reg.b = 2;".to_string(),
-        ];
-        let mut out = "runtime".to_string();
-
-        append_inline_regs(&mut out, &regs);
-
-        assert_eq!(
-            out,
-            "runtime;q=globalThis.__reg||(globalThis.__reg={}),q.a=1,q.b=2;"
-        );
-        assert!(!out.contains(",,"));
-    }
-
-    #[test]
-    fn emits_nothing_when_all_registry_bodies_are_empty() {
-        let mut out = "runtime".to_string();
-        append_inline_regs(&mut out, &[String::new(), " ; ".to_string()]);
-        assert_eq!(out, "runtime");
-        assert!(!inline_regs_need_registry_temp(&[
-            String::new(),
-            " ; ".to_string()
-        ]));
-    }
-
-    #[test]
-    fn declares_the_registry_temp_when_an_inlined_registry_assignment_needs_it() {
-        assert!(inline_regs_need_registry_temp(&[String::from(
-            "globalThis.__reg || (globalThis.__reg = {});globalThis.__reg.a = 1;"
-        )]));
-    }
-
-    #[test]
-    fn compact_body_scanners_preserve_utf8_and_never_slice_inside_a_character() {
-        let names = exported_names("const label=\"中文件exports\";exports[\"ok\"] = 1;");
-        assert!(names.contains("ok"));
-
-        let concat_members = FxHashSet::from_iter([1]);
-        assert_eq!(
-            strip_standalone_requires(
-                "const label=\"中文\";_r(1);exports.value = label;",
-                &concat_members,
-            ),
-            "const label=\"中文\";exports.value = label;"
-        );
-        assert_eq!(
-            strip_standalone_requires("_r(1),globalThis.effect=1;", &concat_members),
-            "_r(1),globalThis.effect=1;",
-            "a require at the head of a sequence is not a standalone statement"
-        );
-        assert_eq!(
-            strip_standalone_requires("_r(2);globalThis.effect=1;", &concat_members),
-            "_r(2);globalThis.effect=1;",
-            "a standalone factory dependency must execute when it is outside this concat"
-        );
-
-        let mut hoisted = FxHashSet::default();
-        hoisted.insert(1);
-        let embedded = "const label=\"😀__wake_require__(1)\";";
-        assert_eq!(
-            strip_hoisted_requires_and_barrels(embedded, &hoisted),
-            embedded
-        );
-        let standalone_text = "globalThis.label=\";__wake_require__(1);\";";
-        assert_eq!(
-            strip_hoisted_requires_and_barrels(standalone_text, &hoisted),
-            standalone_text,
-            "standalone request-shaped text is not a structural deletion proof"
-        );
-    }
-
-    #[test]
-    fn redirects_generated_require_ids_in_one_exact_textual_pass() {
         let redirected = FxHashSet::from_iter([1, 42]);
-        let body = "_r(1);_r(11);const label=\"中文_r(42)\";_r(42);_r(01);_r(x);";
+
+        let result = redirect_generated_request_targets(body, &requests, &redirected, 2002);
 
         assert_eq!(
-            redirect_require_targets(body, "_r", &redirected, 2002),
-            "_r(2002);_r(11);const label=\"中文_r(2002)\";_r(2002);_r(01);_r(x);"
+            result,
+            body.replacen("__wake_require__(1)", "__wake_require__(2002)", 1)
+                .replacen("__wake_require__(42);", "__wake_require__(2002);", 1)
         );
+        assert!(result.contains("'exports|module.exports|__wake_require__(7)|_r(42)'"));
+        assert!(result.contains("`exports|module.exports|__wake_require__(7)|_r(42)`"));
+        assert!(result.contains("/* exports|module.exports|__wake_require__(7)|_r(42) */"));
+        assert!(
+            result.contains("/exports\\|module\\.exports\\|__wake_require__\\(7\\)\\|_r\\(42\\)/")
+        );
+    }
+
+    #[test]
+    fn malformed_or_stale_request_metadata_is_an_atomic_no_op() {
+        let body = "__wake_require__(1);__wake_require__(42);";
+        let redirected = FxHashSet::from_iter([1, 42]);
+        let mut requests = [
+            request(body, "__wake_require__(1)", 1),
+            request(body, "__wake_require__(42)", 42),
+        ];
+        requests[1].target_module_id = 7;
+
         assert_eq!(
-            redirect_require_targets(body, "_r", &FxHashSet::default(), 2002),
+            redirect_generated_request_targets(body, &requests, &redirected, 2002),
             body
+        );
+    }
+
+    #[test]
+    fn cached_specifier_maps_to_the_current_generation_and_requires_an_exact_body_literal() {
+        let mappings = || {
+            Arc::new(CachedModuleMappings {
+                mappings: Vec::new(),
+                names: Vec::new(),
+                generated_module_requests: vec![CachedModuleRequest {
+                    start: "__wake_require__(".len() as u32,
+                    end: ("__wake_require__(".len() + 2) as u32,
+                    specifier: "./dep.js".into(),
+                    kind: CachedModuleRequestKind::StaticImport,
+                    role: CachedModuleRequestRole::Value,
+                }],
+                ..CachedModuleMappings::default()
+            })
+        };
+        let deps = vec![ResolvedModuleRequest {
+            request: ModuleRequestKey::new("./dep.js", ModuleRequestKind::StaticImport),
+            module_id: 42,
+        }];
+
+        let (_, requests, runtime_names) =
+            module_metadata_from_cache("__wake_require__(42);", &deps, mappings())
+                .expect("stable specifier should map to this generation's target id");
+        assert!(runtime_names.is_canonical());
+        assert_eq!(requests.expect("request facts")[0].target_module_id, 42);
+        assert!(
+            module_metadata_from_cache("__wake_require__(41);", &deps, mappings()).is_none(),
+            "a body from another generation must miss as one body+metadata unit"
+        );
+        assert!(
+            module_metadata_from_cache("__wake_require__(42);", &[], mappings()).is_none(),
+            "an unresolved stable specifier must miss instead of retaining an old process id"
         );
     }
 }
 
 #[test]
 fn detects_only_modules_inside_dependency_cycles() {
-    let modules = vec![
-        (1, "const a = __wake_require__(2);".to_string()),
-        (2, "const b = __wake_require__(1);".to_string()),
-        (3, "const c = __wake_require__(2);".to_string()),
-        (4, "const d = __wake_require__(4);".to_string()),
-    ];
-    let cyclic = cyclic_module_ids(&modules);
+    let module_ids = vec![1, 2, 3, 4];
+    let edges = FxHashMap::from_iter([
+        (
+            1,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![2],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            2,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![1],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            3,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![2],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            4,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![4],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+    ]);
+    let cyclic = cyclic_module_ids(&module_ids, &edges);
     assert!(cyclic.contains(&1));
     assert!(cyclic.contains(&2));
     assert!(!cyclic.contains(&3));
@@ -5200,108 +6086,128 @@ fn detects_only_modules_inside_dependency_cycles() {
 fn detects_cycles_created_only_by_collapsing_distant_modules_into_concat() {
     // 原图无环：barrel -> icon -> create -> helper。icon/create 已因其它安全约束独立；若
     // barrel/helper 被折叠为同一个 concat，就会凭空形成 concat -> icon -> create -> concat。
-    let modules = vec![
-        (0, "const barrel = __wake_require__(1);".to_string()),
-        (1, "const icon = __wake_require__(2);".to_string()),
-        (2, "const create = __wake_require__(3);".to_string()),
-        (3, "const helper = __wake_require__(4);".to_string()),
-        (4, "exports.helper = 1;".to_string()),
-        (5, "exports.unrelated = 1;".to_string()),
-    ];
-    assert!(cyclic_module_ids(&modules).is_empty());
+    let module_ids = vec![0, 1, 2, 3, 4, 5];
+    let edges = FxHashMap::from_iter([
+        (
+            0,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![1],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            1,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![2],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            2,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![3],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            3,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![4],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            4,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: Vec::new(),
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            5,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: Vec::new(),
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+    ]);
+    assert!(cyclic_module_ids(&module_ids, &edges).is_empty());
 
     let standalone = FxHashSet::from_iter([2, 3]);
-    let demoted = concat_cycle_source_ids(&modules, 0, &standalone);
+    let demoted = concat_cycle_source_ids(&module_ids, &edges, 0, &standalone);
 
     assert_eq!(demoted, FxHashSet::from_iter([1]));
     assert!(!demoted.contains(&4), "下游 helper 仍可安全留在 concat");
     assert!(!demoted.contains(&5), "无关模块不应被降级");
 }
 
-/// 紧凑模块 body 中的运行时引用：`__wake_require__`→`_r`，自由变量 `exports`→`$`。
-///
-/// **`module.exports` 必须改写成 `m.exports`，不能是 `m.$`**：包装器
-/// `function(m,$,_r)` 由 `.call(module.exports, module, module.exports, __wake_require__)`
-/// 调用，`$` 是 exports 对象的**值**、`m` 才是 module 本身。写成 `m.$` 只是在 module 上挂了个
-/// 名为 `$` 的无关属性，`module.exports` 从未被重新赋值 → 该模块导出恒为空对象
-/// （曾致任何 `module.exports = X` 形态的 CJS 包整包失效）。
-///
-/// 用占位符隔离，避免后一步的 `exports`→`$` 把刚写好的 `m.exports` 又改回 `m.$`。
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RuntimeNames {
-    module: String,
-    exports: String,
-    require: String,
-}
+#[test]
+fn scc_topology_and_concat_consume_only_structured_edges() {
+    let poisoned = concat!(
+        "const s='exports|module.exports|__wake_require__(7)|_r(42)';",
+        "const t=`exports|module.exports|__wake_require__(7)|_r(42)`;",
+        "/* __wake_require__(1);_r(3) */",
+        "const r=/__wake_require__\\(2\\)|_r\\(1\\)/;"
+    );
+    let modules = vec![
+        (1, poisoned.to_owned()),
+        (2, "middle".to_owned()),
+        (3, "leaf".to_owned()),
+    ];
+    let edges = FxHashMap::from_iter([
+        (
+            1,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![2],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            2,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: vec![3],
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+        (
+            3,
+            ModuleEdges {
+                requests: Vec::new(),
+                static_targets: Vec::new(),
+                dyn_targets: Vec::new(),
+                stem: String::new(),
+            },
+        ),
+    ]);
 
-impl RuntimeNames {
-    fn for_bodies<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Self {
-        let bodies: Vec<&str> = bodies.into_iter().collect();
-        // Runtime property calls (for example the trusted `import.meta.url` lowering to
-        // `__wake_require__.metaUrl()`) are emitted as an opaque expression today. The compact
-        // body rewrite only shortens direct `__wake_require__(...)` calls, so shortening the
-        // wrapper parameter here would leave that property read unbound. Keep the canonical
-        // parameter locally until all such compiler-generated reads are structural IR nodes.
-        let requires_runtime_properties =
-            bodies.iter().any(|body| body.contains("__wake_require__."));
-        let mut used = FxHashSet::default();
-        let mut pick = |preferred: &str| {
-            for suffix in 0u32.. {
-                let candidate = if suffix == 0 {
-                    preferred.to_string()
-                } else {
-                    format!("{preferred}{suffix}")
-                };
-                if !used.contains(&candidate)
-                    && !bodies
-                        .iter()
-                        .any(|body| contains_identifier(body, &candidate))
-                {
-                    used.insert(candidate.clone());
-                    return candidate;
-                }
-            }
-            unreachable!()
-        };
-        let module = pick("m");
-        let exports = pick("$");
-        let require = if requires_runtime_properties {
-            "__wake_require__".to_string()
-        } else {
-            pick("_r")
-        };
-        Self {
-            module,
-            exports,
-            require,
-        }
-    }
-}
-
-fn contains_identifier(source: &str, needle: &str) -> bool {
-    fn ident_byte(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$') || b >= 0x80
-    }
-    let bytes = source.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return false;
-    }
-    bytes.windows(needle.len()).enumerate().any(|(i, window)| {
-        window == needle
-            && (i == 0 || !ident_byte(bytes[i - 1]))
-            && (i + needle.len() == bytes.len() || !ident_byte(bytes[i + needle.len()]))
-    })
-}
-
-fn compact_body_names(body: &str, names: &RuntimeNames) -> String {
-    // NUL 不可能出现在 JS 源码里，可安全作占位。占位符自身**不得含 `exports` 子串**，
-    // 否则会被下一步的 `exports`→`$` 改坏而无法还原。
-    const MODULE_EXPORTS: &str = "\u{0}wakeME\u{0}";
-    body.replace("module.exports", MODULE_EXPORTS)
-        .replace("__wake_require__(", &format!("{}(", names.require))
-        .replace("exports", &names.exports)
-        .replace(MODULE_EXPORTS, &format!("{}.exports", names.module))
+    assert!(cyclic_module_ids(&[1, 2, 3], &edges).is_empty());
+    assert_eq!(
+        topo_sort_modules(&modules, &edges)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+    assert_eq!(
+        concat_cycle_source_ids(&[1, 2, 3], &edges, 0, &FxHashSet::from_iter([2])),
+        FxHashSet::from_iter([1])
+    );
 }
 
 /// 从 entry 出发的**依赖后序**编号（模块 id → 序号），即 ESM 的求值顺序：依赖先于消费方，
@@ -5310,10 +6216,10 @@ fn compact_body_names(body: &str, names: &RuntimeNames) -> String {
 /// 供 prod CSS 聚合排序用——层叠顺序必须与 dev 的 `<style>` 注入顺序（模块求值序）一致。
 /// 深度优先按静态 `deps` 原序展开。动态 import 并不参与入口求值；把它先遍历会让 lazy
 /// 子图提前占据 shared module 的 `seen` 槽位，从而颠倒 entry CSS 的 cascade 顺序。
-fn css_emission_order(modules: &FxHashMap<u32, ModuleRec>, entry_id: u32) -> FxHashMap<u32, u32> {
+fn css_emission_order(edges: &FxHashMap<u32, ModuleEdges>, entry_id: u32) -> FxHashMap<u32, u32> {
     fn visit_static_postorder(
         root: u32,
-        modules: &FxHashMap<u32, ModuleRec>,
+        edges: &FxHashMap<u32, ModuleEdges>,
         seen: &mut FxHashSet<u32>,
         order: &mut FxHashMap<u32, u32>,
         next: &mut u32,
@@ -5323,23 +6229,15 @@ fn css_emission_order(modules: &FxHashMap<u32, ModuleRec>, entry_id: u32) -> FxH
         }
         let mut stack: Vec<(u32, usize)> = vec![(root, 0)];
         while let Some((id, dependency_index)) = stack.pop() {
-            let Some(module) = modules.get(&id) else {
+            let Some(module_edges) = edges.get(&id) else {
                 order.insert(id, *next);
                 *next += 1;
                 continue;
             };
-            if dependency_index < module.deps.len() {
+            if dependency_index < module_edges.static_targets.len() {
                 stack.push((id, dependency_index + 1));
-                let dependency = &module.deps[dependency_index];
-                if dependency.kind == DependencyKind::DynamicImport {
-                    continue;
-                }
-                if let Some(&(_, child)) = module
-                    .dep_ids
-                    .iter()
-                    .find(|(specifier, _)| specifier == &dependency.specifier)
-                    && seen.insert(child)
-                {
+                let child = module_edges.static_targets[dependency_index];
+                if seen.insert(child) {
                     stack.push((child, 0));
                 }
             } else {
@@ -5352,17 +6250,17 @@ fn css_emission_order(modules: &FxHashMap<u32, ModuleRec>, entry_id: u32) -> FxH
     let mut order: FxHashMap<u32, u32> = FxHashMap::default();
     let mut seen: FxHashSet<u32> = FxHashSet::default();
     let mut next = 0u32;
-    if modules.contains_key(&entry_id) {
-        visit_static_postorder(entry_id, modules, &mut seen, &mut order, &mut next);
+    if edges.contains_key(&entry_id) {
+        visit_static_postorder(entry_id, edges, &mut seen, &mut order, &mut next);
     }
 
     // Lazy roots are not part of entry evaluation, but their own static dependency order matters
     // once activated. Visit every remaining component in deterministic module-id order.
-    let mut remaining = modules.keys().copied().collect::<Vec<_>>();
+    let mut remaining = edges.keys().copied().collect::<Vec<_>>();
     remaining.sort_unstable();
     for id in remaining {
         if !seen.contains(&id) {
-            visit_static_postorder(id, modules, &mut seen, &mut order, &mut next);
+            visit_static_postorder(id, edges, &mut seen, &mut order, &mut next);
         }
     }
     order
@@ -5373,6 +6271,7 @@ fn css_emission_order(modules: &FxHashMap<u32, ModuleRec>, entry_id: u32) -> FxH
 /// which the runtime resolves before loading the dependent chunk's own styles.
 fn build_style_artifacts(
     modules: &FxHashMap<u32, ModuleRec>,
+    final_edges: &FxHashMap<u32, ModuleEdges>,
     entry_id: u32,
     chunk_graph: Option<&ChunkGraph>,
     collected_css: &mut [(u32, String)],
@@ -5381,25 +6280,33 @@ fn build_style_artifacts(
     if collected_css.is_empty() {
         return (Vec::new(), BTreeMap::new());
     }
-    let order = css_emission_order(modules, entry_id);
+    let order = css_emission_order(final_edges, entry_id);
     let fallback = u32::MAX;
     collected_css.sort_by_key(|(id, _)| (*order.get(id).unwrap_or(&fallback), *id));
 
-    let mut css_by_chunk: BTreeMap<u32, String> = BTreeMap::new();
+    let mut css_by_chunk: BTreeMap<u32, (String, Vec<u32>, Vec<u32>)> = BTreeMap::new();
     for (module_id, text) in collected_css.iter() {
         let chunk_id = chunk_graph
             .and_then(|graph| graph.module_chunk.get(module_id).copied())
             .unwrap_or(0);
-        let output = css_by_chunk.entry(chunk_id).or_default();
+        let (output, owner_module_ids, unscoped_css_owner_module_ids) =
+            css_by_chunk.entry(chunk_id).or_default();
         output.push_str(text);
         if !text.ends_with('\n') {
             output.push('\n');
+        }
+        owner_module_ids.push(*module_id);
+        if modules
+            .get(module_id)
+            .is_some_and(|module| is_css_path(&module.path) && !is_css_module_path(&module.path))
+        {
+            unscoped_css_owner_module_ids.push(*module_id);
         }
     }
 
     let mut assets = Vec::with_capacity(css_by_chunk.len());
     let mut files = BTreeMap::new();
-    for (chunk_id, css) in css_by_chunk {
+    for (chunk_id, (css, mut owner_module_ids, mut unscoped_css_owner_module_ids)) in css_by_chunk {
         let css = if minify { wake_css::minify(&css) } else { css };
         // Entry CSS keeps the stable `styles.<hash>.css` public contract even when the
         // JavaScript graph is split and its source entry has a project-specific stem.
@@ -5413,107 +6320,19 @@ fn build_style_artifacts(
         };
         let file_name = format!("{chunk_name}.{}.css", hash8(&css));
         files.insert(chunk_id, vec![file_name.clone()]);
+        owner_module_ids.sort_unstable();
+        owner_module_ids.dedup();
+        unscoped_css_owner_module_ids.sort_unstable();
+        unscoped_css_owner_module_ids.dedup();
         assets.push(OutputAsset {
             file_name,
             bytes: css.into_bytes(),
             is_css: true,
+            owner_module_ids,
+            unscoped_css_owner_module_ids,
         });
     }
     (assets, files)
-}
-
-/// 模块体写入 exports 对象的**导出名**集合。
-///
-/// 只认 codegen 实际发射的两种赋值形态——`exports["name"] = …`（[`emit_export_binding`] /
-/// re-export）与 `exports.name = …`（默认导出）；`module.exports` 显式排除（那条路由
-/// [`reassigns_module_exports`] 处理）。要求其后紧跟 `=` 且非 `==`/`=>`，避免把读取
-/// （`exports.foo` 作右值）当成导出。
-///
-/// 字符串字面量里若恰好含 `exports["x"]=` 会被误记 → 该模块多降级一次（不进 concat），
-/// **偏向安全方向**：只损失一点体积优化，不影响正确性。
-///
-/// [`emit_export_binding`]: wake_ecma_codegen
-fn exported_names(body: &str) -> FxHashSet<String> {
-    let mut out = FxHashSet::default();
-    // Mutable ESM bindings and bundled re-exports use getter-backed properties. Compare the
-    // emitted literal spelling: equal public names have equal escaped spellings, while a partial
-    // parse can only conservatively create an extra conflict/standalone module.
-    let mut getter_rest = body;
-    const GETTER: &str = "Object.defineProperty(exports,";
-    while let Some(position) = getter_rest.find(GETTER) {
-        getter_rest = &getter_rest[position + GETTER.len()..];
-        let literal = getter_rest.trim_start();
-        let Some(quote) = literal
-            .chars()
-            .next()
-            .filter(|quote| matches!(quote, '\'' | '"'))
-        else {
-            continue;
-        };
-        let value = &literal[quote.len_utf8()..];
-        let Some(end) = value.find(quote) else {
-            break;
-        };
-        out.insert(value[..end].to_string());
-        getter_rest = &value[end + quote.len_utf8()..];
-    }
-    let bytes = body.as_bytes();
-    let mut i = 0usize;
-    while let Some(pos) = body[i..].find("exports") {
-        let at = i + pos;
-        let after = at + "exports".len();
-        i = after;
-        // `module.exports` 不是这里的目标。
-        if at >= "module.".len() && bytes.get(at - "module.".len()..at) == Some(b"module.") {
-            continue;
-        }
-        // `exports` 必须是完整词（前一个字符不能是标识符字符）。
-        if at > 0 {
-            let p = bytes[at - 1];
-            if p.is_ascii_alphanumeric() || p == b'_' || p == b'$' || p == b'.' {
-                continue;
-            }
-        }
-        let rest = &body[after..];
-        let (name, tail) = if let Some(r) = rest.strip_prefix('[') {
-            // `exports["name"]` / `exports['name']`
-            let r = r.trim_start();
-            let Some(quote) = r.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-                continue;
-            };
-            let inner = &r[quote.len_utf8()..];
-            let Some(end) = inner.find(quote) else {
-                continue;
-            };
-            let Some(t) = inner[end + quote.len_utf8()..]
-                .trim_start()
-                .strip_prefix(']')
-            else {
-                continue;
-            };
-            (inner[..end].to_string(), t)
-        } else if let Some(r) = rest.strip_prefix('.') {
-            // `exports.name`
-            let end = r
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-                .unwrap_or(r.len());
-            if end == 0 {
-                continue;
-            }
-            (r[..end].to_string(), &r[end..])
-        } else {
-            continue;
-        };
-        // 只算**赋值**，不算读取。
-        let t = tail.trim_start();
-        if let Some(t2) = t.strip_prefix('=')
-            && !t2.starts_with('=')
-            && !t2.starts_with('>')
-        {
-            out.insert(name);
-        }
-    }
-    out
 }
 
 /// Internal modules whose exported namespace object is observed as an object, rather than only
@@ -5524,129 +6343,100 @@ fn exported_names(body: &str) -> FxHashSet<String> {
 /// imports, star re-exports, dynamic import, and `require`: the shared object would expose exports
 /// belonging to unrelated concat members. These facts come from the current parser generation's
 /// liveness model and resolved graph ids; no `SymbolId` crosses the cache boundary.
-fn namespace_identity_module_ids(modules: &FxHashMap<u32, ModuleRec>) -> FxHashSet<u32> {
+fn namespace_identity_module_ids(
+    modules: &FxHashMap<u32, ModuleRec>,
+    final_edges: &FxHashMap<u32, ModuleEdges>,
+) -> FxHashSet<u32> {
     let mut targets = FxHashSet::default();
-    for module in modules.values() {
-        let resolved = module
-            .dep_ids
-            .iter()
-            .map(|(specifier, id)| (specifier.as_str(), *id))
-            .collect::<FxHashMap<_, _>>();
-        let mut retain = |specifier: &str| {
-            if let Some(id) = resolved.get(specifier) {
-                targets.insert(*id);
+    for (&module_id, module) in modules {
+        let requests = final_edges
+            .get(&module_id)
+            .map(|edges| edges.requests.as_slice())
+            .unwrap_or_default();
+        let mut retain_static = |specifier: &str| {
+            if let Some(request) = requests.iter().find(|request| {
+                request.request.specifier == specifier
+                    && request.request.kind == ModuleRequestKind::StaticImport
+            }) {
+                targets.insert(request.module_id);
             }
         };
 
         if let Some(liveness) = &module.liveness {
             for (_, specifier) in &liveness.namespace_imports {
-                retain(specifier);
+                retain_static(specifier);
             }
             for specifier in &liveness.reexport_star {
-                retain(specifier);
+                retain_static(specifier);
             }
             for (_, specifier) in &liveness.ns_reexports {
-                retain(specifier);
+                retain_static(specifier);
             }
         }
 
         // Both forms return the target's namespace object at runtime. Keeping their targets
         // factory-owned is also the conservative fallback for modules lacking liveness facts.
-        for dependency in &module.deps {
-            if matches!(
-                dependency.kind,
-                DependencyKind::DynamicImport | DependencyKind::Require
-            ) {
-                retain(&dependency.specifier);
-            }
+        for request in requests.iter().filter(|request| {
+            matches!(
+                request.request.kind,
+                ModuleRequestKind::DynamicImport | ModuleRequestKind::Require
+            )
+        }) {
+            targets.insert(request.module_id);
         }
     }
     targets
 }
 
-/// 模块体是否**整体重新赋值** `module.exports`（`module.exports = X`），而非只挂属性
-/// （`module.exports.foo = X`）。
-///
-/// 这类 CJS 模块**不能**并入 scope-hoist 的 concat：concat 让所有被合并模块共享同一个
-/// exports 对象 `$`，而整体赋值会把 `module.exports` 换成**另一个**对象——此后
-/// 该模块的导出与其它模块写入的 `$` 分属两个对象，必丢其一
-/// （曾致 CJS 与同组 ESM 模块的导出互相覆盖丢失）。
-fn reassigns_module_exports(body: &str) -> bool {
-    let mut rest = body;
-    while let Some(pos) = rest.find("module.exports") {
-        let after = &rest[pos + "module.exports".len()..];
-        let trimmed = after.trim_start();
-        // `=` 且非 `==`/`===`/`=>`：是整体赋值。`.foo =` / `[x] =` 只是挂属性，不算。
-        if let Some(t) = trimmed.strip_prefix('=')
-            && !t.starts_with('=')
-            && !t.starts_with('>')
-        {
-            return true;
-        }
-        rest = after;
+/// Conservative public names owned by one concat candidate. Missing liveness or a star re-export
+/// has no closed name set and therefore returns `None`, forcing a standalone factory.
+fn concat_export_names(module: &ModuleRec, interner: &Interner) -> Option<Vec<String>> {
+    let liveness = module.liveness.as_ref()?;
+    if !liveness.reexport_star.is_empty() {
+        return None;
     }
-    false
+    let mut names = liveness
+        .exports
+        .iter()
+        .map(|(name, _)| interner.resolve(*name))
+        .chain(
+            liveness
+                .ns_reexports
+                .iter()
+                .map(|(name, _)| interner.resolve(*name)),
+        )
+        .chain(
+            liveness
+                .reexport_named
+                .iter()
+                .map(|(name, _, _)| interner.resolve(*name)),
+        )
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Some(names)
 }
 
-/// 移除指向同一 concat 成员的独立 `_r(N);` 调用（成员 body 已在 concat 中按序执行）。
-/// 指向独立 factory 的请求必须保留，否则它的顶层副作用永远不会执行。
-fn strip_standalone_requires(body: &str, concat_members: &FxHashSet<u32>) -> String {
-    let mut result = String::with_capacity(body.len());
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    let n = bytes.len();
-    while i < n {
-        if i + 3 <= n && &bytes[i..i + 3] == b"_r(" {
-            let prev_ok = i == 0 || bytes[i - 1] == b';' || bytes[i - 1] == b'{';
-            if prev_ok {
-                let mut j = i + 3;
-                while j < n && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j > i + 3 {
-                    let target = body[i + 3..j].parse::<u32>().ok();
-                    let mut k = j;
-                    while k < n && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    if k < n && bytes[k] == b')' {
-                        k += 1;
-                    }
-                    while k < n && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    if k < n
-                        && bytes[k] == b';'
-                        && target.is_some_and(|target| concat_members.contains(&target))
-                    {
-                        i = k + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        let ch = body[i..]
-            .chars()
-            .next()
-            .expect("i remains on a UTF-8 character boundary");
-        result.push(ch);
-        i += ch.len_utf8();
-    }
-    result
-}
-
-/// 返回处于依赖环中的模块 id。循环模块必须保留独立 factory，不能共享 concat exports。
-fn cyclic_module_ids(modules: &[(u32, String)]) -> FxHashSet<u32> {
-    let ids: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
+/// Return modules inside a retained static dependency cycle. Generated body text is deliberately
+/// absent from this boundary: optimizer-retained [`ModuleEdges`] are the only graph source.
+fn cyclic_module_ids(
+    module_ids: &[u32],
+    retained_edges: &FxHashMap<u32, ModuleEdges>,
+) -> FxHashSet<u32> {
+    let ids: FxHashSet<u32> = module_ids.iter().copied().collect();
     let mut edges: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut reverse: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for (id, body) in modules {
-        let mut targets = Vec::new();
-        for_each_require(body, |_, target, _| {
-            if ids.contains(&target) {
-                targets.push(target);
-            }
-        });
+    for id in module_ids {
+        let mut targets = retained_edges
+            .get(id)
+            .map(|edge| {
+                edge.static_targets
+                    .iter()
+                    .copied()
+                    .filter(|target| ids.contains(target))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         targets.sort_unstable();
         targets.dedup();
         for target in &targets {
@@ -5689,7 +6479,7 @@ fn cyclic_module_ids(modules: &[(u32, String)]) -> FxHashSet<u32> {
         }
     }
 
-    let mut order = Vec::with_capacity(modules.len());
+    let mut order = Vec::with_capacity(module_ids.len());
     let mut seen = FxHashSet::default();
     let mut sorted_ids = ids.iter().copied().collect::<Vec<_>>();
     sorted_ids.sort_unstable();
@@ -5734,11 +6524,12 @@ fn cyclic_module_ids(modules: &[(u32, String)]) -> FxHashSet<u32> {
 /// 1. 反向遍历所有 merge 成员，找出仍能走到 merge 的 standalone 边界；
 /// 2. 再反向遍历这些边界，其上游 merge 成员就是折叠后闭环的来源。
 fn concat_cycle_source_ids(
-    modules: &[(u32, String)],
+    module_ids: &[u32],
+    retained_edges: &FxHashMap<u32, ModuleEdges>,
     entry_id: u32,
     standalone: &FxHashSet<u32>,
 ) -> FxHashSet<u32> {
-    let ids: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
+    let ids: FxHashSet<u32> = module_ids.iter().copied().collect();
     let merged: FxHashSet<u32> = ids
         .iter()
         .copied()
@@ -5750,12 +6541,14 @@ fn concat_cycle_source_ids(
 
     // 反向边：dependency -> importers。
     let mut reverse: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for (id, body) in modules {
-        for_each_require(body, |_, target, _| {
-            if ids.contains(&target) && target != *id {
-                reverse.entry(target).or_default().push(*id);
+    for id in module_ids {
+        if let Some(edge) = retained_edges.get(id) {
+            for target in &edge.static_targets {
+                if ids.contains(target) && target != id {
+                    reverse.entry(*target).or_default().push(*id);
+                }
             }
-        });
+        }
     }
     for importers in reverse.values_mut() {
         importers.sort_unstable();
@@ -5803,20 +6596,29 @@ fn concat_cycle_source_ids(
         .filter(|id| can_reach_bridge.contains(id))
         .collect()
 }
-/// 拓扑排序：按依赖顺序排列模块，确保依赖方先于被依赖方执行。
-/// 解析各模块 body 中的 require 调用构建依赖图，忽略对自身和不在集合内的引用。
-fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
+/// Topologically order bodies from optimizer-retained graph edges. Cycles retain deterministic
+/// input order after the DFS guard; SCC members are separately excluded from concatenation.
+fn topo_sort_modules(
+    modules: &[(u32, String)],
+    retained_edges: &FxHashMap<u32, ModuleEdges>,
+) -> Vec<(u32, String)> {
     let id_set: FxHashSet<u32> = modules.iter().map(|(id, _)| *id).collect();
 
-    // 解析每个模块的内部依赖
     let mut deps: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for (id, body) in modules {
-        let mut module_deps = Vec::new();
-        for_each_require(body, |_, n, _| {
-            if id_set.contains(&n) && n != *id {
-                module_deps.push(n);
-            }
-        });
+    for (id, _) in modules {
+        let mut seen = FxHashSet::default();
+        let module_deps = retained_edges
+            .get(id)
+            .map(|edge| {
+                edge.static_targets
+                    .iter()
+                    .copied()
+                    .filter(|target| {
+                        id_set.contains(target) && target != id && seen.insert(*target)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         deps.insert(*id, module_deps);
     }
 
@@ -5857,86 +6659,18 @@ fn topo_sort_modules(modules: &[(u32, String)]) -> Vec<(u32, String)> {
     result
 }
 
-/// 生成 default import interop helper。minify 下 codegen 省略 `__esModule`，
-/// 因此须改用转译 ESM 必然具有的 `default` 导出键判定。
-fn interop_default_helper(name: &str, no_esmodule: bool) -> String {
-    if no_esmodule {
-        format!(
-            "function {name}(m){{return m&&(typeof m==='object'||typeof m==='function')&&'default' in m?m.default:m}}"
-        )
-    } else {
-        format!("function {name}(m){{return m&&m.__esModule?m.default:m}}")
-    }
-}
-
-/// Generate namespace-import interop for CJS or external/unknown targets. Internal ESM imports
-/// bypass this helper using the target-kind fact carried by the optimizer, so the compact
-/// no-marker runtime must still build a standards-shaped CJS namespace with `.default`.
+/// Split-runtime namespace interop. Module bodies own their inline typed interop; only `nsOf`
+/// needs this entry-local helper when a dynamic chunk resolves an unknown CJS-shaped value.
 fn interop_star_helper(name: &str, _no_esmodule: bool) -> String {
     format!(
         "function {name}(m){{if(m&&m.__esModule)return m;var ns={{}};if(m!=null){{for(var k in m)if(Object.prototype.hasOwnProperty.call(m,k)&&k!='default')ns[k]=m[k]}}ns.default=m;return ns}}"
     )
 }
 
-/// Replace only finalizer-proven, generated request expressions whose target has already been
-/// selected for eager inline execution. `0` deliberately preserves the surrounding typed
-/// statement/sequence grammar; later minified text passes therefore never have to infer or repair
-/// commas, parentheses, or semicolons.
-fn replace_eager_discarded_static_requests(
-    body: &str,
-    requests: &[GeneratedDiscardedStaticRequest],
-    eager_targets: &FxHashSet<u32>,
-) -> String {
-    if requests.is_empty()
-        || !requests
-            .iter()
-            .any(|request| eager_targets.contains(&request.target_module_id))
-    {
-        return body.to_owned();
-    }
-
-    // Persistent metadata is untrusted input. Any malformed/overlapping/out-of-bounds range turns
-    // the optimization into a conservative no-op instead of allowing a byte splice to corrupt JS.
-    let mut previous_end = 0_usize;
-    for request in requests {
-        let start = request.start as usize;
-        let end = request.end as usize;
-        if start < previous_end
-            || start >= end
-            || end > body.len()
-            || !body.is_char_boundary(start)
-            || !body.is_char_boundary(end)
-        {
-            return body.to_owned();
-        }
-        previous_end = end;
-    }
-
-    let removed_bytes = requests
-        .iter()
-        .filter(|request| eager_targets.contains(&request.target_module_id))
-        .map(|request| (request.end - request.start).saturating_sub(1) as usize)
-        .sum::<usize>();
-    let mut out = String::with_capacity(body.len().saturating_sub(removed_bytes));
-    let mut cursor = 0_usize;
-    for request in requests {
-        if !eager_targets.contains(&request.target_module_id) {
-            continue;
-        }
-        let start = request.start as usize;
-        let end = request.end as usize;
-        out.push_str(&body[cursor..start]);
-        out.push('0');
-        cursor = end;
-    }
-    out.push_str(&body[cursor..]);
-    out
-}
-
 /// 拼接各模块（已 codegen 的）函数体 + mini runtime。
 ///
 /// `async_ids`：async 子图（顶层 await）。非空时包装器改 `async function`、runtime 换 Promise 感知版、
-/// 且**关闭模块合并**；**为空时逐字节等同于改造前的产物**（无顶层 await 的项目零影响）。
+/// 且**关闭模块合并**；为空时使用同步 runtime 与结构化 concat 布局。
 ///
 #[derive(Clone, Debug)]
 struct BodyPlacement {
@@ -5959,93 +6693,32 @@ struct RelativeBodyPlacement {
 /// 多条 placement；合成 wrapper 不登记来源。
 fn emit(
     bodies: &[(u32, Arc<String>)],
+    retained_edges: &FxHashMap<u32, ModuleEdges>,
     entry_id: u32,
     minify: bool,
-    no_esmodule: bool,
     block_infos: &FxHashMap<u32, ConcatBlockInfo>,
+    concat_export_names_by_id: &FxHashMap<u32, Option<Vec<String>>>,
     namespace_identity_ids: &FxHashSet<u32>,
     async_ids: &FxHashSet<u32>,
-    discarded_static_requests: &FxHashMap<u32, Arc<Vec<GeneratedDiscardedStaticRequest>>>,
-    exec: &Executor,
+    generated_module_requests: &FxHashMap<u32, Arc<Vec<GeneratedModuleRequest>>>,
+    runtime_names_by_id: &FxHashMap<u32, GeneratedModuleRuntimeNames>,
     module_format: ModuleFormat,
+    has_runtime_imports: bool,
+    has_shared_imports: bool,
+    federation_entry_export: Option<&(String, String)>,
+    federation_entry_export_build_scoped: bool,
     mut body_placements: Option<&mut Vec<BodyPlacement>>,
 ) -> String {
-    let mut keep_bodies: Vec<(u32, Arc<String>)> = Vec::new();
-
+    let runtime_capabilities = union_runtime_capabilities(runtime_names_by_id.values());
     if minify {
-        let mut candidates: FxHashMap<u32, Arc<String>> = FxHashMap::default();
-        let runtime_names = RuntimeNames::for_bodies(bodies.iter().map(|(_, body)| body.as_str()));
-
-        for (id, body) in bodies {
-            if is_pure_reg_body(body) {
-                candidates.insert(*id, body.clone());
-            } else {
-                keep_bodies.push((*id, body.clone()));
-            }
-        }
-
-        // 预剥离：candidates 中的模块无导出 → 任何引用它们的 barrel re-export 行都是空操作。
-        // 在检查非独立引用前先剥离，避免 candidates 因 barrel 行被错误回退。
-        // **并行**：各 keep body 的 strip 互相独立，经执行器扇出（保序 → 输出不变）。少数大 barrel
-        // 模块引用了大量候选，串行 strip 是 emit 的剩余大头。
-        let pre_hoisted: Arc<FxHashSet<u32>> = Arc::new(candidates.keys().copied().collect());
-        let stripped_bodies: Vec<(u32, String)> = if pre_hoisted.is_empty() {
-            keep_bodies
-                .iter()
-                .map(|(id, body)| (*id, (**body).clone()))
-                .collect()
-        } else {
-            let jobs: Vec<_> = keep_bodies
-                .iter()
-                .map(|(id, body)| {
-                    let id = *id;
-                    let body = body.clone();
-                    let ph = pre_hoisted.clone();
-                    let requests = discarded_static_requests
-                        .get(&id)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(Vec::new()));
-                    move || {
-                        let body = replace_eager_discarded_static_requests(&body, &requests, &ph);
-                        (id, strip_hoisted_requires_and_barrels(&body, &ph))
-                    }
-                })
-                .collect();
-            exec.parallel(jobs)
-        };
-
-        // 检查剥离后的模块中是否还有非独立引用（如 `const x = require(N)` 形式的直接导入）。
-        // 单遍扫每个 body 的 `__wake_require__(N)`：N 属候选且该处为非独立引用（前置非 `;`/`{`/起始）
-        // 则记入 ref_ids。等价于原「对每个候选 × 每个 body 调 has_non_standalone_ref」但从
-        // O(候选数 × body) 降到 O(body)。
-        let mut ref_ids: FxHashSet<u32> = FxHashSet::default();
-        for (_, body) in &stripped_bodies {
-            let bytes = body.as_bytes();
-            for_each_require(body, |abs, id, _| {
-                if candidates.contains_key(&id) {
-                    let is_standalone =
-                        abs == 0 || bytes[abs - 1] == b';' || bytes[abs - 1] == b'{';
-                    if !is_standalone {
-                        ref_ids.insert(id);
-                    }
-                }
-            });
-        }
-
-        // 原此处有第二遍 `strip_hoisted_requires_and_barrels`：其 `hoisted` = `pre_hoisted`（同为
-        // `candidates.keys()`），在已被第一遍剥净同一集合的 body 上重跑 → 可证明 no-op（删除只移除文本、
-        // 不新增 require，同集合二次扫描无可删）。故直接复用第一遍结果，省一整趟 O(候选数 × body)。
-        let mut filtered: Vec<(u32, String)> = stripped_bodies;
-
-        // 收集 inline __reg：所有 candidates 的 body 直接内联
-        // FxHashMap 的迭代顺序既不稳定，也会把路径/模块编号相近的注册语句随机打散，
-        // 显著破坏 Gzip/Brotli 的局部重复匹配。按稳定 module id 输出。
-        let mut inline_reg_entries: Vec<_> = candidates.iter().collect();
-        inline_reg_entries.sort_unstable_by_key(|(id, _)| **id);
-        let inline_regs: Vec<String> = inline_reg_entries
-            .into_iter()
-            .map(|(_, body)| (**body).clone())
-            .collect();
+        let canonical_runtime_names = GeneratedModuleRuntimeNames::canonical();
+        // Correctness-first compact emission keeps every graph module as an owned body until the
+        // structured concat policy below chooses a merge. No generated text is reclassified as a
+        // trivial registry module or parsed again for request/barrel semantics.
+        let mut filtered = bodies
+            .iter()
+            .map(|(id, body)| (*id, (**body).clone()))
+            .collect::<Vec<_>>();
 
         // 构建最终模块表。含顶层 await 时**不做模块合并**：合并闭包是单个函数，无法表达
         // 「其中一部分模块是 async、且彼此有 await 依赖顺序」；退回逐模块注册表（仍是紧凑产物）。
@@ -6053,16 +6726,6 @@ fn emit(
         let mut module_fragments: FxHashMap<u32, Vec<RelativeBodyPlacement>> = FxHashMap::default();
         if async_ids.is_empty() {
             // —— 模块合并：将所有非 hoist 模块体拼接到一个闭包，避免命名冲突 ——
-            // Synthetic factories occupy an ID outside the complete real-module domain. The old
-            // `entry + filtered + 1000` formula could collide with a live source module (observed
-            // at real id 1032 in the 2k fixture), silently redirecting that source request to the
-            // concat factory.
-            let concat_id = bodies
-                .iter()
-                .map(|(id, _)| *id)
-                .max()
-                .and_then(|id| id.checked_add(1))
-                .expect("bundle module id space exhausted before concat factory allocation");
             // 被合并模块是否全为 ESM（恒 strict-safe）→ 给 concat 函数加 `"use strict"`，使**块级函数声明
             // 变块作用域**，从而可用裸 `{}` 块替代 IIFE 包裹（省 `(function(){`+`})();` 开销）而不发生
             // 顶层名跨模块碰撞。任一非 ESM（可能依赖 sloppy 语义）→ 全走 IIFE 且不加 strict（保守安全）。
@@ -6079,25 +6742,36 @@ fn emit(
             if all_esm {
                 concat_body.push_str("\"use strict\";");
             }
-            // 拓扑排序：确保依赖模块先于消费方执行，避免 _r(N) 返回空的 $
-            filtered = topo_sort_modules(&filtered);
+            // 拓扑排序：确保依赖模块先于消费方执行，避免
+            // `__wake_require__(N)` 在目标写入共享 exports 前返回空对象。
+            filtered = topo_sort_modules(&filtered, retained_edges);
 
-            // 整体重新赋值 `module.exports` 的 CJS 模块必须留作**独立注册模块**：它们会把
-            // `module.exports` 换成新对象，与 concat 共享的 `$` 分裂成两个导出对象。
-            let cyclic = cyclic_module_ids(&filtered);
+            // 非 ESM 的 structured block fact 保守地保留独立 factory：CJS 可重新赋值
+            // `module.exports`，不能与 concat 成员共享同一 exports 对象。
+            let module_ids = filtered.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let cyclic = cyclic_module_ids(&module_ids, retained_edges);
             let mut standalone: FxHashSet<u32> = filtered
                 .iter()
-                .filter(|(id, body)| {
+                .filter(|(id, _)| {
                     *id != entry_id
-                        && (reassigns_module_exports(body)
-                            || cyclic.contains(id)
+                        && (cyclic.contains(id)
                             || namespace_identity_ids.contains(id)
-                            || !block_infos.get(id).is_some_and(|info| info.is_esm))
+                            || !block_infos.get(id).is_some_and(|info| info.is_esm)
+                            || block_infos
+                                .get(id)
+                                .is_some_and(|info| info.observes_commonjs_bindings)
+                            || !runtime_names_by_id
+                                .get(id)
+                                .is_some_and(GeneratedModuleRuntimeNames::is_canonical)
+                            || concat_export_names_by_id
+                                .get(id)
+                                .and_then(Option::as_ref)
+                                .is_none())
                 })
                 .map(|(id, _)| *id)
                 .collect();
 
-            // **导出名冲突**同理必须降级：concat 让所有成员共享同一个 exports 对象 `$`，两个模块
+            // **导出名冲突**同理必须降级：concat 让所有成员共享同一个 exports 对象，两个模块
             // 写同一个名字就是后者覆盖前者、静默丢值。`default` 尤其必撞——`export default` 是
             // 最常见的写法，而**每个资源模块恰好都是 `export default "<url>"`**，所以只要有两个
             // 图片/字体被 import，它们的 URL 就会串（实测 `import a from './a.js'` +
@@ -6107,15 +6781,18 @@ fn emit(
             // 注册模块（有自己的 exports 对象）。保留尽可能多的 scope-hoist 收益。
             {
                 let mut claimed: FxHashSet<String> = FxHashSet::default();
-                for (id, body) in &filtered {
+                for (id, _) in &filtered {
                     if *id == entry_id || standalone.contains(id) {
                         continue;
                     }
-                    let names = exported_names(body);
+                    let names = concat_export_names_by_id
+                        .get(id)
+                        .and_then(Option::as_ref)
+                        .expect("non-standalone concat member has closed export names");
                     if names.iter().any(|n| claimed.contains(n)) {
                         standalone.insert(*id);
                     } else {
-                        claimed.extend(names);
+                        claimed.extend(names.iter().cloned());
                     }
                 }
             }
@@ -6125,26 +6802,58 @@ fn emit(
             // icon（因重复 default 导出而独立），icon 再依赖 createLucideIcon（独立），后者又依赖
             // concat 内的 helpers。从 createLucideIcon 开始 require 时，循环缓存会暴露尚未初始化的
             // 空 exports。只把 standalone 上游、会闭合该路径的 concat 成员降级即可保留其余合并。
-            standalone.extend(concat_cycle_source_ids(&filtered, entry_id, &standalone));
+            standalone.extend(concat_cycle_source_ids(
+                &module_ids,
+                retained_edges,
+                entry_id,
+                &standalone,
+            ));
 
-            // 真正并入 concat 的模块 id（供 `_r` 垫片判定）。
+            // 真正并入 concat 的模块 id（供规范 require 垫片判定）。
             let concat_member_ids: Vec<u32> = filtered
                 .iter()
                 .map(|(id, _)| *id)
                 .filter(|id| *id != entry_id && !standalone.contains(id))
                 .collect();
-            let concat_member_set = concat_member_ids.iter().copied().collect::<FxHashSet<_>>();
-
-            // `_r` 垫片：并入 concat 的模块共享 `$`，其余 id **转发真实 require**
-            // （独立模块有自己的 module.exports，不能返回 `$`）。
+            // Synthetic factories occupy an ID outside the complete real-module domain. Allocate
+            // one only when a module is actually merged: a failed scan has no bodies, and a
+            // one-module bundle has no concat factory at all. The old eager allocation turned the
+            // former into a secondary panic that hid its authoritative loader diagnostic.
+            let concat_id = (!concat_member_ids.is_empty()).then(|| {
+                bodies
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .max()
+                    .and_then(|id| id.checked_add(1))
+                    .expect("bundle module id space exhausted before concat factory allocation")
+            });
+            // 规范 require 垫片：并入 concat 的模块共享 exports，其余 id **转发真实
+            // require**（独立模块有自己的 module.exports，不能返回共享对象）。
             {
                 let set = concat_member_ids
                     .iter()
                     .map(|i| format!("{i}:1"))
                     .collect::<Vec<_>>()
                     .join(",");
+                let forwarded_services = [
+                    (runtime_capabilities.meta_url, "metaUrl"),
+                    (runtime_capabilities.external_require, "external"),
+                    (runtime_capabilities.promise_resolve, "promiseResolve"),
+                    (runtime_capabilities.object_assign, "objectAssign"),
+                    (runtime_capabilities.object_keys, "objectKeys"),
+                    (
+                        runtime_capabilities.object_define_property,
+                        "objectDefineProperty",
+                    ),
+                    (runtime_capabilities.runtime_import, "runtimeImport"),
+                    (runtime_capabilities.shared, "shared"),
+                ]
+                .into_iter()
+                .filter(|(needed, _)| *needed)
+                .map(|(_, member)| format!("_r.{member}=_o.{member};"))
+                .collect::<String>();
                 concat_body.push_str(&format!(
-                    "{require}=function(_o){{var _m={{{set}}};return function(i){{return _m[i]?{exports}:_o(i)}}}}({require});", require = runtime_names.require, exports = runtime_names.exports,
+                    "{require}=function(_o){{var _m={{{set}}},_r=function(i){{return _m[i]?{exports}:_o(i)}};{forwarded_services}return _r}}({require});", require = canonical_runtime_names.require, exports = canonical_runtime_names.exports,
                 ));
             }
 
@@ -6153,27 +6862,12 @@ fn emit(
                 if *id == entry_id || standalone.contains(id) {
                     continue;
                 }
-                let b = strip_standalone_requires(
-                    &compact_body_names(body, &runtime_names),
-                    &concat_member_set,
-                );
+                let b = body.clone();
                 // 块安全（ESM 且无 `var`/`this`）+ 整组 strict → 用裸 `{}` 块（strict 下块级函数声明块作用域，
                 // let/const 本就块作用域 → 顶层名不跨块碰撞）。否则用 IIFE 建立真正函数作用域隔离
                 // （`var` 会 hoist 出块、sloppy 下块级函数亦 hoist；曾致 React Symbol 覆盖 scheduler 计数器）。
-                let has_scope_binding = ["const ", "let ", "var ", "class ", "function "]
-                    .iter()
-                    .any(|token| b.contains(token));
                 let block_safe = all_esm && block_infos.get(id).is_some_and(|bi| bi.block_safe);
-                if !has_scope_binding {
-                    // 经过 tree shaking 后只剩表达式的模块不再需要隔离作用域。
-                    let offset = concat_body.len();
-                    concat_body.push_str(&b);
-                    concat_fragments.push(RelativeBodyPlacement {
-                        module_id: *id,
-                        offset,
-                        emitted: b,
-                    });
-                } else if block_safe {
+                if block_safe {
                     concat_body.push('{');
                     let offset = concat_body.len();
                     concat_body.push_str(&b);
@@ -6200,19 +6894,26 @@ fn emit(
             let merged_ids: FxHashSet<u32> = filtered
                 .iter()
                 .map(|(id, _)| *id)
-                .filter(|id| *id != entry_id && !ref_ids.contains(id) && !standalone.contains(id))
+                .filter(|id| *id != entry_id && !standalone.contains(id))
                 .collect();
 
-            // 把对已合并模块的 `_r(M)` 重定向到 concat 模块（独立模块保持自己的 id）。
-            let redirect = |body: &str| -> String {
-                let compact = compact_body_names(body, &runtime_names);
-                redirect_require_targets(&compact, &runtime_names.require, &merged_ids, concat_id)
+            // Redirect only finalizer-proven numeric target ranges from this exact codegen body.
+            let redirect = |id: u32, body: &str| -> String {
+                let Some(concat_id) = concat_id else {
+                    return body.to_owned();
+                };
+                let requests = generated_module_requests
+                    .get(&id)
+                    .map(Arc::as_ref)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                redirect_generated_request_targets(body, requests, &merged_ids, concat_id)
             };
 
             // 构建最终模块表：入口 + stubs + 独立 CJS 模块 + 合并模块
             for (id, body) in &filtered {
                 if *id == entry_id {
-                    let emitted = redirect(body);
+                    let emitted = redirect(*id, body);
                     module_fragments.insert(
                         entry_id,
                         vec![RelativeBodyPlacement {
@@ -6225,12 +6926,9 @@ fn emit(
                     break;
                 }
             }
-            for &sid in &ref_ids {
-                final_modules.push((sid, String::new()));
-            }
             for (id, body) in &filtered {
                 if standalone.contains(id) {
-                    let emitted = redirect(body);
+                    let emitted = redirect(*id, body);
                     module_fragments.insert(
                         *id,
                         vec![RelativeBodyPlacement {
@@ -6242,14 +6940,14 @@ fn emit(
                     final_modules.push((*id, emitted));
                 }
             }
-            if !concat_member_ids.is_empty() {
+            if let Some(concat_id) = concat_id {
                 module_fragments.insert(concat_id, concat_fragments);
                 final_modules.push((concat_id, concat_body));
             }
         } else {
             // async 子图存在 → 逐模块注册（`_r` 返回 Promise，由导入点 `await`）。
             for (id, body) in &filtered {
-                let emitted = compact_body_names(body, &runtime_names);
+                let emitted = body.clone();
                 module_fragments.insert(
                     *id,
                     vec![RelativeBodyPlacement {
@@ -6260,103 +6958,103 @@ fn emit(
                 );
                 final_modules.push((*id, emitted));
             }
-            for &sid in &ref_ids {
-                if !final_modules.iter().any(|(i, _)| *i == sid) {
-                    final_modules.push((sid, String::new()));
-                }
-            }
         }
-        // 空 stub 的 require 语义只是“创建并缓存独立的空 exports”。运行时对缺省表项执行
-        // no-op 即可保持该语义，无需为每个 id 输出重复的 `function(){}`。
-        final_modules.retain(|(_, body)| !body.is_empty());
+        // Only a structurally synchronous empty factory may use the registry's missing-entry
+        // no-op. An async/TLA module keeps an explicit `async function(){}` even when DCE empties
+        // its body, preserving the require Promise contract without classifying generated text.
+        final_modules.retain(|(id, body)| !body.is_empty() || async_ids.contains(id));
         final_modules.sort_by_key(|(id, _)| *id);
 
         let mut out = String::new();
 
-        let final_bodies: Vec<&str> = final_modules.iter().map(|(_, b)| b.as_str()).collect();
-        let needs_interop_default = final_bodies
-            .iter()
-            .any(|b| b.contains("__wake_interop_default"));
-        let needs_interop_star = final_bodies
-            .iter()
-            .any(|b| b.contains("__wake_interop_star"));
-        let needs_meta_url = final_bodies
-            .iter()
-            .any(|body| body.contains("__wake_require__.metaUrl"));
+        // Runtime capabilities are part of each byte-identical typed body contract. A concat body
+        // may absorb several source modules, so consume all live metadata rather than attempting
+        // to rediscover `metaUrl` in generated JavaScript. Default/star interop is emitted inline
+        // by typed finalization and therefore has no compact-runtime capability or injection path.
         // minify 下省略 `__esModule` 标记，故不能用它区分「转译 ESM」与「纯 CJS」，改按
         // **是否存在 `default` 键**判定：转译 ESM 必定写了 `exports.default`，而
         // `module.exports = {…}` 的纯 CJS 通常没有。
         //
         // 不能简化为恒取 `m.default`：真 CJS 模块（如 `module.exports = api`）没有 `default`，
-        // 取之得 `undefined`。这类模块现在会作为独立注册模块存在（见 `reassigns_module_exports`），
-        // 简化版会让 `import pkg from 'cjs-pkg'` 直接拿到 undefined。
-        let interop_default = interop_default_helper("__wake_interop_default", no_esmodule);
-        let interop_star = interop_star_helper("__wake_interop_star", no_esmodule);
+        // 取之得 `undefined`。非 ESM 的 block fact 会让它保留独立 factory 所有权；简化
+        // interop 会让 `import pkg from 'cjs-pkg'` 直接拿到 undefined。
         // async 变体：async 模块的包装器返回 Promise → 缓存并返回它，导入方 `await` 得到最终 exports。
-        let needs_registry_temp = inline_regs_need_registry_temp(&inline_regs);
-        out.push_str(match (async_ids.is_empty(), needs_registry_temp) {
-            (true, false) => {
+        out.push_str(match async_ids.is_empty() {
+            true => {
                 "(function(g){var c={};function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
             }
-            (true, true) => {
-                "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
-            }
-            (false, false) => {
+            false => {
                 "(function(g){var c={};function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
-            }
-            (false, true) => {
-                "(function(g){var c={},q;function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
             }
         });
 
-        if needs_meta_url {
-            // `import.meta.url` is lowered by a trusted edit to this runtime property. The
-            // readable runtime always installs it; the compact runtime does so on demand to keep
-            // unrelated bundles byte-identical and avoid an unbound/undefined helper call.
-            out.push_str(
-                "r.metaUrl=function(){return typeof document!='undefined'?document.baseURI:''};",
+        append_typed_runtime_services(&mut out, "r", "g", &runtime_capabilities, true, false);
+        if federation_entry_export_build_scoped
+            && let Some((container, _)) = federation_entry_export
+        {
+            append_federation_asset_context(&mut out, "g", container, true);
+        }
+        if has_runtime_imports {
+            append_federation_runtime_bridge(
+                &mut out,
+                "r",
+                "g",
+                federation_entry_export_build_scoped,
+                true,
+            );
+        }
+        if has_shared_imports && let Some((container, _)) = federation_entry_export {
+            append_federation_shared_bridge(
+                &mut out,
+                "r",
+                "g",
+                container,
+                federation_entry_export_build_scoped,
+                true,
             );
         }
 
-        append_inline_regs(&mut out, &inline_regs);
-
-        if needs_interop_default {
-            out.push_str(&interop_default);
-        }
-        if needs_interop_star {
-            out.push_str(&interop_star);
-        }
         out.push_str("var t={");
         for (id, body) in &final_modules {
-            if body.is_empty() {
-                out.push_str(&format!("{}:function(){{}},", id));
+            let kw = if async_ids.contains(id) {
+                "async function"
             } else {
-                let kw = if async_ids.contains(id) {
-                    "async function"
-                } else {
-                    "function"
-                };
-                out.push_str(&format!(
-                    "{}:{kw}({},{},{}){{",
-                    id, runtime_names.module, runtime_names.exports, runtime_names.require
-                ));
-                let body_offset = out.len();
-                out.push_str(body);
-                if let Some(slot) = body_placements.as_deref_mut()
-                    && let Some(fragments) = module_fragments.get(id)
-                {
-                    slot.extend(fragments.iter().map(|fragment| BodyPlacement {
-                        module_id: fragment.module_id,
-                        generated_offset: body_offset + fragment.offset,
-                        emitted: fragment.emitted.clone(),
-                    }));
-                }
-                out.push_str("},");
+                "function"
+            };
+            let runtime_names = runtime_names_by_id
+                .get(id)
+                .unwrap_or(&canonical_runtime_names);
+            out.push_str(&format!(
+                "{}:{kw}({},{},{}){{",
+                id, runtime_names.module, runtime_names.exports, runtime_names.require
+            ));
+            let body_offset = out.len();
+            out.push_str(body);
+            if let Some(slot) = body_placements.as_deref_mut()
+                && let Some(fragments) = module_fragments.get(id)
+            {
+                slot.extend(fragments.iter().map(|fragment| BodyPlacement {
+                    module_id: fragment.module_id,
+                    generated_offset: body_offset + fragment.offset,
+                    emitted: fragment.emitted.clone(),
+                }));
             }
+            out.push_str("},");
         }
         out.push_str("};r.m=t;r.c=c;");
         out.push_str(&format!("var e=r({});", entry_id));
-        if module_format == ModuleFormat::CommonJs {
+        if let Some((container, expose)) = federation_entry_export {
+            append_federation_expose_export(
+                &mut out,
+                "g",
+                "e",
+                container,
+                expose,
+                federation_entry_export_build_scoped,
+                true,
+            );
+            out.push_str("return e;})(typeof globalThis!='undefined'?globalThis:this);");
+        } else if module_format == ModuleFormat::CommonJs {
             out.push_str(
                 "module.exports=e;return e;})(typeof globalThis!='undefined'?globalThis:this);",
             );
@@ -6377,6 +7075,38 @@ fn emit(
         } else {
             PRELUDE_ASYNC
         });
+        append_typed_runtime_services(
+            &mut out,
+            "__wake_require__",
+            "root",
+            &runtime_capabilities,
+            false,
+            false,
+        );
+        if federation_entry_export_build_scoped
+            && let Some((container, _)) = federation_entry_export
+        {
+            append_federation_asset_context(&mut out, "root", container, false);
+        }
+        if has_runtime_imports {
+            append_federation_runtime_bridge(
+                &mut out,
+                "__wake_require__",
+                "root",
+                federation_entry_export_build_scoped,
+                false,
+            );
+        }
+        if has_shared_imports && let Some((container, _)) = federation_entry_export {
+            append_federation_shared_bridge(
+                &mut out,
+                "__wake_require__",
+                "root",
+                container,
+                federation_entry_export_build_scoped,
+                false,
+            );
+        }
         out.push_str("var __wake_modules__ = {\n");
         // SourceMap：记录实际写入的带缩进模块片段；merge 阶段按 token 对齐到原始模块体。
         for (id, body) in &filtered {
@@ -6387,7 +7117,13 @@ fn emit(
             } else {
                 "function"
             };
-            let head = format!("{id}: {kw}(module, exports, __wake_require__) {{\n");
+            let runtime_names = runtime_names_by_id
+                .get(id)
+                .expect("every emitted module body carries typed runtime names");
+            let head = format!(
+                "{id}: {kw}({}, {}, {}) {{\n",
+                runtime_names.module, runtime_names.exports, runtime_names.require
+            );
             out.push_str(&head);
             let generated_offset = out.len();
             let mut emitted = String::with_capacity(body.len() + body.lines().count() * 3);
@@ -6412,11 +7148,26 @@ fn emit(
         out.push_str(&format!(
             "var __wake_entry__ = __wake_require__({entry_id});\n"
         ));
-        out.push_str(if module_format == ModuleFormat::CommonJs {
-            POSTLUDE_COMMONJS
+        if let Some((container, expose)) = federation_entry_export {
+            append_federation_expose_export(
+                &mut out,
+                "root",
+                "__wake_entry__",
+                container,
+                expose,
+                federation_entry_export_build_scoped,
+                false,
+            );
+            out.push_str(
+                "return __wake_entry__;\n})(typeof globalThis !== \"undefined\" ? globalThis : this);\n",
+            );
         } else {
-            POSTLUDE
-        });
+            out.push_str(if module_format == ModuleFormat::CommonJs {
+                POSTLUDE_COMMONJS
+            } else {
+                POSTLUDE
+            });
+        }
         out
     }
 }
@@ -6987,30 +7738,10 @@ fn async_module_ids_with_edges(
 ) -> FxHashSet<u32> {
     // 反向边：被导入者 → 静态 ESM 导入它的模块。
     let mut importers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for (&id, rec) in modules {
-        let retained = retained_edges
-            .get(&id)
-            .map(|edges| {
-                edges
-                    .static_targets
-                    .iter()
-                    .copied()
-                    .collect::<FxHashSet<_>>()
-            })
-            .unwrap_or_default();
-        let spec2id: FxHashMap<&str, u32> =
-            rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
-        for dep in rec.deps.iter() {
-            if !matches!(
-                dep.kind,
-                DependencyKind::Import | DependencyKind::ExportFrom
-            ) {
-                continue;
-            }
-            if let Some(&tid) = spec2id.get(dep.specifier.as_str())
-                && retained.contains(&tid)
-            {
-                importers.entry(tid).or_default().push(id);
+    for (&id, edges) in retained_edges {
+        for request in &edges.requests {
+            if request.request.kind == ModuleRequestKind::StaticImport {
+                importers.entry(request.module_id).or_default().push(id);
             }
         }
     }
@@ -7034,100 +7765,165 @@ fn async_module_ids_with_edges(
     set
 }
 
-/// 从模块记录提取 chunk 划分所需的依赖边。
-fn build_module_edges(modules: &FxHashMap<u32, ModuleRec>) -> FxHashMap<u32, ModuleEdges> {
-    let mut edges = FxHashMap::default();
-    for (&id, rec) in modules {
-        let spec2id: FxHashMap<&str, u32> =
-            rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
-        let mut st = Vec::new();
-        let mut dy = Vec::new();
-        for dep in rec.deps.iter() {
-            if let Some(&tid) = spec2id.get(dep.specifier.as_str()) {
-                if dep.kind == DependencyKind::DynamicImport {
-                    dy.push(tid);
-                } else {
-                    st.push(tid);
-                }
-            }
-        }
-        st.sort_unstable();
-        st.dedup();
-        dy.sort_unstable();
-        dy.dedup();
-        let stem = rec
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("chunk")
-            .to_string();
-        edges.insert(
-            id,
+/// Build the sole final module graph directly from optimizer-retained typed requests. Request kind
+/// and source order remain attached to each current-generation target; no parser-discovered edge
+/// set or emitted JavaScript is consulted after this boundary.
+fn retained_module_edges(
+    modules: &FxHashMap<u32, ModuleRec>,
+    plans: &[CgPlan],
+) -> FxHashMap<u32, ModuleEdges> {
+    let retained_by_module = plans
+        .iter()
+        .map(|plan| (plan.id, plan.retained_requests.as_deref()))
+        .collect::<FxHashMap<_, _>>();
+    let mut graph = FxHashMap::default();
+    for (&module_id, module) in modules {
+        let mut seen_requests = FxHashSet::default();
+        let requests = retained_by_module
+            .get(&module_id)
+            .and_then(|requests| *requests)
+            .into_iter()
+            .flat_map(|requests| requests.iter())
+            .filter(|request| modules.contains_key(&request.module_id))
+            .filter(|request| seen_requests.insert((*request).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen_static = FxHashSet::default();
+        let mut seen_dynamic = FxHashSet::default();
+        let static_targets = requests
+            .iter()
+            .filter(|request| request.request.kind != ModuleRequestKind::DynamicImport)
+            .filter_map(|request| {
+                seen_static
+                    .insert(request.module_id)
+                    .then_some(request.module_id)
+            })
+            .collect();
+        let dyn_targets = requests
+            .iter()
+            .filter(|request| request.request.kind == ModuleRequestKind::DynamicImport)
+            .filter_map(|request| {
+                seen_dynamic
+                    .insert(request.module_id)
+                    .then_some(request.module_id)
+            })
+            .collect();
+        graph.insert(
+            module_id,
             ModuleEdges {
-                static_targets: st,
-                dyn_targets: dy,
-                stem,
+                requests,
+                static_targets,
+                dyn_targets,
+                stem: module
+                    .path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("chunk")
+                    .to_owned(),
             },
         );
     }
-    edges
-}
-
-/// Restrict parser-discovered edge kinds to the exact dependency targets retained by each
-/// optimizer result. `live` is already the monotonic entry closure, so this produces the sole
-/// graph consumed by final chunk pruning and emit. The target ids are process-local BFS module
-/// identities; parser-local `SymbolId` values have already done their job inside optimization and
-/// never cross this boundary or enter persistent graph state.
-fn retained_module_edges(
-    modules: &FxHashMap<u32, ModuleRec>,
-    retained: &[(u32, Arc<Vec<u32>>)],
-    live: &FxHashSet<u32>,
-) -> FxHashMap<u32, ModuleEdges> {
-    let retained_by_module = retained
-        .iter()
-        .map(|(module, targets)| (*module, targets.iter().copied().collect::<FxHashSet<u32>>()))
-        .collect::<FxHashMap<_, _>>();
-    let mut edges = build_module_edges(modules);
-    edges.retain(|module, _| live.contains(module));
-    for (&module, module_edges) in &mut edges {
-        let targets = retained_by_module.get(&module);
-        module_edges.static_targets.retain(|target| {
-            live.contains(target) && targets.is_some_and(|targets| targets.contains(target))
-        });
-        module_edges.dyn_targets.retain(|target| {
-            live.contains(target) && targets.is_some_and(|targets| targets.contains(target))
-        });
-    }
-    edges
+    graph
 }
 
 /// 本模块每个「跨 chunk」动态 import 的 (说明符, 目标 chunk id)（排序去重；目标落 entry=0 者不入表）。
-fn dyn_chunks_of(rec: &ModuleRec, chunk_graph: Option<&ChunkGraph>) -> Vec<(String, u32)> {
+fn dyn_chunks_of(edges: &ModuleEdges, chunk_graph: Option<&ChunkGraph>) -> DepIds {
     let Some(g) = chunk_graph else {
         return Vec::new();
     };
-    let spec2id: FxHashMap<&str, u32> = rec.dep_ids.iter().map(|(s, i)| (s.as_str(), *i)).collect();
-    let mut v: Vec<(String, u32)> = rec
-        .deps
+    let mut v: DepIds = edges
+        .requests
         .iter()
-        .filter(|d| d.kind == DependencyKind::DynamicImport)
-        .filter_map(|d| {
-            let tid = *spec2id.get(d.specifier.as_str())?;
-            let c = *g.module_chunk.get(&tid)?;
-            (c != 0).then_some((d.specifier.clone(), c))
+        .filter(|request| request.request.kind == ModuleRequestKind::DynamicImport)
+        .filter_map(|request| {
+            let chunk = *g.module_chunk.get(&request.module_id)?;
+            (chunk != 0).then(|| ResolvedModuleRequest {
+                request: request.request.clone(),
+                module_id: chunk,
+            })
         })
         .collect();
-    v.sort();
+    v.sort_by(|left, right| left.request.cmp(&right.request));
     v.dedup();
     v
 }
 
-/// 渲染一组模块为 `<id>: function(module, exports, __wake_require__) { <body> },` 条目。
+fn federation_chunk_exposes(
+    graph: &ChunkGraph,
+    roots: &[(String, String)],
+) -> BTreeMap<u32, String> {
+    let chunk_by_name = graph
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.name.as_str(), chunk.id))
+        .collect::<BTreeMap<_, _>>();
+    let configured_roots = roots
+        .iter()
+        .filter_map(|(chunk_name, expose)| {
+            chunk_by_name
+                .get(chunk_name.as_str())
+                .map(|chunk| (*chunk, expose.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    // Direct dynamic roots not present in the expose table are still owners. Development uses
+    // these for the standalone application and lazy shared fallback. Counting that anonymous
+    // owner prevents a chunk shared by an expose and the local application from inheriting the
+    // expose's closure merely because only exposed roots were named here.
+    const INTERNAL_OWNER: &str = "\0wake-internal-root";
+    let mut root_owners = graph
+        .chunk_dynamic_deps
+        .get(&0)
+        .into_iter()
+        .flatten()
+        .map(|chunk| {
+            (
+                *chunk,
+                configured_roots
+                    .get(chunk)
+                    .cloned()
+                    .unwrap_or_else(|| INTERNAL_OWNER.to_owned()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (chunk, expose) in configured_roots {
+        root_owners.insert(chunk, expose);
+    }
+
+    let mut owners = BTreeMap::<u32, BTreeSet<String>>::new();
+    for (root, owner) in root_owners {
+        let mut stack = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(chunk) = stack.pop() {
+            if !visited.insert(chunk) {
+                continue;
+            }
+            owners.entry(chunk).or_default().insert(owner.clone());
+            if let Some(dependencies) = graph.chunk_deps.get(&chunk) {
+                stack.extend(dependencies.iter().copied());
+            }
+            if let Some(targets) = graph.chunk_dynamic_deps.get(&chunk) {
+                stack.extend(targets.iter().copied());
+            }
+        }
+    }
+    owners
+        .into_iter()
+        .filter_map(|(chunk, owners)| {
+            (owners.len() == 1)
+                .then(|| owners.into_iter().next().unwrap())
+                .filter(|owner| owner != INTERNAL_OWNER)
+                .map(|owner| (chunk, owner))
+        })
+        .collect()
+}
+
+/// 使用每个 typed body 携带的 collision-free 参数名渲染模块 factory 条目。
 /// `async_ids` 中的模块（顶层 await 子图）改用 `async function`。
 fn render_module_entries(
     module_ids: &[u32],
     body_of: &FxHashMap<u32, &Arc<String>>,
     async_ids: &FxHashSet<u32>,
+    runtime_names_by_id: &FxHashMap<u32, GeneratedModuleRuntimeNames>,
 ) -> (String, Vec<BodyPlacement>) {
     let mut out = String::new();
     let mut placements = Vec::new();
@@ -7138,8 +7934,12 @@ fn render_module_entries(
             } else {
                 "function"
             };
+            let runtime_names = runtime_names_by_id
+                .get(&id)
+                .expect("every chunk module body carries typed runtime names");
             out.push_str(&format!(
-                "{id}: {kw}(module, exports, __wake_require__) {{\n"
+                "{id}: {kw}({}, {}, {}) {{\n",
+                runtime_names.module, runtime_names.exports, runtime_names.require
             ));
             let generated_offset = out.len();
             let mut emitted = String::with_capacity(body.len() + body.lines().count() * 3);
@@ -7169,10 +7969,18 @@ fn emit_chunks(
     public_path: &str,
     hashed: bool,
     async_ids: &FxHashSet<u32>,
+    runtime_names_by_id: &FxHashMap<u32, GeneratedModuleRuntimeNames>,
     style_files: &BTreeMap<u32, Vec<String>>,
+    has_runtime_imports: bool,
+    has_shared_imports: bool,
+    federation_entry_export: Option<&(String, String)>,
+    federation_entry_export_build_scoped: bool,
+    federation_expose_roots: &[(String, String)],
     mut chunk_placements: Option<&mut FxHashMap<u32, Vec<BodyPlacement>>>,
 ) -> (Vec<OutputChunk>, usize) {
     let body_of: FxHashMap<u32, &Arc<String>> = bodies.iter().map(|(id, b)| (*id, b)).collect();
+    let runtime_capabilities = union_runtime_capabilities(runtime_names_by_id.values());
+    let expose_of_chunk = federation_chunk_exposes(g, federation_expose_roots);
 
     // 1. 非 entry chunk 先行渲染 + hash（chunk 间只引用数字 id，互相独立）。
     let mut file_of: BTreeMap<u32, String> = BTreeMap::new();
@@ -7181,8 +7989,13 @@ fn emit_chunks(
         if plan.id == 0 {
             continue;
         }
-        let (entries, mut placements) = render_module_entries(&plan.modules, &body_of, async_ids);
-        let (code, entries_offset) = render_async_chunk(token, plan.id, &entries);
+        let (entries, mut placements) =
+            render_module_entries(&plan.modules, &body_of, async_ids, runtime_names_by_id);
+        let federation_container = federation_entry_export_build_scoped
+            .then(|| federation_entry_export.map(|(container, _)| container.as_str()))
+            .flatten();
+        let (code, entries_offset) =
+            render_async_chunk(token, plan.id, &entries, federation_container);
         if let Some(slot) = chunk_placements.as_deref_mut() {
             for placement in &mut placements {
                 placement.generated_offset += entries_offset;
@@ -7199,7 +8012,8 @@ fn emit_chunks(
             is_entry: false,
             chunk_id: plan.id,
             module_ids: plan.modules.clone(),
-            imports: Vec::new(), // 回填于下
+            imports: Vec::new(),         // 回填于下
+            dynamic_imports: Vec::new(), // 回填于下
             styles: style_files.get(&plan.id).cloned().unwrap_or_default(),
             source_map: None, // requested maps are merged after every chunk has its final file name
         });
@@ -7212,14 +8026,26 @@ fn emit_chunks(
                 .filter_map(|d| file_of.get(d).cloned())
                 .collect();
         }
+        if let Some(targets) = g.chunk_dynamic_deps.get(&c.chunk_id) {
+            c.dynamic_imports = targets
+                .iter()
+                .filter_map(|target| file_of.get(target).cloned())
+                .collect();
+        }
     }
 
     // 2. 渲染 entry chunk（内嵌 f/d 映射，引用非 entry 的文件名）。
     let entry_plan = g.chunks.iter().find(|c| c.id == 0).expect("entry chunk");
-    let (entries, mut placements) = render_module_entries(&entry_plan.modules, &body_of, async_ids);
+    let (entries, mut placements) = render_module_entries(
+        &entry_plan.modules,
+        &body_of,
+        async_ids,
+        runtime_names_by_id,
+    );
     let f_map = json_file_map(&file_of);
     let d_map = json_deps_map(&g.chunk_deps);
     let s_map = json_styles_map(style_files);
+    let x_map = json_expose_map(&expose_of_chunk);
     let (code, entries_offset) = render_entry_chunk(
         token,
         entry_id,
@@ -7227,7 +8053,13 @@ fn emit_chunks(
         &f_map,
         &d_map,
         &s_map,
+        &x_map,
         &entries,
+        &runtime_capabilities,
+        has_runtime_imports,
+        has_shared_imports,
+        federation_entry_export,
+        federation_entry_export_build_scoped,
     );
     if let Some(slot) = chunk_placements {
         for placement in &mut placements {
@@ -7245,6 +8077,13 @@ fn emit_chunks(
         chunk_id: 0,
         module_ids: entry_plan.modules.clone(),
         imports: Vec::new(),
+        dynamic_imports: g
+            .chunk_dynamic_deps
+            .get(&0)
+            .into_iter()
+            .flatten()
+            .filter_map(|target| file_of.get(target).cloned())
+            .collect(),
         styles: style_files.get(&0).cloned().unwrap_or_default(),
         source_map: None, // requested maps are merged after every chunk has its final file name
     };
@@ -7265,25 +8104,67 @@ fn render_entry_chunk(
     f_map: &str,
     d_map: &str,
     s_map: &str,
+    x_map: &str,
     entries: &str,
+    runtime_capabilities: &GeneratedModuleRuntimeCapabilities,
+    has_runtime_imports: bool,
+    has_shared_imports: bool,
+    federation_entry_export: Option<&(String, String)>,
+    federation_entry_export_build_scoped: bool,
 ) -> (String, usize) {
     // 分割 runtime 跨 chunk 处理未知模块形态，必须使用 codegen 保留的 ESM marker；不能用
     // `default` 自有键猜测，因为合法 CJS 也可能导出 `{ default: value }`。
-    let interop_default = interop_default_helper("interopDefault", false);
     let interop_star = interop_star_helper("interopStar", false);
     let mut out = RUNTIME_ENTRY_PRELUDE
         .replace("__WAKE_NS__", token)
-        .replace("__WAKE_INTEROP_DEFAULT__", &interop_default)
         .replace("__WAKE_INTEROP_STAR__", &interop_star);
+    if federation_entry_export_build_scoped && let Some((container, _)) = federation_entry_export {
+        out = scope_federation_entry_runtime(out, token, container);
+        out.push_str("__wake__.federation = __wake_federation_asset_context__;\n");
+    }
+    append_typed_runtime_services(
+        &mut out,
+        "__wake_require__",
+        "g",
+        runtime_capabilities,
+        false,
+        true,
+    );
+    if has_runtime_imports {
+        append_federation_runtime_bridge(
+            &mut out,
+            "__wake_require__",
+            "g",
+            federation_entry_export_build_scoped,
+            false,
+        );
+    }
+    if has_shared_imports && let Some((container, _)) = federation_entry_export {
+        append_federation_shared_bridge(
+            &mut out,
+            "__wake_require__",
+            "g",
+            container,
+            federation_entry_export_build_scoped,
+            false,
+        );
+    }
     // 配置的 `publicPath` 注入运行时（`loadFile` 用它拼 chunk URL）：子路径部署下动态 import()
     // 才不会按当前页面 URL 相对解析而 404。写在 prelude 之后而非其对象字面量里——registry 可能
     // 已由同 token 的先前加载建好（`g.__WAKE_NS__ || (...)`），字面量那次不会再跑。
-    out.push_str("__wake__.publicPath = ");
-    push_js_string(&mut out, public_path);
-    out.push_str(";\n");
+    if federation_entry_export_build_scoped {
+        out.push_str("__wake__.publicPath = new URL(\".\", import.meta.url).href;\n");
+    } else if federation_entry_export.is_some() {
+        out.push_str("__wake__.publicPath = typeof document !== \"undefined\" && document.currentScript ? new URL(\".\", document.currentScript.src).href : \"./\";\n");
+    } else {
+        out.push_str("__wake__.publicPath = ");
+        push_js_string(&mut out, public_path);
+        out.push_str(";\n");
+    }
     out.push_str(&format!("__wake__.f = {f_map};\n"));
     out.push_str(&format!("Object.assign(__wake__.d, {d_map});\n"));
     out.push_str(&format!("Object.assign(__wake__.s, {s_map});\n"));
+    out.push_str(&format!("Object.assign(__wake__.x, {x_map});\n"));
     out.push_str("__wake__.markLoaded(0);\n");
     out.push_str("__wake__.register({\n");
     let entries_offset = out.len();
@@ -7292,17 +8173,297 @@ fn render_entry_chunk(
     out.push_str(&format!(
         "var __wake_entry__ = __wake__.require({entry_id});\n"
     ));
-    out.push_str(
-        "if (typeof module !== \"undefined\" && module.exports) module.exports = __wake_entry__;\n",
-    );
-    out.push_str("else g.__wake_entry__ = __wake_entry__;\n");
+    if let Some((container, expose)) = federation_entry_export {
+        append_federation_expose_export(
+            &mut out,
+            "g",
+            "__wake_entry__",
+            container,
+            expose,
+            federation_entry_export_build_scoped,
+            false,
+        );
+    } else {
+        out.push_str(
+            "if (typeof module !== \"undefined\" && module.exports) module.exports = __wake_entry__;\n",
+        );
+        out.push_str("else g.__wake_entry__ = __wake_entry__;\n");
+    }
     out.push_str("})();\n");
     (out, entries_offset)
 }
 
-/// async/shared chunk：接入已建 registry + register 模块 + markLoaded。
-fn render_async_chunk(token: &str, this_chunk_id: u32, entries: &str) -> (String, usize) {
+fn append_federation_runtime_bridge(
+    output: &mut String,
+    require_name: &str,
+    global_name: &str,
+    build_scoped: bool,
+    compact: bool,
+) {
+    let options = if build_scoped {
+        if compact {
+            ",{name:__wake_federation_asset_context__.name,buildId:__wake_federation_asset_context__.buildId,expose:x}"
+        } else {
+            ",{name:__wake_federation_asset_context__.name,buildId:__wake_federation_asset_context__.buildId,expose:expose}"
+        }
+    } else {
+        ""
+    };
+    if compact {
+        output.push_str(&format!(
+            "{require_name}.runtimeImport=function(s,x){{var b={global_name}[Symbol.for('wake.federation.v1')];if(!b||typeof b.loadRemote!='function'){{var e=new Error('wake federation runtime is not installed');e.code='FED_RUNTIME_ABI';return Promise.reject(e)}}return b.loadRemote(s{options})}};"
+        ));
+    } else {
+        output.push_str(&format!(
+            "{require_name}.runtimeImport = function (specifier, expose) {{\n  var broker = {global_name}[Symbol.for(\"wake.federation.v1\")];\n  if (!broker || typeof broker.loadRemote !== \"function\") {{\n    var error = new Error(\"wake federation runtime is not installed\");\n    error.code = \"FED_RUNTIME_ABI\";\n    return Promise.reject(error);\n  }}\n  return broker.loadRemote(specifier{options});\n}};\n"
+        ));
+    }
+}
+
+/// Install only services proven live by finalized typed module metadata. These assignments run in
+/// the outer runtime, never inside a user factory, so source bindings named require/Promise/Object
+/// or globalThis cannot capture compiler-owned intrinsics.
+fn append_typed_runtime_services(
+    out: &mut String,
+    require_name: &str,
+    global_name: &str,
+    capabilities: &GeneratedModuleRuntimeCapabilities,
+    compact: bool,
+    split_runtime: bool,
+) {
+    let push = |out: &mut String, compact_text: String, readable_text: String| {
+        out.push_str(if compact {
+            &compact_text
+        } else {
+            &readable_text
+        });
+    };
+    if capabilities.meta_url {
+        let value = if split_runtime {
+            format!(
+                "typeof {global_name}.document!='undefined'?new {global_name}.URL(__wake__.publicPath||'.',{global_name}.document.baseURI).href:''"
+            )
+        } else {
+            format!("typeof {global_name}.document!='undefined'?{global_name}.document.baseURI:''")
+        };
+        push(
+            out,
+            format!("{require_name}.metaUrl=function(){{return {value}}};"),
+            format!("{require_name}.metaUrl = function () {{ return {value}; }};\n"),
+        );
+    }
+    if capabilities.external_require {
+        let (compact_body, readable_body) = if split_runtime {
+            (
+                "if(__wake__.nreq)return __wake__.nreq(s);throw new Error('wake: external require is unavailable')",
+                "if (__wake__.nreq) return __wake__.nreq(specifier); throw new Error(\"wake: external require is unavailable\");",
+            )
+        } else {
+            (
+                "if(typeof require==='function')return require(s);throw new Error('wake: external require is unavailable')",
+                "if (typeof require === \"function\") return require(specifier); throw new Error(\"wake: external require is unavailable\");",
+            )
+        };
+        push(
+            out,
+            format!("{require_name}.external=function(s){{{compact_body}}};"),
+            format!("{require_name}.external = function (specifier) {{ {readable_body} }};\n"),
+        );
+    }
+    if capabilities.promise_resolve {
+        push(
+            out,
+            format!(
+                "{require_name}.promiseResolve=function(v){{return {global_name}.Promise.resolve(v)}};"
+            ),
+            format!(
+                "{require_name}.promiseResolve = function (value) {{ return {global_name}.Promise.resolve(value); }};\n"
+            ),
+        );
+    }
+    for (needed, member, host_member) in [
+        (capabilities.object_assign, "objectAssign", "assign"),
+        (capabilities.object_keys, "objectKeys", "keys"),
+        (
+            capabilities.object_define_property,
+            "objectDefineProperty",
+            "defineProperty",
+        ),
+    ] {
+        if needed {
+            push(
+                out,
+                format!("{require_name}.{member}={global_name}.Object.{host_member};"),
+                format!("{require_name}.{member} = {global_name}.Object.{host_member};\n"),
+            );
+        }
+    }
+}
+
+fn append_federation_asset_context(
+    output: &mut String,
+    global_name: &str,
+    container: &str,
+    compact: bool,
+) {
+    if compact {
+        output.push_str(&format!(
+            "var __wake_federation_asset_contexts__={global_name}[Symbol.for('wake.federation.asset-contexts.v1')],__wake_federation_asset_context__=__wake_federation_asset_contexts__ instanceof Map?__wake_federation_asset_contexts__.get(import.meta.url):void 0;if(!__wake_federation_asset_context__||__wake_federation_asset_context__.name!=="
+        ));
+        push_js_string(output, container);
+        output.push_str(
+            "){var __wake_federation_context_error__=new Error('wake federation asset execution context is missing or mismatched');__wake_federation_context_error__.code='FED_RUNTIME_ABI';throw __wake_federation_context_error__}",
+        );
+    } else {
+        output.push_str(&format!(
+            "var __wake_federation_asset_contexts__ = {global_name}[Symbol.for(\"wake.federation.asset-contexts.v1\")];\nvar __wake_federation_asset_context__ = __wake_federation_asset_contexts__ instanceof Map ? __wake_federation_asset_contexts__.get(import.meta.url) : undefined;\nif (!__wake_federation_asset_context__ || __wake_federation_asset_context__.name !== "
+        ));
+        push_js_string(output, container);
+        output.push_str(
+            ") {\n  var __wake_federation_context_error__ = new Error(\"wake federation asset execution context is missing or mismatched\");\n  __wake_federation_context_error__.code = \"FED_RUNTIME_ABI\";\n  throw __wake_federation_context_error__;\n}\n",
+        );
+    }
+}
+
+fn append_federation_bundle_runtime_slot(
+    output: &mut String,
+    global_name: &str,
+    container: &str,
+    token: &str,
+    create: bool,
+) {
+    output.push_str(
+        "var __wake_federation_bundle_runtimes_symbol__ = Symbol.for(\"wake.federation.bundle-runtimes.v1\");\nvar __wake_federation_bundle_runtimes__ = ",
+    );
+    output.push_str(global_name);
+    output.push_str("[__wake_federation_bundle_runtimes_symbol__];\n");
+    if create {
+        output.push_str(
+            "if (__wake_federation_bundle_runtimes__ === undefined) {\n  __wake_federation_bundle_runtimes__ = new Map();\n  Object.defineProperty(",
+        );
+        output.push_str(global_name);
+        output.push_str(", __wake_federation_bundle_runtimes_symbol__, { value: __wake_federation_bundle_runtimes__, configurable: false });\n}\n");
+    }
+    output.push_str("if (!(__wake_federation_bundle_runtimes__ instanceof Map)) {\n  var __wake_federation_registry_error__ = new Error(\"wake federation bundle runtime registry is incompatible\");\n  __wake_federation_registry_error__.code = \"FED_RUNTIME_ABI\";\n  throw __wake_federation_registry_error__;\n}\nvar __wake_federation_runtime_key__ = ");
+    push_js_string(output, container);
+    output.push_str(" + \"\\0\" + __wake_federation_asset_context__.buildId + \"\\0\" + ");
+    push_js_string(output, token);
+    output.push_str(";\nvar __wake_federation_runtime_slot__ = __wake_federation_bundle_runtimes__.get(__wake_federation_runtime_key__);\n");
+    if create {
+        output.push_str("if (__wake_federation_runtime_slot__ === undefined) {\n  __wake_federation_runtime_slot__ = Object.create(null);\n  __wake_federation_bundle_runtimes__.set(__wake_federation_runtime_key__, __wake_federation_runtime_slot__);\n}\n");
+    }
+}
+
+fn scope_federation_entry_runtime(mut prelude: String, token: &str, container: &str) -> String {
+    let runtime = format!("g.{token}");
+    let marker = format!("var __wake__ = {runtime}");
+    let position = prelude
+        .find(&marker)
+        .expect("readable Wake entry runtime marker");
+    let mut scoped = String::new();
+    append_federation_asset_context(&mut scoped, "g", container, false);
+    append_federation_bundle_runtime_slot(&mut scoped, "g", container, token, true);
+    prelude.insert_str(position, &scoped);
+    prelude.replace(&runtime, "__wake_federation_runtime_slot__.runtime")
+}
+
+fn scope_federation_async_runtime(mut prelude: String, token: &str, container: &str) -> String {
+    let marker = format!("var __wake__ = g.{token};");
+    let position = prelude
+        .find(&marker)
+        .expect("readable Wake async runtime marker");
+    let mut scoped = String::new();
+    append_federation_asset_context(&mut scoped, "g", container, false);
+    append_federation_bundle_runtime_slot(&mut scoped, "g", container, token, false);
+    scoped.push_str(
+        "var __wake__ = __wake_federation_runtime_slot__ && __wake_federation_runtime_slot__.runtime;",
+    );
+    prelude.replace_range(position..position + marker.len(), &scoped);
+    prelude
+}
+
+fn append_federation_shared_bridge(
+    output: &mut String,
+    require_name: &str,
+    global_name: &str,
+    container: &str,
+    build_scoped: bool,
+    compact: bool,
+) {
+    if compact {
+        output.push_str(&format!(
+            "{require_name}.shared=function(k,s){{var c={global_name}[Symbol.for('wake.federation.share-contexts.v1')],x=c&&c["
+        ));
+        push_js_string(output, container);
+        if build_scoped {
+            output.push_str("]&&c[");
+            push_js_string(output, container);
+            output.push_str("][__wake_federation_asset_context__.buildId");
+        }
+        output.push_str("];if(!x||typeof x.getSync!='function'){var e=new Error('wake federation share context is not initialized');e.code='FED_SHARE_UNSATISFIABLE';throw e}return x.getSync(k,s)};");
+    } else {
+        output.push_str(&format!(
+            "{require_name}.shared = function (shareKey, scope) {{\n  var contexts = {global_name}[Symbol.for(\"wake.federation.share-contexts.v1\")];\n  var context = contexts && contexts["
+        ));
+        push_js_string(output, container);
+        if build_scoped {
+            output.push_str("] && contexts[");
+            push_js_string(output, container);
+            output.push_str("][__wake_federation_asset_context__.buildId");
+        }
+        output.push_str("];\n  if (!context || typeof context.getSync !== \"function\") {\n    var error = new Error(\"wake federation share context is not initialized\");\n    error.code = \"FED_SHARE_UNSATISFIABLE\";\n    throw error;\n  }\n  return context.getSync(shareKey, scope);\n};\n");
+    }
+}
+
+fn append_federation_expose_export(
+    output: &mut String,
+    global_name: &str,
+    entry_name: &str,
+    container: &str,
+    expose: &str,
+    build_scoped: bool,
+    compact: bool,
+) {
+    if compact {
+        output.push_str(&format!(
+            "var __wf={global_name}[Symbol.for('wake.federation.exposes.v1')]||({global_name}[Symbol.for('wake.federation.exposes.v1')]={{}}),__wc=__wf["
+        ));
+        push_js_string(output, container);
+        output.push_str("]||(__wf[");
+        push_js_string(output, container);
+        output.push_str("]={});__wc[");
+        if build_scoped {
+            output.push_str("__wake_federation_asset_context__.buildId]||(__wc[__wake_federation_asset_context__.buildId]={});__wc=__wc[__wake_federation_asset_context__.buildId];__wc[");
+        }
+        push_js_string(output, expose);
+        output.push_str(&format!("]={entry_name};"));
+    } else {
+        output.push_str(&format!(
+            "var __wake_federation_exposes__ = {global_name}[Symbol.for(\"wake.federation.exposes.v1\")] || ({global_name}[Symbol.for(\"wake.federation.exposes.v1\")] = {{}});\nvar __wake_federation_container__ = __wake_federation_exposes__["
+        ));
+        push_js_string(output, container);
+        output.push_str("] || (__wake_federation_exposes__[");
+        push_js_string(output, container);
+        output.push_str("] = {});\n__wake_federation_container__[");
+        if build_scoped {
+            output.push_str("__wake_federation_asset_context__.buildId] || (__wake_federation_container__[__wake_federation_asset_context__.buildId] = {});\n__wake_federation_container__ = __wake_federation_container__[__wake_federation_asset_context__.buildId];\n__wake_federation_container__[");
+        }
+        push_js_string(output, expose);
+        output.push_str(&format!("] = {entry_name};\n"));
+    }
+}
+
+/// async/shared chunk：接入当前 build 的 registry + register 模块 + markLoaded。
+fn render_async_chunk(
+    token: &str,
+    this_chunk_id: u32,
+    entries: &str,
+    federation_container: Option<&str>,
+) -> (String, usize) {
     let mut out = RUNTIME_ASYNC_PRELUDE.replace("__WAKE_NS__", token);
+    if let Some(container) = federation_container {
+        out = scope_federation_async_runtime(out, token, container);
+    }
     out.push_str("__wake__.register({\n");
     let entries_offset = out.len();
     out.push_str(entries);
@@ -7364,6 +8525,20 @@ fn json_styles_map(style_files: &BTreeMap<u32, Vec<String>>) -> String {
     output
 }
 
+/// `{ 1: "./Alpha", 3: "./Beta" }` for chunks owned by exactly one expose.
+fn json_expose_map(exposes: &BTreeMap<u32, String>) -> String {
+    let mut output = String::from("{");
+    for (index, (chunk, expose)) in exposes.iter().filter(|(chunk, _)| **chunk != 0).enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str(&format!(" {chunk}: "));
+        push_js_string(&mut output, expose);
+    }
+    output.push_str(" }");
+    output
+}
+
 /// 内容 hash 文件名 `[name].[hash8].js`（关闭 hash 则 `[name].js`）。
 fn chunk_filename(name: &str, code: &str, hashed: bool) -> String {
     if hashed {
@@ -7378,11 +8553,20 @@ fn hash8(s: &str) -> String {
     format!("{:08x}", xxhash_rust::xxh3::xxh3_64(s.as_bytes()) as u32)
 }
 
-/// 构建命名空间 token（隔离同进程多 bundle 的全局 registry）：`__wake_<hash8(入口路径#模块数)>__`。
-fn build_token(entry_norm: &Path, n: usize) -> String {
+/// 构建命名空间 token（隔离同进程多 bundle 的全局 registry）。
+///
+/// Entry path + module count is insufficient for immutable federation builds: two revisions with
+/// the same graph shape would reuse the first revision's registered factories. Include every
+/// emitted body fingerprint so byte-different builds cannot share a registry, while identical
+/// builds intentionally retain one execution instance.
+fn build_token(entry_norm: &Path, bodies: &[(u32, Arc<String>)]) -> String {
     let mut s = path_to_slash(entry_norm);
-    s.push('#');
-    s.push_str(&n.to_string());
+    for (id, body) in bodies {
+        s.push('#');
+        s.push_str(&id.to_string());
+        s.push(':');
+        s.push_str(&hash8(body));
+    }
     format!("__wake_{}__", hash8(&s))
 }
 
@@ -7394,7 +8578,7 @@ var g = typeof globalThis !== "undefined" ? globalThis
       : typeof window !== "undefined" ? window : this;
 var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
   var modules = {}, cache = {}, chunkPromises = {}, stylePromises = {};
-  var W = { m: modules, c: cache, p: chunkPromises, f: {}, d: {}, s: {},
+  var W = { m: modules, c: cache, p: chunkPromises, f: {}, d: {}, s: {}, x: {},
             publicPath: "", nreq: null, ndir: ".", npath: null };
   function require(id) {
     var hit = cache[id];
@@ -7411,27 +8595,64 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
     }
     return module.exports;
   }
-  __WAKE_INTEROP_DEFAULT__
   __WAKE_INTEROP_STAR__
   function register(mods) { for (var k in mods) if (!modules[k]) modules[k] = mods[k]; }
   function markLoaded(cid) { if (!chunkPromises[cid]) chunkPromises[cid] = Promise.resolve(); }
-  function loadFile(file) {
+  function loadFile(file, expose) {
     if (W.nreq) {
       return new Promise(function (res, rej) {
         try { W.nreq(W.npath.resolve(W.ndir, file)); res(); } catch (e) { rej(e); }
       });
     }
+    var localDevelopment = W.federation && W.federation.developmentLocal === true && expose === undefined;
+    if (W.federation && !localDevelopment) {
+      var broker = g[Symbol.for("wake.federation.v1")];
+      if (!broker || typeof broker.loadFederatedAsset !== "function") {
+        var runtimeError = new Error("wake federation runtime cannot load an integrity-bound chunk");
+        runtimeError.code = "FED_RUNTIME_ABI";
+        return Promise.reject(runtimeError);
+      }
+      return broker.loadFederatedAsset({ name: W.federation.name, buildId: W.federation.buildId,
+                                         expose: expose, fileName: file, kind: "javascript" });
+    }
     return new Promise(function (res, rej) {
       var s = document.createElement("script");
-      s.src = W.publicPath + file; s.async = true;
+      var url = W.publicPath + file;
+      if (localDevelopment) {
+        url = new URL(file, W.publicPath).href;
+        var contexts = g[Symbol.for("wake.federation.asset-contexts.v1")];
+        if (!(contexts instanceof Map)) {
+          var contextError = new Error("wake federation development asset context registry is unavailable");
+          contextError.code = "FED_RUNTIME_ABI";
+          rej(contextError); return;
+        }
+        contexts.set(url, Object.freeze({ name: W.federation.name, buildId: W.federation.buildId,
+          generation: W.federation.generation, fileName: file, kind: "javascript", developmentLocal: true }));
+        s.type = "module";
+      }
+      s.src = url; s.async = true;
       s.onload = function () { res(); };
       s.onerror = function () { rej(new Error("wake: failed to load chunk " + file)); };
       (document.head || document.getElementsByTagName("head")[0] || document.documentElement).appendChild(s);
     });
   }
-  function loadStyle(file) {
+  function loadStyle(file, expose) {
     if (stylePromises[file]) return stylePromises[file];
     if (W.nreq || typeof document === "undefined") return Promise.resolve();
+    var localDevelopment = W.federation && W.federation.developmentLocal === true && expose === undefined;
+    if (W.federation && !localDevelopment) {
+      var broker = g[Symbol.for("wake.federation.v1")];
+      if (!broker || typeof broker.loadFederatedAsset !== "function") {
+        var runtimeError = new Error("wake federation runtime cannot load an integrity-bound style");
+        runtimeError.code = "FED_RUNTIME_ABI";
+        return Promise.reject(runtimeError);
+      }
+      var federatedStyle = broker.loadFederatedAsset({ name: W.federation.name,
+        buildId: W.federation.buildId, expose: expose, fileName: file, kind: "css" });
+      stylePromises[file] = federatedStyle;
+      federatedStyle.catch(function () { if (stylePromises[file] === federatedStyle) delete stylePromises[file]; });
+      return federatedStyle;
+    }
     var p = new Promise(function (res, rej) {
       var link = document.createElement("link");
       link.rel = "stylesheet"; link.href = W.publicPath + file;
@@ -7446,12 +8667,13 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
   function ensure(cid) {
     if (chunkPromises[cid]) return chunkPromises[cid];
     var deps = W.d[cid] || [];
+    var expose = W.x[cid];
     var p = Promise.all(deps.map(ensure)).then(function () {
-      return Promise.all((W.s[cid] || []).map(loadStyle));
+      return Promise.all((W.s[cid] || []).map(function (file) { return loadStyle(file, expose); }));
     }).then(function () {
       var file = W.f[cid];
       if (file == null) throw new Error("wake: unknown chunk " + cid);
-      return loadFile(file);
+      return loadFile(file, expose);
     });
     chunkPromises[cid] = p;
     p.catch(function () { if (chunkPromises[cid] === p) delete chunkPromises[cid]; });
@@ -7465,7 +8687,7 @@ var __wake__ = g.__WAKE_NS__ || (g.__WAKE_NS__ = (function () {
   }
   require.import = dynImport;
   W.require = require; W.register = register; W.markLoaded = markLoaded;
-  W.ensure = ensure; W.interopDefault = interopDefault; W.interopStar = interopStar;
+  W.ensure = ensure;
   return W;
 })());
 if (typeof process !== "undefined" && process.versions && process.versions.node && typeof require !== "undefined") {
@@ -7474,11 +8696,6 @@ if (typeof process !== "undefined" && process.versions && process.versions.node 
   __wake__.npath = require("path");
 }
 var __wake_require__ = __wake__.require;
-__wake_require__.metaUrl = function () {
-  return typeof document !== "undefined" ? new URL(__wake__.publicPath || ".", document.baseURI).href : "";
-};
-var __wake_interop_default = __wake__.interopDefault;
-var __wake_interop_star = __wake__.interopStar;
 "#;
 
 /// async/shared chunk 运行时前半（接入已建 registry）。开放函数体，由 render 收尾。
@@ -7490,8 +8707,6 @@ var g = typeof globalThis !== "undefined" ? globalThis
 var __wake__ = g.__WAKE_NS__;
 if (!__wake__) throw new Error("wake: runtime not initialized (entry chunk must load first)");
 var __wake_require__ = __wake__.require;
-var __wake_interop_default = __wake__.interopDefault;
-var __wake_interop_star = __wake__.interopStar;
 "#;
 
 /// 分配/复用模块 id（无 worklist；纯 id 记账）。

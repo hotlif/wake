@@ -24,6 +24,7 @@ wake_css.workspace = true
 wake_css_in_js.workspace = true
 wake_graph.workspace = true
 wake_cache.workspace = true
+wake_federation_contract.workspace = true
 xxhash-rust.workspace = true
 crossbeam-utils.workspace = true
 

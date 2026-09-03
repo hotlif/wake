@@ -5,13 +5,13 @@
 //! 合成图：`m0` 为入口，`mi` 二叉扇出 `m(2i+1)/m(2i+2)`（完全二叉树，有宽度也有深度），
 //! 且每个模块都 import 公共 `util`（被全体模块引用 → 考验 single-flight 去重）。
 //! 基准组：**bundle_1k**（1000 模块）与 **bundle_2k**（2000 模块），
-//! 每组含 **cold**（新引擎全量构建）与 **incremental**（同实例、同内容第二遍，全缓存命中）。
+//! 每组含 retained cold/warm、one-shot、当前 generation 复用与单文件编辑场景。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use wake_bundler::{BuildOptions, BuildRequest, BuildSession, IncrementalBundler};
+use wake_bundler::{BuildOptions, BuildRequest, BuildSession};
 use wake_common::MemoryFileSystem;
 
 /// 生成 N 模块合成项目：二叉树扇出 + 全体共享 `util`（= m{N-1}）。
@@ -45,15 +45,17 @@ fn bench_bundle(c: &mut Criterion) {
 }
 
 fn bench_n(c: &mut Criterion, name: &str, n: usize) {
-    // cold：每次新引擎全量构建（空缓存）。
+    // retained cold：每次新建长生命周期 session，全量构建（空缓存）。
     {
         let fs = Arc::new(gen_project(n));
+        let options = BuildOptions::default();
+        let request = BuildRequest::new("m0.js");
         let mut group = c.benchmark_group(name);
         group.sample_size(15);
         group.bench_function("cold", |b| {
             b.iter(|| {
-                let mut bundler = IncrementalBundler::new(fs.clone());
-                let out = bundler.build(Path::new("m0.js"));
+                let mut session = BuildSession::new(fs.clone(), options.clone());
+                let out = session.build_current(request.clone());
                 assert!(!out.has_errors());
                 assert_eq!(out.module_count, n);
             })
@@ -61,17 +63,37 @@ fn bench_n(c: &mut Criterion, name: &str, n: usize) {
         group.finish();
     }
 
-    // incremental：同一 bundler 预热后，第二遍全缓存命中。
+    // retained warm：同一 session 预热后，以空变更推进 generation 并重跑缓存管线。
     {
         let fs = Arc::new(gen_project(n));
-        let mut bundler = IncrementalBundler::new(fs);
-        let _ = bundler.build(Path::new("m0.js")); // 预热
+        let mut session = BuildSession::new(fs, BuildOptions::default());
+        let request = BuildRequest::new("m0.js");
+        let _ = session.build_current(request.clone()); // 预热
         let mut group = c.benchmark_group(name);
         group.sample_size(30);
         group.bench_function("incremental_cached", |b| {
             b.iter(|| {
-                let out = bundler.build(Path::new("m0.js"));
+                session.invalidate_paths(&[], false);
+                let out = session.build_current(request.clone());
                 assert!(!out.has_errors());
+            })
+        });
+        group.finish();
+    }
+
+    // one-shot：每次创建瞬态 session 并通过消费型 API 完成一次全量构建。
+    {
+        let fs = Arc::new(gen_project(n));
+        let options = BuildOptions::default();
+        let request = BuildRequest::new("m0.js");
+        let mut group = c.benchmark_group(name);
+        group.sample_size(15);
+        group.bench_function("one_shot", |b| {
+            b.iter(|| {
+                let out = BuildSession::new_one_shot(fs.clone(), options.clone())
+                    .build_once(request.clone());
+                assert!(!out.has_errors());
+                assert_eq!(out.module_count, n);
             })
         });
         group.finish();

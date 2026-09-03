@@ -25,14 +25,17 @@ use std::collections::BTreeMap;
 
 use wake_common::{FxHashMap, FxHashSet};
 
-use crate::ChunkKind;
+use crate::{ChunkKind, ResolvedModuleRequest};
 
 /// 一个模块的依赖边（供 chunk 划分）。
 #[derive(Clone)]
 pub(crate) struct ModuleEdges {
-    /// 静态依赖目标模块 id（import / export-from / require；去重排序）。
+    /// Optimizer-retained requests in source order, including their semantic kind. This is the
+    /// canonical graph fact; the target-only views below are derived for graph algorithms.
+    pub requests: Vec<ResolvedModuleRequest>,
+    /// 静态依赖目标模块 id（import / export-from / require；稳定去重，保留源码顺序）。
     pub static_targets: Vec<u32>,
-    /// 动态 import 目标模块 id（去重排序）。
+    /// 动态 import 目标模块 id（稳定去重，保留源码顺序）。
     pub dyn_targets: Vec<u32>,
     /// 命名用文件 stem（chunk 名）。
     pub stem: String,
@@ -55,6 +58,8 @@ pub(crate) struct ChunkGraph {
     pub module_chunk: FxHashMap<u32, u32>,
     /// chunk id → 依赖的其它 chunk id（须先加载；升序，不含 entry=0）。
     pub chunk_deps: FxHashMap<u32, Vec<u32>>,
+    /// chunk id → 运行时动态 import 的目标 chunk id（升序，不含同 chunk/entry）。
+    pub chunk_dynamic_deps: FxHashMap<u32, Vec<u32>>,
     /// 全部 chunk（按 id 升序）。
     pub chunks: Vec<ChunkPlan>,
 }
@@ -194,9 +199,32 @@ pub(crate) fn compute_chunk_graph(
         v.dedup();
     }
 
+    let mut chunk_dynamic_deps: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&module, edge) in edges {
+        let Some(&source_chunk) = module_chunk.get(&module) else {
+            continue;
+        };
+        for &target in &edge.dyn_targets {
+            if let Some(&target_chunk) = module_chunk.get(&target)
+                && target_chunk != source_chunk
+                && target_chunk != 0
+            {
+                chunk_dynamic_deps
+                    .entry(source_chunk)
+                    .or_default()
+                    .push(target_chunk);
+            }
+        }
+    }
+    for targets in chunk_dynamic_deps.values_mut() {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+
     Some(ChunkGraph {
         module_chunk,
         chunk_deps,
+        chunk_dynamic_deps,
         chunks,
     })
 }
@@ -214,6 +242,7 @@ mod tests {
 
     fn edge(stat: &[u32], dyn_: &[u32], stem: &str) -> ModuleEdges {
         ModuleEdges {
+            requests: Vec::new(),
             static_targets: stat.to_vec(),
             dyn_targets: dyn_.to_vec(),
             stem: stem.to_string(),

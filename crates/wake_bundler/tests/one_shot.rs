@@ -1,10 +1,10 @@
-use std::any::Any;
-use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
 use tempfile::tempdir;
-use wake_bundler::{BuildOutput, BuildPlatform, IncrementalBundler, ModuleFormat};
+use wake_bundler::{
+    BuildOptions, BuildOutput, BuildPlatform, BuildRequest, BuildSession, ModuleFormat,
+};
 use wake_common::MemoryFileSystem;
 
 fn production_fixture() -> Arc<MemoryFileSystem> {
@@ -44,23 +44,25 @@ fn production_fixture() -> Arc<MemoryFileSystem> {
     ]))
 }
 
-fn configure_production(bundler: &mut IncrementalBundler, sourcemap: bool) {
-    bundler
-        .set_platform(BuildPlatform::Browser)
-        .set_module_format(ModuleFormat::Iife)
-        .enable_minify()
-        .enable_tree_shaking()
-        .enable_dead_module_elimination()
-        .enable_css_extraction()
-        .set_asset_inline_limit(0);
-    if sourcemap {
-        bundler.enable_sourcemap();
+fn production_options(source_map: bool) -> BuildOptions {
+    BuildOptions {
+        platform: BuildPlatform::Browser,
+        module_format: ModuleFormat::Iife,
+        extract_css: true,
+        asset_inline_limit: 0,
+        minify: true,
+        dead_module_elimination: true,
+        source_map,
+        tree_shaking: true,
+        ..BuildOptions::default()
     }
 }
 
 fn assert_outputs_equal(regular: &BuildOutput, one_shot: &BuildOutput) {
     assert_eq!(regular.bundle, one_shot.bundle, "entry bundle bytes differ");
     assert_eq!(regular.module_count, one_shot.module_count);
+    assert_eq!(regular.updated_module_count, one_shot.updated_module_count);
+    assert_eq!(regular.cached_module_count, one_shot.cached_module_count);
     assert_eq!(regular.entry_chunk, one_shot.entry_chunk);
 
     assert_eq!(regular.chunks.len(), one_shot.chunks.len());
@@ -73,6 +75,7 @@ fn assert_outputs_equal(regular: &BuildOutput, one_shot: &BuildOutput) {
         assert_eq!(regular.chunk_id, one_shot.chunk_id);
         assert_eq!(regular.module_ids, one_shot.module_ids);
         assert_eq!(regular.imports, one_shot.imports);
+        assert_eq!(regular.dynamic_imports, one_shot.dynamic_imports);
         assert_eq!(regular.styles, one_shot.styles);
         assert_eq!(regular.source_map, one_shot.source_map);
     }
@@ -82,6 +85,11 @@ fn assert_outputs_equal(regular: &BuildOutput, one_shot: &BuildOutput) {
         assert_eq!(regular.file_name, one_shot.file_name);
         assert_eq!(regular.bytes, one_shot.bytes, "asset bytes differ");
         assert_eq!(regular.is_css, one_shot.is_css);
+        assert_eq!(regular.owner_module_ids, one_shot.owner_module_ids);
+        assert_eq!(
+            regular.unscoped_css_owner_module_ids,
+            one_shot.unscoped_css_owner_module_ids
+        );
     }
 
     assert_eq!(regular.diagnostics.len(), one_shot.diagnostics.len());
@@ -123,13 +131,12 @@ fn assert_runtime_semantics(output: &BuildOutput, sourcemap: bool) {
 
 fn assert_production_equivalence(sourcemap: bool) {
     let fs = production_fixture();
-    let mut regular = IncrementalBundler::new(fs.clone());
-    let mut one_shot = IncrementalBundler::new_one_shot(fs);
-    configure_production(&mut regular, sourcemap);
-    configure_production(&mut one_shot, sourcemap);
+    let options = production_options(sourcemap);
+    let request = BuildRequest::new("src/index.js");
+    let mut regular = BuildSession::new(fs.clone(), options.clone());
 
-    let regular = regular.build(Path::new("src/index.js"));
-    let one_shot = one_shot.build(Path::new("src/index.js"));
+    let regular = regular.build_current(request.clone());
+    let one_shot = BuildSession::new_one_shot(fs, options).build_once(request);
 
     assert!(!regular.has_errors(), "{:?}", regular.diagnostics);
     assert!(!one_shot.has_errors(), "{:?}", one_shot.diagnostics);
@@ -158,36 +165,16 @@ fn one_shot_matches_regular_mapped_and_unmapped_production_builds() {
     }
 }
 
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
-}
-
 #[test]
-fn one_shot_rejects_a_second_build() {
+fn one_shot_build_once_consumes_the_session_and_produces_executable_output() {
     let fs = production_fixture();
-    let mut bundler = IncrementalBundler::new_one_shot(fs);
-    configure_production(&mut bundler, false);
-    let first = bundler.build(Path::new("src/index.js"));
-    assert!(!first.has_errors(), "{:?}", first.diagnostics);
-    let task_exec_count = bundler.task_exec_count();
-    assert!(
-        task_exec_count > 0,
-        "one-shot engine release must preserve its observable task count"
-    );
+    let session = BuildSession::new_one_shot(fs, production_options(false));
+    let consume_once: fn(BuildSession, BuildRequest) -> BuildOutput = BuildSession::build_once;
 
-    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = bundler.build(Path::new("src/index.js"));
-    }));
-    let panic = second.expect_err("one-shot bundler must reject a second build");
-    assert_eq!(
-        panic_message(panic),
-        "one-shot IncrementalBundler may only build once"
-    );
-    assert_eq!(bundler.task_exec_count(), task_exec_count);
+    let output = consume_once(session, BuildRequest::new("src/index.js"));
+
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.cached_module_count, 0);
+    assert_eq!(output.updated_module_count, output.module_count);
+    assert_runtime_semantics(&output, false);
 }

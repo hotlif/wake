@@ -5,7 +5,7 @@
 //! 引擎、codegen、linker 零改动。CSS 的 `@import` 翻译成 ESM `import`（进模块图去重排序）。
 //!
 //! 两种形态由 [`LoadOptions`] 切换：
-//! - **dev**：样式经运行时 `<style>` 注入（可 HMR），资源一律内联 base64；
+//! - **dev**：样式经运行时 `<style>` 注入，整页 Live Reload 后重新求值；资源一律内联 base64；
 //! - **prod**（`extract_css`）：CSS 文本经 [`Loaded::css`] 带出聚合为独立 `.css`，
 //!   超过 `asset_inline_limit` 的资源写为带内容 hash 的独立产物。
 //!
@@ -13,6 +13,7 @@
 //! 的主要引用方式是 `@font-face` / `background-image` 而非 JS import，不改写就是产物死链。
 
 use std::path::Path;
+use std::sync::Arc;
 
 use wake_common::FileSystem;
 use wake_ecma_ast::SourceType;
@@ -31,7 +32,7 @@ pub(crate) struct LoadOptions {
     /// 当前是否使用 JSX development runtime。
     pub jsx_dev: bool,
     /// JSX automatic runtime 包名。生产兼容层当前只针对 React。
-    pub jsx_import_source: &'static str,
+    pub jsx_import_source: Arc<str>,
 }
 
 impl Default for LoadOptions {
@@ -41,7 +42,7 @@ impl Default for LoadOptions {
             asset_inline_limit: usize::MAX,
             public_path: "/".to_string(),
             jsx_dev: false,
-            jsx_import_source: "react",
+            jsx_import_source: Arc::from("react"),
         }
     }
 }
@@ -162,9 +163,6 @@ pub(crate) fn load_source(
             })
         } else {
             let mut source = text;
-            if crab_component_package_dir(fs, path).is_some() {
-                source = migrate_crab_component_css_runtime(source);
-            }
             if let Some(style_specifier) = crab_component_style_specifier(fs, path) {
                 source.push_str("\nimport ");
                 push_js_string(&mut source, &style_specifier);
@@ -180,22 +178,11 @@ pub(crate) fn load_source(
     }
 }
 
-/// Early published Crab UI entrypoints imported their class-name helper from the predecessor
-/// package without declaring it as a runtime dependency. Restrict the migration to verified
-/// `@crab-dev/rc-*` public entrypoints: application source, other third-party packages, and
-/// component internals receive no legacy CSS compatibility. Once those packages are republished,
-/// this source migration can be removed without changing the public Crab CSS contract.
-fn migrate_crab_component_css_runtime(source: String) -> String {
-    source
-        .replace("\"@linaria/core\"", "\"@crab-dev/css\"")
-        .replace("'@linaria/core'", "'@crab-dev/css'")
-}
-
 /// React 的 production `jsx-dev-runtime` 会按设计导出 `jsxDEV = undefined`。某些已经发布的
 /// 第三方包却错误地把开发期 `jsxDEV` 调用保留到了 ESM/CJS 产物中。生产构建加载 React 的
 /// package entry 时，用官方 `jsx-runtime` 的 `jsx/jsxs` 做兼容转接，避免依赖压缩后的模块 id。
 fn should_shim_react_jsx_dev_runtime(fs: &dyn FileSystem, path: &Path, opts: &LoadOptions) -> bool {
-    if opts.jsx_dev || opts.jsx_import_source != "react" {
+    if opts.jsx_dev || opts.jsx_import_source.as_ref() != "react" {
         return false;
     }
     if path.file_name().and_then(|name| name.to_str()) != Some("jsx-dev-runtime.js") {
@@ -401,26 +388,6 @@ pub(crate) fn source_type_for(path: &Path) -> SourceType {
     }
 }
 
-/// 可安全从持久路径索引恢复的纯源码模块。
-///
-/// CSS/JSON/资源会产生派生产物，不能只恢复源码；Crab 组件入口还依赖相邻样式文件是否存在，
-/// 因而也保守回退到真实 loader。
-pub(crate) fn cached_source_type(fs: &dyn FileSystem, path: &Path) -> Option<SourceType> {
-    // 这里必须与 `crab_component_style_specifier` 使用完全相同的包身份/入口判定，且不能把
-    // `css/index.css` 当前是否存在算进条件。否则跨进程热缓存会把「没有自动 import 的旧源码」
-    // 直接恢复出来，新增 CSS 不会进入模块图；反向删除 CSS 时也可能保留陈旧 import。
-    if crab_component_package_dir(fs, path).is_some() {
-        return None;
-    }
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("js" | "mjs" | "cjs") => Some(SourceType::Module),
-        Some("ts" | "mts" | "cts") => Some(SourceType::TypeScript),
-        Some("jsx") => Some(SourceType::Jsx),
-        Some("tsx") => Some(SourceType::Tsx),
-        _ => None,
-    }
-}
-
 fn is_crab_component_package_name(name: &str) -> bool {
     name.strip_prefix("@crab-dev/rc-").is_some_and(|component| {
         !component.is_empty()
@@ -447,7 +414,10 @@ fn is_crab_component_manifest(fs: &dyn FileSystem, package_dir: &Path) -> bool {
 /// 包身份只认 `package.json#name = @crab-dev/rc-*`，因此物理目录名可以是 workspace 名、
 /// Yarn virtual/unplugged 目录或 zip 内路径；入口只允许包根及 `esm/`、`cjs/` 下的
 /// `index.js|mjs|cjs`，避免给内部实现文件意外追加样式依赖。
-fn crab_component_package_dir<'a>(fs: &dyn FileSystem, path: &'a Path) -> Option<&'a Path> {
+pub(crate) fn crab_component_package_dir<'a>(
+    fs: &dyn FileSystem,
+    path: &'a Path,
+) -> Option<&'a Path> {
     let entry_file = path.file_name()?.to_str()?;
     if !matches!(entry_file, "index.js" | "index.mjs" | "index.cjs") {
         return None;
@@ -463,10 +433,10 @@ fn crab_component_package_dir<'a>(fs: &dyn FileSystem, path: &'a Path) -> Option
 /// 为 `@crab-dev/rc-*` 的真实包入口补上同包 `css/index.css`。
 ///
 /// 这是 Wake 对 `babel-plugin-auto-import-style` 的原生等价实现：样式仍作为普通 CSS
-/// 模块进入依赖图，因而天然复用 dev 注入、prod 抽取、去重、资源改写和 HMR。导入追加在
+/// 模块进入依赖图，因而天然复用 dev 注入、prod 抽取、去重、资源改写和增量重建。导入追加在
 /// 组件入口已有依赖之后，使子组件样式先求值、本组件样式后求值，保持正确的级联顺序。
 /// 包身份只由 `package.json#name` 判断，以支持普通安装、workspace、Yarn PnP
-/// virtual/unplugged 目录及 zip 内路径，且与持久缓存的排除规则保持一致。
+/// virtual/unplugged 目录及 zip 内路径，并作为 loader 派生组件样式 import 的唯一身份规则。
 fn crab_component_style_specifier(fs: &dyn FileSystem, path: &Path) -> Option<String> {
     let package_dir = crab_component_package_dir(fs, path)?;
     let style = package_dir.join("css").join("index.css");
@@ -506,7 +476,7 @@ pub(crate) fn is_css_preprocessor_path(path: &Path) -> bool {
 }
 
 /// 路径是否为 CSS Modules（`*.module.css` / `*.module.scss` …）。
-fn is_css_module_path(path: &Path) -> bool {
+pub(crate) fn is_css_module_path(path: &Path) -> bool {
     is_css_path(path)
         && path
             .file_stem()
@@ -716,51 +686,6 @@ mod tests {
     use super::*;
     use wake_common::MemoryFileSystem;
 
-    #[test]
-    fn persistent_source_snapshot_only_accepts_pure_source_modules() {
-        let fs = MemoryFileSystem::from_files([
-            (
-                "packages/button/package.json",
-                r#"{"name":"@crab-dev/rc-button"}"#,
-            ),
-            (
-                "packages/not-crab/package.json",
-                r#"{"name":"example-button"}"#,
-            ),
-        ]);
-        assert_eq!(
-            cached_source_type(&fs, Path::new("a.js")),
-            Some(SourceType::Module)
-        );
-        assert_eq!(
-            cached_source_type(&fs, Path::new("a.ts")),
-            Some(SourceType::TypeScript)
-        );
-        assert_eq!(
-            cached_source_type(&fs, Path::new("a.jsx")),
-            Some(SourceType::Jsx)
-        );
-        assert_eq!(
-            cached_source_type(&fs, Path::new("a.tsx")),
-            Some(SourceType::Tsx)
-        );
-        assert!(cached_source_type(&fs, Path::new("a.css")).is_none());
-        assert!(cached_source_type(&fs, Path::new("a.json")).is_none());
-        assert!(cached_source_type(&fs, Path::new("a.png")).is_none());
-        assert!(cached_source_type(&fs, Path::new("a.raw")).is_none());
-        assert!(cached_source_type(&fs, Path::new("packages/button/esm/index.mjs")).is_none());
-        assert_eq!(
-            cached_source_type(&fs, Path::new("packages/button/esm/internal.mjs")),
-            Some(SourceType::Module),
-            "只有公开组件入口需要规避 loader 派生源码快照"
-        );
-        assert_eq!(
-            cached_source_type(&fs, Path::new("packages/not-crab/index.js")),
-            Some(SourceType::Module),
-            "目录名不能代替 package.json 包身份"
-        );
-    }
-
     /// 用内存 FS 走**真实** [`load_source`] 路径加载一个 CSS 文件（dev 形态：不抽取、全内联）。
     fn load_css(
         files: impl IntoIterator<Item = (&'static str, &'static str)>,
@@ -856,7 +781,7 @@ mod tests {
             &fs,
             Path::new("node_modules/react/jsx-dev-runtime.js"),
             &LoadOptions {
-                jsx_import_source: "preact",
+                jsx_import_source: Arc::from("preact"),
                 ..LoadOptions::default()
             },
         )
@@ -894,36 +819,40 @@ mod tests {
     }
 
     #[test]
-    fn crab_component_public_entry_migrates_legacy_cx_runtime_to_crab_css() {
+    fn crab_component_public_entry_keeps_legacy_runtime_source_byte_for_byte() {
+        let esm_source = r#"import { cx } from '@linaria/core';
+export { cx as forwarded } from "@linaria/core";
+const cjs = require('@linaria/core');
+const stringBait = '@linaria/core';
+const templateBait = `@linaria/core`;
+const regexBait = /@linaria\/core/;
+// '@linaria/core' must remain a comment.
+export default cx('alert', cjs('ready'));"#;
+        let cjs_source = r#"const { cx } = require("@linaria/core");
+const bait = "@linaria/core";
+module.exports = cx('alert', bait);"#;
         let fs = MemoryFileSystem::from_files([
             (
                 "node_modules/@crab-dev/rc-alert/package.json",
                 r#"{"name":"@crab-dev/rc-alert"}"#,
             ),
+            ("node_modules/@crab-dev/rc-alert/esm/index.mjs", esm_source),
+            ("node_modules/@crab-dev/rc-alert/cjs/index.cjs", cjs_source),
             (
-                "node_modules/@crab-dev/rc-alert/esm/index.mjs",
-                "import { cx } from '@linaria/core'; export default cx('alert');",
-            ),
-            (
-                "node_modules/@crab-dev/rc-alert/cjs/index.cjs",
-                "const { cx } = require(\"@linaria/core\"); module.exports = cx('alert');",
+                "node_modules/@crab-dev/rc-alert/css/index.css",
+                ".rc-alert {}",
             ),
         ]);
 
-        for path in [
-            "node_modules/@crab-dev/rc-alert/esm/index.mjs",
-            "node_modules/@crab-dev/rc-alert/cjs/index.cjs",
+        for (path, original) in [
+            ("node_modules/@crab-dev/rc-alert/esm/index.mjs", esm_source),
+            ("node_modules/@crab-dev/rc-alert/cjs/index.cjs", cjs_source),
         ] {
             let loaded = load_source(&fs, Path::new(path), &LoadOptions::default()).expect("load");
-            assert!(
-                loaded.source.contains("@crab-dev/css"),
-                "{path}: {}",
-                loaded.source
-            );
-            assert!(
-                !loaded.source.contains("@linaria/core"),
-                "{path}: {}",
-                loaded.source
+            assert_eq!(
+                loaded.source,
+                format!("{original}\nimport \"../css/index.css\";\n"),
+                "loader may only append the existing style dependency for {path}"
             );
         }
 
@@ -937,8 +866,10 @@ mod tests {
             &LoadOptions::default(),
         )
         .expect("ordinary source load");
-        assert!(loaded.source.contains("@linaria/core"));
-        assert!(!loaded.source.contains("@crab-dev/css"));
+        assert_eq!(
+            loaded.source,
+            "import { cx } from '@linaria/core'; export default cx('app');"
+        );
     }
 
     #[test]
@@ -946,6 +877,7 @@ mod tests {
         for root in [
             "components/alert-implementation",
             ".yarn/__virtual__/rc-alert/1/components/rc-alert",
+            ".yarn/unplugged/rc-alert/node_modules/@crab-dev/rc-alert",
             ".yarn/cache/rc-alert.zip/node_modules/@crab-dev/rc-alert",
         ] {
             let fs = MemoryFileSystem::from_files([
@@ -962,12 +894,14 @@ mod tests {
                     ".rc-alert { display: flex; }".to_string(),
                 ),
             ]);
-            let loaded = load_source(
-                &fs,
-                Path::new(&format!("{root}/esm/index.mjs")),
-                &LoadOptions::default(),
-            )
-            .expect("load");
+            let entry = format!("{root}/esm/index.mjs");
+            assert_eq!(
+                crab_component_package_dir(&fs, Path::new(&entry)),
+                Some(Path::new(root)),
+                "manifest identity must not depend on installation layout"
+            );
+            let loaded =
+                load_source(&fs, Path::new(&entry), &LoadOptions::default()).expect("load");
             assert!(
                 loaded.source.ends_with("import \"../css/index.css\";\n"),
                 "{root}: {}",
