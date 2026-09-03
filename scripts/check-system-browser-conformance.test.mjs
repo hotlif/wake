@@ -32,6 +32,21 @@ for (const kind of ['chrome', 'edge', 'chromium']) {
   assert.equal(checked.stableConformance, true)
 }
 
+const linuxEdgeEvidence = validateExperimentalBrowserIdentity({
+  manifest,
+  target: 'linux-x64-gnu',
+  identity: {
+    kind: 'edge',
+    executable: '/usr/bin/microsoft-edge-stable',
+    version: 'Edg/151.0.4129.101',
+    headless: true,
+  },
+})
+assert.equal(linuxEdgeEvidence.stableConformance, true)
+assert.equal(linuxEdgeEvidence.browser.kind, 'edge')
+assert.equal(linuxEdgeEvidence.browser.major, 151)
+assert.equal(linuxEdgeEvidence.browser.executable, '/usr/bin/microsoft-edge-stable')
+
 for (const major of [150, 151]) {
   const checked = validateExperimentalBrowserIdentity({
     manifest,

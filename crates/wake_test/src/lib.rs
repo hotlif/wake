@@ -5299,6 +5299,9 @@ mod tests {
             root: Some(root.to_path_buf()),
             seed: Some("wake-seed".to_string()),
             serial: true,
+            browser_path: std::env::var_os("WAKE_SYSTEM_BROWSER_PATH")
+                .filter(|path| !path.is_empty())
+                .map(Into::into),
             ..TestOptions::default()
         }
     }

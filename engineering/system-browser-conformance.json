@@ -45,12 +45,12 @@
       },
       "reviewedRunnerEvidence": [
         {
-          "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/ubuntu/Ubuntu2404-Readme.md",
-          "imageVersion": "20260816.277.1",
+          "source": "https://github.com/actions/runner-images/blob/cbb8df97e1dd32af7cb23a90590f12734ec11d0b/images/ubuntu/Ubuntu2404-Readme.md",
+          "imageVersion": "20260823.283.1",
           "browserVersions": {
-            "chrome": "151.0.7922.137",
+            "chrome": "151.0.7922.173",
             "chromium": "151.0.7922.0",
-            "edge": "151.0.4129.86"
+            "edge": "151.0.4129.101"
           }
         }
       ]

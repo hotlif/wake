@@ -232,11 +232,13 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             browser_evidence: exact-major-conformance
             browser_major: 151
+            browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - target: linux-x64-gnu
             os: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
             browser_evidence: exact-major-conformance
             browser_major: 151
+            browser_path: /usr/bin/microsoft-edge-stable
           - target: linux-arm64-gnu
             os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
@@ -246,11 +248,15 @@ jobs:
             rust_target: aarch64-apple-darwin
             browser_evidence: exact-major-smoke
             browser_major: 150
+            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           - target: darwin-x64
             os: macos-15-intel
             rust_target: x86_64-apple-darwin
             browser_evidence: reviewed-major-smoke
             browser_majors: '150,151'
+            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    env:
+      WAKE_SYSTEM_BROWSER_PATH: ${{ matrix.browser_path }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6

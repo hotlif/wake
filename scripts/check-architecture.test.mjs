@@ -1505,11 +1505,24 @@ test('system browser evidence separates experimental publication from stable rea
   )
   assert.match(identityExample, /BrowserDriver::launch/)
   assert.match(identityExample, /driver\.installation/)
+  assert.match(identityExample, /WAKE_SYSTEM_BROWSER_PATH/)
   assert.match(ci, /check-system-browser-conformance\.mjs/)
   assert.match(ci, /--identity/)
   assert.match(ci, /--unavailable true/)
   assert.match(ci, /--stable-readiness blocked/)
   assert.match(ci, /browser-stable-readiness:/)
+  assert.match(ci, /WAKE_SYSTEM_BROWSER_PATH: \$\{\{ matrix\.browser_path \}\}/)
+  for (const browserPath of [
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    '/usr/bin/microsoft-edge-stable',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  ]) {
+    const pattern = new RegExp(
+      `browser_path: ['"]?${browserPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+    )
+    assert.match(ci, pattern)
+    assert.match(release, pattern)
+  }
   assert.match(release, /--reporter json/)
   assert.match(release, /--result browser-result\.json/)
   assert.match(release, /--unavailable true/)
@@ -1526,6 +1539,11 @@ test('system browser evidence separates experimental publication from stable rea
       /playwright|puppeteer|chrome-for-testing|setup-chrome|browser-actions/i,
     )
   }
+  assert.doesNotMatch(
+    release,
+    /for command_name in google-chrome-stable google-chrome chromium/,
+    'release evidence must use the reviewed matrix path instead of Chrome-first discovery',
+  )
 })
 
 test('architecture CI fetches the complete lock graph before its offline target-all check', () => {

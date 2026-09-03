@@ -2023,6 +2023,15 @@ fn serve_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conformance_browser_options() -> BrowserLaunchOptions {
+        BrowserLaunchOptions {
+            executable: std::env::var_os("WAKE_SYSTEM_BROWSER_PATH")
+                .filter(|path| !path.is_empty())
+                .map(Into::into),
+            ..BrowserLaunchOptions::default()
+        }
+    }
     use std::io::{BufRead, BufReader};
 
     fn fetch_resource(address: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
@@ -2702,7 +2711,7 @@ mod tests {
     #[test]
     #[ignore = "requires an installed system Chromium browser"]
     fn termination_allows_reuse_but_preserves_queued_jobs() {
-        let driver = BrowserDriver::launch(BrowserLaunchOptions::default()).unwrap();
+        let driver = BrowserDriver::launch(conformance_browser_options()).unwrap();
         let context = driver.create_context().unwrap();
         let page = Arc::new(context.new_page("about:blank").unwrap());
         page.evaluate("globalThis.__wakeTerminatedJobLeaked = false")
@@ -2746,7 +2755,7 @@ mod tests {
     #[test]
     #[ignore = "requires an installed system Chromium browser"]
     fn system_browser_cdp_vertical_spike() {
-        let driver = BrowserDriver::launch(BrowserLaunchOptions::default()).unwrap();
+        let driver = BrowserDriver::launch(conformance_browser_options()).unwrap();
         let context = driver.create_context().unwrap();
         let page = context.new_page("about:blank").unwrap();
         let identity = page

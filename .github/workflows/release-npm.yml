@@ -377,10 +377,12 @@ jobs:
             runner: windows-latest
             browser_evidence: exact-major-conformance
             browser_major: 151
+            browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
             browser_evidence: exact-major-conformance
             browser_major: 151
+            browser_path: /usr/bin/microsoft-edge-stable
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             browser_evidence: unavailable
@@ -388,15 +390,18 @@ jobs:
             runner: macos-15-intel
             browser_evidence: reviewed-major-smoke
             browser_majors: '150,151'
+            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke
             browser_major: 150
+            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:
       WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts
       WAKE_NPM_PLATFORM: ${{ matrix.platform }}
       WAKE_NPM_VERSION: ${{ needs.verify.outputs.version }}
+      WAKE_RELEASE_BROWSER_PATH: ${{ matrix.browser_path }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -480,39 +485,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          browser=''
-          case "$RUNNER_OS" in
-            Windows)
-              for candidate in \
-                'C:/Program Files/Google/Chrome/Application/chrome.exe' \
-                'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe' \
-                'C:/Program Files/Microsoft/Edge/Application/msedge.exe' \
-                'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' \
-                'C:/Program Files/Chromium/Application/chrome.exe' \
-                'C:/Program Files (x86)/Chromium/Application/chrome.exe'; do
-                if [[ -f "$candidate" ]]; then browser="$candidate"; break; fi
-              done
-              ;;
-            macOS)
-              for candidate in \
-                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
-                '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' \
-                '/Applications/Chromium.app/Contents/MacOS/Chromium'; do
-                if [[ -x "$candidate" ]]; then browser="$candidate"; break; fi
-              done
-              ;;
-            Linux)
-              for command_name in google-chrome-stable google-chrome chromium chromium-browser microsoft-edge-stable microsoft-edge; do
-                if command -v "$command_name" >/dev/null 2>&1; then browser="$(command -v "$command_name")"; break; fi
-              done
-              ;;
-          esac
-          if [[ -z "$browser" ]]; then
-            echo "::error::A compatible system Chrome, Edge or Chromium is required for the Node 24 prepublish gate on $RUNNER_OS/$RUNNER_ARCH"
+          if [[ ! -f "$WAKE_RELEASE_BROWSER_PATH" ]]; then
+            echo "::error::Reviewed system browser is unavailable at $WAKE_RELEASE_BROWSER_PATH on $RUNNER_OS/$RUNNER_ARCH"
             exit 1
           fi
-          printf 'WAKE_RELEASE_BROWSER_PATH=%s\n' "$browser" >> "$GITHUB_ENV"
-          printf 'Using system browser: %s\n' "$browser"
+          printf 'Using reviewed system browser: %s\n' "$WAKE_RELEASE_BROWSER_PATH"
       - name: React browser and screenshot smoke from local tarballs
         if: matrix.node == '24' && matrix.browser_evidence != 'unavailable'
         shell: bash
@@ -642,10 +619,12 @@ jobs:
             runner: windows-latest
             browser_evidence: exact-major-conformance
             browser_major: 151
+            browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
             browser_evidence: exact-major-conformance
             browser_major: 151
+            browser_path: /usr/bin/microsoft-edge-stable
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             browser_evidence: unavailable
@@ -653,11 +632,15 @@ jobs:
             runner: macos-15-intel
             browser_evidence: reviewed-major-smoke
             browser_majors: '150,151'
+            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke
             browser_major: 150
+            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
+    env:
+      WAKE_RELEASE_BROWSER_PATH: ${{ matrix.browser_path }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
@@ -698,47 +681,20 @@ jobs:
           set -euo pipefail
           cd smoke
           npm install --ignore-scripts --prefer-online "react@19.2.8" "react-dom@19.2.8"
-          browser=''
-          case "$RUNNER_OS" in
-            Windows)
-              for candidate in \
-                'C:/Program Files/Google/Chrome/Application/chrome.exe' \
-                'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe' \
-                'C:/Program Files/Microsoft/Edge/Application/msedge.exe' \
-                'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' \
-                'C:/Program Files/Chromium/Application/chrome.exe' \
-                'C:/Program Files (x86)/Chromium/Application/chrome.exe'; do
-                if [[ -f "$candidate" ]]; then browser="$candidate"; break; fi
-              done
-              ;;
-            macOS)
-              for candidate in \
-                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
-                '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' \
-                '/Applications/Chromium.app/Contents/MacOS/Chromium'; do
-                if [[ -x "$candidate" ]]; then browser="$candidate"; break; fi
-              done
-              ;;
-            Linux)
-              for command_name in google-chrome-stable google-chrome chromium chromium-browser microsoft-edge-stable microsoft-edge; do
-                if command -v "$command_name" >/dev/null 2>&1; then browser="$(command -v "$command_name")"; break; fi
-              done
-              ;;
-          esac
-          if [[ -z "$browser" ]]; then
-            echo "::error::Reviewed system browser is unavailable on $RUNNER_OS/$RUNNER_ARCH"
+          if [[ ! -f "$WAKE_RELEASE_BROWSER_PATH" ]]; then
+            echo "::error::Reviewed system browser is unavailable at $WAKE_RELEASE_BROWSER_PATH on $RUNNER_OS/$RUNNER_ARCH"
             exit 1
           fi
           node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('published browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('published-ready')})\\n\")"
           npx wake test visual.browser.test.mjs \
             --serial \
-            --browser-path "$browser" \
+            --browser-path "$WAKE_RELEASE_BROWSER_PATH" \
             --reporter json \
             --output browser-result.json
           node "$GITHUB_WORKSPACE/scripts/check-system-browser-conformance.mjs" \
             --target "${{ matrix.platform }}" \
             --result browser-result.json > "$RUNNER_TEMP/wake-browser-evidence.json"
-          npx wake test visual.browser.test.mjs --serial --browser-path "$browser"
+          npx wake test visual.browser.test.mjs --serial --browser-path "$WAKE_RELEASE_BROWSER_PATH"
       - name: Record reviewed browser unavailability
         if: matrix.node == 24 && matrix.browser_evidence == 'unavailable'
         shell: bash

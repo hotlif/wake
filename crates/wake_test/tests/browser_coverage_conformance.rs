@@ -17,6 +17,9 @@ fn browser_options(root: &Path) -> TestOptions {
         environment: Some("browser".to_string()),
         coverage: true,
         serial: true,
+        browser_path: std::env::var_os("WAKE_SYSTEM_BROWSER_PATH")
+            .filter(|path| !path.is_empty())
+            .map(Into::into),
         ..TestOptions::default()
     }
 }

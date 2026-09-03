@@ -426,7 +426,9 @@ fn browser_options() -> BrowserLaunchOptions {
     // the OS sandbox also lets managed Windows Chromium builds create an off-the-record CDP page.
     BrowserLaunchOptions {
         sandbox: false,
-        executable: std::env::var_os("WAKE_FEDERATION_E2E_BROWSER").map(PathBuf::from),
+        executable: std::env::var_os("WAKE_SYSTEM_BROWSER_PATH")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
         ..BrowserLaunchOptions::default()
     }
 }
