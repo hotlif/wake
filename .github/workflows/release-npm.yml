@@ -49,10 +49,12 @@ jobs:
       - run: corepack yarn versions:check
       - run: corepack yarn browser:conformance:test
       - run: corepack yarn release:check
+      - run: corepack yarn npm:test:wake:federation
+      - run: corepack yarn npm:typecheck:wake
       - run: corepack yarn npm:typecheck:css
       - run: corepack yarn npm:pack:check
         env:
-          WAKE_PACK_TARGETS: npm/css
+          WAKE_PACK_TARGETS: npm/css,npm/wake
       - name: Test and build from verified inputs
         run: |
           cargo test --workspace --locked --offline
@@ -313,6 +315,17 @@ jobs:
               '@crab-dev/wake')
                 test "$native_count" -eq 0
                 test "$(stat -c%s "$archive")" -le 524288
+                for required in \
+                  bin/wake.mjs \
+                  index.cjs index.mjs index.d.ts \
+                  experimental.cjs experimental.mjs experimental.d.ts \
+                  federation.mjs federation.d.mts \
+                  federation-react.mjs federation-react.d.ts \
+                  test.cjs test.mjs test.d.ts \
+                  test-react.cjs test-react.mjs test-react.d.ts \
+                  internal/components-runtime.mjs internal/components-runtime.d.ts; do
+                  grep -qx "package/$required" <<<"$list"
+                done
                 ;;
               '@crab-dev/wake-'*)
                 test "$native_count" -eq 1
@@ -623,7 +636,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: [win32-x64-msvc, linux-x64-gnu, linux-arm64-gnu, darwin-x64, darwin-arm64]
-        node: [24, 26]
+        node: ['22.14.0', 24, 26]
         include:
           - platform: win32-x64-msvc
             runner: windows-latest

@@ -30,6 +30,29 @@ const rootManifest = JSON.parse(
   readFileSync(resolve(root, wakePackageDir, 'package.json'), 'utf8'),
 )
 
+function collectPackageTargets(value, targets) {
+  if (typeof value === 'string') {
+    if (value.startsWith('./')) targets.add(value.slice(2))
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) collectPackageTargets(entry, targets)
+    return
+  }
+  if (value && typeof value === 'object') {
+    for (const entry of Object.values(value)) collectPackageTargets(entry, targets)
+  }
+}
+
+function publicPackageFiles(manifest) {
+  const targets = new Set()
+  for (const value of [manifest.main, manifest.module, manifest.types, manifest.exports]) {
+    collectPackageTargets(value, targets)
+  }
+  collectPackageTargets(manifest.bin, targets)
+  return [...targets].sort()
+}
+
 const manifests = packageDirs.map((directory) => {
   const path = resolve(root, directory, 'package.json')
   return {
@@ -84,15 +107,23 @@ for (const { directory, value: packageManifest } of manifests) {
     throw new Error(`${directory} must not contain native binaries`)
   }
   if (isWake) {
-    for (const required of [
-      'internal/components-runtime.mjs',
-      'internal/components-runtime.d.ts',
-      'test.cjs',
-      'test.mjs',
-      'test.d.ts',
+    for (const subpath of [
+      '.',
+      './experimental',
+      './federation',
+      './federation/react',
+      './test',
+      './test/react',
+      './internal/components-runtime',
+      './package.json',
     ]) {
+      if (!Object.hasOwn(packageManifest.exports, subpath)) {
+        throw new Error(`The main package is missing the public export ${subpath}`)
+      }
+    }
+    for (const required of publicPackageFiles(packageManifest)) {
       if (!files.includes(required)) {
-        throw new Error(`The main package is missing ${required}`)
+        throw new Error(`The main package tarball is missing public target ${required}`)
       }
     }
   }

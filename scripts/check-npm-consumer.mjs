@@ -125,6 +125,7 @@ if (platform !== expectedPlatform) {
 }
 
 const rootManifest = readJson(join(repositoryRoot, 'npm/wake/package.json'))
+const workspaceManifest = readJson(join(repositoryRoot, 'package.json'))
 const version = argumentsMap.get('version')
   ?? process.env.WAKE_NPM_VERSION
   ?? rootManifest.version
@@ -183,6 +184,15 @@ const dependencies = {
 const optionalDependencies = Object.fromEntries(
   [...optionalPlatformArchives].map(([name, value]) => [name, fileDependency(project, value.archive)]),
 )
+const devDependencies = Object.fromEntries(
+  ['@types/node', 'typescript'].map((name) => {
+    const value = workspaceManifest.devDependencies?.[name]
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`The workspace must pin ${name} for the external npm typecheck`)
+    }
+    return [name, value]
+  }),
+)
 
 mkdirSync(join(project, 'packages/app/src'), { recursive: true })
 mkdirSync(join(project, 'packages/shared'), { recursive: true })
@@ -192,8 +202,12 @@ writeFileSync(join(project, 'package.json'), `${JSON.stringify({
   version: '0.0.0',
   type: 'module',
   workspaces: ['packages/*'],
-  scripts: { 'wake-build': 'wake build' },
+  scripts: {
+    typecheck: 'tsc --project tsconfig.json',
+    'wake-build': 'wake build',
+  },
   dependencies,
+  devDependencies,
   optionalDependencies,
 }, null, 2)}\n`)
 writeFileSync(join(project, 'packages/app/package.json'), `${JSON.stringify({
@@ -225,6 +239,59 @@ writeFileSync(
   join(project, 'smoke.test.mjs'),
   "import { test, expect } from '@crab-dev/wake/test'; test('npm consumer host', () => expect(42).toBe(42));\n",
 )
+writeFileSync(join(project, 'consumer.ts'), `import { build, type BuildOptions, type FederationOptions } from '@crab-dev/wake'
+import {
+  FEDERATION_RUNTIME_ABI,
+  createFederationRuntime,
+  type FederationDevUpdate,
+} from '@crab-dev/wake/federation'
+import {
+  createFederatedIsolatedBridge,
+  type IsolatedBridgeController,
+} from '@crab-dev/wake/federation/react'
+
+const federation: FederationOptions = {
+  enabled: true,
+  name: 'consumer',
+  remotes: {
+    catalog: { manifestUrl: 'https://catalog.example.test/wake-federation.json' },
+  },
+}
+const options: BuildOptions = { cache: true, federation }
+void build(options)
+
+const abi: 'wake.federation.v1' = FEDERATION_RUNTIME_ABI
+const runtime = createFederationRuntime({ mode: 'development' })
+const update: FederationDevUpdate = {
+  schemaVersion: 'wake.federation.dev-update.v1',
+  remote: 'catalog',
+  oldBuildId: null,
+  newBuildId: 'build-2',
+  changedExposes: ['./Button'],
+  generation: 2,
+  action: 'isolated-remount',
+}
+runtime.applyDevUpdate(update)
+const bridge: Promise<IsolatedBridgeController> = createFederatedIsolatedBridge(
+  runtime,
+  'catalog/Button',
+)
+void abi
+void bridge
+`)
+writeFileSync(join(project, 'tsconfig.json'), `${JSON.stringify({
+  compilerOptions: {
+    strict: true,
+    noEmit: true,
+    module: 'NodeNext',
+    moduleResolution: 'NodeNext',
+    target: 'ES2024',
+    lib: ['ES2024', 'DOM'],
+    types: ['node'],
+    skipLibCheck: false,
+  },
+  include: ['consumer.ts'],
+}, null, 2)}\n`)
 
 const installArguments = ['--ignore-scripts', '--no-audit', '--no-fund']
 const ciArguments = [...installArguments, '--omit=optional']
@@ -305,6 +372,15 @@ run(process.execPath, ['--input-type=module', '-e', [
   "import {cx} from '@crab-dev/css'",
   `if(version()!=='${version}'||cx('wake',{esm:true})!=='wake esm')process.exit(1)`,
 ].join(';')], project)
+run(process.execPath, ['--input-type=module', '-e', [
+  "import {FEDERATION_RUNTIME_ABI,createFederationRuntime} from '@crab-dev/wake/federation'",
+  "import {createFederatedIsolatedBridge,createHostRenderedLazyFactory} from '@crab-dev/wake/federation/react'",
+  "const runtime=createFederationRuntime({global:{},transport:{fetchManifest(){},loadScript(){}}})",
+  "const lazy=createHostRenderedLazyFactory(async()=>({default:'federated'}))",
+  "const loaded=await lazy()",
+  "if(FEDERATION_RUNTIME_ABI!=='wake.federation.v1'||runtime.runtimeAbi!==FEDERATION_RUNTIME_ABI||loaded.default!=='federated'||typeof createFederatedIsolatedBridge!=='function')process.exit(1)",
+].join(';')], project)
+run(npmCommand, ['run', 'typecheck'], project)
 run(npmCommand, ['run', 'wake-build'], project)
 
 const builtFiles = collectFiles(join(project, 'dist'))

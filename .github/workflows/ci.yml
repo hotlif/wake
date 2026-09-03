@@ -298,6 +298,11 @@ jobs:
         run: cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture --test-threads=1
         env:
           CARGO_NET_OFFLINE: "true"
+      - name: Wake Federation host and remote Chromium E2E
+        if: matrix.browser_evidence != 'unavailable'
+        run: cargo test --locked --offline -p wake_test --test federation_chromium -- --ignored --nocapture --test-threads=1
+        env:
+          CARGO_NET_OFFLINE: "true"
       - name: Browser TSX V8 coverage reports and thresholds
         if: matrix.browser_evidence != 'unavailable'
         run: cargo test --locked --offline -p wake_test --test browser_coverage_conformance -- --ignored --nocapture

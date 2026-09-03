@@ -1,6 +1,6 @@
 # Fixtures — 端到端打包用例
 
-> 端到端测试约定见 [工程测试规范](../engineering/TESTING.md#3-必补回归矩阵)。
+> 端到端测试约定见 [工程测试规范](../engineering/TESTING.md#3-回归矩阵)。
 
 ## 布局
 

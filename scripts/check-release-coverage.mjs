@@ -16,6 +16,8 @@ const npmConsumerScript = readFileSync(
   resolve(root, 'scripts/check-npm-consumer.mjs'),
   'utf8',
 )
+const npmPackScript = readFileSync(resolve(root, 'scripts/check-npm-packs.mjs'), 'utf8')
+const workspaceManifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
 const browserManifest = readSystemBrowserConformanceManifest()
 const vscodeWorkflow = readFileSync(
   resolve(root, '.github/workflows/vscode-css.yml'),
@@ -274,16 +276,38 @@ for (const forbidden of ['corepack', 'yarn install', 'cargo ', 'npm pack', 'WAKE
 for (const marker of [
   "['install', '--package-lock-only'",
   "['ci', ...ciArguments]",
+  "['run', 'typecheck']",
   'optionalPlatformArchives',
   'assertNoPnpAncestor(project)',
   "join(project, 'node_modules')",
   'WAKE_NPM_WORKSPACE_CLASSIC',
+  "'@crab-dev/wake/federation'",
+  "'@crab-dev/wake/federation/react'",
+  "join(project, 'consumer.ts')",
+  "join(project, 'tsconfig.json')",
+  'skipLibCheck: false',
   "join(project, 'node_modules', '@crab-dev', 'wake', 'bin', 'wake.mjs')",
   "[wakeCli, '--version']",
   "[wakeCli, 'test'",
 ]) {
   if (!npmConsumerScript.includes(marker)) {
     throw new Error(`check-npm-consumer.mjs is missing contract marker ${marker}`)
+  }
+}
+if (
+  workspaceManifest.scripts?.['npm:test:wake:federation']
+  !== 'node --test npm/wake/test/federation.test.mjs npm/wake/test/federation-react.test.mjs'
+) {
+  throw new Error('npm:test:wake:federation must own the source-tree Federation runtime gate')
+}
+for (const marker of [
+  'publicPackageFiles(packageManifest)',
+  "'./federation'",
+  "'./federation/react'",
+  'The main package tarball is missing public target',
+]) {
+  if (!npmPackScript.includes(marker)) {
+    throw new Error(`check-npm-packs.mjs is missing public tarball contract marker ${marker}`)
   }
 }
 for (const name of [
@@ -307,6 +331,11 @@ requireOrderedJobMarkers('verify', verifyJob.source, [
   'npm install --global corepack@0.34.6',
   'corepack yarn install --immutable --check-cache',
   'corepack yarn yarn:lock:check',
+  'corepack yarn release:check',
+  'corepack yarn npm:test:wake:federation',
+  'corepack yarn npm:typecheck:wake',
+  'corepack yarn npm:typecheck:css',
+  'corepack yarn npm:pack:check',
 ])
 requireOrderedJobMarkers('audit-tarballs', auditTarballsJob.source, [
   'actions/setup-node@v6',
@@ -322,6 +351,15 @@ requireJobMarkers('verify', verifyJob.source, [
   'cargo build -p wake_test_host -p wake_cli --locked --offline',
   './target/debug/wake test npm/css/test/runtime.test.mjs --serial',
   'node --test npm/css/test/realm.node.mjs',
+  'WAKE_PACK_TARGETS: npm/css,npm/wake',
+])
+requireJobMarkers('audit-tarballs', auditTarballsJob.source, [
+  'bin/wake.mjs',
+  'index.cjs index.mjs index.d.ts',
+  'federation.mjs federation.d.mts',
+  'federation-react.mjs federation-react.d.ts',
+  'test-react.cjs test-react.mjs test-react.d.ts',
+  'internal/components-runtime.mjs internal/components-runtime.d.ts',
 ])
 if (verifyJob.source.includes('npm run npm:test:css')) {
   throw new Error('release verify must use the freshly built Wake CLI and host for CSS tests')
@@ -467,7 +505,7 @@ requireJobMarkers('publish', publishJob.source, [
 requireJobMarkers('smoke', registrySmokeJob.source, [
   'needs: publish',
   'platform: [win32-x64-msvc, linux-x64-gnu, linux-arm64-gnu, darwin-x64, darwin-arm64]',
-  'node: [24, 26]',
+  "node: ['22.14.0', 24, 26]",
   'registry-url: https://registry.npmjs.org',
   'Clean registry install without build tools',
   "matrix.node == 24 && matrix.browser_evidence != 'unavailable'",

@@ -27,7 +27,7 @@ const meta =
 
 const app = (
   <main className="app" data-theme={theme}>
-    <h1>wake · TypeScript + React 19 + lodash（JSX + HMR）</h1>
+    <h1>wake · TypeScript + React 19 + lodash（JSX + Live Reload）</h1>
     <Card {...cardProps} />
     <StatsList stats={buildStats(numbers)} />
     <Counter />
