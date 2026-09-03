@@ -32,20 +32,20 @@ for (const kind of ['chrome', 'edge', 'chromium']) {
   assert.equal(checked.stableConformance, true)
 }
 
-const linuxEdgeEvidence = validateExperimentalBrowserIdentity({
+const linuxChromeEvidence = validateExperimentalBrowserIdentity({
   manifest,
   target: 'linux-x64-gnu',
   identity: {
-    kind: 'edge',
-    executable: '/usr/bin/microsoft-edge-stable',
-    version: 'Edg/151.0.4129.101',
+    kind: 'chrome',
+    executable: '/usr/bin/google-chrome',
+    version: 'Google Chrome 151.0.7922.173',
     headless: true,
   },
 })
-assert.equal(linuxEdgeEvidence.stableConformance, true)
-assert.equal(linuxEdgeEvidence.browser.kind, 'edge')
-assert.equal(linuxEdgeEvidence.browser.major, 151)
-assert.equal(linuxEdgeEvidence.browser.executable, '/usr/bin/microsoft-edge-stable')
+assert.equal(linuxChromeEvidence.stableConformance, true)
+assert.equal(linuxChromeEvidence.browser.kind, 'chrome')
+assert.equal(linuxChromeEvidence.browser.major, 151)
+assert.equal(linuxChromeEvidence.browser.executable, '/usr/bin/google-chrome')
 
 for (const major of [150, 151]) {
   const checked = validateExperimentalBrowserIdentity({

@@ -422,7 +422,7 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
   "matrix.node == '24' && matrix.browser_evidence == 'unavailable'",
   'ubuntu-24.04-arm',
   'WAKE_RELEASE_BROWSER_PATH',
-  'A compatible system Chrome, Edge or Chromium is required',
+  'Reviewed system browser is unavailable at $WAKE_RELEASE_BROWSER_PATH',
   'React browser and screenshot smoke from local tarballs',
   "toMatchScreenshot('local-ready')",
   '--browser-path "$WAKE_RELEASE_BROWSER_PATH"',

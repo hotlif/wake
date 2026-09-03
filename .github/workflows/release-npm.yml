@@ -382,7 +382,7 @@ jobs:
             runner: ubuntu-24.04
             browser_evidence: exact-major-conformance
             browser_major: 151
-            browser_path: /usr/bin/microsoft-edge-stable
+            browser_path: /usr/bin/google-chrome
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             browser_evidence: unavailable
@@ -624,7 +624,7 @@ jobs:
             runner: ubuntu-24.04
             browser_evidence: exact-major-conformance
             browser_major: 151
-            browser_path: /usr/bin/microsoft-edge-stable
+            browser_path: /usr/bin/google-chrome
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             browser_evidence: unavailable

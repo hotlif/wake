@@ -1515,7 +1515,7 @@ test('system browser evidence separates experimental publication from stable rea
   assert.match(ci, /WAKE_SYSTEM_BROWSER_PATH: \$\{\{ matrix\.browser_path \}\}/)
   for (const browserPath of [
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
-    '/usr/bin/microsoft-edge-stable',
+    '/usr/bin/google-chrome',
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   ]) {
     const pattern = new RegExp(

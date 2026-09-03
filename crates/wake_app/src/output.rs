@@ -275,11 +275,11 @@ pub(super) fn acquire_output_commit_lock(product: &str) -> Result<OutputCommitLo
             )
             .at(&path));
         }
-        return Ok(OutputCommitLock {
+        Ok(OutputCommitLock {
             _process: process,
             _os: OsOutputCommitLock { _file: file },
             lock_paths: vec![path],
-        });
+        })
     }
 
     #[cfg(windows)]

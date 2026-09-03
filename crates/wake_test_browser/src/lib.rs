@@ -997,6 +997,8 @@ impl BrowserDriver {
             .arg("--disable-component-update")
             .arg("--disable-default-apps")
             .arg("--disable-extensions")
+            .arg("--disable-dev-shm-usage")
+            .arg("--disable-gpu")
             .arg("--disable-component-extensions-with-background-pages")
             .arg("--disable-sync")
             .arg("--metrics-recording-only")
@@ -1010,7 +1012,7 @@ impl BrowserDriver {
             .arg(format!("--lang={}", options.locale))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if options.headless {
             command.arg("--headless=new");
         }
@@ -1033,8 +1035,18 @@ impl BrowserDriver {
                 .try_wait()
                 .map_err(|error| BrowserError::new(format!("could not inspect browser: {error}")))?
             {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                let _ = child.wait();
+                let detail = if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("; stderr: {stderr}")
+                };
                 return Err(BrowserError::new(format!(
-                    "browser exited before CDP became ready: {status}"
+                    "browser exited before CDP became ready: {status}{detail}"
                 ))
                 .at(&installation.executable));
             }
