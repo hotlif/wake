@@ -89,6 +89,7 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 crossterm = "0.29.0"
 arboard = { version = "=3.6.1", default-features = false, features = ["wayland-data-control"] }
 base64 = "=0.22.1"
+ring = "=0.17.14"
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 # Embedded DOM fetch transport. Keep TLS in pure Rust and bound every call in wake_js_runtime;
 # test policy remains owned by wake_test.

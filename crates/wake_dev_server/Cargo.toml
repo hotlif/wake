@@ -13,6 +13,7 @@ wake_common.workspace = true
 wake_turbo.workspace = true
 wake_bundler.workspace = true
 wake_ecma_transform.workspace = true
+wake_federation_contract.workspace = true
 actix-web.workspace = true
 actix-ws.workspace = true
 awc.workspace = true
@@ -20,6 +21,10 @@ regex.workspace = true
 tokio.workspace = true
 notify.workspace = true
 futures-util.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+base64.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
