@@ -10,18 +10,33 @@ use std::net::{Shutdown, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
-use wake_bundler::{BuildOutput, BuildRequest, BuildSession, IncrementalBundler, ResolveOptions};
+use ring::digest::{Context as DigestContext, SHA256};
+use serde::{Deserialize, Serialize};
+use wake_bundler::{
+    BuildGeneration, BuildOptions as BundlerBuildOptions, BuildOutput, BuildRequest, BuildSession,
+    FederationBuildPlan, FederationEntryExport, JsxOptions, ResolveOptions,
+};
 pub use wake_bundler::{BuildPlatform, ModuleFormat};
-use wake_common::{Diagnostic, OsFileSystem, SourceFile};
+use wake_common::{
+    Diagnostic, FileSystem, OsFileSystem, OwnedFileTree, OwnedFileTreeBuilder,
+    OwnedOverlayFileSystem, ProjectedRelativePath, SourceFile,
+};
 
+pub use wake_config::{
+    ContainerName, ExposeConfig, ExposeKey, ExposeMode, FederationOptions, RemoteConfig,
+    ShadowMode, SharedConfig,
+};
+pub use wake_dev_server::{
+    WatchInterest, WatchInvalidation, WatchReconcileError, WatchReconcileOutcome,
+    WatchRegistrationState, WatchTreeFilter, reconcile_watch_interests,
+};
 pub use wake_docs::{DocsMode, DocsPresentation};
 use wake_ecma_transform::{BrowserTarget, TargetEnv};
 pub use wake_test_contract::protocol::WatchControl as TestWatchControl;
@@ -30,15 +45,37 @@ use wake_test_contract::protocol::{
     HostRequest, HostResponse, HostResponseBody, PROTOCOL_VERSION, WatchControl, write_frame,
 };
 pub use wake_test_contract::{
-    TestCaseResult, TestDiagnostic, TestFailure, TestOptions, TestRunResult, TestStatus,
-    TestSuiteResult, TestTerminationReason, WorkerOverride,
+    TestCaseResult, TestDiagnostic, TestEnvironmentKind, TestFailure, TestLeakKind, TestOptions,
+    TestRunResult, TestStatus, TestSuiteResult, TestSuiteStatus, TestTerminationReason,
+    WorkerOverride,
 };
 
+mod federation;
+mod federation_init;
+mod federation_lock;
+mod federation_type_sync;
+mod federation_type_watch;
+mod federation_types;
 mod library;
+mod output;
+pub use federation_init::{
+    FederationInitFileStatus, FederationInitResult, initialize_federation_types,
+};
+pub use federation_lock::{
+    federation_project_root, generate_federation_lock, generate_project_federation_lock,
+};
+pub use federation_type_sync::{
+    FederationTypeSyncResult, SyncedFederationTypes, sync_federation_types,
+};
 pub use library::{
     GenerateCssTokenOptions, GenerateCssTokenResult, GenerateDocgenOptions, GenerateDocgenResult,
     LibraryBuildOptions, LibraryBuildResult, build_library, generate_css_token, generate_docgen,
 };
+use output::{
+    ExactOutput, RecordingFileSystem, acquire_output_commit_lock, is_output_commit_lock_path,
+    publish_exact_outputs,
+};
+pub use output::{OutputFile, OutputFileKind};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -182,7 +219,11 @@ impl DiagnosticInfo {
     }
 }
 
-fn diagnostic_infos(diagnostics: &[Diagnostic], root: &Path) -> Vec<DiagnosticInfo> {
+fn diagnostic_infos(
+    diagnostics: &[Diagnostic],
+    root: &Path,
+    file_system: &dyn FileSystem,
+) -> Vec<DiagnosticInfo> {
     let mut sources = HashMap::<String, Option<SourceFile>>::new();
     diagnostics
         .iter()
@@ -197,12 +238,37 @@ fn diagnostic_infos(diagnostics: &[Diagnostic], root: &Path) -> Vec<DiagnosticIn
                         } else {
                             root.join(path_buf)
                         };
-                        std::fs::read_to_string(resolved)
+                        file_system
+                            .read_to_string(&resolved)
                             .ok()
                             .map(|text| SourceFile::new(path, text))
                     })
                     .as_ref()
             });
+            DiagnosticInfo::from_diagnostic(diagnostic, source)
+        })
+        .collect()
+}
+
+fn diagnostic_infos_from_captured_sources(
+    diagnostics: &[Diagnostic],
+    captured: Vec<wake_dev_server::DiagnosticSource>,
+) -> Vec<DiagnosticInfo> {
+    let sources = captured
+        .into_iter()
+        .map(|captured| {
+            let path = captured.path.to_string_lossy().into_owned();
+            let source = SourceFile::new(path.clone(), captured.text);
+            (path, source)
+        })
+        .collect::<HashMap<_, _>>();
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let source = diagnostic
+                .path
+                .as_deref()
+                .and_then(|path| sources.get(path));
             DiagnosticInfo::from_diagnostic(diagnostic, source)
         })
         .collect()
@@ -222,6 +288,8 @@ pub struct BuildOptions {
     pub cache: bool,
     pub source_map: bool,
     pub write: bool,
+    /// Programmatic federation override. `None` uses `wake.config.toml`.
+    pub federation: Option<FederationOptions>,
 }
 
 impl Default for BuildOptions {
@@ -233,6 +301,7 @@ impl Default for BuildOptions {
             cache: false,
             source_map: false,
             write: true,
+            federation: None,
         }
     }
 }
@@ -250,14 +319,6 @@ pub struct BundleOptions {
     pub minify: bool,
     pub source_map: bool,
     pub cache: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OutputFile {
-    pub path: String,
-    pub kind: String,
-    pub bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,16 +371,31 @@ struct ResolvedBundleOptions {
     cache: bool,
 }
 
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    commit_gate: RwLock<()>,
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
 
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        // Publish cancellation before waiting for an in-flight commit. This prevents a second
+        // operation from entering through an implementation-dependent reader preference while a
+        // cancellation writer is queued. A commit which already passed the read-side fence
+        // linearizes first; cancel() still waits for it to leave before returning.
+        self.0.cancelled.store(true, Ordering::Release);
+        let _gate = self
+            .0
+            .commit_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
 
     fn check(&self) -> Result<(), WakeError> {
@@ -329,14 +405,324 @@ impl CancellationToken {
             Ok(())
         }
     }
+
+    fn commit<T>(&self, commit: impl FnOnce() -> Result<T, WakeError>) -> Result<T, WakeError> {
+        let _gate = self
+            .0
+            .commit_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.check()?;
+        commit()
+    }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ControlFingerprint {
+    Present { len: u64, sha256: [u8; 32] },
+    Unreadable(std::io::ErrorKind),
+}
+
+type ControlFileFingerprint = (PathBuf, ControlFingerprint);
+
+#[derive(Clone)]
 struct PreparedBuild {
+    config_dir: PathBuf,
     root: PathBuf,
     entry: PathBuf,
+    logical_entry: PathBuf,
+    explicit_entry: Option<PathBuf>,
     outdir: PathBuf,
     config: wake_config::Config,
+    control_fingerprints: Vec<ControlFileFingerprint>,
     aliases: Vec<(String, PathBuf)>,
+    core_generation: GenerationView,
+    generation: GenerationView,
+}
+
+#[derive(Clone)]
+struct PreparedBuildProbe {
+    config_dir: PathBuf,
+    root: PathBuf,
+    logical_entry: PathBuf,
+    explicit_entry: Option<PathBuf>,
+    outdir: PathBuf,
+    config: wake_config::Config,
+    control_fingerprints: Vec<ControlFileFingerprint>,
+}
+
+/// The only mutable phase of a generated-input generation.
+///
+/// A draft is deliberately not cloneable and exposes no filesystem view. Every generated byte
+/// must be inserted before [`Self::seal`] transfers ownership to an immutable [`GenerationView`].
+struct GenerationDraft {
+    project_root: PathBuf,
+    files: OwnedFileTreeBuilder,
+}
+
+impl GenerationDraft {
+    fn new(project_root: &Path) -> Self {
+        Self {
+            project_root: project_root.to_path_buf(),
+            files: OwnedFileTreeBuilder::new(),
+        }
+    }
+
+    fn write_file(
+        &mut self,
+        relative: impl AsRef<Path>,
+        contents: impl Into<Arc<[u8]>>,
+    ) -> Result<PathBuf, WakeError> {
+        let relative = ProjectedRelativePath::new(relative.as_ref())
+            .map_err(|error| generated_input_error(&self.project_root, relative.as_ref(), error))?;
+        let logical = self.logical_path(&relative);
+        self.files
+            .insert(relative, contents)
+            .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()).at(&logical))?;
+        Ok(logical)
+    }
+
+    fn insert_tree(
+        &mut self,
+        prefix: impl AsRef<Path>,
+        tree: &OwnedFileTree,
+    ) -> Result<(), WakeError> {
+        let prefix = prefix.as_ref();
+        for (relative, contents) in tree.iter() {
+            self.write_file(prefix.join(relative.as_path()), Arc::clone(contents))?;
+        }
+        Ok(())
+    }
+
+    fn logical_path(&self, relative: &ProjectedRelativePath) -> PathBuf {
+        self.project_root.join(".wake").join(relative.as_path())
+    }
+
+    fn seal(self) -> Result<GenerationView, WakeError> {
+        let (project_root, files) = self.finish();
+        GenerationView::from_tree(project_root, files)
+    }
+
+    fn finish(self) -> (PathBuf, OwnedFileTree) {
+        (self.project_root, self.files.seal())
+    }
+}
+
+/// Immutable owner of one complete logical `.wake` generated-input generation.
+///
+/// Clones retain exactly the same byte tree and filesystem capability. There is intentionally no
+/// mutation API: adding another producer creates a new view before any bundler session observes it.
+#[derive(Clone)]
+struct GenerationView {
+    inner: Arc<GenerationViewInner>,
+}
+
+struct GenerationViewInner {
+    project_root: PathBuf,
+    files: OwnedFileTree,
+    file_system: Arc<dyn FileSystem>,
+}
+
+#[cfg(test)]
+static GENERATION_SEALS: std::sync::LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl GenerationView {
+    fn from_tree(project_root: PathBuf, files: OwnedFileTree) -> Result<Self, WakeError> {
+        let logical_root = project_root.join(".wake");
+        let file_system: Arc<dyn FileSystem> = Arc::new(
+            OwnedOverlayFileSystem::try_new(Arc::new(OsFileSystem), &logical_root, files.clone())
+                .map_err(|error| {
+                WakeError::new("WAKE_INTERNAL", error.to_string()).at(&logical_root)
+            })?,
+        );
+        #[cfg(test)]
+        {
+            let mut seals = GENERATION_SEALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *seals.entry(project_root.clone()).or_default() += 1;
+        }
+        Ok(Self {
+            inner: Arc::new(GenerationViewInner {
+                project_root,
+                files,
+                file_system,
+            }),
+        })
+    }
+
+    fn file_system(&self) -> Arc<dyn FileSystem> {
+        Arc::clone(&self.inner.file_system)
+    }
+
+    fn logical_path(&self, relative: &ProjectedRelativePath) -> PathBuf {
+        self.inner
+            .project_root
+            .join(".wake")
+            .join(relative.as_path())
+    }
+
+    fn logical_inventory(&self) -> Vec<PathBuf> {
+        self.inner
+            .files
+            .inventory()
+            .map(|relative| self.logical_path(relative))
+            .collect()
+    }
+
+    fn owns_logical_file(&self, path: &Path) -> bool {
+        path.strip_prefix(self.inner.project_root.join(".wake"))
+            .ok()
+            .and_then(|relative| ProjectedRelativePath::new(relative).ok())
+            .is_some_and(|relative| self.inner.files.get(&relative).is_some())
+    }
+
+    fn has_same_files(&self, other: &Self) -> bool {
+        self.has_same_tree(&other.inner.files)
+    }
+
+    fn has_same_tree(&self, other: &OwnedFileTree) -> bool {
+        self.inner.files.len() == other.len()
+            && self.inner.files.iter().all(|(path, contents)| {
+                other
+                    .get(path)
+                    .is_some_and(|candidate| candidate == contents.as_ref())
+            })
+    }
+
+    #[cfg(test)]
+    fn is_same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+fn generated_input_error(
+    _project_root: &Path,
+    relative: &Path,
+    error: wake_common::OwnedFileTreeError,
+) -> WakeError {
+    WakeError::new(
+        "WAKE_INTERNAL",
+        format!("invalid generated input `{}`: {error}", relative.display()),
+    )
+}
+
+impl PreparedBuild {
+    /// Replace the final product view with `core_generation + additional` in one sealed tree.
+    /// Reinstalling byte-identical inputs preserves the existing view identity and any session
+    /// that already owns it.
+    fn install_product_inputs(&mut self, additional: &OwnedFileTree) -> Result<bool, WakeError> {
+        let candidate = if additional.is_empty() {
+            self.core_generation.clone()
+        } else {
+            let mut draft = GenerationDraft::new(&self.core_generation.inner.project_root);
+            draft.insert_tree(Path::new(""), &self.core_generation.inner.files)?;
+            draft.insert_tree(Path::new(""), additional)?;
+            draft.seal()?
+        };
+        if self.generation.has_same_files(&candidate) {
+            return Ok(false);
+        }
+        self.generation = candidate;
+        Ok(true)
+    }
+}
+
+fn generation_changed_paths(previous: &GenerationView, next: &GenerationView) -> Vec<PathBuf> {
+    let mut changed = BTreeSet::new();
+    for (path, contents) in previous.inner.files.iter() {
+        if next.inner.files.get(path) != Some(contents.as_ref()) {
+            changed.insert(previous.logical_path(path));
+        }
+    }
+    for (path, contents) in next.inner.files.iter() {
+        if previous.inner.files.get(path) != Some(contents.as_ref()) {
+            changed.insert(next.logical_path(path));
+        }
+    }
+    changed.into_iter().collect()
+}
+
+enum CandidateState<T, E = Diagnostic> {
+    Stable,
+    Pending {
+        id: u64,
+        draft: T,
+        last_error: Option<E>,
+    },
+    Blocked {
+        diagnostic: E,
+    },
+}
+
+struct RefreshState<A, C, E = Diagnostic> {
+    accepted: A,
+    next_id: u64,
+    candidate: CandidateState<C, E>,
+}
+
+#[derive(Clone)]
+struct PreparedDocsRefresh {
+    prepared: PreparedBuild,
+    docs: wake_docs::DocsOptions,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone)]
+struct PreparedDocsProbe {
+    prepared: PreparedBuildProbe,
+    docs: wake_docs::DocsOptions,
+}
+
+fn docs_probe_from_refresh(prepared: &PreparedDocsRefresh) -> PreparedDocsProbe {
+    PreparedDocsProbe {
+        prepared: build_probe_from_prepared(&prepared.prepared),
+        docs: prepared.docs.clone(),
+    }
+}
+
+const OUTPUT_OWNERSHIP_FILE: &str = ".wake-output.json";
+const OUTPUT_OWNERSHIP_SCHEMA: &str = "wake.output.v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputProduct {
+    Application,
+    Documentation,
+}
+
+impl OutputProduct {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Application => "application",
+            Self::Documentation => "documentation",
+        }
+    }
+
+    const fn backup_prefix(self) -> &'static str {
+        match self {
+            Self::Application => ".wake-app-backup-",
+            Self::Documentation => ".wake-docs-backup-",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutputOwnership {
+    schema_version: String,
+    owner: String,
+    product: String,
+}
+
+impl OutputOwnership {
+    fn wake(product: OutputProduct) -> Self {
+        Self {
+            schema_version: OUTPUT_OWNERSHIP_SCHEMA.to_string(),
+            owner: "wake".to_string(),
+            product: product.as_str().to_string(),
+        }
+    }
 }
 
 type PreparedDocs = (
@@ -345,6 +731,7 @@ type PreparedDocs = (
     Vec<wake_docs::RouteInfo>,
     Vec<wake_docs::DemoDescriptor>,
     Vec<String>,
+    Vec<PathBuf>,
 );
 
 pub fn build(
@@ -1435,21 +1822,30 @@ fn execute_build(
 ) -> Result<BuildResult, WakeError> {
     cancellation.check()?;
     let started = Instant::now();
-    let prepared = prepare_build(&options)?;
+    let mut prepared = prepare_build(&options)?;
     cancellation.check()?;
-    let lifetime = if options.cache {
-        BundlerLifetime::Session
-    } else {
-        BundlerLifetime::OneShot
-    };
-    let mut bundler = create_bundler(&prepared, &options, project_defaults, lifetime)?;
-    let output = bundler.build(&prepared.entry);
+    let bundler_options = create_bundler_options(&prepared, &options, project_defaults)?;
+    let federation_inputs = federation::render_production_inputs(&prepared, &options)?;
+    prepared.install_product_inputs(federation_inputs.files())?;
+    let mut generation = BuildGeneration::new(prepared.generation.file_system());
+    let federation_generation = federation::bind_production_generation(
+        &prepared,
+        &options,
+        &federation_inputs,
+        generation.file_system_view(),
+    )?;
+    cancellation.check()?;
+    let request = BuildRequest::new(&prepared.entry);
+    let output = generation.build_once(bundler_options, request);
     cancellation.check()?;
     finish_output(
         &prepared,
         &options,
         output,
-        started.elapsed().as_secs_f64() * 1000.0,
+        started,
+        federation_generation,
+        &mut generation,
+        cancellation,
     )
 }
 
@@ -1471,28 +1867,56 @@ fn execute_bundle(
         ..BuildOptions::default()
     })?;
     let prepare_elapsed = phase_started.elapsed();
-    let lifetime = if options.cache {
-        BundlerLifetime::Session
-    } else {
-        BundlerLifetime::OneShot
-    };
+    if let Some(outfile) = options.outfile.as_deref() {
+        validate_not_reserved(
+            &prepared.root,
+            "Bundle output",
+            &absolute_from(&prepared.root, outfile),
+        )?;
+    }
     let phase_started = Instant::now();
-    let mut bundler = create_bundle_bundler(&prepared, &options, lifetime)?;
+    let bundler_options = create_bundle_options(&prepared, &options)?;
+    let recording_fs = RecordingFileSystem::new(prepared.generation.file_system());
+    let mut generation = BuildGeneration::new(Arc::new(recording_fs.clone()));
     let create_elapsed = phase_started.elapsed();
     let phase_started = Instant::now();
-    let output = bundler.build(&prepared.entry);
+    let request = BuildRequest::new(&prepared.entry);
+    let output = generation.build_once(bundler_options, request);
     cancellation.check()?;
     let build_elapsed = phase_started.elapsed();
     let phase_started = Instant::now();
+    // Owned generated inputs are immutable bytes in the GenerationView, not host files. Physical
+    // identity validation must not canonicalize them; doing so would report that the deliberately
+    // absent `.wake` projection disappeared. The reserved-output check above separately prevents
+    // an exact output from targeting the logical generated-input namespace.
+    let mut protected_inputs = recording_fs
+        .inputs()
+        .into_iter()
+        .filter(|path| !prepared.generation.owns_logical_file(path))
+        .collect::<Vec<_>>();
+    if !prepared.generation.owns_logical_file(&prepared.entry) {
+        protected_inputs.push(prepared.entry.clone());
+    }
+    for path in [
+        prepared.config_dir.join(wake_config::CONFIG_FILE),
+        prepared.root.join(".browserslistrc"),
+        prepared.root.join("package.json"),
+    ] {
+        if path.is_file() {
+            protected_inputs.push(path);
+        }
+    }
     let mut result = finish_bundle(
         &prepared,
         &options,
         output,
         started.elapsed().as_secs_f64() * 1000.0,
+        generation.file_system_view().as_ref(),
+        &protected_inputs,
+        cancellation,
     )?;
     let finish_elapsed = phase_started.elapsed();
     let phase_started = Instant::now();
-    drop(bundler);
     let drop_elapsed = phase_started.elapsed();
     let total_elapsed = started.elapsed();
     result.duration_ms = total_elapsed.as_secs_f64() * 1000.0;
@@ -1581,14 +2005,57 @@ fn valid_package_part(value: &str) -> bool {
 }
 
 fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
+    prepare_build_with_generation(options, false)
+}
+
+fn prepare_build_candidate(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
+    prepare_build_with_generation(options, true)
+}
+
+fn prepare_build_with_generation(
+    options: &BuildOptions,
+    candidate_generation: bool,
+) -> Result<PreparedBuild, WakeError> {
+    materialize_build_probe(probe_build_candidate(options)?, candidate_generation)
+}
+
+fn probe_build_candidate(options: &BuildOptions) -> Result<PreparedBuildProbe, WakeError> {
+    let mut last_snapshot_error = None;
+    for _ in 0..3 {
+        match probe_build_candidate_once(options) {
+            Err(error) if error.code == "WAKE_WATCH_SNAPSHOT_CHANGED" => {
+                last_snapshot_error = Some(error);
+            }
+            result => return result,
+        }
+    }
+    Err(last_snapshot_error.unwrap_or_else(|| {
+        WakeError::new(
+            "WAKE_WATCH_SNAPSHOT_CHANGED",
+            "project control files changed while preparing the build",
+        )
+    }))
+}
+
+fn probe_build_candidate_once(options: &BuildOptions) -> Result<PreparedBuildProbe, WakeError> {
     let cwd = options
         .project
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
-    let config = wake_config::load(&config_dir)
-        .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
+    let config_path = config_dir.join(wake_config::CONFIG_FILE);
+    let config_before = control_file_fingerprint(&config_path);
+    let mut config = wake_config::load(&config_dir)
+        .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_path))?;
+    if let Some(federation) = &options.federation {
+        config.federation = federation
+            .clone()
+            .validate_and_normalize()
+            .map_err(|error| {
+                WakeError::new("FED_CONFIG_INVALID", error.to_string()).at(&config_dir)
+            })?;
+    }
     let configured_root = normalize_path(&config.resolved_root(&config_dir));
     if !configured_root.is_dir() {
         return Err(WakeError::new(
@@ -1601,22 +2068,14 @@ fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
         .at(&configured_root));
     }
     let root = canonical_project_root(&configured_root)?;
-    let aliases = prepare_aliases_and_scans(&config, &root)?;
-    let entry = match &options.entry {
-        Some(entry) => absolute_from(&root, entry),
-        None => virtual_entry(&root, &config)?,
+    validate_reserved_build_inputs(&config, &root, options.entry.as_deref())?;
+    let (explicit_entry, logical_entry) = match &options.entry {
+        Some(entry) => {
+            let entry = absolute_from(&root, entry);
+            (Some(entry.clone()), entry)
+        }
+        None => (None, virtual_entry_target(&root, &config)),
     };
-    if !entry.is_file() {
-        return Err(WakeError::new(
-            "WAKE_IO",
-            format!("entry file does not exist: {}", entry.display()),
-        )
-        .at(&entry));
-    }
-    let entry = entry
-        .canonicalize()
-        .map(|entry| wake_common::fs::normalize(&entry))
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&entry))?;
     let outdir = absolute_from(
         &root,
         options
@@ -1624,13 +2083,135 @@ fn prepare_build(options: &BuildOptions) -> Result<PreparedBuild, WakeError> {
             .as_deref()
             .unwrap_or_else(|| Path::new("dist")),
     );
-    Ok(PreparedBuild {
+    let control_fingerprints = stable_project_control_snapshot(
+        &config_before,
+        &config_dir,
+        &root,
+        explicit_entry.as_deref(),
+    )?;
+    Ok(PreparedBuildProbe {
+        config_dir,
         root,
-        entry,
+        logical_entry,
+        explicit_entry,
         outdir,
         config,
-        aliases,
+        control_fingerprints,
     })
+}
+
+fn materialize_build_probe(
+    probe: PreparedBuildProbe,
+    _candidate_generation: bool,
+) -> Result<PreparedBuild, WakeError> {
+    let PreparedBuildProbe {
+        config_dir,
+        root,
+        logical_entry,
+        explicit_entry,
+        outdir,
+        config,
+        control_fingerprints,
+    } = probe;
+    let mut generation = GenerationDraft::new(&root);
+    let aliases = prepare_generation_aliases(&config, &root, &mut generation)?;
+    let entry = match &explicit_entry {
+        Some(entry) => {
+            if !entry.is_file() {
+                return Err(WakeError::new(
+                    "WAKE_IO",
+                    format!("entry file does not exist: {}", entry.display()),
+                )
+                .at(entry));
+            }
+            entry
+                .canonicalize()
+                .map(|entry| wake_common::fs::normalize(&entry))
+                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(entry))?
+        }
+        None => virtual_entry_in(&config, &mut generation)?,
+    };
+    let generation = generation.seal()?;
+    Ok(PreparedBuild {
+        config_dir,
+        root,
+        entry,
+        logical_entry,
+        explicit_entry,
+        outdir,
+        config,
+        control_fingerprints,
+        aliases,
+        core_generation: generation.clone(),
+        generation,
+    })
+}
+
+fn build_probe_from_prepared(prepared: &PreparedBuild) -> PreparedBuildProbe {
+    PreparedBuildProbe {
+        config_dir: prepared.config_dir.clone(),
+        root: prepared.root.clone(),
+        logical_entry: prepared.logical_entry.clone(),
+        explicit_entry: prepared.explicit_entry.clone(),
+        outdir: prepared.outdir.clone(),
+        config: prepared.config.clone(),
+        control_fingerprints: prepared.control_fingerprints.clone(),
+    }
+}
+
+fn validate_reserved_build_inputs(
+    config: &wake_config::Config,
+    root: &Path,
+    explicit_entry: Option<&Path>,
+) -> Result<(), WakeError> {
+    let mut inputs = Vec::<(&str, PathBuf)>::new();
+    let entry = explicit_entry
+        .map(|entry| absolute_from(root, entry))
+        .unwrap_or_else(|| virtual_entry_target(root, config));
+    inputs.push(("entry", entry));
+    inputs.extend(
+        config
+            .alias
+            .values()
+            .map(|path| ("resolver alias", absolute_from(root, Path::new(path)))),
+    );
+    inputs.extend(config.component_scan.iter().map(|rule| {
+        (
+            "component scan root",
+            absolute_from(root, Path::new(&rule.cwd)),
+        )
+    }));
+    inputs.extend(config.federation.exposes.values().map(|expose| {
+        (
+            "Federation expose",
+            absolute_from(root, Path::new(&expose.entry)),
+        )
+    }));
+    for (kind, path) in inputs {
+        validate_not_reserved(root, kind, &path)?;
+    }
+    Ok(())
+}
+
+fn validate_not_reserved(root: &Path, kind: &str, path: &Path) -> Result<(), WakeError> {
+    let reserved = wake_common::fs::normalize(&root.join(".wake"));
+    let resolved_reserved = reserved
+        .canonicalize()
+        .map(|path| wake_common::fs::normalize(&path))
+        .unwrap_or_else(|_| reserved.clone());
+    let path = wake_common::fs::normalize(path);
+    let resolved = path
+        .canonicalize()
+        .map(|path| wake_common::fs::normalize(&path))
+        .unwrap_or_else(|_| path.clone());
+    if path.starts_with(&reserved) || resolved.starts_with(&resolved_reserved) {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("{kind} must not point into Wake's reserved `.wake` directory"),
+        )
+        .at(&path));
+    }
+    Ok(())
 }
 
 fn resolve_config_dir(cwd: &Path, config_path: Option<&Path>) -> Result<PathBuf, WakeError> {
@@ -1664,18 +2245,16 @@ fn resolve_config_dir(cwd: &Path, config_path: Option<&Path>) -> Result<PathBuf,
     Ok(wake_config::find_root(&cwd))
 }
 
-fn prepare_aliases_and_scans(
+fn prepare_aliases_and_scans_in(
     config: &wake_config::Config,
     root: &Path,
+    generation: &mut GenerationDraft,
 ) -> Result<Vec<(String, PathBuf)>, WakeError> {
     let mut aliases = config.resolver_aliases(root);
     if config.component_scan.is_empty() {
         return Ok(aliases);
     }
-    let scan_base = root.join(".wake").join("scan");
-    std::fs::create_dir_all(&scan_base)
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&scan_base))?;
-    for rule in &config.component_scan {
+    for (index, rule) in config.component_scan.iter().enumerate() {
         let source = wake_scan::scan(&wake_scan::ScanRule {
             namespace: &rule.namespace,
             scan_dir: &root.join(&rule.cwd),
@@ -1685,120 +2264,894 @@ fn prepare_aliases_and_scans(
             exclude: rule.exclude.as_deref(),
         })
         .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
-        let file = scan_base.join(format!("{}.ts", sanitize_namespace(&rule.namespace)));
-        std::fs::write(&file, source)
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&file))?;
+        let file = generation.write_file(
+            PathBuf::from("scan").join(format!(
+                "{index:04}-{}.ts",
+                sanitize_namespace(&rule.namespace)
+            )),
+            source.as_bytes(),
+        )?;
         aliases.push((format!("@@@/{}", rule.namespace), file));
     }
     Ok(aliases)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BundlerLifetime {
-    OneShot,
-    Session,
+fn prepare_generation_aliases(
+    config: &wake_config::Config,
+    root: &Path,
+    generation: &mut GenerationDraft,
+) -> Result<Vec<(String, PathBuf)>, WakeError> {
+    prepare_aliases_and_scans_in(config, root, generation)
 }
 
-fn create_bundler(
+/// Re-render application-owned virtual inputs after watcher coverage is installed.
+///
+/// Returning `true` means an already-created bundler session cannot be reused because its source
+/// overlay owns a different immutable file tree.
+fn refresh_application_generation(prepared: &mut PreparedBuild) -> Result<bool, WakeError> {
+    let mut draft = GenerationDraft::new(&prepared.root);
+    let aliases = prepare_generation_aliases(&prepared.config, &prepared.root, &mut draft)?;
+    let entry = match &prepared.explicit_entry {
+        Some(entry) => entry.clone(),
+        None => virtual_entry_in(&prepared.config, &mut draft)?,
+    };
+    let (project_root, files) = draft.finish();
+    let changed = !prepared.core_generation.has_same_tree(&files);
+    prepared.aliases = aliases;
+    prepared.entry = entry;
+    if changed {
+        let generation = GenerationView::from_tree(project_root, files)?;
+        prepared.core_generation = generation.clone();
+        prepared.generation = generation;
+    }
+    Ok(changed)
+}
+
+type ComponentScanTopology = (String, String, bool, Option<String>, Option<String>);
+type ProxyTopology = (Vec<String>, String, bool, bool, Vec<(String, String)>);
+type DocsServerTopology = (Option<String>, u16, String, bool, Vec<ProxyTopology>);
+type DocsWorkspaceTopology = Vec<(String, String, String, &'static str, &'static str)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DevTopology {
+    config_dir: PathBuf,
+    root: PathBuf,
+    entry: PathBuf,
+    public_path: String,
+    component_scan: Vec<ComponentScanTopology>,
+    server_protocol: Option<String>,
+    port: u16,
+    host: String,
+    open: bool,
+    proxy: Vec<ProxyTopology>,
+    federation: FederationOptions,
+    federation_browser_target: Option<TargetEnv>,
+}
+
+fn dev_topology(
+    prepared: &PreparedBuild,
+    options: &DevServerOptions,
+    default_port: u16,
+    target_env: &TargetEnv,
+) -> DevTopology {
+    dev_topology_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        &prepared.config,
+        options,
+        default_port,
+        target_env,
+    )
+}
+
+fn dev_probe_topology(
+    prepared: &PreparedBuildProbe,
+    options: &DevServerOptions,
+    default_port: u16,
+    target_env: &TargetEnv,
+) -> DevTopology {
+    dev_topology_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        &prepared.config,
+        options,
+        default_port,
+        target_env,
+    )
+}
+
+fn dev_topology_from(
+    config_dir: &Path,
+    root: &Path,
+    logical_entry: &Path,
+    config: &wake_config::Config,
+    options: &DevServerOptions,
+    default_port: u16,
+    target_env: &TargetEnv,
+) -> DevTopology {
+    let server = &config.dev_server;
+    DevTopology {
+        config_dir: config_dir.to_path_buf(),
+        root: root.to_path_buf(),
+        entry: logical_entry.to_path_buf(),
+        public_path: config.public_path().to_owned(),
+        component_scan: config
+            .component_scan
+            .iter()
+            .map(|rule| {
+                (
+                    rule.namespace.clone(),
+                    rule.cwd.clone(),
+                    rule.generate_source,
+                    rule.include.clone(),
+                    rule.exclude.clone(),
+                )
+            })
+            .collect(),
+        server_protocol: server.server.clone(),
+        port: options.port.or(server.port).unwrap_or(default_port),
+        host: options
+            .host
+            .clone()
+            .or_else(|| server.host.clone())
+            .unwrap_or_else(|| "127.0.0.1".to_owned()),
+        open: options.open.unwrap_or(server.open),
+        proxy: server
+            .proxy
+            .iter()
+            .map(|proxy| {
+                (
+                    proxy.context.clone(),
+                    proxy.target.clone(),
+                    proxy.ws,
+                    proxy.change_origin,
+                    proxy
+                        .path_rewrite
+                        .iter()
+                        .map(|(pattern, replacement)| (pattern.clone(), replacement.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+        federation: config.federation.clone(),
+        federation_browser_target: config.federation.enabled.then(|| target_env.clone()),
+    }
+}
+
+fn dev_topology_change(current: &DevTopology, candidate: &DevTopology) -> Option<String> {
+    if current.config_dir != candidate.config_dir {
+        return Some("configuration source changed".to_owned());
+    }
+    if current.root != candidate.root {
+        return Some("project root changed".to_owned());
+    }
+    if current.entry != candidate.entry {
+        return Some("development entry changed".to_owned());
+    }
+    if current.public_path != candidate.public_path {
+        return Some("public URL base changed".to_owned());
+    }
+    if current.component_scan != candidate.component_scan {
+        return Some("component scan topology changed".to_owned());
+    }
+    if current.server_protocol != candidate.server_protocol
+        || current.port != candidate.port
+        || current.host != candidate.host
+        || current.open != candidate.open
+        || current.proxy != candidate.proxy
+    {
+        return Some("development server or proxy topology changed".to_owned());
+    }
+    if current.federation != candidate.federation
+        || current.federation_browser_target != candidate.federation_browser_target
+    {
+        return Some("Federation topology changed".to_owned());
+    }
+    None
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuildTopology {
+    config_dir: PathBuf,
+    root: PathBuf,
+    entry: PathBuf,
+    outdir: PathBuf,
+    component_scan: Vec<ComponentScanTopology>,
+    federation: FederationOptions,
+}
+
+fn build_topology(prepared: &PreparedBuild) -> BuildTopology {
+    build_topology_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        &prepared.outdir,
+        &prepared.config,
+    )
+}
+
+fn build_probe_topology(prepared: &PreparedBuildProbe) -> BuildTopology {
+    build_topology_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        &prepared.outdir,
+        &prepared.config,
+    )
+}
+
+fn build_topology_from(
+    config_dir: &Path,
+    root: &Path,
+    logical_entry: &Path,
+    outdir: &Path,
+    config: &wake_config::Config,
+) -> BuildTopology {
+    BuildTopology {
+        config_dir: config_dir.to_path_buf(),
+        root: root.to_path_buf(),
+        entry: logical_entry.to_path_buf(),
+        outdir: outdir.to_path_buf(),
+        component_scan: config
+            .component_scan
+            .iter()
+            .map(|rule| {
+                (
+                    rule.namespace.clone(),
+                    rule.cwd.clone(),
+                    rule.generate_source,
+                    rule.include.clone(),
+                    rule.exclude.clone(),
+                )
+            })
+            .collect(),
+        federation: config.federation.clone(),
+    }
+}
+
+fn build_topology_change(current: &BuildTopology, candidate: &BuildTopology) -> Option<String> {
+    if current.config_dir != candidate.config_dir {
+        return Some("configuration source changed".to_owned());
+    }
+    if current.root != candidate.root {
+        return Some("project root changed".to_owned());
+    }
+    if current.entry != candidate.entry {
+        return Some("build entry changed".to_owned());
+    }
+    if current.outdir != candidate.outdir {
+        return Some("build output directory changed".to_owned());
+    }
+    if current.component_scan != candidate.component_scan {
+        return Some("component scan topology changed".to_owned());
+    }
+    if current.federation != candidate.federation {
+        return Some("Federation topology changed".to_owned());
+    }
+    None
+}
+
+fn restart_required_error(reason: impl Into<String>) -> WakeError {
+    WakeError::new(
+        wake_dev_server::DEV_RESTART_REQUIRED_CODE,
+        format!("{}; restart the Wake watch process", reason.into()),
+    )
+}
+
+fn union_watch_interests(left: &[WatchInterest], right: &[WatchInterest]) -> Vec<WatchInterest> {
+    let mut interests = left.iter().chain(right).cloned().collect::<Vec<_>>();
+    interests.sort();
+    interests.dedup();
+    interests
+}
+
+fn recovery_watch_interests(
+    mut interests: Vec<WatchInterest>,
+    root: &Path,
+    error: &WakeError,
+) -> Vec<WatchInterest> {
+    if let Some(path) = error.path.as_deref() {
+        let path = Path::new(path);
+        let interest =
+            if path.file_name().and_then(|name| name.to_str()) == Some(wake_config::CONFIG_FILE) {
+                WatchInterest::exact_file(path)
+            } else {
+                WatchInterest::tree(path)
+            };
+        interests.push(interest.resolve_against(root));
+    }
+    interests.sort();
+    interests.dedup();
+    interests
+}
+
+fn app_dev_plan(
+    prepared: &PreparedBuild,
+    entry: PathBuf,
+    aliases: Vec<(String, PathBuf)>,
+) -> Result<wake_dev_server::DevMountPlan, WakeError> {
+    Ok(wake_dev_server::DevMountPlan {
+        entry,
+        resolve_options: ResolveOptions {
+            alias: aliases,
+            conditions: ["browser", "development", "import", "module", "default"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            ..ResolveOptions::default()
+        },
+        define: build_defines(&prepared.config, true),
+        target_env: resolve_target_env(&prepared.config, &prepared.root)?,
+        jsx_import_source: prepared.config.react.jsx_import_source.clone(),
+        file_system: prepared.generation.file_system(),
+    })
+}
+
+fn prepare_dev_refresh_candidate(
+    mut prepared: PreparedBuild,
+    options: &BuildOptions,
+) -> Result<
+    (
+        PreparedBuild,
+        wake_dev_server::DevMountPlan,
+        Vec<WatchInterest>,
+        Vec<PathBuf>,
+    ),
+    WakeError,
+> {
+    refresh_application_generation(&mut prepared)?;
+    let captured_lock = if prepared.config.federation.enabled
+        && prepared
+            .config
+            .federation
+            .remotes
+            .values()
+            .any(|remote| !remote.dev_follow)
+    {
+        federation::load_production_lock(&prepared)?.map(Arc::new)
+    } else {
+        None
+    };
+    let dev_federation = federation::prepare_dev(
+        &prepared,
+        options,
+        prepared.generation.file_system(),
+        captured_lock,
+    )?;
+    prepared.install_product_inputs(&dev_federation.generated_inputs)?;
+    let mut watch_interests = project_watch_interests(&prepared);
+    extend_runtime_source_interests(&prepared, &mut watch_interests, &dev_federation.aliases);
+    let mut aliases = prepared.aliases.clone();
+    aliases.extend(dev_federation.aliases);
+    let plan = app_dev_plan(&prepared, dev_federation.entry, aliases)?;
+    let generated_paths = prepared.generation.logical_inventory();
+    Ok((prepared, plan, watch_interests, generated_paths))
+}
+
+#[allow(clippy::result_large_err)]
+fn make_dev_refresh_candidate(
+    state: Arc<Mutex<RefreshState<PreparedBuild, PreparedBuildProbe>>>,
+    id: u64,
+    draft: PreparedBuildProbe,
+    options: BuildOptions,
+) -> wake_dev_server::DevMountCandidate {
+    let preliminary_interests = probe_watch_interests(&draft);
+    let accepted_slot = Arc::new(Mutex::new(None::<PreparedBuild>));
+    let materialize_slot = Arc::clone(&accepted_slot);
+    let materialize_state = Arc::clone(&state);
+    let materialize_draft = draft.clone();
+    wake_dev_server::DevMountCandidate::new(
+        preliminary_interests,
+        move || {
+            let result = materialize_build_probe(materialize_draft, true)
+                .and_then(|prepared| prepare_dev_refresh_candidate(prepared, &options));
+            match result {
+                Ok((prepared, plan, watch_interests, _generated_paths)) => {
+                    let generated_paths = {
+                        let state = materialize_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        generation_changed_paths(&state.accepted.generation, &prepared.generation)
+                    };
+                    *materialize_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(prepared);
+                    Ok(wake_dev_server::DevMountMaterialization {
+                        plan,
+                        watch_interests,
+                        generated_paths,
+                    })
+                }
+                Err(error) => {
+                    let diagnostic = wake_error_diagnostic(error);
+                    let mut state = materialize_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let CandidateState::Pending {
+                        id: current_id,
+                        last_error,
+                        ..
+                    } = &mut state.candidate
+                        && *current_id == id
+                    {
+                        *last_error = Some(diagnostic.clone());
+                    }
+                    Err(diagnostic)
+                }
+            }
+        },
+        move |outcome| {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = matches!(
+                &state.candidate,
+                CandidateState::Pending { id: current_id, .. } if *current_id == id
+            );
+            if !current {
+                return;
+            }
+            match outcome {
+                wake_dev_server::RefreshOutcome::Committed => {
+                    if let Some(accepted) = accepted_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        state.accepted = accepted;
+                        state.candidate = CandidateState::Stable;
+                    }
+                }
+                wake_dev_server::RefreshOutcome::Superseded => {
+                    state.candidate = CandidateState::Stable;
+                }
+                wake_dev_server::RefreshOutcome::RetryableFailure
+                | wake_dev_server::RefreshOutcome::Aborted => {}
+            }
+        },
+    )
+}
+
+fn alias_watch_interest(path: PathBuf) -> WatchInterest {
+    // An alias target can change shape while the server is alive (missing -> dotted directory,
+    // file -> directory). A source tree matches the exact root in every shape, then promotes to a
+    // recursive registration once a directory exists.
+    WatchInterest::tree(path)
+}
+
+fn project_control_interests(prepared: &PreparedBuild) -> Vec<WatchInterest> {
+    project_control_interests_from(
+        &prepared.config_dir,
+        &prepared.root,
+        prepared.explicit_entry.as_deref(),
+    )
+}
+
+fn project_control_paths(
+    config_dir: &Path,
+    root: &Path,
+    explicit_entry: Option<&Path>,
+) -> Vec<PathBuf> {
+    const INSTALL_LOCKS: [&str; 3] = ["yarn.lock", "package-lock.json", "pnpm-lock.yaml"];
+
+    let mut paths = vec![
+        config_dir.join(wake_config::CONFIG_FILE),
+        root.join(".browserslistrc"),
+        root.join("package.json"),
+        root.join(".pnp.cjs"),
+        root.join("yarn.lock"),
+        root.join("package-lock.json"),
+        root.join("pnpm-lock.yaml"),
+        root.join("wake-federation.lock"),
+    ];
+    if root.join(".pnp.cjs").is_file() {
+        paths.push(root.join(".pnp.data.json"));
+    }
+
+    // Resolver discovery starts at the logical project entry. A user-supplied entry may live
+    // outside the project root, so it contributes a second discovery chain. Generated `.wake`
+    // namespaces never become control owners.
+    let mut discovery_roots = vec![root];
+    if let Some(parent) = explicit_entry.and_then(Path::parent)
+        && parent != root
+    {
+        discovery_roots.push(parent);
+    }
+    for start in discovery_roots {
+        let pnp_root = start
+            .ancestors()
+            .find(|ancestor| ancestor.join(".pnp.cjs").is_file());
+        let install_root = start.ancestors().find(|ancestor| {
+            INSTALL_LOCKS
+                .iter()
+                .any(|name| ancestor.join(name).is_file())
+        });
+        let discovery_boundary = pnp_root.or(install_root).unwrap_or(start);
+        // Match resolver PnP discovery: every closer `.pnp.cjs` marker can replace the currently
+        // selected manifest, but sibling data/lock files matter only at the first actual root.
+        for ancestor in start.ancestors() {
+            let loader = ancestor.join(".pnp.cjs");
+            paths.push(loader.clone());
+            if loader.is_file() {
+                paths.push(ancestor.join(".pnp.data.json"));
+                paths.push(ancestor.join("yarn.lock"));
+                if ancestor.join("package.json").is_file() {
+                    paths.push(ancestor.join("package.json"));
+                }
+                break;
+            }
+            if ancestor == discovery_boundary {
+                break;
+            }
+        }
+
+        // Lockfiles are invalidation witnesses rather than resolver configuration. Retain only
+        // the nearest discovered installation root, while watching its sibling lock names so a
+        // package-manager switch cannot pass unnoticed.
+        if let Some(install_root) = install_root {
+            paths.extend(INSTALL_LOCKS.iter().map(|name| install_root.join(name)));
+            let package = install_root.join("package.json");
+            if package.is_file() {
+                paths.push(package);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn project_control_interests_from(
+    config_dir: &Path,
+    root: &Path,
+    explicit_entry: Option<&Path>,
+) -> Vec<WatchInterest> {
+    project_control_paths(config_dir, root, explicit_entry)
+        .into_iter()
+        .map(|path| WatchInterest::exact_file(path).resolve_against(root))
+        .collect()
+}
+
+fn project_watch_interests(prepared: &PreparedBuild) -> Vec<WatchInterest> {
+    project_watch_interests_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        prepared.explicit_entry.as_deref(),
+        &prepared.config,
+    )
+}
+
+fn probe_watch_interests(prepared: &PreparedBuildProbe) -> Vec<WatchInterest> {
+    project_watch_interests_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        prepared.explicit_entry.as_deref(),
+        &prepared.config,
+    )
+}
+
+fn project_watch_interests_from(
+    config_dir: &Path,
+    root: &Path,
+    logical_entry: &Path,
+    explicit_entry: Option<&Path>,
+    config: &wake_config::Config,
+) -> Vec<WatchInterest> {
+    let source = {
+        let source = root.join("src");
+        if source.is_dir() {
+            source
+        } else {
+            root.to_path_buf()
+        }
+    };
+    let source_interest = if source == root {
+        WatchInterest::tree(source).excluding_tree(root.join(".wake"))
+    } else {
+        WatchInterest::tree(source)
+    };
+    let mut interests = vec![
+        source_interest,
+        WatchInterest::all_files_tree(root.join("public")),
+        WatchInterest::exact_file(root.join("index.html")),
+    ];
+    // Physical generated entries are projected at stable `.wake` module identities and are
+    // driven by their source facts. Only a user-owned source entry is itself a watch input.
+    if !logical_entry.starts_with(root.join(".wake")) {
+        interests.push(WatchInterest::exact_file(logical_entry.to_path_buf()));
+    }
+    interests.extend(project_control_interests_from(
+        config_dir,
+        root,
+        explicit_entry,
+    ));
+    interests.extend(
+        config
+            .component_scan
+            .iter()
+            .map(|rule| WatchInterest::tree(root.join(&rule.cwd))),
+    );
+    // Only configured aliases are additional source ownership. Reserved `.wake` inputs were
+    // rejected during probing, so no physical generated-output exception is needed here.
+    interests.extend(
+        config
+            .alias
+            .values()
+            .map(|target| alias_watch_interest(absolute_from(root, Path::new(target)))),
+    );
+    interests.extend(
+        config
+            .federation
+            .exposes
+            .values()
+            .map(|expose| alias_watch_interest(absolute_from(root, Path::new(&expose.entry)))),
+    );
+    interests = interests
+        .into_iter()
+        .map(|interest| interest.resolve_against(root))
+        .collect();
+    interests.sort();
+    interests.dedup();
+    interests
+}
+
+fn build_context_watch_interests(
+    prepared: &PreparedBuild,
+    options: &BuildOptions,
+) -> Vec<WatchInterest> {
+    let discovery = build_context_discovery_interests(options, &prepared.root);
+    build_context_watch_interests_with_floor(prepared, options, &discovery)
+}
+
+fn build_context_watch_interests_with_floor(
+    prepared: &PreparedBuild,
+    options: &BuildOptions,
+    discovery: &[WatchInterest],
+) -> Vec<WatchInterest> {
+    let project = build_context_interests_with_output(
+        project_watch_interests(prepared),
+        &prepared.root,
+        &prepared.outdir,
+        options,
+    );
+    union_watch_interests(&project, discovery)
+}
+
+fn build_context_probe_watch_interests(
+    prepared: &PreparedBuildProbe,
+    options: &BuildOptions,
+) -> Vec<WatchInterest> {
+    let discovery = build_context_discovery_interests(options, &prepared.root);
+    build_context_probe_watch_interests_with_floor(prepared, options, &discovery)
+}
+
+fn build_context_probe_watch_interests_with_floor(
+    prepared: &PreparedBuildProbe,
+    options: &BuildOptions,
+    discovery: &[WatchInterest],
+) -> Vec<WatchInterest> {
+    let project = build_context_interests_with_output(
+        probe_watch_interests(prepared),
+        &prepared.root,
+        &prepared.outdir,
+        options,
+    );
+    union_watch_interests(&project, discovery)
+}
+
+fn build_context_interests_with_output(
+    mut interests: Vec<WatchInterest>,
+    root: &Path,
+    outdir: &Path,
+    options: &BuildOptions,
+) -> Vec<WatchInterest> {
+    if options.write {
+        interests = interests
+            .into_iter()
+            .map(|interest| {
+                interest
+                    .excluding_tree(outdir.to_path_buf())
+                    .resolve_against(root)
+            })
+            .collect();
+        interests.sort();
+        interests.dedup();
+    }
+    interests
+}
+
+fn extend_runtime_source_interests(
+    prepared: &PreparedBuild,
+    interests: &mut Vec<WatchInterest>,
+    aliases: &[(String, PathBuf)],
+) {
+    let internal = prepared.root.join(".wake");
+    interests.extend(
+        aliases
+            .iter()
+            .map(|(_, path)| path)
+            .filter(|path| !path.starts_with(&internal))
+            .map(|path| alias_watch_interest(path.clone()).resolve_against(&prepared.root)),
+    );
+    interests.sort();
+    interests.dedup();
+}
+
+fn changed_matches(changed: &[PathBuf], interests: &[WatchInterest]) -> bool {
+    changed
+        .iter()
+        .any(|path| interests.iter().any(|interest| interest.matches(path)))
+}
+
+fn control_file_fingerprint(path: &Path) -> ControlFingerprint {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return ControlFingerprint::Unreadable(error.kind()),
+    };
+    let mut context = DigestContext::new(&SHA256);
+    let mut len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => return ControlFingerprint::Unreadable(error.kind()),
+        };
+        context.update(&buffer[..read]);
+        len = len.saturating_add(read as u64);
+    }
+    let mut sha256 = [0_u8; 32];
+    sha256.copy_from_slice(context.finish().as_ref());
+    ControlFingerprint::Present { len, sha256 }
+}
+
+fn prepared_control_fingerprint(prepared: &PreparedBuild, path: &Path) -> ControlFingerprint {
+    captured_control_fingerprint(&prepared.control_fingerprints, path)
+}
+
+fn captured_control_fingerprint(
+    controls: &[ControlFileFingerprint],
+    path: &Path,
+) -> ControlFingerprint {
+    controls
+        .iter()
+        .find_map(|(control, fingerprint)| (control == path).then(|| fingerprint.clone()))
+        .expect("authoritative project controls are captured by the build probe")
+}
+
+fn control_snapshot_changed_error(config_dir: &Path) -> WakeError {
+    WakeError::new(
+        "WAKE_WATCH_SNAPSHOT_CHANGED",
+        "project control files changed while preparing the build; retry from a fresh snapshot",
+    )
+    .at(&config_dir.join(wake_config::CONFIG_FILE))
+}
+
+fn stable_project_control_snapshot(
+    config_before: &ControlFingerprint,
+    config_dir: &Path,
+    root: &Path,
+    explicit_entry: Option<&Path>,
+) -> Result<Vec<ControlFileFingerprint>, WakeError> {
+    if control_file_fingerprint(&config_dir.join(wake_config::CONFIG_FILE)) != *config_before {
+        return Err(control_snapshot_changed_error(config_dir));
+    }
+    let first = build_control_fingerprints(config_dir, root, explicit_entry);
+    let second = build_control_fingerprints(config_dir, root, explicit_entry);
+    if first != second {
+        return Err(control_snapshot_changed_error(config_dir));
+    }
+    Ok(second)
+}
+
+fn federation_lock_changed(
+    changed: &[PathBuf],
+    rescan: bool,
+    interest: &WatchInterest,
+    path: &Path,
+    accepted: &ControlFingerprint,
+) -> bool {
+    (rescan || changed_matches(changed, std::slice::from_ref(interest)))
+        && control_file_fingerprint(path) != *accepted
+}
+
+fn wake_error_diagnostic(error: WakeError) -> Diagnostic {
+    let WakeError {
+        code,
+        message,
+        path,
+        diagnostics,
+    } = error;
+    let mut diagnostic = Diagnostic::error(message).with_code(code);
+    if let Some(path) = path {
+        diagnostic = diagnostic.with_path(path);
+    }
+    for detail in diagnostics {
+        diagnostic = diagnostic.with_note(format!(
+            "{}{}: {}",
+            detail
+                .code
+                .as_deref()
+                .map(|code| format!("[{code}] "))
+                .unwrap_or_default(),
+            detail.path.as_deref().unwrap_or("build"),
+            detail.message
+        ));
+    }
+    diagnostic
+}
+
+fn create_bundler_options(
     prepared: &PreparedBuild,
     options: &BuildOptions,
     project_defaults: bool,
-    lifetime: BundlerLifetime,
-) -> Result<IncrementalBundler, WakeError> {
-    let mut bundler = match lifetime {
-        BundlerLifetime::OneShot => IncrementalBundler::new_one_shot(Arc::new(OsFileSystem)),
-        BundlerLifetime::Session => IncrementalBundler::new(Arc::new(OsFileSystem)),
-    };
-    bundler.set_project_root(prepared.root.clone());
-    bundler.set_resolve_options(ResolveOptions {
-        alias: prepared.aliases.clone(),
-        ..ResolveOptions::default()
-    });
-    bundler.set_define(build_defines(&prepared.config, !project_defaults));
-    bundler.set_target_env(resolve_target_env(&prepared.config, &prepared.root)?);
-    bundler.set_jsx_runtime(
-        false,
-        Box::leak(
-            prepared
+) -> Result<BundlerBuildOptions, WakeError> {
+    let federation = if prepared.config.federation.enabled {
+        FederationBuildPlan {
+            remotes: prepared
                 .config
-                .react
-                .jsx_import_source
-                .clone()
-                .into_boxed_str(),
-        ),
-    );
-    bundler.enable_css_in_js();
-    bundler.set_asset_inline_limit(4096);
-    bundler.set_public_path(prepared.config.public_path());
-    if project_defaults {
-        bundler.enable_css_extraction();
-        bundler.enable_dead_module_elimination();
-        bundler.enable_tree_shaking();
-        bundler.enable_minify();
-        bundler.enable_code_splitting();
-        if options.source_map {
-            bundler.enable_sourcemap();
+                .federation
+                .remotes
+                .keys()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
+            shared: prepared
+                .config
+                .federation
+                .shared
+                .iter()
+                .map(|(share_key, shared)| {
+                    (share_key.clone(), share_key.clone(), shared.scope.clone())
+                })
+                .collect(),
+            entry_export: (!prepared.config.federation.shared.is_empty()).then(|| {
+                FederationEntryExport::page_scoped(
+                    prepared.config.federation.name.as_str(),
+                    federation::HOST_EXPOSE,
+                )
+            }),
+            ..FederationBuildPlan::default()
         }
-    } else if options.source_map {
-        bundler.enable_sourcemap();
-    }
-    if options.cache {
-        let cache_dir = prepared.root.join(".wake");
-        std::fs::create_dir_all(&cache_dir)
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&cache_dir))?;
-        bundler.enable_persistent_cache(cache_dir.join("cache.bin"));
-    }
-    Ok(bundler)
-}
-
-fn create_bundle_bundler(
-    prepared: &PreparedBuild,
-    options: &ResolvedBundleOptions,
-    lifetime: BundlerLifetime,
-) -> Result<IncrementalBundler, WakeError> {
-    let mut bundler = match lifetime {
-        BundlerLifetime::OneShot => IncrementalBundler::new_one_shot(Arc::new(OsFileSystem)),
-        BundlerLifetime::Session => IncrementalBundler::new(Arc::new(OsFileSystem)),
+    } else {
+        FederationBuildPlan::default()
     };
-    bundler
-        .set_project_root(prepared.root.clone())
-        .set_resolve_options(ResolveOptions {
+
+    Ok(BundlerBuildOptions {
+        project_root: Some(prepared.root.clone()),
+        resolve: ResolveOptions {
             alias: prepared.aliases.clone(),
             ..ResolveOptions::default()
-        })
-        .set_platform(options.platform)
-        .set_module_format(options.format)
-        .set_external_packages(options.external.clone())
-        .set_define(build_defines(
-            &prepared.config,
-            options.platform == BuildPlatform::Browser,
-        ))
-        .set_jsx_runtime(
-            false,
-            Box::leak(
-                prepared
-                    .config
-                    .react
-                    .jsx_import_source
-                    .clone()
-                    .into_boxed_str(),
-            ),
-        )
-        .set_content_hash(false);
+        },
+        define: build_defines(&prepared.config, !project_defaults),
+        extract_css: project_defaults,
+        asset_inline_limit: 4096,
+        public_path: prepared.config.public_path().to_owned(),
+        minify: project_defaults,
+        dead_module_elimination: project_defaults,
+        source_map: options.source_map,
+        css_in_js: true,
+        tree_shaking: project_defaults,
+        code_splitting: project_defaults,
+        persistent_cache: persistent_cache_path(&prepared.root, options.cache, "cache.bin"),
+        jsx: JsxOptions {
+            development: false,
+            import_source: prepared.config.react.jsx_import_source.clone(),
+        },
+        federation,
+        target_env: resolve_target_env(&prepared.config, &prepared.root)?,
+        ..BundlerBuildOptions::default()
+    })
+}
 
-    if options.platform == BuildPlatform::Browser {
-        bundler.enable_css_in_js();
-        bundler.set_public_path(prepared.config.public_path());
-        // 省略 outfile 时保持旧的内存 bundle 资源阈值；精确 outfile 是严格单文件，
-        // 因此必须内联资源，不能在目标目录旁静默生成额外文件。
-        bundler.set_asset_inline_limit(if options.outfile.is_some() {
-            usize::MAX
-        } else {
-            4096
-        });
-    }
-
-    let target = match options.platform {
+fn create_bundle_options(
+    prepared: &PreparedBuild,
+    options: &ResolvedBundleOptions,
+) -> Result<BundlerBuildOptions, WakeError> {
+    let target_env = match options.platform {
         BuildPlatform::Browser => resolve_target_env(&prepared.config, &prepared.root)?,
         BuildPlatform::Node => node_target_env(
             options
@@ -1807,23 +3160,47 @@ fn create_bundle_bundler(
                 .expect("Node bundle target is normalized"),
         )?,
     };
-    bundler.set_target_env(target);
-    if options.minify {
-        bundler
-            .enable_minify()
-            .enable_tree_shaking()
-            .enable_dead_module_elimination();
-    }
-    if options.source_map {
-        bundler.enable_sourcemap();
-    }
-    if options.cache {
-        let cache_dir = prepared.root.join(".wake");
-        std::fs::create_dir_all(&cache_dir)
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&cache_dir))?;
-        bundler.enable_persistent_cache(cache_dir.join("bundle-cache.bin"));
-    }
-    Ok(bundler)
+    let browser = options.platform == BuildPlatform::Browser;
+    Ok(BundlerBuildOptions {
+        project_root: Some(prepared.root.clone()),
+        resolve: ResolveOptions {
+            alias: prepared.aliases.clone(),
+            ..ResolveOptions::default()
+        },
+        platform: options.platform,
+        module_format: options.format,
+        external_packages: options.external.clone(),
+        define: build_defines(&prepared.config, browser),
+        // 省略 outfile 时保持旧的内存 browser bundle 资源阈值；精确 outfile 是严格
+        // 单文件，因此必须内联资源，不能在目标目录旁静默生成额外文件。
+        asset_inline_limit: if browser && options.outfile.is_none() {
+            4096
+        } else {
+            usize::MAX
+        },
+        public_path: if browser {
+            prepared.config.public_path().to_owned()
+        } else {
+            BundlerBuildOptions::default().public_path
+        },
+        minify: options.minify,
+        dead_module_elimination: options.minify,
+        source_map: options.source_map,
+        css_in_js: browser,
+        tree_shaking: options.minify,
+        content_hash: false,
+        persistent_cache: persistent_cache_path(&prepared.root, options.cache, "bundle-cache.bin"),
+        jsx: JsxOptions {
+            development: false,
+            import_source: prepared.config.react.jsx_import_source.clone(),
+        },
+        target_env,
+        ..BundlerBuildOptions::default()
+    })
+}
+
+fn persistent_cache_path(root: &Path, enabled: bool, file_name: &str) -> Option<PathBuf> {
+    enabled.then(|| root.join(".wake").join(file_name))
 }
 
 fn node_target_env(target: &str) -> Result<TargetEnv, WakeError> {
@@ -1842,26 +3219,45 @@ fn node_target_env(target: &str) -> Result<TargetEnv, WakeError> {
     Ok(TargetEnv::new(vec![BrowserTarget::new("node", version)]))
 }
 
-fn create_session(
-    prepared: &PreparedBuild,
-    options: &BuildOptions,
-    project_defaults: bool,
-) -> Result<BuildSession, WakeError> {
-    Ok(BuildSession::from_incremental(create_bundler(
-        prepared,
-        options,
-        project_defaults,
-        BundlerLifetime::Session,
-    )?))
+struct ProjectBuildSession {
+    generation: BuildGeneration,
+    application: BuildSession,
+    federation_inputs: federation::ProductionFederationInputs,
 }
 
-fn finish_output(
+fn create_session(
+    prepared: &mut PreparedBuild,
+    options: &BuildOptions,
+    project_defaults: bool,
+) -> Result<ProjectBuildSession, WakeError> {
+    let bundler_options = create_bundler_options(prepared, options, project_defaults)?;
+    let federation_inputs = federation::render_production_inputs(prepared, options)?;
+    prepared.install_product_inputs(federation_inputs.files())?;
+    let generation = BuildGeneration::new(prepared.generation.file_system());
+    let application = generation.retained_session(bundler_options);
+    Ok(ProjectBuildSession {
+        generation,
+        application,
+        federation_inputs,
+    })
+}
+
+struct PreparedApplicationOutput {
+    result: BuildResult,
+    output: BuildOutput,
+    federation: federation::FederationArtifacts,
+    html: String,
+}
+
+fn prepare_application_output(
     prepared: &PreparedBuild,
     options: &BuildOptions,
     output: BuildOutput,
     duration_ms: f64,
-) -> Result<BuildResult, WakeError> {
-    let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root);
+    federation: federation::FederationArtifacts,
+    diagnostic_file_system: &dyn FileSystem,
+) -> Result<PreparedApplicationOutput, WakeError> {
+    let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root, diagnostic_file_system);
     if output.has_errors() {
         return Err(
             WakeError::new("WAKE_BUILD", "Wake build failed").with_diagnostic_infos(diagnostics)
@@ -1873,43 +3269,107 @@ fn finish_output(
         .iter()
         .map(|chunk| OutputFile {
             path: chunk.file_name.clone(),
-            kind: "chunk".to_string(),
+            kind: OutputFileKind::Chunk,
             bytes: chunk.code.len(),
         })
         .chain(output.assets.iter().map(|asset| OutputFile {
             path: asset.file_name.clone(),
-            kind: if asset.is_css { "css" } else { "asset" }.to_string(),
+            kind: if asset.is_css {
+                OutputFileKind::Css
+            } else {
+                OutputFileKind::Asset
+            },
             bytes: asset.bytes.len(),
         }))
         .collect::<Vec<_>>();
-
-    let output_dir = if options.write {
-        write_build_output(&output, &prepared.outdir)?;
-        let html = emit_html(&output, &prepared.config);
-        let html_path = prepared.outdir.join("index.html");
-        std::fs::write(&html_path, html.as_bytes())
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&html_path))?;
+    files.extend(federation.output_files());
+    let html = emit_html(
+        &output,
+        &prepared.config,
+        federation.bootstrap_file.as_deref(),
+    );
+    if options.write {
         files.push(OutputFile {
             path: "index.html".to_string(),
-            kind: "html".to_string(),
+            kind: OutputFileKind::Html,
             bytes: html.len(),
         });
-        Some(prepared.outdir.to_string_lossy().into_owned())
-    } else {
-        None
-    };
+    }
 
-    Ok(BuildResult {
-        success: true,
-        module_count: output.module_count,
-        updated_module_count: output.updated_module_count,
-        cached_module_count: output.cached_module_count,
-        duration_ms,
-        output_dir,
-        code: (!options.write).then(|| output.bundle.clone()),
-        files,
-        diagnostics,
+    Ok(PreparedApplicationOutput {
+        result: BuildResult {
+            success: true,
+            module_count: output.module_count + federation.module_count,
+            updated_module_count: output.updated_module_count + federation.updated_module_count,
+            cached_module_count: output.cached_module_count + federation.cached_module_count,
+            duration_ms,
+            output_dir: None,
+            code: (!options.write).then(|| output.bundle.clone()),
+            files,
+            diagnostics,
+        },
+        output,
+        federation,
+        html,
     })
+}
+
+fn write_application_output(
+    prepared: &PreparedBuild,
+    application: &PreparedApplicationOutput,
+    stage: &Path,
+) -> Result<(), WakeError> {
+    write_build_output(&application.output, stage)?;
+    application.federation.write_public_to(stage)?;
+    let html_path = output_file_path(stage, "index.html")?;
+    atomic_write(&html_path, application.html.as_bytes())?;
+    // Hidden source maps are written before the public tree commits. If this step fails, the
+    // previously published generation remains untouched.
+    application
+        .federation
+        .write_hidden_source_maps_to(&prepared.root)
+}
+
+fn finish_output(
+    prepared: &PreparedBuild,
+    options: &BuildOptions,
+    output: BuildOutput,
+    started: Instant,
+    federation_generation: Option<federation::PreparedFederationGeneration>,
+    generation: &mut BuildGeneration,
+    cancellation: &CancellationToken,
+) -> Result<BuildResult, WakeError> {
+    cancellation.check()?;
+    let federation = federation::build_artifacts(
+        prepared,
+        &output,
+        federation_generation,
+        generation,
+        cancellation,
+    )?;
+    cancellation.check()?;
+    let diagnostic_file_system = generation.file_system_view();
+    let mut application = prepare_application_output(
+        prepared,
+        options,
+        output,
+        0.0,
+        federation,
+        diagnostic_file_system.as_ref(),
+    )?;
+    if options.write {
+        let (_, target) = publish_staged_output(
+            &prepared.root,
+            &[prepared.entry.as_path()],
+            &prepared.outdir,
+            OutputProduct::Application,
+            cancellation,
+            |stage| write_application_output(prepared, &application, stage),
+        )?;
+        application.result.output_dir = Some(target.to_string_lossy().into_owned());
+    }
+    application.result.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(application.result)
 }
 
 fn finish_bundle(
@@ -1917,8 +3377,11 @@ fn finish_bundle(
     options: &ResolvedBundleOptions,
     output: BuildOutput,
     duration_ms: f64,
+    diagnostic_file_system: &dyn FileSystem,
+    protected_inputs: &[PathBuf],
+    cancellation: &CancellationToken,
 ) -> Result<BundleResult, WakeError> {
-    let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root);
+    let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root, diagnostic_file_system);
     if output.has_errors() {
         return Err(
             WakeError::new("WAKE_BUILD", "Wake bundle failed").with_diagnostic_infos(diagnostics)
@@ -1960,23 +3423,28 @@ fn finish_bundle(
         code.push('\n');
     }
     if let Some(path) = &output_file {
+        let mut candidates = vec![ExactOutput::write(path, code.as_bytes())];
         if let (Some(map), Some(map_path)) = (&source_map, &source_map_file) {
-            atomic_write(map_path, map.as_bytes())?;
+            candidates.push(ExactOutput::write(map_path, map.as_bytes()));
         }
-        atomic_write(path, code.as_bytes())?;
+        cancellation.commit(|| publish_exact_outputs(&candidates, protected_inputs))?;
     }
     let mut files = vec![OutputFile {
         path: output_file
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| output.entry().file_name.clone()),
-        kind: "chunk".to_string(),
+        kind: OutputFileKind::Chunk,
         bytes: code.len(),
     }];
     if output_file.is_none() {
         files.extend(output.assets.iter().map(|asset| OutputFile {
             path: asset.file_name.clone(),
-            kind: if asset.is_css { "css" } else { "asset" }.to_string(),
+            kind: if asset.is_css {
+                OutputFileKind::Css
+            } else {
+                OutputFileKind::Asset
+            },
             bytes: asset.bytes.len(),
         }));
     }
@@ -1986,7 +3454,7 @@ fn finish_bundle(
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_else(|| format!("{}.map", output.entry().file_name)),
-            kind: "map".to_string(),
+            kind: OutputFileKind::SourceMap,
             bytes: map.len(),
         });
     }
@@ -2069,24 +3537,39 @@ fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+fn output_file_path(outdir: &Path, relative: impl AsRef<Path>) -> Result<PathBuf, WakeError> {
+    let relative = relative.as_ref();
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(WakeError::new(
+            "WAKE_INTERNAL",
+            format!(
+                "generated output path must be a non-empty relative path without traversal: {}",
+                relative.display()
+            ),
+        ));
+    }
+    Ok(outdir.join(relative))
+}
+
 fn write_build_output(output: &BuildOutput, outdir: &Path) -> Result<(), WakeError> {
-    clean_outdir(outdir)?;
     std::fs::create_dir_all(outdir)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(outdir))?;
     for chunk in &output.chunks {
-        let path = outdir.join(&chunk.file_name);
-        std::fs::write(&path, &chunk.code)
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
+        let path = output_file_path(outdir, &chunk.file_name)?;
+        atomic_write(&path, chunk.code.as_bytes())?;
         if let Some(map) = &chunk.source_map {
-            let map_path = outdir.join(format!("{}.map", chunk.file_name));
-            std::fs::write(&map_path, map)
-                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&map_path))?;
+            let map_path = output_file_path(outdir, format!("{}.map", chunk.file_name))?;
+            atomic_write(&map_path, map.as_bytes())?;
         }
     }
     for asset in &output.assets {
-        let path = outdir.join(&asset.file_name);
-        std::fs::write(&path, &asset.bytes)
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
+        let path = output_file_path(outdir, &asset.file_name)?;
+        atomic_write(&path, &asset.bytes)?;
     }
     let manifest = serde_json::json!({
         "entry": output.entry().file_name,
@@ -2097,31 +3580,54 @@ fn write_build_output(output: &BuildOutput, outdir: &Path) -> Result<(), WakeErr
         })).collect::<Vec<_>>(),
         "assets": output.assets.iter().map(|asset| &asset.file_name).collect::<Vec<_>>(),
     });
-    let path = outdir.join("manifest.json");
-    std::fs::write(
+    let path = output_file_path(outdir, "manifest.json")?;
+    atomic_write(
         &path,
-        serde_json::to_vec_pretty(&manifest).expect("manifest serialization"),
-    )
-    .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
+        &serde_json::to_vec_pretty(&manifest).expect("manifest serialization"),
+    )?;
     Ok(())
 }
 
-fn emit_html(output: &BuildOutput, config: &wake_config::Config) -> String {
-    let scripts = output
-        .chunks
-        .iter()
-        .filter(|chunk| chunk.is_entry)
-        .map(|chunk| chunk.file_name.clone())
-        .collect::<Vec<_>>();
+fn emit_html(
+    output: &BuildOutput,
+    config: &wake_config::Config,
+    federation_bootstrap: Option<&str>,
+) -> String {
+    let scripts = if federation_bootstrap.is_some() {
+        Vec::new()
+    } else {
+        output
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.is_entry)
+            .map(|chunk| chunk.file_name.clone())
+            .collect::<Vec<_>>()
+    };
     let styles = output.entry().styles.clone();
-    wake_html::generate(
+    let mut html = wake_html::generate(
         None,
         &wake_html::HtmlInputs {
             scripts: &scripts,
             styles: &styles,
             public_path: config.public_path(),
         },
-    )
+    );
+    if let Some(bootstrap) = federation_bootstrap {
+        let src = if config.public_path().is_empty() {
+            bootstrap.to_owned()
+        } else if config.public_path().ends_with('/') {
+            format!("{}{bootstrap}", config.public_path())
+        } else {
+            format!("{}/{bootstrap}", config.public_path())
+        };
+        let script = format!("<script type=\"module\" src=\"{src}\"></script>\n");
+        if let Some(position) = html.find("</head>") {
+            html.insert_str(position, &script);
+        } else {
+            html.push_str(&script);
+        }
+    }
+    html
 }
 fn build_defines(config: &wake_config::Config, development: bool) -> Vec<(String, String)> {
     let node_env = if development {
@@ -2140,6 +3646,12 @@ fn build_defines(config: &wake_config::Config, development: bool) -> Vec<(String
         ),
     ];
     for (key, value) in &config.define {
+        // `import.meta.hot` is a capability boundary, not an ordinary user define. Wake emits
+        // classic-script chunks and its browser protocol performs full-page Live Reload, so no
+        // caller may synthesize a truthy module-HMR object through configuration.
+        if key == "import.meta.hot" {
+            continue;
+        }
         if let Some(existing) = values.iter_mut().find(|(name, _)| name == key) {
             existing.1 = value.clone();
         } else {
@@ -2163,37 +3675,277 @@ fn resolve_target_env(config: &wake_config::Config, root: &Path) -> Result<Targe
     Ok(environment)
 }
 
-fn virtual_entry(root: &Path, config: &wake_config::Config) -> Result<PathBuf, WakeError> {
+fn virtual_entry_target(root: &Path, config: &wake_config::Config) -> PathBuf {
     let target = config
         .html
         .entry
         .as_deref()
         .unwrap_or("src/entry.tsx")
         .replace('\\', "/");
-    let dir = root.join(".wake");
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&dir))?;
-    let path = dir.join("entry.tsx");
-    std::fs::write(&path, format!("import(\"@@/{target}\");\n"))
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
-    Ok(path)
+    absolute_from(root, Path::new(&target))
 }
 
-fn clean_outdir(outdir: &Path) -> Result<(), WakeError> {
-    if outdir.exists() {
-        if outdir.file_name().is_none() || outdir == Path::new(".") {
-            return Err(WakeError::new(
-                "WAKE_CONFIG",
-                format!(
-                    "refusing to clean unsafe output directory: {}",
-                    outdir.display()
-                ),
-            ));
+fn virtual_entry_in(
+    config: &wake_config::Config,
+    generation: &mut GenerationDraft,
+) -> Result<PathBuf, WakeError> {
+    let target = config
+        .html
+        .entry
+        .as_deref()
+        .unwrap_or("src/entry.tsx")
+        .replace('\\', "/");
+    generation.write_file(
+        Path::new("entry.tsx"),
+        format!("import(\"@@/{target}\");\n").as_bytes(),
+    )
+}
+
+fn metadata_is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn resolve_physical_output_path(path: &Path) -> Result<PathBuf, WakeError> {
+    if !path.is_absolute() {
+        return Err(WakeError::new(
+            "WAKE_INTERNAL",
+            format!(
+                "output path was not resolved to an absolute path: {}",
+                path.display()
+            ),
+        )
+        .at(path));
+    }
+
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    format!(
+                        "refusing to publish output through a symbolic link or reparse point: {}",
+                        ancestor.display()
+                    ),
+                )
+                .at(ancestor));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(WakeError::new("WAKE_IO", error.to_string()).at(ancestor));
+            }
         }
-        std::fs::remove_dir_all(outdir)
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(outdir))?;
+    }
+
+    let mut cursor = path.to_path_buf();
+    let mut missing = Vec::new();
+    let existing = loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(_) => break cursor,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name() else {
+                    return Err(WakeError::new(
+                        "WAKE_CONFIG",
+                        format!("refusing unsafe output directory: {}", path.display()),
+                    )
+                    .at(path));
+                };
+                missing.push(name.to_os_string());
+                cursor = cursor
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_path_buf();
+            }
+            Err(error) => return Err(WakeError::new("WAKE_IO", error.to_string()).at(&cursor)),
+        }
+    };
+    let mut physical = existing
+        .canonicalize()
+        .map(|path| wake_common::fs::normalize(&path))
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&existing))?;
+    for component in missing.into_iter().rev() {
+        physical.push(component);
+    }
+    Ok(normalize_path(&physical))
+}
+
+fn validate_output_ownership(target: &Path, product: OutputProduct) -> Result<(), WakeError> {
+    let metadata = match std::fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(WakeError::new("WAKE_IO", error.to_string()).at(target)),
+    };
+    if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "output target must be a real directory owned by Wake: {}",
+                target.display()
+            ),
+        )
+        .at(target));
+    }
+    let entries = std::fs::read_dir(target)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(target))?;
+    let mut contains_output = false;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(target))?;
+        let path = entry.path();
+        if is_output_commit_lock_path(&path) {
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
+            if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(WakeError::new(
+                    "WAKE_CONFIG",
+                    "invalid Wake output-commit lock metadata",
+                )
+                .at(&path));
+            }
+        } else {
+            contains_output = true;
+        }
+    }
+    if !contains_output {
+        return Ok(());
+    }
+
+    let marker = target.join(OUTPUT_OWNERSHIP_FILE);
+    let marker_metadata = std::fs::symlink_metadata(&marker).map_err(|error| {
+        WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "refusing to replace non-empty output without a valid {OUTPUT_OWNERSHIP_FILE}: {error}"
+            ),
+        )
+        .at(target)
+    })?;
+    if metadata_is_link_or_reparse_point(&marker_metadata) || !marker_metadata.is_file() {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Wake output ownership marker: {}", marker.display()),
+        )
+        .at(&marker));
+    }
+    let bytes = std::fs::read(&marker)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&marker))?;
+    let ownership = serde_json::from_slice::<OutputOwnership>(&bytes).map_err(|error| {
+        WakeError::new(
+            "WAKE_CONFIG",
+            format!("invalid Wake output ownership marker: {error}"),
+        )
+        .at(&marker)
+    })?;
+    let expected = OutputOwnership::wake(product);
+    if ownership != expected {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "output directory is owned by `{}` rather than `{}`",
+                ownership.product,
+                product.as_str()
+            ),
+        )
+        .at(target));
     }
     Ok(())
+}
+
+fn resolve_safe_output_directory(
+    project_root: &Path,
+    protected_inputs: &[&Path],
+    requested: &Path,
+    product: OutputProduct,
+) -> Result<PathBuf, WakeError> {
+    let target = resolve_physical_output_path(requested)?;
+    if target.file_name().is_none()
+        || target == project_root
+        || project_root.starts_with(&target)
+        || protected_inputs
+            .iter()
+            .any(|input| input.starts_with(&target))
+    {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            format!(
+                "refusing to publish {} output over a project, project ancestor, or input: {}",
+                product.as_str(),
+                target.display()
+            ),
+        )
+        .at(&target));
+    }
+    validate_output_ownership(&target, product)?;
+    Ok(target)
+}
+
+fn write_output_ownership_marker(staging: &Path, product: OutputProduct) -> Result<(), WakeError> {
+    let marker = staging.join(OUTPUT_OWNERSHIP_FILE);
+    let bytes = serde_json::to_vec_pretty(&OutputOwnership::wake(product))
+        .expect("output ownership serialization");
+    atomic_write(&marker, &bytes)
+}
+
+fn publish_staged_output<T>(
+    project_root: &Path,
+    protected_inputs: &[&Path],
+    requested: &Path,
+    product: OutputProduct,
+    cancellation: &CancellationToken,
+    materialize: impl FnOnce(&Path) -> Result<T, WakeError>,
+) -> Result<(T, PathBuf), WakeError> {
+    let target = resolve_safe_output_directory(project_root, protected_inputs, requested, product)?;
+    // Application and Docs staging belongs to the project domain, never the target's parent. A
+    // valid output target cannot equal or contain `project_root`, so an ancestor output commit
+    // cannot move or stale-clean a child publication's uncommitted staging tree.
+    let staging = tempfile::Builder::new()
+        .prefix(".wake-output-stage-")
+        .tempdir_in(project_root)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(project_root))?;
+    let stage_root = staging.path().join("output");
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&stage_root))?;
+    let value = materialize(&stage_root)?;
+    write_output_ownership_marker(&stage_root, product)?;
+    cancellation.commit(|| {
+        commit_staged_output_with(
+            &stage_root,
+            &target,
+            None,
+            product.as_str(),
+            product.backup_prefix(),
+            || {
+                let locked_target = resolve_safe_output_directory(
+                    project_root,
+                    protected_inputs,
+                    requested,
+                    product,
+                )?;
+                if locked_target != target {
+                    return Err(WakeError::new(
+                        "WAKE_OUTPUT_COLLISION",
+                        "output target identity changed while waiting for its publication lock",
+                    )
+                    .at(&locked_target));
+                }
+                Ok(())
+            },
+            None,
+        )
+    })?;
+    Ok((value, target))
 }
 
 fn absolute_from(root: &Path, path: &Path) -> PathBuf {
@@ -2242,7 +3994,8 @@ fn sanitize_namespace(namespace: &str) -> String {
 
 enum ContextCommand {
     Rebuild {
-        changed_paths: Vec<PathBuf>,
+        invalidation: WatchInvalidation,
+        covered_revision: Option<WatchPlanRevision>,
         cancellation: CancellationToken,
         response: mpsc::Sender<Result<BuildResult, WakeError>>,
     },
@@ -2251,10 +4004,475 @@ enum ContextCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WatchPlanRevision(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchPlanSnapshot {
+    pub revision: WatchPlanRevision,
+    pub root: PathBuf,
+    pub interests: Vec<WatchInterest>,
+}
+
+/// Probe-only state for a watched build before it is allowed to create generated inputs or a
+/// retained build session. A waiting bootstrap is recoverable: callers keep its plan installed,
+/// report the diagnostic, and retry activation after a matching filesystem event or Rescan.
+#[derive(Debug, Clone)]
+pub enum BuildWatchBootstrapState {
+    Waiting {
+        plan: WatchPlanSnapshot,
+        error: WakeError,
+    },
+    Activatable {
+        plan: WatchPlanSnapshot,
+    },
+    Activated {
+        plan: WatchPlanSnapshot,
+    },
+}
+
+impl BuildWatchBootstrapState {
+    pub fn plan(&self) -> &WatchPlanSnapshot {
+        match self {
+            Self::Waiting { plan, .. } | Self::Activatable { plan } | Self::Activated { plan } => {
+                plan
+            }
+        }
+    }
+}
+
+enum BuildWatchBootstrapCandidate {
+    Waiting,
+    Probe {
+        identity: BuildProbeIdentity,
+        probe: Box<PreparedBuildProbe>,
+    },
+    Prepared {
+        identity: BuildProbeIdentity,
+        prepared: Box<PreparedBuild>,
+        interests: Vec<WatchInterest>,
+    },
+    Activated,
+}
+
+/// Application-owned startup transaction for `build --watch`.
+///
+/// Unlike [`BuildContext::create`], construction is strictly probe-only. The caller must install
+/// the published plan and present its exact revision to [`Self::activate_at`]. Activation probes
+/// again, materializes a candidate, publishes any refined coverage, and creates the retained
+/// context only after that refined revision is also covered.
+pub struct BuildWatchBootstrap {
+    options: BuildOptions,
+    fallback_root: PathBuf,
+    plan: WatchPlanSnapshot,
+    candidate: BuildWatchBootstrapCandidate,
+    error: Option<WakeError>,
+    #[cfg(test)]
+    refined_interest_for_test: Option<WatchInterest>,
+}
+
+impl BuildWatchBootstrap {
+    pub fn create(options: BuildOptions) -> Result<Self, WakeError> {
+        let fallback_root = validate_build_watch_bootstrap_options(&options)?;
+        match probe_build_candidate(&options) {
+            Ok(probe) => {
+                let plan = WatchPlanSnapshot {
+                    revision: WatchPlanRevision(0),
+                    root: probe.root.clone(),
+                    interests: build_watch_bootstrap_probe_interests(
+                        &options,
+                        &fallback_root,
+                        &probe,
+                    ),
+                };
+                let identity = build_probe_identity(&probe);
+                let mut bootstrap = Self {
+                    options,
+                    fallback_root,
+                    plan,
+                    candidate: BuildWatchBootstrapCandidate::Probe {
+                        identity,
+                        probe: Box::new(probe),
+                    },
+                    error: None,
+                    #[cfg(test)]
+                    refined_interest_for_test: None,
+                };
+                if let Err(error) = validate_build_watch_probe(match &bootstrap.candidate {
+                    BuildWatchBootstrapCandidate::Probe { probe, .. } => probe,
+                    _ => unreachable!("a successful constructor owns a probe"),
+                }) {
+                    bootstrap.set_waiting(error);
+                }
+                Ok(bootstrap)
+            }
+            Err(error) => {
+                let interests = build_watch_bootstrap_recovery_interests(
+                    &options,
+                    &fallback_root,
+                    &fallback_root,
+                    &error,
+                );
+                Ok(Self {
+                    options,
+                    fallback_root: fallback_root.clone(),
+                    plan: WatchPlanSnapshot {
+                        revision: WatchPlanRevision(0),
+                        root: fallback_root,
+                        interests,
+                    },
+                    candidate: BuildWatchBootstrapCandidate::Waiting,
+                    error: Some(error),
+                    #[cfg(test)]
+                    refined_interest_for_test: None,
+                })
+            }
+        }
+    }
+
+    pub fn state(&self) -> BuildWatchBootstrapState {
+        let plan = self.plan.clone();
+        match (&self.candidate, &self.error) {
+            (BuildWatchBootstrapCandidate::Waiting, Some(error)) => {
+                BuildWatchBootstrapState::Waiting {
+                    plan,
+                    error: error.clone(),
+                }
+            }
+            (BuildWatchBootstrapCandidate::Activated, _) => {
+                BuildWatchBootstrapState::Activated { plan }
+            }
+            _ => BuildWatchBootstrapState::Activatable { plan },
+        }
+    }
+
+    pub fn watch_plan(&self) -> WatchPlanSnapshot {
+        self.plan.clone()
+    }
+
+    /// Activate only under a capability for the currently published bootstrap revision.
+    /// `WAKE_WATCH_COVERAGE_PENDING` is an internal frontend control signal: callers install the
+    /// newly published plan and retry with an authoritative Rescan without reporting it as a build
+    /// diagnostic.
+    pub fn activate_at(
+        &mut self,
+        covered_revision: WatchPlanRevision,
+    ) -> Result<BuildContext, WakeError> {
+        if matches!(self.candidate, BuildWatchBootstrapCandidate::Activated) {
+            return Err(WakeError::new(
+                "WAKE_INTERNAL",
+                "build watch bootstrap was already activated",
+            ));
+        }
+        if covered_revision != self.plan.revision {
+            return Err(watch_coverage_pending_error());
+        }
+
+        // A previously prepared value was rendered only to discover refined interests. Once the
+        // caller presents coverage for that revision, start from a fresh probe and render again;
+        // source files may have changed while the watcher was installing the wider plan even when
+        // the control-file identity stayed constant.
+        self.reprobe(false)?;
+        if covered_revision != self.plan.revision {
+            return Err(watch_coverage_pending_error());
+        }
+
+        if matches!(self.candidate, BuildWatchBootstrapCandidate::Probe { .. }) {
+            let (identity, probe) = match &self.candidate {
+                BuildWatchBootstrapCandidate::Probe { identity, probe } => {
+                    (identity.clone(), probe.as_ref().clone())
+                }
+                _ => unreachable!("bootstrap probe state was checked"),
+            };
+            let prepared = match materialize_build_probe(probe, true) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.set_waiting(error.clone());
+                    return Err(error);
+                }
+            };
+            let refined = build_context_watch_interests(&prepared, &self.options);
+            #[cfg(test)]
+            let refined = {
+                let mut refined = refined;
+                if let Some(interest) = self.refined_interest_for_test.take() {
+                    refined.push(interest.resolve_against(&prepared.root));
+                }
+                refined
+            };
+            self.merge_plan(prepared.root.clone(), refined.clone());
+            self.candidate = BuildWatchBootstrapCandidate::Prepared {
+                identity,
+                prepared: Box::new(prepared),
+                interests: refined,
+            };
+            if covered_revision != self.plan.revision {
+                return Err(watch_coverage_pending_error());
+            }
+
+            // Materialization can overlap a control-file replacement. Never hand a prepared
+            // generation to a retained context until a fresh probe proves it still represents the
+            // same authoritative snapshot.
+            let prepared_identity = match &self.candidate {
+                BuildWatchBootstrapCandidate::Prepared { identity, .. } => identity.clone(),
+                _ => unreachable!("candidate was just prepared"),
+            };
+            self.reprobe(true)?;
+            let still_current = matches!(
+                &self.candidate,
+                BuildWatchBootstrapCandidate::Prepared { identity, .. }
+                    if *identity == prepared_identity
+            );
+            if !still_current || covered_revision != self.plan.revision {
+                return Err(watch_coverage_pending_error());
+            }
+        }
+
+        let (prepared, interests) = match &self.candidate {
+            BuildWatchBootstrapCandidate::Prepared {
+                prepared,
+                interests,
+                ..
+            } => (prepared.as_ref().clone(), interests.clone()),
+            BuildWatchBootstrapCandidate::Waiting => {
+                return Err(self.error.clone().unwrap_or_else(|| {
+                    WakeError::new("WAKE_INTERNAL", "build watch bootstrap lost its diagnostic")
+                }));
+            }
+            BuildWatchBootstrapCandidate::Activated => {
+                return Err(WakeError::new(
+                    "WAKE_INTERNAL",
+                    "build watch bootstrap was already activated",
+                ));
+            }
+            BuildWatchBootstrapCandidate::Probe { .. } => {
+                return Err(watch_coverage_pending_error());
+            }
+        };
+        let context =
+            BuildContext::from_prepared_with_interests(self.options.clone(), prepared, interests)?;
+        self.candidate = BuildWatchBootstrapCandidate::Activated;
+        self.error = None;
+        Ok(context)
+    }
+
+    fn reprobe(&mut self, retain_matching_prepared: bool) -> Result<(), WakeError> {
+        let probe = match probe_build_candidate(&self.options) {
+            Ok(probe) => probe,
+            Err(error) => {
+                self.set_waiting(error.clone());
+                return Err(error);
+            }
+        };
+        let identity = build_probe_identity(&probe);
+        let interests =
+            build_watch_bootstrap_probe_interests(&self.options, &self.fallback_root, &probe);
+        self.merge_plan(probe.root.clone(), interests);
+
+        if let Err(error) = validate_build_watch_probe(&probe) {
+            self.set_waiting(error.clone());
+            return Err(error);
+        }
+
+        let retain_prepared = retain_matching_prepared
+            && matches!(
+                &self.candidate,
+                BuildWatchBootstrapCandidate::Prepared {
+                    identity: current,
+                    ..
+                } if *current == identity
+            );
+        if !retain_prepared {
+            self.candidate = BuildWatchBootstrapCandidate::Probe {
+                identity,
+                probe: Box::new(probe),
+            };
+        }
+        self.error = None;
+        Ok(())
+    }
+
+    fn set_waiting(&mut self, error: WakeError) {
+        let watch_root = self.plan.root.clone();
+        let recovery = build_watch_bootstrap_recovery_interests(
+            &self.options,
+            &self.fallback_root,
+            &watch_root,
+            &error,
+        );
+        self.merge_plan(self.plan.root.clone(), recovery);
+        self.candidate = BuildWatchBootstrapCandidate::Waiting;
+        self.error = Some(error);
+    }
+
+    fn merge_plan(&mut self, root: PathBuf, interests: Vec<WatchInterest>) {
+        let interests = union_watch_interests(&self.plan.interests, &interests);
+        if self.plan.root != root || self.plan.interests != interests {
+            self.plan.revision.0 = self.plan.revision.0.saturating_add(1);
+            self.plan.root = root;
+            self.plan.interests = interests;
+        }
+    }
+}
+
+fn validate_build_watch_probe(probe: &PreparedBuildProbe) -> Result<(), WakeError> {
+    if !probe.logical_entry.is_file() {
+        return Err(WakeError::new(
+            "WAKE_IO",
+            format!(
+                "entry file does not exist: {}",
+                probe.logical_entry.display()
+            ),
+        )
+        .at(&probe.logical_entry));
+    }
+    Ok(())
+}
+
+fn validate_build_watch_bootstrap_options(options: &BuildOptions) -> Result<PathBuf, WakeError> {
+    let process_cwd = std::env::current_dir()
+        .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()))?;
+    let cwd = options
+        .project
+        .cwd
+        .as_deref()
+        .map(|cwd| absolute_from(&process_cwd, cwd))
+        .unwrap_or(process_cwd);
+    if !cwd.is_dir() {
+        return Err(
+            WakeError::new("WAKE_CONFIG", "cwd does not exist or is not a directory").at(&cwd),
+        );
+    }
+    if let Some(config_path) = options.project.config_path.as_deref() {
+        let path = absolute_from(&cwd, config_path);
+        if path.file_name().and_then(|name| name.to_str()) != Some(wake_config::CONFIG_FILE) {
+            return Err(WakeError::new(
+                "WAKE_CONFIG",
+                format!("configPath must point to {}", wake_config::CONFIG_FILE),
+            )
+            .at(&path));
+        }
+    }
+    if let Some(federation) = &options.federation {
+        federation
+            .clone()
+            .validate_and_normalize()
+            .map_err(|error| WakeError::new("FED_CONFIG_INVALID", error.to_string()).at(&cwd))?;
+    }
+    // Validate the physical directory without discarding the caller's lexical identity. Exact
+    // discovery witnesses resolved from a symlinked cwd must retain both declared and canonical
+    // paths so replacing or redirecting that symlink can invalidate the bootstrap.
+    canonical_project_root(&cwd)?;
+    Ok(cwd)
+}
+
+fn build_context_discovery_interests(
+    options: &BuildOptions,
+    project_root: &Path,
+) -> Vec<WatchInterest> {
+    let process_cwd = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
+    let fallback_root = options
+        .project
+        .cwd
+        .as_deref()
+        .map(|cwd| absolute_from(&process_cwd, cwd))
+        .unwrap_or(process_cwd);
+    build_watch_bootstrap_discovery_interests(options, &fallback_root)
+}
+
+fn build_watch_bootstrap_discovery_interests(
+    options: &BuildOptions,
+    fallback_root: &Path,
+) -> Vec<WatchInterest> {
+    let mut paths = Vec::new();
+    if let Some(config_path) = options.project.config_path.as_deref() {
+        paths.push(absolute_from(fallback_root, config_path));
+    } else {
+        for ancestor in fallback_root.ancestors() {
+            let config = ancestor.join(wake_config::CONFIG_FILE);
+            let package = ancestor.join("package.json");
+            paths.push(config.clone());
+            paths.push(package.clone());
+            if config.is_file() || package.is_file() {
+                break;
+            }
+        }
+    }
+    if let Some(entry) = options.entry.as_deref() {
+        paths.push(absolute_from(fallback_root, entry));
+    }
+    let mut interests = paths
+        .into_iter()
+        .map(|path| WatchInterest::exact_file(path).resolve_against(fallback_root))
+        .collect::<Vec<_>>();
+    interests.sort();
+    interests.dedup();
+    interests
+}
+
+fn build_watch_bootstrap_probe_interests(
+    options: &BuildOptions,
+    fallback_root: &Path,
+    probe: &PreparedBuildProbe,
+) -> Vec<WatchInterest> {
+    union_watch_interests(
+        &build_context_probe_watch_interests(probe, options),
+        &build_watch_bootstrap_discovery_interests(options, fallback_root),
+    )
+}
+
+fn build_watch_bootstrap_recovery_interests(
+    options: &BuildOptions,
+    fallback_root: &Path,
+    watch_root: &Path,
+    error: &WakeError,
+) -> Vec<WatchInterest> {
+    let mut interests = build_watch_bootstrap_discovery_interests(options, fallback_root);
+    if let Some(path) = error.path.as_deref() {
+        let path = absolute_from(watch_root, Path::new(path));
+        let generated = path.starts_with(watch_root.join(".wake"));
+        let exact = generated
+            || path.file_name().and_then(|name| name.to_str()) == Some(wake_config::CONFIG_FILE);
+        if !exact
+            || !interests
+                .iter()
+                .any(|interest| interest.matches_exact_file(&path))
+        {
+            let interest = if exact {
+                WatchInterest::exact_file(path)
+            } else {
+                WatchInterest::tree(path)
+            };
+            interests.push(interest.resolve_against(watch_root));
+        }
+    }
+    if options.write {
+        let outdir = absolute_from(
+            watch_root,
+            options
+                .outdir
+                .as_deref()
+                .unwrap_or_else(|| Path::new("dist")),
+        );
+        interests = interests
+            .into_iter()
+            .map(|interest| {
+                interest
+                    .excluding_tree(outdir.clone())
+                    .resolve_against(watch_root)
+            })
+            .collect();
+        interests.sort();
+        interests.dedup();
+    }
+    interests
+}
+
 struct BuildContextInner {
     sender: mpsc::Sender<ContextCommand>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
     closed: AtomicBool,
+    watch_plan: Arc<RwLock<WatchPlanSnapshot>>,
 }
 
 #[derive(Clone)]
@@ -2264,13 +4482,44 @@ pub struct BuildContext {
 
 impl BuildContext {
     pub fn create(options: BuildOptions) -> Result<Self, WakeError> {
-        let prepared = prepare_build(&options)?;
+        // A retained context owns an isolated generation. Stable `.wake` paths are reserved for
+        // one-shot production so concurrent watch/dev processes cannot overwrite one another.
+        let prepared = prepare_build_candidate(&options)?;
+        Self::from_prepared(options, prepared)
+    }
+
+    fn from_prepared(options: BuildOptions, prepared: PreparedBuild) -> Result<Self, WakeError> {
+        let interests = build_context_watch_interests(&prepared, &options);
+        Self::from_prepared_with_interests(options, prepared, interests)
+    }
+
+    fn from_prepared_with_interests(
+        options: BuildOptions,
+        prepared: PreparedBuild,
+        interests: Vec<WatchInterest>,
+    ) -> Result<Self, WakeError> {
+        let discovery_floor = build_context_discovery_interests(&options, &prepared.root);
+        let interests = union_watch_interests(&interests, &discovery_floor);
+        let watch_plan = Arc::new(RwLock::new(WatchPlanSnapshot {
+            revision: WatchPlanRevision(0),
+            root: prepared.root.clone(),
+            interests,
+        }));
+        let worker_watch_plan = Arc::clone(&watch_plan);
         let (sender, receiver) = mpsc::channel();
         let join = thread::Builder::new()
             .name("wake-build-context".to_string())
             .spawn(move || {
-                let session = create_session(&prepared, &options, true);
-                run_build_context(receiver, prepared, options, session);
+                let mut prepared = prepared;
+                let session = create_session(&mut prepared, &options, true);
+                run_build_context(
+                    receiver,
+                    prepared,
+                    options,
+                    session,
+                    worker_watch_plan,
+                    discovery_floor,
+                );
             })
             .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))?;
         Ok(Self {
@@ -2278,6 +4527,7 @@ impl BuildContext {
                 sender,
                 join: Mutex::new(Some(join)),
                 closed: AtomicBool::new(false),
+                watch_plan,
             }),
         })
     }
@@ -2287,6 +4537,40 @@ impl BuildContext {
         changed_paths: Vec<PathBuf>,
         cancellation: CancellationToken,
     ) -> Result<BuildResult, WakeError> {
+        let invalidation = if changed_paths.is_empty() {
+            WatchInvalidation::Rescan
+        } else {
+            WatchInvalidation::Paths(changed_paths)
+        };
+        self.send_rebuild(invalidation, cancellation, None)
+    }
+
+    pub fn rebuild_watch(
+        &self,
+        invalidation: WatchInvalidation,
+        cancellation: CancellationToken,
+    ) -> Result<BuildResult, WakeError> {
+        self.send_rebuild(invalidation, cancellation, None)
+    }
+
+    /// Rebuild after a watcher frontend has confirmed complete coverage for `covered_revision`.
+    /// If probing or materialization widens the plan, no generated input or build is allowed until
+    /// the frontend installs the new revision and calls this method again with that capability.
+    pub fn rebuild_watch_at(
+        &self,
+        invalidation: WatchInvalidation,
+        covered_revision: WatchPlanRevision,
+        cancellation: CancellationToken,
+    ) -> Result<BuildResult, WakeError> {
+        self.send_rebuild(invalidation, cancellation, Some(covered_revision))
+    }
+
+    fn send_rebuild(
+        &self,
+        invalidation: WatchInvalidation,
+        cancellation: CancellationToken,
+        covered_revision: Option<WatchPlanRevision>,
+    ) -> Result<BuildResult, WakeError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(WakeError::closed("BuildContext"));
         }
@@ -2294,7 +4578,8 @@ impl BuildContext {
         self.inner
             .sender
             .send(ContextCommand::Rebuild {
-                changed_paths,
+                invalidation,
+                covered_revision,
                 cancellation,
                 response: sender,
             })
@@ -2341,6 +4626,22 @@ impl BuildContext {
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
+
+    /// The authoritative typed watch plan for `build --watch` frontends. It can widen after a
+    /// failed candidate build so that creating a newly configured alias target triggers recovery.
+    pub fn watch_interests(&self) -> Vec<WatchInterest> {
+        self.watch_plan().interests
+    }
+
+    /// One atomic view of the application-owned watch plan. Frontends install all interests for a
+    /// revision before rebuilding and compare the post-build revision to close widening races.
+    pub fn watch_plan(&self) -> WatchPlanSnapshot {
+        self.inner
+            .watch_plan
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl Drop for BuildContextInner {
@@ -2351,72 +4652,432 @@ impl Drop for BuildContextInner {
     }
 }
 
+fn replace_build_watch_plan(
+    watch_plan: &RwLock<WatchPlanSnapshot>,
+    root: PathBuf,
+    mut interests: Vec<WatchInterest>,
+) {
+    interests.sort();
+    interests.dedup();
+    let mut plan = watch_plan
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if plan.root != root || plan.interests != interests {
+        plan.revision.0 = plan.revision.0.saturating_add(1);
+        plan.root = root;
+        plan.interests = interests;
+    }
+}
+
+fn union_build_watch_plan(
+    watch_plan: &RwLock<WatchPlanSnapshot>,
+    root: PathBuf,
+    candidate: &[WatchInterest],
+) {
+    let current = watch_plan
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .interests
+        .clone();
+    replace_build_watch_plan(watch_plan, root, union_watch_interests(&current, candidate));
+}
+
+struct BuildContextCandidate {
+    identity: BuildProbeIdentity,
+    probe: PreparedBuildProbe,
+    materialized: Option<(PreparedBuild, Option<ProjectBuildSession>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuildProbeIdentity {
+    config_dir: PathBuf,
+    root: PathBuf,
+    logical_entry: PathBuf,
+    explicit_entry: Option<PathBuf>,
+    outdir: PathBuf,
+    controls: Vec<ControlFileFingerprint>,
+}
+
+fn build_control_fingerprints(
+    config_dir: &Path,
+    root: &Path,
+    explicit_entry: Option<&Path>,
+) -> Vec<ControlFileFingerprint> {
+    project_control_paths(config_dir, root, explicit_entry)
+        .into_iter()
+        .map(|path| {
+            let fingerprint = control_file_fingerprint(&path);
+            (path, fingerprint)
+        })
+        .collect()
+}
+
+fn build_probe_identity(probe: &PreparedBuildProbe) -> BuildProbeIdentity {
+    BuildProbeIdentity {
+        config_dir: probe.config_dir.clone(),
+        root: probe.root.clone(),
+        logical_entry: probe.logical_entry.clone(),
+        explicit_entry: probe.explicit_entry.clone(),
+        outdir: probe.outdir.clone(),
+        controls: probe.control_fingerprints.clone(),
+    }
+}
+
+fn watch_coverage_pending_error() -> WakeError {
+    WakeError::new(
+        "WAKE_WATCH_COVERAGE_PENDING",
+        "candidate watch coverage changed; install the latest watch-plan revision and rescan",
+    )
+}
+
 fn run_build_context(
     receiver: mpsc::Receiver<ContextCommand>,
     prepared: PreparedBuild,
     options: BuildOptions,
-    session: Result<BuildSession, WakeError>,
+    session: Result<ProjectBuildSession, WakeError>,
+    watch_plan: Arc<RwLock<WatchPlanSnapshot>>,
+    discovery_floor: Vec<WatchInterest>,
 ) {
-    let mut session = match session {
-        Ok(session) => session,
-        Err(error) => {
-            while let Ok(command) = receiver.recv() {
-                match command {
-                    ContextCommand::Rebuild { response, .. } => {
-                        let _ = response.send(Err(error.clone()));
-                    }
-                    ContextCommand::Close { response } => {
-                        let _ = response.send(());
-                        break;
-                    }
-                }
-            }
-            return;
-        }
+    let (mut session, initial_error) = match session {
+        Ok(session) => (Some(session), None),
+        Err(error) => (None, Some(error)),
     };
+    let stable_topology = build_topology(&prepared);
+    let stable_federation_lock_fingerprint =
+        prepared_control_fingerprint(&prepared, &prepared.root.join("wake-federation.lock"));
+    let mut accepted_identity = build_probe_identity(&build_probe_from_prepared(&prepared));
+    let mut refresh_state: RefreshState<PreparedBuild, BuildContextCandidate, WakeError> =
+        RefreshState {
+            accepted: prepared,
+            next_id: 1,
+            candidate: initial_error.map_or(CandidateState::Stable, |diagnostic| {
+                CandidateState::Blocked { diagnostic }
+            }),
+        };
     while let Ok(command) = receiver.recv() {
         match command {
             ContextCommand::Rebuild {
-                changed_paths,
+                invalidation,
+                covered_revision,
                 cancellation,
                 response,
             } => {
-                let result = if let Err(error) = cancellation.check() {
-                    Err(error)
-                } else {
-                    let started = Instant::now();
-                    let mut paths = changed_paths
+                let result = cancellation.check().and_then(|()| {
+                    if covered_revision.is_some_and(|covered| {
+                        covered
+                            != watch_plan
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .revision
+                    }) {
+                        return Err(watch_coverage_pending_error());
+                    }
+                    let rescan = invalidation.is_rescan();
+                    let paths = invalidation
+                        .paths()
                         .iter()
-                        .map(|path| absolute_from(&prepared.root, path))
+                        .map(|path| absolute_from(&refresh_state.accepted.root, path))
                         .collect::<Vec<_>>();
-                    match prepare_aliases_and_scans(&prepared.config, &prepared.root) {
-                        Ok(aliases) => {
-                            paths.extend(aliases.into_iter().filter_map(|(name, path)| {
-                                name.starts_with("@@@/").then_some(path)
-                            }))
-                        }
-                        Err(error) => {
-                            let _ = response.send(Err(error));
-                            continue;
-                        }
+                    let control_interests = union_watch_interests(
+                        &project_control_interests(&refresh_state.accepted),
+                        &discovery_floor,
+                    );
+                    let federation_lock = WatchInterest::exact_file(
+                        refresh_state.accepted.root.join("wake-federation.lock"),
+                    )
+                    .resolve_against(&refresh_state.accepted.root);
+                    let federation_lock_changed = federation_lock_changed(
+                        &paths,
+                        rescan,
+                        &federation_lock,
+                        &refresh_state.accepted.root.join("wake-federation.lock"),
+                        &stable_federation_lock_fingerprint,
+                    );
+                    if federation_lock_changed {
+                        let error = restart_required_error("Federation lock changed");
+                        refresh_state.candidate = CandidateState::Blocked {
+                            diagnostic: error.clone(),
+                        };
+                        return Err(error);
                     }
-                    paths.sort();
-                    paths.dedup();
-                    if paths.is_empty() {
-                        session.invalidate_filesystem();
-                    } else {
-                        session.invalidate_paths(&paths, true);
-                    }
-                    let output = session.build_current(BuildRequest::new(&prepared.entry));
-                    cancellation.check().and_then(|()| {
-                        finish_output(
-                            &prepared,
+                    let control_changed = rescan || changed_matches(&paths, &control_interests);
+                    if control_changed {
+                        let probe = match probe_build_candidate(&options) {
+                            Ok(probe) => probe,
+                            Err(error) => {
+                                let recovery = recovery_watch_interests(
+                                    build_context_watch_interests_with_floor(
+                                        &refresh_state.accepted,
+                                        &options,
+                                        &discovery_floor,
+                                    ),
+                                    &refresh_state.accepted.root,
+                                    &error,
+                                );
+                                union_build_watch_plan(
+                                    &watch_plan,
+                                    refresh_state.accepted.root.clone(),
+                                    &recovery,
+                                );
+                                refresh_state.candidate = CandidateState::Blocked {
+                                    diagnostic: error.clone(),
+                                };
+                                return Err(error);
+                            }
+                        };
+                        if let Some(reason) =
+                            build_topology_change(&stable_topology, &build_probe_topology(&probe))
+                        {
+                            let error = restart_required_error(reason);
+                            union_build_watch_plan(
+                                &watch_plan,
+                                refresh_state.accepted.root.clone(),
+                                &build_context_probe_watch_interests_with_floor(
+                                    &probe,
+                                    &options,
+                                    &discovery_floor,
+                                ),
+                            );
+                            refresh_state.candidate = CandidateState::Blocked {
+                                diagnostic: error.clone(),
+                            };
+                            return Err(error);
+                        }
+                        let identity = build_probe_identity(&probe);
+                        if rescan
+                            && matches!(&refresh_state.candidate, CandidateState::Stable)
+                            && refresh_state.accepted.config.component_scan.is_empty()
+                            && identity == accepted_identity
+                            && let Some(accepted_session) = session.as_mut()
+                        {
+                            return execute_context_session_build(
+                                &refresh_state.accepted,
+                                &options,
+                                accepted_session,
+                                &[],
+                                true,
+                                &cancellation,
+                            );
+                        }
+                        let same_pending = matches!(
+                            &refresh_state.candidate,
+                            CandidateState::Pending { draft, .. }
+                                if draft.identity == identity
+                        );
+                        if !same_pending {
+                            let preliminary = build_context_probe_watch_interests_with_floor(
+                                &probe,
+                                &options,
+                                &discovery_floor,
+                            );
+                            union_build_watch_plan(
+                                &watch_plan,
+                                refresh_state.accepted.root.clone(),
+                                &preliminary,
+                            );
+                            let id = refresh_state.next_id;
+                            refresh_state.next_id = refresh_state.next_id.wrapping_add(1).max(1);
+                            refresh_state.candidate = CandidateState::Pending {
+                                id,
+                                draft: BuildContextCandidate {
+                                    identity,
+                                    probe,
+                                    materialized: None,
+                                },
+                                last_error: None,
+                            };
+                            let after = watch_plan
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .revision;
+                            if covered_revision.is_some_and(|covered| covered != after) {
+                                return Err(watch_coverage_pending_error());
+                            }
+                        }
+                    } else if let CandidateState::Blocked { diagnostic } = &refresh_state.candidate
+                    {
+                        return Err(diagnostic.clone());
+                    } else if matches!(&refresh_state.candidate, CandidateState::Stable)
+                        && refresh_state.accepted.config.component_scan.is_empty()
+                    {
+                        let mut invalidated = paths;
+                        invalidated.sort();
+                        invalidated.dedup();
+                        return execute_context_session_build(
+                            &refresh_state.accepted,
                             &options,
-                            output,
-                            started.elapsed().as_secs_f64() * 1000.0,
+                            session.as_mut().expect("accepted build session"),
+                            &invalidated,
+                            true,
+                            &cancellation,
+                        );
+                    } else if matches!(&refresh_state.candidate, CandidateState::Stable) {
+                        let probe = build_probe_from_prepared(&refresh_state.accepted);
+                        let id = refresh_state.next_id;
+                        refresh_state.next_id = refresh_state.next_id.wrapping_add(1).max(1);
+                        refresh_state.candidate = CandidateState::Pending {
+                            id,
+                            draft: BuildContextCandidate {
+                                identity: build_probe_identity(&probe),
+                                probe,
+                                materialized: None,
+                            },
+                            last_error: None,
+                        };
+                    }
+
+                    if matches!(&refresh_state.candidate, CandidateState::Pending { .. })
+                        && covered_revision.is_some_and(|covered| {
+                            covered
+                                != watch_plan
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .revision
+                        })
+                    {
+                        return Err(watch_coverage_pending_error());
+                    }
+
+                    let pending =
+                        std::mem::replace(&mut refresh_state.candidate, CandidateState::Stable);
+                    let CandidateState::Pending {
+                        id,
+                        mut draft,
+                        mut last_error,
+                    } = pending
+                    else {
+                        return Err(WakeError::new(
+                            "WAKE_INTERNAL",
+                            "build refresh candidate state was lost",
+                        ));
+                    };
+
+                    if draft.materialized.is_none() {
+                        let candidate = match materialize_build_probe(draft.probe.clone(), true) {
+                            Ok(candidate) => candidate,
+                            Err(error) => {
+                                last_error = Some(error.clone());
+                                refresh_state.candidate = CandidateState::Pending {
+                                    id,
+                                    draft,
+                                    last_error,
+                                };
+                                return Err(error);
+                            }
+                        };
+                        // This first materialization exists only to discover the complete watch
+                        // surface. Creating a retained bundler session here would let it escape
+                        // before the frontend proves coverage for the refined plan.
+                        draft.materialized = Some((candidate, None));
+                    }
+
+                    let refined = {
+                        let (candidate, _) = draft
+                            .materialized
+                            .as_ref()
+                            .expect("candidate was materialized");
+                        build_context_watch_interests_with_floor(
+                            candidate,
+                            &options,
+                            &discovery_floor,
                         )
-                    })
-                };
+                    };
+                    union_build_watch_plan(
+                        &watch_plan,
+                        refresh_state.accepted.root.clone(),
+                        &refined,
+                    );
+                    let after = watch_plan
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .revision;
+                    if covered_revision.is_some_and(|covered| covered != after) {
+                        refresh_state.candidate = CandidateState::Pending {
+                            id,
+                            draft,
+                            last_error,
+                        };
+                        return Err(watch_coverage_pending_error());
+                    }
+
+                    let (mut candidate, candidate_session) = draft
+                        .materialized
+                        .take()
+                        .expect("candidate was materialized");
+                    let candidate_identity = draft.identity.clone();
+                    let generation_changed = match refresh_application_generation(&mut candidate) {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            last_error = Some(error.clone());
+                            draft.materialized = Some((candidate, candidate_session));
+                            refresh_state.candidate = CandidateState::Pending {
+                                id,
+                                draft,
+                                last_error,
+                            };
+                            return Err(error);
+                        }
+                    };
+                    let candidate_session =
+                        (!generation_changed).then_some(candidate_session).flatten();
+                    let reused_session = candidate_session.is_some();
+                    let mut candidate_session = match candidate_session {
+                        Some(session) => session,
+                        None => match create_session(&mut candidate, &options, true) {
+                            Ok(session) => session,
+                            Err(error) => {
+                                last_error = Some(error.clone());
+                                draft.materialized = Some((candidate, None));
+                                refresh_state.candidate = CandidateState::Pending {
+                                    id,
+                                    draft,
+                                    last_error,
+                                };
+                                return Err(error);
+                            }
+                        },
+                    };
+                    let mut invalidated = paths;
+                    invalidated.extend(generation_changed_paths(
+                        &refresh_state.accepted.generation,
+                        &candidate.generation,
+                    ));
+                    invalidated.sort();
+                    invalidated.dedup();
+                    let result = execute_context_session_build(
+                        &candidate,
+                        &options,
+                        &mut candidate_session,
+                        &invalidated,
+                        reused_session,
+                        &cancellation,
+                    );
+                    if result.is_ok() {
+                        let candidate_interests = build_context_watch_interests_with_floor(
+                            &candidate,
+                            &options,
+                            &discovery_floor,
+                        );
+                        refresh_state.accepted = candidate;
+                        accepted_identity = candidate_identity;
+                        session = Some(candidate_session);
+                        replace_build_watch_plan(
+                            &watch_plan,
+                            refresh_state.accepted.root.clone(),
+                            candidate_interests,
+                        );
+                        refresh_state.candidate = CandidateState::Stable;
+                    } else {
+                        last_error = result.as_ref().err().cloned();
+                        draft.materialized = Some((candidate, Some(candidate_session)));
+                        refresh_state.candidate = CandidateState::Pending {
+                            id,
+                            draft,
+                            last_error,
+                        };
+                    }
+                    result
+                });
                 let _ = response.send(result);
             }
             ContextCommand::Close { response } => {
@@ -2426,6 +5087,45 @@ fn run_build_context(
         }
     }
 }
+
+fn execute_context_session_build(
+    prepared: &PreparedBuild,
+    options: &BuildOptions,
+    session: &mut ProjectBuildSession,
+    invalidated: &[PathBuf],
+    invalidate: bool,
+    cancellation: &CancellationToken,
+) -> Result<BuildResult, WakeError> {
+    let started = Instant::now();
+    session.generation.advance_generation();
+    let federation_generation = federation::bind_production_generation(
+        prepared,
+        options,
+        &session.federation_inputs,
+        session.generation.file_system_view(),
+    )?;
+    cancellation.check()?;
+    if invalidate {
+        if invalidated.is_empty() {
+            session.application.invalidate_filesystem();
+        } else {
+            session.application.invalidate_paths(invalidated, true);
+        }
+    }
+    let output = session
+        .application
+        .build_current(BuildRequest::new(&prepared.entry));
+    cancellation.check()?;
+    finish_output(
+        prepared,
+        options,
+        output,
+        started,
+        federation_generation,
+        &mut session.generation,
+        cancellation,
+    )
+}
 #[derive(Debug, Clone, Default)]
 pub struct DevServerOptions {
     pub project: ProjectOptions,
@@ -2433,6 +5133,8 @@ pub struct DevServerOptions {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub open: Option<bool>,
+    /// Programmatic federation override. `None` uses `wake.config.toml`.
+    pub federation: Option<FederationOptions>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2473,6 +5175,16 @@ pub enum DevServerEvent {
         current: Option<String>,
         failed_names: Vec<String>,
     },
+    FederationUpdated {
+        remote: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        old_build_id: Option<String>,
+        new_build_id: String,
+        changed_exposes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        types_hash: Option<String>,
+        action: wake_dev_server::DevUpdateAction,
+    },
     Closed,
 }
 
@@ -2480,6 +5192,7 @@ pub enum DevServerEvent {
 pub struct DevServer {
     handle: wake_dev_server::ServerHandle,
     events: Arc<Mutex<mpsc::Receiver<DevServerEvent>>>,
+    federation_type_monitor: Option<federation_type_watch::FederationTypeMonitor>,
 }
 
 impl DevServer {
@@ -2488,19 +5201,35 @@ impl DevServer {
     }
 
     pub fn request_close(&self) {
+        if let Some(monitor) = &self.federation_type_monitor {
+            monitor.request_stop();
+        }
         self.handle.request_close();
     }
 
     pub fn close(&self) -> Result<(), WakeError> {
-        self.handle
+        if let Some(monitor) = &self.federation_type_monitor {
+            monitor.request_stop();
+        }
+        let result = self
+            .handle
             .close()
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))
+            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()));
+        if let Some(monitor) = &self.federation_type_monitor {
+            monitor.stop_and_join();
+        }
+        result
     }
 
     pub fn wait_until_closed(&self) -> Result<(), WakeError> {
-        self.handle
+        let result = self
+            .handle
             .wait()
-            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))
+            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()));
+        if let Some(monitor) = &self.federation_type_monitor {
+            monitor.stop_and_join();
+        }
+        result
     }
     pub fn drain_events(&self) -> Vec<DevServerEvent> {
         let receiver = self
@@ -2513,7 +5242,6 @@ impl DevServer {
 
 fn forward_dev_server_event(
     sender: &mpsc::Sender<DevServerEvent>,
-    root: &Path,
     event: wake_dev_server::ServerEvent,
 ) {
     match event {
@@ -2554,8 +5282,11 @@ fn forward_dev_server_event(
                 base_path,
             });
         }
-        wake_dev_server::ServerEvent::Diagnostics { diagnostics } => {
-            for diagnostic in diagnostic_infos(&diagnostics, root) {
+        wake_dev_server::ServerEvent::Diagnostics {
+            diagnostics,
+            sources,
+        } => {
+            for diagnostic in diagnostic_infos_from_captured_sources(&diagnostics, sources) {
                 let _ = sender.send(DevServerEvent::Diagnostic { diagnostic });
             }
         }
@@ -2574,20 +5305,74 @@ fn forward_dev_server_event(
                 failed_names,
             });
         }
+        wake_dev_server::ServerEvent::FederationUpdated {
+            remote,
+            old_build_id,
+            new_build_id,
+            changed_exposes,
+            types_hash,
+            action,
+        } => {
+            let _ = sender.send(DevServerEvent::FederationUpdated {
+                remote,
+                old_build_id,
+                new_build_id,
+                changed_exposes,
+                types_hash,
+                action,
+            });
+        }
         wake_dev_server::ServerEvent::Closed => {
             let _ = sender.send(DevServerEvent::Closed);
         }
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeError> {
+    let dev_options = options.clone();
     let build_options = BuildOptions {
-        project: options.project,
-        entry: options.entry,
+        project: options.project.clone(),
+        entry: options.entry.clone(),
         write: false,
+        federation: options.federation.clone(),
         ..BuildOptions::default()
     };
-    let prepared = prepare_build(&build_options)?;
+    let mut prepared = prepare_build_candidate(&build_options)?;
+    let development_type_lock = if prepared.config.federation.enabled
+        && prepared
+            .config
+            .federation
+            .remotes
+            .values()
+            .any(|remote| !remote.dev_follow)
+    {
+        federation::load_production_lock(&prepared)?.map(Arc::new)
+    } else {
+        None
+    };
+    let initial_type_sync =
+        if prepared.config.federation.enabled && !prepared.config.federation.remotes.is_empty() {
+            // Development must never pair a newly followed remote build with stale declarations.
+            // The synchronizer validates every remote first and only then atomically swaps the stable
+            // editor index, so a partial network failure cannot publish a mixed build set.
+            Some(federation_type_sync::sync_federation_types_for_development(
+                &prepared.root,
+                &prepared.config.federation,
+                development_type_lock.as_deref(),
+            )?)
+        } else {
+            None
+        };
+    let dev_federation = federation::prepare_dev(
+        &prepared,
+        &build_options,
+        prepared.generation.file_system(),
+        development_type_lock.clone(),
+    )?;
+    prepared.install_product_inputs(&dev_federation.generated_inputs)?;
+    let mut dev_aliases = prepared.aliases.clone();
+    dev_aliases.extend(dev_federation.aliases.clone());
     let config = &prepared.config;
     let server = &config.dev_server;
     let port = options.port.or(server.port).unwrap_or(5173);
@@ -2609,33 +5394,215 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
             change_origin: proxy.change_origin,
         })
         .collect();
-    let watch_roots = config
-        .component_scan
-        .iter()
-        .map(|rule| prepared.root.join(&rule.cwd))
-        .collect();
-    let scan_root = prepared.root.clone();
-    let scan_config = config.clone();
-    let before_rebuild: wake_dev_server::BeforeRebuild = Arc::new(move |_| {
-        prepare_aliases_and_scans(&scan_config, &scan_root)
-            .map(|aliases| {
-                aliases
-                    .into_iter()
-                    .filter_map(|(name, path)| name.starts_with("@@@/").then_some(path))
-                    .collect()
-            })
-            .map_err(|error| error.to_string())
+    let initial_target_env = resolve_target_env(config, &prepared.root)?;
+    let initial_topology = dev_topology(&prepared, &dev_options, 5173, &initial_target_env);
+    let mut initial_watch_interests = project_watch_interests(&prepared);
+    extend_runtime_source_interests(
+        &prepared,
+        &mut initial_watch_interests,
+        &dev_federation.aliases,
+    );
+    let control_interests = project_control_interests(&prepared);
+    let federation_lock_interest =
+        WatchInterest::exact_file(prepared.root.join("wake-federation.lock"))
+            .resolve_against(&prepared.root);
+    let initial_federation_lock_fingerprint =
+        prepared_control_fingerprint(&prepared, &prepared.root.join("wake-federation.lock"));
+    let refresh_state: Arc<Mutex<RefreshState<PreparedBuild, PreparedBuildProbe>>> =
+        Arc::new(Mutex::new(RefreshState {
+            accepted: prepared.clone(),
+            next_id: 1,
+            candidate: CandidateState::Stable,
+        }));
+    let refresh_build_options = build_options.clone();
+    let refresh_dev_options = dev_options.clone();
+    let refresh: wake_dev_server::RefreshMount = Arc::new(move |_current, invalidation| {
+        let changed = invalidation.paths();
+        let rescan = invalidation.is_rescan();
+        let accepted_root = refresh_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepted
+            .root
+            .clone();
+        let current_controls = control_interests
+            .iter()
+            .map(|interest| interest.resolve_against(&accepted_root))
+            .collect::<Vec<_>>();
+        let current_federation_lock = federation_lock_interest.resolve_against(&accepted_root);
+        let federation_lock_changed = federation_lock_changed(
+            changed,
+            rescan,
+            &current_federation_lock,
+            &accepted_root.join("wake-federation.lock"),
+            &initial_federation_lock_fingerprint,
+        );
+        if federation_lock_changed {
+            let diagnostic =
+                wake_error_diagnostic(restart_required_error("Federation lock changed"));
+            let mut state = refresh_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.candidate = CandidateState::Blocked { diagnostic };
+            return Ok(wake_dev_server::DevMountRefresh::RestartRequired {
+                reason: "Federation lock changed".to_owned(),
+            });
+        }
+        let control_changed = rescan || changed_matches(changed, &current_controls);
+        if !control_changed {
+            let state = refresh_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &state.candidate {
+                CandidateState::Blocked { diagnostic } => {
+                    return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                        watch_interests: project_watch_interests(&state.accepted),
+                        diagnostic: diagnostic.clone(),
+                    });
+                }
+                CandidateState::Pending { id, draft, .. } => {
+                    let id = *id;
+                    let draft = draft.clone();
+                    drop(state);
+                    return Ok(wake_dev_server::DevMountRefresh::Candidate(
+                        make_dev_refresh_candidate(
+                            Arc::clone(&refresh_state),
+                            id,
+                            draft,
+                            refresh_build_options.clone(),
+                        ),
+                    ));
+                }
+                CandidateState::Stable => {}
+            }
+            let accepted = state.accepted.clone();
+            drop(state);
+            if accepted.config.component_scan.is_empty() {
+                return Ok(wake_dev_server::DevMountRefresh::Invalidate {
+                    generated_paths: Vec::new(),
+                });
+            }
+            let draft = build_probe_from_prepared(&accepted);
+            let id = {
+                let mut state = refresh_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let id = state.next_id;
+                state.next_id = state.next_id.wrapping_add(1).max(1);
+                state.candidate = CandidateState::Pending {
+                    id,
+                    draft: draft.clone(),
+                    last_error: None,
+                };
+                id
+            };
+            return Ok(wake_dev_server::DevMountRefresh::Candidate(
+                make_dev_refresh_candidate(
+                    Arc::clone(&refresh_state),
+                    id,
+                    draft,
+                    refresh_build_options.clone(),
+                ),
+            ));
+        }
+        let refreshed = match probe_build_candidate(&refresh_build_options) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                let mut state = refresh_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let watch_interests = recovery_watch_interests(
+                    project_watch_interests(&state.accepted),
+                    &state.accepted.root,
+                    &error,
+                );
+                let diagnostic = wake_error_diagnostic(error);
+                state.candidate = CandidateState::Blocked {
+                    diagnostic: diagnostic.clone(),
+                };
+                return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                    watch_interests,
+                    diagnostic,
+                });
+            }
+        };
+        let refreshed_target = match resolve_target_env(&refreshed.config, &refreshed.root) {
+            Ok(target) => target,
+            Err(error) => {
+                let diagnostic = wake_error_diagnostic(error);
+                let mut state = refresh_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let watch_interests = probe_watch_interests(&refreshed);
+                state.candidate = CandidateState::Blocked {
+                    diagnostic: diagnostic.clone(),
+                };
+                return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                    watch_interests,
+                    diagnostic,
+                });
+            }
+        };
+        let refreshed_topology =
+            dev_probe_topology(&refreshed, &refresh_dev_options, 5173, &refreshed_target);
+        if let Some(reason) = dev_topology_change(&initial_topology, &refreshed_topology) {
+            let diagnostic = wake_error_diagnostic(restart_required_error(reason));
+            let watch_interests = probe_watch_interests(&refreshed);
+            refresh_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .candidate = CandidateState::Blocked {
+                diagnostic: diagnostic.clone(),
+            };
+            return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                watch_interests,
+                diagnostic,
+            });
+        }
+        let id = {
+            let mut state = refresh_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1).max(1);
+            state.candidate = CandidateState::Pending {
+                id,
+                draft: refreshed.clone(),
+                last_error: None,
+            };
+            id
+        };
+        Ok(wake_dev_server::DevMountRefresh::Candidate(
+            make_dev_refresh_candidate(
+                Arc::clone(&refresh_state),
+                id,
+                refreshed,
+                refresh_build_options.clone(),
+            ),
+        ))
     });
     let (event_tx, event_rx) = mpsc::channel();
-    let event_root = prepared.root.clone();
+    let federation_type_event_tx = event_tx.clone();
+    let federation_type_monitor_slot: Arc<
+        Mutex<Option<federation_type_watch::FederationTypeMonitor>>,
+    > = Arc::new(Mutex::new(None));
+    let event_monitor_slot = Arc::clone(&federation_type_monitor_slot);
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
-        forward_dev_server_event(&event_tx, &event_root, event);
+        if matches!(&event, wake_dev_server::ServerEvent::Closed)
+            && let Some(monitor) = event_monitor_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+        {
+            monitor.request_stop();
+        }
+        forward_dev_server_event(&event_tx, event);
     });
     let serve_options = wake_dev_server::ServeOptions {
-        entry: prepared.entry,
+        entry: dev_federation.entry,
         base_path: config.public_path().to_string(),
         resolve_options: ResolveOptions {
-            alias: prepared.aliases,
+            alias: dev_aliases,
             conditions: ["browser", "development", "import", "module", "default"]
                 .iter()
                 .map(|value| value.to_string())
@@ -2646,19 +5613,62 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         host,
         open: options.open.unwrap_or(server.open),
         proxy: proxies,
-        target_env: resolve_target_env(config, &prepared.root)?,
+        target_env: initial_target_env,
         jsx_import_source: config.react.jsx_import_source.clone(),
-        watch_roots,
-        before_rebuild: Some(before_rebuild),
+        file_system: Some(prepared.generation.file_system()),
+        watch_interests: initial_watch_interests,
+        refresh: Some(refresh),
         quiet: true,
         event_handler: Some(event_handler),
         mounts: Vec::new(),
+        deferred_mounts: Vec::new(),
+        federation: dev_federation.build,
     };
     let handle = wake_dev_server::start(&prepared.root, port, serve_options)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
+    let federation_type_monitor = if let Some(initial_type_sync) = &initial_type_sync {
+        let report_error = Arc::new(move |error: WakeError| {
+            let WakeError {
+                code,
+                message,
+                path,
+                diagnostics: _,
+            } = error;
+            let mut diagnostic = Diagnostic::error(format!(
+                "Federation type refresh failed; keeping the previous editor declarations: {message}"
+            ))
+            .with_code(code)
+            .with_note("Wake will retry while the development server remains open");
+            if let Some(path) = path {
+                diagnostic = diagnostic.with_path(path);
+            }
+            let _ = federation_type_event_tx.send(DevServerEvent::Diagnostic {
+                diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
+            });
+        });
+        match federation_type_watch::start_federation_type_monitor(
+            &prepared.root,
+            &prepared.config.federation,
+            development_type_lock.as_deref(),
+            initial_type_sync,
+            report_error,
+        ) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                let _ = handle.close();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    *federation_type_monitor_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = federation_type_monitor.clone();
     Ok(DevServer {
         handle,
         events: Arc::new(Mutex::new(event_rx)),
+        federation_type_monitor,
     })
 }
 
@@ -3011,16 +6021,49 @@ fn build_docs_leaf(
     cancellation: &CancellationToken,
 ) -> Result<DocsBuildResult, WakeError> {
     cancellation.check()?;
-    let started = Instant::now();
-    let (mut prepared, docs, routes, demos, warnings) =
-        prepare_docs(&options, wake_docs::BuildMode::Production, docs_mode)?;
-    prepared.outdir = absolute_from(
-        &prepared.root,
+    let prepared_docs = prepare_docs(&options, wake_docs::BuildMode::Production, docs_mode)?;
+    let requested = absolute_from(
+        &prepared_docs.0.root,
         options
             .outdir
             .as_deref()
             .unwrap_or_else(|| Path::new("docs-dist")),
     );
+    let project_root = prepared_docs.0.root.clone();
+    let protected_entry = prepared_docs.0.entry.clone();
+    let (mut result, target) = publish_staged_output(
+        &project_root,
+        &[protected_entry.as_path()],
+        &requested,
+        OutputProduct::Documentation,
+        cancellation,
+        |stage| materialize_docs_leaf(prepared_docs, options, docs_mode, cancellation, stage),
+    )?;
+    result.build.output_dir = Some(target.to_string_lossy().into_owned());
+    Ok(result)
+}
+
+fn build_docs_leaf_into(
+    options: DocsBuildOptions,
+    docs_mode: DocsMode,
+    cancellation: &CancellationToken,
+    outdir: &Path,
+) -> Result<DocsBuildResult, WakeError> {
+    let prepared_docs = prepare_docs(&options, wake_docs::BuildMode::Production, docs_mode)?;
+    materialize_docs_leaf(prepared_docs, options, docs_mode, cancellation, outdir)
+}
+
+fn materialize_docs_leaf(
+    prepared_docs: PreparedDocs,
+    options: DocsBuildOptions,
+    docs_mode: DocsMode,
+    cancellation: &CancellationToken,
+    outdir: &Path,
+) -> Result<DocsBuildResult, WakeError> {
+    cancellation.check()?;
+    let started = Instant::now();
+    let (mut prepared, docs, routes, demos, warnings, _changed_files) = prepared_docs;
+    prepared.outdir = outdir.to_path_buf();
     prepared.config.public_path = Some(normalize_public_path(&docs.base_path));
     let build_options = BuildOptions {
         project: options.project,
@@ -3029,19 +6072,30 @@ fn build_docs_leaf(
         write: true,
         ..BuildOptions::default()
     };
-    let lifetime = if build_options.cache {
-        BundlerLifetime::Session
-    } else {
-        BundlerLifetime::OneShot
-    };
-    let mut bundler = create_bundler(&prepared, &build_options, true, lifetime)?;
-    bundler.set_entry_chunk_name("entry");
-    let output = bundler.build(&prepared.entry);
+    let mut bundler_options = create_bundler_options(&prepared, &build_options, true)?;
+    bundler_options.entry_chunk_name = Some("entry".to_owned());
+    let request = BuildRequest::new(&prepared.entry);
+    let federation_inputs = federation::render_production_inputs(&prepared, &build_options)?;
+    prepared.install_product_inputs(federation_inputs.files())?;
+    let mut generation = BuildGeneration::new(prepared.generation.file_system());
+    let federation_generation = federation::bind_production_generation(
+        &prepared,
+        &build_options,
+        &federation_inputs,
+        generation.file_system_view(),
+    )?;
+    cancellation.check()?;
+    let output = generation.build_once(bundler_options, request);
     cancellation.check()?;
     if output.has_errors() {
         return Err(
-            WakeError::new("WAKE_BUILD", "Wake documentation build failed")
-                .with_diagnostic_infos(diagnostic_infos(&output.diagnostics, &prepared.root)),
+            WakeError::new("WAKE_BUILD", "Wake documentation build failed").with_diagnostic_infos(
+                diagnostic_infos(
+                    &output.diagnostics,
+                    &prepared.root,
+                    generation.file_system_view().as_ref(),
+                ),
+            ),
         );
     }
     let scripts = output
@@ -3059,13 +6113,24 @@ fn build_docs_leaf(
             public_path: prepared.config.public_path(),
         },
     );
-    let mut result = finish_output(
+    let federation = federation::build_artifacts(
+        &prepared,
+        &output,
+        federation_generation,
+        &mut generation,
+        cancellation,
+    )?;
+    let mut application = prepare_application_output(
         &prepared,
         &build_options,
         output,
         started.elapsed().as_secs_f64() * 1000.0,
+        federation,
+        generation.file_system_view().as_ref(),
     )?;
-    result
+    write_application_output(&prepared, &application, outdir)?;
+    application
+        .result
         .diagnostics
         .extend(warnings.into_iter().map(|message| DiagnosticInfo {
             severity: "warning".to_string(),
@@ -3079,7 +6144,7 @@ fn build_docs_leaf(
         }));
 
     wake_docs::write_route_shells(
-        &prepared.outdir,
+        outdir,
         &routes,
         &html,
         &docs.title,
@@ -3087,10 +6152,12 @@ fn build_docs_leaf(
         &docs.locale,
     )
     .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
-    wake_docs::copy_public_assets(&prepared.root, &prepared.outdir)
+    wake_docs::copy_public_assets(&prepared.root, outdir)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
+    application.result.files = docs_output_inventory(outdir)?;
+    application.result.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(DocsBuildResult {
-        build: result,
+        build: application.result,
         routes,
         mode: docs_mode,
         demos,
@@ -3120,101 +6187,106 @@ fn build_aggregated_docs(
             .as_deref()
             .unwrap_or(&config.docs.base_path),
     );
-    let final_outdir = absolute_from(
+    let requested_outdir = absolute_from(
         &site_root,
         options
             .outdir
             .as_deref()
             .unwrap_or_else(|| Path::new("docs-dist")),
     );
-    validate_output_directory(&final_outdir)?;
-    let stage_parent = final_outdir.parent().unwrap_or(&site_root);
-    std::fs::create_dir_all(stage_parent)
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(stage_parent))?;
-    let staging = tempfile::Builder::new()
-        .prefix(".wake-docs-stage-")
-        .tempdir_in(stage_parent)
-        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(stage_parent))?;
-    let stage_root = staging.path().join("output");
+    let (mut result, final_outdir) = publish_staged_output(
+        &site_root,
+        &[],
+        &requested_outdir,
+        OutputProduct::Documentation,
+        cancellation,
+        |stage_root| {
+            let mut site_options = options.clone();
+            site_options.outdir = Some(stage_root.to_path_buf());
+            site_options.presentation = Some(DocsPresentation::Standalone);
+            let mut result =
+                build_docs_leaf_into(site_options, DocsMode::Site, cancellation, stage_root)?;
+            validate_workspace_route_mounts(&site_base, &result.routes, &workspaces)?;
 
-    let mut site_options = options.clone();
-    site_options.outdir = Some(stage_root.clone());
-    site_options.presentation = Some(DocsPresentation::Standalone);
-    let mut result = build_docs_leaf(site_options, DocsMode::Site, cancellation)?;
-    validate_workspace_route_mounts(&site_base, &result.routes, &workspaces)?;
-
-    let mut workspace_infos = Vec::new();
-    for workspace in workspaces {
-        cancellation.check()?;
-        let relative = workspace_output_relative(&site_base, &workspace.base_path)?;
-        let workspace_outdir = stage_root.join(&relative);
-        if workspace_outdir.exists() {
-            return Err(WakeError::new(
-                "WAKE_BUILD",
-                format!(
-                    "Docs workspace `{}` output collides with the parent site at `{}`",
-                    workspace.name, workspace.base_path
-                ),
-            )
-            .at(&workspace_outdir));
-        }
-        let presentation = match workspace.presentation {
-            wake_config::DocsWorkspacePresentation::Embedded => DocsPresentation::Embedded,
-            wake_config::DocsWorkspacePresentation::Standalone => DocsPresentation::Standalone,
-        };
-        let workspace_options = DocsBuildOptions {
-            project: ProjectOptions {
-                cwd: Some(workspace.config_dir.clone()),
-                config_path: None,
-            },
-            outdir: Some(workspace_outdir),
-            base_path: Some(workspace.base_path.clone()),
-            presentation: Some(presentation),
-        };
-        let mut workspace_result =
-            build_docs_leaf(workspace_options, DocsMode::Components, cancellation)
+            let mut workspace_infos = Vec::new();
+            for workspace in workspaces {
+                cancellation.check()?;
+                let relative = workspace_output_relative(&site_base, &workspace.base_path)?;
+                let workspace_outdir = stage_root.join(&relative);
+                if workspace_outdir.exists() {
+                    return Err(WakeError::new(
+                        "WAKE_BUILD",
+                        format!(
+                            "Docs workspace `{}` output collides with the parent site at `{}`",
+                            workspace.name, workspace.base_path
+                        ),
+                    )
+                    .at(&workspace_outdir));
+                }
+                let presentation = match workspace.presentation {
+                    wake_config::DocsWorkspacePresentation::Embedded => DocsPresentation::Embedded,
+                    wake_config::DocsWorkspacePresentation::Standalone => {
+                        DocsPresentation::Standalone
+                    }
+                };
+                let workspace_options = DocsBuildOptions {
+                    project: ProjectOptions {
+                        cwd: Some(workspace.config_dir.clone()),
+                        config_path: None,
+                    },
+                    outdir: Some(workspace_outdir.clone()),
+                    base_path: Some(workspace.base_path.clone()),
+                    presentation: Some(presentation),
+                };
+                let mut workspace_result = build_docs_leaf_into(
+                    workspace_options,
+                    DocsMode::Components,
+                    cancellation,
+                    &workspace_outdir,
+                )
                 .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
-        result.build.module_count += workspace_result.build.module_count;
-        result.build.updated_module_count += workspace_result.build.updated_module_count;
-        result.build.cached_module_count += workspace_result.build.cached_module_count;
-        for file in &mut workspace_result.build.files {
-            file.path = relative
-                .join(&file.path)
-                .to_string_lossy()
-                .replace('\\', "/");
-        }
-        for diagnostic in &mut workspace_result.build.diagnostics {
-            diagnostic
-                .notes
-                .push(format!("Docs workspace: {}", workspace.name));
-        }
-        result.build.files.extend(workspace_result.build.files);
-        result
-            .build
-            .diagnostics
-            .extend(workspace_result.build.diagnostics);
-        workspace_infos.push(DocsWorkspaceBuildInfo {
-            name: workspace.name,
-            root: workspace.root.to_string_lossy().into_owned(),
-            base_path: workspace.base_path,
-            mode: DocsMode::Components,
-            presentation: presentation.as_str().to_string(),
-            demos: workspace_result.demos.len(),
-        });
-    }
+                result.build.module_count += workspace_result.build.module_count;
+                result.build.updated_module_count += workspace_result.build.updated_module_count;
+                result.build.cached_module_count += workspace_result.build.cached_module_count;
+                for file in &mut workspace_result.build.files {
+                    file.path = relative
+                        .join(&file.path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                }
+                for diagnostic in &mut workspace_result.build.diagnostics {
+                    diagnostic
+                        .notes
+                        .push(format!("Docs workspace: {}", workspace.name));
+                }
+                result.build.files.extend(workspace_result.build.files);
+                result
+                    .build
+                    .diagnostics
+                    .extend(workspace_result.build.diagnostics);
+                workspace_infos.push(DocsWorkspaceBuildInfo {
+                    name: workspace.name,
+                    root: workspace.root.to_string_lossy().into_owned(),
+                    base_path: workspace.base_path,
+                    mode: DocsMode::Components,
+                    presentation: presentation.as_str().to_string(),
+                    demos: workspace_result.demos.len(),
+                });
+            }
 
-    write_aggregate_docs_manifest(&stage_root, &site_base, &workspace_infos)?;
-    let published_files = docs_output_inventory(&stage_root)?;
-    commit_output_tree(&stage_root, &final_outdir)?;
+            write_aggregate_docs_manifest(stage_root, &site_base, &workspace_infos)?;
+            result.build.files = docs_output_inventory(stage_root)?;
+            result.workspaces = workspace_infos;
+            Ok(result)
+        },
+    )?;
     result.build.output_dir = Some(final_outdir.to_string_lossy().into_owned());
     result.build.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-    result.build.files = published_files;
-    result.workspaces = workspace_infos;
     Ok(result)
 }
 
 fn docs_output_inventory(root: &Path) -> Result<Vec<OutputFile>, WakeError> {
-    collect_output_tree_files(root, "documentation")?
+    collect_output_tree_files(root, "documentation", false)?
         .into_iter()
         .map(|relative| {
             let path = root.join(&relative);
@@ -3230,47 +6302,22 @@ fn docs_output_inventory(root: &Path) -> Result<Vec<OutputFile>, WakeError> {
                 .and_then(|extension| extension.to_str())
                 .unwrap_or_default();
             let kind = if file_name == "manifest.json" {
-                "manifest"
+                OutputFileKind::Manifest
             } else {
                 match extension {
-                    "html" => "html",
-                    "js" | "mjs" | "cjs" => "chunk",
-                    "map" => "map",
-                    _ => "asset",
+                    "html" => OutputFileKind::Html,
+                    "js" | "mjs" | "cjs" => OutputFileKind::Chunk,
+                    "map" => OutputFileKind::SourceMap,
+                    _ => OutputFileKind::Asset,
                 }
             };
             Ok(OutputFile {
                 path: relative.to_string_lossy().replace('\\', "/"),
-                kind: kind.to_string(),
+                kind,
                 bytes,
             })
         })
         .collect()
-}
-
-fn validate_output_directory(outdir: &Path) -> Result<(), WakeError> {
-    if outdir.file_name().is_none() || outdir == Path::new(".") {
-        return Err(WakeError::new(
-            "WAKE_CONFIG",
-            format!(
-                "refusing to write unsafe documentation output directory: {}",
-                outdir.display()
-            ),
-        ));
-    }
-    if let Ok(metadata) = std::fs::symlink_metadata(outdir)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(WakeError::new(
-            "WAKE_CONFIG",
-            format!(
-                "refusing to write documentation output through a symbolic link: {}",
-                outdir.display()
-            ),
-        )
-        .at(outdir));
-    }
-    Ok(())
 }
 
 fn validate_workspace_route_mounts(
@@ -3378,6 +6425,7 @@ fn write_aggregate_docs_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn commit_output_tree(staging: &Path, target: &Path) -> Result<(), WakeError> {
     commit_staged_output(staging, target, None, "documentation", ".wake-docs-backup-")
 }
@@ -3389,6 +6437,110 @@ pub(crate) fn commit_staged_output(
     product: &str,
     backup_prefix: &str,
 ) -> Result<(), WakeError> {
+    commit_staged_output_with(
+        staging,
+        target,
+        owned_roots,
+        product,
+        backup_prefix,
+        || Ok(()),
+        None,
+    )
+}
+
+fn commit_staged_output_with(
+    staging: &Path,
+    target: &Path,
+    owned_roots: Option<&[&str]>,
+    product: &str,
+    backup_prefix: &str,
+    revalidate: impl FnOnce() -> Result<(), WakeError>,
+    fail_after_installs: Option<usize>,
+) -> Result<(), WakeError> {
+    let target_identity = resolve_physical_output_path(target)?;
+    let output_scopes = resolve_directory_output_scopes(&target_identity, owned_roots)?;
+    let commit_lock = acquire_output_commit_lock(product)?;
+    let locked_identity = resolve_physical_output_path(target)?;
+    if locked_identity != target_identity {
+        return Err(WakeError::new(
+            "WAKE_OUTPUT_COLLISION",
+            "output target identity changed while waiting for its publication lock",
+        )
+        .at(&locked_identity));
+    }
+    let locked_scopes = resolve_directory_output_scopes(&locked_identity, owned_roots)?;
+    if locked_scopes != output_scopes {
+        return Err(WakeError::new(
+            "WAKE_OUTPUT_COLLISION",
+            "output mutation scope identity changed while waiting for its publication lock",
+        )
+        .at(&locked_identity));
+    }
+    validate_directory_output_commit_scope(&locked_scopes, commit_lock.lock_paths(), product)?;
+    revalidate()?;
+    commit_staged_output_locked(
+        staging,
+        &locked_identity,
+        owned_roots,
+        product,
+        backup_prefix,
+        fail_after_installs,
+    )
+}
+
+fn resolve_directory_output_scopes(
+    target: &Path,
+    owned_roots: Option<&[&str]>,
+) -> Result<Vec<PathBuf>, WakeError> {
+    let mut scopes = owned_roots
+        .map(|roots| {
+            roots
+                .iter()
+                .map(|root| resolve_physical_output_path(&target.join(root)))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|| Ok(vec![resolve_physical_output_path(target)?]))?;
+    if scopes.is_empty() {
+        return Err(WakeError::new(
+            "WAKE_INTERNAL",
+            "directory output commit requires at least one mutation scope",
+        ));
+    }
+    scopes.sort();
+    scopes.dedup();
+    Ok(scopes)
+}
+
+fn validate_directory_output_commit_scope(
+    scopes: &[PathBuf],
+    lock_paths: &[PathBuf],
+    product: &str,
+) -> Result<(), WakeError> {
+    for lock_path in lock_paths {
+        let lock_path = resolve_physical_output_path(lock_path)?;
+        for scope in scopes {
+            if lock_path.starts_with(scope) || scope.starts_with(&lock_path) {
+                return Err(WakeError::new(
+                    "WAKE_OUTPUT_COLLISION",
+                    format!(
+                        "refusing to publish {product} output over a live Wake output-commit lock"
+                    ),
+                )
+                .at(scope));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn commit_staged_output_locked(
+    staging: &Path,
+    target: &Path,
+    owned_roots: Option<&[&str]>,
+    product: &str,
+    backup_prefix: &str,
+    fail_after_installs: Option<usize>,
+) -> Result<(), WakeError> {
     if !staging.is_dir() {
         return Err(WakeError::new(
             "WAKE_IO",
@@ -3399,8 +6551,8 @@ pub(crate) fn commit_staged_output(
         )
         .at(staging));
     }
-    let staged_files = collect_scoped_output_files(staging, owned_roots, product)?;
-    let existing_files = collect_scoped_output_files(target, owned_roots, product)?;
+    let staged_files = collect_scoped_output_files(staging, owned_roots, product, true)?;
+    let existing_files = collect_scoped_output_files(target, owned_roots, product, false)?;
     let staged_set = staged_files.iter().cloned().collect::<BTreeSet<_>>();
     let mut replacements = Vec::new();
 
@@ -3474,8 +6626,17 @@ pub(crate) fn commit_staged_output(
     }
 
     let mut touched = Vec::new();
-    for (relative, bytes) in replacements {
+    for (installs, (relative, bytes)) in replacements.into_iter().enumerate() {
         let destination = target.join(&relative);
+        if fail_after_installs == Some(installs) {
+            return Err(rollback_output_tree(
+                target,
+                backup.path(),
+                &touched,
+                WakeError::new("WAKE_IO", "injected directory output install failure")
+                    .at(&destination),
+            ));
+        }
         if let Err(error) = atomic_write(&destination, &bytes) {
             return Err(rollback_output_tree(
                 target,
@@ -3522,9 +6683,10 @@ fn collect_scoped_output_files(
     base: &Path,
     owned_roots: Option<&[&str]>,
     product: &str,
+    reject_commit_locks: bool,
 ) -> Result<Vec<PathBuf>, WakeError> {
     let Some(owned_roots) = owned_roots else {
-        return collect_output_tree_files(base, product);
+        return collect_output_tree_files(base, product, reject_commit_locks);
     };
     let mut files = Vec::new();
     for owned in owned_roots {
@@ -3543,7 +6705,7 @@ fn collect_scoped_output_files(
             .at(&directory));
         }
         files.extend(
-            collect_output_tree_files(&directory, product)?
+            collect_output_tree_files(&directory, product, reject_commit_locks)?
                 .into_iter()
                 .map(|relative| PathBuf::from(owned).join(relative)),
         );
@@ -3552,12 +6714,17 @@ fn collect_scoped_output_files(
     Ok(files)
 }
 
-fn collect_output_tree_files(base: &Path, product: &str) -> Result<Vec<PathBuf>, WakeError> {
+fn collect_output_tree_files(
+    base: &Path,
+    product: &str,
+    reject_commit_locks: bool,
+) -> Result<Vec<PathBuf>, WakeError> {
     fn visit(
         base: &Path,
         directory: &Path,
         files: &mut Vec<PathBuf>,
         product: &str,
+        reject_commit_locks: bool,
     ) -> Result<(), WakeError> {
         for entry in std::fs::read_dir(directory).map_err(|error| {
             output_commit_error(
@@ -3575,6 +6742,23 @@ fn collect_output_tree_files(base: &Path, product: &str) -> Result<Vec<PathBuf>,
             let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
                 output_commit_error(product, "prepare", "inspect output entry", &path, error)
             })?;
+            if is_output_commit_lock_path(&path) {
+                if reject_commit_locks {
+                    return Err(WakeError::new(
+                        "WAKE_OUTPUT_COLLISION",
+                        "staged directory output uses Wake's reserved output-commit lock name",
+                    )
+                    .at(&path));
+                }
+                if metadata_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                    return Err(WakeError::new(
+                        "WAKE_CONFIG",
+                        "invalid Wake output-commit lock metadata",
+                    )
+                    .at(&path));
+                }
+                continue;
+            }
             if metadata.file_type().is_symlink() {
                 return Err(WakeError::new(
                     "WAKE_IO",
@@ -3586,7 +6770,7 @@ fn collect_output_tree_files(base: &Path, product: &str) -> Result<Vec<PathBuf>,
                 .at(&path));
             }
             if metadata.is_dir() {
-                visit(base, &path, files, product)?;
+                visit(base, &path, files, product, reject_commit_locks)?;
             } else if metadata.is_file() {
                 files.push(
                     path.strip_prefix(base)
@@ -3621,7 +6805,7 @@ fn collect_output_tree_files(base: &Path, product: &str) -> Result<Vec<PathBuf>,
         .at(base));
     }
     let mut files = Vec::new();
-    visit(base, base, &mut files, product)?;
+    visit(base, base, &mut files, product, reject_commit_locks)?;
     files.sort();
     Ok(files)
 }
@@ -3816,13 +7000,14 @@ fn start_docs_dev_server_leaf(
     options: DevServerOptions,
     docs_mode: DocsMode,
 ) -> Result<DevServer, WakeError> {
+    let dev_options = options.clone();
     let docs_options = DocsBuildOptions {
         project: options.project.clone(),
         outdir: None,
         base_path: None,
         presentation: None,
     };
-    let (prepared, docs, _routes, _demos, warnings) =
+    let (prepared, docs, _routes, _demos, warnings, _changed_files) =
         prepare_docs(&docs_options, wake_docs::BuildMode::Development, docs_mode)?;
     let config = &prepared.config;
     let port = options.port.or(config.dev_server.port).unwrap_or(5173);
@@ -3837,21 +7022,22 @@ fn start_docs_dev_server_leaf(
             diagnostic: DiagnosticInfo::from_diagnostic(&diagnostic, None),
         });
     }
-    let event_root = prepared.root.clone();
     let forwarded_tx = event_tx.clone();
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
-        forward_dev_server_event(&forwarded_tx, &event_root, event);
+        forward_dev_server_event(&forwarded_tx, event);
     });
     let docs_base_path = docs.base_path.clone();
-    let before_rebuild = docs_before_rebuild(
-        prepared.root.clone(),
-        config.clone(),
-        docs,
+    let watch_interests = docs_watch_interests(&prepared, &docs);
+    let refresh = docs_refresh(
+        docs_options,
+        dev_options,
+        &prepared,
+        &docs,
         docs_mode,
+        true,
+        None,
         event_tx.clone(),
         None,
-        None,
-        false,
     );
     let serve_options = wake_dev_server::ServeOptions {
         entry: prepared.entry,
@@ -3884,17 +7070,21 @@ fn start_docs_dev_server_leaf(
             .collect(),
         target_env: resolve_target_env(config, &prepared.root)?,
         jsx_import_source: config.react.jsx_import_source.clone(),
-        watch_roots: docs_watch_roots(&prepared.root, config),
-        before_rebuild: Some(before_rebuild),
+        file_system: Some(prepared.generation.file_system()),
+        watch_interests,
+        refresh: Some(refresh),
         quiet: true,
         event_handler: Some(event_handler),
         mounts: Vec::new(),
+        deferred_mounts: Vec::new(),
+        federation: wake_dev_server::FederationBuildOptions::default(),
     };
     let handle = wake_dev_server::start(&prepared.root, port, serve_options)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
     Ok(DevServer {
         handle,
         events: Arc::new(Mutex::new(event_rx)),
+        federation_type_monitor: None,
     })
 }
 
@@ -3903,7 +7093,8 @@ fn start_aggregated_docs_dev_server(
     docs_options: DocsBuildOptions,
     workspaces: Vec<ResolvedDocsWorkspace>,
 ) -> Result<DevServer, WakeError> {
-    let (prepared, site_docs, _routes, _demos, warnings) = prepare_docs(
+    let dev_options = options.clone();
+    let (prepared, site_docs, _routes, _demos, warnings, _changed_files) = prepare_docs(
         &docs_options,
         wake_docs::BuildMode::Development,
         DocsMode::Site,
@@ -3916,41 +7107,26 @@ fn start_aggregated_docs_dev_server(
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let (event_tx, event_rx) = mpsc::channel();
     send_docs_warnings(&event_tx, warnings, None);
-    let event_root = prepared.root.clone();
     let forwarded_tx = event_tx.clone();
     let event_handler: wake_dev_server::EventHandler = Arc::new(move |event| {
-        forward_dev_server_event(&forwarded_tx, &event_root, event);
+        forward_dev_server_event(&forwarded_tx, event);
     });
 
     let topology = docs_workspace_topology(&workspaces);
-    let topology_options = docs_options.clone();
-    let site_before_rebuild = docs_before_rebuild(
-        prepared.root.clone(),
-        config.clone(),
-        site_docs.clone(),
+    let site_refresh = docs_refresh(
+        docs_options.clone(),
+        dev_options.clone(),
+        &prepared,
+        &site_docs,
         DocsMode::Site,
+        true,
+        Some(topology),
         event_tx.clone(),
         None,
-        Some(Arc::new(move |changed| {
-            if !changed.iter().any(|path| {
-                path.file_name()
-                    .is_some_and(|name| name == wake_config::CONFIG_FILE)
-            }) {
-                return Ok(());
-            }
-            let discovered =
-                discover_docs_workspaces(&topology_options).map_err(|error| error.to_string())?;
-            if docs_workspace_topology(&discovered) != topology {
-                return Err(
-                    "Docs workspace topology changed; restart the development server".to_string(),
-                );
-            }
-            Ok(())
-        })),
-        true,
     );
 
     let mut mounts = Vec::new();
+    let mut deferred_mounts = Vec::new();
     for workspace in workspaces {
         let presentation = match workspace.presentation {
             wake_config::DocsWorkspacePresentation::Embedded => DocsPresentation::Embedded,
@@ -3965,23 +7141,48 @@ fn start_aggregated_docs_dev_server(
             base_path: Some(workspace.base_path.clone()),
             presentation: Some(presentation),
         };
-        let (workspace_prepared, workspace_docs, _routes, _demos, warnings) = prepare_docs(
-            &workspace_options,
-            wake_docs::BuildMode::Development,
-            DocsMode::Components,
-        )
-        .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
+        if workspace.dev_loading == wake_config::DocsWorkspaceDevLoading::Lazy {
+            let probe = probe_docs_candidate(&workspace_options, DocsMode::Components)
+                .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
+            let watch_interests = docs_probe_watch_interests(&probe);
+            let refresh = deferred_docs_refresh(
+                workspace_options,
+                dev_options.clone(),
+                probe.clone(),
+                DocsMode::Components,
+                event_tx.clone(),
+                Some(workspace.name.clone()),
+            );
+            deferred_mounts.push(wake_dev_server::DeferredMountedServeOptions {
+                name: workspace.name,
+                root: probe.prepared.root,
+                base_path: workspace.base_path,
+                watch_interests,
+                refresh,
+                federation: wake_dev_server::FederationBuildOptions::default(),
+            });
+            continue;
+        }
+        let (workspace_prepared, workspace_docs, _routes, _demos, warnings, _changed_files) =
+            prepare_docs(
+                &workspace_options,
+                wake_docs::BuildMode::Development,
+                DocsMode::Components,
+            )
+            .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
         send_docs_warnings(&event_tx, warnings, Some(&workspace.name));
         let workspace_config = workspace_prepared.config.clone();
-        let before_rebuild = docs_before_rebuild(
-            workspace_prepared.root.clone(),
-            workspace_config.clone(),
-            workspace_docs,
+        let watch_interests = docs_watch_interests(&workspace_prepared, &workspace_docs);
+        let refresh = docs_refresh(
+            workspace_options,
+            dev_options.clone(),
+            &workspace_prepared,
+            &workspace_docs,
             DocsMode::Components,
+            false,
+            None,
             event_tx.clone(),
             Some(workspace.name.clone()),
-            None,
-            true,
         );
         let resolve_options = ResolveOptions {
             alias: workspace_prepared.aliases,
@@ -3996,20 +7197,20 @@ fn start_aggregated_docs_dev_server(
             name: workspace.name,
             root: workspace_prepared.root.clone(),
             base_path: workspace.base_path,
-            loading: match workspace.dev_loading {
-                wake_config::DocsWorkspaceDevLoading::Lazy => wake_dev_server::DevLoading::Lazy,
-                wake_config::DocsWorkspaceDevLoading::Eager => wake_dev_server::DevLoading::Eager,
-            },
+            loading: wake_dev_server::DevLoading::Eager,
             entry: workspace_prepared.entry,
             resolve_options,
             define: build_defines(&workspace_config, true),
             target_env,
             jsx_import_source: workspace_config.react.jsx_import_source.clone(),
-            watch_roots: docs_watch_roots(&workspace_prepared.root, &workspace_config),
-            before_rebuild: Some(before_rebuild),
+            file_system: Some(workspace_prepared.generation.file_system()),
+            watch_interests,
+            refresh: Some(refresh),
+            federation: wake_dev_server::FederationBuildOptions::default(),
         });
     }
 
+    let site_watch_interests = docs_watch_interests(&prepared, &site_docs);
     let serve_options = wake_dev_server::ServeOptions {
         entry: prepared.entry,
         base_path: site_docs.base_path,
@@ -4041,111 +7242,680 @@ fn start_aggregated_docs_dev_server(
             .collect(),
         target_env: resolve_target_env(&config, &prepared.root)?,
         jsx_import_source: config.react.jsx_import_source.clone(),
-        watch_roots: docs_watch_roots(&prepared.root, &config),
-        before_rebuild: Some(site_before_rebuild),
+        file_system: Some(prepared.generation.file_system()),
+        watch_interests: site_watch_interests,
+        refresh: Some(site_refresh),
         quiet: true,
         event_handler: Some(event_handler),
         mounts,
+        deferred_mounts,
+        federation: wake_dev_server::FederationBuildOptions::default(),
     };
     let handle = wake_dev_server::start(&prepared.root, port, serve_options)
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
     Ok(DevServer {
         handle,
         events: Arc::new(Mutex::new(event_rx)),
+        federation_type_monitor: None,
     })
 }
 
-type DocsTopologyCheck = Arc<dyn Fn(&[PathBuf]) -> Result<(), String> + Send + Sync + 'static>;
-
-fn docs_before_rebuild(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsDevTopology {
+    config_dir: PathBuf,
     root: PathBuf,
-    config: wake_config::Config,
-    docs: wake_docs::DocsOptions,
+    entry: PathBuf,
+    source_dir: PathBuf,
+    preview: Option<PathBuf>,
+    theme_css: Option<PathBuf>,
+    base_path: String,
+    presentation: DocsPresentation,
+    component_scan: Vec<ComponentScanTopology>,
+    federation: FederationOptions,
+    server: Option<DocsServerTopology>,
+}
+
+fn docs_dev_topology(
+    prepared: &PreparedBuild,
+    docs: &wake_docs::DocsOptions,
+    dev_options: &DevServerOptions,
+    owns_server: bool,
+) -> DocsDevTopology {
+    docs_dev_topology_from(
+        &prepared.config_dir,
+        &prepared.root,
+        &prepared.logical_entry,
+        &prepared.config,
+        docs,
+        dev_options,
+        owns_server,
+    )
+}
+
+fn docs_probe_topology(
+    prepared: &PreparedDocsProbe,
+    dev_options: &DevServerOptions,
+    owns_server: bool,
+) -> DocsDevTopology {
+    docs_dev_topology_from(
+        &prepared.prepared.config_dir,
+        &prepared.prepared.root,
+        &prepared.prepared.logical_entry,
+        &prepared.prepared.config,
+        &prepared.docs,
+        dev_options,
+        owns_server,
+    )
+}
+
+fn docs_dev_topology_from(
+    config_dir: &Path,
+    root: &Path,
+    logical_entry: &Path,
+    config: &wake_config::Config,
+    docs: &wake_docs::DocsOptions,
+    dev_options: &DevServerOptions,
+    owns_server: bool,
+) -> DocsDevTopology {
+    let server = &config.dev_server;
+    DocsDevTopology {
+        config_dir: config_dir.to_path_buf(),
+        root: root.to_path_buf(),
+        entry: logical_entry.to_path_buf(),
+        source_dir: docs.source_dir.clone(),
+        preview: docs.preview.clone(),
+        theme_css: docs.theme_css.clone(),
+        base_path: docs.base_path.clone(),
+        presentation: docs.presentation,
+        component_scan: config
+            .component_scan
+            .iter()
+            .map(|rule| {
+                (
+                    rule.namespace.clone(),
+                    rule.cwd.clone(),
+                    rule.generate_source,
+                    rule.include.clone(),
+                    rule.exclude.clone(),
+                )
+            })
+            .collect(),
+        federation: config.federation.clone(),
+        server: owns_server.then(|| {
+            (
+                server.server.clone(),
+                dev_options.port.or(server.port).unwrap_or(5173),
+                dev_options
+                    .host
+                    .clone()
+                    .or_else(|| server.host.clone())
+                    .unwrap_or_else(|| "127.0.0.1".to_owned()),
+                dev_options.open.unwrap_or(server.open),
+                server
+                    .proxy
+                    .iter()
+                    .map(|proxy| {
+                        (
+                            proxy.context.clone(),
+                            proxy.target.clone(),
+                            proxy.ws,
+                            proxy.change_origin,
+                            proxy
+                                .path_rewrite
+                                .iter()
+                                .map(|(pattern, replacement)| {
+                                    (pattern.clone(), replacement.clone())
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        }),
+    }
+}
+
+fn docs_topology_change(current: &DocsDevTopology, candidate: &DocsDevTopology) -> Option<String> {
+    if current.config_dir != candidate.config_dir {
+        return Some("Docs configuration source changed".to_owned());
+    }
+    if current.root != candidate.root {
+        return Some("Docs project root changed".to_owned());
+    }
+    if current.entry != candidate.entry {
+        return Some("Docs generated entry topology changed".to_owned());
+    }
+    if current.source_dir != candidate.source_dir
+        || current.preview != candidate.preview
+        || current.theme_css != candidate.theme_css
+    {
+        return Some("Docs source, Preview, or theme topology changed".to_owned());
+    }
+    if current.base_path != candidate.base_path || current.presentation != candidate.presentation {
+        return Some("Docs mount URL or presentation changed".to_owned());
+    }
+    if current.component_scan != candidate.component_scan {
+        return Some("Docs component scan topology changed".to_owned());
+    }
+    if current.federation != candidate.federation {
+        return Some("Federation topology changed".to_owned());
+    }
+    if current.server != candidate.server {
+        return Some("Docs server or proxy topology changed".to_owned());
+    }
+    None
+}
+
+#[allow(clippy::result_large_err)]
+fn make_docs_refresh_candidate(
+    state: Arc<Mutex<RefreshState<Option<PreparedDocsRefresh>, PreparedDocsProbe>>>,
+    id: u64,
+    draft: PreparedDocsProbe,
     docs_mode: DocsMode,
     event_tx: mpsc::Sender<DevServerEvent>,
     workspace: Option<String>,
-    topology_check: Option<DocsTopologyCheck>,
-    lock_base_path: bool,
-) -> wake_dev_server::BeforeRebuild {
-    let state = Arc::new(Mutex::new((config, docs)));
-    Arc::new(move |changed| {
-        if let Some(check) = &topology_check {
-            check(changed)?;
-        }
-        if let Some(config_path) = changed.iter().find(|path| {
-            path.file_name()
-                .is_some_and(|name| name == wake_config::CONFIG_FILE)
-        }) {
-            let config_dir = config_path.parent().unwrap_or(&root);
-            let refreshed_config =
-                wake_config::load(config_dir).map_err(|error| error.to_string())?;
-            let refreshed_root = canonical_project_root(&normalize_path(
-                &refreshed_config.resolved_root(config_dir),
-            ))
-            .map_err(|error| error.to_string())?;
-            if refreshed_root != root {
-                return Err("Docs project root changed; restart the development server".to_string());
+) -> wake_dev_server::DevMountCandidate {
+    let preliminary_interests = docs_probe_watch_interests(&draft);
+    let accepted_slot = Arc::new(Mutex::new(None::<PreparedDocsRefresh>));
+    let materialize_slot = Arc::clone(&accepted_slot);
+    let materialize_state = Arc::clone(&state);
+    let materialize_draft = draft.clone();
+    wake_dev_server::DevMountCandidate::new(
+        preliminary_interests,
+        move || {
+            let result = materialize_docs_probe(
+                materialize_draft,
+                wake_docs::BuildMode::Development,
+                docs_mode,
+            )
+            .and_then(
+                |(prepared, docs, _routes, _demos, warnings, _changed_files)| {
+                    let changed_files = {
+                        let state = materialize_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.accepted.as_ref().map_or_else(
+                            || prepared.generation.logical_inventory(),
+                            |accepted| {
+                                generation_changed_paths(
+                                    &accepted.prepared.generation,
+                                    &prepared.generation,
+                                )
+                            },
+                        )
+                    };
+                    let plan =
+                        app_dev_plan(&prepared, prepared.entry.clone(), prepared.aliases.clone())?;
+                    let watch_interests = docs_watch_interests(&prepared, &docs);
+                    Ok((
+                        PreparedDocsRefresh {
+                            prepared,
+                            docs,
+                            warnings,
+                        },
+                        plan,
+                        watch_interests,
+                        changed_files,
+                    ))
+                },
+            );
+            match result {
+                Ok((prepared, plan, watch_interests, generated_paths)) => {
+                    *materialize_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(prepared);
+                    Ok(wake_dev_server::DevMountMaterialization {
+                        plan,
+                        watch_interests,
+                        generated_paths,
+                    })
+                }
+                Err(error) => {
+                    let diagnostic = wake_error_diagnostic(error);
+                    let mut state = materialize_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let CandidateState::Pending {
+                        id: current_id,
+                        last_error,
+                        ..
+                    } = &mut state.candidate
+                        && *current_id == id
+                    {
+                        *last_error = Some(diagnostic.clone());
+                    }
+                    Err(diagnostic)
+                }
             }
-            let mut state = state.lock().unwrap();
-            let previous_docs = &state.1;
-            if refreshed_config.docs.source_dir != state.0.docs.source_dir
-                || refreshed_config.docs.preview != state.0.docs.preview
-                || refreshed_config.docs.theme_css != state.0.docs.theme_css
-            {
-                return Err(
-                    "Docs source, Preview, or theme file topology changed; restart the development server"
-                        .to_string(),
-                );
+        },
+        move |outcome| {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = matches!(
+                &state.candidate,
+                CandidateState::Pending { id: current_id, .. } if *current_id == id
+            );
+            if !current {
+                return;
             }
-            let mut refreshed_docs =
-                docs_options(&refreshed_config, None, previous_docs.presentation);
-            if lock_base_path {
-                refreshed_docs.base_path = previous_docs.base_path.clone();
+            match outcome {
+                wake_dev_server::RefreshOutcome::Committed => {
+                    if let Some(accepted) = accepted_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        send_docs_warnings(
+                            &event_tx,
+                            accepted.warnings.clone(),
+                            workspace.as_deref(),
+                        );
+                        state.accepted = Some(accepted);
+                        state.candidate = CandidateState::Stable;
+                    }
+                }
+                wake_dev_server::RefreshOutcome::Superseded => {
+                    state.candidate = CandidateState::Stable;
+                }
+                wake_dev_server::RefreshOutcome::RetryableFailure
+                | wake_dev_server::RefreshOutcome::Aborted => {}
             }
-            *state = (refreshed_config, refreshed_docs);
-        }
-        let (config, docs) = state.lock().unwrap().clone();
-        let generated = wake_docs::generate_with_mode(
-            &root,
-            &docs,
-            wake_docs::BuildMode::Development,
-            docs_mode,
-        )
-        .map_err(|error| error.to_string())?;
-        send_docs_warnings(&event_tx, generated.warnings, workspace.as_deref());
-        let mut invalidated = generated.changed_files;
-        invalidated.extend(
-            prepare_aliases_and_scans(&config, &root)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter_map(|(name, path)| name.starts_with("@@@/").then_some(path)),
+        },
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn docs_refresh(
+    options: DocsBuildOptions,
+    dev_options: DevServerOptions,
+    prepared: &PreparedBuild,
+    docs: &wake_docs::DocsOptions,
+    docs_mode: DocsMode,
+    owns_server: bool,
+    expected_workspaces: Option<DocsWorkspaceTopology>,
+    event_tx: mpsc::Sender<DevServerEvent>,
+    workspace: Option<String>,
+) -> wake_dev_server::RefreshMount {
+    let initial_topology = docs_dev_topology(prepared, docs, &dev_options, owns_server);
+    let config_interest =
+        WatchInterest::exact_file(prepared.config_dir.join(wake_config::CONFIG_FILE))
+            .resolve_against(&prepared.root);
+    let federation_lock_interest =
+        WatchInterest::exact_file(prepared.root.join("wake-federation.lock"))
+            .resolve_against(&prepared.root);
+    let initial_federation_lock_fingerprint =
+        prepared_control_fingerprint(prepared, &prepared.root.join("wake-federation.lock"));
+    let control_interests = project_control_interests(prepared);
+    let state: Arc<Mutex<RefreshState<Option<PreparedDocsRefresh>, PreparedDocsProbe>>> =
+        Arc::new(Mutex::new(RefreshState {
+            accepted: Some(PreparedDocsRefresh {
+                prepared: prepared.clone(),
+                docs: docs.clone(),
+                warnings: Vec::new(),
+            }),
+            next_id: 1,
+            candidate: CandidateState::Stable,
+        }));
+    Arc::new(move |_current, invalidation| {
+        let changed = invalidation.paths();
+        let rescan = invalidation.is_rescan();
+        let accepted_root = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepted
+            .as_ref()
+            .expect("ready Docs refresh owns an accepted generation")
+            .prepared
+            .root
+            .clone();
+        let current_controls = control_interests
+            .iter()
+            .map(|interest| interest.resolve_against(&accepted_root))
+            .collect::<Vec<_>>();
+        let current_config_interest = config_interest.resolve_against(&accepted_root);
+        let current_federation_lock = federation_lock_interest.resolve_against(&accepted_root);
+        let federation_lock_changed = federation_lock_changed(
+            changed,
+            rescan,
+            &current_federation_lock,
+            &accepted_root.join("wake-federation.lock"),
+            &initial_federation_lock_fingerprint,
         );
-        Ok(invalidated)
+        if federation_lock_changed {
+            let diagnostic =
+                wake_error_diagnostic(restart_required_error("Federation lock changed"));
+            let mut refresh_state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            refresh_state.candidate = CandidateState::Blocked { diagnostic };
+            return Ok(wake_dev_server::DevMountRefresh::RestartRequired {
+                reason: "Federation lock changed".to_owned(),
+            });
+        }
+        let control_changed = rescan || changed_matches(changed, &current_controls);
+        if !control_changed {
+            let state_guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &state_guard.candidate {
+                CandidateState::Blocked { diagnostic } => {
+                    let accepted = state_guard
+                        .accepted
+                        .as_ref()
+                        .expect("ready Docs refresh owns an accepted generation");
+                    return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                        watch_interests: docs_watch_interests(&accepted.prepared, &accepted.docs),
+                        diagnostic: diagnostic.clone(),
+                    });
+                }
+                CandidateState::Pending { id, draft, .. } => {
+                    let id = *id;
+                    let draft = draft.clone();
+                    drop(state_guard);
+                    return Ok(wake_dev_server::DevMountRefresh::Candidate(
+                        make_docs_refresh_candidate(
+                            Arc::clone(&state),
+                            id,
+                            draft,
+                            docs_mode,
+                            event_tx.clone(),
+                            workspace.clone(),
+                        ),
+                    ));
+                }
+                CandidateState::Stable => {}
+            }
+            let draft = docs_probe_from_refresh(
+                state_guard
+                    .accepted
+                    .as_ref()
+                    .expect("ready Docs refresh owns an accepted generation"),
+            );
+            drop(state_guard);
+            let id = {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let id = state.next_id;
+                state.next_id = state.next_id.wrapping_add(1).max(1);
+                state.candidate = CandidateState::Pending {
+                    id,
+                    draft: draft.clone(),
+                    last_error: None,
+                };
+                id
+            };
+            return Ok(wake_dev_server::DevMountRefresh::Candidate(
+                make_docs_refresh_candidate(
+                    Arc::clone(&state),
+                    id,
+                    draft,
+                    docs_mode,
+                    event_tx.clone(),
+                    workspace.clone(),
+                ),
+            ));
+        }
+        if (rescan || changed_matches(changed, std::slice::from_ref(&current_config_interest)))
+            && let Some(expected) = &expected_workspaces
+        {
+            let discovered = match discover_docs_workspaces(&options) {
+                Ok(discovered) => discovered,
+                Err(error) => {
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let accepted = state
+                        .accepted
+                        .as_ref()
+                        .expect("ready Docs refresh owns an accepted generation");
+                    let watch_interests = recovery_watch_interests(
+                        docs_watch_interests(&accepted.prepared, &accepted.docs),
+                        &accepted.prepared.root,
+                        &error,
+                    );
+                    let diagnostic = wake_error_diagnostic(error);
+                    state.candidate = CandidateState::Blocked {
+                        diagnostic: diagnostic.clone(),
+                    };
+                    return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                        watch_interests,
+                        diagnostic,
+                    });
+                }
+            };
+            if docs_workspace_topology(&discovered) != *expected {
+                let diagnostic = wake_error_diagnostic(restart_required_error(
+                    "Docs workspace topology changed",
+                ));
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let accepted = state
+                    .accepted
+                    .as_ref()
+                    .expect("ready Docs refresh owns an accepted generation");
+                let watch_interests = docs_watch_interests(&accepted.prepared, &accepted.docs);
+                state.candidate = CandidateState::Blocked {
+                    diagnostic: diagnostic.clone(),
+                };
+                return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                    watch_interests,
+                    diagnostic,
+                });
+            }
+        }
+        let refreshed = match probe_docs_candidate(&options, docs_mode) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let accepted = state
+                    .accepted
+                    .as_ref()
+                    .expect("ready Docs refresh owns an accepted generation");
+                let watch_interests = recovery_watch_interests(
+                    docs_watch_interests(&accepted.prepared, &accepted.docs),
+                    &accepted.prepared.root,
+                    &error,
+                );
+                let diagnostic = wake_error_diagnostic(error);
+                state.candidate = CandidateState::Blocked {
+                    diagnostic: diagnostic.clone(),
+                };
+                return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                    watch_interests,
+                    diagnostic,
+                });
+            }
+        };
+        let topology = docs_probe_topology(&refreshed, &dev_options, owns_server);
+        if let Some(reason) = docs_topology_change(&initial_topology, &topology) {
+            let diagnostic = wake_error_diagnostic(restart_required_error(reason));
+            let watch_interests = docs_probe_watch_interests(&refreshed);
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .candidate = CandidateState::Blocked {
+                diagnostic: diagnostic.clone(),
+            };
+            return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                watch_interests,
+                diagnostic,
+            });
+        }
+        let id = {
+            let mut refresh_state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = refresh_state.next_id;
+            refresh_state.next_id = refresh_state.next_id.wrapping_add(1).max(1);
+            refresh_state.candidate = CandidateState::Pending {
+                id,
+                draft: refreshed.clone(),
+                last_error: None,
+            };
+            id
+        };
+        Ok(wake_dev_server::DevMountRefresh::Candidate(
+            make_docs_refresh_candidate(
+                Arc::clone(&state),
+                id,
+                refreshed,
+                docs_mode,
+                event_tx.clone(),
+                workspace.clone(),
+            ),
+        ))
     })
 }
 
-fn docs_watch_roots(root: &Path, config: &wake_config::Config) -> Vec<PathBuf> {
-    let mut roots = vec![
-        root.join(&config.docs.source_dir),
-        root.join("src"),
-        root.join(wake_config::CONFIG_FILE),
-        root.join("navigation.toml"),
-    ];
-    if let Some(preview) = &config.docs.preview {
-        roots.push(root.join(preview));
-    }
-    if let Some(theme_css) = &config.docs.theme_css {
-        roots.push(root.join(theme_css));
-    }
-    roots.extend(
-        config
-            .component_scan
-            .iter()
-            .map(|rule| root.join(&rule.cwd)),
+#[allow(clippy::result_large_err)]
+fn deferred_docs_refresh(
+    options: DocsBuildOptions,
+    dev_options: DevServerOptions,
+    initial_probe: PreparedDocsProbe,
+    docs_mode: DocsMode,
+    event_tx: mpsc::Sender<DevServerEvent>,
+    workspace: Option<String>,
+) -> wake_dev_server::DeferredRefreshMount {
+    let root = initial_probe.prepared.root.clone();
+    let initial_topology = docs_probe_topology(&initial_probe, &dev_options, false);
+    let federation_lock_path = root.join("wake-federation.lock");
+    let federation_lock_interest =
+        WatchInterest::exact_file(&federation_lock_path).resolve_against(&root);
+    let initial_federation_lock_fingerprint = captured_control_fingerprint(
+        &initial_probe.prepared.control_fingerprints,
+        &federation_lock_path,
     );
-    roots.sort();
-    roots.dedup();
-    roots
+    let state: Arc<Mutex<RefreshState<Option<PreparedDocsRefresh>, PreparedDocsProbe>>> =
+        Arc::new(Mutex::new(RefreshState {
+            accepted: None,
+            next_id: 1,
+            candidate: CandidateState::Stable,
+        }));
+    Arc::new(move |invalidation| {
+        if federation_lock_changed(
+            invalidation.paths(),
+            invalidation.is_rescan(),
+            &federation_lock_interest,
+            &federation_lock_path,
+            &initial_federation_lock_fingerprint,
+        ) {
+            let diagnostic =
+                wake_error_diagnostic(restart_required_error("Federation lock changed"));
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .candidate = CandidateState::Blocked { diagnostic };
+            return Ok(wake_dev_server::DevMountRefresh::RestartRequired {
+                reason: "Federation lock changed".to_owned(),
+            });
+        }
+
+        let refreshed = match probe_docs_candidate(&options, docs_mode) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let base = state.accepted.as_ref().map_or_else(
+                    || docs_probe_watch_interests(&initial_probe),
+                    |accepted| docs_watch_interests(&accepted.prepared, &accepted.docs),
+                );
+                let watch_interests = recovery_watch_interests(base, &root, &error);
+                let diagnostic = wake_error_diagnostic(error);
+                state.candidate = CandidateState::Blocked {
+                    diagnostic: diagnostic.clone(),
+                };
+                return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                    watch_interests,
+                    diagnostic,
+                });
+            }
+        };
+        if let Some(reason) = docs_topology_change(
+            &initial_topology,
+            &docs_probe_topology(&refreshed, &dev_options, false),
+        ) {
+            let diagnostic = wake_error_diagnostic(restart_required_error(reason));
+            let watch_interests = docs_probe_watch_interests(&refreshed);
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .candidate = CandidateState::Blocked {
+                diagnostic: diagnostic.clone(),
+            };
+            return Ok(wake_dev_server::DevMountRefresh::RejectedCandidate {
+                watch_interests,
+                diagnostic,
+            });
+        }
+        let id = {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1).max(1);
+            state.candidate = CandidateState::Pending {
+                id,
+                draft: refreshed.clone(),
+                last_error: None,
+            };
+            id
+        };
+        Ok(wake_dev_server::DevMountRefresh::Candidate(
+            make_docs_refresh_candidate(
+                Arc::clone(&state),
+                id,
+                refreshed,
+                docs_mode,
+                event_tx.clone(),
+                workspace.clone(),
+            ),
+        ))
+    })
+}
+
+fn docs_watch_interests(
+    prepared: &PreparedBuild,
+    docs: &wake_docs::DocsOptions,
+) -> Vec<WatchInterest> {
+    docs_watch_interests_from(project_watch_interests(prepared), &prepared.root, docs)
+}
+
+fn docs_probe_watch_interests(prepared: &PreparedDocsProbe) -> Vec<WatchInterest> {
+    docs_watch_interests_from(
+        probe_watch_interests(&prepared.prepared),
+        &prepared.prepared.root,
+        &prepared.docs,
+    )
+}
+
+fn docs_watch_interests_from(
+    mut interests: Vec<WatchInterest>,
+    root: &Path,
+    docs: &wake_docs::DocsOptions,
+) -> Vec<WatchInterest> {
+    interests.extend([
+        WatchInterest::tree(root.join(&docs.source_dir)),
+        WatchInterest::exact_file(root.join(&docs.source_dir).join("navigation.toml")),
+    ]);
+    if let Some(preview) = &docs.preview {
+        interests.push(WatchInterest::tree(root.join(preview)));
+    }
+    if let Some(theme_css) = &docs.theme_css {
+        interests.push(WatchInterest::tree(root.join(theme_css)));
+    }
+    interests = interests
+        .into_iter()
+        .map(|interest| interest.resolve_against(root))
+        .collect();
+    interests.sort();
+    interests.dedup();
+    interests
 }
 
 fn send_docs_warnings(
@@ -4164,9 +7934,7 @@ fn send_docs_warnings(
     }
 }
 
-fn docs_workspace_topology(
-    workspaces: &[ResolvedDocsWorkspace],
-) -> Vec<(String, String, String, &'static str, &'static str)> {
+fn docs_workspace_topology(workspaces: &[ResolvedDocsWorkspace]) -> DocsWorkspaceTopology {
     workspaces
         .iter()
         .map(|workspace| {
@@ -4186,12 +7954,41 @@ fn prepare_docs(
     mode: wake_docs::BuildMode,
     docs_mode: DocsMode,
 ) -> Result<PreparedDocs, WakeError> {
+    materialize_docs_probe(probe_docs_candidate(options, docs_mode)?, mode, docs_mode)
+}
+
+fn probe_docs_candidate(
+    options: &DocsBuildOptions,
+    docs_mode: DocsMode,
+) -> Result<PreparedDocsProbe, WakeError> {
+    let mut last_snapshot_error = None;
+    for _ in 0..3 {
+        match probe_docs_candidate_once(options, docs_mode) {
+            Err(error) if error.code == "WAKE_WATCH_SNAPSHOT_CHANGED" => {
+                last_snapshot_error = Some(error);
+            }
+            result => return result,
+        }
+    }
+    Err(last_snapshot_error.unwrap_or_else(|| {
+        WakeError::new(
+            "WAKE_WATCH_SNAPSHOT_CHANGED",
+            "project control files changed while preparing the Docs build",
+        )
+    }))
+}
+
+fn probe_docs_candidate_once(
+    options: &DocsBuildOptions,
+    docs_mode: DocsMode,
+) -> Result<PreparedDocsProbe, WakeError> {
     let cwd = options
         .project
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
+    let config_before = control_file_fingerprint(&config_dir.join(wake_config::CONFIG_FILE));
     let config = wake_config::load(&config_dir)
         .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
     let configured_root = normalize_path(&config.resolved_root(&config_dir));
@@ -4206,31 +8003,91 @@ fn prepare_docs(
         .at(&configured_root));
     }
     let root = canonical_project_root(&configured_root)?;
-    let mut aliases = prepare_aliases_and_scans(&config, &root)?;
     let docs = docs_options(
         &config,
         options.base_path.as_deref(),
         options.presentation.unwrap_or_default(),
     );
-    let generated = wake_docs::generate_with_mode(&root, &docs, mode, docs_mode)
-        .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
-    aliases.retain(|(name, _)| name != "@@wake/docs" && name != "@@wake/docs-project");
-    aliases.extend(generated.aliases);
-    let routes = generated.routes;
-    let demos = generated.demos;
-    let warnings = generated.warnings;
-    Ok((
-        PreparedBuild {
+    validate_reserved_docs_inputs(&config, &root, &docs)?;
+    let entry_relative = match docs_mode {
+        DocsMode::Site => "runtime/site-entry.tsx",
+        DocsMode::Components => "runtime/components-entry.tsx",
+    };
+    let logical_entry = root.join(".wake/docs/generated").join(entry_relative);
+    let control_fingerprints =
+        stable_project_control_snapshot(&config_before, &config_dir, &root, None)?;
+    Ok(PreparedDocsProbe {
+        prepared: PreparedBuildProbe {
+            config_dir,
             root: root.clone(),
-            entry: generated.entry,
+            logical_entry,
+            explicit_entry: None,
             outdir: root.join("docs-dist"),
             config,
+            control_fingerprints,
+        },
+        docs,
+    })
+}
+
+fn materialize_docs_probe(
+    probe: PreparedDocsProbe,
+    mode: wake_docs::BuildMode,
+    docs_mode: DocsMode,
+) -> Result<PreparedDocs, WakeError> {
+    let PreparedDocsProbe {
+        prepared:
+            PreparedBuildProbe {
+                config_dir,
+                root,
+                logical_entry: _,
+                explicit_entry: _,
+                outdir,
+                config,
+                control_fingerprints,
+            },
+        docs,
+    } = probe;
+    let mut generation = GenerationDraft::new(&root);
+    let mut aliases = prepare_generation_aliases(&config, &root, &mut generation)?;
+    let rendered = wake_docs::render_with_mode(&root, &docs, mode, docs_mode)
+        .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
+    let docs_root = root.join(".wake/docs/generated");
+    let changed_files = rendered
+        .files
+        .inventory()
+        .map(|path| docs_root.join(path.as_path()))
+        .collect::<Vec<_>>();
+    generation.insert_tree(Path::new("docs/generated"), &rendered.files)?;
+    aliases.retain(|(name, _)| name != "@@wake/docs" && name != "@@wake/docs-project");
+    aliases.extend([
+        ("@@wake/docs".to_string(), docs_root.clone()),
+        ("@@wake/docs-project".to_string(), root.clone()),
+    ]);
+    let entry = docs_root.join(rendered.entry_relative.as_path());
+    let routes = rendered.routes;
+    let demos = rendered.demos;
+    let warnings = rendered.warnings;
+    let generation = generation.seal()?;
+    Ok((
+        PreparedBuild {
+            config_dir,
+            root: root.clone(),
+            entry: entry.clone(),
+            logical_entry: entry,
+            explicit_entry: None,
+            outdir,
+            config,
+            control_fingerprints,
             aliases,
+            core_generation: generation.clone(),
+            generation,
         },
         docs,
         routes,
         demos,
         warnings,
+        changed_files,
     ))
 }
 
@@ -4256,6 +8113,40 @@ fn docs_options(
     }
 }
 
+fn validate_reserved_docs_inputs(
+    config: &wake_config::Config,
+    root: &Path,
+    docs: &wake_docs::DocsOptions,
+) -> Result<(), WakeError> {
+    for (kind, path) in config
+        .alias
+        .values()
+        .map(|path| ("resolver alias", absolute_from(root, Path::new(path))))
+        .chain(config.component_scan.iter().map(|rule| {
+            (
+                "component scan root",
+                absolute_from(root, Path::new(&rule.cwd)),
+            )
+        }))
+        .chain(config.federation.exposes.values().map(|expose| {
+            (
+                "Federation expose",
+                absolute_from(root, Path::new(&expose.entry)),
+            )
+        }))
+    {
+        validate_not_reserved(root, kind, &path)?;
+    }
+    validate_not_reserved(root, "Docs source", &absolute_from(root, &docs.source_dir))?;
+    if let Some(preview) = &docs.preview {
+        validate_not_reserved(root, "Docs Preview", &absolute_from(root, preview))?;
+    }
+    if let Some(theme) = &docs.theme_css {
+        validate_not_reserved(root, "Docs theme", &absolute_from(root, theme))?;
+    }
+    Ok(())
+}
+
 fn normalize_public_path(path: &str) -> String {
     if path.trim().is_empty() || path == "/" {
         "/".to_string()
@@ -4271,6 +8162,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn persistent_cache_path_does_not_create_optional_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        assert_eq!(persistent_cache_path(root, false, "cache.bin"), None);
+        assert_eq!(
+            persistent_cache_path(root, true, "cache.bin"),
+            Some(root.join(".wake").join("cache.bin"))
+        );
+        assert!(!root.join(".wake").exists());
+    }
 
     fn assert_same_existing_file(actual: impl AsRef<Path>, expected: impl AsRef<Path>) {
         let actual = std::fs::canonicalize(actual.as_ref()).unwrap();
@@ -4321,6 +8225,22 @@ mod tests {
         )
     }
 
+    fn http_get(port: u16, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
     fn test_host_response(request_id: u64, sequence: u64, body: HostResponseBody) -> HostResponse {
         HostResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -4336,7 +8256,7 @@ mod tests {
             run_id,
             "test-seed".to_string(),
             wake_test_contract::TestEnvironmentInfo {
-                kind: "dom".to_string(),
+                kind: wake_test_contract::TestEnvironmentKind::Dom,
                 react: None,
                 react_dom: None,
                 v8: "test-v8".to_string(),
@@ -4883,13 +8803,52 @@ mod tests {
                 .with_path("does-not-exist.ts")
                 .with_primary(wake_common::Span::new(0, 1), "missing")],
             Path::new("."),
+            &OsFileSystem,
         );
         assert!(missing[0].location.is_none());
     }
 
     #[test]
-    fn build_defines_disable_esm_hmr_syntax_in_classic_script_chunks() {
-        let config = wake_config::Config::default();
+    fn diagnostic_locations_read_the_owned_generation_instead_of_shadowed_host_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let logical_root = root.join(".wake");
+        std::fs::create_dir_all(&logical_root).unwrap();
+        std::fs::write(logical_root.join("generated.ts"), "rogue host bytes\n").unwrap();
+
+        let overlay_text = "first line\nconst generated = ;\n";
+        let mut files = OwnedFileTreeBuilder::new();
+        files
+            .insert(
+                ProjectedRelativePath::new("generated.ts").unwrap(),
+                Arc::<[u8]>::from(overlay_text.as_bytes()),
+            )
+            .unwrap();
+        let file_system =
+            OwnedOverlayFileSystem::try_new(Arc::new(OsFileSystem), &logical_root, files.seal())
+                .unwrap();
+        let start = overlay_text.find("generated").unwrap() as u32;
+        let end = start + "generated".len() as u32;
+        let infos = diagnostic_infos(
+            &[Diagnostic::error("generated source error")
+                .with_path(".wake/generated.ts")
+                .with_primary(wake_common::Span::new(start, end), "generated binding")],
+            root,
+            &file_system,
+        );
+
+        let location = infos[0].location.as_ref().expect("overlay source location");
+        assert_eq!(location.line, 2);
+        assert_eq!(location.line_text, "const generated = ;");
+        assert_eq!(location.label.as_deref(), Some("generated binding"));
+    }
+
+    #[test]
+    fn build_defines_keep_the_unsupported_hot_module_api_false() {
+        let mut config = wake_config::Config::default();
+        config
+            .define
+            .insert("import.meta.hot".to_owned(), "true".to_owned());
         let defines = build_defines(&config, true);
 
         assert!(
@@ -4918,10 +8877,15 @@ mod tests {
             ),
             ("src/route.css", ".route { color: red; }"),
         ]);
-        let mut bundler = IncrementalBundler::new(Arc::new(fs));
-        bundler.enable_code_splitting().enable_css_extraction();
-
-        let output = bundler.build(Path::new("src/index.js"));
+        let mut session = BuildSession::new(
+            Arc::new(fs),
+            BundlerBuildOptions {
+                extract_css: true,
+                code_splitting: true,
+                ..BundlerBuildOptions::default()
+            },
+        );
+        let output = session.build(BuildRequest::new("src/index.js"));
         assert!(!output.has_errors(), "{:?}", output.diagnostics);
         assert!(
             output.chunks.len() > 1,
@@ -4980,6 +8944,1318 @@ mod tests {
         }
     }
 
+    fn generation_seal_count(root: &Path) -> usize {
+        GENERATION_SEALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(root)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn activate_bootstrap_after_current_coverage(
+        bootstrap: &mut BuildWatchBootstrap,
+    ) -> BuildContext {
+        for _ in 0..4 {
+            let revision = bootstrap.watch_plan().revision;
+            match bootstrap.activate_at(revision) {
+                Ok(context) => return context,
+                Err(error) if error.code == "WAKE_WATCH_COVERAGE_PENDING" => {}
+                Err(error) => panic!("bootstrap activation failed: {error}"),
+            }
+        }
+        panic!("bootstrap did not converge after current coverage")
+    }
+
+    fn bootstrap_activation_error(
+        bootstrap: &mut BuildWatchBootstrap,
+        revision: WatchPlanRevision,
+    ) -> WakeError {
+        match bootstrap.activate_at(revision) {
+            Err(error) => error,
+            Ok(context) => {
+                context.close();
+                panic!("bootstrap unexpectedly activated")
+            }
+        }
+    }
+
+    #[test]
+    fn build_watch_bootstrap_recovers_invalid_toml_without_early_generation() {
+        let fixture = Fixture::new("build-watch-bootstrap-invalid-toml");
+        fixture.write(wake_config::CONFIG_FILE, "[html\n");
+        let options = BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        };
+        let mut bootstrap = BuildWatchBootstrap::create(options).unwrap();
+        let initial = bootstrap.watch_plan();
+        let config = fixture.0.join(wake_config::CONFIG_FILE);
+        assert!(matches!(
+            bootstrap.state(),
+            BuildWatchBootstrapState::Waiting { .. }
+        ));
+        assert!(
+            initial
+                .interests
+                .iter()
+                .any(|interest| interest.matches_exact_file(&config))
+        );
+        assert!(!fixture.0.join(".wake").exists());
+        let error = bootstrap_activation_error(&mut bootstrap, initial.revision);
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(bootstrap.watch_plan().revision, initial.revision);
+        assert!(!fixture.0.join(".wake").exists());
+
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\n",
+        );
+        assert_eq!(
+            bootstrap_activation_error(&mut bootstrap, initial.revision).code,
+            "WAKE_WATCH_COVERAGE_PENDING"
+        );
+        assert!(!fixture.0.join(".wake").exists());
+        let context = activate_bootstrap_after_current_coverage(&mut bootstrap);
+        let plan = context.watch_plan();
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Rescan,
+                    plan.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        context.close();
+    }
+
+    #[test]
+    fn build_watch_bootstrap_recovers_missing_config_entry_and_root() {
+        let fixture = Fixture::new("build-watch-bootstrap-missing-facts");
+        let config = fixture.0.join(wake_config::CONFIG_FILE);
+        std::fs::remove_file(&config).unwrap();
+        let options = BuildOptions {
+            project: ProjectOptions {
+                cwd: Some(fixture.0.clone()),
+                config_path: Some(config.clone()),
+            },
+            write: false,
+            ..BuildOptions::default()
+        };
+        let mut bootstrap = BuildWatchBootstrap::create(options).unwrap();
+        assert!(matches!(
+            bootstrap.state(),
+            BuildWatchBootstrapState::Waiting { .. }
+        ));
+        assert!(
+            bootstrap
+                .watch_plan()
+                .interests
+                .iter()
+                .any(|interest| interest.matches_exact_file(&config))
+        );
+        assert!(!fixture.0.join(".wake").exists());
+
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "root_dir = \"project\"\n[html]\nentry = \"src/index.js\"\n",
+        );
+        let revision = bootstrap.watch_plan().revision;
+        let missing_root = fixture.0.join("project");
+        let error = bootstrap_activation_error(&mut bootstrap, revision);
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert!(
+            bootstrap
+                .watch_plan()
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&missing_root, true))
+        );
+        assert!(!fixture.0.join(".wake").exists());
+
+        fixture.write("project/src/index.js", "export const recovered = true;\n");
+        let context = activate_bootstrap_after_current_coverage(&mut bootstrap);
+        context.close();
+
+        let missing_entry = Fixture::new("build-watch-bootstrap-missing-entry");
+        std::fs::remove_file(missing_entry.0.join("src/index.js")).unwrap();
+        let mut bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: missing_entry.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let entry = missing_entry.0.join("src/index.js");
+        assert!(matches!(
+            bootstrap.state(),
+            BuildWatchBootstrapState::Waiting { .. }
+        ));
+        assert!(
+            bootstrap
+                .watch_plan()
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&entry, true))
+        );
+        assert!(!missing_entry.0.join(".wake").exists());
+        missing_entry.write("src/index.js", "export const recovered = true;\n");
+        activate_bootstrap_after_current_coverage(&mut bootstrap).close();
+    }
+
+    #[test]
+    fn build_watch_bootstrap_tracks_implicit_discovery_markers() {
+        let fixture = Fixture::new("build-watch-bootstrap-discovery");
+        let child = fixture.0.join("packages/client");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::remove_file(fixture.0.join(wake_config::CONFIG_FILE)).unwrap();
+        fixture.write("package.json", "{}\n");
+        let bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: ProjectOptions {
+                cwd: Some(child.clone()),
+                config_path: None,
+            },
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let plan = bootstrap.watch_plan();
+        for marker in [
+            child.join(wake_config::CONFIG_FILE),
+            child.join("package.json"),
+            fixture.0.join(wake_config::CONFIG_FILE),
+            fixture.0.join("package.json"),
+        ] {
+            assert!(
+                plan.interests
+                    .iter()
+                    .any(|interest| interest.matches_exact_file(&marker)),
+                "missing discovery marker {}",
+                marker.display()
+            );
+        }
+        assert!(matches!(
+            bootstrap.state(),
+            BuildWatchBootstrapState::Waiting { .. }
+        ));
+        assert!(!fixture.0.join(".wake").exists());
+    }
+
+    #[test]
+    fn build_context_retains_discovery_floor_after_bootstrap_handoff() {
+        let fixture = Fixture::new("build-watch-context-discovery-floor");
+        let child = fixture.0.join("packages/client");
+        std::fs::create_dir_all(&child).unwrap();
+        let closer_config = child.join(wake_config::CONFIG_FILE);
+        let mut bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: ProjectOptions {
+                cwd: Some(child.clone()),
+                config_path: None,
+            },
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            bootstrap.state(),
+            BuildWatchBootstrapState::Activatable { .. }
+        ));
+        let context = activate_bootstrap_after_current_coverage(&mut bootstrap);
+        let initial = context.watch_plan();
+        assert!(
+            initial
+                .interests
+                .iter()
+                .any(|interest| interest.matches_exact_file(&closer_config)),
+            "the retained context must own missing closer discovery markers"
+        );
+        context
+            .rebuild_watch_at(
+                WatchInvalidation::Rescan,
+                initial.revision,
+                CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(
+            context
+                .watch_plan()
+                .interests
+                .iter()
+                .any(|interest| interest.matches_exact_file(&closer_config)),
+            "a successful build must not shrink away the discovery floor"
+        );
+
+        fixture.write(
+            "packages/client/wake.config.toml",
+            "root_dir = \"../..\"\n[html]\nentry = \"src/index.js\"\n",
+        );
+        let current = context.watch_plan();
+        let error = context
+            .rebuild_watch_at(
+                WatchInvalidation::Paths(vec![closer_config]),
+                current.revision,
+                CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "WAKE_DEV_RESTART_REQUIRED");
+        context.close();
+    }
+
+    #[test]
+    fn build_watch_bootstrap_plan_covers_derived_inputs_and_excludes_output() {
+        let fixture = Fixture::new("build-watch-bootstrap-derived-plan");
+        std::fs::remove_dir_all(fixture.0.join("src")).unwrap();
+        fixture.write("index.js", "export const value = true;\n");
+        fixture.write("scan/page.ts", "export const page = true;\n");
+        fixture.write(
+            "packages/Button.tsx",
+            "export default function Button() {}\n",
+        );
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            r#"[html]
+entry = "index.js"
+
+[alias]
+external = "linked-package"
+
+[[component_scan]]
+namespace = "pages"
+cwd = "scan"
+generate_source = true
+
+[federation]
+enabled = true
+name = "shell"
+
+[federation.exposes."./Button"]
+entry = "packages/Button.tsx"
+"#,
+        );
+        let linked = fixture.0.join("linked-package");
+        let target = fixture.0.join("actual-package");
+        std::fs::create_dir_all(&target).unwrap();
+        #[cfg(unix)]
+        let linked_created = std::os::unix::fs::symlink(&target, &linked).is_ok();
+        #[cfg(windows)]
+        let linked_created = std::os::windows::fs::symlink_dir(&target, &linked).is_ok();
+        if !linked_created {
+            std::fs::create_dir_all(&linked).unwrap();
+        }
+
+        let bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: fixture.project(),
+            outdir: Some(PathBuf::from("dist")),
+            write: true,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let plan = bootstrap.watch_plan();
+        for input in [
+            linked.clone(),
+            fixture.0.join("scan"),
+            fixture.0.join("packages/Button.tsx"),
+        ] {
+            assert!(
+                plan.interests
+                    .iter()
+                    .any(|interest| interest.matches_event(&input, true)),
+                "missing derived input {}",
+                input.display()
+            );
+        }
+        if linked_created {
+            assert!(
+                plan.interests
+                    .iter()
+                    .any(|interest| interest.matches_event(&target.join("change.ts"), true)),
+                "resolved symlink identity is not covered"
+            );
+        }
+        assert!(
+            !plan
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&fixture.0.join("dist/chunk.js"), true))
+        );
+        assert!(!fixture.0.join(".wake").exists());
+    }
+
+    #[test]
+    fn build_watch_bootstrap_recovers_a_missing_explicit_entry() {
+        let fixture = Fixture::new("build-watch-bootstrap-explicit-entry");
+        let entry = fixture.0.join("external/missing.js");
+        let mut bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: fixture.project(),
+            entry: Some(entry.clone()),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            bootstrap.state(),
+            BuildWatchBootstrapState::Waiting { .. }
+        ));
+        assert!(
+            bootstrap
+                .watch_plan()
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&entry, true))
+        );
+        assert!(!fixture.0.join(".wake").exists());
+        fixture.write("external/missing.js", "export const recovered = true;\n");
+        activate_bootstrap_after_current_coverage(&mut bootstrap).close();
+    }
+
+    #[test]
+    fn build_watch_bootstrap_revisions_are_semantic_and_stale_is_side_effect_free() {
+        let fixture = Fixture::new("build-watch-bootstrap-revision");
+        std::fs::remove_file(fixture.0.join("src/index.js")).unwrap();
+        let mut bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: fixture.project(),
+            outdir: Some(PathBuf::from("output")),
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let initial = bootstrap.watch_plan();
+        assert_eq!(
+            bootstrap_activation_error(&mut bootstrap, WatchPlanRevision(initial.revision.0 + 1),)
+                .code,
+            "WAKE_WATCH_COVERAGE_PENDING"
+        );
+        assert_eq!(bootstrap.watch_plan(), initial);
+        assert!(!fixture.0.join(".wake").exists());
+        assert!(!fixture.0.join("output").exists());
+
+        let error = bootstrap_activation_error(&mut bootstrap, initial.revision);
+        assert_eq!(error.code, "WAKE_IO");
+        assert_eq!(bootstrap.watch_plan(), initial);
+        assert!(!fixture.0.join(".wake").exists());
+    }
+
+    #[test]
+    fn build_watch_bootstrap_rejects_only_nonrecoverable_constructor_inputs() {
+        let fixture = Fixture::new("build-watch-bootstrap-fatal-inputs");
+        assert_eq!(
+            BuildWatchBootstrap::create(BuildOptions {
+                project: ProjectOptions {
+                    cwd: Some(fixture.0.join("does-not-exist")),
+                    config_path: None,
+                },
+                ..BuildOptions::default()
+            })
+            .err()
+            .expect("invalid cwd is fatal")
+            .code,
+            "WAKE_CONFIG"
+        );
+        assert_eq!(
+            BuildWatchBootstrap::create(BuildOptions {
+                project: ProjectOptions {
+                    cwd: Some(fixture.0.clone()),
+                    config_path: Some(PathBuf::from("other.toml")),
+                },
+                ..BuildOptions::default()
+            })
+            .err()
+            .expect("bad config basename is fatal")
+            .code,
+            "WAKE_CONFIG"
+        );
+        assert_eq!(
+            BuildWatchBootstrap::create(BuildOptions {
+                project: fixture.project(),
+                federation: Some(FederationOptions {
+                    enabled: true,
+                    ..FederationOptions::default()
+                }),
+                ..BuildOptions::default()
+            })
+            .err()
+            .expect("invalid programmatic federation is fatal")
+            .code,
+            "FED_CONFIG_INVALID"
+        );
+        assert!(!fixture.0.join(".wake").exists());
+    }
+
+    #[test]
+    fn build_watch_bootstrap_refined_widening_requires_new_coverage() {
+        let fixture = Fixture::new("build-watch-bootstrap-refined-fence");
+        let mut bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let initial = bootstrap.watch_plan();
+        let refined = fixture.0.join("resolved-after-materialization");
+        bootstrap.refined_interest_for_test = Some(WatchInterest::tree(&refined));
+
+        assert_eq!(
+            bootstrap_activation_error(&mut bootstrap, initial.revision).code,
+            "WAKE_WATCH_COVERAGE_PENDING"
+        );
+        let widened = bootstrap.watch_plan();
+        assert!(widened.revision > initial.revision);
+        assert!(
+            widened
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&refined, true))
+        );
+        let materialized = generation_seal_count(&fixture.0);
+        assert_eq!(materialized, 1);
+        assert_eq!(
+            bootstrap_activation_error(&mut bootstrap, initial.revision).code,
+            "WAKE_WATCH_COVERAGE_PENDING"
+        );
+        assert_eq!(generation_seal_count(&fixture.0), materialized);
+        let context = bootstrap.activate_at(widened.revision).unwrap();
+        assert_eq!(
+            generation_seal_count(&fixture.0),
+            materialized + 1,
+            "covered activation must render a fresh immutable generation"
+        );
+        assert_eq!(
+            bootstrap_activation_error(&mut bootstrap, widened.revision).code,
+            "WAKE_INTERNAL"
+        );
+        assert_eq!(generation_seal_count(&fixture.0), materialized + 1);
+        assert!(!fixture.0.join(".wake").exists());
+        context.close();
+    }
+
+    #[test]
+    fn build_watch_bootstrap_generated_failure_uses_an_exact_recovery_witness() {
+        let fixture = Fixture::new("build-watch-bootstrap-generated-recovery");
+        let fault = fixture.0.join(".wake/dev-candidates/fault");
+        let error = WakeError::new("WAKE_IO", "candidate generation failed").at(&fault);
+        let interests = build_watch_bootstrap_recovery_interests(
+            &BuildOptions {
+                project: fixture.project(),
+                ..BuildOptions::default()
+            },
+            &fixture.0,
+            &fixture.0,
+            &error,
+        );
+        assert!(
+            interests
+                .iter()
+                .any(|interest| interest.matches_event(&fault, true))
+        );
+        assert!(
+            !interests
+                .iter()
+                .any(|interest| interest.matches_event(&fault.join("generated.js"), true))
+        );
+    }
+
+    #[test]
+    fn build_watch_bootstrap_preserves_outdir_until_the_first_success() {
+        let fixture = Fixture::new("build-watch-bootstrap-output-sentinel");
+        let output = fixture.0.join("dist");
+        std::fs::create_dir_all(&output).unwrap();
+        fixture.write("dist/sentinel.txt", "previous output\n");
+        write_output_ownership_marker(&output, OutputProduct::Application).unwrap();
+        let mut bootstrap = BuildWatchBootstrap::create(BuildOptions {
+            project: fixture.project(),
+            outdir: Some(output.clone()),
+            write: true,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output.join("sentinel.txt")).unwrap(),
+            "previous output\n"
+        );
+        let context = activate_bootstrap_after_current_coverage(&mut bootstrap);
+        assert_eq!(
+            std::fs::read_to_string(output.join("sentinel.txt")).unwrap(),
+            "previous output\n"
+        );
+        let plan = context.watch_plan();
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Rescan,
+                    plan.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        assert!(!output.join("sentinel.txt").exists());
+        assert!(output.join("index.html").is_file());
+        context.close();
+    }
+
+    #[test]
+    fn manual_build_context_creation_remains_eager() {
+        let fixture = Fixture::new("manual-build-context-eager");
+        assert!(!fixture.0.join(".wake").exists());
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        assert!(
+            !fixture.0.join(".wake").exists(),
+            "eager preparation must retain generated inputs in memory"
+        );
+        context.close();
+    }
+
+    #[test]
+    fn candidate_generations_keep_stable_logical_entries_and_isolate_physical_inputs() {
+        let fixture = Fixture::new("candidate-generation-isolation");
+        let options = BuildOptions {
+            project: fixture.project(),
+            ..BuildOptions::default()
+        };
+        let first = prepare_build_candidate(&options).unwrap();
+        let logical_entry = first.root.join(".wake/entry.tsx");
+        assert_eq!(first.entry, logical_entry);
+        let first_generation = first.generation.clone();
+        let first_bytes = first_generation.file_system().read(&logical_entry).unwrap();
+        assert_eq!(
+            first
+                .generation
+                .file_system()
+                .read_to_string(&logical_entry)
+                .unwrap(),
+            "import(\"@@/src/index.js\");\n"
+        );
+
+        fixture.write("src/other.js", "export const other = true;\n");
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/other.js\"\n",
+        );
+        let second = prepare_build_candidate(&options).unwrap();
+        assert_eq!(second.entry, logical_entry);
+        assert!(!first_generation.is_same_generation(&second.generation));
+        assert_eq!(
+            first_generation.file_system().read(&logical_entry).unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            second
+                .generation
+                .file_system()
+                .read_to_string(&logical_entry)
+                .unwrap(),
+            "import(\"@@/src/other.js\");\n"
+        );
+        assert!(
+            !fixture.0.join(".wake").exists(),
+            "isolated generations must not create a physical candidate tree"
+        );
+    }
+
+    #[test]
+    fn generation_diff_reports_only_added_modified_and_removed_logical_files() {
+        let fixture = Fixture::new("generation-logical-diff");
+        let mut previous = GenerationDraft::new(&fixture.0);
+        previous.write_file("same.js", b"same".as_slice()).unwrap();
+        previous
+            .write_file("modified.js", b"before".as_slice())
+            .unwrap();
+        previous
+            .write_file("removed.js", b"removed".as_slice())
+            .unwrap();
+        let previous = previous.seal().unwrap();
+
+        let mut next = GenerationDraft::new(&fixture.0);
+        next.write_file("same.js", b"same".as_slice()).unwrap();
+        next.write_file("modified.js", b"after".as_slice()).unwrap();
+        next.write_file("added.js", b"added".as_slice()).unwrap();
+        let next = next.seal().unwrap();
+
+        assert_eq!(
+            generation_changed_paths(&previous, &next),
+            ["added.js", "modified.js", "removed.js"]
+                .into_iter()
+                .map(|path| fixture.0.join(".wake").join(path))
+                .collect::<Vec<_>>()
+        );
+        assert!(!fixture.0.join(".wake").exists());
+    }
+
+    #[test]
+    fn build_candidate_probe_declares_coverage_before_generation_materialization() {
+        let fixture = Fixture::new("candidate-probe-before-materialize");
+        fixture.write("packages/external.js", "export const external = true;\n");
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\n[alias]\nexternal = \"packages/external.js\"\n",
+        );
+        let options = BuildOptions {
+            project: fixture.project(),
+            ..BuildOptions::default()
+        };
+
+        let probe = probe_build_candidate(&options).unwrap();
+        assert!(
+            !fixture.0.join(".wake").exists(),
+            "a watch probe must not allocate a generation"
+        );
+        let interests = probe_watch_interests(&probe);
+        assert!(
+            interests
+                .iter()
+                .any(|interest| interest.matches(&fixture.0.join("packages/external.js"))),
+            "candidate source coverage must be available before materialization"
+        );
+
+        let materialized = materialize_build_probe(probe, true).unwrap();
+        assert!(
+            materialized
+                .generation
+                .logical_inventory()
+                .contains(&materialized.entry)
+        );
+        assert_eq!(
+            materialized
+                .generation
+                .file_system()
+                .read_to_string(&materialized.entry)
+                .unwrap(),
+            "import(\"@@/src/index.js\");\n"
+        );
+        assert!(
+            !fixture.0.join(".wake").exists(),
+            "materialization must remain an owned in-memory operation"
+        );
+    }
+
+    #[test]
+    fn docs_candidate_probe_does_not_generate_docs() {
+        let fixture = Fixture::new("docs-candidate-probe");
+        fixture.write("docs/index.md", "# Docs\n");
+        let options = DocsBuildOptions {
+            project: fixture.project(),
+            ..DocsBuildOptions::default()
+        };
+
+        let probe = probe_docs_candidate(&options, DocsMode::Site).unwrap();
+        assert!(!fixture.0.join(".wake").exists());
+        assert!(
+            docs_probe_watch_interests(&probe)
+                .iter()
+                .any(|interest| interest.matches(&fixture.0.join("docs/index.md")))
+        );
+    }
+
+    #[test]
+    fn control_discovery_tracks_nearest_ancestor_pnp_and_install_root_only() {
+        let outer = tempfile::tempdir().unwrap();
+        let install = outer.path().join("workspace");
+        let root = install.join("packages/app");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(install.join(".pnp.cjs"), "module.exports = {};").unwrap();
+        std::fs::write(install.join(".pnp.data.json"), "{}").unwrap();
+        std::fs::write(install.join("yarn.lock"), "lock").unwrap();
+        std::fs::write(outer.path().join("package-lock.json"), "unrelated").unwrap();
+
+        let paths = project_control_paths(&root, &root, None);
+        for expected in [
+            install.join(".pnp.cjs"),
+            install.join(".pnp.data.json"),
+            install.join("yarn.lock"),
+        ] {
+            assert!(paths.contains(&expected), "missing {}", expected.display());
+        }
+        assert!(!paths.contains(&outer.path().join("package-lock.json")));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(root.join(".wake")))
+        );
+        if let Some(volume_root) = root.ancestors().last()
+            && !volume_root.join(".pnp.cjs").is_file()
+        {
+            assert!(!paths.contains(&volume_root.join(".pnp.cjs")));
+        }
+    }
+
+    #[test]
+    fn control_discovery_follows_an_explicit_entry_outside_the_project() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        let external = outer.path().join("external-workspace");
+        let entry = external.join("packages/app/index.js");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(external.join(".pnp.cjs"), "module.exports = {};").unwrap();
+        std::fs::write(external.join(".pnp.data.json"), "{}").unwrap();
+        std::fs::write(external.join("yarn.lock"), "lock").unwrap();
+
+        let paths = project_control_paths(&root, &root, Some(&entry));
+        assert!(paths.contains(&external.join(".pnp.cjs")));
+        assert!(paths.contains(&external.join(".pnp.data.json")));
+        assert!(paths.contains(&external.join("yarn.lock")));
+    }
+
+    #[test]
+    fn materialized_build_keeps_the_probe_owned_control_snapshot() {
+        let fixture = Fixture::new("probe-owned-control-snapshot");
+        let options = BuildOptions {
+            project: fixture.project(),
+            ..BuildOptions::default()
+        };
+        let probe = probe_build_candidate(&options).unwrap();
+        let probed_identity = build_probe_identity(&probe);
+
+        fixture.write("package-lock.json", r#"{"lockfileVersion":3}"#);
+        let prepared = materialize_build_probe(probe, true).unwrap();
+        assert_eq!(
+            build_probe_identity(&build_probe_from_prepared(&prepared)),
+            probed_identity
+        );
+        assert_ne!(
+            build_control_fingerprints(
+                &prepared.config_dir,
+                &prepared.root,
+                prepared.explicit_entry.as_deref(),
+            ),
+            probed_identity.controls
+        );
+    }
+
+    #[test]
+    fn federation_lock_events_compare_content_and_allow_restoration() {
+        let fixture = Fixture::new("federation-lock-fingerprint");
+        let lock = fixture.0.join("wake-federation.lock");
+        fixture.write("wake-federation.lock", "accepted");
+        let accepted = control_file_fingerprint(&lock);
+        let interest = WatchInterest::exact_file(&lock).resolve_against(&fixture.0);
+        let changed = vec![lock.clone()];
+
+        fixture.write("wake-federation.lock", "accepted");
+        assert!(!federation_lock_changed(
+            &changed, false, &interest, &lock, &accepted
+        ));
+        fixture.write("wake-federation.lock", "changed");
+        assert!(federation_lock_changed(
+            &changed, false, &interest, &lock, &accepted
+        ));
+        fixture.write("wake-federation.lock", "accepted");
+        assert!(!federation_lock_changed(
+            &[],
+            true,
+            &interest,
+            &lock,
+            &accepted
+        ));
+    }
+
+    #[test]
+    fn project_watch_plan_includes_controls_aliases_and_federation_exposes_outside_src() {
+        let fixture = Fixture::new("typed-project-watch-plan");
+        fixture.write(
+            "packages/Button.tsx",
+            "export default function Button() {}\n",
+        );
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            r#"[html]
+entry = "src/index.js"
+
+[alias]
+external = "packages/external.dotted"
+
+[federation]
+enabled = true
+name = "shell"
+
+[federation.exposes."./Button"]
+entry = "packages/Button.tsx"
+"#,
+        );
+        let prepared = prepare_build_candidate(&BuildOptions {
+            project: fixture.project(),
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let interests = project_watch_interests(&prepared);
+        let alias = fixture.0.join("packages/external.dotted");
+        let expose = fixture.0.join("packages/Button.tsx");
+        let config = fixture.0.join(wake_config::CONFIG_FILE);
+
+        assert!(interests.iter().any(|interest| interest.matches(&alias)));
+        assert!(interests.iter().any(|interest| interest.matches(&expose)));
+        assert!(
+            interests
+                .iter()
+                .any(|interest| interest.matches_exact_file(&config))
+        );
+        assert!(!interests.iter().any(|interest| {
+            interest.matches_exact_file(&fixture.0.join("nested/wake.config.toml"))
+        }));
+    }
+
+    #[test]
+    fn build_rejects_project_root_and_source_output_without_touching_inputs() {
+        for (label, outdir) in [("root-outdir", "."), ("source-outdir", "src")] {
+            let fixture = Fixture::new(label);
+            fixture.write("sentinel.txt", "keep-root");
+            fixture.write("src/sentinel.txt", "keep-source");
+
+            let error = build(
+                BuildOptions {
+                    project: fixture.project(),
+                    outdir: Some(PathBuf::from(outdir)),
+                    ..BuildOptions::default()
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code, "WAKE_CONFIG");
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("sentinel.txt")).unwrap(),
+                "keep-root"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("src/sentinel.txt")).unwrap(),
+                "keep-source"
+            );
+            assert!(fixture.0.join(wake_config::CONFIG_FILE).is_file());
+        }
+    }
+
+    #[test]
+    fn build_rejects_project_ancestor_output_without_touching_siblings() {
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join(wake_config::CONFIG_FILE),
+            "[html]\nentry = \"src/index.js\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/index.js"), "export const value = 42;\n").unwrap();
+        std::fs::write(outer.path().join("sibling.txt"), "keep-sibling").unwrap();
+
+        let error = build(
+            BuildOptions {
+                project: ProjectOptions {
+                    cwd: Some(project.clone()),
+                    config_path: None,
+                },
+                outdir: Some(PathBuf::from("..")),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(
+            std::fs::read_to_string(outer.path().join("sibling.txt")).unwrap(),
+            "keep-sibling"
+        );
+        assert!(project.join("src/index.js").is_file());
+    }
+
+    #[test]
+    fn build_rejects_nonempty_unowned_output_directory() {
+        let fixture = Fixture::new("unowned-output");
+        fixture.write("custom-output/sentinel.txt", "keep-unowned");
+
+        let error = build(
+            BuildOptions {
+                project: fixture.project(),
+                outdir: Some(PathBuf::from("custom-output")),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("custom-output/sentinel.txt")).unwrap(),
+            "keep-unowned"
+        );
+    }
+
+    fn output_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        collect_output_tree_files(root, "test snapshot", false)
+            .unwrap()
+            .into_iter()
+            .map(|relative| {
+                let bytes = std::fs::read(root.join(&relative)).unwrap();
+                (relative, bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_publishes_an_owned_tree_and_removes_stale_files() {
+        let fixture = Fixture::new("owned-output");
+        let options = BuildOptions {
+            project: fixture.project(),
+            outdir: Some(PathBuf::from("dist")),
+            ..BuildOptions::default()
+        };
+
+        build(options.clone(), &CancellationToken::default()).unwrap();
+        let output = fixture.0.join("dist");
+        let ownership: OutputOwnership =
+            serde_json::from_slice(&std::fs::read(output.join(OUTPUT_OWNERSHIP_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(ownership, OutputOwnership::wake(OutputProduct::Application));
+        std::fs::write(output.join("stale.txt"), "stale").unwrap();
+        fixture.write("src/index.js", "export const value = 43;\n");
+
+        build(options, &CancellationToken::default()).unwrap();
+
+        assert!(!output.join("stale.txt").exists());
+        assert!(output.join("index.html").is_file());
+        assert!(output.join("manifest.json").is_file());
+    }
+
+    #[test]
+    fn build_failure_preserves_the_last_published_tree() {
+        let fixture = Fixture::new("publish-failure");
+        let options = BuildOptions {
+            project: fixture.project(),
+            outdir: Some(PathBuf::from("dist")),
+            ..BuildOptions::default()
+        };
+        build(options.clone(), &CancellationToken::default()).unwrap();
+        let output = fixture.0.join("dist");
+        let before = output_snapshot(&output);
+        fixture.write("src/index.js", "export const = ;\n");
+
+        let error = build(options, &CancellationToken::default()).unwrap_err();
+
+        assert_eq!(error.code, "WAKE_BUILD");
+        assert_eq!(output_snapshot(&output), before);
+    }
+
+    #[test]
+    fn cancellation_is_visible_while_waiting_for_an_inflight_commit() {
+        let cancellation = CancellationToken::default();
+        let commit_cancellation = cancellation.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let commit = thread::spawn(move || {
+            commit_cancellation.commit(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let cancel_cancellation = cancellation.clone();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let cancel = thread::spawn(move || {
+            cancel_cancellation.cancel();
+            cancelled_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !cancellation.is_cancelled() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            cancellation.is_cancelled(),
+            "cancellation must be published before waiting for the commit writer gate"
+        );
+        assert!(
+            matches!(cancelled_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "cancel should still be waiting for the in-flight commit"
+        );
+
+        release_tx.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+        cancel.join().unwrap();
+        cancelled_rx.recv().unwrap();
+        assert_eq!(
+            cancellation.commit(|| Ok(())).unwrap_err().code,
+            "WAKE_CANCELLED"
+        );
+    }
+
+    #[test]
+    fn cancelled_exact_publication_never_reaches_the_destination() {
+        let fixture = tempfile::tempdir().unwrap();
+        let output = fixture.path().join("bundle.js");
+        std::fs::write(&output, "last-good").unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let error = cancellation
+            .commit(|| publish_exact_outputs(&[ExactOutput::write(&output, b"cancelled")], &[]))
+            .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_CANCELLED");
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "last-good");
+    }
+
+    #[test]
+    fn backend_cancellation_fences_staged_commit_until_recovery() {
+        let fixture = Fixture::new("backend-cancelled-output-commit");
+        let output = fixture.0.join("dist");
+        std::fs::create_dir_all(&output).unwrap();
+        write_output_ownership_marker(&output, OutputProduct::Application).unwrap();
+        std::fs::write(output.join("sentinel.txt"), "accepted").unwrap();
+
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let project = fixture.0.clone();
+        let worker_output = output.clone();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            publish_staged_output(
+                &project,
+                &[],
+                &worker_output,
+                OutputProduct::Application,
+                &worker_cancellation,
+                |stage| {
+                    std::fs::write(stage.join("index.html"), "stale")
+                        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
+                    staged_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        staged_rx.recv().unwrap();
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, "WAKE_CANCELLED");
+        assert_eq!(
+            std::fs::read_to_string(output.join("sentinel.txt")).unwrap(),
+            "accepted"
+        );
+        assert!(!output.join("index.html").exists());
+
+        let recovered = CancellationToken::default();
+        publish_staged_output(
+            &fixture.0,
+            &[],
+            &output,
+            OutputProduct::Application,
+            &recovered,
+            |stage| {
+                std::fs::write(stage.join("index.html"), "recovered")
+                    .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))
+            },
+        )
+        .unwrap();
+        assert!(!output.join("sentinel.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(output.join("index.html")).unwrap(),
+            "recovered"
+        );
+    }
+
+    #[test]
+    fn build_rejects_output_owned_by_another_product() {
+        let fixture = Fixture::new("product-mismatch");
+        let output = fixture.0.join("dist");
+        std::fs::create_dir_all(&output).unwrap();
+        write_output_ownership_marker(&output, OutputProduct::Documentation).unwrap();
+        std::fs::write(output.join("sentinel.txt"), "keep").unwrap();
+
+        let error = build(
+            BuildOptions {
+                project: fixture.project(),
+                outdir: Some(PathBuf::from("dist")),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(
+            std::fs::read_to_string(output.join("sentinel.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn build_allows_a_new_external_output_directory() {
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("project");
+        let output = outer.path().join("published");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join(wake_config::CONFIG_FILE),
+            "[html]\nentry = \"src/index.js\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/index.js"), "export const value = 42;\n").unwrap();
+
+        let result = build(
+            BuildOptions {
+                project: ProjectOptions {
+                    cwd: Some(project),
+                    config_path: None,
+                },
+                outdir: Some(output.clone()),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.output_dir.as_deref(),
+            Some(output.to_string_lossy().as_ref())
+        );
+        assert!(output.join(OUTPUT_OWNERSHIP_FILE).is_file());
+    }
+
+    #[test]
+    fn staged_output_paths_reject_absolute_and_parent_traversal() {
+        let stage = Path::new("stage");
+        assert!(output_file_path(stage, "nested/file.js").is_ok());
+        assert!(output_file_path(stage, "../escape.js").is_err());
+        assert!(output_file_path(stage, Path::new("/absolute.js")).is_err());
+        assert!(output_file_path(stage, "").is_err());
+    }
+
+    #[test]
+    fn docs_leaf_publishes_routes_and_public_assets_in_one_owned_inventory() {
+        let fixture = Fixture::new("docs-owned-output");
+        fixture.write("docs/index.mdx", "+++\ntitle = \"Home\"\n+++\n\n# Home\n");
+        fixture.write(
+            "docs/navigation.toml",
+            "[[group]]\nid = \"start\"\ntitle = \"Start\"\npages = [\"index\"]\n",
+        );
+        fixture.write(
+            "package.json",
+            r#"{"dependencies":{"react":"^19.2.8","react-dom":"^19.2.8"}}"#,
+        );
+        fixture.write(
+            "node_modules/react/package.json",
+            r#"{"name":"react","version":"19.2.8","type":"module","exports":{".":"./index.js","./jsx-runtime":"./jsx-runtime.js","./jsx-dev-runtime":"./jsx-runtime.js"}}"#,
+        );
+        fixture.write(
+            "node_modules/react/index.js",
+            "export default {}; export const Suspense = Symbol(); export const startTransition = f => f(); export const useCallback = f => f; export const useEffect = () => {}; export const useId = () => 'id'; export const useLayoutEffect = () => {}; export const useMemo = f => f(); export const useRef = v => ({ current: v }); export const useState = v => [v, () => {}];\n",
+        );
+        fixture.write(
+            "node_modules/react/jsx-runtime.js",
+            "export const Fragment = Symbol(); export const jsx = () => ({}); export const jsxs = jsx; export const jsxDEV = jsx;\n",
+        );
+        fixture.write(
+            "node_modules/react-dom/package.json",
+            r#"{"name":"react-dom","version":"19.2.8","type":"module","exports":{".":"./index.js","./client":"./client.js"}}"#,
+        );
+        fixture.write("node_modules/react-dom/index.js", "export default {};\n");
+        fixture.write(
+            "node_modules/react-dom/client.js",
+            "export const createRoot = () => ({ render() {} });\n",
+        );
+        fixture.write("public/robots.txt", "User-agent: *\n");
+
+        let result = build_docs(
+            DocsBuildOptions {
+                project: fixture.project(),
+                outdir: Some(PathBuf::from("docs-dist")),
+                ..DocsBuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        let output = fixture.0.join("docs-dist");
+        let ownership: OutputOwnership =
+            serde_json::from_slice(&std::fs::read(output.join(OUTPUT_OWNERSHIP_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            ownership,
+            OutputOwnership::wake(OutputProduct::Documentation)
+        );
+        let reported = result
+            .build
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let actual = collect_output_tree_files(&output, "documentation", false)
+            .unwrap()
+            .into_iter()
+            .filter(|path| path != Path::new(OUTPUT_OWNERSHIP_FILE))
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reported,
+            actual.iter().map(String::as_str).collect::<BTreeSet<_>>()
+        );
+        assert!(reported.contains("robots.txt"));
+        assert!(reported.contains("index.html"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_symlink_is_rejected_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("output-symlink");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel.txt"), "keep").unwrap();
+        symlink(outside.path(), fixture.0.join("dist")).unwrap();
+
+        let error = build(
+            BuildOptions {
+                project: fixture.project(),
+                outdir: Some(PathBuf::from("dist")),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("sentinel.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_reparse_point_is_rejected_without_touching_its_target() {
+        use std::os::windows::fs::symlink_dir;
+
+        let fixture = Fixture::new("output-reparse");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel.txt"), "keep").unwrap();
+        if symlink_dir(outside.path(), fixture.0.join("dist")).is_err() {
+            return;
+        }
+
+        let error = build(
+            BuildOptions {
+                project: fixture.project(),
+                outdir: Some(PathBuf::from("dist")),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("sentinel.txt")).unwrap(),
+            "keep"
+        );
+    }
+
     #[test]
     fn docs_workspace_discovery_is_direct_stable_and_base_prefixed() {
         let fixture = Fixture::new("docs-workspaces");
@@ -5023,6 +10299,84 @@ base_path = "/components/{name}/workbench/"
             workspaces[0].dev_loading,
             wake_config::DocsWorkspaceDevLoading::Lazy
         );
+    }
+
+    #[test]
+    fn aggregated_lazy_docs_materialize_only_the_requested_workspace() {
+        let directory = tempfile::Builder::new()
+            .prefix("wake-app-aggregated-lazy-docs-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let root = directory.path();
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, contents).unwrap();
+        };
+        write(
+            wake_config::CONFIG_FILE,
+            r#"[docs]
+base_path = "/docs/"
+
+[[docs.workspace]]
+root = "components"
+include = ["rc-*"]
+base_path = "/components/{name}/workbench/"
+dev_loading = "lazy"
+"#,
+        );
+        write("docs/index.mdx", "# Site\n");
+        write(
+            "docs/navigation.toml",
+            "[[group]]\nid = \"main\"\ntitle = \"Main\"\npages = [\"index\"]\n",
+        );
+        write(
+            "package.json",
+            r#"{"dependencies":{"react":"19.2.8","react-dom":"19.2.8"}}"#,
+        );
+        for name in ["rc-alpha", "rc-beta"] {
+            write(&format!("components/{name}/wake.config.toml"), "");
+            write(
+                &format!("components/{name}/docs/index.mdx"),
+                "# Component\n",
+            );
+            write(
+                &format!("components/{name}/docs/navigation.toml"),
+                "[[group]]\nid = \"main\"\ntitle = \"Main\"\npages = [\"index\"]\n",
+            );
+            write(
+                &format!("components/{name}/package.json"),
+                r#"{"dependencies":{"react":"19.2.8","react-dom":"19.2.8"}}"#,
+            );
+        }
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let server = start_docs_dev_server(DevServerOptions {
+            project: ProjectOptions {
+                cwd: Some(root.to_path_buf()),
+                config_path: None,
+            },
+            port: Some(port),
+            open: Some(false),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        let alpha = root.join("components/rc-alpha");
+        let beta = root.join("components/rc-beta");
+        assert_eq!(generation_seal_count(&alpha), 0);
+        assert_eq!(generation_seal_count(&beta), 0);
+
+        let response = http_get(port, "/docs/components/rc-alpha/workbench/bundle.js");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(generation_seal_count(&alpha), 1);
+        assert_eq!(generation_seal_count(&beta), 0);
+        assert!(!alpha.join(".wake").exists());
+        assert!(!beta.join(".wake").exists());
+        server.close().unwrap();
     }
 
     #[test]
@@ -5076,6 +10430,474 @@ base_path = "/components/{name}/workbench/"
         commit_output_tree(&staging, &target).unwrap();
     }
 
+    #[test]
+    fn directory_output_rejects_a_staged_commit_lock_file() {
+        let fixture = Fixture::new("directory-output-reserved-lock");
+        let staging = fixture.0.join("stage");
+        let target = fixture.0.join("docs-dist");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(staging.join(".wake-output.lock"), "artifact").unwrap();
+        std::fs::write(target.join("index.html"), "accepted").unwrap();
+
+        let error = commit_output_tree(&staging, &target).unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.html")).unwrap(),
+            "accepted"
+        );
+        assert!(!target.join(".wake-output.lock").exists());
+    }
+
+    #[test]
+    fn directory_output_preserves_existing_reserved_lock_metadata() {
+        let fixture = Fixture::new("directory-output-preserves-reserved-lock");
+        let staging = fixture.0.join("stage");
+        let target = fixture.0.join("docs-dist");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(staging.join("index.html"), "new").unwrap();
+        let lock_path = target.join(".wake-output.lock");
+        std::fs::write(&lock_path, "reserved").unwrap();
+        std::fs::write(target.join("stale.txt"), "stale").unwrap();
+        let original = same_file::Handle::from_path(&lock_path).unwrap();
+
+        commit_output_tree(&staging, &target).unwrap();
+
+        assert_eq!(same_file::Handle::from_path(&lock_path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "reserved");
+        assert!(!target.join("stale.txt").exists());
+    }
+
+    #[test]
+    fn directory_output_lock_serializes_injected_rollback_before_the_next_commit() {
+        let fixture = Fixture::new("directory-output-lock-rollback");
+        let target = fixture.0.join("docs-dist");
+        let failed_staging = fixture.0.join("failed-stage");
+        let successful_staging = fixture.0.join("successful-stage");
+        for directory in [&target, &failed_staging, &successful_staging] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for (directory, generation) in [
+            (&target, "old"),
+            (&failed_staging, "failed"),
+            (&successful_staging, "accepted"),
+        ] {
+            std::fs::write(directory.join("a.txt"), format!("{generation}-a")).unwrap();
+            std::fs::write(directory.join("b.txt"), format!("{generation}-b")).unwrap();
+        }
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let failed_target = target.clone();
+        let failed_writer = thread::spawn(move || {
+            commit_staged_output_with(
+                &failed_staging,
+                &failed_target,
+                None,
+                "documentation",
+                ".wake-docs-backup-",
+                || {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+                Some(1),
+            )
+        });
+        locked_rx.recv().unwrap();
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let successful_target = target.clone();
+        let successful_writer = thread::spawn(move || {
+            let result = commit_output_tree(&successful_staging, &successful_target);
+            completed_tx.send(()).unwrap();
+            result
+        });
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a writer for the same target entered while rollback still owned the target lock"
+        );
+
+        release_tx.send(()).unwrap();
+        let failure = failed_writer.join().unwrap().unwrap_err();
+        assert_eq!(failure.code, "WAKE_IO");
+        assert!(
+            failure
+                .message
+                .contains("injected directory output install failure")
+        );
+        successful_writer.join().unwrap().unwrap();
+        completed_rx.recv().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("a.txt")).unwrap(),
+            "accepted-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("b.txt")).unwrap(),
+            "accepted-b"
+        );
+    }
+
+    #[test]
+    fn nested_directory_outputs_share_one_commit_lock() {
+        let fixture = Fixture::new("nested-directory-output-lock");
+        let parent_target = fixture.0.join("dist");
+        let child_target = parent_target.join("nested");
+        let parent_staging = fixture.0.join("parent-stage");
+        let child_staging = fixture.0.join("child-stage");
+        for directory in [
+            &parent_target,
+            &child_target,
+            &parent_staging,
+            &child_staging,
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(child_target.join("old.txt"), "old").unwrap();
+        std::fs::write(parent_staging.join("parent.txt"), "parent").unwrap();
+        std::fs::write(child_staging.join("child.txt"), "child").unwrap();
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let parent_writer = thread::spawn(move || {
+            commit_staged_output_with(
+                &parent_staging,
+                &parent_target,
+                None,
+                "documentation",
+                ".wake-docs-backup-",
+                || {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+                None,
+            )
+        });
+        locked_rx.recv().unwrap();
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let child_writer = thread::spawn(move || {
+            let result = commit_output_tree(&child_staging, &child_target);
+            completed_tx.send(()).unwrap();
+            result
+        });
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a nested directory publisher bypassed the parent publisher's commit lock"
+        );
+
+        release_tx.send(()).unwrap();
+        parent_writer.join().unwrap().unwrap();
+        child_writer.join().unwrap().unwrap();
+        completed_rx.recv().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("dist/parent.txt")).unwrap(),
+            "parent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("dist/nested/child.txt")).unwrap(),
+            "child"
+        );
+    }
+
+    #[test]
+    fn exact_staging_inside_a_directory_target_is_locked_before_creation() {
+        let fixture = Fixture::new("exact-inside-directory-staging-lock");
+        let target = fixture.0.join("dist");
+        let parent_staging = fixture.0.join("parent-stage");
+        let exact_path = target.join("bundle.js");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&parent_staging).unwrap();
+        std::fs::write(parent_staging.join("bundle.js"), "parent").unwrap();
+
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let exact_writer = thread::spawn(move || {
+            output::publish_exact_outputs_with_staging_hook(
+                &[ExactOutput::write(&exact_path, b"exact")],
+                &[],
+                || {
+                    staged_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        staged_rx.recv().unwrap();
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let parent_writer = thread::spawn(move || {
+            let result = commit_output_tree(&parent_staging, &target);
+            completed_tx.send(()).unwrap();
+            result
+        });
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "an ancestor directory publisher reached commit while exact staging was live"
+        );
+
+        release_tx.send(()).unwrap();
+        exact_writer.join().unwrap().unwrap();
+        parent_writer.join().unwrap().unwrap();
+        completed_rx.recv().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("dist/bundle.js")).unwrap(),
+            "parent"
+        );
+    }
+
+    #[test]
+    fn child_directory_materialization_stays_outside_the_parent_output_tree() {
+        let fixture = Fixture::new("child-directory-safe-staging-domain");
+        let project_root = fixture.0.clone();
+        let parent_target = fixture.0.join("dist");
+        let child_target = parent_target.join("child");
+        std::fs::create_dir_all(&parent_target).unwrap();
+        write_output_ownership_marker(&parent_target, OutputProduct::Application).unwrap();
+        std::fs::write(parent_target.join("old.txt"), "old").unwrap();
+
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let child_root = project_root.clone();
+        let child_writer = thread::spawn(move || {
+            publish_staged_output(
+                &child_root,
+                &[],
+                &child_target,
+                OutputProduct::Application,
+                &CancellationToken::default(),
+                |stage| {
+                    std::fs::write(stage.join("child.txt"), "child").unwrap();
+                    staged_tx.send(stage.to_path_buf()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        let child_stage = staged_rx.recv().unwrap();
+        let stage_was_safe = !child_stage.starts_with(&parent_target);
+
+        let parent_result = publish_staged_output(
+            &project_root,
+            &[],
+            &parent_target,
+            OutputProduct::Application,
+            &CancellationToken::default(),
+            |stage| {
+                std::fs::write(stage.join("parent.txt"), "parent").unwrap();
+                Ok(())
+            },
+        );
+        release_tx.send(()).unwrap();
+
+        assert!(
+            stage_was_safe,
+            "child staging was materialized inside an ancestor output's cleanup scope"
+        );
+        parent_result.unwrap();
+        child_writer.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent_target.join("parent.txt")).unwrap(),
+            "parent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent_target.join("child/child.txt")).unwrap(),
+            "child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_output_rejects_a_scope_containing_a_live_commit_lock() {
+        let commit = acquire_output_commit_lock("directory lock collision test").unwrap();
+        let scope = commit.lock_paths()[0]
+            .parent()
+            .expect("global Unix lock has a parent")
+            .to_path_buf();
+
+        let error = validate_directory_output_commit_scope(
+            std::slice::from_ref(&scope),
+            commit.lock_paths(),
+            "documentation",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+    }
+
+    #[test]
+    fn output_commit_lock_blocks_directory_and_exact_publishers_in_a_separate_process() {
+        const READY_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_READY";
+        const RELEASE_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_RELEASE";
+
+        let fixture = Fixture::new("directory-output-process-lock");
+        let target = fixture.0.join("docs-dist");
+        let staging = fixture.0.join("stage");
+        let exact = fixture.0.join("bundle.js");
+        let ready = fixture.0.join("lock-ready");
+        let release = fixture.0.join("lock-release");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(target.join("index.html"), "old").unwrap();
+        std::fs::write(staging.join("index.html"), "new").unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::directory_output_lock_process_helper",
+            ])
+            .env(READY_ENV, &ready)
+            .env(RELEASE_ENV, &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_file() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("output lock helper exited before acquiring its lock: {status}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.is_file() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("output lock helper did not acquire its lock");
+        }
+
+        let (directory_completed_tx, directory_completed_rx) = mpsc::channel();
+        let directory_writer = thread::spawn(move || {
+            let result = commit_output_tree(&staging, &target);
+            directory_completed_tx.send(()).unwrap();
+            result
+        });
+        let (exact_completed_tx, exact_completed_rx) = mpsc::channel();
+        let exact_writer = thread::spawn(move || {
+            let result = publish_exact_outputs(&[ExactOutput::write(&exact, b"exact")], &[]);
+            exact_completed_tx.send(()).unwrap();
+            result
+        });
+        let directory_blocked = matches!(
+            directory_completed_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let exact_blocked = matches!(
+            exact_completed_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        std::fs::write(&release, "release").unwrap();
+        let helper_status = child.wait().unwrap();
+        let directory_result = directory_writer.join().unwrap();
+        let exact_result = exact_writer.join().unwrap();
+
+        assert!(helper_status.success(), "output lock helper failed");
+        assert!(
+            directory_blocked,
+            "a directory publisher bypassed the separate process commit lock"
+        );
+        assert!(
+            exact_blocked,
+            "an exact publisher bypassed the separate process commit lock"
+        );
+        directory_result.unwrap();
+        exact_result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("docs-dist/index.html")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("bundle.js")).unwrap(),
+            "exact"
+        );
+    }
+
+    #[test]
+    fn output_commit_lock_recovers_after_a_holder_process_exits() {
+        const READY_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_READY";
+        const RELEASE_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_RELEASE";
+        const ABANDON_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_ABANDON";
+
+        let fixture = Fixture::new("output-process-lock-abandonment");
+        let ready = fixture.0.join("lock-ready");
+        let release = fixture.0.join("unused-release");
+        let output = fixture.0.join("bundle.js");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::directory_output_lock_process_helper",
+            ])
+            .env(READY_ENV, &ready)
+            .env(RELEASE_ENV, &release)
+            .env(ABANDON_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_file() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    !status.success(),
+                    "abandonment helper unexpectedly succeeded"
+                );
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.is_file(),
+            "abandonment helper never acquired the lock"
+        );
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "abandonment helper unexpectedly succeeded"
+        );
+
+        publish_exact_outputs(&[ExactOutput::write(&output, b"recovered")], &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "recovered");
+    }
+
+    #[test]
+    #[ignore = "invoked as a child process by the output commit lock regression"]
+    fn directory_output_lock_process_helper() {
+        const READY_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_READY";
+        const RELEASE_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_RELEASE";
+        const ABANDON_ENV: &str = "WAKE_TEST_OUTPUT_LOCK_ABANDON";
+        if std::env::var_os(READY_ENV).is_none() {
+            return;
+        }
+        let ready = PathBuf::from(std::env::var_os(READY_ENV).expect("missing ready path"));
+        let release = PathBuf::from(std::env::var_os(RELEASE_ENV).expect("missing release path"));
+        let _lock = acquire_output_commit_lock("test helper").unwrap();
+        std::fs::write(ready, "ready").unwrap();
+        if std::env::var_os(ABANDON_ENV).is_some() {
+            std::process::exit(86);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !release.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            release.is_file(),
+            "parent did not release output lock helper"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn docs_output_commit_rolls_back_after_a_locked_stale_file() {
@@ -5117,7 +10939,12 @@ base_path = "/components/{name}/workbench/"
         };
         let result = build(options.clone(), &CancellationToken::default()).unwrap();
         assert!(result.success);
-        assert!(result.files.iter().any(|file| file.kind == "html"));
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|file| file.kind == OutputFileKind::Html)
+        );
 
         let bundled = bundle(
             BundleOptions {
@@ -5160,6 +10987,439 @@ base_path = "/components/{name}/workbench/"
                 .code,
             "WAKE_INTERNAL"
         );
+    }
+
+    #[test]
+    fn build_context_rescan_recovers_a_sticky_configuration_error() {
+        let fixture = Fixture::new("build-context-rescan-recovery");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        assert!(
+            context
+                .rebuild_watch(WatchInvalidation::Rescan, CancellationToken::default())
+                .unwrap()
+                .success
+        );
+
+        let config = fixture.0.join(wake_config::CONFIG_FILE);
+        fixture.write(wake_config::CONFIG_FILE, "[html\n");
+        assert!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![config.clone()]),
+                    CancellationToken::default(),
+                )
+                .is_err()
+        );
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\n",
+        );
+        assert!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![fixture.0.join("src/index.js")]),
+                    CancellationToken::default(),
+                )
+                .is_err(),
+            "ordinary source events must not erase a sticky control failure"
+        );
+        assert!(
+            context
+                .rebuild_watch(WatchInvalidation::Rescan, CancellationToken::default())
+                .unwrap()
+                .success
+        );
+        context.close();
+    }
+
+    #[test]
+    fn build_context_watch_revision_widens_before_a_failed_candidate_can_recover() {
+        let fixture = Fixture::new("build-context-watch-widening");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        context
+            .rebuild_watch(WatchInvalidation::Rescan, CancellationToken::default())
+            .unwrap();
+        let initial = context.watch_plan();
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\n\n[alias]\nmissing = \"packages/missing.js\"\n",
+        );
+        fixture.write(
+            "src/index.js",
+            "import { value } from \"missing\"; export { value };\n",
+        );
+
+        assert!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![fixture.0.join(wake_config::CONFIG_FILE)]),
+                    CancellationToken::default(),
+                )
+                .is_err()
+        );
+        let widened = context.watch_plan();
+        let missing = fixture.0.join("packages/missing.js");
+        assert!(widened.revision > initial.revision);
+        assert!(
+            widened
+                .interests
+                .iter()
+                .any(|interest| interest.matches_event(&missing, true))
+        );
+
+        fixture.write("packages/missing.js", "export const value = 7;\n");
+        assert!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![missing]),
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        context.close();
+    }
+
+    #[test]
+    fn build_context_revision_capability_fences_materialization() {
+        let fixture = Fixture::new("build-context-revision-capability");
+        fixture.write("packages/external.js", "export const external = true;\n");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let initial = context.watch_plan();
+        let initial_generations = generation_seal_count(&fixture.0);
+        fixture.write("src/index.js", "export const temporarilyBroken = ;\n");
+        for invalidation in [
+            WatchInvalidation::Paths(vec![fixture.0.join("src/index.js")]),
+            WatchInvalidation::Rescan,
+        ] {
+            assert_eq!(
+                context
+                    .rebuild_watch_at(
+                        invalidation,
+                        WatchPlanRevision(initial.revision.0 + 1),
+                        CancellationToken::default(),
+                    )
+                    .unwrap_err()
+                    .code,
+                "WAKE_WATCH_COVERAGE_PENDING"
+            );
+        }
+        assert_eq!(generation_seal_count(&fixture.0), initial_generations);
+        fixture.write("src/index.js", "export const value = 42;\n");
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\n[alias]\nexternal = \"packages/external.js\"\n",
+        );
+
+        let error = context
+            .rebuild_watch_at(
+                WatchInvalidation::Paths(vec![fixture.0.join(wake_config::CONFIG_FILE)]),
+                initial.revision,
+                CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "WAKE_WATCH_COVERAGE_PENDING");
+        assert_eq!(generation_seal_count(&fixture.0), initial_generations);
+        let widened = context.watch_plan();
+        assert!(widened.revision > initial.revision);
+
+        for stale in [initial.revision, WatchPlanRevision(widened.revision.0 + 1)] {
+            assert_eq!(
+                context
+                    .rebuild_watch_at(
+                        WatchInvalidation::Rescan,
+                        stale,
+                        CancellationToken::default(),
+                    )
+                    .unwrap_err()
+                    .code,
+                "WAKE_WATCH_COVERAGE_PENDING"
+            );
+            assert_eq!(generation_seal_count(&fixture.0), initial_generations);
+        }
+
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Rescan,
+                    widened.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        assert!(generation_seal_count(&fixture.0) > initial_generations);
+        assert!(!fixture.0.join(".wake").exists());
+        context.close();
+    }
+
+    #[test]
+    fn build_context_rescan_rematerializes_component_scan_inputs() {
+        let fixture = Fixture::new("build-context-component-scan-rescan");
+        fixture.write("pages/a.ts", "export const page = 'before';\n");
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            r#"[html]
+entry = "src/index.js"
+
+[[component_scan]]
+namespace = "pages"
+cwd = "pages"
+generate_source = true
+"#,
+        );
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let plan = context.watch_plan();
+        let before = generation_seal_count(&fixture.0);
+        fixture.write("pages/a.ts", "export const page = 'after';\n");
+
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Rescan,
+                    plan.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        assert!(generation_seal_count(&fixture.0) > before);
+        assert!(!fixture.0.join(".wake").exists());
+        context.close();
+    }
+
+    #[test]
+    fn build_context_same_snapshot_rescan_reuses_accepted_generation() {
+        let fixture = Fixture::new("build-context-same-snapshot");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let plan = context.watch_plan();
+        let before = generation_seal_count(&fixture.0);
+
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Rescan,
+                    plan.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        assert_eq!(generation_seal_count(&fixture.0), before);
+        context.close();
+    }
+
+    #[test]
+    fn build_context_control_fingerprint_change_replaces_the_session() {
+        let fixture = Fixture::new("build-context-control-fingerprint");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let plan = context.watch_plan();
+        let before = generation_seal_count(&fixture.0);
+        let browsers = fixture.0.join(".browserslistrc");
+        fixture.write(".browserslistrc", "chrome 120\n");
+
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Paths(vec![browsers]),
+                    plan.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        assert!(generation_seal_count(&fixture.0) > before);
+        assert!(!fixture.0.join(".wake").exists());
+        context.close();
+    }
+
+    #[test]
+    fn build_context_federation_lock_blocks_only_real_content_drift_and_recovers() {
+        let fixture = Fixture::new("build-context-federation-lock-content");
+        fixture.write("wake-federation.lock", "accepted");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let lock = fixture.0.join("wake-federation.lock");
+
+        fixture.write("wake-federation.lock", "accepted");
+        assert!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![lock.clone()]),
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+
+        fixture.write("wake-federation.lock", "changed");
+        assert_eq!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![lock.clone()]),
+                    CancellationToken::default(),
+                )
+                .unwrap_err()
+                .code,
+            "WAKE_DEV_RESTART_REQUIRED"
+        );
+
+        fixture.write("wake-federation.lock", "accepted");
+        assert!(
+            context
+                .rebuild_watch(
+                    WatchInvalidation::Paths(vec![lock]),
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        context.close();
+    }
+
+    #[test]
+    fn build_context_failed_candidate_reuses_its_materialized_generation() {
+        let fixture = Fixture::new("build-context-candidate-retry");
+        fixture.write("packages/external.js", "export const external = true;\n");
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let initial_seals = generation_seal_count(&fixture.0);
+        let initial = context.watch_plan();
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\n[alias]\nexternal = \"packages/external.js\"\n",
+        );
+        fixture.write("src/index.js", "export const broken = ;\n");
+        assert_eq!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Paths(vec![fixture.0.join(wake_config::CONFIG_FILE)]),
+                    initial.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap_err()
+                .code,
+            "WAKE_WATCH_COVERAGE_PENDING"
+        );
+        let widened = context.watch_plan();
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Rescan,
+                    widened.revision,
+                    CancellationToken::default(),
+                )
+                .is_err()
+        );
+        let failed_generation = generation_seal_count(&fixture.0);
+        assert_eq!(failed_generation, initial_seals + 1);
+
+        let source = fixture.0.join("src/index.js");
+        fixture.write("src/index.js", "export const fixed = true;\n");
+        assert!(
+            context
+                .rebuild_watch_at(
+                    WatchInvalidation::Paths(vec![source]),
+                    widened.revision,
+                    CancellationToken::default(),
+                )
+                .unwrap()
+                .success
+        );
+        assert_eq!(generation_seal_count(&fixture.0), failed_generation);
+        assert!(!fixture.0.join(".wake").exists());
+        context.close();
+    }
+
+    #[test]
+    fn write_build_watch_plan_excludes_owned_output_from_root_fallback() {
+        let fixture = Fixture::new("build-context-output-exclusion");
+        std::fs::remove_dir_all(fixture.0.join("src")).unwrap();
+        fixture.write("index.js", "export const value = 42;\n");
+        fixture.write(wake_config::CONFIG_FILE, "[html]\nentry = \"index.js\"\n");
+        let options = BuildOptions {
+            project: fixture.project(),
+            outdir: Some(PathBuf::from("dist")),
+            write: true,
+            ..BuildOptions::default()
+        };
+        let prepared = prepare_build_candidate(&options).unwrap();
+        let interests = build_context_watch_interests(&prepared, &options);
+
+        assert!(
+            !interests
+                .iter()
+                .any(|interest| { interest.matches_event(&fixture.0.join("dist/chunk.js"), true) })
+        );
+        assert!(
+            interests
+                .iter()
+                .any(|interest| { interest.matches(&fixture.0.join("index.js")) })
+        );
+    }
+
+    #[test]
+    fn watch_plan_revision_changes_only_when_the_snapshot_value_changes() {
+        let root = PathBuf::from("project");
+        let initial = WatchInterest::tree(root.join("src"));
+        let plan = RwLock::new(WatchPlanSnapshot {
+            revision: WatchPlanRevision(0),
+            root: root.clone(),
+            interests: vec![initial.clone()],
+        });
+        replace_build_watch_plan(&plan, root.clone(), vec![initial.clone()]);
+        assert_eq!(plan.read().unwrap().revision, WatchPlanRevision(0));
+
+        replace_build_watch_plan(
+            &plan,
+            root.clone(),
+            vec![initial.clone(), WatchInterest::tree(root.join("packages"))],
+        );
+        assert_eq!(plan.read().unwrap().revision, WatchPlanRevision(1));
+        replace_build_watch_plan(
+            &plan,
+            root,
+            vec![WatchInterest::tree("project/packages"), initial],
+        );
+        assert_eq!(plan.read().unwrap().revision, WatchPlanRevision(1));
     }
 
     #[test]
@@ -5295,7 +11555,12 @@ base_path = "/components/{name}/workbench/"
         assert!(memory.source_map.is_some());
         assert!(memory.source_map_file.is_none());
         assert!(!memory.code.contains("sourceMappingURL="));
-        assert!(memory.files.iter().any(|file| file.kind == "map"));
+        assert!(
+            memory
+                .files
+                .iter()
+                .any(|file| file.kind == OutputFileKind::SourceMap)
+        );
 
         let written = bundle(
             BundleOptions {
@@ -5326,6 +11591,197 @@ base_path = "/components/{name}/workbench/"
         let code = std::fs::read_to_string(outfile).unwrap();
         assert_eq!(written.code, code);
         assert!(code.ends_with("//# sourceMappingURL=extension.js.map\n"));
+    }
+
+    #[test]
+    fn bundle_rejects_exact_output_over_entry_or_transitive_input() {
+        let fixture = Fixture::new("bundle-input-collision");
+        fixture.write(
+            "src/index.js",
+            "import { value } from './dep.js'; export { value };\n",
+        );
+        fixture.write("src/dep.js", "export const value = 42;\n");
+        fixture.write("sentinel.txt", "outside");
+
+        for outfile in ["src/index.js", "src/dep.js"] {
+            let before = std::fs::read(fixture.0.join(outfile)).unwrap();
+            let error = bundle(
+                BundleOptions {
+                    project: fixture.project(),
+                    entry: Some(PathBuf::from("src/index.js")),
+                    outfile: Some(PathBuf::from(outfile)),
+                    ..BundleOptions::default()
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code, "WAKE_OUTPUT_COLLISION", "{outfile}");
+            assert_eq!(std::fs::read(fixture.0.join(outfile)).unwrap(), before);
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("sentinel.txt")).unwrap(),
+                "outside"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_rejects_output_inside_the_owned_generation_namespace() {
+        let fixture = Fixture::new("bundle-owned-generation-output");
+        let error = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                outfile: Some(PathBuf::from(".wake/entry.tsx")),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert!(error.message.contains("reserved `.wake`"));
+        assert!(!fixture.0.join(".wake").exists());
+    }
+
+    #[test]
+    fn bundle_rejects_exact_output_over_the_loaded_project_configuration() {
+        let fixture = Fixture::new("bundle-config-collision");
+        fixture.write("sentinel.txt", "outside");
+        let config = fixture.0.join(wake_config::CONFIG_FILE);
+        let before = std::fs::read(&config).unwrap();
+
+        let error = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                outfile: Some(PathBuf::from(wake_config::CONFIG_FILE)),
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(std::fs::read(config).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_source_map_companion_over_a_read_input() {
+        let fixture = Fixture::new("bundle-map-input-collision");
+        fixture.write(
+            "artifacts/result.js.map",
+            "export const sourceValue = 42;\n",
+        );
+        fixture.write("sentinel.txt", "outside");
+        let before = std::fs::read(fixture.0.join("artifacts/result.js.map")).unwrap();
+
+        let error = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some(PathBuf::from("artifacts/result.js.map")),
+                outfile: Some(PathBuf::from("artifacts/result.js")),
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(
+            std::fs::read(fixture.0.join("artifacts/result.js.map")).unwrap(),
+            before
+        );
+        assert!(!fixture.0.join("artifacts/result.js").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn bundle_replaces_code_but_preserves_an_unowned_stale_map() {
+        let fixture = Fixture::new("bundle-stale-map");
+        let outfile = fixture.0.join("artifacts/extension.js");
+        let mapfile = fixture.0.join("artifacts/extension.js.map");
+        let with_map = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                outfile: Some(PathBuf::from("artifacts/extension.js")),
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(mapfile.is_file());
+        assert_eq!(with_map.files.len(), 2);
+        let previous_map = std::fs::read(&mapfile).unwrap();
+
+        fixture.write("src/index.js", "export const value = 84;\n");
+        let without_map = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                outfile: Some(PathBuf::from("artifacts/extension.js")),
+                source_map: false,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert!(mapfile.exists());
+        assert_eq!(std::fs::read(&mapfile).unwrap(), previous_map);
+        assert_eq!(std::fs::read_to_string(&outfile).unwrap(), without_map.code);
+        assert_eq!(without_map.files.len(), 1);
+        assert_same_existing_file(&without_map.files[0].path, &outfile);
+        assert_eq!(
+            without_map.files[0].bytes,
+            std::fs::read(&outfile).unwrap().len()
+        );
+        assert!(without_map.source_map.is_none());
+        assert!(without_map.source_map_file.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bundle_locked_map_failure_preserves_the_previous_code_map_pair() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let fixture = Fixture::new("bundle-locked-map");
+        let outfile = fixture.0.join("artifacts/extension.js");
+        let mapfile = fixture.0.join("artifacts/extension.js.map");
+        std::fs::create_dir_all(outfile.parent().unwrap()).unwrap();
+        std::fs::write(&outfile, "old-code").unwrap();
+        std::fs::write(&mapfile, "old-map").unwrap();
+        fixture.write("sentinel.txt", "outside");
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&mapfile)
+            .unwrap();
+
+        let error = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                outfile: Some(PathBuf::from("artifacts/extension.js")),
+                source_map: true,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "WAKE_IO");
+        assert_eq!(std::fs::read_to_string(outfile).unwrap(), "old-code");
+        assert_eq!(std::fs::read_to_string(mapfile).unwrap(), "old-map");
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("sentinel.txt")).unwrap(),
+            "outside"
+        );
     }
 
     #[test]

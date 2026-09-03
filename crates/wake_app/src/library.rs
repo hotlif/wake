@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,8 +11,9 @@ use wake_common::{FileSystem, OsFileSystem};
 use wake_resolver::ResolutionEnvironment;
 
 use super::{
-    CancellationToken, OutputFile, ProjectOptions, WakeError, absolute_from, atomic_write,
-    canonical_project_root, commit_staged_output, is_bare_package_name,
+    CancellationToken, ExactOutput, OutputFile, OutputFileKind, ProjectOptions,
+    RecordingFileSystem, WakeError, absolute_from, canonical_project_root, commit_staged_output,
+    is_bare_package_name, publish_exact_outputs,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -137,22 +138,24 @@ struct TokenLoader {
     environment: ResolutionEnvironment,
     memo: HashMap<PathBuf, TokenSource>,
     stack: Vec<PathBuf>,
+    recording_fs: RecordingFileSystem,
 }
 
 impl TokenLoader {
     fn new(_root: &Path) -> Self {
-        let os: Arc<dyn FileSystem> = Arc::new(OsFileSystem);
-        let environment = ResolutionEnvironment::new(os);
+        let recording_fs = RecordingFileSystem::new(Arc::new(OsFileSystem));
+        let environment = ResolutionEnvironment::new(Arc::new(recording_fs.clone()));
         let fs = environment.file_system();
         Self {
             fs,
             environment,
             memo: HashMap::new(),
             stack: Vec::new(),
+            recording_fs,
         }
     }
 
-    fn read_config(&self, path: &Path) -> Result<TokenConfig, WakeError> {
+    fn read_config(&mut self, path: &Path) -> Result<TokenConfig, WakeError> {
         let source = self
             .fs
             .read_to_string(path)
@@ -273,14 +276,19 @@ pub fn generate_css_token(
     let generated = generate_source(&config, &globals, &config_path)?;
     let output = absolute_from(&root, Path::new(&config.build.output));
     cancellation.check()?;
-    atomic_write(&output, generated.as_bytes())?;
+    cancellation.commit(|| {
+        publish_exact_outputs(
+            &[ExactOutput::write(&output, generated.as_bytes())],
+            &loader.recording_fs.inputs(),
+        )
+    })?;
     Ok(GenerateCssTokenResult {
         success: true,
         duration_ms: started.elapsed().as_secs_f64() * 1000.0,
         output_file: output.to_string_lossy().into_owned(),
         files: vec![OutputFile {
             path: output.to_string_lossy().into_owned(),
-            kind: "asset".to_string(),
+            kind: OutputFileKind::Asset,
             bytes: generated.len(),
         }],
     })
@@ -493,10 +501,12 @@ pub fn generate_docgen(
         );
     }
     let root = canonical_project_root(&cwd)?;
-    let entry = resolve_docgen_entry(&root, options.entry.as_deref())?;
+    let mut resolution_inputs = BTreeSet::new();
+    let entry = resolve_docgen_entry(&root, options.entry.as_deref(), &mut resolution_inputs)?;
     cancellation.check()?;
-    let component = wake_tsdoc::extract_component_api(&entry)
+    let extraction = wake_tsdoc::extract_component_api_with_provenance(&entry)
         .map_err(|error| WakeError::new("WAKE_DOCGEN_TYPE", error.to_string()).at(&entry))?;
+    let component = extraction.document;
 
     let mut props = BTreeMap::new();
     for prop in component.api.props {
@@ -553,7 +563,14 @@ pub fn generate_docgen(
         .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))?;
     cancellation.check()?;
     let output = root.join("public/docgen.json");
-    atomic_write(&output, &generated)?;
+    resolution_inputs.extend(extraction.inputs);
+    let protected_inputs = resolution_inputs.into_iter().collect::<Vec<_>>();
+    cancellation.commit(|| {
+        publish_exact_outputs(
+            &[ExactOutput::write(&output, &generated)],
+            &protected_inputs,
+        )
+    })?;
     Ok(GenerateDocgenResult {
         success: true,
         duration_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -561,7 +578,7 @@ pub fn generate_docgen(
         output_file: output.to_string_lossy().into_owned(),
         files: vec![OutputFile {
             path: output.to_string_lossy().into_owned(),
-            kind: "asset".to_string(),
+            kind: OutputFileKind::Asset,
             bytes: generated.len(),
         }],
     })
@@ -607,9 +624,9 @@ pub fn build_library(
             Path::new("esm").join(&module.file_name),
             module.code.as_bytes(),
             if module.file_name == esm.entry {
-                "entry"
+                OutputFileKind::Entry
             } else {
-                "chunk"
+                OutputFileKind::Chunk
             },
             &root,
             &mut files,
@@ -621,9 +638,9 @@ pub fn build_library(
             Path::new("cjs").join(&module.file_name),
             module.code.as_bytes(),
             if module.file_name == cjs.entry {
-                "entry"
+                OutputFileKind::Entry
             } else {
-                "chunk"
+                OutputFileKind::Chunk
             },
             &root,
             &mut files,
@@ -634,7 +651,7 @@ pub fn build_library(
             staging.path(),
             Path::new("declarations").join(&declaration.file_name),
             declaration.code.as_bytes(),
-            "declaration",
+            OutputFileKind::Declaration,
             &root,
             &mut files,
         )?;
@@ -649,7 +666,7 @@ pub fn build_library(
                 staging.path(),
                 relative,
                 css.as_bytes(),
-                "css",
+                OutputFileKind::Css,
                 &root,
                 &mut files,
             )?;
@@ -662,7 +679,7 @@ pub fn build_library(
         })
         .transpose()?;
     cancellation.check()?;
-    commit_library_outputs(&root, staging.path())?;
+    cancellation.commit(|| commit_library_outputs(&root, staging.path()))?;
 
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(LibraryBuildResult {
@@ -697,7 +714,7 @@ fn write_library_file(
     staging: &Path,
     relative: PathBuf,
     bytes: &[u8],
-    kind: &str,
+    kind: OutputFileKind,
     root: &Path,
     files: &mut Vec<OutputFile>,
 ) -> Result<(), WakeError> {
@@ -722,7 +739,7 @@ fn write_library_file(
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&path))?;
     files.push(OutputFile {
         path: root.join(relative).to_string_lossy().into_owned(),
-        kind: kind.to_string(),
+        kind,
         bytes: bytes.len(),
     });
     Ok(())
@@ -758,20 +775,25 @@ fn react_docgen_type(type_text: &str) -> Value {
     }
 }
 
-fn resolve_docgen_entry(root: &Path, explicit: Option<&Path>) -> Result<PathBuf, WakeError> {
+fn resolve_docgen_entry(
+    root: &Path,
+    explicit: Option<&Path>,
+    inputs: &mut BTreeSet<PathBuf>,
+) -> Result<PathBuf, WakeError> {
     if let Some(entry) = explicit {
         return validate_docgen_entry(root, absolute_from(root, entry));
     }
     let package_path = root.join("package.json");
     let package_source = std::fs::read_to_string(&package_path)
         .map_err(|error| WakeError::new("WAKE_DOCGEN_IO", error.to_string()).at(&package_path))?;
+    inputs.insert(package_path.clone());
     let package: DocgenPackage = serde_json::from_str(&package_source).map_err(|error| {
         WakeError::new("WAKE_DOCGEN_CONFIG", error.to_string()).at(&package_path)
     })?;
     if let Some(entry) = package.docgen.and_then(|config| config.entry) {
         return validate_docgen_entry(root, absolute_from(root, Path::new(&entry)));
     }
-    resolve_docgen_entry_from_index(root)
+    resolve_docgen_entry_from_index(root, inputs)
 }
 
 fn validate_docgen_entry(root: &Path, entry: PathBuf) -> Result<PathBuf, WakeError> {
@@ -788,10 +810,14 @@ fn validate_docgen_entry(root: &Path, entry: PathBuf) -> Result<PathBuf, WakeErr
     Ok(entry)
 }
 
-fn resolve_docgen_entry_from_index(root: &Path) -> Result<PathBuf, WakeError> {
+fn resolve_docgen_entry_from_index(
+    root: &Path,
+    inputs: &mut BTreeSet<PathBuf>,
+) -> Result<PathBuf, WakeError> {
     let index = root.join("src/index.ts");
     let source = std::fs::read_to_string(&index)
         .map_err(|error| WakeError::new("WAKE_DOCGEN_IO", error.to_string()).at(&index))?;
+    inputs.insert(index.clone());
 
     let direct = Regex::new(
         r#"(?m)^\s*export\s*\{\s*(?:default|[A-Za-z_$][\w$]*\s+as\s+default)\s*\}\s*from\s*["'](\.?\.?/[^"']+)["']"#,
@@ -1143,6 +1169,73 @@ border = "1px solid $ref(color.primary)"
     }
 
     #[test]
+    fn token_output_cannot_replace_its_root_configuration() {
+        let fixture = Fixture::new();
+        fixture.write("sentinel.txt", "outside");
+        fixture.write(
+            "token.toml",
+            "[build]\noutput='./token.toml'\nprefix='local'\n[token]\ncolor='red'\n",
+        );
+        let before = fs::read(fixture.path("token.toml")).unwrap();
+
+        let error = fixture.generate().unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(fs::read(fixture.path("token.toml")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(fixture.path("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn token_output_cannot_replace_a_recursively_imported_configuration() {
+        let fixture = Fixture::new();
+        fixture.write("node_modules/base/package.json", r#"{"name":"base"}"#);
+        fixture.write(
+            "node_modules/base/token.toml",
+            "[build]\noutput='./generated.ts'\nprefix='base'\n[token]\ncolor='red'\n",
+        );
+        fixture.write(
+            "token.toml",
+            "[build]\noutput='./node_modules/base/token.toml'\nprefix='local'\nimports=['base']\n[token]\ncolor='$ref(color)'\n",
+        );
+        fixture.write("sentinel.txt", "outside");
+        let imported_before = fs::read(fixture.path("node_modules/base/token.toml")).unwrap();
+
+        let error = fixture.generate().unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(
+            fs::read(fixture.path("node_modules/base/token.toml")).unwrap(),
+            imported_before
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn token_output_cannot_replace_a_configuration_through_a_symbolic_alias() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "token.toml",
+            "[build]\noutput='./generated.ts'\nprefix='local'\n[token]\ncolor='red'\n",
+        );
+        if create_file_symlink(&fixture.path("token.toml"), &fixture.path("generated.ts")).is_err()
+        {
+            return;
+        }
+        let before = fs::read(fixture.path("token.toml")).unwrap();
+
+        let error = fixture.generate().unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(fs::read(fixture.path("token.toml")).unwrap(), before);
+    }
+
+    #[test]
     fn rejects_recursive_package_imports() {
         let fixture = Fixture::new();
         for (name, dependency) in [("a", "b"), ("b", "a")] {
@@ -1221,6 +1314,52 @@ border = "1px solid $ref(color.primary)"
     }
 
     #[test]
+    fn token_output_cannot_replace_a_pnp_manifest_read_by_resolution() {
+        let fixture = Fixture::new();
+        fixture.write(".pnp.cjs", "module.exports = require('./.pnp.data.json');");
+        fixture.write(
+            ".pnp.data.json",
+            r#"{
+  "enableTopLevelFallback": false,
+  "fallbackExclusionList": [],
+  "fallbackPool": [],
+  "packageRegistryData": [
+    [null, [[null, {
+      "packageLocation": "./",
+      "packageDependencies": [["base", "workspace:base"]],
+      "linkType": "SOFT"
+    }]]],
+    ["base", [["workspace:base", {
+      "packageLocation": "./packages/base/",
+      "packageDependencies": [["base", "workspace:base"]],
+      "linkType": "SOFT"
+    }]]]
+  ]
+}"#,
+        );
+        fixture.write("packages/base/package.json", r#"{"name":"base"}"#);
+        fixture.write(
+            "packages/base/token.toml",
+            "[build]\noutput='./token.ts'\nprefix='base'\n[token]\ncolor='red'\n",
+        );
+        fixture.write(
+            "token.toml",
+            "[build]\noutput='./.pnp.data.json'\nprefix='local'\nimports=['base']\n[token]\ncolor='$ref(color)'\n",
+        );
+        fixture.write("sentinel.txt", "outside");
+        let before = fs::read(fixture.path(".pnp.data.json")).unwrap();
+
+        let error = fixture.generate().unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(fs::read(fixture.path(".pnp.data.json")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(fixture.path("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
     fn generates_compact_react_docgen_shape_from_package_entry() {
         let fixture = Fixture::new();
         fixture.write(
@@ -1290,5 +1429,66 @@ border = "1px solid $ref(color.primary)"
             fs::read_to_string(fixture.path("public/docgen.json")).unwrap(),
             "last known good"
         );
+    }
+
+    #[test]
+    fn docgen_output_cannot_replace_its_explicit_source_entry() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "public/docgen.json",
+            "interface Props { label: string; }\nconst Button = (props: Props) => null;\nexport default Button;\n",
+        );
+        fixture.write("sentinel.txt", "outside");
+        let before = fs::read(fixture.path("public/docgen.json")).unwrap();
+
+        let error = fixture.docgen(Some("public/docgen.json")).unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(
+            fs::read(fixture.path("public/docgen.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn docgen_output_cannot_replace_a_transitively_read_type_source() {
+        let fixture = Fixture::new();
+        fixture.write("package.json", r#"{"name":"example"}"#);
+        fixture.write(
+            "src/button.tsx",
+            "import type { Props } from '../public/docgen.json';\nconst Button = (props: Props) => null;\nexport default Button;\n",
+        );
+        fixture.write(
+            "public/docgen.json",
+            "export interface Props { label: string; }\n",
+        );
+        fixture.write("sentinel.txt", "outside");
+        let before = fs::read(fixture.path("public/docgen.json")).unwrap();
+
+        let error = fixture.docgen(Some("src/button.tsx")).unwrap_err();
+
+        assert_eq!(error.code, "WAKE_OUTPUT_COLLISION");
+        assert_eq!(
+            fs::read(fixture.path("public/docgen.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path("sentinel.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(input: &Path, output: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(input, output)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(input: &Path, output: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(input, output)
     }
 }

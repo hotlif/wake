@@ -4189,23 +4189,30 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 name = "wake_app"
 version = "0.1.26"
 dependencies = [
+ "base64 0.22.1",
  "getrandom 0.3.4",
+ "libc",
  "regex",
+ "ring",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "ureq",
  "wake_bundler",
  "wake_common",
  "wake_config",
  "wake_dev_server",
  "wake_docs",
  "wake_ecma_transform",
+ "wake_federation_contract",
  "wake_html",
  "wake_resolver",
  "wake_scan",
  "wake_test_contract",
  "wake_tsdoc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
