@@ -1,0 +1,22 @@
+[package]
+name = "wake_compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Stable, owned single-module compiler facade for Wake"
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_compiler_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "transpile"
+harness = false

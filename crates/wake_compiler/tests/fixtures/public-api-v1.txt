@@ -1,0 +1,25 @@
+wake_compiler::SourceText<'_>
+wake_compiler::Language
+wake_compiler::ModuleOutput
+wake_compiler::SourceMapMode
+wake_compiler::BrowserTarget
+wake_compiler::Target
+wake_compiler::AutomaticJsxOptions
+wake_compiler::TranspileOptions
+wake_compiler::Severity
+wake_compiler::TextRange
+wake_compiler::DiagnosticLabel
+wake_compiler::Diagnostic
+wake_compiler::ModuleRequestKind
+wake_compiler::ModuleRequestOrigin
+wake_compiler::ModuleRequest
+wake_compiler::SourceMapArtifact
+wake_compiler::TranspileOutput
+wake_compiler::TranspileErrorKind
+wake_compiler::TranspileError
+Language::[JavaScript, TypeScript]
+ModuleOutput::[PreserveEsm, CommonJs]
+SourceMapMode::[None, Detached]
+Severity::[Error, Warning, Note, Help]
+ModuleRequestKind::[Import, ExportFrom, DynamicImport, Require]
+TranspileErrorKind::[InvalidOptions, SourceTooLarge, Syntax, UnsupportedTransform, Internal]

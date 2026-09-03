@@ -99,6 +99,8 @@ unicode-width = "=0.2.1"
 
 # —— 内部 crate（路径依赖）——
 wake_common = { path = "crates/wake_common" }
+wake_compiler_core = { path = "crates/wake_compiler_core" }
+wake_compiler = { path = "crates/wake_compiler" }
 wake_config = { path = "crates/wake_config" }
 wake_scan = { path = "crates/wake_scan" }
 wake_html = { path = "crates/wake_html" }

@@ -4276,6 +4276,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wake_compiler"
+version = "0.1.26"
+dependencies = [
+ "criterion",
+ "serde_json",
+ "wake_compiler_core",
+]
+
+[[package]]
+name = "wake_compiler_core"
+version = "0.1.26"
+dependencies = [
+ "wake_common",
+ "wake_ecma_ast",
+ "wake_ecma_codegen",
+ "wake_ecma_minify",
+ "wake_ecma_parser",
+ "wake_ecma_transform",
+]
+
+[[package]]
 name = "wake_config"
 version = "0.1.26"
 dependencies = [
