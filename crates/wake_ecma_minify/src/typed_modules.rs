@@ -5,19 +5,20 @@
 //! strings or span overlays. Finalization recognizes sentinels by symbol identity, replaces every
 //! request transactionally, and finalization rejects any live sentinel before typed codegen.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
 use wake_ecma_ast::{BinaryOperator, LogicalOperator, VarKind};
 use wake_ecma_semantic::{DeclKind, SymbolId};
 
+use crate::optimizer::{LinkerExportStar, LinkerExportStarResolution};
 use crate::typed_analysis::{NameAccess, TypedAnalysis};
 use crate::typed_ir::{
     ChildRole, ClassContext, DerivedOriginKind, ExportDefaultValueKind, FunctionContext,
     ImportSpecifierKind, IrModuleName, IrNode, IrNodeData, IrOrigin, IrPropertyKey, ListId,
-    ModuleNameKind, NameId, NameRole, NameSyntax, NodeId, SyntheticOriginKind, TypedIrError,
-    TypedProgram,
+    ModuleNameKind, NameId, NameRole, NameSyntax, NodeId, PropertyKeyKind, SyntheticOriginKind,
+    TypedIrError, TypedProgram,
 };
 use crate::typed_lowering::{Binding, SyntheticFactory};
 
@@ -68,10 +69,9 @@ pub struct TypedModuleOptions {
     /// `true` represents the absence of linker liveness information. `false` makes `roots`
     /// authoritative, including the meaningful empty set which removes every unused export.
     pub preserve_all_exports: bool,
-    /// Preserve plain `export *` forwarding unless the linker authoritatively reports that this
-    /// module has no consumed public names. Star-provided names have no module-local `SymbolId`,
-    /// so this proof cannot be reconstructed from `linker_liveness.roots` alone.
-    pub preserve_export_star: bool,
+    /// Linker-owned plans for plain `export *` declarations, in source order. An empty vector is
+    /// the conservative standalone-optimizer fallback and retains runtime enumeration.
+    pub export_stars: Vec<LinkerExportStar>,
     /// Exact public export names observed by the linker when `preserve_all_exports` is false.
     /// Source re-exports have no module-local `SymbolId`, so their liveness must remain keyed by
     /// the public name rather than being reconstructed from `linker_liveness.roots`.
@@ -85,7 +85,7 @@ impl Default for TypedModuleOptions {
             mode: TypedModuleMode::PreserveEsm,
             module_id: TypedModuleId(0),
             preserve_all_exports: true,
-            preserve_export_star: true,
+            export_stars: Vec::new(),
             observed_export_names: BTreeSet::new(),
             linker_liveness: TypedLinkerLiveness::default(),
         }
@@ -93,7 +93,7 @@ impl Default for TypedModuleOptions {
 }
 
 /// Static or dynamic abstract dependency edge in source order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypedModuleRequestKind {
     StaticImport,
     DynamicImport,
@@ -117,6 +117,7 @@ pub struct TypedRuntimeBinding {
 /// All wrapper/runtime bindings owned by one module plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypedModuleRuntimeBindings {
+    pub module: TypedRuntimeBinding,
     pub exports: TypedRuntimeBinding,
     pub export_live: TypedRuntimeBinding,
     pub export_all: TypedRuntimeBinding,
@@ -125,6 +126,25 @@ pub struct TypedModuleRuntimeBindings {
     pub internal_require_async: TypedRuntimeBinding,
     pub internal_import: TypedRuntimeBinding,
     pub external_require: TypedRuntimeBinding,
+}
+
+/// Runtime services required by compiler-owned expressions which survive the final typed tree.
+///
+/// This is deliberately a closed semantic set. Generated JavaScript text is never searched to
+/// infer these needs: the module-plan seal records them from symbol-bound typed nodes, and codegen
+/// carries them beside the byte-identical body. Default/namespace CommonJS interop is emitted
+/// structurally inline and has no shared runtime capability; the sole current service is
+/// `metaUrl`, recorded only when a symbol-bound internal-require member survives optimization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypedModuleRuntimeCapabilities {
+    pub meta_url: bool,
+    pub external_require: bool,
+    pub promise_resolve: bool,
+    pub object_assign: bool,
+    pub object_keys: bool,
+    pub object_define_property: bool,
+    pub runtime_import: bool,
+    pub shared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +160,7 @@ pub struct TypedModulePlan {
     mode: TypedModuleMode,
     module_id: TypedModuleId,
     preserve_all_exports: bool,
-    preserve_export_star: bool,
+    export_stars: Vec<LinkerExportStar>,
     observed_export_names: BTreeSet<String>,
     prepared_revision: u64,
     sealed_revision: Option<u64>,
@@ -150,6 +170,7 @@ pub struct TypedModulePlan {
     default_read: TypedRuntimeBinding,
     namespace_read: TypedRuntimeBinding,
     runtime: TypedModuleRuntimeBindings,
+    runtime_capabilities: TypedModuleRuntimeCapabilities,
     namespace_requests: Vec<NamespaceRequest>,
     local_bindings: Vec<TypedRuntimeBinding>,
     retained_liveness: BTreeSet<TypedModuleSymbol>,
@@ -180,6 +201,10 @@ impl TypedModulePlan {
         &self.runtime
     }
 
+    pub const fn runtime_capabilities(&self) -> &TypedModuleRuntimeCapabilities {
+        &self.runtime_capabilities
+    }
+
     pub fn retained_liveness(&self) -> &BTreeSet<TypedModuleSymbol> {
         &self.retained_liveness
     }
@@ -201,15 +226,19 @@ impl TypedModulePlan {
         let mut hash = Fnv64::new();
         hash.write(
             format!(
-                "mode={:?};module={:?};preserve_all_exports={};preserve_export_star={};",
-                self.mode, self.module_id, self.preserve_all_exports, self.preserve_export_star
+                "mode={:?};module={:?};preserve_all_exports={};",
+                self.mode, self.module_id, self.preserve_all_exports
             )
             .as_bytes(),
         );
         for name in &self.observed_export_names {
             hash.write(format!("observed_export={name};").as_bytes());
         }
+        for star in &self.export_stars {
+            hash.write(format!("export_star={star:?};").as_bytes());
+        }
         for binding in self.sentinel_bindings().into_iter().chain([
+            &self.runtime.module,
             &self.runtime.exports,
             &self.runtime.export_live,
             &self.runtime.export_all,
@@ -221,6 +250,7 @@ impl TypedModulePlan {
         ]) {
             hash.write(format!("symbol={}:{};", binding.symbol, binding.original_name).as_bytes());
         }
+        hash.write(format!("runtime_capabilities={:?};", self.runtime_capabilities).as_bytes());
         for namespace in &self.namespace_requests {
             hash.write(
                 format!(
@@ -302,6 +332,21 @@ pub enum TypedFinalModuleTarget {
     External {
         rewritten_specifier: String,
     },
+    /// A literal dynamic import whose loading semantics are owned by the embedding runtime.
+    ///
+    /// This target is intentionally generic: product policy (for example federation) is decided
+    /// by the linker, while the parser and typed module plan continue to model an ordinary
+    /// `import()` edge.
+    RuntimeDynamic {
+        request: String,
+        /// Optional immutable remote-expose identity owned by the final embedding chunk.
+        expose: Option<String>,
+    },
+    /// A dependency supplied synchronously by an initialized runtime share context.
+    RuntimeShared {
+        request: String,
+        scope: String,
+    },
     Internal {
         module_id: TypedModuleId,
         is_esm: bool,
@@ -328,7 +373,6 @@ pub struct TypedModuleSpecifierRewrite {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TypedFinalModuleFacts {
     pub modules: Vec<TypedResolvedModule>,
-    pub specifier_rewrites: BTreeMap<String, String>,
     pub request_rewrites: Vec<TypedModuleSpecifierRewrite>,
     /// Preserve-CommonJS output may deliberately express external `import()` through the host
     /// `require` contract. Bundled output leaves this false and uses native import/runtime chunks.
@@ -347,25 +391,47 @@ pub struct TypedFinalModuleReport {
     pub requires_async_module: bool,
 }
 
-/// One compiler-generated synchronous static request whose value is structurally discarded.
+/// How the finalized module consumes one compiler-generated internal request.
 ///
-/// The typed finalizer owns the semantic proof; code generation later turns `node` into an exact
-/// byte range, and the final bundler layout decides whether the target is already eagerly
-/// executed. Keeping the arena id private prevents downstream text scanners from manufacturing
-/// this fact.
+/// This role is proved while the request is still typed IR. It must never be reconstructed from
+/// generated JavaScript text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TypedDiscardedStaticRequest {
-    node: NodeId,
-    target: TypedModuleId,
+pub enum TypedGeneratedModuleRequestRole {
+    Value,
+    DiscardedStatic,
 }
 
-impl TypedDiscardedStaticRequest {
-    pub const fn node(self) -> NodeId {
-        self.node
+/// One compiler-generated internal request and the exact typed numeric literal which owns its
+/// stable module target. Code generation turns `target_node` into a byte range during the same
+/// token walk which creates the body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedGeneratedModuleRequest {
+    target_node: NodeId,
+    target: TypedModuleId,
+    role: TypedGeneratedModuleRequestRole,
+    specifier: String,
+    kind: TypedModuleRequestKind,
+}
+
+impl TypedGeneratedModuleRequest {
+    pub const fn target_node(&self) -> NodeId {
+        self.target_node
     }
 
-    pub const fn target(self) -> TypedModuleId {
+    pub const fn target(&self) -> TypedModuleId {
         self.target
+    }
+
+    pub const fn role(&self) -> TypedGeneratedModuleRequestRole {
+        self.role
+    }
+
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+
+    pub const fn kind(&self) -> TypedModuleRequestKind {
+        self.kind
     }
 }
 
@@ -377,7 +443,7 @@ impl TypedDiscardedStaticRequest {
 pub struct FinalizedTypedProgram {
     program: TypedProgram,
     plan: TypedModulePlan,
-    discarded_static_requests: Vec<TypedDiscardedStaticRequest>,
+    generated_module_requests: Vec<TypedGeneratedModuleRequest>,
 }
 
 impl FinalizedTypedProgram {
@@ -389,8 +455,8 @@ impl FinalizedTypedProgram {
         &self.plan
     }
 
-    pub fn discarded_static_requests(&self) -> &[TypedDiscardedStaticRequest] {
-        &self.discarded_static_requests
+    pub fn generated_module_requests(&self) -> &[TypedGeneratedModuleRequest] {
+        &self.generated_module_requests
     }
 }
 
@@ -568,7 +634,20 @@ fn allocate_module_plan(
         DeclKind::Function,
     )?;
     let runtime = TypedModuleRuntimeBindings {
-        exports: allocate_exact_runtime_binding(program, "exports", DeclKind::Var)?,
+        module: allocate_wrapper_runtime_binding(
+            program,
+            reserved,
+            options.mode,
+            "module",
+            DeclKind::Var,
+        )?,
+        exports: allocate_wrapper_runtime_binding(
+            program,
+            reserved,
+            options.mode,
+            "exports",
+            DeclKind::Var,
+        )?,
         export_live: allocate_runtime_binding(
             program,
             reserved,
@@ -587,8 +666,10 @@ fn allocate_module_plan(
             "__wake_mark_esmodule",
             DeclKind::Function,
         )?,
-        internal_require: allocate_exact_runtime_binding(
+        internal_require: allocate_wrapper_runtime_binding(
             program,
+            reserved,
+            options.mode,
             "__wake_require__",
             DeclKind::Function,
         )?,
@@ -623,7 +704,7 @@ fn allocate_module_plan(
         mode: options.mode,
         module_id: options.module_id,
         preserve_all_exports: options.preserve_all_exports,
-        preserve_export_star: options.preserve_export_star,
+        export_stars: options.export_stars.clone(),
         observed_export_names: options.observed_export_names.clone(),
         prepared_revision: 0,
         sealed_revision: None,
@@ -633,6 +714,7 @@ fn allocate_module_plan(
         default_read,
         namespace_read,
         runtime,
+        runtime_capabilities: TypedModuleRuntimeCapabilities::default(),
         namespace_requests: Vec::new(),
         local_bindings: Vec::new(),
         retained_liveness,
@@ -692,6 +774,9 @@ pub(crate) fn plan_owned_typed_modules(
         }
     }
     abstractify_runtime_requests(&mut working, &mut plan)?;
+    if options.mode == TypedModuleMode::BundledCommonJs {
+        bind_bundled_wrapper_references(&mut working, &plan)?;
+    }
     working.validate()?;
     plan.prepared_revision = working.revision();
     Ok((working, plan))
@@ -969,18 +1054,18 @@ pub fn finalize_owned_typed_modules(
     mut plan: TypedModulePlan,
     facts: &TypedFinalModuleFacts,
 ) -> Result<(FinalizedTypedProgram, TypedFinalModuleReport), TypedModuleError> {
-    let mut discarded_static_requests = Vec::new();
+    let mut generated_module_requests = Vec::new();
     let report = finalize_typed_modules_in_place(
         &mut program,
         &mut plan,
         facts,
-        &mut discarded_static_requests,
+        &mut generated_module_requests,
     )?;
     Ok((
         FinalizedTypedProgram {
             program,
             plan,
-            discarded_static_requests,
+            generated_module_requests,
         },
         report,
     ))
@@ -990,7 +1075,7 @@ fn finalize_typed_modules_in_place(
     program: &mut TypedProgram,
     plan: &mut TypedModulePlan,
     facts: &TypedFinalModuleFacts,
-    discarded_static_requests: &mut Vec<TypedDiscardedStaticRequest>,
+    generated_module_requests: &mut Vec<TypedGeneratedModuleRequest>,
 ) -> Result<TypedFinalModuleReport, TypedModuleError> {
     let Some(sealed_revision) = plan.sealed_revision else {
         return Err(TypedModuleError::InvalidInput {
@@ -1023,7 +1108,7 @@ fn finalize_typed_modules_in_place(
         &resolved,
         facts,
         &mut report,
-        discarded_static_requests,
+        generated_module_requests,
     )?;
     rewrite_native_specifiers(program, facts, &mut report)?;
     insert_esmodule_marker(program, plan, facts.no_esmodule)?;
@@ -1106,11 +1191,37 @@ pub fn seal_typed_module_plan(
         .collect::<HashSet<_>>();
     let mut next = plan.clone();
     next.requests = requests;
+    next.runtime_capabilities = collect_runtime_capabilities(program, &next)?;
     next.retained_liveness
         .retain(|root| live_symbols.contains(&root.symbol));
     next.sealed_revision = Some(program.revision());
     *plan = next;
     Ok(())
+}
+
+fn collect_runtime_capabilities(
+    program: &TypedProgram,
+    plan: &TypedModulePlan,
+) -> Result<TypedModuleRuntimeCapabilities, TypedModuleError> {
+    let mut capabilities = TypedModuleRuntimeCapabilities::default();
+    for node in program.preorder_validated()? {
+        let IrNodeData::MemberExpression {
+            object,
+            property,
+            property_kind: PropertyKeyKind::Identifier,
+            ..
+        } = program.node(node).expect("validated live node").data()
+        else {
+            continue;
+        };
+        if identifier_symbol(program, *object) != Some(plan.runtime.internal_require.symbol) {
+            continue;
+        }
+        if name_record(program, *property).is_some_and(|(_, name)| name.original() == "metaUrl") {
+            capabilities.meta_url = true;
+        }
+    }
+    Ok(capabilities)
 }
 
 fn live_module_requests(
@@ -1305,6 +1416,20 @@ fn allocate_exact_runtime_binding(
         symbol,
         original_name: name.to_owned(),
     })
+}
+
+fn allocate_wrapper_runtime_binding(
+    program: &mut TypedProgram,
+    reserved: &mut HashSet<String>,
+    mode: TypedModuleMode,
+    name: &str,
+    kind: DeclKind,
+) -> Result<TypedRuntimeBinding, TypedModuleError> {
+    if mode == TypedModuleMode::BundledCommonJs {
+        allocate_runtime_binding(program, reserved, name, kind)
+    } else {
+        allocate_exact_runtime_binding(program, name, kind)
+    }
 }
 
 fn allocate_namespace_binding(
@@ -1624,6 +1749,7 @@ fn lower_esm_to_common_js(
     let mut imports = HashMap::<SymbolId, ImportedBinding>::new();
     let mut eval_snapshots = Vec::<ImportedBinding>::new();
     let mut namespace_ordinal = 0_usize;
+    let mut export_star_ordinal = 0_usize;
 
     for statement in original.iter().copied() {
         if !matches!(
@@ -1667,10 +1793,19 @@ fn lower_esm_to_common_js(
             reserved,
             statement,
             &mut namespace_ordinal,
+            &mut export_star_ordinal,
             &imports,
             &module_bindings,
         )?;
         replace_program_statement(program, statement, &replacements)?;
+    }
+
+    if !options.export_stars.is_empty() && export_star_ordinal != options.export_stars.len() {
+        return Err(module_error(
+            TypedModulePhase::Plan,
+            None,
+            "linker export-star plan count does not match the module syntax",
+        ));
     }
 
     Ok(())
@@ -2399,6 +2534,7 @@ fn lower_export_declaration(
     reserved: &mut HashSet<String>,
     statement: NodeId,
     namespace_ordinal: &mut usize,
+    export_star_ordinal: &mut usize,
     imports: &HashMap<SymbolId, ImportedBinding>,
     module_bindings: &HashMap<String, SymbolId>,
 ) -> Result<Vec<NodeId>, TypedModuleError> {
@@ -2608,11 +2744,66 @@ fn lower_export_declaration(
                     })
                 })
                 .transpose()?;
-            let keep_forwarding = exported_name.as_deref().map_or_else(
-                || options.preserve_all_exports || options.preserve_export_star,
-                |name| exported_name_live(options, name),
+            let star_resolution = if exported_name.is_none() {
+                let planned = options.export_stars.get(*export_star_ordinal);
+                *export_star_ordinal += 1;
+                if let Some(planned) = planned
+                    && planned.specifier() != specifier
+                {
+                    return Err(module_error(
+                        TypedModulePhase::Plan,
+                        Some(statement),
+                        "linker export-star plan specifier does not match the module syntax",
+                    ));
+                }
+                Some(
+                    planned
+                        .map(LinkerExportStar::resolution)
+                        .cloned()
+                        .unwrap_or(LinkerExportStarResolution::Runtime {
+                            excluded: Vec::new(),
+                        }),
+                )
+            } else {
+                None
+            };
+            if let Some(name) = exported_name.as_deref()
+                && !exported_name_live(options, name)
+            {
+                let factory = SyntheticFactory::new(program);
+                return Ok(vec![request_statement(
+                    &factory,
+                    &plan.static_import_request,
+                    &specifier,
+                    origin,
+                )?]);
+            }
+            let star_resolution = star_resolution.map(|resolution| match resolution {
+                LinkerExportStarResolution::Exact(names) if !options.preserve_all_exports => {
+                    LinkerExportStarResolution::Exact(
+                        names
+                            .into_iter()
+                            .filter(|name| options.observed_export_names.contains(name))
+                            .collect(),
+                    )
+                }
+                other => other,
+            });
+            let keep_runtime = match star_resolution.as_ref() {
+                Some(LinkerExportStarResolution::Runtime { excluded }) => {
+                    options.preserve_all_exports
+                        || options
+                            .observed_export_names
+                            .iter()
+                            .any(|name| !excluded.contains(name))
+                }
+                _ => true,
+            };
+            let keep_exact = !matches!(
+                star_resolution.as_ref(),
+                Some(LinkerExportStarResolution::Exact(names)) if names.is_empty()
             );
-            if !keep_forwarding {
+            if !keep_runtime || !keep_exact {
                 let factory = SyntheticFactory::new(program);
                 return Ok(vec![request_statement(
                     &factory,
@@ -2639,15 +2830,37 @@ fn lower_export_declaration(
             if let Some(name) = exported_name {
                 let value = factory.reference(&namespace)?;
                 output.push(export_live_statement(&factory, plan, &name, value, origin)?);
-            } else {
-                let exports = binding_reference(&factory, &plan.runtime.exports)?;
-                let namespace = factory.reference(&namespace)?;
-                let call = request_call(
-                    &factory,
-                    &plan.runtime.export_all,
-                    vec![exports, namespace],
-                    origin,
-                )?;
+            } else if let Some(LinkerExportStarResolution::Exact(names)) = star_resolution {
+                if names.len() < 3 {
+                    for name in names {
+                        let namespace_value = factory.reference(&namespace)?;
+                        let property = factory.string(&name)?;
+                        let value = factory.computed_member(namespace_value, property)?;
+                        output.push(export_live_statement(&factory, plan, &name, value, origin)?);
+                    }
+                } else {
+                    let mut arguments = vec![
+                        binding_reference(&factory, &plan.runtime.exports)?,
+                        factory.reference(&namespace)?,
+                        factory.boolean(true)?,
+                    ];
+                    for name in names {
+                        arguments.push(factory.string(&name)?);
+                    }
+                    let call = request_call(&factory, &plan.runtime.export_all, arguments, origin)?;
+                    let statement = factory.expression_statement(call)?;
+                    output.push(set_derived_origin(&factory, statement, origin)?);
+                }
+            } else if let Some(LinkerExportStarResolution::Runtime { excluded }) = star_resolution {
+                let mut arguments = vec![
+                    binding_reference(&factory, &plan.runtime.exports)?,
+                    factory.reference(&namespace)?,
+                    factory.boolean(false)?,
+                ];
+                for name in excluded {
+                    arguments.push(factory.string(&name)?);
+                }
+                let call = request_call(&factory, &plan.runtime.export_all, arguments, origin)?;
                 let statement = factory.expression_statement(call)?;
                 output.push(set_derived_origin(&factory, statement, origin)?);
             }
@@ -3155,6 +3368,48 @@ fn abstractify_runtime_requests(
     Ok(())
 }
 
+/// Attach every free bundled-wrapper reference to the exact runtime symbol whose final spelling
+/// codegen will report to the enclosing factory. Source bindings with the same text already carry
+/// their own `SymbolId` and are deliberately untouched, including bindings observed by direct
+/// eval. This avoids both wrapper-parameter collisions and generated-text renaming.
+fn bind_bundled_wrapper_references(
+    program: &mut TypedProgram,
+    plan: &TypedModulePlan,
+) -> Result<(), TypedModuleError> {
+    let bindings = [
+        ("module", &plan.runtime.module),
+        ("exports", &plan.runtime.exports),
+        ("__wake_require__", &plan.runtime.internal_require),
+    ];
+    let occurrences = program
+        .preorder_validated()?
+        .into_iter()
+        .filter_map(|node| {
+            let IrNodeData::Name { name } = program.node(node)?.data() else {
+                return None;
+            };
+            let occurrence = program.name(*name)?;
+            (occurrence.role() == NameRole::Reference
+                && occurrence.syntax() == NameSyntax::Identifier
+                && occurrence.symbol().is_none())
+            .then(|| (*name, occurrence.original().to_owned()))
+        })
+        .collect::<Vec<_>>();
+    for (name, original) in occurrences {
+        let Some((_, binding)) = bindings
+            .iter()
+            .find(|(runtime_name, _)| *runtime_name == original)
+        else {
+            continue;
+        };
+        program.set_name_symbol(name, Some(binding.symbol))?;
+        if binding.original_name != original {
+            program.set_emitted_name(name, binding.original_name.clone())?;
+        }
+    }
+    Ok(())
+}
+
 fn is_unresolved_require(program: &TypedProgram, callee: NodeId) -> bool {
     let Some((_, name)) = name_record(program, callee) else {
         return false;
@@ -3189,6 +3444,46 @@ fn validate_final_facts(
                 ),
             });
         }
+        if let TypedFinalModuleTarget::RuntimeDynamic { request, expose } = &module.target {
+            if request.is_empty() {
+                return Err(TypedModuleError::InvalidInput {
+                    phase: TypedModulePhase::Finalize,
+                    message: format!(
+                        "runtime-owned request for `{}` must not be empty",
+                        module.specifier
+                    ),
+                });
+            }
+            if module.request_kind != TypedModuleRequestKind::DynamicImport {
+                return Err(TypedModuleError::InvalidInput {
+                    phase: TypedModulePhase::Finalize,
+                    message: format!(
+                        "runtime-owned request `{}` must originate from a dynamic import",
+                        module.specifier
+                    ),
+                });
+            }
+            if expose.as_ref().is_some_and(String::is_empty) {
+                return Err(TypedModuleError::InvalidInput {
+                    phase: TypedModulePhase::Finalize,
+                    message: format!(
+                        "runtime-owned request for `{}` has an empty expose identity",
+                        module.specifier
+                    ),
+                });
+            }
+        }
+        if let TypedFinalModuleTarget::RuntimeShared { request, scope } = &module.target
+            && (request.is_empty() || scope.is_empty())
+        {
+            return Err(TypedModuleError::InvalidInput {
+                phase: TypedModulePhase::Finalize,
+                message: format!(
+                    "runtime shared request and scope for `{}` must not be empty",
+                    module.specifier
+                ),
+            });
+        }
         if resolved
             .insert(
                 (module.specifier.clone(), module.request_kind),
@@ -3202,14 +3497,6 @@ fn validate_final_facts(
                     "duplicate final facts for `{}'/{:?}",
                     module.specifier, module.request_kind
                 ),
-            });
-        }
-    }
-    for (source, rewrite) in &facts.specifier_rewrites {
-        if source.is_empty() || rewrite.is_empty() {
-            return Err(TypedModuleError::InvalidInput {
-                phase: TypedModulePhase::Finalize,
-                message: "specifier rewrites must have non-empty source and target".into(),
             });
         }
     }
@@ -3239,11 +3526,7 @@ fn resolved_target<'a>(
     specifier: &str,
     kind: TypedModuleRequestKind,
 ) -> Option<&'a TypedFinalModuleTarget> {
-    resolved.get(&(specifier.to_owned(), kind)).or_else(|| {
-        (kind == TypedModuleRequestKind::DynamicImport)
-            .then(|| resolved.get(&(specifier.to_owned(), TypedModuleRequestKind::StaticImport)))
-            .flatten()
-    })
+    resolved.get(&(specifier.to_owned(), kind))
 }
 
 fn rewrite_with_kind<'a>(
@@ -3256,7 +3539,6 @@ fn rewrite_with_kind<'a>(
         .iter()
         .find(|rewrite| rewrite.specifier == specifier && rewrite.request_kind == kind)
         .map(|rewrite| rewrite.rewritten_specifier.as_str())
-        .or_else(|| facts.specifier_rewrites.get(specifier).map(String::as_str))
 }
 
 fn apply_external_rewrite(
@@ -3283,7 +3565,7 @@ fn finalize_requests(
     resolved: &HashMap<(String, TypedModuleRequestKind), TypedFinalModuleTarget>,
     facts: &TypedFinalModuleFacts,
     report: &mut TypedFinalModuleReport,
-    discarded_static_requests: &mut Vec<TypedDiscardedStaticRequest>,
+    generated_module_requests: &mut Vec<TypedGeneratedModuleRequest>,
 ) -> Result<(), TypedModuleError> {
     let nodes = program.preorder_validated()?;
     for node in nodes.into_iter().rev() {
@@ -3349,23 +3631,18 @@ fn finalize_requests(
                     .to_owned(),
             });
         let target = apply_external_rewrite(target, facts, &specifier, kind);
-        let discarded_static_target = if kind == TypedModuleRequestKind::StaticImport
+        let request_role = if kind == TypedModuleRequestKind::StaticImport
             && static_request_value_is_discarded(program, node)
-        {
-            match &target {
+            && matches!(
+                target,
                 TypedFinalModuleTarget::Internal {
-                    module_id,
                     async_dependency: false,
                     ..
-                } => Some(*module_id),
-                TypedFinalModuleTarget::Internal {
-                    async_dependency: true,
-                    ..
                 }
-                | TypedFinalModuleTarget::External { .. } => None,
-            }
+            ) {
+            TypedGeneratedModuleRequestRole::DiscardedStatic
         } else {
-            None
+            TypedGeneratedModuleRequestRole::Value
         };
         let origin = program.node(node).expect("request node").origin();
         let replacement = match kind {
@@ -3431,11 +3708,16 @@ fn finalize_requests(
                 )?
             }
         };
-        program.replace_node(node, replacement)?;
-        if let Some(target) = discarded_static_target {
-            discarded_static_requests.push(TypedDiscardedStaticRequest {
-                node: replacement,
-                target,
+        program.replace_node(node, replacement.root)?;
+        if let (Some(target_node), TypedFinalModuleTarget::Internal { module_id, .. }) =
+            (replacement.target_node, &target)
+        {
+            generated_module_requests.push(TypedGeneratedModuleRequest {
+                target_node,
+                target: *module_id,
+                role: request_role,
+                specifier: specifier.clone(),
+                kind,
             });
         }
     }
@@ -3523,6 +3805,11 @@ fn request_namespace_symbol(program: &TypedProgram, request: NodeId) -> Option<S
     identifier_symbol(program, *binding)
 }
 
+struct FinalizedModuleRequest {
+    root: NodeId,
+    target_node: Option<NodeId>,
+}
+
 fn final_static_request(
     program: &mut TypedProgram,
     plan: &mut TypedModulePlan,
@@ -3531,16 +3818,22 @@ fn final_static_request(
     allow_await: bool,
     namespace_interop: bool,
     report: &mut TypedFinalModuleReport,
-) -> Result<NodeId, TypedModuleError> {
+) -> Result<FinalizedModuleRequest, TypedModuleError> {
     let factory = SyntheticFactory::new(program);
-    let loaded = match target {
+    let (loaded, target_node) = match target {
         TypedFinalModuleTarget::External {
             rewritten_specifier,
         } => {
             let source = factory.string(rewritten_specifier)?;
-            let require = factory.global("require")?;
+            let require = if plan.mode == TypedModuleMode::BundledCommonJs {
+                plan.runtime_capabilities.external_require = true;
+                let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+                factory.member(require, "external")?
+            } else {
+                preserved_host_global(&factory, plan, "require")?
+            };
             let call = factory.call(require, vec![source])?;
-            set_derived_origin(&factory, call, origin)
+            set_derived_origin(&factory, call, origin).map(|root| (root, None))
         }
         TypedFinalModuleTarget::Internal {
             module_id,
@@ -3559,27 +3852,45 @@ fn final_static_request(
                     .append_detached_node_with(derived_origin(origin), |_| {
                         Ok(IrNodeData::AwaitExpression { argument: call })
                     })?;
-                Ok(awaited)
+                Ok((awaited, Some(id)))
             } else {
-                Ok(call)
+                Ok((call, Some(id)))
             }
         }
+        TypedFinalModuleTarget::RuntimeDynamic { request, .. } => {
+            Err(TypedModuleError::InvalidInput {
+                phase: TypedModulePhase::Finalize,
+                message: format!(
+                    "runtime-owned request `{request}` cannot be emitted by a static import or require"
+                ),
+            })
+        }
+        TypedFinalModuleTarget::RuntimeShared { request, scope } => {
+            plan.runtime_capabilities.shared = true;
+            let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+            let shared = factory.member(require, "shared")?;
+            let request = factory.string(request)?;
+            let scope = factory.string(scope)?;
+            let call = factory.call(shared, vec![request, scope])?;
+            set_derived_origin(&factory, call, origin).map(|root| (root, None))
+        }
     }?;
-    if namespace_interop {
+    let root = if namespace_interop {
         namespace_interop_expression(&factory, plan, loaded, origin)
     } else {
         Ok(loaded)
-    }
+    }?;
+    Ok(FinalizedModuleRequest { root, target_node })
 }
 
 fn final_dynamic_request(
     program: &mut TypedProgram,
-    plan: &TypedModulePlan,
+    plan: &mut TypedModulePlan,
     target: &TypedFinalModuleTarget,
     options: Option<NodeId>,
     origin: IrOrigin,
     lower_external_to_require: bool,
-) -> Result<NodeId, TypedModuleError> {
+) -> Result<FinalizedModuleRequest, TypedModuleError> {
     let factory = SyntheticFactory::new(program);
     match target {
         TypedFinalModuleTarget::External {
@@ -3587,23 +3898,47 @@ fn final_dynamic_request(
         } => {
             let source = factory.string(rewritten_specifier)?;
             if lower_external_to_require && options.is_none() {
-                let require = factory.global("require")?;
-                let loaded = factory.call(require, vec![source])?;
-                let promise = factory.global("Promise")?;
-                let resolve = factory.member(promise, "resolve")?;
-                let call = factory.call(resolve, vec![loaded])?;
-                return set_derived_origin(&factory, call, origin);
+                let (external, resolve) = if plan.mode == TypedModuleMode::BundledCommonJs {
+                    plan.runtime_capabilities.external_require = true;
+                    plan.runtime_capabilities.promise_resolve = true;
+                    let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+                    let external = factory.member(require, "external")?;
+                    let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+                    let resolve = factory.member(require, "promiseResolve")?;
+                    (external, resolve)
+                } else {
+                    let external = preserved_host_global(&factory, plan, "require")?;
+                    let promise = preserved_host_global(&factory, plan, "Promise")?;
+                    let resolve = factory.member(promise, "resolve")?;
+                    (external, resolve)
+                };
+                let loaded = factory.call(external, vec![source])?;
+                let promise = factory.call(resolve, vec![loaded])?;
+                let then = factory.member(promise, "then")?;
+                let namespace = namespace_interop_function(&factory, plan)?;
+                let call = factory.call(then, vec![namespace])?;
+                return set_derived_origin(&factory, call, origin).map(|root| {
+                    FinalizedModuleRequest {
+                        root,
+                        target_node: None,
+                    }
+                });
             }
-            Ok(factory
+            let root = factory
                 .program
                 .borrow_mut()
                 .append_detached_node_with(derived_origin(origin), |_| {
                     Ok(IrNodeData::ImportExpression { source, options })
-                })?)
+                })?;
+            Ok(FinalizedModuleRequest {
+                root,
+                target_node: None,
+            })
         }
         TypedFinalModuleTarget::Internal {
             module_id,
             dynamic_chunk,
+            is_esm,
             ..
         } => {
             let id = factory.number(f64::from(module_id.0))?;
@@ -3612,15 +3947,79 @@ fn final_dynamic_request(
                 let import = factory.member(require, "import")?;
                 let chunk = factory.number(f64::from(chunk.0))?;
                 let call = factory.call(import, vec![chunk, id])?;
-                set_derived_origin(&factory, call, origin)
+                set_derived_origin(&factory, call, origin).map(|root| FinalizedModuleRequest {
+                    root,
+                    target_node: Some(id),
+                })
             } else {
                 let require = binding_reference(&factory, &plan.runtime.internal_require)?;
                 let loaded = factory.call(require, vec![id])?;
-                let promise = factory.global("Promise")?;
-                let resolve = factory.member(promise, "resolve")?;
-                let call = factory.call(resolve, vec![loaded])?;
-                set_derived_origin(&factory, call, origin)
+                plan.runtime_capabilities.promise_resolve = true;
+                let resolve = binding_reference(&factory, &plan.runtime.internal_require)?;
+                let resolve = factory.member(resolve, "promiseResolve")?;
+                let promise = factory.call(resolve, vec![loaded])?;
+                let call = if *is_esm {
+                    promise
+                } else {
+                    let then = factory.member(promise, "then")?;
+                    let namespace = namespace_interop_function(&factory, plan)?;
+                    factory.call(then, vec![namespace])?
+                };
+                set_derived_origin(&factory, call, origin).map(|root| FinalizedModuleRequest {
+                    root,
+                    target_node: Some(id),
+                })
             }
+        }
+        TypedFinalModuleTarget::RuntimeDynamic { request, expose } => {
+            if options.is_some() {
+                return Err(TypedModuleError::InvalidInput {
+                    phase: TypedModulePhase::Finalize,
+                    message: format!(
+                        "runtime-owned request `{request}` does not support import attributes"
+                    ),
+                });
+            }
+            plan.runtime_capabilities.runtime_import = true;
+            let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+            let runtime_import = factory.member(require, "runtimeImport")?;
+            let request = factory.string(request)?;
+            let mut arguments = vec![request];
+            if let Some(expose) = expose {
+                arguments.push(factory.string(expose)?);
+            }
+            let call = factory.call(runtime_import, arguments)?;
+            set_derived_origin(&factory, call, origin).map(|root| FinalizedModuleRequest {
+                root,
+                target_node: None,
+            })
+        }
+        TypedFinalModuleTarget::RuntimeShared { request, scope } => {
+            if options.is_some() {
+                return Err(TypedModuleError::InvalidInput {
+                    phase: TypedModulePhase::Finalize,
+                    message: format!(
+                        "runtime shared request `{request}` does not support import attributes"
+                    ),
+                });
+            }
+            plan.runtime_capabilities.shared = true;
+            plan.runtime_capabilities.promise_resolve = true;
+            let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+            let shared = factory.member(require, "shared")?;
+            let request = factory.string(request)?;
+            let scope = factory.string(scope)?;
+            let loaded = factory.call(shared, vec![request, scope])?;
+            let resolve = binding_reference(&factory, &plan.runtime.internal_require)?;
+            let resolve = factory.member(resolve, "promiseResolve")?;
+            let promise = factory.call(resolve, vec![loaded])?;
+            let then = factory.member(promise, "then")?;
+            let namespace = namespace_interop_function(&factory, plan)?;
+            let call = factory.call(then, vec![namespace])?;
+            set_derived_origin(&factory, call, origin).map(|root| FinalizedModuleRequest {
+                root,
+                target_node: None,
+            })
         }
     }
 }
@@ -3630,6 +4029,15 @@ fn namespace_interop_expression(
     plan: &mut TypedModulePlan,
     loaded: NodeId,
     origin: IrOrigin,
+) -> Result<NodeId, TypedModuleError> {
+    let wrapper = namespace_interop_function(factory, plan)?;
+    let call = factory.call(wrapper, vec![loaded])?;
+    set_derived_origin(factory, call, origin)
+}
+
+fn namespace_interop_function(
+    factory: &SyntheticFactory<'_>,
+    plan: &mut TypedModulePlan,
 ) -> Result<NodeId, TypedModuleError> {
     let mut reserved = collect_reserved_names(&factory.program.borrow());
     let value = allocate_runtime_binding(
@@ -3647,8 +4055,14 @@ fn namespace_interop_expression(
     let test = factory.logical(LogicalOperator::And, truthy, marker)?;
     let consequent = factory.reference(&value)?;
 
-    let object = factory.global("Object")?;
-    let assign = factory.member(object, "assign")?;
+    let assign = if plan.mode == TypedModuleMode::BundledCommonJs {
+        plan.runtime_capabilities.object_assign = true;
+        let require = binding_reference(factory, &plan.runtime.internal_require)?;
+        factory.member(require, "objectAssign")?
+    } else {
+        let object = preserved_host_global(factory, plan, "Object")?;
+        factory.member(object, "assign")?
+    };
     let empty = factory.object(Vec::new())?;
     let named = factory.reference(&value)?;
     let default_value = factory.reference(&value)?;
@@ -3656,9 +4070,7 @@ fn namespace_interop_expression(
     let default_object = factory.object(vec![default_property])?;
     let alternate = factory.call(assign, vec![empty, named, default_object])?;
     let body = factory.conditional(test, consequent, alternate)?;
-    let wrapper = ordinary_function_expression(factory, std::slice::from_ref(&value), body)?;
-    let call = factory.call(wrapper, vec![loaded])?;
-    set_derived_origin(factory, call, origin)
+    ordinary_function_expression(factory, std::slice::from_ref(&value), body)
 }
 
 fn finalize_namespace_read(
@@ -3718,7 +4130,9 @@ fn finalize_namespace_read(
             set_derived_origin(&factory, raw, origin)?
         }
         TypedFinalModuleTarget::Internal { is_esm: false, .. }
-        | TypedFinalModuleTarget::External { .. } => {
+        | TypedFinalModuleTarget::External { .. }
+        | TypedFinalModuleTarget::RuntimeDynamic { .. }
+        | TypedFinalModuleTarget::RuntimeShared { .. } => {
             namespace_interop_expression(&factory, plan, raw, origin)?
         }
     };
@@ -3792,7 +4206,9 @@ fn finalize_default_read(
             }
         }
         TypedFinalModuleTarget::Internal { is_esm: false, .. }
-        | TypedFinalModuleTarget::External { .. } => {
+        | TypedFinalModuleTarget::External { .. }
+        | TypedFinalModuleTarget::RuntimeDynamic { .. }
+        | TypedFinalModuleTarget::RuntimeShared { .. } => {
             let test_object = factory
                 .program
                 .borrow_mut()
@@ -4025,7 +4441,7 @@ fn finalize_runtime_sentinels(
             let name = program.clone_detached_subtree(arguments[1])?;
             let getter = program.clone_detached_subtree(arguments[2])?;
             let factory = SyntheticFactory::new(program);
-            object_define_property(&factory, exports, name, getter, true, origin)?
+            object_define_property(&factory, plan, exports, name, getter, true, origin)?
         } else if symbol == plan.runtime.mark_esmodule.symbol {
             if arguments.len() != 1 {
                 return Err(module_error(
@@ -4039,21 +4455,52 @@ fn finalize_runtime_sentinels(
             let name = factory.string("__esModule")?;
             let value = factory.boolean(true)?;
             let descriptor = factory.object(vec![factory.data_property("value", value)?])?;
-            let object = factory.global("Object")?;
-            let define = factory.member(object, "defineProperty")?;
+            let define = if plan.mode == TypedModuleMode::BundledCommonJs {
+                plan.runtime_capabilities.object_define_property = true;
+                let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+                factory.member(require, "objectDefineProperty")?
+            } else {
+                let object = preserved_host_global(&factory, plan, "Object")?;
+                factory.member(object, "defineProperty")?
+            };
             let call = factory.call(define, vec![exports, name, descriptor])?;
             set_derived_origin(&factory, call, origin)?
         } else if symbol == plan.runtime.export_all.symbol {
-            if arguments.len() != 2 {
+            if arguments.len() < 3 {
                 return Err(module_error(
                     TypedModulePhase::Finalize,
                     Some(node),
-                    "export-all sentinel must have exports and namespace arguments",
+                    "export-all sentinel must have exports, namespace, mode and names",
                 ));
             }
+            let exact = match program.node(arguments[2]).map(IrNode::data) {
+                Some(IrNodeData::BooleanLiteral { value }) => *value,
+                _ => {
+                    return Err(module_error(
+                        TypedModulePhase::Finalize,
+                        Some(arguments[2]),
+                        "export-all mode must be a boolean literal",
+                    ));
+                }
+            };
             let exports = program.clone_detached_subtree(arguments[0])?;
+            let exports_for_keys = program.clone_detached_subtree(arguments[0])?;
             let namespace_for_keys = program.clone_detached_subtree(arguments[1])?;
             let namespace_for_getter = program.clone_detached_subtree(arguments[1])?;
+            let names = arguments[3..]
+                .iter()
+                .map(|argument| {
+                    string_value(program, *argument)
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            module_error(
+                                TypedModulePhase::Finalize,
+                                Some(*argument),
+                                "export-all name must be a string literal",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let mut reserved = collect_reserved_names(program);
             let key_runtime = allocate_runtime_binding(
                 program,
@@ -4065,37 +4512,95 @@ fn finalize_runtime_sentinels(
             let key = Binding::from(&key_runtime);
             let factory = SyntheticFactory::new(program);
 
-            let object = factory.global("Object")?;
-            let keys = factory.member(object, "keys")?;
-            let keys = factory.call(keys, vec![namespace_for_keys])?;
+            let keys = if exact {
+                let names = names
+                    .iter()
+                    .map(|name| factory.string(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                factory.array(names)?
+            } else {
+                let keys = if plan.mode == TypedModuleMode::BundledCommonJs {
+                    plan.runtime_capabilities.object_keys = true;
+                    let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+                    factory.member(require, "objectKeys")?
+                } else {
+                    let object = preserved_host_global(&factory, plan, "Object")?;
+                    factory.member(object, "keys")?
+                };
+                factory.call(keys, vec![namespace_for_keys])?
+            };
             let for_each = factory.member(keys, "forEach")?;
 
             let key_for_member = factory.reference(&key)?;
             let value = factory.computed_member(namespace_for_getter, key_for_member)?;
             let getter = ordinary_function_expression(&factory, &[], value)?;
             let key_for_define = factory.reference(&key)?;
-            let define =
-                object_define_property(&factory, exports, key_for_define, getter, true, origin)?;
-            let key_default = factory.reference(&key)?;
-            let default = factory.string("default")?;
-            let not_default = binary_expression(
+            let define = object_define_property(
                 &factory,
-                BinaryOperator::StrictNotEq,
-                key_default,
-                default,
+                plan,
+                exports,
+                key_for_define,
+                getter,
+                true,
                 origin,
             )?;
-            let key_marker = factory.reference(&key)?;
-            let marker = factory.string("__esModule")?;
-            let not_marker = binary_expression(
-                &factory,
-                BinaryOperator::StrictNotEq,
-                key_marker,
-                marker,
-                origin,
-            )?;
-            let condition = factory.logical(LogicalOperator::And, not_default, not_marker)?;
-            let body = factory.logical(LogicalOperator::And, condition, define)?;
+            let body = if exact {
+                define
+            } else {
+                let key_default = factory.reference(&key)?;
+                let default = factory.string("default")?;
+                let not_default = binary_expression(
+                    &factory,
+                    BinaryOperator::StrictNotEq,
+                    key_default,
+                    default,
+                    origin,
+                )?;
+                let key_marker = factory.reference(&key)?;
+                let marker = factory.string("__esModule")?;
+                let not_marker = binary_expression(
+                    &factory,
+                    BinaryOperator::StrictNotEq,
+                    key_marker,
+                    marker,
+                    origin,
+                )?;
+                let mut condition =
+                    factory.logical(LogicalOperator::And, not_default, not_marker)?;
+                for excluded in &names {
+                    let key_excluded = factory.reference(&key)?;
+                    let excluded = factory.string(excluded)?;
+                    let not_excluded = binary_expression(
+                        &factory,
+                        BinaryOperator::StrictNotEq,
+                        key_excluded,
+                        excluded,
+                        origin,
+                    )?;
+                    condition = factory.logical(LogicalOperator::And, condition, not_excluded)?;
+                }
+                let export_keys = if plan.mode == TypedModuleMode::BundledCommonJs {
+                    plan.runtime_capabilities.object_keys = true;
+                    let require = binding_reference(&factory, &plan.runtime.internal_require)?;
+                    factory.member(require, "objectKeys")?
+                } else {
+                    let object = preserved_host_global(&factory, plan, "Object")?;
+                    factory.member(object, "keys")?
+                };
+                let export_keys = factory.call(export_keys, vec![exports_for_keys])?;
+                let index_of = factory.member(export_keys, "indexOf")?;
+                let key_for_index = factory.reference(&key)?;
+                let index = factory.call(index_of, vec![key_for_index])?;
+                let missing = binary_expression(
+                    &factory,
+                    BinaryOperator::StrictEq,
+                    index,
+                    factory.number(-1.0)?,
+                    origin,
+                )?;
+                condition = factory.logical(LogicalOperator::And, condition, missing)?;
+                factory.logical(LogicalOperator::And, condition, define)?
+            };
             let callback =
                 ordinary_function_expression(&factory, std::slice::from_ref(&key), body)?;
             let call = factory.call(for_each, vec![callback])?;
@@ -4119,6 +4624,7 @@ fn finalize_runtime_sentinels(
 
 fn object_define_property(
     factory: &SyntheticFactory<'_>,
+    plan: &mut TypedModulePlan,
     object_value: NodeId,
     name: NodeId,
     getter: NodeId,
@@ -4129,10 +4635,35 @@ fn object_define_property(
     let enumerable = factory.data_property("enumerable", enumerable)?;
     let getter = factory.data_property("get", getter)?;
     let descriptor = factory.object(vec![enumerable, getter])?;
-    let object = factory.global("Object")?;
-    let define = factory.member(object, "defineProperty")?;
+    let define = if plan.mode == TypedModuleMode::BundledCommonJs {
+        plan.runtime_capabilities.object_define_property = true;
+        let require = binding_reference(factory, &plan.runtime.internal_require)?;
+        factory.member(require, "objectDefineProperty")?
+    } else {
+        let object = preserved_host_global(factory, plan, "Object")?;
+        factory.member(object, "defineProperty")?
+    };
     let call = factory.call(define, vec![object_value, name, descriptor])?;
     set_derived_origin(factory, call, origin)
+}
+
+/// Preserve output intentionally executes against its host module globals and has no bundle-owned
+/// service prelude. Keep that escape hatch explicit so a bundled finalizer cannot accidentally
+/// manufacture a capturable compiler intrinsic.
+fn preserved_host_global(
+    factory: &SyntheticFactory<'_>,
+    plan: &TypedModulePlan,
+    name: &str,
+) -> Result<NodeId, TypedModuleError> {
+    if plan.mode == TypedModuleMode::BundledCommonJs {
+        return Err(TypedModuleError::InvalidInput {
+            phase: TypedModulePhase::Finalize,
+            message: format!(
+                "bundled compiler intrinsic `{name}` must use a typed runtime service"
+            ),
+        });
+    }
+    Ok(factory.global(name)?)
 }
 
 /// Module-runtime closures are created after target lowering has already run. Emit syntax that is
@@ -4425,7 +4956,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_lowered_jsx_repair_preserves_same_spelling_local_shadow() {
+    fn parser_lowered_jsx_repair_preserves_collision_free_local_shadow() {
         let mut program = lower(
             "const view=<div/>;function invoke(_jsx){return _jsx('user')}use(view,invoke);",
             SourceType::Jsx,
@@ -4434,7 +4965,7 @@ mod tests {
         let imported = program
             .names()
             .iter()
-            .find(|name| name.original() == "_jsx" && name.role() == NameRole::ImportBinding)
+            .find(|name| name.original() == "__wake_jsx" && name.role() == NameRole::ImportBinding)
             .and_then(crate::typed_ir::IrName::symbol)
             .expect("repaired JSX import symbol");
         let shadow = program
@@ -4447,6 +4978,7 @@ mod tests {
             })
             .and_then(crate::typed_ir::IrName::symbol)
             .expect("function-local _jsx shadow symbol");
+        assert_ne!(imported, shadow);
         let analysis = TypedAnalysis::rebuild(&program).unwrap();
         assert!(analysis.reference_count(imported) > 0);
         assert!(analysis.reference_count(shadow) > 0);
@@ -4499,7 +5031,7 @@ mod tests {
         let options = TypedModuleOptions {
             mode: TypedModuleMode::BundledCommonJs,
             preserve_all_exports: false,
-            preserve_export_star: false,
+            export_stars: vec![LinkerExportStar::exact("dep", Vec::new())],
             ..TypedModuleOptions::default()
         };
         let mut plan = plan(&mut program, &options);
@@ -4535,7 +5067,11 @@ mod tests {
                 let IrNodeData::CallExpression { callee, .. } = data else {
                     return false;
                 };
-                name_text(&program, *callee) == Some("require")
+                matches!(
+                    program.node(*callee).map(IrNode::data),
+                    Some(IrNodeData::MemberExpression { property, .. })
+                        if name_text(&program, *property) == Some("external")
+                )
             }),
             1,
             "the re-export target must still execute for side effects"
@@ -4553,11 +5089,52 @@ mod tests {
     }
 
     #[test]
+    fn large_exact_export_star_uses_one_static_loop_without_namespace_enumeration() {
+        let mut program = lower("export * from 'dep';", SourceType::Module);
+        let options = TypedModuleOptions {
+            mode: TypedModuleMode::BundledCommonJs,
+            export_stars: vec![LinkerExportStar::exact(
+                "dep",
+                vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            )],
+            ..TypedModuleOptions::default()
+        };
+        let mut plan = plan(&mut program, &options);
+
+        seal_typed_module_plan(&program, &mut plan).unwrap();
+        finalize_typed_modules(&mut program, &mut plan, &external_facts(&["dep"])).unwrap();
+        validate_no_pending_module_requests(&program, &plan).unwrap();
+
+        assert_eq!(
+            count_nodes(&program, |data| {
+                let IrNodeData::MemberExpression { property, .. } = data else {
+                    return false;
+                };
+                name_text(&program, *property) == Some("forEach")
+            }),
+            1,
+            "three or more statically resolved names should share one forwarding callback"
+        );
+        assert!(!plan.runtime_capabilities.object_keys);
+        assert_eq!(
+            count_nodes(&program, |data| {
+                let IrNodeData::MemberExpression { property, .. } = data else {
+                    return false;
+                };
+                name_text(&program, *property) == Some("objectKeys")
+            }),
+            0,
+            "a closed export surface must not enumerate the dependency namespace at runtime"
+        );
+    }
+
+    #[test]
     fn requested_or_namespace_export_star_keeps_forwarding() {
         let exact_named = TypedModuleOptions {
             mode: TypedModuleMode::BundledCommonJs,
             preserve_all_exports: false,
-            preserve_export_star: true,
+            export_stars: vec![LinkerExportStar::exact("dep", vec!["value".to_owned()])],
+            observed_export_names: BTreeSet::from(["value".to_owned()]),
             ..TypedModuleOptions::default()
         };
         let mut named = lower("export * from 'dep';", SourceType::Module);
@@ -4568,14 +5145,14 @@ mod tests {
                 return false;
             };
             named.name(*name).and_then(crate::typed_ir::IrName::symbol)
-                == Some(named_plan.runtime.export_all.symbol)
+                == Some(named_plan.runtime.export_live.symbol)
         }));
 
         let mut namespace = lower("export * as ns from 'dep';", SourceType::Module);
         let namespace_plan = plan(
             &mut namespace,
             &TypedModuleOptions {
-                preserve_export_star: false,
+                export_stars: Vec::new(),
                 observed_export_names: BTreeSet::from(["ns".to_owned()]),
                 ..exact_named
             },
@@ -4592,7 +5169,6 @@ mod tests {
         let options = TypedModuleOptions {
             mode: TypedModuleMode::BundledCommonJs,
             preserve_all_exports: false,
-            preserve_export_star: false,
             observed_export_names: BTreeSet::from(["kept".to_owned()]),
             ..TypedModuleOptions::default()
         };
@@ -4630,7 +5206,11 @@ mod tests {
                 let IrNodeData::CallExpression { callee, .. } = data else {
                     return false;
                 };
-                name_text(&program, *callee) == Some("require")
+                matches!(
+                    program.node(*callee).map(IrNode::data),
+                    Some(IrNodeData::MemberExpression { property, .. })
+                        if name_text(&program, *property) == Some("external")
+                )
             }),
             2,
             "both re-export sources must still execute"
@@ -4904,8 +5484,11 @@ mod tests {
                     },
                 },
             ],
-            specifier_rewrites: BTreeMap::from([("external".into(), "pkg".into())]),
-            request_rewrites: Vec::new(),
+            request_rewrites: vec![TypedModuleSpecifierRewrite {
+                specifier: "external".into(),
+                request_kind: TypedModuleRequestKind::Require,
+                rewritten_specifier: "pkg".into(),
+            }],
             lower_external_dynamic_to_require: false,
             no_esmodule: false,
         };
@@ -4991,6 +5574,26 @@ mod tests {
             module: options.module_id,
             symbol: live_symbol,
         }));
+    }
+
+    #[test]
+    fn runtime_capabilities_follow_bound_typed_nodes_not_text_or_local_lures() {
+        let mut runtime = lower("consume(__wake_require__.metaUrl());", SourceType::Script);
+        let mut runtime_plan = plan(&mut runtime, &cjs_options());
+        seal_typed_module_plan(&runtime, &mut runtime_plan).unwrap();
+        assert!(runtime_plan.runtime_capabilities().meta_url);
+
+        let mut lures = lower(
+            r#"const module=1,exports=2,__wake_require__={metaUrl(){return "local"}};
+consume(module,exports,__wake_require__.metaUrl(),"__wake_interop_default",`__wake_interop_star`,/__wake_require__\.metaUrl/);"#,
+            SourceType::Script,
+        );
+        let mut lure_plan = plan(&mut lures, &cjs_options());
+        seal_typed_module_plan(&lures, &mut lure_plan).unwrap();
+        assert_eq!(
+            lure_plan.runtime_capabilities(),
+            &TypedModuleRuntimeCapabilities::default()
+        );
     }
 
     #[test]
@@ -5098,7 +5701,11 @@ mod tests {
             &mut program,
             &mut plan,
             &TypedFinalModuleFacts {
-                specifier_rewrites: BTreeMap::from([("old".into(), "new".into())]),
+                request_rewrites: vec![TypedModuleSpecifierRewrite {
+                    specifier: "old".into(),
+                    request_kind: TypedModuleRequestKind::StaticImport,
+                    rewritten_specifier: "new".into(),
+                }],
                 ..TypedFinalModuleFacts::default()
             },
         )
@@ -5250,7 +5857,7 @@ mod tests {
                     else {
                         return false;
                     };
-                    name_text(program, *property) == Some("assign")
+                    name_text(program, *property) == Some("objectAssign")
                 })
                 .count()
         };

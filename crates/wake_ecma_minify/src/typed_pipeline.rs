@@ -427,10 +427,10 @@ fn run_typed_pipeline_impl(
 
 /// Run the only structural normalization which the binding-free proof may still expose.
 ///
-/// In particular, the compact bundle registry recognizes `object.property` but not the equivalent
-/// `object["property"]` spelling. Late peephole owns that syntax-local rewrite and nested sequence
-/// flattening. A reverse-preorder run reaches canonical form in one pass for the trivial grammar,
-/// so this deliberately does not restore the semantic fixed point or identifier mangling.
+/// In particular, late peephole canonicalizes `object["property"]` to the shorter
+/// `object.property` spelling when the property is identifier-safe, and flattens nested sequences.
+/// A reverse-preorder run reaches canonical form in one pass for the trivial grammar, so this
+/// deliberately does not restore the semantic fixed point or identifier mangling.
 fn run_trivial_minifying_compaction(
     program: &mut TypedProgram,
     stats: &mut OptimizeStats,
@@ -1166,7 +1166,6 @@ mod tests {
             &TypedModuleOptions {
                 mode: TypedModuleMode::BundledCommonJs,
                 preserve_all_exports: false,
-                preserve_export_star: false,
                 ..TypedModuleOptions::default()
             },
         )

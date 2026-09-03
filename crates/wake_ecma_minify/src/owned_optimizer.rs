@@ -524,6 +524,8 @@ pub(crate) fn optimize_owned_program(
     let (owned, report, module_plan, dynamic_scope_hazard) =
         run_typed_pipeline_with_modules(owned, &edits, &pipeline_options, &module_options)
             .map_err(|error| {
+                let unsupported_transform =
+                    error.source().is_some_and(is_unsupported_transform_source);
                 let invalid_linker_liveness = error
                     .source()
                     .and_then(|source| source.downcast_ref::<TypedModuleError>())
@@ -534,8 +536,9 @@ pub(crate) fn optimize_owned_program(
                                 if message.contains("linker liveness references unknown symbol")
                         )
                     });
-                let kind = if error.iterations
-                    == crate::typed_pipeline::MAX_TYPED_PIPELINE_ITERATIONS
+                let kind = if unsupported_transform {
+                    MinifyDiagnosticKind::UnsupportedTransform
+                } else if error.iterations == crate::typed_pipeline::MAX_TYPED_PIPELINE_ITERATIONS
                     && error.message.contains("converge")
                 {
                     MinifyDiagnosticKind::DidNotConverge
@@ -576,6 +579,20 @@ fn pipeline_error_message(error: &crate::typed_pipeline::TypedPipelineError) -> 
     message
 }
 
+fn is_unsupported_transform_source(source: &(dyn std::error::Error + 'static)) -> bool {
+    source
+        .downcast_ref::<crate::typed_decorators::DecoratorLoweringError>()
+        .is_some_and(|source| {
+            matches!(
+                source,
+                crate::typed_decorators::DecoratorLoweringError::Unsupported { .. }
+            )
+        })
+        || source
+            .downcast_ref::<TypedModuleError>()
+            .is_some_and(|source| matches!(source, TypedModuleError::Unsupported { .. }))
+}
+
 fn retained_dependencies(
     input: &OptimizeInput<'_>,
     report: &TypedPipelineReport,
@@ -590,6 +607,7 @@ fn retained_dependencies(
                 retained.specifier == dependency.specifier && retained.origin == origin
             }) || module_plan.requests().iter().any(|request| {
                 request.specifier == dependency.specifier
+                    && request.kind == dependency.kind
                     && origins_share_source_lineage(request.origin, origin)
             })
         })
@@ -731,10 +749,7 @@ fn typed_module_options(
         mode,
         module_id,
         preserve_all_exports: input.linker_liveness.is_none(),
-        preserve_export_star: input
-            .linker_liveness
-            .as_ref()
-            .is_none_or(|liveness| liveness.preserve_export_star()),
+        export_stars: input.linker_export_stars().to_vec(),
         observed_export_names,
         linker_liveness,
     }
@@ -780,9 +795,21 @@ fn diagnostic(
 mod tests {
     use super::*;
     use crate::typed_ir::IrNodeData;
+    use crate::typed_modules::TypedModulePhase;
     use crate::{ConstVal, LinkerExportLiveness, ValidatedDefine};
     use wake_ecma_ast::SourceType;
     use wake_ecma_parser::parse;
+
+    #[test]
+    fn typed_module_unsupported_error_has_a_stable_transform_classification() {
+        let error = TypedModuleError::Unsupported {
+            phase: TypedModulePhase::Plan,
+            node: None,
+            message: "fixture".into(),
+        };
+
+        assert!(is_unsupported_transform_source(&error));
+    }
 
     fn lowering_plan(
         source: &str,
@@ -1200,14 +1227,14 @@ mod tests {
         let mut input = OptimizeInput::new("");
         let absent = typed_module_options(&input, &export_bindings);
         assert!(absent.preserve_all_exports);
-        assert!(absent.preserve_export_star);
+        assert!(absent.export_stars.is_empty());
         assert!(absent.observed_export_names.is_empty());
         assert!(absent.linker_liveness.roots.is_empty());
 
         input.linker_liveness = Some(LinkerExportLiveness::new(7, Vec::<String>::new()));
         let empty = typed_module_options(&input, &export_bindings);
         assert!(!empty.preserve_all_exports);
-        assert!(!empty.preserve_export_star);
+        assert!(empty.export_stars.is_empty());
         assert!(empty.observed_export_names.is_empty());
         assert_eq!(empty.module_id, TypedModuleId(7));
         assert!(empty.linker_liveness.roots.is_empty());
@@ -1215,7 +1242,7 @@ mod tests {
         input.linker_liveness = Some(LinkerExportLiveness::new(7, ["kept"]));
         let exact = typed_module_options(&input, &export_bindings);
         assert!(!exact.preserve_all_exports);
-        assert!(exact.preserve_export_star);
+        assert!(exact.export_stars.is_empty());
         assert_eq!(
             exact.observed_export_names,
             BTreeSet::from(["kept".to_owned()])
@@ -1264,6 +1291,7 @@ mod tests {
             .iter()
             .map(|dependency| OptimizeDependency {
                 specifier: interner.resolve(dependency.specifier),
+                kind: dependency.kind.into(),
                 origin: NodeOrigin::Source(dependency.span),
             })
             .collect::<Vec<_>>();

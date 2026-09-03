@@ -1423,7 +1423,14 @@ impl TypedProgram {
         let name_len = self.names.len();
         let revision = self.revision;
         match self.clone_detached_subtree_inner(source) {
-            Ok(root) => Ok(root),
+            Ok(root) => {
+                // A directive statement is only valid once its enclosing Program/FunctionBody
+                // list exists. Deep cloning is bottom-up, so nested directives are temporarily
+                // created detached before their cloned function body can adopt them. Recompute
+                // directive provenance after the complete subtree has been assembled.
+                self.normalize_cloned_directive_prologues(root);
+                Ok(root)
+            }
             Err(error) => {
                 self.nodes.truncate(node_len);
                 self.lists.truncate(list_len);
@@ -2523,34 +2530,56 @@ impl TypedProgram {
             })
             .collect::<Vec<_>>();
         for list in directive_lists {
-            let statements = self.lists[list.index()].items.clone();
-            for statement in statements {
-                let IrNodeData::ExpressionStatement { expression, .. } =
-                    self.nodes[statement.index()].data
-                else {
-                    break;
-                };
-                let candidate = matches!(
-                    self.nodes[expression.index()].data,
-                    IrNodeData::StringLiteral { .. }
-                ) && matches!(
-                    (
-                        self.nodes[statement.index()].origin,
-                        self.nodes[expression.index()].origin
-                    ),
-                    (IrOrigin::Source(statement), IrOrigin::Source(expression))
-                        if statement.lo == expression.lo
-                );
-                if !candidate {
-                    break;
+            self.mark_directive_prefix(list);
+        }
+    }
+
+    fn normalize_cloned_directive_prologues(&mut self, root: NodeId) {
+        let mut stack = vec![root];
+        let mut directive_lists = Vec::new();
+        while let Some(node) = stack.pop() {
+            match self.nodes[node.index()].data {
+                IrNodeData::Program { body, .. } => directive_lists.push(body),
+                IrNodeData::FunctionBody { statements, .. } => {
+                    directive_lists.push(statements);
                 }
-                let IrNodeData::ExpressionStatement { directive, .. } =
-                    &mut self.nodes[statement.index()].data
-                else {
-                    unreachable!()
-                };
-                *directive = true;
+                _ => {}
             }
+            stack.extend(self.child_ids_unchecked(node));
+        }
+        for list in directive_lists {
+            self.mark_directive_prefix(list);
+        }
+    }
+
+    fn mark_directive_prefix(&mut self, list: ListId) {
+        let statements = self.lists[list.index()].items.clone();
+        for statement in statements {
+            let IrNodeData::ExpressionStatement { expression, .. } =
+                self.nodes[statement.index()].data
+            else {
+                break;
+            };
+            let candidate = matches!(
+                self.nodes[expression.index()].data,
+                IrNodeData::StringLiteral { .. }
+            ) && matches!(
+                (
+                    self.nodes[statement.index()].origin,
+                    self.nodes[expression.index()].origin
+                ),
+                (IrOrigin::Source(statement), IrOrigin::Source(expression))
+                    if statement.lo == expression.lo
+            );
+            if !candidate {
+                break;
+            }
+            let IrNodeData::ExpressionStatement { directive, .. } =
+                &mut self.nodes[statement.index()].data
+            else {
+                unreachable!()
+            };
+            *directive = true;
         }
     }
 
@@ -2828,6 +2857,9 @@ impl TypedProgram {
         }
 
         let mut data = record.data;
+        if let IrNodeData::ExpressionStatement { directive, .. } = &mut data {
+            *directive = false;
+        }
         let edges = data.edges();
         let mut cloned_lists = Vec::new();
         for edge in edges {

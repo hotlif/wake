@@ -8,7 +8,11 @@
 //!
 //! 入口：[`codegen`]（默认 dev 可读风格）。往返 `parse → codegen → parse` 语义等价（见测试）。
 
-use std::fmt::Write as _;
+/// Stable emitter implementation identity for caller-owned cache keys.
+pub const PIPELINE_VERSION: &str = "wake-ecma-codegen-v1";
+
+use std::error::Error;
+use std::fmt::{self, Write as _};
 
 mod decorators;
 mod typed;
@@ -17,11 +21,11 @@ use wake_common::{Atom, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::*;
 use wake_ecma_minify::OptimizedProgram;
 use wake_ecma_minify::codegen_bridge::{
-    TypedChunkId, TypedFinalModuleFacts, TypedFinalModuleTarget, TypedModuleId, TypedModuleMode,
-    TypedModuleRequestKind, TypedModuleSpecifierRewrite, TypedResolvedModule,
+    TypedChunkId, TypedFinalModuleFacts, TypedFinalModuleTarget, TypedModuleError, TypedModuleId,
+    TypedModuleMode, TypedModuleRequestKind, TypedModuleSpecifierRewrite, TypedResolvedModule,
     finalize_owned_typed_modules,
 };
-pub use wake_ecma_minify::{ConstVal, OptimizeInput, ValidatedDefine, optimize};
+pub use wake_ecma_minify::{ConstVal, ModuleRequestKind, OptimizeInput, ValidatedDefine, optimize};
 
 pub mod sourcemap;
 pub use sourcemap::{Mapping, ModuleMappings, SourceMap};
@@ -52,14 +56,34 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
 /// 供 webpack 式函数包装打包（DESIGN §6.1）。
 pub trait ModuleLinker {
     /// 说明符 → 内部模块 id；`None` 表示外部/未解析（MVP 保留原样）。
-    fn module_id(&self, specifier: &str) -> Option<u32>;
-    /// runtime require 函数名。
-    fn require_fn(&self) -> &str {
-        "__wake_require__"
-    }
+    fn module_id(&self, specifier: &str, kind: ModuleRequestKind) -> Option<u32>;
     /// 动态 `import(specifier)` 目标所属的 async/shared chunk id（代码分割，6.5）。
     /// `None` = 目标在入口闭包内 / 未启用分割 → 走旧内联（`Promise.resolve(require(id))`）。
     fn dynamic_chunk(&self, _specifier: &str) -> Option<u32> {
+        None
+    }
+    /// Returns a normalized request when a literal dynamic import is owned by the embedding
+    /// runtime instead of the local module graph.
+    ///
+    /// The emitted call starts as `__wake_require__.runtimeImport(request)`, with an optional expose
+    /// argument supplied by [`ModuleLinker::runtime_dynamic_import_expose`]. Static imports and
+    /// `require()` never consult this hook, which keeps asynchronous runtime boundaries explicit.
+    fn runtime_dynamic_import(&self, _specifier: &str) -> Option<String> {
+        None
+    }
+    /// Optional immutable expose identity for a runtime-owned dynamic request. This final-layout
+    /// fact is emitted structurally as the second `runtimeImport` argument and participates in the
+    /// caller's body-cache identity.
+    fn runtime_dynamic_import_expose(&self, _specifier: &str) -> Option<String> {
+        None
+    }
+    /// Returns a normalized share key when an initialized embedding runtime supplies this
+    /// request synchronously. Product configuration owns the explicit allowlist.
+    fn runtime_shared_module(
+        &self,
+        _specifier: &str,
+        _kind: ModuleRequestKind,
+    ) -> Option<(String, String)> {
         None
     }
     /// 目标模块是否为 **async 模块**（自身含顶层 await，或静态导入了这类模块）。
@@ -111,14 +135,106 @@ pub enum PreserveModuleFormat {
     CommonJs,
 }
 
-/// Exact generated range of one synchronous compiler-owned static request whose result is
-/// discarded. The bundler may replace this expression only after final layout proves that
-/// `target_module_id` has already been executed eagerly.
+/// A fallible optimized-codegen failure suitable for compiler facades.
+///
+/// Existing infallible entry points retain their assertion-based contract for trusted internal
+/// callers. User-input-facing compiler APIs should use the `try_*` variants so malformed or
+/// unsupported module plans never escape as a panic.
+#[derive(Debug)]
+pub enum CodegenError {
+    ModuleModeMismatch {
+        expected: PreserveModuleFormat,
+        actual: String,
+    },
+    ModuleFinalization(TypedModuleError),
+}
+
+impl fmt::Display for CodegenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModuleModeMismatch { expected, actual } => write!(
+                formatter,
+                "optimized module mode {actual} cannot be emitted as {expected:?}"
+            ),
+            Self::ModuleFinalization(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for CodegenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ModuleModeMismatch { .. } => None,
+            Self::ModuleFinalization(error) => Some(error),
+        }
+    }
+}
+
+impl From<TypedModuleError> for CodegenError {
+    fn from(error: TypedModuleError) -> Self {
+        Self::ModuleFinalization(error)
+    }
+}
+
+/// Semantic use of an internal request, proved by typed module finalization.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct GeneratedDiscardedStaticRequest {
+pub enum GeneratedModuleRequestRole {
+    Value,
+    DiscardedStatic,
+}
+
+/// Exact generated byte range of one compiler-owned internal request's numeric target literal.
+/// The bundler may redirect this range only against the byte-identical body emitted in the same
+/// codegen walk.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct GeneratedModuleRequest {
     pub start: u32,
     pub end: u32,
     pub target_module_id: u32,
+    pub role: GeneratedModuleRequestRole,
+    pub specifier: String,
+    pub kind: ModuleRequestKind,
+}
+
+/// Exact collision-free parameter spellings expected by one generated module body.
+///
+/// These names come from the finalized typed symbol table and must travel with the byte-identical
+/// body. Wrappers and persistent-cache restores consume this value; neither is allowed to infer
+/// runtime bindings by searching generated JavaScript.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct GeneratedModuleRuntimeCapabilities {
+    /// Whether a symbol-bound internal-require `metaUrl` member survives typed optimization.
+    pub meta_url: bool,
+    pub external_require: bool,
+    pub promise_resolve: bool,
+    pub object_assign: bool,
+    pub object_keys: bool,
+    pub object_define_property: bool,
+    pub runtime_import: bool,
+    pub shared: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct GeneratedModuleRuntimeNames {
+    pub module: String,
+    pub exports: String,
+    pub require: String,
+    pub capabilities: GeneratedModuleRuntimeCapabilities,
+}
+
+impl GeneratedModuleRuntimeNames {
+    pub fn canonical() -> Self {
+        Self {
+            module: "module".into(),
+            exports: "exports".into(),
+            require: "__wake_require__".into(),
+            capabilities: GeneratedModuleRuntimeCapabilities::default(),
+        }
+    }
+
+    pub fn is_canonical(&self) -> bool {
+        self.module == "module" && self.exports == "exports" && self.require == "__wake_require__"
+    }
 }
 
 /// Emit a preserve-modules artifact from optimizer-owned trusted edits. This is the library-build
@@ -129,9 +245,26 @@ pub fn codegen_preserved_optimized(
     format: PreserveModuleFormat,
     rewriter: &dyn ModuleSpecifierRewriter,
 ) -> String {
-    assert_preserved_module_mode(optimized, format);
+    try_codegen_preserved_optimized(optimized, _interner, format, rewriter).expect(match format {
+        PreserveModuleFormat::EsModule => {
+            "preserve-ESM codegen requires an optimizer-owned ESM module plan"
+        }
+        PreserveModuleFormat::CommonJs => {
+            "preserve-CommonJS codegen requires an optimizer-owned import plan"
+        }
+    })
+}
+
+/// Fallible counterpart of [`codegen_preserved_optimized`] for user-input-facing compiler APIs.
+pub fn try_codegen_preserved_optimized(
+    optimized: &OptimizedProgram,
+    _interner: &Interner,
+    format: PreserveModuleFormat,
+    rewriter: &dyn ModuleSpecifierRewriter,
+) -> Result<String, CodegenError> {
+    validate_preserved_module_mode(optimized, format)?;
     let facts = preserved_module_facts(optimized, rewriter);
-    emit_finalized_typed(optimized, &facts, false).0
+    Ok(try_emit_finalized_typed(optimized, &facts, false)?.0)
 }
 
 /// Mapped counterpart of [`codegen_preserved_optimized`]. Trusted edits, defines, and renames are
@@ -143,10 +276,29 @@ pub fn codegen_preserved_optimized_with_map(
     format: PreserveModuleFormat,
     rewriter: &dyn ModuleSpecifierRewriter,
 ) -> (String, ModuleMappings) {
-    assert_preserved_module_mode(optimized, format);
+    try_codegen_preserved_optimized_with_map(optimized, _interner, format, rewriter).expect(
+        match format {
+            PreserveModuleFormat::EsModule => {
+                "preserve-ESM codegen requires an optimizer-owned ESM module plan"
+            }
+            PreserveModuleFormat::CommonJs => {
+                "preserve-CommonJS codegen requires an optimizer-owned import plan"
+            }
+        },
+    )
+}
+
+/// Fallible mapped counterpart of [`codegen_preserved_optimized_with_map`].
+pub fn try_codegen_preserved_optimized_with_map(
+    optimized: &OptimizedProgram,
+    _interner: &Interner,
+    format: PreserveModuleFormat,
+    rewriter: &dyn ModuleSpecifierRewriter,
+) -> Result<(String, ModuleMappings), CodegenError> {
+    validate_preserved_module_mode(optimized, format)?;
     let facts = preserved_module_facts(optimized, rewriter);
-    let (code, mappings) = emit_finalized_typed(optimized, &facts, true);
-    (code, mappings.unwrap_or_default())
+    let (code, mappings) = try_emit_finalized_typed(optimized, &facts, true)?;
+    Ok((code, mappings.unwrap_or_default()))
 }
 
 /// Emit the optimizer-owned program through the single production minification path.
@@ -186,13 +338,22 @@ pub fn codegen_optimized_with_map_and_requests(
     _interner: &Interner,
     linker: &dyn ModuleLinker,
     no_esmodule: bool,
-) -> (String, ModuleMappings, Vec<GeneratedDiscardedStaticRequest>) {
+) -> (
+    String,
+    ModuleMappings,
+    Vec<GeneratedModuleRequest>,
+    GeneratedModuleRuntimeNames,
+) {
     assert_bundled_module_mode(optimized);
     let facts = bundled_module_facts(optimized, linker, no_esmodule);
     if optimized.can_emit_sealed_without_finalization(facts.no_esmodule) {
         let (code, mappings) =
             codegen_sealed_trivial_typed_with_map(optimized.typed_program(), optimized.minify());
-        return (code, mappings, Vec::new());
+        let runtime_names = typed::generated_module_runtime_names(
+            optimized.typed_program(),
+            optimized.typed_module_plan(),
+        );
+        return (code, mappings, Vec::new(), runtime_names);
     }
     let (program, _) = finalize_owned_typed_modules(
         optimized.typed_program().clone(),
@@ -203,20 +364,23 @@ pub fn codegen_optimized_with_map_and_requests(
     codegen_finalized_typed_with_requests(&program, optimized.minify())
 }
 
-fn assert_preserved_module_mode(optimized: &OptimizedProgram, format: PreserveModuleFormat) {
+fn validate_preserved_module_mode(
+    optimized: &OptimizedProgram,
+    format: PreserveModuleFormat,
+) -> Result<(), CodegenError> {
     let expected = match format {
         PreserveModuleFormat::EsModule => TypedModuleMode::PreserveEsm,
         PreserveModuleFormat::CommonJs => TypedModuleMode::PreserveCommonJs,
     };
-    let message = match format {
-        PreserveModuleFormat::EsModule => {
-            "preserve-ESM codegen requires an optimizer-owned ESM module plan"
-        }
-        PreserveModuleFormat::CommonJs => {
-            "preserve-CommonJS codegen requires an optimizer-owned import plan"
-        }
-    };
-    assert_eq!(optimized.typed_module_plan().mode(), expected, "{message}");
+    let actual = optimized.typed_module_plan().mode();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CodegenError::ModuleModeMismatch {
+            expected: format,
+            actual: format!("{actual:?}"),
+        })
+    }
 }
 
 fn assert_bundled_module_mode(optimized: &OptimizedProgram) {
@@ -232,30 +396,39 @@ fn emit_finalized_typed(
     facts: &TypedFinalModuleFacts,
     want_map: bool,
 ) -> (String, Option<ModuleMappings>) {
+    try_emit_finalized_typed(optimized, facts, want_map)
+        .expect("optimizer-owned module requests must finalize before code generation")
+}
+
+fn try_emit_finalized_typed(
+    optimized: &OptimizedProgram,
+    facts: &TypedFinalModuleFacts,
+    want_map: bool,
+) -> Result<(String, Option<ModuleMappings>), CodegenError> {
     if optimized.can_emit_sealed_without_finalization(facts.no_esmodule) {
         if want_map {
             let (code, mappings) = codegen_sealed_trivial_typed_with_map(
                 optimized.typed_program(),
                 optimized.minify(),
             );
-            return (code, Some(mappings));
+            return Ok((code, Some(mappings)));
         }
-        return (
+        return Ok((
             codegen_sealed_trivial_typed(optimized.typed_program(), optimized.minify()),
             None,
-        );
+        ));
     }
     let (program, _) = finalize_owned_typed_modules(
         optimized.typed_program().clone(),
         optimized.typed_module_plan().clone(),
         facts,
     )
-    .expect("optimizer-owned module requests must finalize before code generation");
+    .map_err(CodegenError::ModuleFinalization)?;
     if want_map {
         let (code, mappings) = codegen_finalized_typed_with_map(&program, optimized.minify());
-        (code, Some(mappings))
+        Ok((code, Some(mappings)))
     } else {
-        (codegen_finalized_typed(&program, optimized.minify()), None)
+        Ok((codegen_finalized_typed(&program, optimized.minify()), None))
     }
 }
 
@@ -270,10 +443,24 @@ fn bundled_module_facts(
         if !seen.insert((request.specifier.clone(), request.kind)) {
             continue;
         }
-        let target = if let Some(module_id) = linker.module_id(&request.specifier) {
+        let runtime_request = (request.kind == TypedModuleRequestKind::DynamicImport)
+            .then(|| linker.runtime_dynamic_import(&request.specifier))
+            .flatten();
+        let shared_request = linker.runtime_shared_module(&request.specifier, request.kind);
+        let target = if let Some(runtime_request) = runtime_request {
+            TypedFinalModuleTarget::RuntimeDynamic {
+                request: runtime_request,
+                expose: linker.runtime_dynamic_import_expose(&request.specifier),
+            }
+        } else if let Some((shared_request, scope)) = shared_request {
+            TypedFinalModuleTarget::RuntimeShared {
+                request: shared_request,
+                scope,
+            }
+        } else if let Some(module_id) = linker.module_id(&request.specifier, request.kind) {
             TypedFinalModuleTarget::Internal {
                 module_id: TypedModuleId(module_id),
-                is_esm: optimized.dependency_target_is_esm(&request.specifier),
+                is_esm: optimized.dependency_target_is_esm(&request.specifier, request.kind),
                 async_dependency: linker.is_async_module(module_id),
                 dynamic_chunk: (request.kind == TypedModuleRequestKind::DynamicImport)
                     .then(|| linker.dynamic_chunk(&request.specifier).map(TypedChunkId))

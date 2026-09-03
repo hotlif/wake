@@ -10,8 +10,8 @@ use std::process::Command;
 use wake_common::Interner;
 use wake_ecma_ast::SourceType;
 use wake_ecma_codegen::{
-    ModuleLinker, ModuleMappings, ModuleSpecifierRewriter, PreserveModuleFormat, codegen_optimized,
-    codegen_optimized_with_map, codegen_optimized_with_map_and_requests,
+    ModuleLinker, ModuleMappings, ModuleRequestKind, ModuleSpecifierRewriter, PreserveModuleFormat,
+    codegen_optimized, codegen_optimized_with_map, codegen_optimized_with_map_and_requests,
     codegen_preserved_optimized, codegen_preserved_optimized_with_map,
 };
 use wake_ecma_minify::{OptimizeInput, OptimizeStats, optimize};
@@ -47,7 +47,7 @@ const fn linked(specifier: &'static str, module_id: u32, is_esm: bool) -> Linked
 struct FixtureLinker<'a>(&'a [LinkedDependency]);
 
 impl ModuleLinker for FixtureLinker<'_> {
-    fn module_id(&self, specifier: &str) -> Option<u32> {
+    fn module_id(&self, specifier: &str, _kind: ModuleRequestKind) -> Option<u32> {
         self.0
             .iter()
             .find(|dependency| dependency.specifier == specifier)
@@ -86,6 +86,15 @@ fn build_bundled(
     dependencies: &[LinkedDependency],
     no_esmodule: bool,
 ) -> ModuleBuild {
+    build_bundled_with_minify(source, dependencies, no_esmodule, true).0
+}
+
+fn build_bundled_with_minify(
+    source: &str,
+    dependencies: &[LinkedDependency],
+    no_esmodule: bool,
+    minify: bool,
+) -> (ModuleBuild, wake_ecma_codegen::GeneratedModuleRuntimeNames) {
     let interner = Interner::new();
     let parsed = parse(source, &interner, SourceType::Module);
     assert!(
@@ -94,13 +103,20 @@ fn build_bundled(
         parsed.diagnostics
     );
     let mut input = OptimizeInput::new(source);
-    input.minify = true;
+    input.minify = minify;
     input.set_bundled_commonjs(true);
     input.set_bundled_internal_esm_dependencies(
         dependencies
             .iter()
             .filter(|dependency| dependency.is_esm)
-            .map(|dependency| dependency.specifier.to_owned()),
+            .flat_map(|dependency| {
+                [
+                    ModuleRequestKind::StaticImport,
+                    ModuleRequestKind::DynamicImport,
+                    ModuleRequestKind::Require,
+                ]
+                .map(|kind| (dependency.specifier.to_owned(), kind))
+            }),
     );
     input.reserved_names = vec![
         "exports".into(),
@@ -111,16 +127,19 @@ fn build_bundled(
         .unwrap_or_else(|error| panic!("public module optimization failed:\n{source}\n{error}"));
     let linker = FixtureLinker(dependencies);
     let code = codegen_optimized(&optimized, &interner, &linker, no_esmodule);
-    let (mapped, mappings) =
-        codegen_optimized_with_map(&optimized, &interner, &linker, no_esmodule);
+    let (mapped, mappings, _, runtime_names) =
+        codegen_optimized_with_map_and_requests(&optimized, &interner, &linker, no_esmodule);
     assert_eq!(code, mapped, "source-map collection changed emitted bytes");
-    ModuleBuild {
-        code,
-        mapped,
-        mappings,
-        stats: optimized.stats().clone(),
-        fingerprint: optimized.fingerprint(),
-    }
+    (
+        ModuleBuild {
+            code,
+            mapped,
+            mappings,
+            stats: optimized.stats().clone(),
+            fingerprint: optimized.fingerprint(),
+        },
+        runtime_names,
+    )
 }
 
 fn build_preserved(source: &str, rewriter: &dyn ModuleSpecifierRewriter) -> ModuleBuild {
@@ -154,7 +173,7 @@ fn build_preserved(source: &str, rewriter: &dyn ModuleSpecifierRewriter) -> Modu
 }
 
 #[test]
-fn bundled_codegen_reports_only_sync_top_level_discarded_static_request_ranges() {
+fn bundled_codegen_reports_every_internal_request_with_its_typed_role() {
     let source = r#"
 import "side-a";
 import value from "used";
@@ -180,34 +199,120 @@ globalThis.__wake_result=value;
     let mut input = OptimizeInput::new(source);
     input.minify = true;
     input.set_bundled_commonjs(true);
-    input.set_bundled_internal_esm_dependencies(
-        dependencies
-            .iter()
-            .map(|dependency| dependency.specifier.to_owned()),
-    );
+    input.set_bundled_internal_esm_dependencies(dependencies.iter().flat_map(|dependency| {
+        [
+            ModuleRequestKind::StaticImport,
+            ModuleRequestKind::DynamicImport,
+            ModuleRequestKind::Require,
+        ]
+        .map(|kind| (dependency.specifier.to_owned(), kind))
+    }));
     input.reserved_names = vec!["__wake_require__".into()];
     let optimized = optimize(parsed.module.clone(), &interner, &input).unwrap();
     let linker = FixtureLinker(&dependencies);
     let (plain, _) = codegen_optimized_with_map(&optimized, &interner, &linker, true);
-    let (code, _, requests) =
+    let (code, _, requests, runtime_names) =
         codegen_optimized_with_map_and_requests(&optimized, &interner, &linker, true);
 
     assert_eq!(code, plain, "request metadata changed emitted JavaScript");
+    assert!(runtime_names.is_canonical());
     assert_eq!(
         requests
             .iter()
             .map(|request| request.target_module_id)
             .collect::<Vec<_>>(),
-        [3, 5],
-        "used imports and awaited static requests must not be marked discardable: {code}"
+        [3, 4, 5, 6],
+        "the same codegen walk must report every generated internal request: {code}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.role)
+            .collect::<Vec<_>>(),
+        [
+            wake_ecma_codegen::GeneratedModuleRequestRole::DiscardedStatic,
+            wake_ecma_codegen::GeneratedModuleRequestRole::Value,
+            wake_ecma_codegen::GeneratedModuleRequestRole::DiscardedStatic,
+            wake_ecma_codegen::GeneratedModuleRequestRole::Value,
+        ]
     );
     for request in requests {
         let generated = &code[request.start as usize..request.end as usize];
         assert_eq!(
             generated,
-            format!("__wake_require__({})", request.target_module_id),
-            "range must cover exactly the generated request expression"
+            request.target_module_id.to_string(),
+            "range must cover exactly the generated target literal"
         );
+    }
+}
+
+#[test]
+fn bundled_codegen_emits_registered_request_ids_as_canonical_decimal() {
+    let source = "import value from 'used';globalThis.__wake_result=[value,1000]";
+    let dependencies = [linked("used", 1000, true)];
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut input = OptimizeInput::new(source);
+    input.minify = true;
+    input.set_bundled_commonjs(true);
+    input.set_bundled_internal_esm_dependencies([(
+        "used".to_owned(),
+        ModuleRequestKind::StaticImport,
+    )]);
+    input.reserved_names = vec!["__wake_require__".into()];
+    let optimized = optimize(parsed.module.clone(), &interner, &input).unwrap();
+    let linker = FixtureLinker(&dependencies);
+
+    let (code, _, requests, _) =
+        codegen_optimized_with_map_and_requests(&optimized, &interner, &linker, true);
+
+    assert_eq!(requests.len(), 1, "{code}");
+    let request = &requests[0];
+    assert_eq!(request.target_module_id, 1000);
+    assert_eq!(
+        &code[request.start as usize..request.end as usize],
+        "1000",
+        "registered target range must use canonical decimal bytes: {code}"
+    );
+    assert!(
+        code.contains("1e3"),
+        "ordinary numeric literals should retain shortest minified spelling: {code}"
+    );
+}
+
+#[test]
+fn bundled_codegen_reports_collision_free_runtime_names_without_renaming_eval_bindings() {
+    let source = "const module=1;const exports=2;const __wake_require__=3;export default eval('module+exports+__wake_require__');";
+    for minify in [false, true] {
+        let interner = Interner::new();
+        let parsed = parse(source, &interner, SourceType::Module);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let mut input = OptimizeInput::new(source);
+        input.minify = minify;
+        input.set_bundled_commonjs(true);
+        input.reserved_names = vec!["module".into(), "exports".into(), "__wake_require__".into()];
+        let optimized = optimize(parsed.module.clone(), &interner, &input).unwrap();
+        let linker = FixtureLinker(&[]);
+        let (code, _, _, runtime_names) =
+            codegen_optimized_with_map_and_requests(&optimized, &interner, &linker, true);
+
+        assert_eq!(runtime_names.module, "module$1");
+        assert_eq!(runtime_names.exports, "exports$1");
+        assert_eq!(runtime_names.require, "__wake_require__$1");
+        let compact = code
+            .chars()
+            .filter(|char| !char.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains("module=1"), "{code}");
+        assert!(compact.contains("exports=2"), "{code}");
+        assert!(compact.contains("__wake_require__=3"), "{code}");
+        assert!(
+            code.contains("eval('module+exports+__wake_require__')")
+                || code.contains("eval(\"module+exports+__wake_require__\")"),
+            "direct-eval source must remain byte-semantically owned by the user: {code}"
+        );
+        assert!(code.contains(&runtime_names.exports), "{code}");
     }
 }
 
@@ -268,6 +373,12 @@ try{{eval(source)}}catch(error){{console.error(error&&error.stack||error);proces
     );
     String::from_utf8(output.stdout).expect("Node output is UTF-8")
 }
+
+const OBJECT_RUNTIME_CAPABILITIES: &str = r#"
+__wake_require__.objectDefineProperty=globalThis.Object.defineProperty;
+__wake_require__.objectKeys=globalThis.Object.keys;
+__wake_require__.objectAssign=globalThis.Object.assign;
+"#;
 
 #[test]
 fn bundled_cjs_full_surface_reparses_maps_and_runs() {
@@ -368,6 +479,7 @@ function instantiate(id){{
 }}
 function __wake_require__(id){{events.push("require:"+id);return instantiate(id)}}
 __wake_require__.import=(chunk,id)=>{{events.push("import:"+chunk+":"+id);return Promise.resolve(instantiate(id))}};
+{object_runtime}
 const exports={{}};
 {code}
 Promise.resolve(globalThis.__wake_result).then(value=>process.stdout.write(JSON.stringify({{
@@ -377,6 +489,7 @@ Promise.resolve(globalThis.__wake_result).then(value=>process.stdout.write(JSON.
   events
 }})),error=>{{console.error(error&&error.stack||error);process.exitCode=1}});
 "#,
+            object_runtime = OBJECT_RUNTIME_CAPABILITIES,
             code = build.code
         );
         assert_eq!(
@@ -445,14 +558,20 @@ globalThis.__wake_result={
     let cjs = build(false);
     assert_reparses("internal ESM interop", &esm.code, SourceType::Script);
     assert_reparses("internal CJS interop", &cjs.code, SourceType::Script);
-    assert!(!esm.code.contains("Object.assign"), "{}", esm.code);
-    assert!(cjs.code.contains("Object.assign"), "{}", cjs.code);
+    assert!(!esm.code.contains(".objectAssign"), "{}", esm.code);
+    assert!(
+        cjs.code.contains("__wake_require__.objectAssign"),
+        "{}",
+        cjs.code
+    );
+    assert!(!cjs.code.contains("Object.assign"), "{}", cjs.code);
     assert!(cjs.code.contains("__esModule"), "{}", cjs.code);
 
     if node_available() {
         let execute = |code: &str, dependency: &str| {
             run_node(&format!(
-                r#"const exports={{}};const dependency={dependency};function __wake_require__(id){{if(id!==1)throw new Error("bad id");return dependency}};{code};process.stdout.write(JSON.stringify(globalThis.__wake_result));"#
+                r#"const exports={{}};const dependency={dependency};function __wake_require__(id){{if(id!==1)throw new Error("bad id");return dependency}};{object_runtime}{code};process.stdout.write(JSON.stringify(globalThis.__wake_result));"#,
+                object_runtime = OBJECT_RUNTIME_CAPABILITIES,
             ))
         };
         assert_eq!(
@@ -473,6 +592,97 @@ globalThis.__wake_result={
             ),
             r#"{"defaultValue":"wrapped","namespace":{"__esModule":true,"default":"wrapped","named":"marked"},"stableNamespace":true}"#
         );
+    }
+}
+
+#[test]
+fn compiler_intrinsics_do_not_capture_local_require_promise_or_object() {
+    let source = r#"
+import externalDefault from "external";
+import * as cjsNamespace from "cjs";
+export * from "all";
+export const answer=7;
+const require={tag:"r"};
+const Promise={tag:"p",resolve(){throw new Error("captured promise intrinsic")}};
+const Object={
+  tag:"o",
+  assign(){throw new Error("captured assign intrinsic")},
+  keys(){throw new Error("captured keys intrinsic")},
+  defineProperty(){throw new Error("captured define intrinsic")}
+};
+const localTags=eval("require.tag+Promise.tag+Object.tag");
+globalThis.__wake_result=import("lazy").then(module=>[
+  externalDefault.value,
+  cjsNamespace.default.value,
+  module.default.value,
+  localTags
+]);
+"#;
+    let dependencies = [
+        linked("cjs", 1, false),
+        linked("all", 2, true),
+        linked("lazy", 3, false),
+    ];
+
+    for minify in [false, true] {
+        let (build, runtime_names) =
+            build_bundled_with_minify(source, &dependencies, false, minify);
+        let capabilities = &runtime_names.capabilities;
+        assert!(capabilities.external_require, "{}", build.code);
+        assert!(capabilities.promise_resolve, "{}", build.code);
+        assert!(capabilities.object_assign, "{}", build.code);
+        assert!(capabilities.object_keys, "{}", build.code);
+        assert!(capabilities.object_define_property, "{}", build.code);
+        assert!(!capabilities.meta_url, "{}", build.code);
+        assert!(
+            build.code.contains("__wake_require__.external("),
+            "{}",
+            build.code
+        );
+        assert!(
+            build.code.contains("__wake_require__.promiseResolve("),
+            "{}",
+            build.code
+        );
+        assert!(!build.code.contains("Promise.resolve"), "{}", build.code);
+        assert!(!build.code.contains("Object.assign"), "{}", build.code);
+        assert_reparses(
+            "compiler intrinsic collision fixture",
+            &build.code,
+            SourceType::Script,
+        );
+
+        if node_available() {
+            let executable = format!(
+                r#"
+const exports={{}};
+function __wake_require__(id){{
+  if(id===1)return {{value:"cjs"}};
+  if(id===2)return {{__esModule:true,additional:"all"}};
+  if(id===3)return {{value:"lazy"}};
+  throw new Error("bad id "+id);
+}}
+__wake_require__.external=specifier=>{{
+  if(specifier!=="external")throw new Error("bad external "+specifier);
+  return {{value:"external"}};
+}};
+__wake_require__.promiseResolve=value=>globalThis.Promise.resolve(value);
+{object_runtime}
+{code}
+globalThis.Promise.resolve(globalThis.__wake_result).then(value=>{{
+  process.stdout.write(JSON.stringify([value,exports.answer,exports.additional,exports.__esModule]));
+}},error=>{{console.error(error&&error.stack||error);process.exitCode=1}});
+"#,
+                object_runtime = OBJECT_RUNTIME_CAPABILITIES,
+                code = build.code,
+            );
+            assert_eq!(
+                run_node(&executable),
+                r#"[["external","cjs","lazy","rpo"],7,"all",true]"#,
+                "minify={minify}\n{}",
+                build.code
+            );
+        }
     }
 }
 
@@ -558,12 +768,14 @@ function __wake_require__(id){{
   factories[id](module,module.exports,__wake_require__);
   return module.exports;
 }}
+{object_runtime}
 const first=__wake_require__(0),second=__wake_require__(1);
 first.bumpA();second.bumpB();
 process.stdout.write(JSON.stringify([first.readA(),first.valueA,second.valueB]));
 "#,
             a = a.code,
-            b = b.code
+            b = b.code,
+            object_runtime = OBJECT_RUNTIME_CAPABILITIES,
         );
         assert_eq!(run_node(&executable), "[7,2,3]");
     }
@@ -596,7 +808,8 @@ export const answer=await Promise.resolve(value+1);
 
     if node_available() {
         let executable = format!(
-            r#"const exports={{}};async function __wake_require__(id){{if(id!==1)throw new Error("bad id");return {{__esModule:true,value:10}}}};async function execute(){{{code}}};execute().then(()=>process.stdout.write(JSON.stringify([exports.answer,exports.__esModule])),error=>{{console.error(error&&error.stack||error);process.exitCode=1}});"#,
+            r#"const exports={{}};async function __wake_require__(id){{if(id!==1)throw new Error("bad id");return {{__esModule:true,value:10}}}};{object_runtime}async function execute(){{{code}}};execute().then(()=>process.stdout.write(JSON.stringify([exports.answer,exports.__esModule])),error=>{{console.error(error&&error.stack||error);process.exitCode=1}});"#,
+            object_runtime = OBJECT_RUNTIME_CAPABILITIES,
             code = build.code
         );
         assert_eq!(run_node(&executable), "[11,true]");

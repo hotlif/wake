@@ -32,9 +32,10 @@ pub mod codegen_bridge {
         PropertyKeyKind, SyntheticOriginKind, TypedIrError, TypedProgram,
     };
     pub use crate::typed_modules::{
-        FinalizedTypedProgram, TypedChunkId, TypedDiscardedStaticRequest, TypedFinalModuleFacts,
-        TypedFinalModuleReport, TypedFinalModuleTarget, TypedModuleError, TypedModuleId,
-        TypedModuleMode, TypedModulePlan, TypedModuleRequestEdge, TypedModuleRequestKind,
+        FinalizedTypedProgram, TypedChunkId, TypedFinalModuleFacts, TypedFinalModuleReport,
+        TypedFinalModuleTarget, TypedGeneratedModuleRequest, TypedGeneratedModuleRequestRole,
+        TypedModuleError, TypedModuleId, TypedModuleMode, TypedModulePhase, TypedModulePlan,
+        TypedModuleRequestEdge, TypedModuleRequestKind, TypedModuleRuntimeCapabilities,
         TypedModuleSpecifierRewrite, TypedResolvedModule, finalize_owned_typed_modules,
         finalize_typed_modules,
     };
@@ -43,6 +44,7 @@ pub mod codegen_bridge {
 pub use const_eval::ConstVal;
 pub(crate) use const_eval::write_number_minified;
 pub use optimizer::*;
+pub use typed_modules::TypedModuleRequestKind as ModuleRequestKind;
 
 #[cfg(test)]
 mod tests;

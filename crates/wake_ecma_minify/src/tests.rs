@@ -5,10 +5,10 @@ use wake_ecma_ast::SourceType;
 use wake_ecma_parser::parse;
 
 use crate::{
-    ConstVal, FINAL_PASS_ORDER, FIXED_POINT_PASS_ORDER, LinkerExportLiveness, MinifyDiagnosticKind,
-    NodeOrigin, ONE_TIME_PASS_ORDER, OptimizationPass, OptimizeDependency, OptimizeInput,
-    PIPELINE_VERSION, TrustedExpression, TrustedExpressionEdit, ValidatedDefine, optimize,
-    optimize_one_shot,
+    ConstVal, FINAL_PASS_ORDER, FIXED_POINT_PASS_ORDER, LinkerExportLiveness, LinkerExportStar,
+    MinifyDiagnosticKind, NodeOrigin, ONE_TIME_PASS_ORDER, OptimizationPass, OptimizeDependency,
+    OptimizeInput, PIPELINE_VERSION, TrustedExpression, TrustedExpressionEdit, ValidatedDefine,
+    optimize, optimize_one_shot,
 };
 
 fn parsed(source: &str, interner: &Interner) -> wake_ecma_parser::ParseOutput {
@@ -44,7 +44,7 @@ fn public_optimize_returns_only_valid_owned_typed_state() {
 
 #[test]
 fn pass_order_is_an_explicit_stable_contract() {
-    assert_eq!(PIPELINE_VERSION, "wake-closure-minifier-v12");
+    assert_eq!(PIPELINE_VERSION, "wake-closure-minifier-v15");
     assert_eq!(
         ONE_TIME_PASS_ORDER,
         &[
@@ -143,6 +143,11 @@ fn unsupported_complex_decorator_lowering_reports_module_and_pass() {
     input.module_name = Some("src/complex-super.ts".into());
 
     let error = optimize(parsed.module, &interner, &input).unwrap_err();
+    assert_eq!(
+        error.kind,
+        MinifyDiagnosticKind::UnsupportedTransform,
+        "unsupported lowering must be classified independently from trusted-edit failures"
+    );
     assert_eq!(error.module_name.as_deref(), Some("src/complex-super.ts"));
     assert_eq!(error.pass, Some(OptimizationPass::ApplyTrustedEdits));
     assert!(
@@ -179,6 +184,7 @@ fn sealed_module_plan_drives_retained_dependency_edges() {
         .iter()
         .map(|dependency| OptimizeDependency {
             specifier: interner.resolve(dependency.specifier),
+            kind: dependency.kind.into(),
             origin: NodeOrigin::Source(dependency.span),
         })
         .collect::<Vec<_>>();
@@ -224,18 +230,13 @@ fn fingerprints_are_deterministic_and_cover_policy_inputs() {
         0,
         ["answer"],
         Vec::<String>::new(),
-        false,
     ));
     let retained_only = optimize(retained_only.module, &interner, &retained_input).unwrap();
 
     let publicly_observed = parsed(export_source, &interner);
     let mut observed_input = OptimizeInput::new(export_source);
-    observed_input.linker_liveness = Some(LinkerExportLiveness::from_parts(
-        0,
-        ["answer"],
-        ["answer"],
-        false,
-    ));
+    observed_input.linker_liveness =
+        Some(LinkerExportLiveness::from_parts(0, ["answer"], ["answer"]));
     let publicly_observed = optimize(publicly_observed.module, &interner, &observed_input).unwrap();
     assert_ne!(
         retained_only.fingerprint(),
@@ -261,6 +262,24 @@ fn fingerprints_are_deterministic_and_cover_policy_inputs() {
         null_define.fingerprint(),
         "define value type is part of the stable cache fingerprint"
     );
+}
+
+#[test]
+fn fingerprints_include_the_linker_export_star_plan() {
+    let source = "export * from 'dep';";
+    let interner = Interner::new();
+    let runtime = parsed(source, &interner);
+    let mut runtime_input = OptimizeInput::new(source);
+    runtime_input.set_bundled_commonjs(true);
+    let runtime = optimize(runtime.module, &interner, &runtime_input).unwrap();
+
+    let exact = parsed(source, &interner);
+    let mut exact_input = OptimizeInput::new(source);
+    exact_input.set_bundled_commonjs(true);
+    exact_input.set_linker_export_stars([LinkerExportStar::exact("dep", vec!["value".to_owned()])]);
+    let exact = optimize(exact.module, &interner, &exact_input).unwrap();
+
+    assert_ne!(runtime.fingerprint(), exact.fingerprint());
 }
 
 #[test]

@@ -9,10 +9,22 @@ use std::sync::Arc;
 use wake_common::{FxHashSet, Interner, Span};
 use wake_ecma_ast::{ModuleAst, Program, SourceType, Statement};
 
-use crate::ConstVal;
+use crate::{ConstVal, ModuleRequestKind};
+
+impl From<wake_ecma_ast::DependencyKind> for ModuleRequestKind {
+    fn from(kind: wake_ecma_ast::DependencyKind) -> Self {
+        match kind {
+            wake_ecma_ast::DependencyKind::Import | wake_ecma_ast::DependencyKind::ExportFrom => {
+                Self::StaticImport
+            }
+            wake_ecma_ast::DependencyKind::DynamicImport => Self::DynamicImport,
+            wake_ecma_ast::DependencyKind::Require => Self::Require,
+        }
+    }
+}
 
 /// Bump whenever pass semantics, ordering, or fingerprint inputs change.
-pub const PIPELINE_VERSION: &str = "wake-closure-minifier-v12";
+pub const PIPELINE_VERSION: &str = "wake-closure-minifier-v15";
 pub const MAX_FIXED_POINT_ITERATIONS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,6 +125,7 @@ impl NodeOrigin {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OptimizeDependency {
     pub specifier: String,
+    pub kind: ModuleRequestKind,
     pub origin: NodeOrigin,
 }
 
@@ -151,7 +164,52 @@ pub struct LinkerExportLiveness {
     live_export_names: FxHashSet<String>,
     /// Exact public keys observed across the module boundary.
     observed_export_names: FxHashSet<String>,
-    preserve_export_star: bool,
+}
+
+/// Stable linker plan for one plain `export *` declaration, in source order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LinkerExportStar {
+    specifier: String,
+    resolution: LinkerExportStarResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LinkerExportStarResolution {
+    Exact(Vec<String>),
+    Runtime { excluded: Vec<String> },
+}
+
+impl LinkerExportStar {
+    pub fn exact(specifier: impl Into<String>, names: impl IntoIterator<Item = String>) -> Self {
+        let mut names: Vec<_> = names.into_iter().collect();
+        names.sort_unstable();
+        names.dedup();
+        Self {
+            specifier: specifier.into(),
+            resolution: LinkerExportStarResolution::Exact(names),
+        }
+    }
+
+    pub fn runtime(
+        specifier: impl Into<String>,
+        excluded: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut excluded: Vec<_> = excluded.into_iter().collect();
+        excluded.sort_unstable();
+        excluded.dedup();
+        Self {
+            specifier: specifier.into(),
+            resolution: LinkerExportStarResolution::Runtime { excluded },
+        }
+    }
+
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+
+    pub const fn resolution(&self) -> &LinkerExportStarResolution {
+        &self.resolution
+    }
 }
 
 impl LinkerExportLiveness {
@@ -164,7 +222,6 @@ impl LinkerExportLiveness {
         Self {
             module_id,
             observed_export_names: live_export_names.clone(),
-            preserve_export_star: !live_export_names.is_empty(),
             live_export_names,
         }
     }
@@ -173,13 +230,11 @@ impl LinkerExportLiveness {
         module_id: u32,
         live_export_names: impl IntoIterator<Item = impl Into<String>>,
         observed_export_names: impl IntoIterator<Item = impl Into<String>>,
-        preserve_export_star: bool,
     ) -> Self {
         Self {
             module_id,
             live_export_names: live_export_names.into_iter().map(Into::into).collect(),
             observed_export_names: observed_export_names.into_iter().map(Into::into).collect(),
-            preserve_export_star,
         }
     }
 
@@ -193,10 +248,6 @@ impl LinkerExportLiveness {
 
     pub fn observed_export_names(&self) -> &FxHashSet<String> {
         &self.observed_export_names
-    }
-
-    pub const fn preserve_export_star(&self) -> bool {
-        self.preserve_export_star
     }
 }
 
@@ -352,10 +403,11 @@ pub struct OptimizeInput<'source> {
     pub drop_console: bool,
     pub reserved_names: Vec<String>,
     pub linker_liveness: Option<LinkerExportLiveness>,
+    linker_export_stars: Vec<LinkerExportStar>,
     expression_replacements: Vec<TrustedExpressionEdit>,
     preserve_commonjs: bool,
     bundled_commonjs: bool,
-    bundled_internal_esm_dependencies: FxHashSet<String>,
+    bundled_internal_esm_dependencies: FxHashSet<(String, ModuleRequestKind)>,
     removed_statement_spans: FxHashSet<Span>,
     removed_binding_spans: FxHashSet<Span>,
     pub dependencies: Vec<OptimizeDependency>,
@@ -372,6 +424,7 @@ impl<'source> OptimizeInput<'source> {
             drop_console: false,
             reserved_names: Vec::new(),
             linker_liveness: None,
+            linker_export_stars: Vec::new(),
             expression_replacements: Vec::new(),
             preserve_commonjs: false,
             bundled_commonjs: false,
@@ -404,9 +457,18 @@ impl<'source> OptimizeInput<'source> {
     #[doc(hidden)]
     pub fn set_bundled_internal_esm_dependencies(
         &mut self,
-        dependencies: impl IntoIterator<Item = String>,
+        dependencies: impl IntoIterator<Item = (String, ModuleRequestKind)>,
     ) {
         self.bundled_internal_esm_dependencies = dependencies.into_iter().collect();
+    }
+
+    #[doc(hidden)]
+    pub fn set_linker_export_stars(&mut self, plans: impl IntoIterator<Item = LinkerExportStar>) {
+        self.linker_export_stars = plans.into_iter().collect();
+    }
+
+    pub(crate) fn linker_export_stars(&self) -> &[LinkerExportStar] {
+        &self.linker_export_stars
     }
 
     pub fn add_expression_edit(&mut self, edit: TrustedExpressionEdit) {
@@ -463,6 +525,7 @@ impl Default for OptimizeInput<'static> {
 pub enum MinifyDiagnosticKind {
     OptimizerInputMismatch,
     InvalidTrustedEdit,
+    UnsupportedTransform,
     InvalidIr,
     DidNotConverge,
 }
@@ -549,7 +612,7 @@ pub struct OptimizedProgram {
     linker_module_id: Option<u32>,
     preserve_commonjs: bool,
     bundled_commonjs: bool,
-    internal_esm_dependencies: FxHashSet<String>,
+    internal_esm_dependencies: FxHashSet<(String, ModuleRequestKind)>,
 }
 
 impl fmt::Debug for OptimizedProgram {
@@ -598,8 +661,9 @@ impl OptimizedProgram {
         self.bundled_commonjs
     }
 
-    pub fn dependency_target_is_esm(&self, specifier: &str) -> bool {
-        self.internal_esm_dependencies.contains(specifier)
+    pub fn dependency_target_is_esm(&self, specifier: &str, kind: ModuleRequestKind) -> bool {
+        self.internal_esm_dependencies
+            .contains(&(specifier.to_owned(), kind))
     }
 
     pub fn retained_dependencies(&self) -> &[OptimizeDependency] {
@@ -865,8 +929,9 @@ fn stable_fingerprint(
         input.bundled_internal_esm_dependencies.iter().collect();
     internal_dependencies.sort_unstable();
     hash.write_u64(internal_dependencies.len() as u64);
-    for dependency in internal_dependencies {
-        hash.write_str(dependency);
+    for (specifier, kind) in internal_dependencies {
+        hash.write_str(specifier);
+        hash.write_u64(*kind as u64);
     }
     let mut reserved = input.reserved_names.clone();
     reserved.sort();
@@ -918,7 +983,26 @@ fn stable_fingerprint(
         for name in observed_names {
             hash.write_str(name);
         }
-        hash.write_bool(liveness.preserve_export_star);
+    }
+    hash.write_u64(input.linker_export_stars.len() as u64);
+    for star in &input.linker_export_stars {
+        hash.write_str(&star.specifier);
+        match &star.resolution {
+            LinkerExportStarResolution::Exact(names) => {
+                hash.write_u64(0);
+                hash.write_u64(names.len() as u64);
+                for name in names {
+                    hash.write_str(name);
+                }
+            }
+            LinkerExportStarResolution::Runtime { excluded } => {
+                hash.write_u64(1);
+                hash.write_u64(excluded.len() as u64);
+                for name in excluded {
+                    hash.write_str(name);
+                }
+            }
+        }
     }
     hash.write_span_set(input.statement_removals());
     hash.write_span_set(input.binding_removals());
@@ -936,11 +1020,13 @@ fn stable_fingerprint(
     dependencies.sort_unstable_by(|left, right| {
         origin_key(left.origin)
             .cmp(&origin_key(right.origin))
+            .then_with(|| left.kind.cmp(&right.kind))
             .then_with(|| left.specifier.cmp(&right.specifier))
     });
     hash.write_u64(dependencies.len() as u64);
     for dependency in dependencies {
         hash.write_str(&dependency.specifier);
+        hash.write_u64(dependency.kind as u64);
         let (kind, lo, hi, reason) = origin_key(dependency.origin);
         hash.write_u64(u64::from(kind));
         hash.write_u64(u64::from(lo));

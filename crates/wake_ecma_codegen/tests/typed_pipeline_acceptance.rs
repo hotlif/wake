@@ -170,7 +170,11 @@ globalThis.__wake_result=[view.type,view.props.children.type,view.props.children
 struct NoLinker;
 
 impl ModuleLinker for NoLinker {
-    fn module_id(&self, _specifier: &str) -> Option<u32> {
+    fn module_id(
+        &self,
+        _specifier: &str,
+        _kind: wake_ecma_codegen::ModuleRequestKind,
+    ) -> Option<u32> {
         None
     }
 }
@@ -276,6 +280,13 @@ const sandbox={{
     throw new Error(`unexpected external ${{specifier}}`);
   }}
 }};
+const __wake_require__=id=>{{throw new Error(`unexpected internal ${{id}}`)}};
+__wake_require__.external=sandbox.require;
+__wake_require__.promiseResolve=value=>Promise.resolve(value);
+__wake_require__.objectAssign=Object.assign;
+__wake_require__.objectKeys=Object.keys;
+__wake_require__.objectDefineProperty=Object.defineProperty;
+sandbox.__wake_require__=__wake_require__;
 const normalize=value=>JSON.parse(JSON.stringify(value,(_key,item)=>{{
   if(typeof item==="bigint")return `${{item}}n`;
   if(typeof item==="number"&&Number.isNaN(item))return "NaN";

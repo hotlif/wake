@@ -14,10 +14,14 @@ use wake_ecma_minify::codegen_bridge::{
     ArrowBodyKind, ClassContext, ExportDefaultValueKind, FinalizedTypedProgram, ForInitializerKind,
     ForLeftKind, FunctionContext, ImportSpecifierKind, IrModuleName, IrNode, IrNodeData, IrOrigin,
     IrPropertyKey, ListId, ModuleNameKind, NameSyntax, NodeId, PropertyKeyKind,
-    SyntheticOriginKind, TypedDiscardedStaticRequest, TypedProgram, write_number_minified,
+    SyntheticOriginKind, TypedGeneratedModuleRequest, TypedGeneratedModuleRequestRole,
+    TypedModulePlan, TypedProgram, write_number_minified,
 };
 
-use crate::{GeneratedDiscardedStaticRequest, Mapping, ModuleMappings};
+use crate::{
+    GeneratedModuleRequest, GeneratedModuleRequestRole, GeneratedModuleRuntimeCapabilities,
+    GeneratedModuleRuntimeNames, Mapping, ModuleMappings,
+};
 
 /// Emit a fully finalized optimizer-owned program without collecting source mappings.
 pub(crate) fn codegen_finalized_typed(program: &FinalizedTypedProgram, minify: bool) -> String {
@@ -37,18 +41,52 @@ pub(crate) fn codegen_finalized_typed_with_map(
 pub(crate) fn codegen_finalized_typed_with_requests(
     program: &FinalizedTypedProgram,
     minify: bool,
-) -> (String, ModuleMappings, Vec<GeneratedDiscardedStaticRequest>) {
+) -> (
+    String,
+    ModuleMappings,
+    Vec<GeneratedModuleRequest>,
+    GeneratedModuleRuntimeNames,
+) {
     let (code, mappings, requests) = emit_validated(
         program.program(),
         minify,
         true,
-        program.discarded_static_requests(),
+        program.generated_module_requests(),
     );
     (
         code,
         mappings.expect("mapping collection was requested"),
         requests,
+        generated_module_runtime_names(program.program(), program.plan()),
     )
+}
+
+pub(crate) fn generated_module_runtime_names(
+    program: &TypedProgram,
+    plan: &TypedModulePlan,
+) -> GeneratedModuleRuntimeNames {
+    let emitted = |symbol| {
+        program
+            .symbol(symbol)
+            .expect("module plan runtime symbol must belong to its typed program")
+            .emitted_name()
+            .to_owned()
+    };
+    GeneratedModuleRuntimeNames {
+        module: emitted(plan.runtime().module.symbol),
+        exports: emitted(plan.runtime().exports.symbol),
+        require: emitted(plan.runtime().internal_require.symbol),
+        capabilities: GeneratedModuleRuntimeCapabilities {
+            meta_url: plan.runtime_capabilities().meta_url,
+            external_require: plan.runtime_capabilities().external_require,
+            promise_resolve: plan.runtime_capabilities().promise_resolve,
+            object_assign: plan.runtime_capabilities().object_assign,
+            object_keys: plan.runtime_capabilities().object_keys,
+            object_define_property: plan.runtime_capabilities().object_define_property,
+            runtime_import: plan.runtime_capabilities().runtime_import,
+            shared: plan.runtime_capabilities().shared,
+        },
+    }
 }
 
 /// Emit a sealed optimizer program whose paired module plan proves finalization cannot mutate it.
@@ -104,30 +142,36 @@ fn emit_validated(
     program: &TypedProgram,
     minify: bool,
     want_map: bool,
-    discarded_static_requests: &[TypedDiscardedStaticRequest],
-) -> (
-    String,
-    Option<ModuleMappings>,
-    Vec<GeneratedDiscardedStaticRequest>,
-) {
+    generated_module_requests: &[TypedGeneratedModuleRequest],
+) -> (String, Option<ModuleMappings>, Vec<GeneratedModuleRequest>) {
     let mut emitter = TypedEmitter {
         program,
         out: String::new(),
         minify,
         indent: 0,
         map: want_map.then(MapState::default),
-        discarded_static_request_targets: discarded_static_requests
+        generated_module_request_targets: generated_module_requests
             .iter()
-            .map(|request| (request.node(), request.target().0))
+            .map(|request| {
+                (
+                    request.target_node(),
+                    (
+                        request.target().0,
+                        request.role(),
+                        request.specifier().to_owned(),
+                        request.kind(),
+                    ),
+                )
+            })
             .collect(),
-        discarded_static_requests: Vec::with_capacity(discarded_static_requests.len()),
+        generated_module_requests: Vec::with_capacity(generated_module_requests.len()),
     };
     emitter.emit_node(program.root());
     let mappings = emitter.map.map(|map| ModuleMappings {
         mappings: map.mappings,
         names: map.names,
     });
-    (emitter.out, mappings, emitter.discarded_static_requests)
+    (emitter.out, mappings, emitter.generated_module_requests)
 }
 
 #[derive(Default)]
@@ -212,8 +256,16 @@ struct TypedEmitter<'program> {
     minify: bool,
     indent: usize,
     map: Option<MapState>,
-    discarded_static_request_targets: HashMap<NodeId, u32>,
-    discarded_static_requests: Vec<GeneratedDiscardedStaticRequest>,
+    generated_module_request_targets: HashMap<
+        NodeId,
+        (
+            u32,
+            TypedGeneratedModuleRequestRole,
+            String,
+            wake_ecma_minify::ModuleRequestKind,
+        ),
+    >,
+    generated_module_requests: Vec<GeneratedModuleRequest>,
 }
 
 // Expression precedence: larger values bind more tightly.
@@ -427,11 +479,11 @@ impl<'program> TypedEmitter<'program> {
     /// codegen assigns it concrete grammar.
     #[allow(clippy::too_many_lines)]
     fn emit_node(&mut self, id: NodeId) {
-        let discarded_request = self
-            .discarded_static_request_targets
-            .get(&id)
-            .copied()
-            .map(|target_module_id| (self.out.len(), target_module_id));
+        let generated_request = self.generated_module_request_targets.get(&id).cloned().map(
+            |(target_module_id, role, specifier, kind)| {
+                (self.out.len(), target_module_id, role, specifier, kind)
+            },
+        );
         let node = self.node(id);
         assert!(
             !node.is_tombstone(),
@@ -623,7 +675,18 @@ impl<'program> TypedEmitter<'program> {
                 self.emit_node(body);
             }
             IrNodeData::NumberLiteral { value } => {
-                let number = number_source(value, self.minify);
+                let number = if let Some((_, target_module_id, _, _, _)) =
+                    generated_request.as_ref()
+                {
+                    assert_eq!(
+                        value,
+                        f64::from(*target_module_id),
+                        "generated module request target node must contain its registered u32 id"
+                    );
+                    target_module_id.to_string()
+                } else {
+                    number_source(value, self.minify)
+                };
                 self.source_token(id, &number);
             }
             IrNodeData::StringLiteral { ref value } => self.emit_string_value(id, value),
@@ -963,16 +1026,23 @@ impl<'program> TypedEmitter<'program> {
                 attributes,
             } => self.emit_export_all(id, exported, source, attributes),
         }
-        if let Some((start, target_module_id)) = discarded_request {
+        if let Some((start, target_module_id, role, specifier, kind)) = generated_request {
             let end = self.out.len();
-            self.discarded_static_requests
-                .push(GeneratedDiscardedStaticRequest {
-                    start: u32::try_from(start)
-                        .expect("typed module body exceeds generated request range capacity"),
-                    end: u32::try_from(end)
-                        .expect("typed module body exceeds generated request range capacity"),
-                    target_module_id,
-                });
+            self.generated_module_requests.push(GeneratedModuleRequest {
+                start: u32::try_from(start)
+                    .expect("typed module body exceeds generated request range capacity"),
+                end: u32::try_from(end)
+                    .expect("typed module body exceeds generated request range capacity"),
+                target_module_id,
+                role: match role {
+                    TypedGeneratedModuleRequestRole::Value => GeneratedModuleRequestRole::Value,
+                    TypedGeneratedModuleRequestRole::DiscardedStatic => {
+                        GeneratedModuleRequestRole::DiscardedStatic
+                    }
+                },
+                specifier,
+                kind,
+            });
         }
     }
 

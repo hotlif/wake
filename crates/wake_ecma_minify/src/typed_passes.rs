@@ -1412,6 +1412,39 @@ const c = null ?? 3;
     }
 
     #[test]
+    fn branch_promotion_clones_nested_function_directives() {
+        let (program, _) = optimize(
+            r#"
+if (true) {
+  (function () {
+    "use strict";
+    chosen();
+  })();
+}
+"#,
+            TypedPassOptions::default(),
+        );
+        assert_eq!(
+            count(&program, |node| matches!(
+                node,
+                IrNodeData::IfStatement { .. }
+            )),
+            0
+        );
+        assert_eq!(
+            count(&program, |node| matches!(
+                node,
+                IrNodeData::ExpressionStatement {
+                    directive: true,
+                    ..
+                }
+            )),
+            1
+        );
+        assert!(live_names(&program).contains(&"chosen"));
+    }
+
+    #[test]
     fn selected_branch_keeps_its_own_source_origin() {
         let mut program = lower("true?chosen():rejected();");
         let selected_origin = source_span(&program, |data| {

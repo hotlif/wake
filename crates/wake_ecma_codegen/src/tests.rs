@@ -488,7 +488,7 @@ fn decorated_named_default_export_keeps_its_outer_binding() {
     );
 
     let script = format!(
-        "var exports={{}};{linked};process.stdout.write(JSON.stringify([globalThis.result[0],globalThis.result[1],exports.default===globalThis.same]));"
+        "var exports={{}},__wake_require__={{objectDefineProperty:Object.defineProperty}};{linked};process.stdout.write(JSON.stringify([globalThis.result[0],globalThis.result[1],exports.default===globalThis.same]));"
     );
     let output = std::process::Command::new("node")
         .arg("-e")
@@ -737,9 +737,103 @@ fn jsx_nested_and_text() {
 struct NoLinker;
 #[cfg(test)]
 impl crate::ModuleLinker for NoLinker {
-    fn module_id(&self, _s: &str) -> Option<u32> {
+    fn module_id(&self, _s: &str, _kind: crate::ModuleRequestKind) -> Option<u32> {
         None
     }
+}
+
+struct RuntimeImportLinker;
+
+impl crate::ModuleLinker for RuntimeImportLinker {
+    fn module_id(&self, _specifier: &str, _kind: crate::ModuleRequestKind) -> Option<u32> {
+        None
+    }
+
+    fn runtime_dynamic_import(&self, specifier: &str) -> Option<String> {
+        specifier
+            .starts_with("catalog/")
+            .then(|| specifier.to_owned())
+    }
+
+    fn runtime_dynamic_import_expose(&self, specifier: &str) -> Option<String> {
+        specifier
+            .starts_with("catalog/")
+            .then(|| "./Widget".to_owned())
+    }
+
+    fn runtime_shared_module(
+        &self,
+        specifier: &str,
+        _kind: crate::ModuleRequestKind,
+    ) -> Option<(String, String)> {
+        (specifier == "react").then(|| (specifier.to_owned(), "react18".to_owned()))
+    }
+}
+
+#[test]
+fn bundled_dynamic_import_can_be_owned_by_the_runtime() {
+    let source = "export async function load(){return import('catalog/Button')}";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut input = wake_ecma_minify::OptimizeInput::new(source);
+    input.set_bundled_commonjs(true);
+    let optimized = parsed.module.with_ast(|program| {
+        optimize_fixture(program, &interner, &input)
+            .expect("runtime import fixture should optimize")
+    });
+
+    let js = crate::codegen_optimized(&optimized, &interner, &RuntimeImportLinker, false);
+
+    assert!(
+        js.contains("__wake_require__.runtimeImport(\"catalog/Button\", \"./Widget\")")
+            || js.contains("__wake_require__.runtimeImport(\"catalog/Button\",\"./Widget\")"),
+        "{js}"
+    );
+    assert!(!js.contains("import(\"catalog/Button\")"), "{js}");
+}
+
+#[test]
+fn runtime_import_hook_does_not_capture_static_imports() {
+    let source = "import Button from 'catalog/Button';export default Button";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut input = wake_ecma_minify::OptimizeInput::new(source);
+    input.set_bundled_commonjs(true);
+    let optimized = parsed.module.with_ast(|program| {
+        optimize_fixture(program, &interner, &input).expect("static import fixture should optimize")
+    });
+
+    let js = crate::codegen_optimized(&optimized, &interner, &RuntimeImportLinker, false);
+
+    assert!(
+        js.contains("__wake_require__.external(\"catalog/Button\")"),
+        "{js}"
+    );
+    assert!(!js.contains("runtimeImport"), "{js}");
+}
+
+#[test]
+fn bundled_static_import_can_be_owned_by_a_runtime_share_context() {
+    let source = "import React from 'react';export const version=React.version";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut input = wake_ecma_minify::OptimizeInput::new(source);
+    input.set_bundled_commonjs(true);
+    let optimized = parsed.module.with_ast(|program| {
+        optimize_fixture(program, &interner, &input).expect("shared import fixture should optimize")
+    });
+
+    let js = crate::codegen_optimized(&optimized, &interner, &RuntimeImportLinker, false);
+
+    assert!(
+        js.contains("__wake_require__.shared(\"react\",\"react18\")")
+            || js.contains("__wake_require__.shared(\"react\", \"react18\")"),
+        "{js}"
+    );
+    assert!(!js.contains("require(\"react\")"), "{js}");
 }
 
 fn emit_optimized_linked(
@@ -1520,7 +1614,7 @@ fn precedence_parens_preserved() {
 
 struct NoLink;
 impl crate::ModuleLinker for NoLink {
-    fn module_id(&self, _s: &str) -> Option<u32> {
+    fn module_id(&self, _s: &str, _kind: crate::ModuleRequestKind) -> Option<u32> {
         None
     }
 }
@@ -1551,6 +1645,12 @@ fn has_export_binding(js: &str, name: &str) -> bool {
         || js.contains(&format!("exports[\"{name}\"]"))
         || js.contains(&format!("Object.defineProperty(exports,\"{name}\""))
         || js.contains(&format!("Object.defineProperty(exports, \"{name}\""))
+        || js.contains(&format!(
+            "__wake_require__.objectDefineProperty(exports,\"{name}\""
+        ))
+        || js.contains(&format!(
+            "__wake_require__.objectDefineProperty(exports, \"{name}\""
+        ))
 }
 
 #[test]
@@ -2000,7 +2100,7 @@ fn optimized_dotted_namespace_merges_keep_nested_initializers() {
     if let Ok(output) = std::process::Command::new("node")
         .arg("-e")
         .arg(format!(
-            "const exports={{}};{js};process.stdout.write(exports.default);"
+            "const exports={{}},__wake_require__={{objectDefineProperty:Object.defineProperty}};{js};process.stdout.write(exports.default);"
         ))
         .output()
     {
@@ -3215,6 +3315,32 @@ fn preserve_commonjs_codegen_has_no_independent_planner_fallback() {
 }
 
 #[test]
+fn fallible_preserve_codegen_reports_mode_mismatch_without_panicking() {
+    let source = "export const value = 1;";
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+    let error = parsed.module.with_ast(|program| {
+        let mut input = wake_ecma_minify::OptimizeInput::new(source);
+        input.minify = false;
+        let optimized = optimize_fixture(program, &interner, &input).expect("optimizer");
+        crate::try_codegen_preserved_optimized(
+            &optimized,
+            &interner,
+            PreserveModuleFormat::CommonJs,
+            &ExtensionRewriter(".cjs"),
+        )
+        .expect_err("an ESM plan must not be emitted as CommonJS")
+    });
+
+    assert!(
+        matches!(error, crate::CodegenError::ModuleModeMismatch { .. }),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn preserved_commonjs_keeps_synthetic_jsx_and_byte_zero_import_namespaces_distinct() {
     use wake_ecma_parser::{ParseOptions, parse_with};
 
@@ -3368,8 +3494,8 @@ fn ts_import_equals_lowers_to_require() {
 #[test]
 fn ts_export_assign_lowers_to_module_exports() {
     let js = strip_ts("const api = { a: 1 };\nexport = api;");
-    // 必须逐字是 `module.exports`：bundler 的 compact_body_names 以文本匹配这一串改写成
-    // 包装器形参 `m.exports`，换写法会静默丢导出。
+    // `export =` has CommonJS assignment semantics. Typed codegen and the bundler's canonical
+    // factory wrapper agree on `module`; no later generated-body text rewrite owns this binding.
     assert!(js.contains("module.exports = api;"), "{js}");
     assert!(!js.contains("export ="), "不应残留 `export =`:\n{js}");
     // 降级后模块内无任何 ESM 语句 → `program_is_esm` 为假 → 不打 `__esModule` 标记，
@@ -3599,32 +3725,72 @@ fn preserved_commonjs_retains_import_and_require_edge_kinds_for_one_specifier() 
     let source = "import value from 'dual'; const required = require('dual'); export async function load() { return import('dual') } globalThis.result = [value, required];";
     let parsed = parse(source, &interner, SourceType::Module);
     assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
-    let generated = parsed.module.with_ast(|program| {
-        let mut input = wake_ecma_minify::OptimizeInput::new(source);
-        input.minify = false;
-        input.set_preserve_commonjs(true);
-        let optimized = optimize_fixture(program, &interner, &input)
-            .expect("conditional preserve fixture should optimize");
-        crate::codegen_preserved_optimized(
-            &optimized,
-            &interner,
-            PreserveModuleFormat::CommonJs,
-            &ConditionalKindRewriter,
-        )
-    });
+    for minify in [false, true] {
+        let generated = parsed.module.with_ast(|program| {
+            let mut input = wake_ecma_minify::OptimizeInput::new(source);
+            input.minify = minify;
+            input.set_preserve_commonjs(true);
+            let optimized = optimize_fixture(program, &interner, &input)
+                .expect("conditional preserve fixture should optimize");
+            crate::codegen_preserved_optimized(
+                &optimized,
+                &interner,
+                PreserveModuleFormat::CommonJs,
+                &ConditionalKindRewriter,
+            )
+        });
 
-    assert!(
-        generated.contains("require(\"import:dual\")"),
-        "{generated}"
-    );
-    assert!(
-        generated.contains("require(\"require:dual\")"),
-        "{generated}"
-    );
-    assert!(
-        generated.contains("Promise.resolve(require(\"import:dual\"))"),
-        "{generated}"
-    );
+        assert!(
+            generated.contains("require(\"import:dual\")"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("require(\"require:dual\")"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("Promise.resolve(require(\"import:dual\"))"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("__wake_require__.external")
+                && !generated.contains("__wake_require__.promiseResolve"),
+            "preserved CommonJS has no bundle runtime service owner:\n{generated}"
+        );
+
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            let script = format!(
+                r#"
+const module={{exports:{{}}}},exports=module.exports;
+function require(specifier){{
+  if(specifier==="import:dual")return {{__esModule:true,default:"import-value",named:"lazy-value"}};
+  if(specifier==="require:dual")return "require-value";
+  throw new Error("unexpected "+specifier);
+}}
+{generated}
+Promise.resolve(module.exports.load()).then(lazy=>{{
+  const actual=[globalThis.result,lazy.default,lazy.named];
+  const expected=[["import-value","require-value"],"import-value","lazy-value"];
+  if(JSON.stringify(actual)!==JSON.stringify(expected)){{console.error(actual);process.exitCode=2;}}
+}},error=>{{console.error(error&&error.stack||error);process.exitCode=1;}});
+"#
+            );
+            let output = std::process::Command::new("node")
+                .arg("-e")
+                .arg(script)
+                .output()
+                .expect("execute preserved CommonJS request-kind fixture");
+            assert!(
+                output.status.success(),
+                "minify={minify}\n{generated}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 #[test]
@@ -4446,7 +4612,7 @@ fn typed_decorator_lowering_handles_private_fields_and_all_class_contexts() {
     let runtime = std::process::Command::new("node")
         .arg("-e")
         .arg(format!(
-            "var exports={{}};{output};process.stdout.write(JSON.stringify(globalThis.classDecoratorNames));"
+            "var exports={{}},__wake_require__={{objectDefineProperty:Object.defineProperty}};{output};process.stdout.write(JSON.stringify(globalThis.classDecoratorNames));"
         ))
         .output()
         .expect("run named and anonymous class decorator contexts");
