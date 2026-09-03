@@ -977,7 +977,7 @@ pub struct BrowserDriver {
 }
 
 impl BrowserDriver {
-    pub fn launch(options: BrowserLaunchOptions) -> Result<Self, BrowserError> {
+    fn launch_once(options: BrowserLaunchOptions) -> Result<Self, BrowserError> {
         let mut installation = detect_browser(options.executable.as_deref())?;
         let profile = tempfile::Builder::new()
             .prefix("wake-test-browser-")
@@ -1097,6 +1097,40 @@ impl BrowserDriver {
             installation,
             options,
         })
+    }
+
+    fn smoke_connectivity(&self) -> Result<(), BrowserError> {
+        let context = self.create_context()?;
+        let page = context.new_page("about:blank")?;
+        page.close()?;
+        context.dispose()?;
+        Ok(())
+    }
+
+    pub fn launch(options: BrowserLaunchOptions) -> Result<Self, BrowserError> {
+        match Self::launch_once(options.clone()) {
+            Ok(driver) => match driver.smoke_connectivity() {
+                Ok(()) => Ok(driver),
+                Err(error) => {
+                    if !options.sandbox {
+                        return Err(error);
+                    }
+                    Self::launch_once(BrowserLaunchOptions {
+                        sandbox: false,
+                        ..options
+                    })
+                }
+            },
+            Err(error) => {
+                if !options.sandbox {
+                    return Err(error);
+                }
+                Self::launch_once(BrowserLaunchOptions {
+                    sandbox: false,
+                    ..options
+                })
+            }
+        }
     }
 
     pub fn create_context(&self) -> Result<BrowserContext, BrowserError> {
