@@ -10,13 +10,12 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use wake_common::{FileSystem, Interner, OsFileSystem};
-use wake_ecma_ast::SourceType;
-use wake_ecma_codegen::{
-    ConstVal, ModuleMappings, ModuleSpecifierKind, ModuleSpecifierRewriter, OptimizeInput,
-    PreserveModuleFormat, ValidatedDefine, codegen_preserved_optimized_with_map, optimize,
+use wake_common::{FileSystem, OsFileSystem};
+use wake_compiler_core::{
+    CompilerBackend, CompilerMappings, LifetimeMode, MapMode, ModuleFinalizeFacts,
+    ModuleRequestKind, OptimizeLinkFacts, OptimizeOptions, ParseInput, ParsedModule, SourceType,
+    TransformEdits,
 };
-use wake_ecma_parser::{ParseOptions, parse_with};
 use wake_ecma_vm::{ScriptSource, Vm, VmError, VmHandle, VmOptions};
 use wake_resolver::{ResolutionEnvironment, ResolutionProfile, Resolver};
 
@@ -28,29 +27,6 @@ const HAPPY_DOM_PREFIX: &str = "__wake_internal__/happy-dom/";
 const HAPPY_DOM_ENTRY: &str = "wake-entry.js";
 const IMPORT_REQUEST_PREFIX: &str = "@wake-internal/module-request/import:";
 const REQUIRE_REQUEST_PREFIX: &str = "@wake-internal/module-request/require:";
-
-struct PreserveSpecifiers;
-
-impl ModuleSpecifierRewriter for PreserveSpecifiers {
-    fn rewrite(&self, _specifier: &str) -> Option<String> {
-        None
-    }
-
-    fn rewrite_with_kind(&self, specifier: &str, kind: ModuleSpecifierKind) -> Option<String> {
-        if is_test_builtin_module(specifier) || is_builtin_module(specifier) {
-            return None;
-        }
-        let prefix = match kind {
-            ModuleSpecifierKind::Import => IMPORT_REQUEST_PREFIX,
-            ModuleSpecifierKind::Require => REQUIRE_REQUEST_PREFIX,
-        };
-        Some(format!("{prefix}{specifier}"))
-    }
-
-    fn lower_dynamic_import_to_require(&self) -> bool {
-        true
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModuleResolutionMode {
@@ -122,7 +98,7 @@ impl TextRewriteMap {
 
 struct TranspiledModule {
     code: String,
-    mappings: ModuleMappings,
+    mappings: CompilerMappings,
 }
 
 #[derive(Debug)]
@@ -220,7 +196,7 @@ impl From<VmError> for RuntimeError {
     }
 }
 
-/// Preprocess one module with Wake's parser and code generator, preserving module boundaries.
+/// Preprocess one module through Wake's compiler backend, preserving module boundaries.
 pub fn transpile_module(path: &Path, source: &str) -> Result<String, RuntimeError> {
     Ok(transpile_module_with_mappings(path, source)?.code)
 }
@@ -231,25 +207,25 @@ fn transpile_module_with_mappings(
 ) -> Result<TranspiledModule, RuntimeError> {
     let source_type = source_type(path);
     let (rewritten_source, rewrite_map) = rewrite_esm_create_require(source);
-    let interner = Interner::new();
-    let parsed = parse_with(
-        &rewritten_source,
-        &interner,
-        source_type,
-        ParseOptions {
-            file_name: path.to_str().unwrap_or(""),
-            jsx_dev: true,
-            ..ParseOptions::default()
-        },
-    );
+    let backend = CompilerBackend::new();
+    let parsed = backend
+        .parse_module(ParseInput::new(&rewritten_source, source_type).with_jsx(
+            "react",
+            true,
+            path.to_str().unwrap_or(""),
+        ))
+        .map_err(|error| RuntimeError::Parse {
+            path: path.to_path_buf(),
+            messages: vec![error.message().to_owned()],
+        })?;
     if parsed.has_errors() {
         return Err(RuntimeError::Parse {
             path: path.to_path_buf(),
             messages: parsed
-                .diagnostics
+                .diagnostics()
                 .iter()
                 .filter(|diagnostic| diagnostic.is_error())
-                .map(|diagnostic| diagnostic.message.clone())
+                .map(|diagnostic| diagnostic.message().to_owned())
                 .collect(),
         });
     }
@@ -263,36 +239,73 @@ fn transpile_module_with_mappings(
     } else {
         format!("file:///{filename}")
     };
-    let defines = vec![
-        ValidatedDefine::primitive("import.meta.dirname", ConstVal::Str(directory)),
-        ValidatedDefine::primitive("import.meta.filename", ConstVal::Str(filename)),
-        ValidatedDefine::primitive("import.meta.url", ConstVal::Str(url)),
+    let mut options = OptimizeOptions::preserve_commonjs();
+    options.defines = vec![
+        (
+            "import.meta.dirname".to_string(),
+            javascript_string(&directory),
+        ),
+        (
+            "import.meta.filename".to_string(),
+            javascript_string(&filename),
+        ),
+        ("import.meta.url".to_string(), javascript_string(&url)),
     ];
-    let (code, mut mappings) = {
-        let mut input = OptimizeInput::new(&rewritten_source);
-        input.minify = false;
-        input.set_preserve_commonjs(true);
-        input.defines = defines;
-        input.module_name = Some(module_id(path));
-        let optimized = optimize(parsed.module.clone(), &interner, &input).map_err(|error| {
-            RuntimeError::Parse {
-                path: path.to_path_buf(),
-                messages: vec![error.to_string()],
-            }
-        })?;
-        codegen_preserved_optimized_with_map(
-            &optimized,
-            &interner,
-            PreserveModuleFormat::CommonJs,
-            &PreserveSpecifiers,
+    options.module_name = Some(filename);
+    let optimized = backend
+        .optimize_module(
+            &parsed,
+            &options,
+            &OptimizeLinkFacts::default(),
+            &TransformEdits::default(),
+            LifetimeMode::OneShot,
         )
-    };
+        .map_err(|error| RuntimeError::Parse {
+            path: path.to_path_buf(),
+            messages: vec![error.message().to_owned()],
+        })?;
+    let final_facts = runtime_finalize_facts(&parsed);
+    let emitted = backend
+        .emit_module(&optimized, &final_facts, MapMode::SourceMap)
+        .map_err(|error| RuntimeError::Parse {
+            path: path.to_path_buf(),
+            messages: vec![error.message().to_owned()],
+        })?;
+    let mut mappings = emitted
+        .mappings()
+        .cloned()
+        .expect("source-map mode always returns compiler mappings");
+    let code = emitted.into_code();
     for mapping in &mut mappings.mappings {
-        mapping.src_offset =
-            u32::try_from(rewrite_map.original_offset(mapping.src_offset as usize))
+        mapping.source_offset =
+            u32::try_from(rewrite_map.original_offset(mapping.source_offset as usize))
                 .expect("parser source offsets fit in u32");
     }
     Ok(TranspiledModule { code, mappings })
+}
+
+fn javascript_string(value: &str) -> String {
+    serde_json::to_string(value).expect("a Rust string is always representable as JSON")
+}
+
+fn runtime_finalize_facts(parsed: &ParsedModule) -> ModuleFinalizeFacts {
+    let mut facts = ModuleFinalizeFacts::default();
+    for dependency in parsed.dependencies() {
+        let specifier = dependency.specifier();
+        if is_test_builtin_module(specifier) || is_builtin_module(specifier) {
+            continue;
+        }
+        let kind = dependency.kind().request_kind();
+        let prefix = match kind {
+            ModuleRequestKind::StaticImport | ModuleRequestKind::DynamicImport => {
+                IMPORT_REQUEST_PREFIX
+            }
+            ModuleRequestKind::Require => REQUIRE_REQUEST_PREFIX,
+        };
+        facts.rewrite_request(specifier, kind, format!("{prefix}{specifier}"));
+    }
+    facts.set_lower_external_dynamic_to_require(true);
+    facts
 }
 
 fn rewrite_esm_create_require(source: &str) -> (String, TextRewriteMap) {
@@ -779,23 +792,24 @@ pub fn emit_commonjs_graph_script(
         let mut source_mappings = Vec::new();
         let mut source_mapping_segments = Vec::new();
         for mapping in &module.mappings.mappings {
-            let Some(line_start) = generated_line_starts.get(mapping.gen_line as usize) else {
+            let Some(line_start) = generated_line_starts.get(mapping.generated_line as usize)
+            else {
                 continue;
             };
-            let generated_utf16_offset = *line_start + mapping.gen_col as usize;
+            let generated_utf16_offset = *line_start + mapping.generated_column as usize;
             if generated_utf16_offset > generated_utf16_len {
                 continue;
             }
             source_mapping_segments.push(CommonJsSourceMappingSegment {
                 generated_utf16_offset,
-                original_byte_offset: (!mapping.is_unmapped).then_some(mapping.src_offset),
+                original_byte_offset: (!mapping.is_unmapped).then_some(mapping.source_offset),
             });
             if !mapping.is_unmapped {
                 source_mappings.push(CommonJsSourceMapping {
-                    generated_line: mapping.gen_line,
-                    generated_utf16_column: mapping.gen_col,
+                    generated_line: mapping.generated_line,
+                    generated_utf16_column: mapping.generated_column,
                     generated_utf16_offset,
-                    original_byte_offset: mapping.src_offset,
+                    original_byte_offset: mapping.source_offset,
                 });
             }
         }
@@ -999,7 +1013,7 @@ struct CompiledModule {
     source_path: PathBuf,
     original_source: String,
     code: String,
-    mappings: ModuleMappings,
+    mappings: CompilerMappings,
     resolutions: BTreeMap<String, String>,
     request_specifiers: BTreeMap<String, String>,
     dependencies: Vec<ModuleGraphDependency>,
@@ -1224,7 +1238,7 @@ fn compile_module_graph_interruptible(
             })?;
             TranspiledModule {
                 code: format!("module.exports = {value};"),
-                mappings: ModuleMappings::default(),
+                mappings: CompilerMappings::default(),
             }
         } else {
             transpile_module_with_mappings(&path, &source)
@@ -2102,6 +2116,39 @@ fn source_type(path: &Path) -> SourceType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transpile_preserves_kind_specific_module_request_rewrites() {
+        let source = "import imported from 'dual'; const required = require('dual'); export { imported, required };";
+        let code = transpile_module(Path::new("entry.mjs"), source).unwrap();
+
+        assert!(
+            code.contains("@wake-internal/module-request/import:dual"),
+            "{code}"
+        );
+        assert!(
+            code.contains("@wake-internal/module-request/require:dual"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn transpile_keeps_parser_failure_path_and_messages() {
+        let path = Path::new("broken.ts");
+        let error = transpile_module(path, "export const value: = ;").unwrap_err();
+
+        match error {
+            RuntimeError::Parse {
+                path: actual,
+                messages,
+            } => {
+                assert_eq!(actual, path);
+                assert!(!messages.is_empty());
+                assert!(messages.iter().all(|message| !message.is_empty()));
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn executes_typescript_after_wake_preprocessing() {

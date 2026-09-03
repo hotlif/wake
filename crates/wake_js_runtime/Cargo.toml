@@ -15,9 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
 wake_common.workspace = true
-wake_ecma_ast.workspace = true
-wake_ecma_codegen.workspace = true
-wake_ecma_parser.workspace = true
+wake_compiler_core.workspace = true
 wake_ecma_vm.workspace = true
 wake_resolver.workspace = true
 

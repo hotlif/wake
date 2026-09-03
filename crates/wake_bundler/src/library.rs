@@ -9,12 +9,13 @@ use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use wake_common::{FileSystem, FxHashMap, FxHashSet, Interner, OsFileSystem, fs::normalize};
+use wake_common::{FileSystem, FxHashMap, FxHashSet, OsFileSystem, fs::normalize};
+use wake_compiler_core::{
+    CompilerBackend, LifetimeMode, MapMode, ModuleFinalizeFacts, ModuleRequest, OptimizeLinkFacts,
+    OptimizeOptions, ParseInput, ParsedModule, TransformEdits,
+};
 use wake_ecma_ast::SourceType;
 pub use wake_ecma_codegen::PreserveModuleFormat;
-use wake_ecma_codegen::{ModuleSpecifierRewriter, codegen_preserved_optimized};
-use wake_ecma_minify::{OptimizeInput, TrustedExpressionEdit, optimize};
-use wake_ecma_parser::{ParseOutput, parse};
 use wake_resolver::{ModuleIdentity, ResolutionEnvironment, ResolveOptions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,10 +35,9 @@ pub struct LibraryDependency {
 
 struct LibraryModule {
     path: PathBuf,
-    source: String,
     runtime: bool,
     dependencies: Vec<LibraryDependency>,
-    parsed: ParseOutput,
+    parsed: ParsedModule,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub struct LibraryGraph {
     package_name: String,
     class_prefix: String,
     entry_id: u32,
-    interner: Interner,
+    compiler: CompilerBackend,
     modules: FxHashMap<u32, LibraryModule>,
 }
 
@@ -125,7 +125,7 @@ impl LibraryGraph {
         let resolver = environment.resolver();
 
         let analysis_packages: FxHashSet<String> = options.analysis_packages.into_iter().collect();
-        let interner = Interner::new();
+        let compiler = CompilerBackend::new();
         let entry_identity = resolver.module_identity(&entry);
         let mut identities = FxHashMap::default();
         identities.insert(entry_identity, 0);
@@ -169,21 +169,23 @@ impl LibraryGraph {
                 .read_to_string(&path)
                 .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
             let source_type = source_type(&path)?;
-            let parsed = parse(&source, &interner, source_type);
+            let parsed = compiler
+                .parse_module(ParseInput::new(&source, source_type))
+                .map_err(|error| format!("cannot parse `{}`: {}", path.display(), error))?;
             if parsed.has_errors() {
                 let messages = parsed
-                    .diagnostics
+                    .diagnostics()
                     .iter()
-                    .map(|diagnostic| diagnostic.message.as_str())
+                    .map(|diagnostic| diagnostic.message())
                     .collect::<Vec<_>>()
                     .join("; ");
                 return Err(format!("cannot parse `{}`: {messages}", path.display()));
             }
 
             let issuer = path.parent().unwrap_or(&root);
-            let mut dependencies = Vec::with_capacity(parsed.dependencies.len());
-            for dependency in &parsed.dependencies {
-                let specifier = interner.resolve(dependency.specifier);
+            let mut dependencies = Vec::with_capacity(parsed.dependencies().len());
+            for dependency in parsed.dependencies() {
+                let specifier = dependency.specifier().to_owned();
                 if is_bare_specifier(&specifier) {
                     let package = bare_package_name(&specifier);
                     let same_workspace_scope = package_scope
@@ -252,7 +254,6 @@ impl LibraryGraph {
                 id,
                 LibraryModule {
                     path,
-                    source,
                     runtime: runtime_request,
                     dependencies,
                     parsed,
@@ -273,7 +274,7 @@ impl LibraryGraph {
             package_name: package_identity,
             class_prefix,
             entry_id: 0,
-            interner,
+            compiler,
             modules,
         })
     }
@@ -291,7 +292,7 @@ impl LibraryGraph {
             && self
                 .modules
                 .values()
-                .any(|module| module.runtime && module.parsed.has_top_level_await)
+                .any(|module| module.runtime && module.parsed.has_top_level_await())
         {
             return Err(
                 "CommonJS library output does not support modules with top-level await".to_string(),
@@ -338,14 +339,14 @@ impl LibraryGraph {
             };
             let code = module
                 .parsed
-                .module
+                .ast()
                 .with_ast(|program| -> Result<String, String> {
                     let seed = self.css_seed(&module.path);
                     let scope = scopes.get(&id).cloned().unwrap_or_default();
                     let transformed = wake_css_in_js::transform_with_class_prefix(
                         program,
-                        &self.interner,
-                        &module.source,
+                        self.compiler.interner(),
+                        module.parsed.source(),
                         &seed,
                         &scope,
                         Some(&self.class_prefix),
@@ -367,41 +368,38 @@ impl LibraryGraph {
                         ));
                     }
                     css.push_str(&transformed.css);
-                    let mut optimize_input = OptimizeInput::new(&module.source);
-                    optimize_input.minify = false;
-                    if format == PreserveModuleFormat::CommonJs {
-                        optimize_input.set_preserve_commonjs(true);
-                    }
+                    let mut edits = TransformEdits::default();
                     for (span, replacement) in &transformed.replacements {
-                        let parsed_replacement =
-                            parse(replacement, &self.interner, SourceType::Module);
-                        optimize_input.add_expression_edit(
-                            TrustedExpressionEdit::from_parsed_program(
-                                *span,
-                                &parsed_replacement.module,
-                                &self.interner,
-                            ),
-                        );
+                        edits.replace_expression(*span, replacement.clone());
                     }
-                    optimize_input.extend_statement_removals(
-                        transformed.removable_import_spans.iter().copied(),
-                    );
-                    optimize_input.extend_binding_removals(
-                        transformed.removable_import_binding_spans.iter().copied(),
-                    );
-                    optimize_input.module_name = Some(path_to_slash(&module.path));
-                    let optimized = optimize(
-                        module.parsed.module.clone(),
-                        &self.interner,
-                        &optimize_input,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    Ok(codegen_preserved_optimized(
-                        &optimized,
-                        &self.interner,
-                        format,
-                        &rewriter,
-                    ))
+                    for span in &transformed.removable_import_spans {
+                        edits.remove_statement(*span);
+                    }
+                    for span in &transformed.removable_import_binding_spans {
+                        edits.remove_binding(*span);
+                    }
+                    let mut optimize_options = match format {
+                        PreserveModuleFormat::EsModule => OptimizeOptions::preserve_esm(),
+                        PreserveModuleFormat::CommonJs => OptimizeOptions::preserve_commonjs(),
+                    };
+                    optimize_options.module_name = Some(path_to_slash(&module.path));
+                    let optimized = self
+                        .compiler
+                        .optimize_module(
+                            &module.parsed,
+                            &optimize_options,
+                            &OptimizeLinkFacts::default(),
+                            &edits,
+                            LifetimeMode::OneShot,
+                        )
+                        .map_err(|error| error.message().to_owned())?;
+                    let facts = rewriter.finalize_facts(optimized.retained_requests());
+                    self.compiler
+                        // LibraryJavaScriptOutput has no detached map field; keep its existing
+                        // zero-map contract instead of collecting and discarding mappings.
+                        .emit_module(&optimized, &facts, MapMode::None)
+                        .map(|emission| emission.into_code())
+                        .map_err(|error| error.message().to_owned())
                 })?;
             output.push(LibraryOutputModule {
                 id,
@@ -459,8 +457,8 @@ impl LibraryGraph {
             let module = &self.modules[&id];
             let imports = module
                 .parsed
-                .module
-                .with_ast(|program| collect_imports(program, &self.interner));
+                .ast()
+                .with_ast(|program| collect_imports(program, self.compiler.interner()));
             let mut scope = Scope::default();
             for (local, specifier, imported_name) in imports {
                 let Some(target) = module
@@ -487,10 +485,10 @@ impl LibraryGraph {
             }
 
             let seed = self.css_seed(&module.path);
-            let mut exports = module.parsed.module.with_ast(|program| {
+            let mut exports = module.parsed.ast().with_ast(|program| {
                 wake_css_in_js::collect_static_exports_with_class_prefix(
                     program,
-                    &self.interner,
+                    self.compiler.interner(),
                     &seed,
                     &scope,
                     Some(&self.class_prefix),
@@ -498,8 +496,8 @@ impl LibraryGraph {
             });
             let reexports = module
                 .parsed
-                .module
-                .with_ast(|program| collect_static_reexports(program, &self.interner));
+                .ast()
+                .with_ast(|program| collect_static_reexports(program, self.compiler.interner()));
             for reexport in reexports {
                 let Some(target) = module
                     .dependencies
@@ -587,7 +585,7 @@ struct GraphSpecifierRewriter<'a> {
     lower_dynamic_import_to_require: bool,
 }
 
-impl ModuleSpecifierRewriter for GraphSpecifierRewriter<'_> {
+impl GraphSpecifierRewriter<'_> {
     fn rewrite(&self, specifier: &str) -> Option<String> {
         let dependency = self
             .module
@@ -604,8 +602,16 @@ impl ModuleSpecifierRewriter for GraphSpecifierRewriter<'_> {
         ))
     }
 
-    fn lower_dynamic_import_to_require(&self) -> bool {
-        self.lower_dynamic_import_to_require
+    fn finalize_facts(&self, retained_requests: &[ModuleRequest]) -> ModuleFinalizeFacts {
+        let mut facts = ModuleFinalizeFacts::default();
+        for request in retained_requests {
+            let Some(rewritten) = self.rewrite(&request.specifier) else {
+                continue;
+            };
+            facts.rewrite_request(&request.specifier, request.kind, rewritten);
+        }
+        facts.set_lower_external_dynamic_to_require(self.lower_dynamic_import_to_require);
+        facts
     }
 }
 
@@ -700,6 +706,8 @@ mod tests {
     use std::process::Command;
 
     use tempfile::tempdir;
+    use wake_common::Interner;
+    use wake_ecma_parser::parse;
 
     use super::*;
 
@@ -719,6 +727,61 @@ mod tests {
         for module in &output.modules {
             write(&root.join(&module.file_name), &module.code);
         }
+    }
+
+    #[test]
+    fn preserved_modules_keep_kind_agnostic_internal_rewrites_and_owned_parse_diagnostics() {
+        let project = tempdir().unwrap();
+        write(
+            &project.path().join("package.json"),
+            r#"{"name":"example"}"#,
+        );
+        write(
+            &project.path().join("src/index.ts"),
+            "export { value } from './value.js'; export async function load() { return (await import('./value.js')).value; }",
+        );
+        write(
+            &project.path().join("src/value.ts"),
+            "export const value: number = 42;",
+        );
+
+        let graph =
+            LibraryGraph::scan(LibraryGraphOptions::new(project.path(), "src/index.ts")).unwrap();
+        let esm = graph.emit(PreserveModuleFormat::EsModule).unwrap();
+        let esm_entry = &esm
+            .modules
+            .iter()
+            .find(|module| module.id == 0)
+            .unwrap()
+            .code;
+        assert_eq!(esm.entry, "index.mjs");
+        assert_eq!(
+            esm_entry.matches("./_wake/src/value.mjs").count(),
+            2,
+            "static and dynamic requests must share the internal ESM rewrite:\n{esm_entry}"
+        );
+
+        let cjs = graph.emit(PreserveModuleFormat::CommonJs).unwrap();
+        let cjs_entry = &cjs
+            .modules
+            .iter()
+            .find(|module| module.id == 0)
+            .unwrap()
+            .code;
+        assert_eq!(cjs.entry, "index.cjs");
+        assert_eq!(
+            cjs_entry.matches("./_wake/src/value.cjs").count(),
+            2,
+            "static and lowered dynamic requests must share the internal CJS rewrite:\n{cjs_entry}"
+        );
+
+        write(&project.path().join("src/broken.ts"), "export const = 42;");
+        let error = LibraryGraph::scan(LibraryGraphOptions::new(project.path(), "src/broken.ts"))
+            .err()
+            .expect("invalid source must retain an owned diagnostic");
+        assert!(error.contains("cannot parse"), "{error}");
+        assert!(error.contains("broken.ts"), "{error}");
+        assert!(error.len() > "cannot parse broken.ts".len(), "{error}");
     }
 
     #[test]

@@ -4218,6 +4218,7 @@ dependencies = [
  "tempfile",
  "wake_cache",
  "wake_common",
+ "wake_compiler_core",
  "wake_css",
  "wake_css_in_js",
  "wake_ecma_ast",
@@ -4489,9 +4490,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "wake_common",
- "wake_ecma_ast",
- "wake_ecma_codegen",
- "wake_ecma_parser",
+ "wake_compiler_core",
  "wake_ecma_vm",
  "wake_resolver",
 ]
