@@ -103,7 +103,7 @@ pub enum HostCommand {
 }
 
 /// Wake-owned interactive watch controls. These are intentionally not Jest key/API aliases.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -116,6 +116,58 @@ pub enum WatchControl {
     Name { pattern: String },
     UpdateSnapshots,
     Rerun,
+}
+
+#[derive(Debug, Default)]
+enum RawWatchPattern {
+    #[default]
+    Missing,
+    Present(String),
+}
+
+impl<'de> Deserialize<'de> for RawWatchPattern {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+impl<'de> Deserialize<'de> for WatchControl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawWatchControl {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            pattern: RawWatchPattern,
+        }
+
+        let raw = RawWatchControl::deserialize(deserializer)?;
+        match (raw.kind.as_str(), raw.pattern) {
+            ("all", RawWatchPattern::Missing) => Ok(Self::All),
+            ("failed", RawWatchPattern::Missing) => Ok(Self::Failed),
+            ("path", RawWatchPattern::Present(pattern)) => Ok(Self::Path { pattern }),
+            ("name", RawWatchPattern::Present(pattern)) => Ok(Self::Name { pattern }),
+            ("updateSnapshots", RawWatchPattern::Missing) => Ok(Self::UpdateSnapshots),
+            ("rerun", RawWatchPattern::Missing) => Ok(Self::Rerun),
+            ("path" | "name", RawWatchPattern::Missing) => {
+                Err(serde::de::Error::missing_field("pattern"))
+            }
+            ("all" | "failed" | "updateSnapshots" | "rerun", RawWatchPattern::Present(_)) => {
+                Err(serde::de::Error::unknown_field("pattern", &["type"]))
+            }
+            (kind, _) => Err(serde::de::Error::unknown_variant(
+                kind,
+                &["all", "failed", "path", "name", "updateSnapshots", "rerun"],
+            )),
+        }
+    }
 }
 
 /// A response frame. `sequence` is monotonically increasing within one TCP session.
@@ -501,6 +553,29 @@ mod tests {
             }
             serde_json::from_value::<HostCommand>(value).unwrap();
         }
+
+        assert!(
+            serde_json::from_value::<WatchControl>(serde_json::json!({
+                "type": "all",
+                "pattern": "unexpected"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WatchControl>(serde_json::json!({
+                "type": "all",
+                "pattern": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WatchControl>(serde_json::json!({
+                "type": "path",
+                "pattern": "src/button",
+                "typo": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]

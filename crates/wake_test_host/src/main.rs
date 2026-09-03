@@ -18,7 +18,7 @@ use wake_test_contract::protocol::{
     FrameDecoder, HOST_BUILD_ID, HostAck, HostCommand, HostError, HostEvent, HostHello,
     HostRequest, HostResponse, HostResponseBody, PROTOCOL_VERSION, WatchControl, write_frame,
 };
-use wake_test_contract::{TestOptions, TestRunResult, TestStatus, TestTerminationReason};
+use wake_test_contract::{TestOptions, TestRunResult, TestSuiteStatus, TestTerminationReason};
 
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1756,7 +1756,7 @@ fn update_failed_suites(watch: &mut ActiveWatch, result: &TestRunResult, scope: 
             project: selector.project.clone(),
         };
         watch.last_failed.remove(&identity);
-        if suite.status == TestStatus::Failed {
+        if suite.status == TestSuiteStatus::Failed {
             watch.last_failed.insert(identity, selector);
         }
     }
@@ -1929,7 +1929,8 @@ mod tests {
     use super::*;
     use wake_test_contract::protocol::{HostResponseBody, read_frame};
     use wake_test_contract::{
-        TestEnvironmentInfo, TestStatus, TestSuiteResult, TestTerminationReason,
+        TestEnvironmentInfo, TestEnvironmentKind, TestSuiteResult, TestSuiteStatus,
+        TestTerminationReason,
     };
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -1995,7 +1996,7 @@ mod tests {
         }
     }
 
-    fn test_suite(path: &str, project: Option<&str>, status: TestStatus) -> TestSuiteResult {
+    fn test_suite(path: &str, project: Option<&str>, status: TestSuiteStatus) -> TestSuiteResult {
         TestSuiteResult {
             id: format!("{path}-{}", project.unwrap_or("root")),
             path: path.to_string(),
@@ -2278,7 +2279,7 @@ mod tests {
             .start_watch("failed-cache", 1, watch_options(root.path()), sender)
             .unwrap();
         let environment = TestEnvironmentInfo {
-            kind: "dom".to_string(),
+            kind: TestEnvironmentKind::Dom,
             react: None,
             react_dom: None,
             v8: "test-v8".to_string(),
@@ -2290,9 +2291,9 @@ mod tests {
             environment.clone(),
         );
         initial.suites = vec![
-            test_suite("same.test.ts", Some("alpha"), TestStatus::Failed),
-            test_suite("same.test.ts", Some("beta"), TestStatus::Passed),
-            test_suite("other.test.ts", None, TestStatus::Failed),
+            test_suite("same.test.ts", Some("alpha"), TestSuiteStatus::Failed),
+            test_suite("same.test.ts", Some("beta"), TestSuiteStatus::Passed),
+            test_suite("other.test.ts", None, TestSuiteStatus::Failed),
         ];
         update_failed_suites(
             state.watch.as_mut().unwrap(),
@@ -2303,7 +2304,11 @@ mod tests {
 
         let mut partial =
             TestRunResult::empty("partial-run".to_string(), "seed".to_string(), environment);
-        partial.suites = vec![test_suite("same.test.ts", Some("beta"), TestStatus::Passed)];
+        partial.suites = vec![test_suite(
+            "same.test.ts",
+            Some("beta"),
+            TestSuiteStatus::Passed,
+        )];
         update_failed_suites(
             state.watch.as_mut().unwrap(),
             &partial,
@@ -2349,7 +2354,7 @@ mod tests {
             )
             .unwrap();
         let environment = TestEnvironmentInfo {
-            kind: "dom".to_string(),
+            kind: TestEnvironmentKind::Dom,
             react: None,
             react_dom: None,
             v8: "test-v8".to_string(),
@@ -2361,8 +2366,8 @@ mod tests {
             environment.clone(),
         );
         initial.suites = vec![
-            test_suite("deleted.test.ts", None, TestStatus::Failed),
-            test_suite("renamed.test.ts", Some("client"), TestStatus::Failed),
+            test_suite("deleted.test.ts", None, TestSuiteStatus::Failed),
+            test_suite("renamed.test.ts", Some("client"), TestSuiteStatus::Failed),
         ];
         let watch = state.watch.as_mut().unwrap();
         update_failed_suites(watch, &initial, FailedCacheScope::Full);
@@ -2378,7 +2383,7 @@ mod tests {
         rerun.suites = vec![test_suite(
             "replacement.test.ts",
             Some("client"),
-            TestStatus::Failed,
+            TestSuiteStatus::Failed,
         )];
         update_failed_suites(watch, &rerun, FailedCacheScope::Partial);
         assert_eq!(watch.last_failed.len(), 1);
@@ -2465,7 +2470,7 @@ mod tests {
                 "watch-run".to_string(),
                 "watch-seed".to_string(),
                 TestEnvironmentInfo {
-                    kind: "dom".to_string(),
+                    kind: TestEnvironmentKind::Dom,
                     react: None,
                     react_dom: None,
                     v8: "test-v8".to_string(),
@@ -2700,7 +2705,7 @@ mod tests {
                 "cancelled-run".to_string(),
                 "seed".to_string(),
                 TestEnvironmentInfo {
-                    kind: "dom".to_string(),
+                    kind: TestEnvironmentKind::Dom,
                     react: None,
                     react_dom: None,
                     v8: "test-v8".to_string(),

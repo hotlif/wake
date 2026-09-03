@@ -12,9 +12,9 @@ pub use wake_test_contract::protocol;
 pub use wake_test_contract::{
     BrowserEnvironmentInfo, CoverageFile, CoverageMetric, CoverageMetrics, CoverageResult,
     DiagnosticSeverity, SnapshotSummary, TestArtifact, TestCaseResult, TestCaseStatusCounts,
-    TestDiagnostic, TestDiff, TestEnvironmentInfo, TestFailure, TestLeak, TestLocation,
-    TestOptions, TestRunCounts, TestRunResult, TestStatus, TestStatusCounts, TestSuiteResult,
-    TestTerminationReason, WorkerOverride,
+    TestDiagnostic, TestDiff, TestEnvironmentInfo, TestEnvironmentKind, TestFailure, TestLeak,
+    TestLeakKind, TestLocation, TestOptions, TestRunCounts, TestRunResult, TestStatus,
+    TestStatusCounts, TestSuiteResult, TestSuiteStatus, TestTerminationReason, WorkerOverride,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -228,7 +228,7 @@ impl std::error::Error for TestError {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimeSuiteResult {
     schema_version: String,
-    status: TestStatus,
+    status: TestSuiteStatus,
     cases: Vec<RuntimeCaseResult>,
     failures: Vec<RuntimeFailure>,
     snapshots: Vec<RuntimeSnapshot>,
@@ -263,7 +263,7 @@ struct RuntimeFailure {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimeLeak {
-    kind: String,
+    kind: TestLeakKind,
     description: String,
     stack: Option<String>,
 }
@@ -856,9 +856,9 @@ fn run_tests_with_selection_cached(
         .iter()
         .all(|suite| suite.discovered.environment == wake_config::TestEnvironment::Browser)
     {
-        "browser"
+        TestEnvironmentKind::Browser
     } else {
-        "dom"
+        TestEnvironmentKind::Dom
     };
     let mut result = TestRunResult::empty(
         format!("wake-test-{}-{}", std::process::id(), random_seed()),
@@ -899,13 +899,13 @@ fn run_tests_with_selection_cached(
                 coverage_enabled,
                 &cancellation,
             )?;
-            let failed = suite.suite.status == TestStatus::Failed;
+            let failed = suite.suite.status == TestSuiteStatus::Failed;
             suites.push(suite);
             if failed
                 && bail > 0
                 && suites
                     .iter()
-                    .filter(|suite| suite.suite.status == TestStatus::Failed)
+                    .filter(|suite| suite.suite.status == TestSuiteStatus::Failed)
                     .count()
                     >= bail as usize
             {
@@ -963,10 +963,9 @@ fn run_tests_with_selection_cached(
     result.counts.suites.total = result.suites.len();
     for suite in &result.suites {
         match suite.status {
-            TestStatus::Failed => result.counts.suites.failed += 1,
-            TestStatus::Skipped => result.counts.suites.skipped += 1,
-            TestStatus::Passed => result.counts.suites.passed += 1,
-            TestStatus::Todo => result.counts.suites.skipped += 1,
+            TestSuiteStatus::Failed => result.counts.suites.failed += 1,
+            TestSuiteStatus::Skipped => result.counts.suites.skipped += 1,
+            TestSuiteStatus::Passed => result.counts.suites.passed += 1,
         }
         for test in &suite.tests {
             result.counts.tests.total += 1;
@@ -1254,14 +1253,14 @@ fn execute_suite(
                     project: project.map(str::to_string),
                     environment: Some(environment_info(
                         match config.environment {
-                            wake_config::TestEnvironment::Browser => "browser",
+                            wake_config::TestEnvironment::Browser => TestEnvironmentKind::Browser,
                             wake_config::TestEnvironment::Auto
-                            | wake_config::TestEnvironment::Dom => "dom",
+                            | wake_config::TestEnvironment::Dom => TestEnvironmentKind::Dom,
                         },
                         react_versions.as_ref(),
                         browser,
                     )),
-                    status: TestStatus::Failed,
+                    status: TestSuiteStatus::Failed,
                     duration_ms: duration_ms(suite_started),
                     tests: Vec::new(),
                     failures,
@@ -1394,7 +1393,7 @@ fn execute_suite(
             }
         })
         .collect::<Vec<_>>();
-    let failed = internal.status == TestStatus::Failed
+    let failed = internal.status == TestSuiteStatus::Failed
         || tests.iter().any(|test| test.status == TestStatus::Failed)
         || !failures.is_empty();
     Ok(ExecutedSuite {
@@ -1408,16 +1407,18 @@ fn execute_suite(
             project: project.map(str::to_string),
             environment: Some(environment_info(
                 match config.environment {
-                    wake_config::TestEnvironment::Browser => "browser",
-                    wake_config::TestEnvironment::Auto | wake_config::TestEnvironment::Dom => "dom",
+                    wake_config::TestEnvironment::Browser => TestEnvironmentKind::Browser,
+                    wake_config::TestEnvironment::Auto | wake_config::TestEnvironment::Dom => {
+                        TestEnvironmentKind::Dom
+                    }
                 },
                 react_versions.as_ref(),
                 browser,
             )),
             status: if failed {
-                TestStatus::Failed
+                TestSuiteStatus::Failed
             } else {
-                TestStatus::Passed
+                TestSuiteStatus::Passed
             },
             duration_ms: duration_ms(suite_started),
             tests,
@@ -1452,13 +1453,15 @@ fn failed_prepared_suite(
             project: prepared.discovered.project.clone(),
             environment: Some(environment_info(
                 match config.environment {
-                    wake_config::TestEnvironment::Browser => "browser",
-                    wake_config::TestEnvironment::Auto | wake_config::TestEnvironment::Dom => "dom",
+                    wake_config::TestEnvironment::Browser => TestEnvironmentKind::Browser,
+                    wake_config::TestEnvironment::Auto | wake_config::TestEnvironment::Dom => {
+                        TestEnvironmentKind::Dom
+                    }
                 },
                 None,
                 browser,
             )),
-            status: TestStatus::Failed,
+            status: TestSuiteStatus::Failed,
             duration_ms: duration_ms(suite_started),
             tests: Vec::new(),
             failures: vec![TestFailure {
@@ -3595,7 +3598,7 @@ fn browser_timeout_result(
             registration_stack: planned.registration_stack.clone(),
         });
     }
-    result.status = TestStatus::Failed;
+    result.status = TestSuiteStatus::Failed;
     Ok(result)
 }
 
@@ -5216,12 +5219,12 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
 }
 
 fn environment_info(
-    kind: &str,
+    kind: TestEnvironmentKind,
     react_versions: Option<&ReactVersions>,
     browser: Option<&BrowserDriver>,
 ) -> TestEnvironmentInfo {
     TestEnvironmentInfo {
-        kind: kind.to_string(),
+        kind,
         react: react_versions.map(|versions| versions.react.clone()),
         react_dom: react_versions.map(|versions| versions.react_dom.clone()),
         v8: JsRuntime::engine_version().to_string(),
@@ -5955,7 +5958,7 @@ environment = "dom"
             .unwrap();
         assert!(!result.success, "{result:#?}");
         assert_eq!(result.suites.len(), 1);
-        assert_eq!(result.suites[0].status, TestStatus::Failed);
+        assert_eq!(result.suites[0].status, TestSuiteStatus::Failed);
         assert_eq!(result.suites[0].failures.len(), 1);
         assert_eq!(
             result.suites[0].failures[0].code.as_deref(),
@@ -5978,6 +5981,18 @@ environment = "dom"
         });
         let result: RuntimeSuiteResult = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(result.schema_version, RUNTIME_RESULT_SCHEMA);
+
+        let mut invalid_status = value.clone();
+        invalid_status["status"] = serde_json::json!("todo");
+        assert!(serde_json::from_value::<RuntimeSuiteResult>(invalid_status).is_err());
+
+        let mut invalid_leak = value.clone();
+        invalid_leak["leaks"] = serde_json::json!([{
+            "kind": "handle",
+            "description": "unknown leak",
+            "stack": null
+        }]);
+        assert!(serde_json::from_value::<RuntimeSuiteResult>(invalid_leak).is_err());
 
         let mut invalid = value;
         invalid["unexpected"] = serde_json::Value::Bool(true);
@@ -6407,7 +6422,7 @@ environment = "dom"
                     .iter()
                     .find(|suite| suite.path == path)
                     .expect("compiled failing suite is present");
-                assert_eq!(suite.status, TestStatus::Failed, "{suite:#?}");
+                assert_eq!(suite.status, TestSuiteStatus::Failed, "{suite:#?}");
                 assert_eq!(
                     suite.failures[0].code.as_deref(),
                     Some("WAKE_TEST_RUNTIME"),
@@ -6419,7 +6434,7 @@ environment = "dom"
                 .iter()
                 .find(|suite| suite.path == "top-level.test.ts")
                 .expect("top-level failing suite is present");
-            assert_eq!(top_level.status, TestStatus::Failed, "{top_level:#?}");
+            assert_eq!(top_level.status, TestSuiteStatus::Failed, "{top_level:#?}");
             assert!(
                 top_level.failures[0].message.contains("top-level boom"),
                 "{top_level:#?}"
@@ -6445,7 +6460,7 @@ environment = "dom"
             )
             .expect("compile failure resolves as a watch result");
         assert!(!first.success, "{first:#?}");
-        assert_eq!(first.suites[0].status, TestStatus::Failed);
+        assert_eq!(first.suites[0].status, TestSuiteStatus::Failed);
         let canonical_test_path = test_path.canonicalize().unwrap();
         assert!(session.watch_paths().iter().any(|entry| {
             entry.path == canonical_test_path
@@ -8247,7 +8262,7 @@ environment = "dom"
         let result = run_tests(options(fixture.path())).unwrap();
         assert!(result.success, "{result:#?}");
         server.join().unwrap();
-        assert_eq!(result.environment.kind, "browser");
+        assert_eq!(result.environment.kind, TestEnvironmentKind::Browser);
         let browser = result.environment.browser.expect("browser metadata");
         assert!(!browser.version.is_empty());
         assert!(browser.headless);

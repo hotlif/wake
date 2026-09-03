@@ -21,3 +21,6 @@ wake_js_runtime.workspace = true
 wake_test_browser.workspace = true
 wake_test_contract.workspace = true
 wake_turbo.workspace = true
+
+[dev-dependencies]
+wake_app.workspace = true

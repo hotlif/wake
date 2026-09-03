@@ -4575,6 +4575,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "wake_app",
  "wake_common",
  "wake_config",
  "wake_js_runtime",

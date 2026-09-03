@@ -79,6 +79,14 @@ pub enum TestStatus {
     Todo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestSuiteStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestCaseResult {
@@ -164,14 +172,32 @@ pub struct BrowserEnvironmentInfo {
     pub headless: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestEnvironmentKind {
+    Dom,
+    Browser,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestEnvironmentInfo {
-    pub kind: String,
+    pub kind: TestEnvironmentKind,
     pub react: Option<String>,
     pub react_dom: Option<String>,
     pub v8: String,
     pub browser: Option<BrowserEnvironmentInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestLeakKind {
+    Timer,
+    Listener,
+    Task,
+    Socket,
+    Network,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,7 +214,7 @@ pub struct TestArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestLeak {
-    pub kind: String,
+    pub kind: TestLeakKind,
     pub description: String,
     pub location: Option<TestLocation>,
     pub stack: Option<String>,
@@ -202,7 +228,7 @@ pub struct TestSuiteResult {
     pub name: Option<String>,
     pub project: Option<String>,
     pub environment: Option<TestEnvironmentInfo>,
-    pub status: TestStatus,
+    pub status: TestSuiteStatus,
     pub duration_ms: u64,
     pub tests: Vec<TestCaseResult>,
     pub failures: Vec<TestFailure>,
@@ -298,7 +324,7 @@ mod tests {
             "run-1".to_string(),
             "seed-1".to_string(),
             TestEnvironmentInfo {
-                kind: "dom".to_string(),
+                kind: TestEnvironmentKind::Dom,
                 react: Some("19.2.8".to_string()),
                 react_dom: Some("19.2.8".to_string()),
                 v8: "150.4.0".to_string(),
@@ -312,6 +338,25 @@ mod tests {
         assert_eq!(value["environment"]["reactDom"], "19.2.8");
         assert!(value.get("schema_version").is_none());
         assert!(value.get("run_id").is_none());
+    }
+
+    #[test]
+    fn result_enums_match_the_public_typescript_sets() {
+        assert_eq!(
+            serde_json::to_value(TestSuiteStatus::Skipped).unwrap(),
+            "skipped"
+        );
+        assert_eq!(
+            serde_json::to_value(TestEnvironmentKind::Browser).unwrap(),
+            "browser"
+        );
+        assert_eq!(
+            serde_json::to_value(TestLeakKind::Network).unwrap(),
+            "network"
+        );
+        assert!(serde_json::from_str::<TestSuiteStatus>(r#""todo""#).is_err());
+        assert!(serde_json::from_str::<TestEnvironmentKind>(r#""node""#).is_err());
+        assert!(serde_json::from_str::<TestLeakKind>(r#""handle""#).is_err());
     }
 
     #[test]
