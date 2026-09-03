@@ -12,6 +12,8 @@ export const {
   runTests,
   generateCssToken,
   generateDocgen,
+  initializeFederation,
+  generateFederationLock,
   createBuildContext,
   createTestContext,
   startDevServer,

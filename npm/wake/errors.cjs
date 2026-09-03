@@ -2,7 +2,7 @@
 
 class WakeError extends Error {
   constructor(code, message, options = {}) {
-    super(message, options.cause ? { cause: options.cause } : undefined)
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined)
     this.name = 'WakeError'
     this.code = code
     if (options.path !== undefined) this.path = options.path
@@ -65,11 +65,17 @@ async function invoke(promise) {
 }
 
 function splitOptions(options) {
-  if (options == null) return [{}, undefined]
-  if (typeof options !== 'object' || Array.isArray(options)) {
+  if (options === undefined) return [{}, undefined]
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
     throw new WakeError('WAKE_CONFIG', 'Wake options must be an object')
   }
   const { signal, ...nativeOptions } = options
+  if (signal === null) {
+    throw new WakeError(
+      'WAKE_CONFIG',
+      'explicit null is not allowed in a Node request at /signal; omit the field to use its default',
+    )
+  }
   if (signal?.aborted) {
     throw new WakeError('WAKE_CANCELLED', 'Wake operation was cancelled')
   }

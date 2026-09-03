@@ -14,6 +14,13 @@ const {
 } = require('./errors.cjs')
 
 const native = loadNative()
+const INTERNAL_CONTEXT_CONSTRUCTOR = Symbol('Wake context constructor')
+
+function assertInternalContextConstructor(token, name, factory) {
+  if (token !== INTERNAL_CONTEXT_CONSTRUCTOR) {
+    throw new WakeError('WAKE_CONFIG', `${name} must be created with ${factory}()`)
+  }
+}
 
 function version() {
   return native.version()
@@ -54,8 +61,9 @@ class TestContext extends EventEmitter {
   #closed = false
   #eventPoll
 
-  constructor(handle) {
+  constructor(handle, token) {
     super()
+    assertInternalContextConstructor(token, 'TestContext', 'createTestContext')
     this.#native = handle
     registerTestContext(this, handle)
   }
@@ -213,6 +221,7 @@ async function createTestContext(options) {
   try {
     return new TestContext(
       native.createTestContext(JSON.stringify(value), native.__wakeTestHostPath),
+      INTERNAL_CONTEXT_CONSTRUCTOR,
     )
   } catch (error) {
     throw fromNativeError(error)
@@ -234,11 +243,22 @@ async function generateDocgen(options) {
   return invoke(native.generateDocgen(JSON.stringify(value), signal))
 }
 
+async function initializeFederation(options) {
+  const [value, signal] = splitOptions(options)
+  return invoke(native.initializeFederation(JSON.stringify(value), signal))
+}
+
+async function generateFederationLock(options) {
+  const [value, signal] = splitOptions(options)
+  return invoke(native.generateFederationLock(JSON.stringify(value), signal))
+}
+
 class BuildContext {
   #native
   #closed = false
 
-  constructor(handle) {
+  constructor(handle, token) {
+    assertInternalContextConstructor(token, 'BuildContext', 'createBuildContext')
     this.#native = handle
   }
 
@@ -272,7 +292,10 @@ class BuildContext {
 async function createBuildContext(options) {
   const [value] = splitOptions(options)
   try {
-    return new BuildContext(native.createBuildContext(JSON.stringify(value)))
+    return new BuildContext(
+      native.createBuildContext(JSON.stringify(value)),
+      INTERNAL_CONTEXT_CONSTRUCTOR,
+    )
   } catch (error) {
     throw fromNativeError(error)
   }
@@ -285,8 +308,9 @@ class DevServer extends EventEmitter {
   #closing = false
   #eventTimer
 
-  constructor(handle) {
+  constructor(handle, token) {
     super()
+    assertInternalContextConstructor(token, 'DevServer', 'startDevServer')
     this.#native = handle
     this.url = handle.url
     const reference = new WeakRef(this)
@@ -319,12 +343,20 @@ class DevServer extends EventEmitter {
         this.emit('rebuilt', event)
       } else if (event.type === 'workspaceState') {
         this.emit('workspaceState', event)
+      } else if (event.type === 'federationUpdated') {
+        this.emit('federationUpdated', event)
       } else if (event.type === 'diagnostic') {
         this.emit('diagnostic', event.diagnostic)
       } else if (event.type === 'closed' && !this.#closed) {
         this.#closed = true
         clearInterval(this.#eventTimer)
         this.emit('closed')
+      } else {
+        this.emit('diagnostic', {
+          severity: 'error',
+          code: 'WAKE_INTERNAL',
+          message: `Unknown development server event: ${String(event?.type)}`,
+        })
       }
     }
   }
@@ -380,7 +412,10 @@ class DevServer extends EventEmitter {
 async function startServer(method, options) {
   const [value, signal] = splitOptions(options)
   try {
-    return new DevServer(await method(JSON.stringify(value), signal))
+    return new DevServer(
+      await method(JSON.stringify(value), signal),
+      INTERNAL_CONTEXT_CONSTRUCTOR,
+    )
   } catch (error) {
     throw fromNativeError(error)
   }
@@ -411,6 +446,8 @@ module.exports = {
   runTests,
   generateCssToken,
   generateDocgen,
+  initializeFederation,
+  generateFederationLock,
   createBuildContext,
   createTestContext,
   startDevServer,

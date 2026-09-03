@@ -141,3 +141,28 @@ test('library docgen generates the deterministic react-docgen payload', async ()
   assert.equal(docgen['./src/button.tsx'][0].displayName, 'Button')
   await rm(cwd, { recursive: true, force: true })
 })
+
+test('federation init and lock use the shared native control-plane services', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-cli-federation-'))
+  await writeFile(
+    join(cwd, 'wake.config.toml'),
+    "[federation]\nenabled = true\nname = 'shell'\n",
+  )
+  try {
+    const first = run(['--no-color', 'federation', 'init', cwd])
+    assert.equal(first.status, 0, first.stderr)
+    assert.match(first.stderr, /FEDERATION INIT/)
+    assert.match(first.stderr, /Initialized federation types/)
+    await readFile(join(cwd, 'wake-federation.d.ts'), 'utf8')
+
+    const second = run(['--no-color', 'federation', 'init', cwd])
+    assert.equal(second.status, 0, second.stderr)
+    assert.match(second.stderr, /Already initialized/)
+
+    const lock = run(['--no-color', 'federation', 'lock', cwd])
+    assert.equal(lock.status, 1, lock.stderr)
+    assert.match(lock.stderr, /FED_CONFIG_INVALID/)
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})

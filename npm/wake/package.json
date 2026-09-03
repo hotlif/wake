@@ -22,6 +22,16 @@
       "import": "./experimental.mjs",
       "require": "./experimental.cjs"
     },
+    "./federation": {
+      "types": "./federation.d.mts",
+      "import": "./federation.mjs",
+      "default": "./federation.mjs"
+    },
+    "./federation/react": {
+      "types": "./federation-react.d.ts",
+      "import": "./federation-react.mjs",
+      "default": "./federation-react.mjs"
+    },
     "./test": {
       "types": "./test.d.ts",
       "import": "./test.mjs",
@@ -49,6 +59,8 @@
     "*.mjs",
     "index.d.ts",
     "experimental.d.ts",
+    "federation.d.mts",
+    "federation-react.d.ts",
     "test.cjs",
     "test.mjs",
     "test.d.ts",

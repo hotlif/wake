@@ -73,7 +73,7 @@
 ## 0.1.21
 
 - Added aggregate Wake Docs workspaces with isolated production bundles, deterministic manifests,
-  transactional output commits, one-port lazy/eager development mounts, scoped HMR events, and
+  transactional output commits, one-port lazy/eager development mounts, scoped Live Reload events, and
   embedded or standalone workbench presentation.
 - Fixed MDX JSX structure generation by lifting block JSX and splitting mixed paragraphs at AST
   boundaries, preventing invalid paragraph/block nesting without changing inline JSX or component

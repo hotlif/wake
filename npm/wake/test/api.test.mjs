@@ -3,9 +3,10 @@ import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { createConnection, createServer } from 'node:net'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { runInNewContext } from 'node:vm'
 // This is the one intentionally Node-owned gate: it loads the real `.node` addon and exercises
 // Worker, socket, and cleanup-hook lifecycles. It is not a Wake Test runner or product fallback.
 import { after, test } from 'node:test'
@@ -20,17 +21,21 @@ import {
   bundle,
   createBuildContext,
   createTestContext,
+  generateFederationLock,
   generateCssToken,
   generateDocgen,
+  initializeFederation,
   runTests,
   startDevServer,
   startDocsDevServer,
   version,
 } from '../index.mjs'
+import * as esmApi from '../index.mjs'
 import { analyze, parse, tokenize, transform } from '../experimental.mjs'
 
 const require = createRequire(import.meta.url)
 const commonjs = require('../index.cjs')
+const { splitOptions } = require('../errors.cjs')
 const {
   getTestContextFatalError,
   sendTestWatchControl,
@@ -62,20 +67,152 @@ function loadBuiltNative() {
   return require(join(dirname(fileURLToPath(import.meta.url)), '..', `wake.${suffix}.node`))
 }
 
+async function withNativeFactory(name, factory, create) {
+  const rawNative = loadBuiltNative()
+  const original = rawNative[name]
+  rawNative[name] = factory
+  try {
+    return await create()
+  } finally {
+    rawNative[name] = original
+  }
+}
+
 after(async () => {
   await Promise.all(contexts.map((context) => context.close()))
 })
 
 test('loads the same API from ESM and CommonJS', () => {
+  const expectedRuntimeExports = [
+    'BuildContext',
+    'DevServer',
+    'TestContext',
+    'WakeError',
+    'build',
+    'buildDocs',
+    'buildLibrary',
+    'bundle',
+    'createBuildContext',
+    'createTestContext',
+    'generateCssToken',
+    'generateDocgen',
+    'generateFederationLock',
+    'initializeFederation',
+    'runTests',
+    'startDevServer',
+    'startDocsDevServer',
+    'version',
+  ].sort()
+  assert.deepEqual(Object.keys(commonjs).sort(), expectedRuntimeExports)
+  assert.deepEqual(Object.keys(esmApi).sort(), [...expectedRuntimeExports, 'default'].sort())
   assert.equal(version(), packageVersion)
   assert.equal(commonjs.version(), version())
   assert.equal(typeof commonjs.build, 'function')
   assert.equal(typeof commonjs.buildLibrary, 'function')
   assert.equal(typeof commonjs.generateCssToken, 'function')
   assert.equal(typeof commonjs.generateDocgen, 'function')
+  assert.equal(typeof commonjs.initializeFederation, 'function')
+  assert.equal(typeof commonjs.generateFederationLock, 'function')
   assert.equal(typeof commonjs.TestContext.prototype.startWatch, 'function')
   assert.equal(typeof commonjs.TestContext.prototype.stopWatch, 'function')
   assert.equal('initTestConfig' in commonjs, false)
+})
+
+test('loads the exact freshly built native addon ABI', () => {
+  const expectedNativeExports = [
+    'NativeBuildContext',
+    'NativeDevServer',
+    'NativeParsedModule',
+    'NativeTestContext',
+    'build',
+    'buildDocs',
+    'buildLibrary',
+    'bundle',
+    'createBuildContext',
+    'createTestContext',
+    'generateCssToken',
+    'generateDocgen',
+    'generateFederationLock',
+    'initializeFederation',
+    'parse',
+    'runTests',
+    'startDevServer',
+    'startDocsDevServer',
+    'tokenize',
+    'version',
+  ].sort()
+  assert.deepEqual(Object.keys(loadBuiltNative()).sort(), expectedNativeExports)
+})
+
+test('shares Federation initialization and lock services across Node frontends', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-node-federation-control-'))
+  await writeFile(
+    join(cwd, 'wake.config.toml'),
+    "[federation]\nenabled = true\nname = 'shell'\n",
+  )
+  try {
+    const first = await initializeFederation({ cwd })
+    await assertSameExistingPath(first.projectRoot, cwd)
+    assert.equal(first.declaration, 'created')
+    assert.equal(first.typesIndex, 'created')
+    assert.equal(
+      await readFile(first.declarationPath, 'utf8'),
+      '/// <reference path="./.wake/federation/types/index.d.ts" />\n',
+    )
+    const second = await commonjs.initializeFederation({ cwd })
+    assert.equal(second.declaration, 'unchanged')
+    assert.equal(second.typesIndex, 'unchanged')
+
+    await assert.rejects(
+      generateFederationLock({ cwd }),
+      (error) => error instanceof WakeError && error.code === 'FED_CONFIG_INVALID',
+    )
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('forwards native federationUpdated events through DevServer', async () => {
+  const update = {
+    type: 'federationUpdated',
+    remote: 'catalog',
+    oldBuildId: 'catalog-1',
+    newBuildId: 'catalog-2',
+    changedExposes: ['./Button'],
+    typesHash: 'types-2',
+    action: 'isolated-remount',
+  }
+  const nativeEvents = [update, { type: 'futureNativeEvent' }]
+  const nativeServer = {
+    url: 'http://127.0.0.1:5173/',
+    eventsJson() {
+      return JSON.stringify(nativeEvents.splice(0))
+    },
+    async close() {
+      nativeEvents.push({ type: 'closed' })
+      return JSON.stringify({ ok: true, value: null })
+    },
+  }
+  const server = await withNativeFactory(
+    'startDevServer',
+    async () => nativeServer,
+    () => commonjs.startDevServer(),
+  )
+  let timeout
+  try {
+    const [[event], [diagnostic]] = await Promise.race([
+      Promise.all([once(server, 'federationUpdated'), once(server, 'diagnostic')]),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('federationUpdated was not forwarded')), 2_000)
+      }),
+    ])
+    assert.deepEqual(event, update)
+    assert.equal(diagnostic.code, 'WAKE_INTERNAL')
+    assert.match(diagnostic.message, /futureNativeEvent/)
+  } finally {
+    clearTimeout(timeout)
+    await server.close()
+  }
 })
 
 test('keeps the raw native test ABI on the persistent v3 context', () => {
@@ -89,15 +226,145 @@ test('keeps the raw native test ABI on the persistent v3 context', () => {
   }
 })
 
+test('rejects Node contract drift before starting product work', async () => {
+  const rawNative = loadBuiltNative()
+  const explicitFalseCause = new WakeError('WAKE_CONFIG', 'invalid', { cause: false })
+  assert.equal(explicitFalseCause.cause, false)
+  for (const [Context, factory] of [
+    [commonjs.BuildContext, 'createBuildContext'],
+    [commonjs.DevServer, 'startDevServer'],
+    [commonjs.TestContext, 'createTestContext'],
+  ]) {
+    assert.throws(
+      () => new Context(),
+      (error) => error instanceof WakeError
+        && error.code === 'WAKE_CONFIG'
+        && error.message.includes(`${factory}()`),
+    )
+  }
+  assert.deepEqual(splitOptions(undefined), [{}, undefined])
+  assert.throws(
+    () => splitOptions(null),
+    (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
+  )
+  assert.throws(
+    () => splitOptions({ signal: null }),
+    (error) => error instanceof WakeError
+      && error.code === 'WAKE_CONFIG'
+      && error.message.includes('/signal'),
+  )
+  await assert.rejects(
+    build(null),
+    (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
+  )
+  await assert.rejects(
+    runTests(null),
+    (error) => error instanceof WakeError && error.code === 'WAKE_TEST_CONFIG',
+  )
+  assert.throws(() => rawNative.createBuildContext('null'))
+  for (const federation of [
+    null,
+    { enabled: true },
+    { enabled: false, name: 'shell' },
+    { enabled: true, name: 'shell', typo: true },
+    {
+      enabled: true,
+      name: 'shell',
+      remotes: { catalog: { manifest_url: 'https://catalog.test/wake-federation.json' } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      exposes: { Button: { entry: 'src/button.tsx', allow_global_css: true } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      shared: { react: { required_version: '^19' } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      remotes: { catalog: { manifestUrl: null } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      remotes: {
+        catalog: {
+          manifestUrl: 'https://catalog.test/wake-federation.json',
+          allowedOrigins: [null],
+        },
+      },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      exposes: { Button: { entry: 'src/button.tsx', scope: null } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      exposes: { Button: { entry: 'src/button.tsx', shadow: null } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      shared: { react: { requiredVersion: null } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      shared: { react: { coherenceGroup: null } },
+    },
+    {
+      enabled: true,
+      name: 'shell',
+      shared: { react: { owner: null } },
+    },
+  ]) {
+    assert.throws(() => rawNative.createBuildContext(JSON.stringify({ federation })))
+  }
+
+  for (const options of [
+    null,
+    { environment: 'jsdom' },
+    { environment: null },
+    { updateSnapshots: 'overwrite' },
+    { updateSnapshots: null },
+    { workers: 0 },
+    { workers: null },
+    { workers: '0%' },
+    { workers: '101%' },
+    { workers: '01%' },
+    { related: [null] },
+  ]) {
+    assert.throws(() => rawNative.createTestContext(JSON.stringify(options)))
+  }
+
+  const missingContext = rawNative.createTestContext()
+  await missingContext.close()
+  const undefinedContext = rawNative.createTestContext(JSON.stringify({ environment: undefined }))
+  await undefinedContext.close()
+
+  const context = rawNative.createTestContext('{}')
+  try {
+    for (const control of [
+      { type: 'all', pattern: 'unexpected' },
+      { type: 'all', pattern: null },
+      { type: 'path' },
+      { type: 'name', pattern: 'renders', typo: true },
+    ]) {
+      assert.throws(() => context.watchControl(JSON.stringify(control)))
+    }
+  } finally {
+    await context.close()
+  }
+})
+
 test('reuses one real native test context across runs and watch control', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'wake-test-context-'))
-  const hostName = process.platform === 'win32' ? 'wake-test-host.exe' : 'wake-test-host'
-  const hostPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'test-host', hostName)
-  const nativeHandle = loadBuiltNative().createTestContext(
-    JSON.stringify({ root: cwd, allowNoTests: true }),
-    hostPath,
-  )
-  const context = new commonjs.TestContext(nativeHandle)
+  const context = await createTestContext({ root: cwd, allowNoTests: true })
   const events = []
   const completedRunIds = []
   context.on('runStart', (event) => events.push(['start', event.runId]))
@@ -272,7 +539,11 @@ test('publishes strict Wake test and React entrypoints outside the test realm', 
       return envelope(null)
     },
   }
-  const context = new commonjs.TestContext(nativeContext)
+  const context = await withNativeFactory(
+    'createTestContext',
+    () => nativeContext,
+    () => commonjs.createTestContext(),
+  )
   const starts = []
   const eventOrder = []
   context.on('runStart', (event) => starts.push(event))
@@ -319,7 +590,11 @@ test('closes a watched context after a fatal host event-pump failure', async () 
       return JSON.stringify({ ok: true, value: null })
     },
   }
-  const context = new commonjs.TestContext(nativeContext)
+  const context = await withNativeFactory(
+    'createTestContext',
+    () => nativeContext,
+    () => commonjs.createTestContext(),
+  )
   const closed = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('context did not close')), 2_000)
     context.once('closed', () => {
@@ -435,7 +710,8 @@ test('exposes disposable experimental compiler handles', async () => {
 
 test('builds, bundles, and serializes context rebuilds', async () => {
   const cwd = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
-  const outdir = fileURLToPath(new URL('../../../target/node-api-test/', import.meta.url))
+  const outputRoot = await mkdtemp(join(tmpdir(), 'wake-node-api-build-'))
+  const outdir = join(outputRoot, 'dist')
 
   const result = await build({ cwd, outdir })
   assert.equal(result.success, true)
@@ -456,6 +732,7 @@ test('builds, bundles, and serializes context rebuilds', async () => {
   await context.close()
   assert.equal(context.closed, true)
   await context.close()
+  await rm(outputRoot, { recursive: true, force: true })
 })
 
 test('writes an executable Node CommonJS bundle to an exact outfile', async () => {
@@ -493,6 +770,26 @@ test('writes an executable Node CommonJS bundle to an exact outfile', async () =
   assert.match(await readFile(mappedOutfile, 'utf8'), /sourceMappingURL=mapped\.cjs\.map/)
   assert.equal(await readFile(join(cwd, 'package.json'), 'utf8'), '{"name":"fixture"}')
   await rm(cwd, { recursive: true, force: true })
+})
+
+test('exposes the reachable exact-output collision code', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-node-output-collision-'))
+  const entry = join(cwd, 'src', 'index.js')
+  const source = 'export const value = 42\n'
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await Promise.all([
+    writeFile(join(cwd, 'wake.config.toml'), '[html]\nentry = "src/index.js"\n'),
+    writeFile(entry, source),
+  ])
+  try {
+    await assert.rejects(
+      bundle({ cwd, entry: 'src/index.js', outfile: 'src/index.js' }),
+      (error) => error instanceof WakeError && error.code === 'WAKE_OUTPUT_COLLISION',
+    )
+    assert.equal(await readFile(entry, 'utf8'), source)
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
 })
 
 test('minifies with a source map without changing the JavaScript payload', async () => {
@@ -545,22 +842,78 @@ async function listen(server, port = 0) {
   return server.address().port
 }
 
-async function openHmrSocket(port) {
-  const socket = createConnection({ host: '127.0.0.1', port })
-  await once(socket, 'connect', { signal: AbortSignal.timeout(10_000) })
-  socket.write([
-    'GET /__wake_hmr HTTP/1.1',
-    `Host: 127.0.0.1:${port}`,
-    'Upgrade: websocket',
-    'Connection: Upgrade',
-    'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
-    'Sec-WebSocket-Version: 13',
-    '',
-    '',
-  ].join('\r\n'))
-  const [response] = await once(socket, 'data', { signal: AbortSignal.timeout(10_000) })
-  assert.match(response.toString(), /^HTTP\/1\.1 101 /)
+function nextWebSocketJson(socket, predicate = () => true, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error('Timed out waiting for a Live Reload WebSocket message'))
+    }, timeoutMs)
+    const onMessage = (event) => {
+      let message
+      try {
+        message = JSON.parse(String(event.data))
+      } catch {
+        return
+      }
+      if (!predicate(message)) return
+      cleanup()
+      resolve(message)
+    }
+    const onError = () => {
+      cleanup()
+      reject(new Error('Live Reload WebSocket failed'))
+    }
+    const cleanup = () => {
+      clearTimeout(timeout)
+      socket.removeEventListener('message', onMessage)
+      socket.removeEventListener('error', onError)
+    }
+    socket.addEventListener('message', onMessage)
+    socket.addEventListener('error', onError)
+  })
+}
+
+async function openLiveReloadSocket(port) {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/__wake_live_reload`)
+  const ready = nextWebSocketJson(socket, (message) => message.type === 'ready')
+  await once(socket, 'open', { signal: AbortSignal.timeout(10_000) })
+  assert.deepEqual(await ready, { type: 'ready' })
   return socket
+}
+
+async function assertServedClientPerformsFullPageReload(url, message) {
+  const source = await fetch(new URL('/__wake/client.js', url)).then((response) => response.text())
+  let socket
+  let reloads = 0
+  class BrowserSocket {
+    constructor(socketUrl) {
+      this.url = socketUrl
+      socket = this
+    }
+
+    close() {}
+  }
+  const window = { __WAKE_MOUNT__: '' }
+  const location = {
+    protocol: 'http:',
+    host: new URL(url).host,
+    reload() {
+      reloads += 1
+    },
+  }
+  runInNewContext(source, {
+    console,
+    document: {},
+    encodeURIComponent,
+    location,
+    setTimeout,
+    Symbol,
+    WebSocket: BrowserSocket,
+    window,
+  })
+  assert.equal(socket.url, `ws://${location.host}/__wake_live_reload?mount=`)
+  socket.onmessage({ data: JSON.stringify(message) })
+  assert.equal(reloads, 1)
 }
 
 function onceMatching(emitter, eventName, predicate, timeoutMs = 10_000) {
@@ -589,7 +942,7 @@ function onceMatching(emitter, eventName, predicate, timeoutMs = 10_000) {
   })
 }
 
-test('emits rebuild events and releases the port on idempotent close', async () => {
+test('emits rebuild events, performs Live Reload, and releases the port', async () => {
   const source = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
   const cwd = await mkdtemp(join(tmpdir(), 'wake-node-dev-'))
   await cp(source, cwd, { recursive: true })
@@ -601,26 +954,41 @@ test('emits rebuild events and releases the port on idempotent close', async () 
   // an alternate spelling so this test also locks canonical project roots against notify paths.
   const serverCwd = process.platform === 'win32' ? cwd.toUpperCase() : cwd
   const server = await startDevServer({ cwd: serverCwd, port })
-  let hmrSocket
+  let liveReloadSocket
   let closedEvents = 0
   server.on('closed', () => closedEvents += 1)
   try {
     assert.equal(server.url, `http://127.0.0.1:${port}/`)
     const initialBuild = once(server, 'rebuilt', { signal: AbortSignal.timeout(10_000) })
-    const rebuilding = once(server, 'rebuildStart', { signal: AbortSignal.timeout(10_000) })
-    // Windows can emit more than one watcher notification for one append. Ignore an
-    // intermediate no-op rebuild, but still time out if no substantive rebuild follows.
+    // Native startup is fenced behind an authoritative Rescan, but its completed events can still
+    // be waiting in the Node event pump. Match the file-backed generation instead of consuming
+    // that startup `rebuildStart` with an intentionally empty path list.
+    const rebuilding = onceMatching(
+      server,
+      'rebuildStart',
+      (event) => event.changedPaths.length > 0,
+    )
+    // The same queued startup Rescan can report a full rebuild. This append changes exactly one
+    // module, so select the incremental result paired with the substantive rebuild start.
     const rebuilt = onceMatching(
       server,
       'rebuilt',
-      (event) => !event.initial && event.updatedModules > 0,
+      (event) => !event.initial
+        && event.updatedModules === 1
+        && event.cachedModules === event.modules - 1,
+    )
+    liveReloadSocket = await openLiveReloadSocket(port)
+    const reloadFrame = nextWebSocketJson(
+      liveReloadSocket,
+      (message) => message.type === 'reload',
     )
     // `startDevServer()` returning is the readiness contract: an immediate write must
     // already be covered by the native watcher, without a sleep or retry in user code.
-    const [[initial], [start], event] = await Promise.all([
+    const [[initial], start, event, reload] = await Promise.all([
       initialBuild,
       rebuilding,
       rebuilt,
+      reloadFrame,
       appendFile(join(cwd, 'src/index.js'), '\nexport const changed = true;\n'),
     ])
     assert.equal(initial.initial, true)
@@ -636,16 +1004,14 @@ test('emits rebuild events and releases the port on idempotent close', async () 
     assert.equal(event.cachedModules, event.modules - 1)
     assert.equal(event.updatedModules + event.cachedModules, event.modules)
     assert.ok(event.durationMs >= 0)
-    hmrSocket = await openHmrSocket(port)
+    assert.deepEqual(reload, { type: 'reload', mount: '' })
+    await assertServedClientPerformsFullPageReload(server.url, reload)
   } finally {
+    liveReloadSocket?.close()
     const closingAt = performance.now()
-    try {
-      await Promise.all([server.close(), server.waitUntilClosed()])
-      const closeDurationMs = performance.now() - closingAt
-      assert.ok(closeDurationMs < 2_000, `dev server close took ${closeDurationMs.toFixed(0)}ms`)
-    } finally {
-      hmrSocket?.destroy()
-    }
+    await Promise.all([server.close(), server.waitUntilClosed()])
+    const closeDurationMs = performance.now() - closingAt
+    assert.ok(closeDurationMs < 2_000, `dev server close took ${closeDurationMs.toFixed(0)}ms`)
     await server.close()
   }
   assert.equal(closedEvents, 1)
@@ -718,8 +1084,52 @@ test('addon cleanup releases native resources when a Worker exits', async () => 
   await rm(cwd, { recursive: true, force: true })
 })
 
+test('rejects fields outside each closed Node request contract', async () => {
+  for (const operation of [
+    () => build({ source_map: true }),
+    () => bundle({ source_map: true }),
+    () => generateCssToken({ config_path: 'token.toml' }),
+    () => generateDocgen({ entryPath: 'src/button.tsx' }),
+    () => buildLibrary({ entryPath: 'src/index.ts' }),
+    () => buildDocs({ base_path: '/docs/' }),
+    () => startDevServer({ mode: 'site' }),
+    () => startDocsDevServer({ entry: 'src/index.ts' }),
+    () => startDocsDevServer({ federation: { enabled: false } }),
+  ]) {
+    await assert.rejects(
+      operation(),
+      (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
+    )
+  }
+
+  const missingRoot = join(tmpdir(), `wake-node-unknown-priority-${process.pid}`)
+  await assert.rejects(
+    build({ cwd: missingRoot, source_map: true }),
+    (error) => error instanceof WakeError
+      && error.code === 'WAKE_CONFIG'
+      && /unknown field `source_map`/.test(error.message),
+    'wire-shape rejection must run before project discovery or build work',
+  )
+
+  for (const options of [
+    { watch: true },
+    { reporter: 'json' },
+    { output: 'artifacts/tests' },
+  ]) {
+    await assert.rejects(
+      runTests(options),
+      (error) => error instanceof WakeError && error.code === 'WAKE_TEST_CONFIG',
+    )
+    await assert.rejects(
+      createTestContext(options),
+      (error) => error instanceof WakeError && error.code === 'WAKE_TEST_CONFIG',
+    )
+  }
+})
+
 test('builds docs and controls the docs dev server lifecycle', async () => {
   const cwd = fileURLToPath(new URL('../../../', import.meta.url))
+  const docsOutputRoot = await mkdtemp(join(tmpdir(), 'wake-node-docs-api-'))
   const componentsRuntime = await readFile(
     fileURLToPath(new URL('../internal/components-runtime.mjs', import.meta.url)),
     'utf8',
@@ -729,11 +1139,45 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
     /["'][^"'\r\n]+\.css(?:\?[^"'\r\n]*)?["']/,
     'Components runtime must rely on Wake auto-style injection and contain no CSS import',
   )
-  const outdir = fileURLToPath(new URL('../../../target/node-docs-api-test/', import.meta.url))
+  const outdir = join(docsOutputRoot, 'site')
   const result = await buildDocs({ cwd, outdir })
   assert.equal(result.success, true)
   assert.ok(result.routes.length > 0)
   assert.deepEqual(result.workspaces, [])
+  assert.deepEqual(Object.keys(result).sort(), [
+    'cachedModuleCount',
+    'demos',
+    'diagnostics',
+    'durationMs',
+    'files',
+    'mode',
+    'moduleCount',
+    'outputDir',
+    'routes',
+    'success',
+    'updatedModuleCount',
+    'workspaces',
+  ])
+  assert.deepEqual(Object.keys(result.routes[0]).sort(), [
+    'description',
+    'draft',
+    'file',
+    'group',
+    'groupId',
+    'headings',
+    'hidden',
+    'id',
+    'kind',
+    'section',
+    'sectionId',
+    'slug',
+    'status',
+    'title',
+  ])
+  if (result.routes[0].headings.length > 0) {
+    assert.deepEqual(Object.keys(result.routes[0].headings[0]).sort(), ['depth', 'id', 'title'])
+  }
+  assert.deepEqual(Object.keys(result.files[0]).sort(), ['bytes', 'kind', 'path'])
   const componentsCwd = fileURLToPath(new URL('../../../fixtures/react-docs/', import.meta.url))
   const componentsRoot = await mkdtemp(join(tmpdir(), 'wake-components-api-'))
   const componentsOutdir = join(componentsRoot, 'dist')
@@ -747,6 +1191,15 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   assert.deepEqual(workbench.routes, [])
   assert.deepEqual(workbench.workspaces, [])
   assert.ok(workbench.demos.some((demo) => demo.component === '按钮' && demo.controlCount > 0))
+  assert.deepEqual(Object.keys(workbench.demos[0]).sort(), [
+    'component',
+    'controlCount',
+    'group',
+    'id',
+    'order',
+    'title',
+    'warnings',
+  ])
   const generatedComponentsRuntime = await readFile(
     join(componentsCwd, '.wake/docs/generated/runtime/components.tsx'),
     'utf8',
@@ -815,9 +1268,7 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
   const aggregateCwd = fileURLToPath(
     new URL('../../../fixtures/react-docs-workspaces/', import.meta.url),
   )
-  const aggregateOutdir = fileURLToPath(
-    new URL('../../../target/node-docs-workspaces-api-test/', import.meta.url),
-  )
+  const aggregateOutdir = join(docsOutputRoot, 'workspaces')
   const aggregate = await buildDocs({ cwd: aggregateCwd, outdir: aggregateOutdir })
   assert.deepEqual(
     aggregate.workspaces.map(({ name, basePath, presentation, demos }) => ({
@@ -841,6 +1292,14 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
       },
     ],
   )
+  assert.deepEqual(Object.keys(aggregate.workspaces[0]).sort(), [
+    'basePath',
+    'demos',
+    'mode',
+    'name',
+    'presentation',
+    'root',
+  ])
   const aggregateManifest = JSON.parse(
     await readFile(join(aggregateOutdir, 'manifest.json'), 'utf8'),
   )
@@ -891,6 +1350,7 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
     buildDocs({ cwd: invalid }),
     (error) => error instanceof WakeError && error.code === 'WAKE_BUILD',
   )
+  await rm(docsOutputRoot, { recursive: true, force: true })
 })
 
 test('normalizes cancellation and configuration failures', async () => {

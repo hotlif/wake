@@ -8,8 +8,10 @@ import {
   buildDocs,
   bundle,
   createTestContext,
+  generateFederationLock,
   generateCssToken,
   generateDocgen,
+  initializeFederation,
   runTests,
   startDevServer,
   startDocsDevServer,
@@ -46,6 +48,8 @@ Usage:
               [--target node20] [--external PACKAGE] [--minify] [--sourcemap]
               [--cache] [--config FILE]
   wake library token [project] [--config token.toml]
+  wake federation init [root]
+  wake federation lock [root]
   wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open]
   wake docs build [root] [--mode site|components] [--outdir DIR] [--base PATH]
   wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
@@ -335,10 +339,10 @@ async function runServer(factory, options, command, root, ui, uiMode) {
     command,
     root: root || '.',
     watchLabel: command === 'docs dev'
-      ? 'MDX · HMR · search index · watching'
+      ? 'MDX · Live reload · search index · watching'
       : command === 'docs components'
-        ? 'Demo · Controls · HMR · watching'
-        : 'HMR · source maps · watching',
+        ? 'Demo · Controls · Live reload · watching'
+        : 'Live reload · source maps · watching',
   })
   state.version = version()
   let dashboard
@@ -484,13 +488,12 @@ async function runTestCommand(args) {
       throw testUsageError(`unknown test arguments: ${args.filter((argument) => argument.startsWith('-')).join(' ')}`)
     }
 
-    const options = {
+    const nativeOptions = {
       root,
       patterns: args.splice(0),
       namePattern,
       projects,
       environment,
-      watch,
       changed,
       related,
       coverage,
@@ -501,8 +504,6 @@ async function runTestCommand(args) {
       shard,
       seed,
       shuffle,
-      reporter,
-      output,
       allowNoTests,
       browserPath,
       headful,
@@ -510,12 +511,12 @@ async function runTestCommand(args) {
     const selectedReporter = reporter || 'pretty'
 
     if (!watch) {
-      const result = await runTests(options)
+      const result = await runTests(nativeOptions)
       printTestRun(result, selectedReporter, output)
       return testResultExitCode(result)
     }
 
-    const context = await createTestContext(options)
+    const context = await createTestContext(nativeOptions)
     let lastExitCode = 0
     let outputError
     let finish
@@ -749,6 +750,34 @@ export async function runCli(argv = process.argv.slice(2)) {
     }
     const result = action === 'token' ? await generateCssToken(options) : await generateDocgen(options)
     printLines(formatGeneratorResult(ui, result, action === 'token' ? 'Tokens generated' : 'Docgen generated'))
+    return 0
+  }
+
+  if (command === 'federation') {
+    ensureStaticMode(uiMode)
+    const action = args.shift()
+    if (action !== 'init' && action !== 'lock') {
+      throw usageError('federation requires init or lock')
+    }
+    const cwd = args.shift() || '.'
+    if (args.length) throw usageError(`unknown federation ${action} arguments: ${args.join(' ')}`)
+    printLines(formatBanner(ui, `federation ${action}`, version()))
+    if (action === 'init') {
+      const result = await initializeFederation({ cwd })
+      const unchanged = result.declaration === 'unchanged' && result.typesIndex === 'unchanged'
+      printLines([
+        `  ${ui.ok('✓')}  ${ui.bold(unchanged ? 'Already initialized' : 'Initialized')} federation types`,
+        `     ${ui.dim('Project')}  ${ui.accent(result.projectRoot)}`,
+        '',
+      ])
+      return 0
+    }
+    const result = await generateFederationLock({ cwd })
+    printLines([
+      `  ${ui.ok('✓')}  ${ui.bold(`Locked ${result.remotes} remote${result.remotes === 1 ? '' : 's'}`)}`,
+      `     ${ui.dim('Output')}  ${ui.accent(result.lockPath)}`,
+      '',
+    ])
     return 0
   }
 

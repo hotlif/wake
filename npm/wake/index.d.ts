@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import type { FederationErrorCode as FederationContractErrorCode } from './federation.mjs'
 
 export type WakeErrorCode =
   | 'WAKE_CONFIG'
@@ -8,6 +9,8 @@ export type WakeErrorCode =
   | 'WAKE_CANCELLED'
   | 'WAKE_UNSUPPORTED_PLATFORM'
   | 'WAKE_INTERNAL'
+  | 'WAKE_OUTPUT_COLLISION'
+  | 'WAKE_WATCH_SNAPSHOT_CHANGED'
   | 'WAKE_TOKEN_IO'
   | 'WAKE_TOKEN_CONFIG'
   | 'WAKE_TOKEN_IMPORT'
@@ -37,6 +40,10 @@ export type WakeErrorCode =
   | 'WAKE_TEST_BUSY'
   | 'WAKE_TEST_UNKNOWN_RUN'
   | 'WAKE_TEST_UNKNOWN_WATCH'
+  | 'WAKE_FED_INIT_CONFIG'
+  | 'WAKE_FED_INIT_IO'
+  | 'WAKE_FED_INIT_CONFLICT'
+  | FederationContractErrorCode
 
 export interface DiagnosticLocation {
   /** One-based source line. */
@@ -63,7 +70,14 @@ export interface Diagnostic {
   notes?: string[]
 }
 
+export interface WakeErrorOptions {
+  path?: string
+  diagnostics?: Diagnostic[]
+  cause?: unknown
+}
+
 export class WakeError extends Error {
+  constructor(code: WakeErrorCode, message: string, options?: WakeErrorOptions)
   readonly code: WakeErrorCode
   readonly path?: string
   readonly diagnostics?: Diagnostic[]
@@ -76,17 +90,135 @@ export interface ProjectOptions {
   signal?: AbortSignal
 }
 
+export interface FederationControlOptions {
+  cwd?: string
+  signal?: AbortSignal
+}
+
+export type FederationInitFileStatus = 'created' | 'unchanged'
+
+export interface FederationInitResult {
+  projectRoot: string
+  declarationPath: string
+  typesIndexPath: string
+  declaration: FederationInitFileStatus
+  typesIndex: FederationInitFileStatus
+}
+
+export interface FederationLockRemoteBase {
+  manifestUrl: string
+  buildId: string
+  manifestIntegrity: string
+  allowedAssets: Record<string, string>
+}
+
+export type FederationLockRemote = FederationLockRemoteBase &
+  (
+    | { hasExposes: false; typesIntegrity?: string }
+    | { hasExposes: true; typesIntegrity: string }
+  )
+
+export interface FederationLock {
+  schemaVersion: 'wake.federation.lock.v1'
+  remotes: Record<string, FederationLockRemote>
+}
+
+export interface FederationLockResult {
+  projectRoot: string
+  lockPath: string
+  remotes: number
+  lock: FederationLock
+}
+
+/** A remote Wake container resolved through its immutable federation manifest. */
+export interface FederationRemoteOptions {
+  manifestUrl: string
+  allowedOrigins?: string[]
+  /** Follow new remote build IDs in development. Production builds remain lock-bound. */
+  devFollow?: boolean
+}
+
+export type FederationExposeMode = 'generic' | 'host-rendered' | 'isolated'
+export type FederationShadowMode = 'none' | 'open'
+
+export interface FederationGenericExposeOptions {
+  entry: string
+  mode?: 'generic'
+  scope?: string
+  shadow?: 'none'
+}
+
+export interface FederationHostRenderedExposeOptions {
+  entry: string
+  mode: 'host-rendered'
+  /** Share scope containing the host-owned React coherence group. */
+  scope: string
+  shadow?: 'none'
+  /** Permit ordinary unscoped CSS to enter the host document. Defaults to false. */
+  allowGlobalCss?: boolean
+}
+
+export interface FederationIsolatedExposeOptions {
+  entry: string
+  mode: 'isolated'
+  /** A non-default scope owned by the isolated component root. */
+  scope: string
+  /** Defaults to an open shadow root. */
+  shadow?: 'open'
+}
+
+export type FederationExposeOptions =
+  | FederationGenericExposeOptions
+  | FederationHostRenderedExposeOptions
+  | FederationIsolatedExposeOptions
+
+export interface FederationSharedOptions {
+  scope?: string
+  requiredVersion?: string
+  singleton?: boolean
+  strict?: boolean
+  fallback?: boolean
+  coherenceGroup?: string
+  /** Required for deterministic singleton selection in production builds. */
+  owner?: string
+}
+
+export interface FederationEnabledOptions {
+  enabled: true
+  name: string
+  remotes?: Record<string, FederationRemoteOptions>
+  exposes?: Record<string, FederationExposeOptions>
+  shared?: Record<string, FederationSharedOptions>
+}
+
+export interface FederationDisabledOptions {
+  enabled?: false
+  name?: never
+  remotes?: never
+  exposes?: never
+  shared?: never
+}
+
+/** Wake-native browser federation options. Omitted or `{ enabled: false }` disables federation. */
+export type FederationOptions = FederationEnabledOptions | FederationDisabledOptions
+
 export interface BuildOptions extends ProjectOptions {
   entry?: string
   outdir?: string
   cache?: boolean
   sourceMap?: boolean
+  federation?: FederationOptions
 }
 
 export type TestEnvironment = 'auto' | 'dom' | 'browser'
-export type TestReporter = 'pretty' | 'json' | 'junit'
 export type SnapshotUpdateMode = 'none' | 'new' | 'all'
-export type TestWorkers = number | 'auto' | `${number}%`
+type TestWorkerNonZeroDigit = '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
+type TestWorkerDigit = '0' | TestWorkerNonZeroDigit
+export type TestWorkerPercentage =
+  | `${TestWorkerNonZeroDigit}%`
+  | `${TestWorkerNonZeroDigit}${TestWorkerDigit}%`
+  | '100%'
+export type TestWorkers = number | 'auto' | TestWorkerPercentage
 
 export interface TestOptions {
   root?: string
@@ -94,19 +226,18 @@ export interface TestOptions {
   namePattern?: string
   projects?: string[]
   environment?: TestEnvironment
-  watch?: boolean
   changed?: boolean
   related?: string[]
   coverage?: boolean
   updateSnapshots?: SnapshotUpdateMode
   serial?: boolean
+  /** A positive integer, `"auto"`, or an integer percentage from `"1%"` through `"100%"`. */
   workers?: TestWorkers
+  /** A non-negative integer no greater than 4,294,967,295. */
   bail?: number
   shard?: `${number}/${number}`
   seed?: string
   shuffle?: boolean
-  reporter?: TestReporter
-  output?: string
   allowNoTests?: boolean
   browserPath?: string
   headful?: boolean
@@ -331,9 +462,25 @@ export interface BundleOptions extends ProjectOptions {
   cache?: boolean
 }
 
+export type OutputFileKind =
+  | 'asset'
+  | 'chunk'
+  | 'css'
+  | 'declaration'
+  | 'entry'
+  | 'federation-bootstrap'
+  | 'federation-chunk'
+  | 'federation-entry'
+  | 'federation-manifest'
+  | 'federation-shared'
+  | 'types'
+  | 'html'
+  | 'manifest'
+  | 'map'
+
 export interface OutputFile {
   path: string
-  kind: 'entry' | 'chunk' | 'css' | 'declaration' | 'asset' | 'html' | 'map'
+  kind: OutputFileKind
   bytes: number
 }
 
@@ -406,22 +553,22 @@ export interface GenerateDocgenResult {
 
 export type DocsMode = 'site' | 'components'
 
-  export interface DocsRoute {
-    id: string
-    file: string
-    title: string
-    description: string
-    kind: 'overview' | 'tutorial' | 'guide' | 'reference' | 'component'
-    group: string
-    groupId: string
-    section: string
-    sectionId: string
-    slug: string
-    status: string
-    draft: boolean
-    hidden: boolean
-    headings: Array<{ depth: number; title: string; id: string }>
-  }
+export interface DocsRoute {
+  id: string
+  file: string
+  title: string
+  description: string
+  kind: 'overview' | 'tutorial' | 'guide' | 'reference' | 'component'
+  group: string
+  groupId: string
+  section: string
+  sectionId: string
+  slug: string
+  status: string
+  draft: boolean
+  hidden: boolean
+  headings: Array<{ depth: number; title: string; id: string }>
+}
 export interface DocsDemo {
   id: string
   title: string
@@ -457,10 +604,16 @@ export interface DocsBuildResult extends BuildResult {
 export interface DevServerOptions extends ProjectOptions {
   entry?: string
   host?: string
+  /** An integer from 0 through 65,535. */
   port?: number
   open?: boolean
+  federation?: FederationOptions
 }
-export interface DocsDevServerOptions extends DevServerOptions {
+export interface DocsDevServerOptions extends ProjectOptions {
+  host?: string
+  /** An integer from 0 through 65,535. */
+  port?: number
+  open?: boolean
   mode?: DocsMode
 }
 
@@ -493,7 +646,18 @@ export interface DevServerWorkspaceStateEvent {
   failedNames: string[]
 }
 
+export interface DevServerFederationUpdatedEvent {
+  type: 'federationUpdated'
+  remote: string
+  oldBuildId?: string
+  newBuildId: string
+  changedExposes: string[]
+  typesHash?: string
+  action: 'types-only' | 'isolated-remount' | 'full-reload'
+}
+
 export class BuildContext {
+  private constructor()
   readonly closed: boolean
   rebuild(changedPaths?: string[], options?: { signal?: AbortSignal }): Promise<BuildResult>
   rebuild(options?: { signal?: AbortSignal }): Promise<BuildResult>
@@ -502,6 +666,7 @@ export class BuildContext {
 }
 
 export class DevServer extends EventEmitter {
+  private constructor()
   readonly url: string
   close(): Promise<void>
   waitUntilClosed(): Promise<void>
@@ -510,16 +675,19 @@ export class DevServer extends EventEmitter {
   on(event: 'rebuildStart', listener: (event: DevServerRebuildStartEvent) => void): this
   on(event: 'rebuilt', listener: (event: DevServerRebuiltEvent) => void): this
   on(event: 'workspaceState', listener: (event: DevServerWorkspaceStateEvent) => void): this
+  on(event: 'federationUpdated', listener: (event: DevServerFederationUpdatedEvent) => void): this
   on(event: 'diagnostic', listener: (diagnostic: Diagnostic) => void): this
   on(event: 'closed', listener: () => void): this
 }
 
 export function version(): string
-export function bundle(options: BundleOptions): Promise<BundleResult>
+export function bundle(options?: BundleOptions): Promise<BundleResult>
 export function build(options?: BuildOptions): Promise<BuildResult>
 export function buildLibrary(options?: LibraryBuildOptions): Promise<LibraryBuildResult>
 export function generateCssToken(options?: GenerateCssTokenOptions): Promise<GenerateCssTokenResult>
 export function generateDocgen(options?: GenerateDocgenOptions): Promise<GenerateDocgenResult>
+export function initializeFederation(options?: FederationControlOptions): Promise<FederationInitResult>
+export function generateFederationLock(options?: FederationControlOptions): Promise<FederationLockResult>
 export function createBuildContext(options?: BuildOptions): Promise<BuildContext>
 export function runTests(options?: TestOptions & { signal?: AbortSignal }): Promise<TestRunResult>
 export function createTestContext(options?: TestOptions): Promise<TestContext>
@@ -538,6 +706,8 @@ declare const wake: {
   bundle: typeof bundle
   generateCssToken: typeof generateCssToken
   generateDocgen: typeof generateDocgen
+  initializeFederation: typeof initializeFederation
+  generateFederationLock: typeof generateFederationLock
   createBuildContext: typeof createBuildContext
   runTests: typeof runTests
   createTestContext: typeof createTestContext

@@ -354,7 +354,7 @@ export function createDashboardState({
   command,
   root = '.',
   endpointLabel = 'LOCAL',
-  watchLabel = 'HMR · source maps · watching',
+  watchLabel = 'Live reload · source maps · watching',
 }) {
   const state = {
     command,

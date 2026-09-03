@@ -64,13 +64,17 @@ configuration.
 `bundle()` returns a dedicated result whose `code` is always a string. With
 `sourceMap: true`, `sourceMap` is returned in memory; when
 `outfile` is present Wake also writes `<outfile>.map`, exposes
-`sourceMapFile`, and appends the matching `sourceMappingURL`.
+`sourceMapFile`, and appends the matching `sourceMappingURL`. JavaScript and
+its emitted map commit as one rollback-capable set. Wake rejects an outfile
+or map that aliases any file read by the build. Disabling source maps does not
+delete an adjacent map whose Wake ownership cannot be proven.
 
 Component packages can generate design-token TypeScript without a Node-based
 generator by running `wake library token` or calling `generateCssToken()`. The
 generator supports recursive package imports in Yarn PnP and `node_modules`,
 rejects missing references and cycles, and atomically writes only the output
-declared by `build.output`.
+declared by `build.output`. It also rejects outputs that alias the root token
+configuration, a recursive import, or resolver/PnP input.
 
 `wake library build` and `buildLibrary()` emit `esm/index.mjs`,
 `cjs/index.cjs`, `declarations/index.d.ts`, and optional `css/index.css` from
