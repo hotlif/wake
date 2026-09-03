@@ -25,7 +25,7 @@
 
 # M3 — Dev/Prod 产物
 
-- dev 注入 development define、样式和 HMR；
+- dev 注入 development define、样式和整页 Live Reload；
 - prod 开启 Tree Shaking、压缩、分包、CSS 抽取和内容哈希；
 - `[dev_server]` 提供 host、port、open 和 HTTP/WS 代理；
 - 小资源内联、大资源独立输出，HTML 与 manifest 使用统一路径。
@@ -46,7 +46,7 @@ origin 提供源位置，改名 occurrence 通过 V3 `names` 保留原标识符�
 
 ## M4e — 压缩语义边界
 
-`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v12`），不要求第二个
+`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v13`），不要求第二个
 名字优化开关，也不因模块源码长度改变行为。这里的“Closure 风格”只表示 Wake 对 pass 排序、变更跟踪和收敛模型的架构选择；
 不兼容 Closure `ADVANCED`、Closure modules、externs、类型优化、全局属性 flattening 或逐字输出。
 普通 ESM/CommonJS、公开成员和宿主协议按 Wake 的局部可证明安全边界保留。实现只使用 workspace
@@ -94,6 +94,11 @@ parser/transform 支持项目测试覆盖的现代 JavaScript、TypeScript、JSX
 # M6 — 边界收口
 
 组件 namespace、JSX、define 和死分支进入统一构建链。无法安全转换的语法应产生带路径和 Span 的诊断，不静默改变语义。
+
+仍受支持的旧 `@crab-dev/rc-*` 公共入口若静态请求 `@linaria/core`，只由 parser-owned
+`Import`/`ExportFrom`/`Require` 依赖在解析目标层映射到 `@crab-dev/css`；loader 源码、ModuleRec、
+缓存和 codegen request 保留原 specifier/kind。动态 import、应用、第三方、内部/嵌套入口不迁移。
+内部目标不受 source alias 改写，PnP 则必须由组件或 `packageExtensions` 显式声明依赖。
 
 # M7 — 根与不支持项
 

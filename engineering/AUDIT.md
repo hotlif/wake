@@ -22,7 +22,7 @@
 
 以上项目由本轮工程文档、API 页面、注释校正和 `docs:check` 门禁解决。
 
-# 3. 开放风险
+# 3. 当时的开放风险
 
 ## A1 — 双 Bundler 路径
 
@@ -46,7 +46,7 @@ CI 的 benchmark job 使用 `cargo bench --workspace --no-run`，只能发现编
 
 ## A5 — 浏览器端端到端覆盖有限
 
-多数 bundler 回归通过 Rust 测试、Node 执行和静态输出断言覆盖；文档运行时与 HMR 的真实浏览器交互没有在当前 CI workflow 中形成独立跨浏览器矩阵。
+多数 bundler 回归通过 Rust 测试、Node 执行和静态输出断言覆盖；文档运行时与 Live Reload 的真实浏览器交互没有在当前 CI workflow 中形成独立跨浏览器矩阵。
 
 这是根据 workflow 和测试形态得出的覆盖风险，不等同于已知运行时错误。
 
@@ -64,3 +64,25 @@ CI 的 benchmark job 使用 `cargo bench --workspace --no-run`，只能发现编
 - “通过 CI”只表示 workflow 中实际存在并运行的矩阵。
 - 已修复项从开放风险移到变更记录，不反复保留为当前缺陷。
 - 未来复核以新 tag/commit 新建审计段落，不改写旧基线日期。
+
+# 6. v0.1.26 工作树复核（2026-09-02）
+
+本节复核当前工作树，不改写上面的 v0.1.14 历史基线。当前 workspace 为 34 个 crate；Docs 有
+53 个 canonical route、106 个 Markdown 文件与 6 个 fixture page；npm 自动发布覆盖 7/7 个包
+（`@crab-dev/wake`、`@crab-dev/css` 与五个平台包）。
+
+状态变化：
+
+- A1 已关闭：产品构建统一由 typed `BuildSession`/`BuildGeneration` 所有，底层 engine 只保留在
+  bundler 实现与单元测试边界；见 ADR 0027、0028。
+- A2 已缓解但未关闭：CI 已运行 deterministic avoided-work 性能不变量和 benchmark compile smoke，
+  仍缺固定 runner 上的历史样本、噪声阈值与人工复跑流程；继续由路线图 R2 跟踪。
+- A3 已关闭：常规 CI、发布前 local tarball 与发布后 registry smoke 均覆盖精确下界 Node 22.14.0，
+  并验证 TypeScript、CLI 和 `build()`；发布门禁静态锁定 22.14.0/24/26 矩阵。
+- A4 仍为 P2 维护风险：历史 Phase/Gate/M 编号由 PLAN/COMPATIBILITY 提供稳定索引，但新增注释仍须
+  引用当前契约或 ADR，不能借历史阶段暗示完成度。
+- A5 已缓解但未关闭：CI 和发布前/后已有五目标 system-browser evidence、React/screenshot 与
+  Federation Chromium E2E；共享 exact-major stable readiness 仍被显式标记为 blocked，Docs/Live Reload
+  的完整浏览器行为矩阵继续由路线图 R4 跟踪。
+
+本轮架构修复的长期边界记录在 ADR 0026—0035；当前仍开放的架构工作只有 R2、R4 与持续性的 R5。

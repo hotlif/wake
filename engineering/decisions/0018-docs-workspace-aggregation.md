@@ -61,6 +61,12 @@ iframe 隔离和运行时诊断。`standalone` 保留完整目录、工具栏、
 Node `DocsBuildResult` 新增必需的 `workspaces` 数组。开发事件新增可选的 `workspace`、`basePath`
 字段和 `workspaceState`。现有单项目使用方收到空数组，事件中不含工作区字段。
 
+## Terminology clarification
+
+本记录作出决策时使用的 “HMR 端点/消息” 描述的是按挂载筛选的浏览器刷新通知，并不意味着模块
+替换或状态保持。普通应用的当前能力与端点已由 [ADR 0030](0030-live-reload-capability-boundary.md)
+明确为 Live Reload；该澄清不改变本记录的多挂载所有权或事务性生产发布决策。
+
 ## Validation
 
 使用真实的一站点/两工作区夹具、Yarn 4.16 PnP 聚合门禁、51 个惰性挂载启动测试、聚焦 Rust 测试、

@@ -30,6 +30,7 @@ sample size / warmup:
 | `wake_common` | `interner` | 字符串驻留和并发热点 |
 | `wake_ecma_lexer` | `lexer` | 词法吞吐 |
 | `wake_ecma_parser` | `parser` | 解析吞吐与语法模式 |
+| `wake_compiler` | `transpile` | TSX 单模块 parse/lower/optimize/emit 端到端吞吐 |
 | `wake_resolver` | `resolve` | 包、目录和缓存解析 |
 | `wake_turbo` | `engine` | 调度、命中、失效与扇出 |
 | `wake_bundler` | `bundle` | 合成模块冷构建与重复构建 |
@@ -53,6 +54,7 @@ cargo test -p wake_bundler --test performance_invariants --release
 ```bash
 cargo bench -p wake_ecma_lexer --bench lexer
 cargo bench -p wake_ecma_parser --bench parser
+cargo bench -p wake_compiler --bench transpile
 cargo bench -p wake_resolver --bench resolve
 cargo bench -p wake_turbo --bench engine
 cargo bench -p wake_bundler --bench bundle
@@ -135,10 +137,10 @@ node scripts/check-startup.mjs
 - 冷构建：新进程、无内存会话；是否保留 `.wake/cache.bin` 必须说明。
 - 持久化缓存构建：新进程但保留 cache，验证跳过 source read/parse/optimize/codegen 的程度。
 - 热重建：同一 `BuildSession`/`BuildContext`，无变化或指定 changed paths。
-- Dev HMR：包含 watcher 合并、构建和消息发送；浏览器应用时间应单独测量。
+- Dev Live Reload：包含 watcher 合并、构建和 reload frame 发送；整页浏览器刷新时间应单独测量。
 
 性能提升必须同时验证冷/热产物等价、诊断一致和缓存失效。压缩器版本（当前
-`wake-closure-minifier-v12`）、defines/drop flags、图/缓存中稳定的声明保留名、公开观察名与 star 事实、可信编辑和保留名参与
+`wake-closure-minifier-v13`）、defines/drop flags、图/缓存中稳定的声明保留名、公开观察名与 star 事实、可信编辑和保留名参与
 相关身份；optimizer 内部解析的 `SymbolId` 以及 parser owner 的 interner identity 只对本次 AST 有效，
 不作为持久性能缓存身份。retained facts、final-layout JavaScript body 和 mapping facts 分阶段缓存；
 `want_map` 不进入 optimize/body 任务 key。启用 map 不得改变 JS payload 或重跑这两个阶段；只减少
@@ -192,3 +194,38 @@ Wake `258ms (250–263)` / `235.0MB`，Vite `431ms (420–449)`。两轮均先 w
 未设置 `WAKE_TIMING` 的 runner 样本。
 保留 one-shot `task_exec_count()` 可观察语义并隔离并行析构 panic 后，最终 release 复测为
 Wake `257ms (248–269)` / `235.5MB`，Vite `436ms (426–442)` / `209.0MB`，产物字节仍完全不变。
+
+# 9. 2026-09-03 React compiler 抽离后基线
+
+该记录用于给 `wake_compiler_core`/`wake_compiler` 抽离及 React helper import 裁剪建立后续可比较的
+Criterion 基线，不是迁移前后 A/B 结论：开始本切片时工作树已包含大量未提交的 parser、optimizer 和
+Bundler 改动，没有可归因的同机迁移前快照，因此不能伪造“优化百分比”。环境为 Windows NT
+10.0.26200 x64、Intel Family 6 Model 165、`rustc 1.95.0 (59807616e)`、Node `v22.15.0`；电源模式和
+后台负载未固定。命令均使用 Criterion `--quick`，只作为功能与数量级冒烟：
+
+```powershell
+cargo +1.95.0 bench -p wake_ecma_parser --bench parser -- --quick
+cargo +1.95.0 bench -p wake_compiler --bench transpile -- --quick
+cargo +1.95.0 bench -p wake_bundler --bench bundle -- --quick
+```
+
+| 基准 | 本次区间 | 中值/中间估计 |
+| --- | --- | --- |
+| parser 256 KiB module | 4.8153–4.8321 ms | 4.8186 ms / 51.933 MiB/s |
+| compiler TSX module | 41.128–42.547 ms | 42.263 ms / 983.86 KiB/s |
+| bundle 1k cold | 73.261–77.219 ms | 74.052 ms |
+| bundle 1k incremental cached | 7.4804–7.5304 ms | 7.5204 ms |
+| bundle 1k one-shot | 50.689–51.166 ms | 51.070 ms |
+| bundle 1k edit-one | 9.2633–9.6183 ms | 9.5473 ms |
+| bundle 2k cold | 110.91–115.60 ms | 111.85 ms |
+| bundle 2k incremental cached | 14.945–14.949 ms | 14.948 ms |
+| bundle 2k one-shot | 93.692–96.725 ms | 94.299 ms |
+| bundle 2k edit-one | 16.495–16.836 ms | 16.768 ms |
+
+`generation_cached` 的 1k/2k quick 样本分别约 51.9 ns/59.3 ns。后续性能改动必须在相同 fixture、工具链
+和机器上运行正式 Criterion 样本，并以本节为“抽离后”起点；本轮正确性门禁另外证明没有额外 parse、
+完整 AST clone 或 optimized IR clone。
+
+React helper import 裁剪另有可重复的输出体积证据：简单 production JSX fixture 从固定 helper 集合的
+153 B 降至 115 B（-38 B），development fixture 从 238 B 降至 215 B（-23 B）。差异只来自删除未使用的
+runtime helper import；production/development golden 和运行时行为测试共同锁定其余代码语义。

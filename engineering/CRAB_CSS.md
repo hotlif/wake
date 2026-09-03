@@ -49,7 +49,7 @@ v0.1 聚焦七个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`�
 | `npm/css` | ESM/CJS 入口、TypeScript 品牌类型、未经编译保护、`cx`、`createVar` 的保守运行时后备、`assignVars`、`defineTokens` 的深冻结 | 解析 CSS、生成 `<style>`、访问 React |
 | `wake_css` | 共享 CSS CST、节点/声明/错误与源码 span；普通 CSS 的 import、URL、压缩和 Modules 变换 | CSS-in-JS 静态求值、编辑器协议、产品编排 |
 | `wake_css_in_js` | 按 import 来源和语义符号识别 API，安全静态求值；消费共享 CST 展开嵌套并产出 JS 替换、CSS 和诊断 | 启动 Node/VM、读取网络、执行被编译模块、维护另一套 CSS 扫描器 |
-| `wake_bundler` | 扫描依赖、传播静态导出、按模块调用转换、删除已完全消解的 marker import、聚合 CSS | 重复实现 API 语义 |
+| `wake_bundler` | 扫描依赖、传播静态导出、按模块调用转换、删除已完全消解的 marker import、聚合 CSS；按 parser dependency node 为旧组件选择内部解析目标 | 重复实现 API 语义、改写 loader 源码 |
 | Wake dev/build | 开发时服务重建产物，生产时输出带内容 hash 的 CSS 资源 | 让服务端执行依赖 DOM 的样式逻辑 |
 | `wake_css_language` / `wake_css_lsp` | 编辑器模板发现、虚拟 CSS、消费共享 CST 提供提示和诊断协议 | 复制静态求值规则、维护私有 CSS 解析器、执行用户模块、接管 TypeScript 符号导航 |
 
@@ -57,6 +57,13 @@ v0.1 聚焦七个框架无关 API：`css`、`cx`、`keyframes`、`globalStyle`�
 局部参数或块变量对同名 API 的遮蔽不得被误编译。只有来自 `@crab-dev/css` 的七个名字具有
 完整 v0.1 语义；仓库中的 JavaScript、TypeScript、示例、fixture 与发布依赖不得使用其他
 CSS-in-JS 入口。
+
+不可变的旧 `@crab-dev/rc-*` 归档是受限迁移输入，不是第二个编译器入口。只有 manifest 验证过的
+公共 index 中，parser 识别出的静态 ESM/CJS `@linaria/core` 依赖会在解析目标层指向
+`@crab-dev/css`；源码、缓存摘要和 codegen request 仍保留原始 specifier/kind。loader 不做文本
+替换，动态 import 不映射，字符串/模板/注释/正则中的同值文本没有兼容语义。内部目标跳过用户
+alias，但不能跳过 PnP issuer 声明。详见
+[ADR 0035](decisions/0035-parser-owned-crab-runtime-resolution.md)。
 
 ### 3.2 构建数据流
 
@@ -247,7 +254,10 @@ v0.1 为防止“JS 命中缓存但 CSS 消失”，CSS-in-JS 活跃时避开只
 v0.1 codegen 已为每个模块分配确定的 style ID；浏览器以 bundle runtime 的 require 函数对象作为
 WeakMap owner，再在 owner 内按 style ID upsert/remove。这样相同输入的生成代码逐字节一致，独立
 bundle 不会覆盖彼此，同一 runtime 的动态 chunk 则共享样式槽。重复执行模块不会累积匿名
-`<style>`，复用节点时保持 cascade slot。dev server 对外仍以重建/live reload 为兼容基线；
+`<style>`，复用节点时保持 cascade slot。模块 codegen 对成功结果保留显式的
+`Absent / Remove / Upsert` 三态：没有成功样式模板的模块（包括仅使用 `cx`、`createVar` 或
+`assignVars`）不触碰 registry，非空样式变为空样式时发布删除 tombstone，含 error 的候选不携带
+样式更新。dev server 对外仍以重建/live reload 为兼容基线；
 后续细粒度 HMR 还需覆盖模块删除 prune、错误恢复保留最后成功样式以及跨 chunk 更新顺序。
 
 ### 7.3 SSR

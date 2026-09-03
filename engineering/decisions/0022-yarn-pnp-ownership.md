@@ -36,6 +36,13 @@ Components 不再拥有 resolver fallback；旧发布包缺失的 CSS/Lucide 元
 registry 是唯一安装图。所有 npm 包与 VS Code 编辑器均为根 workspace；不保留根 `file:` 平台包桥或
 编辑器独立 lock。源码构建只读取现有 PnP 安装并通过 `pnpapi` 定位依赖，绝不联网。
 
+源码树的 Node addon 门禁不得依赖 PnP optional platform package 中可能滞后的发布产物。`native:build`
+之后，Wake CLI 测试进程和独立 `node --test` addon 进程都必须在首次导入公开 API 前预加载
+`npm/wake/test/select-built-native.mjs`；selector 只按当前 host 选择同目录的
+`npm/wake/wake.<target>.node`，并通过 `WAKE_NATIVE_PATH` 交给正式 loader。两个进程分别预加载，因为父
+进程的环境修改不会回传调用它的 shell；门禁不复制二进制，也不把 workspace platform package 当作
+刚构建产物的替身。发布 tarball consumer 门禁仍独立验证 optional platform package 路径。
+
 ## Invariants
 
 - `.pnp.cjs` 缺失表示未启用 PnP；存在但损坏时产生包含清单路径和原因的最终错误。
@@ -44,11 +51,17 @@ registry 是唯一安装图。所有 npm 包与 VS Code 编辑器均为根 works
 - 有效裸包在受管理 issuer 中由 Yarn locator、fallback、peer/virtual/unplugged 与 ignore 语义决定。
 - PnP 拒绝不能被 Wake alias、Components 桥或现存 `node_modules` 覆盖。
 - zip 文件系统支持 Yarn 生成的 STORE 与 DEFLATE，并显式拒绝其他压缩算法。
+- zip 内模块和目录 listing 保留调用方的逻辑（含 virtual）路径身份；物理 archive 路径只用于 I/O、
+  watcher 和归一化缓存 key，不得泄漏为解析结果。
+- watcher 报告物理 archive 变化时只失效完全匹配的 `ZipArchive`；失效 revision 必须胜过并发中的旧
+  archive open，使下一 generation 重新读取字节，同时保留未变化归档的热缓存。
 - `.pnp.cjs`、`.pnp.data.json`、`yarn.lock` 任一变化都会清除清单、成功/失败解析和模块拓扑缓存。
 - `package-lock.json` 变化会清除经典解析的成功/失败缓存和模块拓扑，但其内容不会被运行时解析。
 - Bundler、Library/Token、Wake Test 与 CSS LSP 只通过 `ResolutionEnvironment` 访问 PnP 状态并传播诊断。
 - 仓库只有一个 `yarn.lock`；工作区 locator、精确 npm resolution 与 checksum 由官方 `parseSyml` 校验。
 - 安装使用 `yarn install --immutable --check-cache`，依赖 lifecycle scripts 禁用。
+- 源码 Node 门禁的 CLI 与 addon 两段均从本轮 `native:build` 的 colocated `.node` 加载；若该文件缺失或
+  host 不受支持则立即失败，不静默回退到 workspace optional package。
 
 ## Evidence
 
@@ -57,6 +70,7 @@ registry 是唯一安装图。所有 npm 包与 VS Code 编辑器均为根 works
 - `scripts/check-yarn-lock.mjs`、`scripts/check-pnp-conformance.mjs`
 - `.yarnrc.yml`、`yarn.lock` 与根 workspaces
 - `crates/wake_js_runtime/build.rs`、`scripts/resolve-embedded-packages.mjs`
+- `npm/wake/test/select-built-native.mjs`、根 `npm:test:wake`/`npm:test:wake:addon` 脚本及架构门禁
 - Bundler、Library/Token、Wake Test、CSS LSP 的 PnP 回归测试
 - `scripts/check-npm-consumer.mjs` 与 CI 的 npm artifact/consumer 矩阵
 
@@ -64,6 +78,8 @@ registry 是唯一安装图。所有 npm 包与 VS Code 编辑器均为根 works
 
 PnP 项目的未声明依赖会稳定显示 Yarn/PnP 诊断，损坏安装不会被物理目录掩盖；npm 项目继续使用物理
 安装树并在缺失时返回普通解析诊断。两种项目的 lock/安装变化都会在下一 generation 重建模块拓扑。
+普通 zip 内容变化不再清空其他 archive；若变化与首次打开并发，旧字节或旧解析错误不会在失效之后
+重新进入缓存。
 仓库安装、编辑器和维护脚本统一使用 Yarn PnP，Windows 与 Linux 的干净 checkout 不再需要源码
 `node_modules`。
 

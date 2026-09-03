@@ -99,6 +99,8 @@
     "wake_cache",
     "wake_cli",
     "wake_common",
+    "wake_compiler",
+    "wake_compiler_core",
     "wake_config",
     "wake_css",
     "wake_css_in_js",
@@ -114,6 +116,7 @@
     "wake_ecma_semantic",
     "wake_ecma_transform",
     "wake_ecma_vm",
+    "wake_federation_contract",
     "wake_graph",
     "wake_html",
     "wake_js_runtime",
@@ -131,6 +134,8 @@
   "groups": {
     "compilerCore": [
       "wake_common",
+      "wake_compiler",
+      "wake_compiler_core",
       "wake_ecma_ast",
       "wake_ecma_codegen",
       "wake_ecma_lexer",
@@ -143,10 +148,10 @@
     "productEdges": ["wake_dev_server", "wake_docs", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
     "shells": ["wake_cli", "wake_node"],
     "nonShells": [
-      "wake_app", "wake_bundler", "wake_cache", "wake_common", "wake_config",
+      "wake_app", "wake_bundler", "wake_cache", "wake_common", "wake_compiler", "wake_compiler_core", "wake_config",
       "wake_css", "wake_css_in_js", "wake_css_language", "wake_css_lsp", "wake_dev_server", "wake_docs", "wake_ecma_ast",
       "wake_ecma_codegen", "wake_ecma_lexer", "wake_ecma_minify", "wake_ecma_parser",
-      "wake_ecma_semantic", "wake_ecma_transform", "wake_ecma_vm", "wake_graph", "wake_html",
+      "wake_ecma_semantic", "wake_ecma_transform", "wake_ecma_vm", "wake_federation_contract", "wake_graph", "wake_html",
       "wake_js_runtime", "wake_resolver", "wake_scan", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_tsdoc", "wake_turbo", "wake_turbo_macros"
     ]
   },
@@ -218,6 +223,41 @@
       "suggestion": "Depend on wake_ecma_semantic directly from the analysis consumer."
     },
     {
+      "id": "compiler-core-owns-pure-module-phases",
+      "description": "the reusable compiler backend composes only product-neutral ECMAScript phases",
+      "from": ["wake_compiler_core"],
+      "allowOnly": ["wake_common", "wake_ecma_ast", "wake_ecma_codegen", "wake_ecma_minify", "wake_ecma_parser", "wake_ecma_transform"],
+      "require": ["wake_ecma_codegen", "wake_ecma_minify", "wake_ecma_parser"],
+      "decision": "engineering/decisions/0043-react-module-compiler-boundary.md",
+      "suggestion": "Keep files, configuration, tasks, caches, graphs, bundles and products in callers above wake_compiler_core."
+    },
+    {
+      "id": "compiler-facade-depends-on-core-only",
+      "description": "the public single-module facade exposes owned DTOs without bypassing the reusable backend",
+      "from": ["wake_compiler"],
+      "allowOnly": ["wake_compiler_core"],
+      "require": ["wake_compiler_core"],
+      "decision": "engineering/decisions/0043-react-module-compiler-boundary.md",
+      "suggestion": "Add compiler semantics to wake_compiler_core and keep the public facade independent of lower AST and product crates."
+    },
+    {
+      "id": "tsdoc-consumes-parser-owned-declaration-facts",
+      "description": "declaration discovery and syntax facts belong to the ECMA parser, while wake_tsdoc owns graph resolution and rendering",
+      "from": ["wake_tsdoc"],
+      "allowOnly": ["wake_ecma_parser"],
+      "require": ["wake_ecma_parser"],
+      "decision": "engineering/decisions/0040-parser-owned-frozen-declaration-graph.md",
+      "suggestion": "Add declaration syntax facts to wake_ecma_parser and consume them from wake_tsdoc instead of scanning generated text."
+    },
+    {
+      "id": "dev-server-does-not-own-declaration-parsing",
+      "description": "the development server consumes an opaque frozen type generation and cannot own declaration parsing or rendering",
+      "from": ["wake_dev_server"],
+      "deny": ["wake_ecma_parser", "wake_tsdoc"],
+      "decision": "engineering/decisions/0040-parser-owned-frozen-declaration-graph.md",
+      "suggestion": "Prepare the frozen declaration generation in wake_app and pass only its identity and pure binder to wake_dev_server."
+    },
+    {
       "id": "vm-is-product-neutral",
       "description": "the V8 facade cannot own files, DOM, resolution, testing, orchestration, or products",
       "from": ["wake_ecma_vm"],
@@ -229,7 +269,7 @@
       "id": "js-runtime-owns-modules-not-products",
       "description": "the JavaScript runtime may own modules and the private fast DOM lifecycle but not test or browser policy",
       "from": ["wake_js_runtime"],
-      "allowOnly": ["wake_common", "wake_ecma_ast", "wake_ecma_codegen", "wake_ecma_parser", "wake_ecma_semantic", "wake_ecma_transform", "wake_ecma_vm", "wake_resolver"],
+      "allowOnly": ["wake_common", "wake_compiler_core", "wake_ecma_vm", "wake_resolver"],
       "decision": "engineering/decisions/0020-react-browser-test-runtime.md",
       "suggestion": "Keep Wake test semantics in wake_test, Chromium/CDP in wake_test_browser and application lifecycle in wake_app."
     },
@@ -248,6 +288,14 @@
       "allowOnly": [],
       "decision": "engineering/decisions/0020-react-browser-test-runtime.md",
       "suggestion": "Keep options, results, diagnostics and protocol frames as dependency-free owned data."
+    },
+    {
+      "id": "federation-contract-is-data-only",
+      "description": "the federation contract cannot depend on compiler, resolver, I/O, runtime, orchestration or product crates",
+      "from": ["wake_federation_contract"],
+      "allowOnly": [],
+      "decision": "engineering/decisions/0025-wake-native-federation-contract.md",
+      "suggestion": "Keep versioned manifests, identities, policies, errors and dev messages as owned data; put hashing, resolution, HTTP and execution in consumers."
     },
     {
       "id": "test-runner-owns-wake-policy",

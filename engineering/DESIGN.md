@@ -16,7 +16,7 @@ CLI 与 Node API 是两种调用外壳；构建行为由 `wake_app` 统一。Wak
 
 ## 3.1 Workspace 与入口
 
-25 个 crate 按基础、编译、解析/资源、执行/编排和产品边缘分层。完整列表和依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+36 个 crate 按基础、编译、解析/资源、执行/编排和产品边缘分层。完整列表和依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 3.2 构建阶段
 
@@ -28,8 +28,56 @@ optimizer 内部属于当前 AST 生命周期，不是跨 crate 或持久缓存�
 
 ## 3.3 核心抽象
 
-编译核心通过 `FileSystem` 读取内容，通过 `Diagnostic` 报告问题；parser 创建的 `ModuleAst` 持有 arena
-生命周期与精确 source，并记录创建其 `Atom` 的进程内 interner identity；打包器只跨阶段传稳定记录和受控句柄。
+ECMAScript 编译核心不读取文件，只消费调用方提供的源码并返回 owned 诊断/依赖/发射事实；parser
+创建的 `ModuleAst` 持有 arena 生命周期与精确 source，并记录创建其 `Atom` 的进程内 interner
+identity。文件系统、路径解析、任务和缓存由 bundler/runtime 等调用方拥有，它们跨阶段只传稳定记录和
+受控句柄。
+
+## 3.4 BuildSession 所有权与生命周期
+
+`BuildSession` 是所有产品构建进入 `wake_bundler` 的唯一公共 owner。调用方先把平台、解析、JSX、
+CSS/资源、优化、缓存、entry/chunk 命名和 bundler-facing Federation plan 完整归一化为 owned
+`BuildOptions`，再一次性创建 session；构建开始后不存在产品可用的 setter 路径。新增语义选项必须同时
+进入 typed options、最近的复用身份和 retained/one-shot 等价矩阵，不能只给某个产品入口补配置。
+
+`BuildSession::new` 创建 retained 生命周期，拥有 loader snapshots、generation 和 committed
+entry/output；强制构建与 current-generation 构建通过同一 commit transition 更新状态。
+`BuildSession::new_one_shot` 创建 transient 生命周期，只能由消费式 `build_once(self, request)` 执行一次，
+不启用 retained load cache，也不为未来 generation 保存和 clone 完整输出。两种生命周期共享相同的
+Scan/Link/Optimize/Emit 任务定义、诊断和 `BuildOutput` 契约；one-shot 只省略没有后续消费者的进程内状态。
+
+底层 engine 与 mutable setter 只属于 `wake_bundler` crate 内部实现和 unit-level 证明。产品 crate、外部
+integration tests 与 benchmark 只能使用 session API；兼容 façade 必须委托 typed session，不能重新暴露
+configurator closure。长期边界见
+[ADR 0027](decisions/0027-build-session-ownership-and-lifetime.md)。
+
+## 3.5 BuildGeneration 与候选一致性
+
+`BuildSession` 只拥有一次 typed compilation；application、Federation container、optional shared
+provider、types 和 manifest 组成的产品候选由更外层的 `BuildGeneration` 唯一拥有。一次性 build/Docs
+从 owner 创建 application one-shot view，再由同一 owner 创建 container/shared one-shot views。长生命周期
+build context 同时保存 owner 与 retained application session；接受 watcher batch 后先推进 generation，再
+失效 retained graph 并创建该代的 transient Federation views。产品 Federation 子构建不能另建 filesystem
+或 session。
+
+Owner 内的 filesystem proxy 按 `FileSystem` method family 和精确 `OsString` 路径拼写缓存首次完成结果，
+包括可重放的 I/O failure。六个查询族互不推导；advance 会整体替换 observation epoch。因此它提供的是
+lazy、query-scoped repeatability，不是时间点文件系统快照：未查询路径可能看到后续变化，先前
+`exists(false)` 也不约束另一个 family 的首次 `read`。跨产物 identity 所需的 package/config/synthetic
+source/type inputs 必须在候选准备阶段主动观察或冻结。
+
+完整 application/Federation/声明/manifest/bootstrap/HTML/asset/hidden-map 候选构造成功后只发布一次。
+声明 emitter 每个候选只读取一次，以 reserved placeholder 生成稳定图；最终 `buildId` 计算后只重绑定该
+owned graph，不重新读取源文件。开发服务器采用另一种但同样唯一的 owner 形态：一个 retained session
+编译 synthetic container、application、exposes 与 shared fallback 的 combined graph，成功后才安装新的
+runtime snapshot。长期边界和明确非保证见
+[ADR 0028](decisions/0028-build-generation-ownership-and-observation-cache.md)。
+
+Node addon、CommonJS/ESM wrapper 与 npm CLI 只是产品适配器。Federation 初始化和 lock 生成调用
+`wake_app` 的同一服务；`OutputFileKind` 与 Federation `ErrorCode` 使用闭合集合和跨语言相等门禁，
+dev event adapter 对未知事件产生诊断。ESM Federation 子路径使用与 `.mjs` 配对的唯一 `.d.mts`
+声明，tarball 外部 NodeNext 消费测试负责证明 export map 和声明解析。见
+[ADR 0029](decisions/0029-node-contract-and-federation-control-ownership.md)。
 
 # 4. ECMAScript 编译器
 
@@ -51,7 +99,22 @@ Lexer 按字节扫描，token 只保存类型、Span 和 ASI 换行状态。pars
 
 ## 4.5 Transform
 
-TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上下文中运行。`wake_ecma_transform` 不依赖 parser，只提供稳定的 lowering 规则与 AST helper；parser 可在仍掌握 cover grammar/作用域上下文时调用它们。转换复用原 Span，避免丢失诊断与 Source Map 来源。
+TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上下文中运行。`wake_ecma_transform` 不依赖 parser，只提供稳定的 lowering 规则与 AST helper；React runtime plan 统一决定 `jsx-runtime`/`jsx-dev-runtime` 路径、固定 helper import 集合和 runtime call ABI。parser 在仍掌握 cover grammar、作用域、collision-free 本地名、import 插入位置和依赖记录时调用这些 helper。转换复用原 Span，避免丢失诊断与 Source Map 来源。
+
+### 4.5.1 Compiler core 与公开 façade
+
+`wake_compiler_core::CompilerBackend` 在共享 `Interner` 上依次执行 `parse_module`、
+`optimize_module` 和 `emit_module`。它只拥有
+纯 CPU 编译能力；finalize 只在 emit 调用内部消费最终模块事实，不形成可观察的第四阶段或缓存身份。
+Bundler 复用 backend，但继续拥有 retained/one-shot task、persistent/body cache、sealed-trivial fast
+path、依赖图、Chunk、CSS/runtime 组装与最终 map 合并。
+
+`wake_compiler::transpile_module` 是借用源码、返回 owned 结果的 React-only 单模块入口。首版支持
+JavaScript/TypeScript Module、可选 React-compatible automatic JSX、Preserve ESM/CommonJS 与 detached
+V3 Source Map，并固定不压缩。它不暴露 AST、Atom、Interner 或 typed IR。依赖 graph/runtime 才能可靠
+转换的 CommonJS 构造必须 fail closed，错误结果不同时携带 code/map。Vue 和 AngularJS 未来通过独立
+需求、ADR 与前端接入，不在当前 API 中预留 trait、枚举或字段。见
+[ADR 0043](decisions/0043-react-module-compiler-boundary.md)。
 
 ## 4.6 Closure 风格优化管线
 
@@ -63,10 +126,12 @@ TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上�
 typed IR 为事实源，codegen 不按 Span 或外部计划拼装重写。
 
 `OptimizeInput` 包含 parser 已验证的 defines、drop flags、保留名、当前程序上的
-`LinkerExportLiveness`、内部模块模式，以及 CSS-in-JS 等可信结构化编辑。`typed_edits.rs` 先把编辑解析为
+`LinkerExportLiveness`、源码有序的精确/opaque export-star plan、内部模块模式，以及 CSS-in-JS 等可信结构化编辑。`typed_edits.rs` 先把编辑解析为
 typed target 和 owned expression；目标不唯一、类型错误、重叠或 owner 错配都返回诊断。`optimize` 返回
 持有最终 `TypedProgram`、typed module plan、最终名字、保留依赖、稳定指纹和 pass 统计的
-`OptimizedProgram`。
+`OptimizedProgram`。内部 ESM 的 plain star 由 graph 按最终 binding identity 静态消歧；显式名不进入
+star plan，同一 binding 的多路径只分配一次，循环使用静态名称 getter。只有 CommonJS、external 或
+缺少完整分析的 surface 使用带显式排除名和 own-export guard 的运行时枚举。
 
 一次性验证之后，固定点按“常量传播/折叠 → 条件与退出点简化 → 已封闭函数/调用内联 → 单次使用变量
 内联 → 死控制流/赋值/声明清除 → 声明/sequence 合并 → late peephole”调度，统一 change tracker
@@ -120,8 +185,11 @@ Yarn locator、alias dependency、peer/virtual/unplugged 与 fallback 的成功�
 Wake 路径 alias 保留。ignore pattern 或 unmanaged issuer 执行 Yarn 指定的经典 Node 解析，无 PnP 根
 时使用普通 Wake alias/node_modules 行为。npm 的 nested/scoped/workspace/subpath/exports 均由已安装
 文件树解析；`package-lock.json` 不被求解，但其变化会失效解析和模块拓扑。zip 支持 STORE 与 DEFLATE；
-PnP 清单、data 或 lock 变化会清除清单、解析和模块拓扑缓存。Components 不拥有 resolver fallback，旧归档元数据由 Yarn
-`packageExtensions` 声明。
+逻辑（含 virtual）路径始终是模块身份，物理 archive 路径只用于 I/O、watch 与精确缓存 key。物理 zip
+变化只失效对应 `ZipArchive`，并发中的旧 archive open 由 revision 丢弃；PnP 清单、data 或 lock 变化
+则清除全部清单、解析和 zip 缓存。Components 不拥有 resolver fallback，旧归档元数据由 Yarn
+`packageExtensions` 声明。Wake 内部兼容目标通过 strict package-root resolution 跳过用户源码 alias，
+但不跳过 issuer 的 PnP 可见性；这类目标不能用来提供未声明依赖。
 
 ## 5.2 Scan
 
@@ -166,19 +234,81 @@ Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map
 Library emit 先生成确定性 staging 清单，再在稳定输出目录内跳过相同文件、逐文件原子替换变化、
 删除 stale 文件并在失败时回滚；不得整体 rename 已存在的输出目录。
 
+精确文件产物由 `wake_app::output` 单独拥有集合事务。Bundle 的 JavaScript 与启用时的 Source Map、
+token 生成结果和 Docgen 结果在发布前携带 reader/resolver 给出的成功内容读取 provenance；目标先按
+词法、canonical、符号/reparse 与文件身份和全部输入比较，再以同目录 unique temp 完整写入、flush、
+sync、备份、安装和反向回滚。Bundle 未启用 Source Map 时不推断相邻旧 map 的所有权，也不删除它。
+长期不变量见 [ADR 0036](decisions/0036-input-disjoint-exact-output-transactions.md)。
+
 ## 6.3 Chunk 与动态导入
 
 生产构建为动态 import 创建 async chunk，并通过 `public_path` 生成加载 URL。抽取 CSS 归属到具体 chunk：入口样式由 HTML 激活，异步样式由 runtime 在对应 JavaScript 执行前加载；书面 manifest 保留同一 chunk/style 关系。相对 `./` 用于 file URL/Electron；文档站独立使用 `base_path`。
 
-# 7. Dev Server 与 HMR
+## 6.4 Wake Federation v1
 
-开发服务器采用增量打包模式：监听变化、失效会话、重建受影响模块，再发送 HMR 消息。通知在 Windows 上会合并延迟事件；配置、根或入口的结构变化建议重启。
+`wake_federation_contract` 是 Federation 公共数据的唯一 Rust owner，固定
+`wake.federation.manifest.v1` schema 与 `wake.federation.v1` browser ABI。配置、bundler、dev server、
+Node 和浏览器适配只转换或消费这些 DTO；contract 不执行文件、网络、resolver、hashing、semver 或
+JavaScript。Manifest 以有序 map 描述 container/build、remote entry、exposes、同步/异步 JS/CSS/Source
+Map、shared offers/requirements、声明文件和开发更新端点。所有资源携带 content hash、SHA-384 SRI、
+MIME 与 size，类型产物必须绑定同一 `buildId`。
+
+生产 Federation 不是 application 之外的一组独立文件系统构建。`wake_app` 先冻结一个 generation 的
+shared descriptors、synthetic entries 与 declaration graph，再由同一 `BuildGeneration` 编译 application、
+container 和 optional shared provider。container/shared 可以使用不同 immutable `BuildOptions` profile，
+但不能脱离同一 observation epoch。所有编译输出与单次冻结的类型 identity 共同决定一个 `buildId`；
+manifest、bootstrap、types 和 hidden maps 完成后，整个候选才进入一次 failure-atomic publication。
+
+跨构建身份是 `(container, buildId, expose, generation)`；现有数字 module ID 和 runtime namespace token
+仍只在单一 container 内有效。Canonical build material 规范 set-like 顺序并排除部署 URL、dev metadata
+和 `buildId` 自身，bundler 再负责实际 hash。Manifest 是控制面，异步 container `init/get` 是数据面；只
+允许显式 remote dynamic import，静态 import、`require` 和跨 container 静态/TLA 循环 fail closed。
+
+每个 Window 的 broker 以 single-flight 加载 container，按冻结 singleton/coherence group、宿主 provider、
+已加载兼容 remote、当前 remote lazy fallback 的顺序求解显式 shared 白名单。相同 package version 只有
+resolver 的 package/peer context 与 build variant 一致时才是同一 provider。React coherence group 同时
+覆盖 `react`、JSX runtimes 与 `react-dom` entry；host-rendered 复用宿主 scope 且不创建 ShadowRoot，
+isolated 使用非 default scope、自己的 root 与 open ShadowRoot，并只跨边界传递结构化 props/events/DOM
+slots。长期所有权、失败语义和删除计划见
+[ADR 0025](decisions/0025-wake-native-federation-contract.md)。
+
+# 7. Dev Server 与 Live Reload
+
+开发服务器采用增量打包模式：监听变化、失效会话并重建受影响模块；普通应用完整候选成功发布后，
+通过 `/__wake_live_reload` 发送 typed `reload` frame，浏览器调用 `location.reload()`。服务端的增量复用
+不构成浏览器模块热替换：`import.meta.hot` 恒为 `false`，没有 accept/dispose、React Fast Refresh 或
+状态保留契约。
+
+Federation dev 把 synthetic container、application、exposes 与 shared fallback 放进一个 retained
+session 的 combined graph，不按生产形态创建 container/provider 子 session；只有完整 build 成功才安装
+runtime snapshot 并发送独立的 types-only / isolated-remount / full-reload 更新。每个 browser socket
+同时用 versioned lease 申领至多 8 个实际活跃 build；服务端仅为 lease refcount 或两代 manifest→entry
+竞态窗口保留旧 build routes，断开后回收。cursor 变化即使 build set 不变也重新 lease；ack 必须精确
+匹配页面已接受 cursor，漏代重连只刷新本页。每个 remote 独占 sender，多 mount container name 不得重复。
+已裁剪 build 的 HEAD/GET 返回无副作用 typed 410，只有请求该资产、严格匹配控制身份且 generation 严格
+推进的页面会刷新；reserved missing 直接 404，不进入 public/SPA。Production page cache 不参与这套裁剪，
+development metadata 不能越过 registration mode 开启恢复行为。通知在 Windows 上会
+合并延迟事件；配置、根或入口的结构变化建议重启。长期能力与生命周期边界见
+[ADR 0030](decisions/0030-live-reload-capability-boundary.md) 与
+[ADR 0032](decisions/0032-federation-development-snapshot-leases.md)。
+
+Federation editor 类型同步属于 dev server 控制面：启动时由唯一的 fail-closed synchronizer 校验全部
+remote，之后仅轮询 `dev_follow` Manifest 的 build/type revision。revision 未变不下载声明；变化后仍由
+同一 synchronizer 先校验全体，再原子切换稳定 index。刷新失败不修改 index 并产生可重试诊断；pinned
+remote 不轮询，启动同步必须满足生产 lock。monitor 与 `DevServer` 共享生命周期，关闭完成后不得继续写入。
 
 # 8. CSS 与静态资源
 
 ## 8.1 CSS
 
-开发模式可注入样式，生产模式抽取 CSS；CSS Modules 生成局部类名。CSS-in-JS 位于独立 crate，保持编译核心依赖边界。Crab UI 包由 `package.json#name = @crab-dev/rc-*` 与受支持入口共同识别，存在 `css/index.css` 时由 loader 自动加入模块图；业务源码与 Components runtime 均不显式导入这些样式。该身份也参与持久缓存判定，使 CSS 的新增、删除及跨进程热缓存保持冷构建等价。
+开发模式可注入样式，生产模式抽取 CSS；CSS Modules 生成局部类名。CSS-in-JS 位于独立 crate，保持编译核心依赖边界。Crab UI 包由 `package.json#name = @crab-dev/rc-*` 与受支持入口共同识别，存在 `css/index.css` 时由 loader 自动加入模块图；业务源码与 Components runtime 均不显式导入这些样式。该身份使 CSS 的新增、删除及跨进程热缓存保持冷构建等价。
+
+旧组件公共入口的 `@linaria/core` runtime 兼容不修改 loader 源码。parser 产出的精确
+`Import`/`ExportFrom`/`Require` 依赖在 resolution-time 指向内部 `@crab-dev/css` 包目标；原始
+specifier/kind 继续由 ModuleRec、缓存、诊断和 codegen request 拥有。动态 import、应用、第三方、
+组件内部文件和嵌套入口不映射。目标跳过 source alias，但 Yarn PnP 仍按组件 issuer 的依赖声明
+成功或拒绝。长期边界与删除条件见
+[ADR 0035](decisions/0035-parser-owned-crab-runtime-resolution.md)。
 
 ## 8.2 静态资源
 
@@ -188,13 +318,27 @@ Library emit 先生成确定性 staging 清单，再在稳定输出目录内跳�
 
 当前没有承诺稳定的公开 Rust/JavaScript 插件系统。组件扫描、Preview、主题 CSS 和声明式 TOML 是受支持的扩展点；实验编译器 API 不等于插件 ABI。
 
+## 9.1 Wake Docs 身份与源码溯源
+
+Docs 页面编译是 typed content pipeline，不是字符串预处理器。每个源文件先构造一次 `PageIdentity`，
+同时冻结 root-relative source/generated 路径和 decoded/canonical-encoded `RoutePath`；registry、静态 shell、
+browser runtime 与文档 checker 只能转换或消费该身份。URL codec 逐段编码 UTF-8，只保留 RFC 3986
+unreserved，percent hex 固定大写。非 UTF-8 段或 normal component 内反斜杠不允许 lossy 降级。
+
+markdown AST 拥有 `MdxjsEsm` node/span，Wake ECMA parser/lexer 在 node 内按 typed dependency kind
+定位 module specifier。标题先由单个 `HeadingPlan` 分配 ID，再供 metadata 和 renderer 使用。页面 writer
+将 synthetic wrapper 留空映射，只为能证明由 MDX node/token 派生的 generated 位置建立 Source Map 段，
+并用 generated-only 段终止同一行的映射。详细不变量及移除的旧路径见
+[ADR 0031](decisions/0031-docs-page-identity-and-source-provenance.md)。
+
 # 10. 增量与并发
 
 ## 10.1 工作规避
 
 Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要和优化/生成体缓存减少重复解析与
 codegen。依赖形状和绑定活跃性不变时复用上一 generation 的 link/chunk 规划；旧的内存摘要在成功
-generation 后回收。持久缓存成功落盘即恢复 clean，并按访问新近度限制为 512 MiB/20 万条。
+generation 后回收。新进程始终读取并哈希真实 loader 输出，持久层只复用由内容身份派生的摘要、优化
+事实和生成体。持久缓存成功原子落盘才恢复 clean，并按访问新近度限制为 512 MiB/20 万条。
 
 ## 10.2 并发模型
 
@@ -222,13 +366,22 @@ Loom 验证 single-flight 交错；循环依赖检测在同线程任务栈上拒
 ## 10.7 缓存身份
 
 目标浏览器、JSX、源码内容、压缩器版本、defines/drop flags、图边界的声明保留名/公开观察名/star 事实、可信编辑和保留名
-进入相关输入。optimizer key 不含最终 chunk 编号，单独保存 retained module IDs；这些边收敛并重新规划
-chunk 后，final-layout key 才标识 JavaScript body。body 发射始终记录 mapping facts，二者在持久层独立
-存取；map 开关不进入 optimize/body 的输入、相等性或哈希。body metadata 同时保存 typed finalizer
-证明的 discarded static request 生成区间，供最终 eager 布局选择性替换；它参与 body hash 并随 mapping
-facts 持久化。当前 `wake-closure-minifier-v12` 与 schema 10 使旧路径产物自然 miss，不做格式迁移；当前
+进入相关输入。optimizer key 不含最终 chunk 编号，持久层单独保存 retained request specifier，再映射为
+本代 module IDs；这些边收敛并重新规划
+chunk 后，final-layout key 才标识 JavaScript body。body 发射始终记录 mapping facts，二者在持久层作为
+一个 provenance group 原子写入和合并；map 开关不进入 optimize/body 的输入、相等性或哈希。body metadata 同时保存 typed finalizer
+证明的全部 internal request 的目标字面量区间、稳定 specifier/role，以及 typed symbol 表决定的三个
+collision-free runtime 参数名和真实的 `metaUrl` runtime capability；default/star interop 已结构化
+内联，不进入 compact runtime 注入；最终布局只能修改经整组校验的 typed
+range，任一界外、重叠、非规范字面量或当代 target 不匹配都使整模块 no-op。它参与 body hash 并随
+mapping facts 持久化。当前 `wake-closure-minifier-v15` 与 schema 13 使旧路径产物自然 miss，不做格式迁移；当前
 AST 的 `SymbolId`/`NodeId` 只可进入本次 optimize/codegen 内部，不进入指纹或持久 key。缓存命中必须与
-冷构建产物等价。
+冷构建产物等价。SCC/拓扑/concat 只消费 retained `ModuleEdges`，wrapper 名称和 Federation expose 在 typed
+codegen/body identity 中决定；非 canonical runtime 名称的 concat 候选保守保留独立 factory，禁止从生成
+body 重建这些语义或通过 helper/metaUrl token 扫描决定 runtime 注入。见
+[ADR 0033](decisions/0033-structured-module-emit-provenance.md)。持久文件的校验 envelope、有界解码、
+并发 authored-key 合并和失败诊断见
+[ADR 0034](decisions/0034-transactional-persistent-cache-boundary.md)。
 
 最终 map 合并按 placement 为 generated token 位置建立一次索引；模块局部 mapping 只进行精确位置与
 单列 separator 回退查询。禁止对每条 mapping 从 token 列表头重新扫描，否则大模块会退化为

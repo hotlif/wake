@@ -12,11 +12,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+模块导出/linker 修改还必须覆盖 readable/minified、tree-shaking 开/关、显式导出与 star 的两种源码顺序、
+不同 star binding 的歧义、同一最终 binding 的多路径、循环晚声明，以及 CommonJS/external opaque fallback。
+结构测试须证明内部 ESM 不再依赖运行时 `Object.keys(namespace)`；retained edit 和 fresh-process
+persistent-cache 构建必须与冷构建产生相同 star plan 与产物。
+
 架构或 crate 依赖修改：
 
 ```bash
 corepack yarn architecture:test
 corepack yarn architecture:check
+```
+
+Federation contract 或其 crate 边界修改至少先运行：
+
+```bash
+cargo +1.95.0 test -p wake_federation_contract
+cargo +1.95.0 clippy -p wake_federation_contract --all-targets -- -D warnings
 ```
 
 `architecture:check` 还执行 [architecture-boundaries.json](architecture-boundaries.json) 的依赖
@@ -83,6 +95,21 @@ exact major 上运行 conformance。
 PnP 门禁通过根工作区精确锁定的 `corepack@0.34.6` 启动 Yarn，避免依赖或覆盖 CI
 镜像中的全局 `yarn` shim。
 
+Crab 已发布组件的 runtime compatibility/resolver 修改至少运行：
+
+```bash
+cargo +1.95.0 test -p wake_resolver
+cargo +1.95.0 test -p wake_bundler
+corepack yarn architecture:test
+corepack yarn architecture:check
+```
+
+测试必须同时覆盖 parser-owned `Import`、`ExportFrom`、`Require` 和不映射的 `DynamicImport`；
+loader 输入字节及字符串、模板、注释、正则诱饵；应用、其他第三方、组件内部/嵌套入口和伪 manifest
+负例；classic/workspace/virtual/unplugged/zip manifest identity；source alias 隔离；PnP declared 与
+`PnpDependency::Undeclared`；以及 readable/minified Node 执行和 cold/retained/persistent-warm 逐字节
+等价。仅检查 bundle 中的包名字符串不能代替运行时与结构化 request identity 证据。
+
 文档修改：
 
 ```bash
@@ -91,7 +118,9 @@ corepack yarn docs:build
 cargo test -p wake_docs
 ```
 
-`docs:check` 校验 Frontmatter、slug、站内路由和仓库文档链接；`docs:build` 验证真实 MDX/React 打包，而不只检查 Markdown 文本。
+`docs:check` 校验 Frontmatter、canonical encoded route、站内路由和仓库文档链接，并执行 runtime route
+codec/search 测试；checker 与浏览器必须直接共享 `runtime/routes.mjs`，不能复制 slug 规则。`docs:build`
+验证真实 MDX/React 打包，而不只检查 Markdown 文本。
 
 Crab CSS 编辑器修改：
 
@@ -204,7 +233,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 - 单文件变化只失效受影响记录；
 - resolver miss、结构性文件和配置身份正确失效；
 - persistent cache 冷/热路径覆盖生成体、保留模块 ID、Source Map/names、concat、顶层 await 和代码分割；
-- 压缩器版本（当前 `wake-closure-minifier-v12`）、defines/drop flags、图/缓存中的声明保留名、公开观察名、
+- 压缩器版本（当前 `wake-closure-minifier-v13`）、defines/drop flags、图/缓存中的声明保留名、公开观察名、
   star 事实、可信编辑和保留名变化必须正确失效。当前 AST 的 `SymbolId` 只用于 optimizer 内部，不是指纹或持久
   缓存输入；
   retained edges 使用不含最终 chunk 编号的 optimizer key；JavaScript body、mapping facts 和 generated
@@ -214,6 +243,64 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 - 同一线程配置下重复 optimize 的名字、指纹和 pass 统计已有确定性用例；bundler 另有 1/4 worker
   的代码、分包 map 和 assets 对拍。更多调度配置以及优化器保留依赖/pass 统计的跨线程对拍仍需扩展；
 - `wake_turbo` 红绿参考、并发压力、循环检测和纯并行降级通过。
+
+### 3.2.1 BuildSession 所有权门禁
+
+- typed `BuildOptions` 必须覆盖 JSX、entry/chunk 命名、单 chunk hash、persistent cache 和完整
+  bundler-facing Federation plan；每个新增语义选项都要有从 session 到产物或缓存身份的回归；
+- one-shot 与 retained 首次构建必须比较完整 `BuildOutput`：bundle、module/update/cache counts、全部
+  diagnostic 字段、entry index、chunk 的 code/kind/id/imports/dynamic imports/styles/source map，以及
+  asset bytes/CSS flag/owner metadata；不能只比较入口字符串；
+- consuming `build_once(self, request)` 用 compile-fail 证明不能调用第二次，并验证 one-shot 不启用
+  retained load cache、不提交输出；retained 则覆盖 generation、强制构建和 current-output 的原子 commit；
+- `scripts/check-architecture.test.mjs` 扫描 `crates/` 下全部 Rust 产品、integration、example 与 benchmark
+  源码，仅豁免 `crates/wake_bundler/src/` 内部实现/unit test；边界外不得引用底层 engine 类型或
+  `BuildSession::from_incremental`。长期契约见
+  [ADR 0027](decisions/0027-build-session-ownership-and-lifetime.md)。
+
+### 3.2.2 BuildGeneration 候选一致性门禁
+
+- generation filesystem 用可变/计数 fake filesystem 覆盖六个 method family、success/failure replay、
+  精确路径拼写、跨 retained/one-shot view 共享、并发 first-query single-flight 和 advance 后重新观察；
+- 必须单独证明明确的非保证：同一 generation 中未观察路径可以看到底层后续变化，且先观察
+  `exists` 不会冻结首次 `read`。测试与文档不得把 lazy query cache 称为事务或全局 filesystem snapshot；
+- application one-shot 与 retained build context 都要证明 container/shared one-shot children 来自同一个
+  `BuildGeneration` epoch；watcher batch 必须在 retained invalidation/build 之前 advance；
+- Federation 类型 emitter 每个候选只允许一次 source observation。最终 `buildId` 通过 rebinding frozen
+  declaration output 得到 types/ambient files，identity 阶段与物化阶段不得二次读取声明源；
+- fault injection 分别覆盖 application、container、shared provider、types、manifest/bootstrap、HTML、
+  hidden map 与 staging commit。任一步失败均不得改变 last-good public tree、returned inventory 或 runtime
+  snapshot，成功候选只跨一次 publication boundary；
+- dev Federation fixture 必须证明 synthetic container、application、exposes 与 shared fallback 共用一个
+  retained session/combined graph，失败 rebuild 不安装部分 snapshot；
+- `scripts/check-architecture.test.mjs` 只扫描 `wake_app` federation 的生产区段，拒绝直接
+  `BuildSession::new*` 与 `Arc::new(OsFileSystem)`，同时要求公开 `BuildGeneration` owner、build-context
+  retained pair 和至少两个 generation-owned transient builds。`#[cfg(test)] mod tests` 内的隔离 fixture
+  明确允许直接构造。长期契约见
+  [ADR 0028](decisions/0028-build-generation-ownership-and-observation-cache.md)。
+
+### 3.2.3 精确文件发布门禁
+
+- `wake_app::output` 的故障注入必须在第二个 install 前失败并证明已安装文件、全部旧目标及外部
+  sentinel 字节恢复；Windows 另以拒绝 delete sharing 的锁定第二目标覆盖真实 OS 失败；
+- 输出身份矩阵覆盖词法同一路径、大小写语义、canonical/symlink/reparse、hard link、缺失目标的
+  canonical parent 投影，以及输入在提交前消失时 fail-closed；成功后不得遗留正常 stage/backup 文件；
+- bundle 覆盖 `entry == outfile`、传递模块碰撞、map 候选碰撞、成功 code+map 替换、锁定 map 回滚和
+  `sourceMap: false` 保留无 ownership 证据的相邻旧 map；返回 inventory 只列本轮实际安装文件；
+- token 的记录型 `ResolutionEnvironment` 必须覆盖根/递归 token 配置及 PnP manifest/archive 读取；
+  Docgen 必须由 `wake_tsdoc` 返回递归类型读取 provenance，不得在产品层猜测固定文件列表；
+- `scripts/check-architecture.test.mjs` 固定统一 publisher、记录型 filesystem、Docgen provenance API、
+  bundle 单次候选提交，并拒绝 token/Docgen 恢复直接 `atomic_write`。长期契约见
+  [ADR 0036](decisions/0036-input-disjoint-exact-output-transactions.md)。
+- Node 公共契约必须静态比较 Rust `OutputFileKind`、TypeScript union，以及 Rust/浏览器/声明三方
+  Federation error code 集合；`federationUpdated` 和未知 native event 都要有 adapter 行为测试。
+- 发布验证必须 pack `npm/wake`，在 PnP 树外从本地 tarball 安装，并以 NodeNext、
+  `skipLibCheck: false` 验证 Federation 两个 ESM 子路径。见
+  [ADR 0029](decisions/0029-node-contract-and-federation-control-ownership.md)。
+- PnP 文件系统必须以同一长生命周期环境覆盖 zip v1 读取、物理 archive 覆写、watcher path 失效与
+  v2 重读；另以两个 archive 证明精确失效不驱逐无关缓存，并用受控并发证明 in-flight v1 open 不能
+  在失效后回填。virtual zip `read_dir` 的返回值必须保持逻辑路径身份。见
+  [ADR 0022](decisions/0022-yarn-pnp-ownership.md)。
 
 ## 3.3 Bundler fixture
 
@@ -238,15 +325,63 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
 比较初值/变更后的实时命名导入和 re-export、循环、default interop、命名 import call/tag receiver、namespace
 身份、shorthand、JSX 共享 Span 与用户 namespace 名冲突。
 
-## 3.4 Docs
+应用与 Docs 目录发布必须在隔离临时项目中覆盖 `outdir = "."`、源码目录、项目祖先、非空未标记
+目录、产品标记不匹配、符号链接和 Windows reparse point；每个拒绝用例都要验证项目及外部 sentinel
+字节不变。成功路径必须覆盖新目录首次声明、重复构建删除 stale、构建失败保留 last-good，以及 Docs
+route shell/public 资源与返回 inventory 一致。危险祖先用例不得把共享系统临时目录作为删除候选。
 
-- Frontmatter 必填字段、重复 slug、MDX 静态属性和 import；
+## 3.4 Wake Federation
+
+- Contract JSON 固定 schema/runtime ABI、camelCase 字段、Asset/Type/Shared shape 与稳定 `FED_*` 码；
+  unknown field、错误 schema/ABI、类型 build drift、MIME/SHA-384 和 production HTTP lock 必须失败；
+- canonical identity 对 map 插入顺序、set-like shared offer/requirement 顺序和部署 URL 不敏感，但对
+  有语义的 CSS/同步资源顺序、内容 hash、package
+  context、policy、expose mode/scope 与 browser target 敏感；不得包含 numeric module ID 或进程身份；
+- 配置覆盖 disabled opt-in、name、严格 HTTP(S) URL/origin、entry/traversal、expose 规范化、isolated
+  scope/open ShadowRoot、host-rendered 无 ShadowRoot、bare shared specifier、strict version 和 singleton
+  coherence group；
+- bundler 覆盖 Application/Expose/DynamicImport/SharedFallback root、多个 expose 公共 chunk、1/4 worker
+  确定性、remote dynamic import lowering，以及静态 import/require/跨 container cycle 诊断；
+- production candidate 覆盖 application retained/one-shot 与 container/shared transient views 同代、声明
+  identity 单次冻结，以及 application/Federation/types/manifest/bootstrap/hidden-map 完整候选一次发布；
+- 浏览器 runtime 覆盖 host-first/loaded-first/fallback、多版本、冻结 singleton/coherence group、并发
+  single-flight、build generation 隔离、SRI/CORS/MIME/timeout 与 `explain()` 决策；
+- Rust/Node 控制面用例覆盖声明 bundle/editor 解析、types-only 更新、isolated remount 与 full reload；
+  development snapshot 生命周期还必须覆盖数百个无客户端 generation 的两代上界、旧 build lease
+  跨大量 types-only 更新仍可取 lazy asset、双连接 refcount/最后断开回收、非法/跨 remote/>8 替换不
+  增长，以及 known-build 404、reserved public/SPA 隔离与 pruned-build typed 410；
+- 真实 Federation WS 测试必须执行 canonical lease/ack 和 connection-local full reload。跨 origin HEAD
+  必须能读取 exposed control headers；header/body 损坏或 remote/build 不匹配只能产生 `FED_NETWORK`，
+  equal-generation 控制不能刷新页面。重连 ack 必须检测 current build/generation gap；相同 build set 的
+  cursor 推进仍要发 lease。多 mount 重名 container 必须失败，一个 remote 的 65+ 帧不得 lag sibling
+  socket。HTTP 410 请求不得向其他 socket 广播；production Manifest development metadata 不得把 asset
+  context 切到开发模式，production accepted Manifest cache 保持原契约；
+  Chromium E2E 覆盖 host-rendered React 同实例/Context、React 17/18 isolated roots、Shadow CSS/portal，
+  以及 remote entry、async chunk 和生产压缩 lazy chunk 的 Source Map。
+- `browser-conformance` CI 在存在受审系统浏览器的目标上显式运行
+  `cargo test --locked --offline -p wake_test --test federation_chromium -- --ignored --nocapture --test-threads=1`；
+  该用例必须验证真实 host `import("remote/expose")`、host singleton 复用、remote fallback/standalone
+  不执行，以及 remoteEntry/expose Source Map 的 `wake://remote@buildId/` 命名空间。
+- editor 类型控制面覆盖未变化 Manifest 不下载 bundle、仅 `dev_follow` probe、失败保留旧 index 并重试、
+  pinned remote 的 lock/build/Manifest/type 摘要一致性，以及关闭 monitor 后不再启动同步写入。
+
+## 3.5 Docs
+
+- Frontmatter 必填字段、重复 route、MDX 静态属性，以及 multiline side-effect/import-from/export-from/
+  literal dynamic import；普通字符串、模板、注释、import attribute 同值诱饵和非字面量 dynamic import
+  必须保持原样；
+- `PageIdentity` 的 id/source/generated/decoded+encoded route 单点派生，非 UTF-8 显式诊断，以及 `%`、
+  `#`、空格、中文、大写 percent hex、unsafe encoded slash/backslash 与 no-double-encoding；
+- 重复 heading 的 metadata/DOM ID 同源，以及 direct refresh、client navigation、静态 decoded shell 和
+  runtime encoded lookup 一致；
+- 两个 checkout 根的页面、registry、Source Map 字节一致；真实 generated/source 相对文件名、synthetic
+  wrapper unmapped、typed ESM/node 映射和同一行 generated-only 终止段；
 - Demo glob、Preview、主题、Props/JSDoc 和 API 表；
 - Components 模式的 Controls、默认值、显式 unset、hash round-trip、视口和错误恢复；
 - `base_path`、404 外壳、public 资源和静态托管路径。
-- 聚合挂载冲突、lazy single-flight、作用域 HMR、事务回滚和根/子 manifest。
+- 聚合挂载冲突、lazy single-flight、按 mount 隔离的 Live Reload、事务回滚和根/子 manifest。
 
-## 3.5 Node API
+## 3.6 Node API
 
 - ESM/CommonJS 导出一致；
 - build、bundle、BuildContext、应用/文档服务器和事件，包括 CLI/Node 的 `minify + sourceMap` 组合；
@@ -254,7 +389,7 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
 - experimental 句柄 dispose、字符串便捷入口和 TypeScript 声明；
 - 主包与五个平台包的版本、文件清单和可选依赖一致。
 
-## 3.6 React 优先测试系统
+## 3.7 React 优先测试系统
 
 - `wake_ecma_vm` 的 V8 realm、Promise job、异常位置、终止和 handle 生命周期；除该 crate 外
   任意 workspace crate 直接依赖 `deno_core` 都必须被架构门禁拒绝；
@@ -339,7 +474,7 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
    生成 blocking、machine-readable `unavailable` 证据；其 clean install 与全部非 browser smoke
    仍必须成功。任何可用目标找不到浏览器或版本不匹配都阻止发布，不得放宽范围或下载自愈；
 6. 只有上述本地 tarball matrix 全绿后，才先发布平台包、最后发布主包；
-7. 发布后继续在 Node 24/26 和全部目标平台执行注册表干净安装与构建 smoke；Node 24 同步复核上述
+7. 发布后继续在 Node 22.14/24/26 和全部目标平台执行注册表干净安装与构建 smoke；Node 24 同步复核上述
    per-target browser evidence，并再次证明 stable readiness 仍为 blocked。平台包的硬上限为 64 MiB
    packed / 192 MiB unpacked，56 MiB packed 起发布 warning；运行期不得下载 host 或浏览器。
 

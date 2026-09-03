@@ -77,9 +77,10 @@ Gate-3 当前含义：同步与增量路径能构建 fixture，缓存命中不�
 TypeScript、JSX、浏览器目标转换和精确 Source Map 已进入应用层。`--sourcemap` 可与生产压缩和代码
 分割同时启用；映射采集不改变不含 trailer 的 JavaScript payload。
 
-# 5. Dev Server 与 HMR
+# 5. Dev Server 与 Live Reload
 
-开发服务器、文件监听、代理、WebSocket、重建指标和 TTY/plain 终端界面已经接入 CLI 与 Node API。
+开发服务器、文件监听、代理、Live Reload WebSocket、重建指标和 TTY/plain 终端界面已经接入 CLI 与
+Node API。当前浏览器能力是成功重建后的整页刷新，不是模块热替换。
 
 # 6. 生产优化
 
@@ -99,6 +100,15 @@ TypeScript、JSX、浏览器目标转换和精确 Source Map 已进入应用层�
 
 ## 7.1 持久化缓存
 
-缓存保存源码 stamp、内容身份、依赖/活跃性/concat 摘要和生成体；配置指纹防止跨选项错误复用。
+缓存不保存源码、路径或文件 stamp；新进程先读取并哈希真实 loader 输出，再按内容身份复用
+依赖/活跃性/concat 摘要、优化事实和原子 body/mapping 组。配置指纹防止跨选项错误复用，schema 13
+事务边界与诊断契约见 [ADR 0034](decisions/0034-transactional-persistent-cache-boundary.md)。
+
+## 7.2 输出发布
+
+Wake-owned 目录产品通过 ownership marker 与 staging/rollback 发布；精确文件产品另以 reader
+provenance 保证输入/输出物理分离，并把 bundle JavaScript 与启用时的 map 作为一个事务集合提交。
+边界见 [ADR 0026](decisions/0026-owned-failure-atomic-output-publication.md) 与
+[ADR 0036](decisions/0036-input-disjoint-exact-output-transactions.md)。
 
 Phase 7 还包括 Node 发布、平台包、终端体验、文档系统和性能工作。当前状态与后续验收分别见 [AUDIT.md](AUDIT.md) 和 [ROADMAP.md](ROADMAP.md)。

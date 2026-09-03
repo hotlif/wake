@@ -158,10 +158,12 @@ mapping 只能做精确位置或单列 separator 回退查询，禁止重新从�
 
 ### 一次性冷构建、并行与解析
 
-CLI/library 的普通单次 `build` 显式使用 `IncrementalBundler::new_one_shot`；watch、dev server 和任何会构建
-第二个 generation 的宿主继续使用 `IncrementalBundler::new`。One-shot bundler 只能调用一次 `build`，其
-`Engine::new_one_shot` 在首个派生 query 后冻结输入，保留 typed `Vc` 边界、并发 single-flight 和同次
-构建内的值共享，但不计算无后续 generation 消费者的 red/green 指纹，也不保存 recomputer 或依赖边。
+CLI/library 的普通单次 `build` 显式使用 `BuildSession::new_one_shot` 和消费式 `build_once`；watch、dev
+server 和任何会构建第二个 generation 的宿主使用 retained `BuildSession::new`。`BuildSession` 是产品侧
+唯一 owner，底层 one-shot engine 只能执行一次 build；其 `Engine::new_one_shot` 在首个派生 query 后冻结
+输入，保留 typed `Vc` 边界、并发 single-flight 和同次构建内的值共享，但不计算无后续 generation
+消费者的 red/green 指纹，也不保存 recomputer 或依赖边。该公共生命周期边界由
+[ADR 0027](0027-build-session-ownership-and-lifetime.md) 定义。
 对应的 `optimize_one_shot` 只省略进程内 `OptimizedProgram` 的跨 generation fingerprint；owned program、
 module plan、诊断、retained dependencies 和 codegen 输出必须与普通 `optimize` 相同。
 
@@ -204,9 +206,9 @@ Resolver 以两个互补缓存压缩 package-root 探测：`package_owners` 把�
 测试时或运行时 fallback。
 
 Validated/consuming、semantic-free、trivial-effect 和 no-op finalization 都是同一 typed pipeline 的证明化
-入口；成功后不保留运行时 feature flag 或双实现。One-shot engine/terminal emission 与 session engine 是由
-宿主生命周期显式选择的两个执行策略，共享同一任务定义和编译产物；one-shot 不得被 session 自动采用，
-session 也不通过探测“是否可能只构建一次”切换语义。
+入口；成功后不保留运行时 feature flag 或双实现。One-shot engine/terminal emission 与 retained engine
+由 `BuildSession` 的显式构造器选择，共享同一任务定义和编译产物；session 不通过运行期探测“是否可能只
+构建一次”切换生命周期或语义。
 
 压缩器版本（当前 `wake-closure-minifier-v12`）、defines/drop flags、稳定的声明保留名/公开观察名/star 链接事实、可信编辑和保留名进入稳定指纹。版本提升使旧产物自然
 miss，不做格式迁移。Map facts 可以独立缓存，但 map 开关不得改变 optimizer/body 身份或 JavaScript
@@ -226,8 +228,8 @@ One-shot 省略的只是没有下一 generation 消费者的进程内元数据�
 - 绑定敏感行为只用 `SymbolId`/`NameId`；`Span` 只表示来源与外部编辑定位，不作为活跃性或 rewrite key。
 - Pre-lower 与 semantic-free 路径只接受 exact linker liveness 和显式 allow-list；证明拒绝必须无部分提交
   地回到普通 semantic 路径，不能放宽 live export、动态作用域、可信编辑或 ESM identity。
-- One-shot 输入在首个 query 后不可变且 bundler 只能 build 一次；watch/dev/session 始终保留普通 engine
-  的 fingerprint、依赖、revision 与精确失效语义。
+- One-shot 输入在首个 query 后不可变，消费式 `BuildSession::build_once` 只能执行一次；retained
+  `BuildSession` 始终保留普通 engine 的 fingerprint、依赖、revision 与精确失效语义。
 - CPU batching 和 128 shards 必须保持请求/输出确定顺序与 single-flight；resolver exact prefetch 失败必须
   回到规范解析，不能吞掉 TS twin、目录、alias、PnP 或诊断。
 - 合成标点和 wrapper 不伪造源码位置；改名映射保留 original name。

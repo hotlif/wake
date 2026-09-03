@@ -38,15 +38,16 @@ ESM/CJS 入口仍包含前代 CSS runtime 的 bare import，且没有完整声�
 
 Wake 对无法原地修改的发布归档保留两条受限迁移措施：
 
-- loader 仅在已经验证包身份的 `@crab-dev/rc-*` 公开入口中，把旧 runtime specifier 改写为
-  `@crab-dev/css`；业务源码、其他第三方包和组件内部文件不会被改写；
+- parser 只为已经验证包身份的 `@crab-dev/rc-*` 公开入口记录的静态 ESM/CJS 依赖选择内部
+  `@crab-dev/css` 解析目标；loader 不改源码，ModuleRec/缓存/codegen 保留旧 runtime 的原始
+  specifier/kind，业务源码、其他第三方包、组件内部文件和动态 import 不映射；
 - Yarn `.yarnrc.yml#packageExtensions` 显式补齐已知 `@crab-dev/rc-*` 归档的 CSS、Lucide、React 与
   React DOM 元数据；这些条目进入 PnP 清单，Wake resolver 不再提供 Components 私有供给桥。
 
 使用旧归档的 Yarn PnP 项目应迁移根仓库 `.yarnrc.yml` 中对应的 `packageExtensions`；不得通过
 `pnpFallbackMode` 或隐式顶层 fallback 放宽可见性。当所有受支持组件版本都声明完整元数据后，应删除
-这些扩展及 loader 迁移，但保留隔离 PnP fixture。详见
-[ADR 0006](decisions/0006-crab-css-public-contract.md)。
+这些扩展及 resolution bridge，但保留隔离 PnP fixture。详见
+[ADR 0035](decisions/0035-parser-owned-crab-runtime-resolution.md)。
 
 ## 发布与验证
 
