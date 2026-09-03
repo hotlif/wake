@@ -20,7 +20,11 @@ pub mod zip;
 
 pub use atom::{Atom, Interner};
 pub use diagnostic::{Diagnostic, Label, Severity};
-pub use fs::{FileSystem, MemoryFileSystem, OsFileSystem};
+pub use fs::{
+    FileSystem, FileSystemProjection, MemoryFileSystem, OsFileSystem, OwnedFileTree,
+    OwnedFileTreeBuilder, OwnedFileTreeError, OwnedOverlayFileSystem, ProjectedFileSystem,
+    ProjectedRelativePath,
+};
 pub use render::{RenderStyle, render};
 pub use source::{LineCol, SourceFile};
 pub use span::Span;
