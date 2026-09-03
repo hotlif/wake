@@ -10,6 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use wake_ecma_parser::parse_declaration_facts;
+
+pub use wake_ecma_parser::{
+    DeclarationFactError, DeclarationFacts, DeclarationImportUsage, DeclarationItemFact,
+    DeclarationItemKind, DeclarationRequestFact, DeclarationRequestRole, SourceType,
+    validate_declaration_module, validate_declaration_module_allow_any,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApiDoc {
@@ -47,11 +54,565 @@ pub struct ComponentApiDoc {
     pub api: ApiDoc,
 }
 
+/// Component API extraction plus the complete set of source files whose contents contributed to
+/// it. Product layers use this provenance to keep generated exact outputs disjoint from inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentApiExtraction {
+    pub document: ComponentApiDoc,
+    pub inputs: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationFile {
     pub source: PathBuf,
     pub file_name: PathBuf,
     pub code: String,
+}
+
+/// One explicitly-owned declaration entry in a multi-entry library build.
+///
+/// `owner` is supplied by the product layer (for example a federation expose key). It is never
+/// inferred from a file name, so two entries with the same basename remain distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationEntry {
+    pub owner: String,
+    pub source: PathBuf,
+}
+
+impl DeclarationEntry {
+    pub fn new(owner: impl Into<String>, source: impl Into<PathBuf>) -> Self {
+        Self {
+            owner: owner.into(),
+            source: source.into(),
+        }
+    }
+}
+
+/// The declaration files owned by one entry.
+///
+/// Every bundle has its own `index.d.ts`; the owner is the namespace that disambiguates that
+/// filename from another entry's `index.d.ts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationBundle {
+    pub owner: String,
+    pub source: PathBuf,
+    pub files: Vec<DeclarationFile>,
+}
+
+/// Immutable context passed to declaration request rewriters during pure rendering.
+#[derive(Debug, Clone, Copy)]
+pub struct DeclarationRenderRequest<'a> {
+    pub owner: &'a str,
+    pub module_source: &'a Path,
+    pub output_file: &'a Path,
+    pub specifier: &'a str,
+    pub role: DeclarationRequestRole,
+    pub resolved_source: Option<&'a Path>,
+    pub resolved_output: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclarationTemplateContext {
+    Standalone,
+    Ambient,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenDeclarationModule {
+    facts: DeclarationFacts,
+    requests: Vec<Vec<FrozenDeclarationRequest>>,
+    included_items: Vec<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenDeclarationRequest {
+    resolved_source: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenDeclarationEntry {
+    entry: DeclarationEntry,
+    reachable: BTreeSet<PathBuf>,
+}
+
+/// A declaration graph whose source reads, parses, request resolution and entry reachability are
+/// complete. Rendering this value performs no filesystem access and can be repeated with different
+/// request bindings.
+#[derive(Debug, Clone)]
+pub struct FrozenDeclarationGraph {
+    root: PathBuf,
+    entries: Vec<FrozenDeclarationEntry>,
+    modules: BTreeMap<PathBuf, FrozenDeclarationModule>,
+}
+
+impl FrozenDeclarationGraph {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = &DeclarationEntry> {
+        self.entries.iter().map(|entry| &entry.entry)
+    }
+
+    /// Canonical source inputs, in deterministic path order.
+    pub fn inputs(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.modules.keys().map(PathBuf::as_path)
+    }
+
+    /// Look up facts by one of the canonical paths returned by [`Self::inputs`]. This method is an
+    /// exact frozen-map lookup and deliberately performs no path canonicalization or filesystem I/O.
+    pub fn module_facts(&self, source: impl AsRef<Path>) -> Option<&DeclarationFacts> {
+        self.modules
+            .get(source.as_ref())
+            .map(|module| &module.facts)
+    }
+
+    /// Render every owner with the default relative local request mapping.
+    pub fn render(&self) -> Vec<DeclarationBundle> {
+        self.render_in_context(DeclarationTemplateContext::Standalone, |_| None)
+    }
+
+    /// Render one owner with the default relative local request mapping.
+    pub fn render_entry(&self, owner: &str) -> Option<DeclarationBundle> {
+        self.render_entry_in_context(owner, DeclarationTemplateContext::Standalone, |_| None)
+    }
+
+    /// Render parser-proven bodies for nesting inside `declare module { ... }` blocks.
+    pub fn render_ambient(&self) -> Vec<DeclarationBundle> {
+        self.render_in_context(DeclarationTemplateContext::Ambient, |_| None)
+    }
+
+    /// Render one parser-proven body for nesting inside a `declare module { ... }` block.
+    pub fn render_entry_ambient(&self, owner: &str) -> Option<DeclarationBundle> {
+        self.render_entry_in_context(owner, DeclarationTemplateContext::Ambient, |_| None)
+    }
+
+    /// Purely render every owner. Returning `Some(specifier)` overrides the default binding for a
+    /// request; returning `None` preserves external requests and maps local requests to the
+    /// corresponding declaration output.
+    pub fn render_with<F>(&self, mut rewrite: F) -> Vec<DeclarationBundle>
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        self.render_in_context(DeclarationTemplateContext::Standalone, &mut rewrite)
+    }
+
+    /// Purely render ambient-module bodies with an optional request override.
+    pub fn render_ambient_with<F>(&self, mut rewrite: F) -> Vec<DeclarationBundle>
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        self.render_in_context(DeclarationTemplateContext::Ambient, &mut rewrite)
+    }
+
+    fn render_in_context<F>(
+        &self,
+        context: DeclarationTemplateContext,
+        mut rewrite: F,
+    ) -> Vec<DeclarationBundle>
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        self.entries
+            .iter()
+            .map(|entry| self.render_frozen_entry(entry, context, &mut rewrite))
+            .collect()
+    }
+
+    /// Purely render one owner with an optional request override.
+    pub fn render_entry_with<F>(&self, owner: &str, mut rewrite: F) -> Option<DeclarationBundle>
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        self.render_entry_in_context(owner, DeclarationTemplateContext::Standalone, &mut rewrite)
+    }
+
+    /// Purely render one ambient-module body with an optional request override.
+    pub fn render_entry_ambient_with<F>(
+        &self,
+        owner: &str,
+        mut rewrite: F,
+    ) -> Option<DeclarationBundle>
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        self.render_entry_in_context(owner, DeclarationTemplateContext::Ambient, &mut rewrite)
+    }
+
+    fn render_entry_in_context<F>(
+        &self,
+        owner: &str,
+        context: DeclarationTemplateContext,
+        mut rewrite: F,
+    ) -> Option<DeclarationBundle>
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        self.entries
+            .iter()
+            .find(|entry| entry.entry.owner == owner)
+            .map(|entry| self.render_frozen_entry(entry, context, &mut rewrite))
+    }
+
+    fn render_frozen_entry<F>(
+        &self,
+        entry: &FrozenDeclarationEntry,
+        context: DeclarationTemplateContext,
+        rewrite: &mut F,
+    ) -> DeclarationBundle
+    where
+        F: FnMut(&DeclarationRenderRequest<'_>) -> Option<String>,
+    {
+        let output_paths = declaration_output_paths(
+            &self.root,
+            &entry.entry.source,
+            entry.reachable.iter().map(PathBuf::as_path),
+        );
+
+        let mut files = entry
+            .reachable
+            .iter()
+            .map(|source| {
+                let module = self
+                    .modules
+                    .get(source)
+                    .expect("reachable declaration module is frozen");
+                let output_file = &output_paths[source];
+                let mut code = String::new();
+
+                for (item_index, item) in module.facts.items().iter().enumerate() {
+                    if !module.included_items[item_index] {
+                        continue;
+                    }
+                    let frozen_requests = &module.requests[item_index];
+                    debug_assert!(frozen_requests.iter().all(|request| {
+                        request
+                            .resolved_source
+                            .as_ref()
+                            .is_none_or(|target| entry.reachable.contains(target))
+                    }));
+
+                    let (template, requests) = match context {
+                        DeclarationTemplateContext::Standalone => {
+                            (item.template(), item.requests())
+                        }
+                        DeclarationTemplateContext::Ambient => {
+                            (item.ambient_template(), item.ambient_requests())
+                        }
+                    };
+                    let mut cursor = 0;
+                    for (request, frozen) in requests.iter().zip(frozen_requests) {
+                        let range = request.template_range();
+                        code.push_str(&template[cursor..range.start]);
+                        let resolved_output = frozen
+                            .resolved_source
+                            .as_ref()
+                            .and_then(|target| output_paths.get(target));
+                        let context = DeclarationRenderRequest {
+                            owner: &entry.entry.owner,
+                            module_source: source,
+                            output_file,
+                            specifier: request.specifier(),
+                            role: request.role(),
+                            resolved_source: frozen.resolved_source.as_deref(),
+                            resolved_output: resolved_output.map(PathBuf::as_path),
+                        };
+                        let override_specifier = rewrite(&context);
+                        if let Some(specifier) = override_specifier {
+                            code.push_str(&quote_like(&template[range.clone()], &specifier));
+                        } else if let Some(target_output) = resolved_output {
+                            let specifier =
+                                relative_declaration_specifier(output_file, target_output);
+                            code.push_str(&quote_like(&template[range.clone()], &specifier));
+                        } else {
+                            code.push_str(&template[range.clone()]);
+                        }
+                        cursor = range.end;
+                    }
+                    code.push_str(&template[cursor..]);
+                    if !template.ends_with('\n') {
+                        code.push('\n');
+                    }
+                }
+
+                if code.is_empty() {
+                    code.push_str("export {};\n");
+                }
+                DeclarationFile {
+                    source: source.clone(),
+                    file_name: output_file.clone(),
+                    code,
+                }
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+        DeclarationBundle {
+            owner: entry.entry.owner.clone(),
+            source: entry.entry.source.clone(),
+            files,
+        }
+    }
+}
+
+/// Read and parse all declaration inputs once, sharing modules between every explicit owner.
+pub fn prepare_library_declarations(
+    project_root: impl AsRef<Path>,
+    entries: impl IntoIterator<Item = DeclarationEntry>,
+) -> Result<FrozenDeclarationGraph, ApiError> {
+    prepare_library_declarations_with_file_system(
+        project_root.as_ref(),
+        entries,
+        &OsDeclarationFileSystem,
+    )
+}
+
+/// Minimal filesystem snapshot consumed while freezing a declaration graph.
+///
+/// Product layers should adapt the same immutable/recording filesystem used by their generation;
+/// mixing this interface with process-global filesystem reads would break snapshot consistency.
+pub trait DeclarationFileSystem: Send + Sync {
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, String>;
+    fn is_file(&self, path: &Path) -> bool;
+    fn read_to_string(&self, path: &Path) -> Result<String, String>;
+}
+
+/// Process filesystem adapter used by the compatibility API.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsDeclarationFileSystem;
+
+impl DeclarationFileSystem for OsDeclarationFileSystem {
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, String> {
+        fs::canonicalize(path).map_err(|error| error.to_string())
+    }
+
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+
+    fn read_to_string(&self, path: &Path) -> Result<String, String> {
+        fs::read_to_string(path).map_err(|error| error.to_string())
+    }
+}
+
+/// Freeze declarations against an explicitly supplied filesystem snapshot.
+pub fn prepare_library_declarations_with_file_system(
+    project_root: &Path,
+    entries: impl IntoIterator<Item = DeclarationEntry>,
+    file_system: &(impl DeclarationFileSystem + ?Sized),
+) -> Result<FrozenDeclarationGraph, ApiError> {
+    let root = declaration_canonical(file_system, project_root)?;
+    let mut owners = BTreeSet::new();
+    let mut frozen_entries = Vec::new();
+    for mut entry in entries {
+        if entry.owner.is_empty() {
+            return Err(ApiError::InvalidSource(
+                entry.source,
+                "declaration entry owner cannot be empty".to_string(),
+            ));
+        }
+        if !owners.insert(entry.owner.clone()) {
+            return Err(ApiError::InvalidSource(
+                entry.source,
+                format!("duplicate declaration entry owner `{}`", entry.owner),
+            ));
+        }
+        entry.source = if entry.source.is_absolute() {
+            declaration_canonical(file_system, &entry.source)?
+        } else {
+            declaration_canonical(file_system, &root.join(&entry.source))?
+        };
+        if !entry.source.starts_with(&root) {
+            return Err(ApiError::InvalidSource(
+                entry.source,
+                "library declaration entry escapes the project root".to_string(),
+            ));
+        }
+        frozen_entries.push(FrozenDeclarationEntry {
+            entry,
+            reachable: BTreeSet::new(),
+        });
+    }
+    if frozen_entries.is_empty() {
+        return Err(ApiError::InvalidSource(
+            root,
+            "at least one declaration entry is required".to_string(),
+        ));
+    }
+
+    let mut modules = BTreeMap::<PathBuf, FrozenDeclarationModule>::new();
+    for frozen_entry in &mut frozen_entries {
+        let entry_source = frozen_entry.entry.source.clone();
+        let mut pending = vec![entry_source.clone()];
+        while let Some(path) = pending.pop() {
+            if !frozen_entry.reachable.insert(path.clone()) {
+                continue;
+            }
+            if !modules.contains_key(&path) {
+                let source = file_system
+                    .read_to_string(&path)
+                    .map_err(|error| ApiError::Io(path.clone(), error))?;
+                let source_type = declaration_source_type(&path)?;
+                let facts = parse_declaration_facts(&source, source_type)
+                    .map_err(|error| ApiError::InvalidSource(path.clone(), error.to_string()))?;
+                if facts.contains_forbidden_any() {
+                    return Err(ApiError::InvalidSource(
+                        path.clone(),
+                        "public declarations cannot contain the `any` type".to_string(),
+                    ));
+                }
+                let mut requests = Vec::with_capacity(facts.items().len());
+                let mut included_items = Vec::with_capacity(facts.items().len());
+                for item in facts.items() {
+                    validate_declaration_template(
+                        path.as_path(),
+                        item.template(),
+                        item.requests(),
+                    )?;
+                    validate_declaration_template(
+                        path.as_path(),
+                        item.ambient_template(),
+                        item.ambient_requests(),
+                    )?;
+                    if item.requests().len() != item.ambient_requests().len()
+                        || item.requests().iter().zip(item.ambient_requests()).any(
+                            |(standalone, ambient)| {
+                                standalone.specifier() != ambient.specifier()
+                                    || standalone.role() != ambient.role()
+                                    || standalone.source_span() != ambient.source_span()
+                            },
+                        )
+                    {
+                        return Err(ApiError::InvalidSource(
+                            path.clone(),
+                            "standalone and ambient declaration requests do not match".to_string(),
+                        ));
+                    }
+                    let runtime_side_effect =
+                        item.import_usage() == Some(DeclarationImportUsage::RuntimeSideEffect);
+                    if runtime_side_effect && !is_declaration_file_path(&path) {
+                        requests.push(Vec::new());
+                        included_items.push(false);
+                        continue;
+                    }
+                    let mut item_requests = Vec::with_capacity(item.requests().len());
+                    let mut include_item = true;
+                    for request in item.requests() {
+                        let resolved_source = if request.specifier().starts_with('.') {
+                            let target = if runtime_side_effect {
+                                match resolve_optional_local_declaration_import(
+                                    file_system,
+                                    &path,
+                                    request.specifier(),
+                                )? {
+                                    Some(target) => target,
+                                    None => {
+                                        include_item = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                resolve_required_local_declaration_import(
+                                    file_system,
+                                    &path,
+                                    request.specifier(),
+                                )?
+                            };
+                            if !target.starts_with(&root) {
+                                return Err(ApiError::InvalidSource(
+                                    path.clone(),
+                                    format!(
+                                        "local declaration dependency `{}` escapes the project root",
+                                        request.specifier()
+                                    ),
+                                ));
+                            }
+                            Some(target)
+                        } else {
+                            None
+                        };
+                        item_requests.push(FrozenDeclarationRequest { resolved_source });
+                    }
+                    if !include_item {
+                        item_requests.clear();
+                    }
+                    requests.push(item_requests);
+                    included_items.push(include_item);
+                }
+                modules.insert(
+                    path.clone(),
+                    FrozenDeclarationModule {
+                        facts,
+                        requests,
+                        included_items,
+                    },
+                );
+            }
+
+            let module = modules
+                .get(&path)
+                .expect("declaration module was inserted before traversal");
+            for (item_index, (item, frozen_requests)) in module
+                .facts
+                .items()
+                .iter()
+                .zip(&module.requests)
+                .enumerate()
+            {
+                if !module.included_items[item_index] {
+                    continue;
+                }
+                for (_request, frozen) in item.requests().iter().zip(frozen_requests) {
+                    if let Some(target) = &frozen.resolved_source {
+                        pending.push(target.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(FrozenDeclarationGraph {
+        root,
+        entries: frozen_entries,
+        modules,
+    })
+}
+
+/// Validate a generated declaration body with the same parser-owned facts used by the graph.
+pub fn validate_declaration_body(
+    source_path: impl AsRef<Path>,
+    body: &str,
+) -> Result<DeclarationFacts, ApiError> {
+    let source_path = source_path.as_ref();
+    let source_type = declaration_source_type(source_path)?;
+    validate_declaration_module_allow_any(body, source_type)
+        .map_err(|error| ApiError::InvalidSource(source_path.to_path_buf(), error.to_string()))
+}
+
+/// Validate a body that will be nested inside an already-ambient `declare module` block.
+///
+/// TypeScript rejects redundant `declare` modifiers in that context. The decision is based on the
+/// parser-owned modifier fact rather than scanning declaration text.
+pub fn validate_ambient_declaration_body(
+    source_path: impl AsRef<Path>,
+    body: &str,
+) -> Result<DeclarationFacts, ApiError> {
+    let source_path = source_path.as_ref();
+    let facts = validate_declaration_body(source_path, body)?;
+    if let Some(item) = facts
+        .items()
+        .iter()
+        .find(|item| item.has_declare_modifier())
+    {
+        return Err(ApiError::InvalidSource(
+            source_path.to_path_buf(),
+            format!(
+                "redundant `declare` modifier in ambient body at byte {}..{}",
+                item.source_span().lo,
+                item.source_span().hi
+            ),
+        ));
+    }
+    Ok(facts)
 }
 
 /// Emit a dependency-free declaration module set for a library entry.
@@ -63,70 +624,14 @@ pub fn emit_library_declarations(
     project_root: impl AsRef<Path>,
     entry: impl AsRef<Path>,
 ) -> Result<Vec<DeclarationFile>, ApiError> {
-    let root = canonical(project_root.as_ref())?;
-    let entry = if entry.as_ref().is_absolute() {
-        canonical(entry.as_ref())?
-    } else {
-        canonical(&root.join(entry.as_ref()))?
-    };
-    if !entry.starts_with(&root) {
-        return Err(ApiError::InvalidSource(
-            entry,
-            "library declaration entry escapes the project root".to_string(),
-        ));
-    }
-
-    let mut pending = vec![entry.clone()];
-    let mut sources = BTreeMap::new();
-    while let Some(path) = pending.pop() {
-        if sources.contains_key(&path) {
-            continue;
-        }
-        let source = read(&path)?;
-        for specifier in declaration_module_specifiers(&source, path == entry) {
-            if specifier.starts_with('.') {
-                let target = resolve_local_import(&path, &specifier)?;
-                if !target.starts_with(&root) {
-                    return Err(ApiError::InvalidSource(
-                        path.clone(),
-                        format!(
-                            "local declaration dependency `{specifier}` escapes the project root"
-                        ),
-                    ));
-                }
-                pending.push(target);
-            }
-        }
-        sources.insert(path, source);
-    }
-
-    let mut output_paths = BTreeMap::new();
-    for path in sources.keys() {
-        let output = if path == &entry {
-            PathBuf::from("index.d.ts")
-        } else {
-            let relative = path.strip_prefix(&root).map_err(|_| {
-                ApiError::InvalidSource(path.clone(), "source escaped project root".to_string())
-            })?;
-            let mut output = PathBuf::from("_wake").join(relative);
-            output.set_extension("d.ts");
-            output
-        };
-        output_paths.insert(path.clone(), output);
-    }
-
-    let mut files = Vec::with_capacity(sources.len());
-    for (path, source) in sources {
-        let current_output = &output_paths[&path];
-        let code = emit_declaration_module(&path, &source, current_output, &output_paths)?;
-        files.push(DeclarationFile {
-            source: path.clone(),
-            file_name: current_output.clone(),
-            code,
-        });
-    }
-    files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-    Ok(files)
+    let graph = prepare_library_declarations(
+        project_root,
+        [DeclarationEntry::new("entry", entry.as_ref())],
+    )?;
+    Ok(graph
+        .render_entry("entry")
+        .expect("compatibility entry is present")
+        .files)
 }
 
 #[derive(Debug)]
@@ -250,8 +755,16 @@ pub fn extract_demo_props(source: impl AsRef<Path>) -> Result<Option<ApiDoc>, Ap
 /// function/arrow parameter, or `forwardRef<Ref, Props>`. Missing public annotations are errors;
 /// this function never invents `any`.
 pub fn extract_component_api(source: impl AsRef<Path>) -> Result<ComponentApiDoc, ApiError> {
+    extract_component_api_with_provenance(source).map(|extraction| extraction.document)
+}
+
+/// Extract a component API and retain authoritative successful-read provenance.
+pub fn extract_component_api_with_provenance(
+    source: impl AsRef<Path>,
+) -> Result<ComponentApiExtraction, ApiError> {
     let source_path = canonical(source.as_ref())?;
-    let source_text = read(&source_path)?;
+    let mut resolver = Resolver::default();
+    let source_text = resolver.read_source(&source_path)?;
     let (display_name, declaration_offset) =
         default_component_name(&source_text).ok_or_else(|| {
             ApiError::InvalidSource(
@@ -267,7 +780,6 @@ pub fn extract_component_api(source: impl AsRef<Path>) -> Result<ComponentApiDoc
     })?;
 
     let imports = parse_imports(&source_text);
-    let mut resolver = Resolver::default();
     let mut resolved = Resolved::default();
     resolver.merge_expression(
         &source_path,
@@ -290,7 +802,7 @@ pub fn extract_component_api(source: impl AsRef<Path>) -> Result<ComponentApiDoc
     });
     deduplicate(&mut resolved);
     let description = preceding_jsdoc(&source_text, declaration_offset).description;
-    Ok(ComponentApiDoc {
+    let document = ComponentApiDoc {
         display_name,
         description: if description.is_empty() {
             resolved.description.clone()
@@ -305,6 +817,10 @@ pub fn extract_component_api(source: impl AsRef<Path>) -> Result<ComponentApiDoc
             inherited: resolved.inherited,
             warnings: resolved.warnings,
         },
+    };
+    Ok(ComponentApiExtraction {
+        document,
+        inputs: resolver.inputs.into_iter().collect(),
     })
 }
 
@@ -466,6 +982,7 @@ struct Resolved {
 #[derive(Debug, Default)]
 struct Resolver {
     cache: BTreeMap<(PathBuf, String), Resolved>,
+    inputs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -503,7 +1020,7 @@ impl Resolver {
         }
 
         stack.push(key.clone());
-        let source = read(path)?;
+        let source = self.read_source(path)?;
         let imports = parse_imports(&source);
         let declaration =
             find_declaration(&source, path, symbol)?.ok_or_else(|| ApiError::SymbolNotFound {
@@ -607,6 +1124,12 @@ impl Resolver {
             }
         }
         Ok(())
+    }
+
+    fn read_source(&mut self, path: &Path) -> Result<String, ApiError> {
+        let source = read(path)?;
+        self.inputs.insert(path.to_path_buf());
+        Ok(source)
     }
 }
 
@@ -916,28 +1439,102 @@ fn parse_jsdoc(comment: Option<&str>) -> JsDoc {
 }
 
 fn resolve_local_import(path: &Path, specifier: &str) -> Result<PathBuf, ApiError> {
+    resolve_local_import_with_file_system(&OsDeclarationFileSystem, path, specifier)
+}
+
+fn resolve_local_import_with_file_system(
+    file_system: &(impl DeclarationFileSystem + ?Sized),
+    path: &Path,
+    specifier: &str,
+) -> Result<PathBuf, ApiError> {
+    let (base, candidates) = local_import_candidates(path, specifier);
+    candidates
+        .into_iter()
+        .find(|candidate| file_system.is_file(candidate))
+        .map(|candidate| declaration_canonical(file_system, &candidate))
+        .transpose()?
+        .ok_or_else(|| ApiError::Io(base, format!("cannot resolve local import `{specifier}`")))
+}
+
+fn resolve_required_local_declaration_import(
+    file_system: &(impl DeclarationFileSystem + ?Sized),
+    path: &Path,
+    specifier: &str,
+) -> Result<PathBuf, ApiError> {
+    let (base, candidates) = local_import_candidates(path, specifier);
+    resolve_declaration_candidate(file_system, candidates)?
+        .ok_or_else(|| ApiError::Io(base, format!("cannot resolve local import `{specifier}`")))
+}
+
+fn resolve_optional_local_declaration_import(
+    file_system: &(impl DeclarationFileSystem + ?Sized),
+    path: &Path,
+    specifier: &str,
+) -> Result<Option<PathBuf>, ApiError> {
+    let (_, candidates) = local_import_candidates(path, specifier);
+    resolve_declaration_candidate(file_system, candidates)
+}
+
+fn resolve_declaration_candidate(
+    file_system: &(impl DeclarationFileSystem + ?Sized),
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>, ApiError> {
+    for candidate in candidates {
+        // A runtime resource may exist at the literal request while a declaration shim such as
+        // `theme.scss.d.ts` appears later in the candidate list. Never canonicalize or parse the
+        // opaque resource itself; keep searching only among declaration-capable source paths.
+        if declaration_source_type(&candidate).is_err() {
+            continue;
+        }
+        if !file_system.is_file(&candidate) {
+            continue;
+        }
+        let candidate = declaration_canonical(file_system, &candidate)?;
+        if declaration_source_type(&candidate).is_ok() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn local_import_candidates(path: &Path, specifier: &str) -> (PathBuf, Vec<PathBuf>) {
     let base = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(specifier);
-    let mut candidates = vec![base.clone()];
+    let mut candidates = Vec::new();
     if let Some(extension) = base.extension().and_then(|value| value.to_str()) {
+        let source_base = base.with_extension("");
+        match extension {
+            "mjs" => candidates
+                .extend([".mts", ".d.mts"].map(|suffix| append_path_text(&source_base, suffix))),
+            "cjs" => candidates
+                .extend([".cts", ".d.cts"].map(|suffix| append_path_text(&source_base, suffix))),
+            _ => {}
+        }
+        candidates.push(base.clone());
         let source_base = if matches!(extension, "js" | "jsx" | "mjs" | "cjs") {
-            base.with_extension("")
+            source_base
         } else {
             base.clone()
         };
         candidates
             .extend([".ts", ".tsx", ".d.ts"].map(|suffix| append_path_text(&source_base, suffix)));
     } else {
+        candidates.push(base.clone());
         candidates.extend(["ts", "tsx", "d.ts"].map(|ext| base.with_extension(ext)));
         candidates.extend(["index.ts", "index.tsx", "index.d.ts"].map(|name| base.join(name)));
     }
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .map(|candidate| fs::canonicalize(&candidate).unwrap_or(candidate))
-        .ok_or_else(|| ApiError::Io(base, format!("cannot resolve local import `{specifier}`")))
+    (base, candidates)
+}
+
+fn declaration_canonical(
+    file_system: &(impl DeclarationFileSystem + ?Sized),
+    path: &Path,
+) -> Result<PathBuf, ApiError> {
+    file_system
+        .canonicalize(path)
+        .map_err(|error| ApiError::Io(path.to_path_buf(), error))
 }
 
 fn append_path_text(path: &Path, suffix: &str) -> PathBuf {
@@ -1108,470 +1705,93 @@ fn strip_parens(mut value: &str) -> &str {
     }
 }
 
-fn declaration_module_specifiers(source: &str, is_entry: bool) -> Vec<String> {
-    let regex = Regex::new(
-        r#"(?m)^\s*(?:import(?:[\s\S]*?\sfrom\s*)?|export(?:[\s\S]*?\sfrom\s*))["']([^"']+)["']\s*;"#,
-    )
-    .expect("valid module specifier regex");
-    regex
-        .captures_iter(source)
-        .filter_map(|captures| {
-            let statement = captures.get(0)?.as_str().trim_start();
-            let declaration_edge = is_entry
-                || statement.starts_with("export")
-                || statement.starts_with("import type")
-                || statement.contains("{ type ")
-                || statement.contains("{type ");
-            declaration_edge.then(|| captures[1].to_string())
-        })
-        .collect()
+fn declaration_source_type(path: &Path) -> Result<SourceType, ApiError> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("tsx") => Ok(SourceType::Tsx),
+        Some("ts" | "mts" | "cts") => Ok(SourceType::TypeScript),
+        _ => Err(ApiError::InvalidSource(
+            path.to_path_buf(),
+            "library declarations require a .ts, .tsx, .mts, .cts, or .d.ts source".to_string(),
+        )),
+    }
 }
 
-fn emit_declaration_module(
+fn is_declaration_file_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts")
+}
+
+fn validate_declaration_template(
     path: &Path,
-    source: &str,
-    current_output: &Path,
-    output_paths: &BTreeMap<PathBuf, PathBuf>,
-) -> Result<String, ApiError> {
-    let default_name = Regex::new(r"(?m)^\s*export\s+default\s+([A-Za-z_$][\w$]*)\s*;")
-        .expect("valid default export regex")
-        .captures(source)
-        .map(|captures| captures[1].to_string());
-    let mut statements = BTreeMap::<usize, (usize, String)>::new();
-
-    let module_statement = Regex::new(
-        r#"(?m)^\s*(?:(?:import(?:[\s\S]*?\sfrom\s*)?)|(?:export(?:[\s\S]*?\sfrom\s*)))["']([^"']+)["']\s*;"#,
-    )
-    .expect("valid module statement regex");
-    for captures in module_statement.captures_iter(source) {
-        let whole = captures.get(0).expect("whole module statement");
-        let specifier = &captures[1];
-        let mut text = whole.as_str().trim().to_string();
-        if specifier.starts_with('.') {
-            let target = resolve_local_import(path, specifier)?;
-            let Some(target_output) = output_paths.get(&target) else {
-                continue;
-            };
-            let rewritten = relative_module_specifier(current_output, target_output);
-            text = text.replacen(specifier, &rewritten, 1);
-        }
-        statements.insert(whole.start(), (whole.end(), text));
-    }
-
-    let declaration = Regex::new(
-        r"(?m)^\s*(?:(?:export|declare)\s+)*(?:abstract\s+)?(interface|type|enum|namespace)\s+[A-Za-z_$][\w$]*",
-    )
-    .expect("valid declaration regex");
-    for found in declaration.find_iter(source) {
-        let text = found.as_str();
-        let end = if text.contains("type ") {
-            find_statement_end(source, found.end())
-        } else {
-            let open = source[found.end()..]
-                .find('{')
-                .map(|offset| found.end() + offset)
-                .ok_or_else(|| {
-                    ApiError::InvalidSource(
-                        path.to_path_buf(),
-                        format!("type declaration at byte {} has no body", found.start()),
-                    )
-                })?;
-            find_matching(source, open, '{', '}')
-                .map(|close| close + 1)
-                .ok_or_else(|| {
-                    ApiError::InvalidSource(
-                        path.to_path_buf(),
-                        format!(
-                            "type declaration at byte {} has no closing brace",
-                            found.start()
-                        ),
-                    )
-                })?
-        };
-        statements.insert(
-            found.start(),
-            (end, source[found.start()..end].trim().to_string()),
-        );
-    }
-
-    let function = Regex::new(
-        r"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*(?:\s*<[^>{}]*>)?\s*\(",
-    )
-    .expect("valid function regex");
-    for found in function.find_iter(source) {
-        let open = source[..found.end()]
-            .rfind('(')
-            .expect("function has opening paren");
-        let close = find_matching(source, open, '(', ')').ok_or_else(|| {
-            ApiError::InvalidSource(
-                path.to_path_buf(),
-                "function parameter list is incomplete".to_string(),
-            )
-        })?;
-        let body = find_function_body(source, close + 1).ok_or_else(|| {
-            ApiError::InvalidSource(
-                path.to_path_buf(),
-                "function declaration has no body".to_string(),
-            )
-        })?;
-        let body_end = find_matching(source, body, '{', '}').ok_or_else(|| {
-            ApiError::InvalidSource(
-                path.to_path_buf(),
-                "function body is incomplete".to_string(),
-            )
-        })?;
-        let between = source[close + 1..body].trim();
-        let mut signature = source[found.start()..=close].trim().to_string();
-        signature = signature
-            .replace("export default async function", "export default function")
-            .replace("export async function", "export function");
-        if signature.starts_with("async function") {
-            signature = signature.replacen("async function", "declare function", 1);
-        } else if signature.starts_with("function") {
-            signature.insert_str(0, "declare ");
-        }
-        if between.starts_with(':') {
-            signature.push(' ');
-            signature.push_str(between);
-        } else if path.extension().and_then(|value| value.to_str()) == Some("tsx") {
-            signature.push_str(": import(\"react\").JSX.Element");
-        } else {
-            return Err(ApiError::InvalidSource(
-                path.to_path_buf(),
-                format!(
-                    "public function at byte {} needs an explicit return type",
-                    found.start()
-                ),
-            ));
-        }
-        signature.push(';');
-        statements.insert(found.start(), (body_end + 1, signature));
-    }
-
-    let variable = Regex::new(
-        r"(?m)^\s*(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*",
-    )
-    .expect("valid variable regex");
-    for captures in variable.captures_iter(source) {
-        let whole = captures.get(0).expect("whole variable declaration");
-        let name = &captures[1];
-        let exported = whole.as_str().contains("export ") || default_name.as_deref() == Some(name);
-        if !exported {
-            continue;
-        }
-        let end = find_statement_end(source, whole.end());
-        let tail = &source[whole.end()..end];
-        let Some(equal) = find_variable_assignment(tail) else {
-            continue;
-        };
-        let before = tail[..equal].trim();
-        let modifier = if whole.as_str().contains("export ") {
-            "export "
-        } else {
-            ""
-        };
-        let declaration_type = if let Some(annotation) = before.strip_prefix(':') {
-            annotation.trim().to_string()
-        } else if path.extension().and_then(|value| value.to_str()) == Some("tsx") {
-            infer_public_value_type(&tail[equal + 1..], true).ok_or_else(|| {
-                ApiError::InvalidSource(
-                    path.to_path_buf(),
-                    format!("public value `{name}` needs an explicit type annotation"),
-                )
-            })?
-        } else if let Some(inferred) = infer_public_value_type(&tail[equal + 1..], false) {
-            inferred
-        } else {
-            return Err(ApiError::InvalidSource(
-                path.to_path_buf(),
-                format!("public value `{name}` needs an explicit type annotation"),
-            ));
-        };
-        statements.insert(
-            whole.start(),
-            (
-                end,
-                format!("{modifier}declare const {name}: {declaration_type};"),
-            ),
-        );
-    }
-
-    let plain_export = Regex::new(
-        r"(?m)^\s*export\s+(?:type\s+)?\{[^}]*\}\s*;|^\s*export\s+default\s+[A-Za-z_$][\w$]*\s*;",
-    )
-    .expect("valid plain export regex");
-    for found in plain_export.find_iter(source) {
-        statements
-            .entry(found.start())
-            .or_insert_with(|| (found.end(), found.as_str().trim().to_string()));
-    }
-
-    let mut code = String::new();
-    for (_, (_, statement)) in statements {
-        code.push_str(&statement);
-        code.push('\n');
-    }
-    if code.is_empty() {
-        code.push_str("export {};\n");
-    }
-    Ok(code)
-}
-
-fn find_function_body(source: &str, start: usize) -> Option<usize> {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut angle = 0u32;
-    for (offset, ch) in source[start..].char_indices() {
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' | '`' => quote = Some(ch),
-            '<' => angle += 1,
-            '>' => angle = angle.saturating_sub(1),
-            '{' if angle == 0 => return Some(start + offset),
-            ';' if angle == 0 => return None,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn infer_arrow_type(initializer: &str, allow_jsx_return: bool) -> Option<String> {
-    let initializer = initializer.trim();
-    let (initializer, is_async) = initializer
-        .strip_prefix("async ")
-        .map_or((initializer, false), |value| (value, true));
-    let arrow = find_top_level_arrow(initializer)?;
-    let left = initializer[..arrow].trim();
-    let open = left.find('(')?;
-    let close = find_matching(left, open, '(', ')')?;
-    let parameters = &left[open..=close];
-    if split_top_level(&parameters[1..parameters.len() - 1], ',')
-        .iter()
-        .any(|parameter| !parameter.trim().is_empty() && find_top_level(parameter, ':').is_none())
-    {
-        return None;
-    }
-    let generics = left[..open].trim();
-    let explicit_return = left[close + 1..].trim().strip_prefix(':').map(str::trim);
-    if explicit_return.is_none() && !allow_jsx_return {
-        return None;
-    }
-    let return_type = explicit_return.map_or_else(
-        || {
-            if is_async {
-                "Promise<import(\"react\").JSX.Element>".to_string()
-            } else {
-                "import(\"react\").JSX.Element".to_string()
-            }
-        },
-        ToString::to_string,
-    );
-    Some(format!("{generics}{parameters} => {return_type}"))
-}
-
-fn infer_public_value_type(initializer: &str, allow_jsx: bool) -> Option<String> {
-    let initializer = initializer.trim().trim_end_matches(';').trim();
-    if let Some(inferred) = infer_arrow_type(initializer, allow_jsx) {
-        return Some(inferred);
-    }
-    if let Some(rest) = initializer.strip_prefix("createContext<") {
-        let close = find_matching(initializer, "createContext".len(), '<', '>')?;
-        let type_text = initializer["createContext<".len()..close].trim();
-        if !type_text.is_empty() && rest.contains('>') {
-            return Some(format!("import(\"react\").Context<{type_text}>"));
-        }
-    }
-    if initializer.starts_with("defineTokens(") && initializer.ends_with(')') {
-        return infer_static_object_type(
-            initializer["defineTokens(".len()..initializer.len() - 1].trim(),
-        );
-    }
-    if let Some(value_type) = infer_static_value_type(initializer) {
-        return Some(value_type);
-    }
-    if let Some(question) = find_top_level(initializer, '?')
-        && let Some(colon_offset) = find_top_level(&initializer[question + 1..], ':')
-    {
-        let truthy = initializer[question + 1..question + 1 + colon_offset].trim();
-        let falsy = initializer[question + 1 + colon_offset + 1..].trim();
-        if [truthy, falsy].iter().all(|branch| {
-            !branch.is_empty()
-                && branch.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '_' | '$' | '.')
-                })
-        }) {
-            return Some(format!("typeof {truthy} | typeof {falsy}"));
-        }
-    }
-    if !initializer.is_empty()
-        && initializer.chars().enumerate().all(|(index, character)| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '_' | '$')
-                || (index > 0 && character == '.')
-        })
-    {
-        return Some(format!("typeof {initializer}"));
-    }
-    infer_static_object_type(initializer)
-}
-
-fn infer_static_value_type(value: &str) -> Option<String> {
-    let value = value.trim();
-    let (value, constant) = value
-        .strip_suffix("as const")
-        .map_or((value, false), |value| (value.trim(), true));
-    if (value.starts_with('\'') && value.ends_with('\''))
-        || (value.starts_with('"') && value.ends_with('"'))
-        || value == "true"
-        || value == "false"
-        || value.parse::<f64>().is_ok()
-    {
-        return Some(value.to_string());
-    }
-    if value.starts_with('[') && value.ends_with(']') {
-        let comment = Regex::new(r"(?ms)//[^\r\n]*|/\*.*?\*/").expect("valid comment regex");
-        let body = comment.replace_all(&value[1..value.len() - 1], "");
-        let members = split_top_level(&body, ',')
-            .into_iter()
-            .filter(|member| !member.trim().is_empty())
-            .map(|member| infer_static_value_type(member.trim()))
-            .collect::<Option<Vec<_>>>()?;
-        if constant {
-            return Some(format!("readonly [{}]", members.join(", ")));
-        }
-        let mut unique = BTreeSet::new();
-        for member in members {
-            unique.insert(match member.as_str() {
-                "true" | "false" => "boolean".to_string(),
-                value if value.parse::<f64>().is_ok() => "number".to_string(),
-                value
-                    if (value.starts_with('\'') && value.ends_with('\''))
-                        || (value.starts_with('"') && value.ends_with('"')) =>
-                {
-                    "string".to_string()
-                }
-                value => value.to_string(),
-            });
-        }
-        return Some(format!(
-            "Array<{}>",
-            unique.into_iter().collect::<Vec<_>>().join(" | ")
-        ));
-    }
-    None
-}
-
-fn infer_static_object_type(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = value.strip_suffix("as const").unwrap_or(value).trim();
-    if !value.starts_with('{') || !value.ends_with('}') {
-        return None;
-    }
-    let body = &value[1..value.len() - 1];
-    let mut members = Vec::new();
-    for item in split_top_level(body, ',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let colon = find_top_level(item, ':')?;
-        let key = item[..colon].trim();
-        if key.is_empty() || key.starts_with("...") {
-            return None;
-        }
-        let value = item[colon + 1..].trim();
-        let value_type = if (value.starts_with('\'') && value.ends_with('\''))
-            || (value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('`') && value.ends_with('`'))
+    template: &str,
+    requests: &[DeclarationRequestFact],
+) -> Result<(), ApiError> {
+    let mut previous_end = 0;
+    for request in requests {
+        let range = request.template_range();
+        if range.start < previous_end
+            || range.end > template.len()
+            || !template.is_char_boundary(range.start)
+            || !template.is_char_boundary(range.end)
+            || !is_quoted_literal(&template[range.clone()])
         {
-            "string".to_string()
-        } else if value == "true" || value == "false" {
-            "boolean".to_string()
-        } else if value.parse::<f64>().is_ok() {
-            "number".to_string()
+            return Err(ApiError::InvalidSource(
+                path.to_path_buf(),
+                "parser returned an invalid declaration request range".to_string(),
+            ));
+        }
+        previous_end = range.end;
+    }
+    Ok(())
+}
+
+fn declaration_output_paths<'a>(
+    root: &Path,
+    entry: &Path,
+    sources: impl Iterator<Item = &'a Path>,
+) -> BTreeMap<PathBuf, PathBuf> {
+    let mut allocated = BTreeSet::new();
+    let mut output_paths = BTreeMap::new();
+    for source in sources {
+        let mut output = if source == entry {
+            PathBuf::from("index.d.ts")
         } else {
-            infer_static_object_type(value)?
+            let relative = source
+                .strip_prefix(root)
+                .expect("frozen declaration inputs stay inside their project root");
+            let mut output = PathBuf::from("_wake").join(relative);
+            output.set_extension("d.ts");
+            output
         };
-        members.push(format!("readonly {key}: {value_type}"));
-    }
-    Some(format!("{{ {}; }}", members.join("; ")))
-}
-
-fn find_top_level_arrow(value: &str) -> Option<usize> {
-    let bytes = value.as_bytes();
-    let mut depth = Depth::default();
-    let mut quote = None;
-    let mut escaped = false;
-    let mut index = 0;
-    while index + 1 < bytes.len() {
-        let ch = bytes[index] as char;
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        match ch {
-            '\'' | '"' | '`' => quote = Some(ch),
-            '=' if bytes[index + 1] == b'>' && depth.is_zero() => return Some(index),
-            _ => depth.update(ch),
-        }
-        index += 1;
-    }
-    None
-}
-
-fn find_variable_assignment(value: &str) -> Option<usize> {
-    let bytes = value.as_bytes();
-    let mut depth = Depth::default();
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, byte) in bytes.iter().enumerate() {
-        let ch = *byte as char;
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(ch, '\'' | '"' | '`') {
-            quote = Some(ch);
-            continue;
-        }
-        if ch == '=' && depth.is_zero() {
-            let previous = index.checked_sub(1).map(|value| bytes[value]);
-            let next = bytes.get(index + 1).copied();
-            if next != Some(b'>')
-                && next != Some(b'=')
-                && !matches!(previous, Some(b'=') | Some(b'!') | Some(b'<') | Some(b'>'))
-            {
-                return Some(index);
+        if allocated.contains(&output) {
+            let relative = source
+                .strip_prefix(root)
+                .expect("frozen declaration inputs stay inside their project root");
+            output = append_path_text(&PathBuf::from("_wake").join(relative), ".d.ts");
+            let mut collision = 2usize;
+            while allocated.contains(&output) {
+                output = append_path_text(
+                    &PathBuf::from("_wake").join(relative),
+                    &format!(".{collision}.d.ts"),
+                );
+                collision += 1;
             }
         }
-        depth.update(ch);
+        allocated.insert(output.clone());
+        output_paths.insert(source.to_path_buf(), output);
     }
-    None
+    output_paths
 }
 
-fn relative_module_specifier(current: &Path, target: &Path) -> String {
+fn relative_declaration_specifier(current: &Path, target: &Path) -> String {
     let from = current.parent().unwrap_or_else(|| Path::new(""));
     let from_components = from.components().collect::<Vec<_>>();
     let target_components = target.components().collect::<Vec<_>>();
@@ -1597,6 +1817,45 @@ fn relative_module_specifier(current: &Path, target: &Path) -> String {
         value.insert_str(0, "./");
     }
     value
+}
+
+fn is_quoted_literal(value: &str) -> bool {
+    value.len() >= 2
+        && matches!(value.as_bytes().first(), Some(b'\'') | Some(b'"'))
+        && value.as_bytes().first() == value.as_bytes().last()
+}
+
+fn quote_like(original: &str, specifier: &str) -> String {
+    let quote = original
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|quote| matches!(quote, b'\'' | b'"'))
+        .unwrap_or(b'"');
+    let mut literal = String::with_capacity(specifier.len() + 2);
+    literal.push(char::from(quote));
+    for character in specifier.chars() {
+        match character {
+            '\\' => literal.push_str("\\\\"),
+            '\t' => literal.push_str("\\t"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            character if character <= '\u{1f}' => {
+                use std::fmt::Write;
+                write!(literal, "\\u{:04X}", character as u32)
+                    .expect("writing a declaration literal cannot fail");
+            }
+            '\u{2028}' => literal.push_str("\\u2028"),
+            '\u{2029}' => literal.push_str("\\u2029"),
+            character if character as u32 == u32::from(quote) => {
+                literal.push('\\');
+                literal.push(character);
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push(char::from(quote));
+    literal
 }
 
 fn leading_identifier(value: &str) -> &str {
@@ -1629,7 +1888,53 @@ fn is_static_literal(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct DeclarationFileSystemCalls {
+        canonicalize: Vec<PathBuf>,
+        is_file: Vec<PathBuf>,
+        reads: BTreeMap<PathBuf, usize>,
+    }
+
+    #[derive(Default)]
+    struct CountingDeclarationFileSystem {
+        calls: Mutex<DeclarationFileSystemCalls>,
+    }
+
+    impl CountingDeclarationFileSystem {
+        fn calls(&self) -> DeclarationFileSystemCalls {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl DeclarationFileSystem for CountingDeclarationFileSystem {
+        fn canonicalize(&self, path: &Path) -> Result<PathBuf, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .canonicalize
+                .push(path.to_path_buf());
+            fs::canonicalize(path).map_err(|error| error.to_string())
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            self.calls.lock().unwrap().is_file.push(path.to_path_buf());
+            path.is_file()
+        }
+
+        fn read_to_string(&self, path: &Path) -> Result<String, String> {
+            *self
+                .calls
+                .lock()
+                .unwrap()
+                .reads
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+            fs::read_to_string(path).map_err(|error| error.to_string())
+        }
+    }
 
     fn fixture(files: &[(&str, &str)]) -> PathBuf {
         let id = SystemTime::now()
@@ -1886,6 +2191,828 @@ mod tests {
     }
 
     #[test]
+    fn component_extraction_reports_every_transitively_read_source() {
+        let root = fixture(&[
+            (
+                "button.tsx",
+                "import type { ButtonProps } from './props.js';\nconst Button = (props: ButtonProps) => null;\nexport default Button;\n",
+            ),
+            (
+                "props.ts",
+                "import type { BaseProps } from './base.js';\nexport interface ButtonProps extends BaseProps { label: string; }\n",
+            ),
+            (
+                "base.ts",
+                "export interface BaseProps { disabled?: boolean; }\n",
+            ),
+        ]);
+
+        let extraction = extract_component_api_with_provenance(root.join("button.tsx")).unwrap();
+
+        assert_eq!(extraction.document.display_name, "Button");
+        assert_eq!(
+            extraction.inputs,
+            ["base.ts", "button.tsx", "props.ts"]
+                .map(|path| std::fs::canonicalize(root.join(path)).unwrap())
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn freezes_multi_entry_graph_with_one_shared_read_per_source() {
+        let root = fixture(&[
+            (
+                "src/one/index.ts",
+                "import type Shared = require('../../shared.js'); export interface Public { shared: Shared; }",
+            ),
+            (
+                "src/two/index.ts",
+                "export type { Shared } from '../../shared.js'; export interface Public { other: Shared; }",
+            ),
+            (
+                "shared.ts",
+                "import { Model } from './model.js'; export interface Shared { model: Model; }",
+            ),
+            ("model.ts", "export interface Model { id: string; }"),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [
+                DeclarationEntry::new("one", "src/one/index.ts"),
+                DeclarationEntry::new("two", "src/two/index.ts"),
+            ],
+            &file_system,
+        )
+        .unwrap();
+
+        assert_eq!(graph.inputs().count(), 4);
+        let calls_after_prepare = file_system.calls();
+        assert_eq!(calls_after_prepare.reads.len(), 4);
+        assert!(calls_after_prepare.reads.values().all(|count| *count == 1));
+        assert!(!calls_after_prepare.canonicalize.is_empty());
+        assert!(!calls_after_prepare.is_file.is_empty());
+
+        let bundles = graph.render();
+        assert_eq!(bundles.len(), 2);
+        for (bundle, owner) in bundles.iter().zip(["one", "two"]) {
+            assert_eq!(bundle.owner, owner);
+            assert!(
+                bundle
+                    .files
+                    .iter()
+                    .any(|file| file.file_name == Path::new("index.d.ts"))
+            );
+            let shared = bundle
+                .files
+                .iter()
+                .find(|file| file.file_name == Path::new("_wake/shared.d.ts"))
+                .expect("shared dependency declaration");
+            assert!(shared.code.contains("import { Model }"));
+            assert!(shared.code.contains("./model.js"));
+            assert!(
+                bundle
+                    .files
+                    .iter()
+                    .any(|file| file.file_name == Path::new("_wake/model.d.ts"))
+            );
+        }
+        assert_eq!(file_system.calls(), calls_after_prepare);
+    }
+
+    #[test]
+    fn implementation_graph_drops_runtime_resource_edges_but_keeps_type_references() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "import './broken.scss';\n\
+                 import type {} from './type-augment.js';\n\
+                 import logo from './shared.woff2';\n\
+                 import { Model } from './model.js';\n\
+                 export interface Public { model: Model; }\n\
+                 export function renderLogo(): string { return logo; }",
+            ),
+            ("src/broken.scss", "$broken: true;"),
+            ("src/shared.woff2", "not-a-declaration"),
+            (
+                "src/type-augment.ts",
+                "export {}; declare global { interface TypeAugment { value: string; } }",
+            ),
+            ("src/model.ts", "export interface Model { id: string; }"),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("resources", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+
+        let inputs = graph.inputs().collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().any(|path| path.ends_with("src/index.ts")));
+        assert!(inputs.iter().any(|path| path.ends_with("src/model.ts")));
+        let calls_after_prepare = file_system.calls();
+        assert_eq!(calls_after_prepare.reads.len(), 2);
+        assert!(calls_after_prepare.reads.values().all(|count| *count == 1));
+        for resource in ["src/broken.scss", "src/shared.woff2", "src/type-augment.ts"] {
+            assert!(
+                !calls_after_prepare
+                    .reads
+                    .keys()
+                    .any(|path| path.ends_with(resource))
+            );
+            assert!(
+                !calls_after_prepare
+                    .canonicalize
+                    .iter()
+                    .any(|path| path.ends_with(resource))
+            );
+            assert!(
+                !calls_after_prepare
+                    .is_file
+                    .iter()
+                    .any(|path| path.ends_with(resource))
+            );
+        }
+
+        let bundle = graph.render_entry("resources").unwrap();
+        let entry = bundle
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(!entry.code.contains("broken.scss"));
+        assert!(!entry.code.contains("type-augment.js"));
+        assert!(!entry.code.contains("shared.woff2"));
+        assert!(entry.code.contains("import { Model }"));
+        assert!(entry.code.contains("model.js"));
+        assert!(
+            bundle
+                .files
+                .iter()
+                .any(|file| file.source.ends_with("src/model.ts"))
+        );
+        assert_eq!(file_system.calls(), calls_after_prepare);
+    }
+
+    #[test]
+    fn generic_type_parameter_shadow_does_not_add_a_declaration_edge() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "import { T } from './runtime.js';\n\
+                 import { LocalInfer } from './infer-runtime.js';\n\
+                 import { LocalKey } from './mapped-runtime.js';\n\
+                 import { ParameterValue } from './parameter-runtime.js';\n\
+                 import { ArrowSignatureValue } from './arrow-signature-runtime.js';\n\
+                 import { AsyncArrowValue } from './async-arrow-runtime.js';\n\
+                 import { SingleArrowValue } from './single-arrow-runtime.js';\n\
+                 import { AsyncSingleArrowValue } from './async-single-arrow-runtime.js';\n\
+                 import type { ForwardType } from './forward-runtime.js';\n\
+                 import { type InlineForward } from './inline-forward-runtime.js';\n\
+                 export type Box<T> = T;\n\
+                 export type Unwrap<Value> = Value extends infer LocalInfer ? LocalInfer : never;\n\
+                 export type Mapping<Keys> = { [LocalKey in Keys as LocalKey]: LocalKey };\n\
+                 export declare function forward<T extends ForwardType, ForwardType>(): void;\n\
+                 export type InlineShadow<InlineForward> = InlineForward;\n\
+                 export const callback = (first: typeof ArrowSignatureValue, ArrowSignatureValue: string): typeof ArrowSignatureValue => ArrowSignatureValue;\n\
+                 export const asyncCallback = async <T,>(first: typeof AsyncArrowValue, { value: AsyncArrowValue }: { value: string }): Promise<typeof AsyncArrowValue> => AsyncArrowValue;\n\
+                 export const single: (value: string) => string = SingleArrowValue => (null as typeof SingleArrowValue);\n\
+                 export const asyncSingle: (value: string) => Promise<string> = async AsyncSingleArrowValue => (null as typeof AsyncSingleArrowValue);\n\
+                 export declare function inspect(first: typeof ParameterValue, ParameterValue: string): typeof ParameterValue;",
+            ),
+            ("src/runtime.js", "export const T = run();"),
+            ("src/infer-runtime.js", "export const LocalInfer = run();"),
+            ("src/mapped-runtime.js", "export const LocalKey = run();"),
+            (
+                "src/parameter-runtime.js",
+                "export const ParameterValue = run();",
+            ),
+            (
+                "src/arrow-signature-runtime.js",
+                "export const ArrowSignatureValue = run();",
+            ),
+            (
+                "src/async-arrow-runtime.js",
+                "export const AsyncArrowValue = run();",
+            ),
+            (
+                "src/single-arrow-runtime.js",
+                "export const SingleArrowValue = run();",
+            ),
+            (
+                "src/async-single-arrow-runtime.js",
+                "export const AsyncSingleArrowValue = run();",
+            ),
+            ("src/forward-runtime.js", "export interface ForwardType {}"),
+            (
+                "src/inline-forward-runtime.js",
+                "export interface InlineForward {}",
+            ),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("shadow", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+
+        assert_eq!(graph.inputs().count(), 1);
+        let calls = file_system.calls();
+        for shadowed in [
+            "runtime.js",
+            "infer-runtime.js",
+            "mapped-runtime.js",
+            "parameter-runtime.js",
+            "arrow-signature-runtime.js",
+            "async-arrow-runtime.js",
+            "single-arrow-runtime.js",
+            "async-single-arrow-runtime.js",
+            "forward-runtime.js",
+            "inline-forward-runtime.js",
+        ] {
+            assert!(!calls.reads.keys().any(|path| path.ends_with(shadowed)));
+            assert!(!calls.is_file.iter().any(|path| path.ends_with(shadowed)));
+        }
+        let entry = graph
+            .render_entry("shadow")
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(!entry.code.contains("runtime.js"));
+        assert!(entry.code.contains("export type Box<T> = T;"));
+    }
+
+    #[test]
+    fn generic_type_binding_does_not_shadow_typeof_value_dependency() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "import { T } from './dep.js'; export type Query<T> = typeof T;",
+            ),
+            ("src/dep.js", "throw new Error('runtime shadow');"),
+            ("src/dep.ts", "export const T = 'token' as const;"),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("typeof-value", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+
+        let inputs = graph.inputs().collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().any(|path| path.ends_with("src/dep.ts")));
+        assert!(!inputs.iter().any(|path| path.ends_with("src/dep.js")));
+        let calls_after_prepare = file_system.calls();
+        assert!(
+            !calls_after_prepare
+                .reads
+                .keys()
+                .any(|path| path.ends_with("dep.js"))
+        );
+
+        let bundle = graph.render_entry("typeof-value").unwrap();
+        let entry = bundle
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(entry.code.contains("typeof T"));
+        assert!(entry.code.contains("./_wake/src/dep.js"));
+        assert_eq!(file_system.calls(), calls_after_prepare);
+    }
+
+    #[test]
+    fn type_export_alias_only_follows_the_local_import_binding() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "import type { Foo } from './foo.js';\n\
+                 import type { Public } from './public.js';\n\
+                 export type { Foo as Public };",
+            ),
+            ("src/foo.ts", "export interface Foo { value: string; }"),
+            ("src/public.ts", "export interface Public { wrong: true; }"),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("type-export", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+
+        let inputs = graph.inputs().collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().any(|path| path.ends_with("src/foo.ts")));
+        assert!(!inputs.iter().any(|path| path.ends_with("src/public.ts")));
+        let calls = file_system.calls();
+        assert!(!calls.reads.keys().any(|path| path.ends_with("public.ts")));
+        assert!(!calls.is_file.iter().any(|path| path.ends_with("public.ts")));
+    }
+
+    #[test]
+    fn declaration_side_effect_import_keeps_ts_augmentation_and_drops_resources() {
+        let root = fixture(&[
+            (
+                "types/index.d.ts",
+                "import './augment.js';\n\
+                 import type {} from './type-augment.js';\n\
+                 import './theme.scss';\n\
+                 import './missing.scss';\n\
+                 export interface Public { value: string; }",
+            ),
+            (
+                "types/augment.d.ts",
+                "export interface Augmented { active: true; }",
+            ),
+            (
+                "types/type-augment.d.ts",
+                "export {}; declare global { interface WakeGlobal { value: string; } }",
+            ),
+            ("types/theme.scss", "$theme: true;"),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("augmentation", "types/index.d.ts")],
+            &file_system,
+        )
+        .unwrap();
+
+        let inputs = graph.inputs().collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs.iter().any(|path| path.ends_with("types/index.d.ts")));
+        assert!(
+            inputs
+                .iter()
+                .any(|path| path.ends_with("types/augment.d.ts"))
+        );
+        assert!(
+            inputs
+                .iter()
+                .any(|path| path.ends_with("types/type-augment.d.ts"))
+        );
+        let calls_after_prepare = file_system.calls();
+        assert_eq!(calls_after_prepare.reads.len(), 3);
+        assert!(calls_after_prepare.reads.values().all(|count| *count == 1));
+        assert!(
+            !calls_after_prepare
+                .reads
+                .keys()
+                .any(|path| path.ends_with("types/theme.scss"))
+        );
+
+        let bundle = graph.render_entry("augmentation").unwrap();
+        let entry = bundle
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(entry.code.contains("augment"), "{}", entry.code);
+        assert!(entry.code.contains("type-augment"), "{}", entry.code);
+        assert!(!entry.code.contains("theme.scss"));
+        assert!(!entry.code.contains("missing.scss"));
+        assert!(
+            bundle
+                .files
+                .iter()
+                .any(|file| file.source.ends_with("types/augment.d.ts"))
+        );
+        assert_eq!(file_system.calls(), calls_after_prepare);
+    }
+
+    #[test]
+    fn declaration_graph_resolves_node_next_runtime_extensions_before_legacy_fallbacks() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "export type { EsmSource } from './esm.mjs';\n\
+                 export type { EsmDeclaration } from './esm-declaration.mjs';\n\
+                 export type { CommonSource } from './common.cjs';\n\
+                 export type { CommonDeclaration } from './common-declaration.cjs';\n\
+                 export type { LegacyEsm } from './legacy-esm.mjs';\n\
+                 export type { LegacyCommon } from './legacy-common.cjs';\n\
+                 export type { LegacyJs } from './legacy-js.js';",
+            ),
+            ("src/esm.mts", "export interface EsmSource { esm: true; }"),
+            ("src/esm.mjs", "throw new Error('runtime only');"),
+            (
+                "src/esm.ts",
+                "export interface EsmFallback { wrong: true; }",
+            ),
+            (
+                "src/esm-declaration.d.mts",
+                "export interface EsmDeclaration { declaration: true; }",
+            ),
+            ("src/esm-declaration.mjs", "export const runtime = true;"),
+            (
+                "src/esm-declaration.d.ts",
+                "export interface EsmDeclarationFallback { wrong: true; }",
+            ),
+            (
+                "src/common.cts",
+                "export interface CommonSource { common: true; }",
+            ),
+            ("src/common.cjs", "throw new Error('runtime only');"),
+            (
+                "src/common.ts",
+                "export interface CommonFallback { wrong: true; }",
+            ),
+            (
+                "src/common-declaration.d.cts",
+                "export interface CommonDeclaration { declaration: true; }",
+            ),
+            (
+                "src/common-declaration.cjs",
+                "module.exports = { runtime: true };",
+            ),
+            (
+                "src/common-declaration.d.ts",
+                "export interface CommonDeclarationFallback { wrong: true; }",
+            ),
+            (
+                "src/legacy-esm.ts",
+                "export interface LegacyEsm { compatible: true; }",
+            ),
+            (
+                "src/legacy-esm.mjs",
+                "throw new Error('runtime literal must not shadow TypeScript');",
+            ),
+            (
+                "src/legacy-common.ts",
+                "export interface LegacyCommon { compatible: true; }",
+            ),
+            (
+                "src/legacy-common.cjs",
+                "throw new Error('runtime literal must not shadow TypeScript');",
+            ),
+            (
+                "src/legacy-js.ts",
+                "export interface LegacyJs { compatible: true; }",
+            ),
+            (
+                "src/legacy-js.js",
+                "throw new Error('runtime literal must not shadow TypeScript');",
+            ),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("node-next", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+
+        let inputs = graph.inputs().collect::<Vec<_>>();
+        for expected in [
+            "src/index.ts",
+            "src/esm.mts",
+            "src/esm-declaration.d.mts",
+            "src/common.cts",
+            "src/common-declaration.d.cts",
+            "src/legacy-esm.ts",
+            "src/legacy-common.ts",
+            "src/legacy-js.ts",
+        ] {
+            assert!(
+                inputs.iter().any(|path| path.ends_with(expected)),
+                "missing declaration input {expected}: {inputs:?}"
+            );
+        }
+        for shadowed in [
+            "src/esm.mjs",
+            "src/esm.ts",
+            "src/esm-declaration.mjs",
+            "src/esm-declaration.d.ts",
+            "src/common.cjs",
+            "src/common.ts",
+            "src/common-declaration.cjs",
+            "src/common-declaration.d.ts",
+            "src/legacy-esm.mjs",
+            "src/legacy-common.cjs",
+            "src/legacy-js.js",
+        ] {
+            assert!(
+                !inputs.iter().any(|path| path.ends_with(shadowed)),
+                "selected shadowed declaration input {shadowed}: {inputs:?}"
+            );
+        }
+        let calls_after_prepare = file_system.calls();
+        assert!(calls_after_prepare.reads.values().all(|count| *count == 1));
+        assert_eq!(calls_after_prepare.reads.len(), inputs.len());
+        let bundle = graph.render_entry("node-next").unwrap();
+        assert_eq!(bundle.files.len(), inputs.len());
+        assert_eq!(file_system.calls(), calls_after_prepare);
+    }
+
+    #[test]
+    fn rewrites_only_parser_registered_request_ranges_and_rerenders_without_reads() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                r#"
+                    export interface Exact {
+                        literal: "./dep.js";
+                        // keep "./dep.js" unchanged
+                        nested: import("./dep.js").Value;
+                    }
+                "#,
+            ),
+            ("src/dep.ts", "export interface Value { ok: true; }"),
+        ]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("exact", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+        let calls_after_prepare = file_system.calls();
+
+        let default = graph.render_entry("exact").unwrap();
+        let entry = default
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(entry.code.contains("literal: \"./dep.js\""));
+        assert!(entry.code.contains("// keep \"./dep.js\" unchanged"));
+        assert!(entry.code.contains("import(\"./_wake/src/dep.js\").Value"));
+
+        let first = graph
+            .render_entry_with("exact", |request| {
+                request
+                    .resolved_source
+                    .is_some()
+                    .then(|| "virtual:first".to_string())
+            })
+            .unwrap();
+        let second = graph
+            .render_entry_with("exact", |request| {
+                request
+                    .resolved_source
+                    .is_some()
+                    .then(|| "virtual:second".to_string())
+            })
+            .unwrap();
+        let first_entry = first
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        let second_entry = second
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(first_entry.code.contains("virtual:first"));
+        assert!(!first_entry.code.contains("virtual:second"));
+        assert!(second_entry.code.contains("virtual:second"));
+        assert_eq!(file_system.calls(), calls_after_prepare);
+    }
+
+    #[test]
+    fn quoted_request_rewrite_is_escaped_after_unicode_prefixes() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "export interface Cafe { snow: '雪原文'; value: import('./dep.js').Value; }",
+            ),
+            ("src/dep.ts", "export interface Value { ok: true; }"),
+        ]);
+        let graph =
+            prepare_library_declarations(&root, [DeclarationEntry::new("unicode", "src/index.ts")])
+                .unwrap();
+
+        let bundle = graph
+            .render_entry_with("unicode", |request| {
+                request
+                    .resolved_source
+                    .is_some()
+                    .then(|| "@scope/雪'\\module".to_string())
+            })
+            .unwrap();
+        let entry = bundle
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(entry.code.contains("Cafe"));
+        assert!(entry.code.contains("snow: '雪原文'"));
+        assert!(
+            entry
+                .code
+                .contains("import('@scope/雪\\'\\\\module').Value")
+        );
+    }
+
+    #[test]
+    fn ambient_render_uses_parser_proven_modifier_free_templates() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "export type { Shared } from './dependency.js';\n\
+                 export declare function exported(value: string): void;\n\
+                 export declare class Public { method(): void; }\n\
+                 export declare const value: string;",
+            ),
+            (
+                "src/dependency.ts",
+                "declare function helper(value: string): void;\n\
+                 export interface Shared { value: string; }",
+            ),
+        ]);
+        let graph =
+            prepare_library_declarations(&root, [DeclarationEntry::new("ambient", "src/index.ts")])
+                .unwrap();
+        let bundle = graph.render_entry_ambient("ambient").unwrap();
+
+        let entry = bundle
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(
+            entry.code.contains("export function exported"),
+            "{}",
+            entry.code
+        );
+        assert!(entry.code.contains("export class Public"));
+        assert!(entry.code.contains("export const value"));
+        assert!(!entry.code.contains("export declare"));
+
+        let dependency = bundle
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("_wake/src/dependency.d.ts"))
+            .unwrap();
+        assert!(dependency.code.contains("function helper"));
+        assert!(!dependency.code.contains("declare function helper"));
+
+        for file in &bundle.files {
+            validate_ambient_declaration_body(&file.file_name, &file.code).unwrap();
+            let wrapped = format!("declare module \"ambient-test\" {{\n{}\n}}", file.code);
+            validate_declaration_body(Path::new("wrapped.d.ts"), &wrapped).unwrap();
+        }
+        let error = validate_ambient_declaration_body(
+            Path::new("invalid.d.ts"),
+            "export declare const invalid: string;",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("redundant `declare` modifier"));
+    }
+
+    #[test]
+    fn strict_body_validation_returns_any_as_a_typed_policy_fact() {
+        let facts = validate_declaration_body(
+            Path::new("remote.d.ts"),
+            "export interface Public { value: any; }",
+        )
+        .unwrap();
+        assert!(facts.contains_forbidden_any());
+
+        let facts = validate_ambient_declaration_body(
+            Path::new("remote.d.ts"),
+            "export interface Public { value: any; }",
+        )
+        .unwrap();
+        assert!(facts.contains_forbidden_any());
+        assert!(
+            validate_declaration_body(
+                Path::new("remote.d.ts"),
+                "export const invalid: string = run();",
+            )
+            .is_err()
+        );
+        for invalid in [
+            "export type InvalidConst<const T> = T;",
+            "export type OptionalIndex = { [key: string]?: boolean };",
+            "export type ParameterProperty = (public value: string) => void;",
+            "export type InvalidReadonlyRemoval = { -readonly value: string };",
+            "export interface InvalidReadonlyAddition { +readonly value: string; }",
+            "type Keys = 'key'; export type MixedMapped<T> = { [Key in Keys]: T; extra: string };",
+        ] {
+            assert!(
+                validate_declaration_body(Path::new("remote.d.ts"), invalid).is_err(),
+                "invalid strict declaration was accepted: {invalid}"
+            );
+        }
+        validate_declaration_body(
+            Path::new("remote.d.ts"),
+            "export interface ReadonlyNames { readonly?: string; readonly?(): void; }",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn same_named_entries_keep_distinct_index_ownership() {
+        let root = fixture(&[
+            ("one/index.ts", "export interface Public { one: true; }"),
+            ("two/index.ts", "export interface Public { two: true; }"),
+        ]);
+        let graph = prepare_library_declarations(
+            &root,
+            [
+                DeclarationEntry::new("expose-one", "one/index.ts"),
+                DeclarationEntry::new("expose-two", "two/index.ts"),
+            ],
+        )
+        .unwrap();
+
+        let one = graph.render_entry("expose-one").unwrap();
+        let two = graph.render_entry("expose-two").unwrap();
+        assert_eq!(one.files.len(), 1);
+        assert_eq!(two.files.len(), 1);
+        assert_eq!(one.files[0].file_name, Path::new("index.d.ts"));
+        assert_eq!(two.files[0].file_name, Path::new("index.d.ts"));
+        assert_ne!(one.source, two.source);
+        assert!(one.files[0].code.contains("one: true"));
+        assert!(two.files[0].code.contains("two: true"));
+    }
+
+    #[test]
+    fn graph_renders_same_line_overloads_and_anonymous_default_class() {
+        let root = fixture(&[(
+            "src/index.ts",
+            "export interface A { a: string } export type B = A & { b: number };\n\
+             export function overload(value: string): string;\n\
+             export function overload(value: number): number;\n\
+             export function overload(value: string | number): string | number { return value; }\n\
+             export default class { readonly value: string = ''; method(input: B): A { return input; } }",
+        )]);
+        let files = emit_library_declarations(&root, "src/index.ts").unwrap();
+        let code = &files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap()
+            .code;
+
+        assert!(code.contains("export interface A { a: string }"));
+        assert!(code.contains("export type B = A & { b: number };"));
+        assert_eq!(code.matches("function overload").count(), 2);
+        assert!(code.contains("export default class"));
+        assert!(code.contains("readonly value: string"));
+        assert!(code.contains("method(input: B): A"));
+        assert!(!code.contains("return value"));
+        assert!(!code.contains("return input"));
+    }
+
+    #[test]
+    fn frozen_graph_preserves_valid_export_assignment_and_rejects_expressions() {
+        let root = fixture(&[
+            (
+                "src/index.ts",
+                "const api = { version: '1' }; export = api;",
+            ),
+            ("src/invalid.ts", "export = createApi();"),
+        ]);
+        let graph = prepare_library_declarations(
+            &root,
+            [DeclarationEntry::new("commonjs", "src/index.ts")],
+        )
+        .unwrap();
+
+        let standalone = graph.render_entry("commonjs").unwrap();
+        let standalone = standalone
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(standalone.code.contains("declare const api:"));
+        assert!(standalone.code.contains("export = api;"));
+
+        let ambient = graph.render_entry_ambient("commonjs").unwrap();
+        let ambient = ambient
+            .files
+            .iter()
+            .find(|file| file.file_name == Path::new("index.d.ts"))
+            .unwrap();
+        assert!(ambient.code.contains("const api:"));
+        assert!(!ambient.code.contains("declare const api:"));
+        assert!(ambient.code.contains("export = api;"));
+        validate_ambient_declaration_body(&ambient.file_name, &ambient.code).unwrap();
+
+        let error = prepare_library_declarations(
+            &root,
+            [DeclarationEntry::new("invalid", "src/invalid.ts")],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("export assignment requires an identifier or dotted name")
+        );
+    }
+
+    #[test]
     fn emits_preserved_library_declarations_without_any() {
         let root = fixture(&[
             ("package.json", r#"{"name":"@demo/button","type":"module"}"#),
@@ -1974,7 +3101,12 @@ mod tests {
         assert!(group.code.contains(
             "declare function ButtonGroup(props: GroupProps): import(\"react\").JSX.Element;"
         ));
-        assert!(!group.code.contains("internal.js"));
+        assert!(!group.code.contains("./internal.js"));
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.file_name == Path::new("_wake/src/internal.d.ts"))
+        );
     }
 
     #[test]

@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 regex.workspace = true
 serde.workspace = true
+wake_ecma_parser.workspace = true

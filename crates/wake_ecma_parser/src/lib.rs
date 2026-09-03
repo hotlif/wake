@@ -8,11 +8,19 @@
 /// Stable parser implementation identity for caller-owned cache keys.
 pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v2";
 
+mod declaration;
 mod expr;
 mod jsx;
 mod stmt;
 mod ts;
 mod ts_value;
+
+pub use declaration::{
+    DeclarationFactError, DeclarationFacts, DeclarationImportUsage, DeclarationItemFact,
+    DeclarationItemKind, DeclarationRequestFact, DeclarationRequestRole, parse_declaration_facts,
+    validate_declaration_module, validate_declaration_module_allow_any,
+};
+pub use wake_ecma_ast::SourceType;
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -21,8 +29,8 @@ use std::sync::Arc;
 use bumpalo::Bump;
 use wake_common::{Atom, Diagnostic, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::{
-    AVec, Dependency, Ident, ModuleAst, Pattern, Program, SourceType, Statement, VarKind,
-    VariableDeclaration, VariableDeclarator,
+    AVec, Dependency, Ident, ModuleAst, Pattern, Program, Statement, VarKind, VariableDeclaration,
+    VariableDeclarator,
 };
 use wake_ecma_lexer::{Keyword, Lexer, LexerCheckpoint, Token, TokenKind, regex_allowed_after};
 use wake_ecma_transform::AutomaticJsxUsage;
@@ -193,6 +201,8 @@ struct ParserCheckpoint {
     lex: LexerCheckpoint,
     /// 回溯时丢弃试探期间累积的 parser 诊断（如类型实参试探失败）。
     diag_len: usize,
+    /// Optional declaration fact sink state. Speculative grammar must not leak facts on rewind.
+    declaration_mark: Option<declaration::DeclarationCollectorMark>,
 }
 
 /// JSX 降级要反复驻留的编译期常量名的预驻留 Atom（见 [`Parser::jsx_atoms`]）。
@@ -238,6 +248,9 @@ pub(crate) struct Parser<'a, 'src, const LOWER: bool> {
     has_top_level_await: bool,
     diagnostics: Vec<Diagnostic>,
     dependencies: Vec<Dependency>,
+    /// Installed only by `parse_declaration_facts`/`validate_declaration_module`; ordinary builds
+    /// pay no declaration collection or secondary parse cost.
+    declaration: Option<declaration::DeclarationCollector<'src>>,
 
     /// 标识符驻留缓存：源码切片 → Atom。真实代码里标识符高频重复，命中即跳过全局
     /// interner 的锁 + 二次哈希，大幅提升单核解析吞吐。`RefCell` 保持 `&self` 接口。
@@ -309,6 +322,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             has_top_level_await: false,
             diagnostics: Vec::new(),
             dependencies: Vec::new(),
+            declaration: None,
             ident_cache: RefCell::new(FxHashMap::default()),
             require_atom: interner.intern("require"),
             jsx_atoms: Cell::new(None),
@@ -503,6 +517,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             prev_end: self.prev_end,
             lex: self.lexer.checkpoint(),
             diag_len: self.diagnostics.len(),
+            declaration_mark: self.declaration.as_ref().map(|collector| collector.mark()),
         }
     }
 
@@ -513,6 +528,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.prev_end = cp.prev_end;
         self.lexer.rewind(cp.lex);
         self.diagnostics.truncate(cp.diag_len);
+        if let (Some(collector), Some(mark)) = (&mut self.declaration, cp.declaration_mark) {
+            collector.rewind(mark);
+        }
     }
 
     /// 若当前 token 是 `kind` 则消费并返回 true。

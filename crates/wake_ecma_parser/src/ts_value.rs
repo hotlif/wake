@@ -14,7 +14,7 @@ use wake_common::{Atom, Span};
 use wake_ecma_ast::*;
 use wake_ecma_lexer::TokenKind;
 
-use crate::Parser;
+use crate::{DeclarationItemKind, Parser};
 
 impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 解析 `enum E { .. }`（`const` 已由调用方消费；当前 token 为 `enum`）。
@@ -97,6 +97,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         // 用 `||` 而非 `{}`：TS 的 enum 同样支持跨声明合并。
         let init = self.or_assign_ident(name);
         let decl_span = self.span_to(lo);
+        self.declaration_record_source_item(DeclarationItemKind::Enum, decl_span, Some(name.span));
         self.build_value_iife(decl_span, name, parameter, stmts, init)
     }
 
@@ -107,14 +108,31 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 字符串模块名（ambient `module "x" {}`）→ 擦除。
     pub(crate) fn parse_namespace(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // namespace / module
+        let declaration_item_mark = self.declaration_item_mark();
 
         // ambient 模块 `module "x" { .. }` → 擦除。
         if self.at(TokenKind::Str) {
             self.bump();
             if self.at(TokenKind::LBrace) {
-                self.ts_skip_balanced();
+                if self.declaration_is_collecting() {
+                    self.bump(); // {
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        let before = self.cur.span.lo;
+                        let statement = self.parse_statement();
+                        self.declaration_record_declared_statement(statement);
+                        if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
+                            self.bump();
+                        }
+                    }
+                    self.expect(TokenKind::RBrace);
+                } else {
+                    self.ts_skip_balanced();
+                }
             }
-            return Statement::Empty(self.span_to(lo));
+            let span = self.span_to(lo);
+            self.declaration_discard_items_since(declaration_item_mark);
+            self.declaration_record_source_item(DeclarationItemKind::Namespace, span, None);
+            return Statement::Empty(span);
         }
 
         let name = if self.at_ident_name() {
@@ -146,12 +164,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let before = self.cur.span.lo;
             let s = self.parse_statement();
+            self.declaration_record_declared_statement(s);
             self.lower_namespace_member(s, inner_binding, &mut stmts);
             if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
                 self.bump();
             }
         }
         self.expect(TokenKind::RBrace);
+        self.declaration_discard_items_since(declaration_item_mark);
 
         stmts.push(Statement::Return(self.alloc(ReturnStatement {
             span: Span::DUMMY,
@@ -182,6 +202,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             };
             let iife = self.build_value_iife(decl_span, seg, parameters[depth], current, init);
             if depth == 0 {
+                self.declaration_record_source_item(
+                    DeclarationItemKind::Namespace,
+                    decl_span,
+                    Some(name.span),
+                );
                 return iife;
             }
             // 外层函数体：`var Seg = <iife>;` + `return Parent;`
@@ -341,8 +366,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// TS `export = value;` 的降级：`module.exports = value;`（对齐 tsc 的 commonjs emit）。
     ///
-    /// 必须逐字发射 `module.exports`：bundler 的 `compact_body_names` 以**文本**匹配这一串把它
-    /// 改写成包装器形参 `m.exports`（见 incremental.rs 的注释），换成别的写法会静默丢导出。
+    /// 这里保留标准 CommonJS AST 形状；bundled typed module planning 会按 SymbolId 绑定自由
+    /// `module` 引用，并把最终运行时参数名作为 codegen metadata 交给包装器，生成文本不再被扫描。
     pub(crate) fn module_exports_assign(&self, span: Span, value: Expression<'a>) -> Statement<'a> {
         let target = Expression::Member(self.alloc(MemberExpression {
             span: Span::DUMMY,

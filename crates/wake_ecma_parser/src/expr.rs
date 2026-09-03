@@ -5,12 +5,13 @@ use wake_ecma_ast::*;
 use wake_ecma_lexer::{Keyword, TokenKind};
 use wake_ecma_transform::AutomaticJsxUsage;
 
-use crate::{Context, Parser, ParserCheckpoint};
+use crate::{Context, Parser, ParserCheckpoint, ts::TsTypeParameterContext};
 
 /// cover 括号：可能是箭头参数，也可能是括号/序列表达式。
 struct CoverParen<'a> {
     items: AVec<'a, Expression<'a>>,
     rest: Option<&'a RestElement<'a>>,
+    value_reference_mark: Option<usize>,
 }
 
 /// 泛型箭头完整试探的输出状态快照。
@@ -86,9 +87,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 TokenKind::LParen => {
                     self.bump(); // async
                     let cover = self.parse_cover_paren();
-                    self.skip_arrow_return_type_if_arrow();
+                    let return_type = self.skip_arrow_return_type_if_arrow();
                     if self.at(TokenKind::Arrow) && !self.newline_before() {
-                        return self.finish_arrow(lo, cover, true);
+                        return self.finish_arrow(lo, cover, true, return_type);
                     }
                     // 实为调用 `async(args)`。
                     let callee = Expression::Identifier(self.alloc(Ident::new(
@@ -1076,9 +1077,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             TokenKind::Keyword(Keyword::Import) => self.parse_import_expression(lo),
             TokenKind::LParen => {
                 let cover = self.parse_cover_paren();
-                self.skip_arrow_return_type_if_arrow();
+                let return_type = self.skip_arrow_return_type_if_arrow();
                 if self.at(TokenKind::Arrow) && !self.newline_before() {
-                    return self.finish_arrow(lo, cover, false);
+                    return self.finish_arrow(lo, cover, false, return_type);
                 }
                 self.cover_to_expression(lo, cover)
             }
@@ -1328,7 +1329,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // 方法（含 get/set/async/generator）。
         if self.at(TokenKind::LParen) || kind != PropertyKind::Init || is_async || is_generator {
-            let func = self.parse_method_function(lo, is_async, is_generator);
+            let (func, _) = self.parse_method_function(
+                lo,
+                is_async,
+                is_generator,
+                false,
+                kind != PropertyKind::Set,
+            );
             return self.alloc(ObjectProperty {
                 span: self.span_to(lo),
                 key,
@@ -1521,7 +1528,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if is_async {
             self.bump(); // async
         }
-        let type_parameters = self.ts_type_parameters();
+        let type_parameters = self.ts_type_parameters(TsTypeParameterContext::FunctionLike);
         let can_be_arrow = type_parameters.closed
             && (!self.jsx || type_parameters.jsx_unambiguous)
             && self.at(TokenKind::LParen);
@@ -1531,14 +1538,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
 
         let checkpoint = self.generic_arrow_checkpoint();
+        let type_scope = self.declaration_type_scope_mark();
         if is_async {
             self.bump(); // async
         }
-        self.ts_type_parameters();
+        self.ts_type_parameters(TsTypeParameterContext::FunctionLike);
         let cover = self.parse_cover_paren();
-        self.skip_arrow_return_type_if_arrow();
+        let return_type = self.skip_arrow_return_type_if_arrow();
         if self.at(TokenKind::Arrow) && !self.newline_before() {
-            return Some(self.finish_arrow(lo, cover, is_async));
+            let arrow = self.finish_arrow(lo, cover, is_async, return_type);
+            self.declaration_restore_type_scope(type_scope);
+            return Some(arrow);
         }
 
         self.rewind_generic_arrow(checkpoint);
@@ -1583,6 +1593,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     fn parse_cover_paren(&mut self) -> CoverParen<'a> {
+        let value_reference_mark = self.declaration_value_reference_mark();
         self.expect(TokenKind::LParen);
         let previous_cover = self.in_cover_paren;
         self.in_cover_paren = true;
@@ -1644,7 +1655,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.expect(TokenKind::RParen);
         let _ = self.pop_transform_temp_scope();
         self.in_cover_paren = previous_cover;
-        CoverParen { items, rest }
+        CoverParen {
+            items,
+            rest,
+            value_reference_mark,
+        }
     }
 
     fn ts_optional_arrow_parameter_ahead(&mut self) -> bool {
@@ -1664,16 +1679,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// TS：箭头返回类型注解 `(...): R =>` 擦除。仅当 `)` 后为 `: 类型`（或类型谓词）且紧跟 `=>`
     /// 时才消费；用 checkpoint 试探，避免误吃 `cond ? (x) : y` 里条件表达式的 `:`。
-    fn skip_arrow_return_type_if_arrow(&mut self) {
+    fn skip_arrow_return_type_if_arrow(&mut self) -> Option<Span> {
         if !self.ts || !self.at(TokenKind::Colon) {
-            return;
+            return None;
         }
         let cp = self.checkpoint();
+        let lo = self.start();
         self.bump(); // :
         self.ts_type_or_predicate();
         // 只有确实是箭头（`=>` 紧随）才提交；否则回退，`:` 交回给条件表达式等。
         if !self.at(TokenKind::Arrow) || self.newline_before() {
             self.rewind(cp);
+            None
+        } else {
+            Some(self.span_to(lo))
         }
     }
 
@@ -1823,7 +1842,15 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         )
     }
 
-    fn finish_arrow(&mut self, lo: u32, cover: CoverParen<'a>, is_async: bool) -> Expression<'a> {
+    fn finish_arrow(
+        &mut self,
+        lo: u32,
+        cover: CoverParen<'a>,
+        is_async: bool,
+        return_type: Option<Span>,
+    ) -> Expression<'a> {
+        let value_scope = self.declaration_value_scope_mark();
+        let arrow_span = self.cur.span;
         self.expect(TokenKind::Arrow);
         let mut params = self.new_vec::<Pattern>();
         for e in cover.items.iter() {
@@ -1832,14 +1859,35 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if let Some(rest) = cover.rest {
             params.push(Pattern::Rest(rest));
         }
-        self.finish_arrow_body(lo, params, is_async)
+        self.declaration_activate_parameter_bindings(cover.value_reference_mark, params.as_slice());
+        let expression = self.finish_arrow_body(lo, params, is_async);
+        self.declaration_record_arrow(
+            expression.span(),
+            Span::new(lo, return_type.map_or(arrow_span.lo, |span| span.lo)),
+            return_type.map(|span| Span::new(span.lo + 1, span.hi)),
+            is_async,
+        );
+        self.declaration_restore_value_scope(value_scope);
+        expression
     }
 
     fn finish_single_arrow(&mut self, lo: u32, id: Ident, is_async: bool) -> Expression<'a> {
+        let value_scope = self.declaration_value_scope_mark();
+        let value_reference_mark = self.declaration_value_reference_mark();
+        let arrow_span = self.cur.span;
         self.expect(TokenKind::Arrow);
         let mut params = self.new_vec::<Pattern>();
         params.push(Pattern::Ident(self.alloc(id)));
-        self.finish_arrow_body(lo, params, is_async)
+        self.declaration_activate_parameter_bindings(value_reference_mark, params.as_slice());
+        let expression = self.finish_arrow_body(lo, params, is_async);
+        self.declaration_record_arrow(
+            expression.span(),
+            Span::new(lo, arrow_span.lo),
+            None,
+            is_async,
+        );
+        self.declaration_restore_value_scope(value_scope);
+        expression
     }
 
     fn finish_arrow_body(

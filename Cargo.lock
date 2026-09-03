@@ -4587,6 +4587,7 @@ version = "0.1.26"
 dependencies = [
  "regex",
  "serde",
+ "wake_ecma_parser",
 ]
 
 [[package]]
