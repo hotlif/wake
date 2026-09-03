@@ -5,6 +5,9 @@
 //!
 //! 入口：[`parse`]。产出 [`ParseOutput`]（自引用 [`ModuleAst`] + 依赖 + 诊断）。
 
+/// Stable parser implementation identity for caller-owned cache keys.
+pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v2";
+
 mod expr;
 mod jsx;
 mod stmt;
@@ -16,12 +19,13 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 
 use bumpalo::Bump;
-use wake_common::{Atom, Diagnostic, FxHashMap, Interner, Span};
+use wake_common::{Atom, Diagnostic, FxHashMap, FxHashSet, Interner, Span};
 use wake_ecma_ast::{
     AVec, Dependency, Ident, ModuleAst, Pattern, Program, SourceType, Statement, VarKind,
     VariableDeclaration, VariableDeclarator,
 };
 use wake_ecma_lexer::{Keyword, Lexer, LexerCheckpoint, Token, TokenKind, regex_allowed_after};
+use wake_ecma_transform::AutomaticJsxUsage;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 /// 解析结果。
@@ -224,8 +228,8 @@ pub(crate) struct Parser<'a, 'src, const LOWER: bool> {
     ts: bool,
     /// JSX 模式：表达式起始处的 `<` 解析为 JSX 元素（DESIGN §4.3）。
     jsx: bool,
-    /// 本模块是否用到 JSX（用于按需注入 `react/jsx-runtime` 的 import）。
-    used_jsx: bool,
+    /// 本模块 lowering 后实际引用的 automatic-runtime binding；也是 import 裁剪的唯一事实源。
+    jsx_runtime_usage: AutomaticJsxUsage,
     /// 解析选项（JSX 运行时口径）。
     options: ParseOptions<'src>,
     /// 换行偏移表，惰性构建——仅 JSX dev runtime 需要把 span 换算成行列。
@@ -241,9 +245,12 @@ pub(crate) struct Parser<'a, 'src, const LOWER: bool> {
     /// 预驻留的 `"require"` Atom：`require(...)` 依赖检测用 `id.name == require_atom`（u32 比较）
     /// 取代每次调用 `with_resolved` 锁分片 + 字符串比较。
     require_atom: Atom,
-    /// JSX 常量名（`children`/`_jsx`/`_jsxs`/`_Fragment`）的惰性预驻留：非 JSX 模块永不触发，
-    /// JSX 模块首个元素驻留一次后复用，省去每元素对固定分片的锁 + 哈希 + 查找。
+    /// JSX props/source key 与全部候选 runtime alias 的惰性预驻留：非 JSX 模块永不触发，
+    /// JSX 模块首个元素按固定顺序驻留一次后复用，保持 Atom 分配稳定。
     jsx_atoms: Cell<Option<JsxAtoms>>,
+    /// 含 Unicode escape 的源码需要按 lexer 解码后的标识符检查 synthetic import 冲突。
+    /// 使用字符串集合避免预扫描改变 Interner 的 Atom 分配顺序。
+    jsx_source_identifiers: OnceCell<FxHashSet<String>>,
     /// 为 lowering IIFE 生成与源码标识符不冲突的局部参数名。
     transform_temp: u32,
     /// 正在解析的可注入 `var` 的词法作用域。`None` 是参数/class 等保守区，禁止把
@@ -298,13 +305,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             ctx,
             ts: source_type.is_typescript(),
             jsx: source_type.is_jsx(),
-            used_jsx: false,
+            jsx_runtime_usage: AutomaticJsxUsage::default(),
             has_top_level_await: false,
             diagnostics: Vec::new(),
             dependencies: Vec::new(),
             ident_cache: RefCell::new(FxHashMap::default()),
             require_atom: interner.intern("require"),
             jsx_atoms: Cell::new(None),
+            jsx_source_identifiers: OnceCell::new(),
             transform_temp: 0,
             transform_temp_scopes: Vec::new(),
             spread_helper: None,
@@ -542,7 +550,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 从 `lo` 到上一个已消费 token 结束的 span。
     #[inline]
     fn span_to(&self, lo: u32) -> Span {
-        Span::new(lo, self.prev_end)
+        // Error recovery may deliberately leave an unexpected token unconsumed. If trivia lies
+        // between the previously consumed token and that token, `prev_end` can precede the
+        // construct's start. Keep the recovered node zero-width instead of manufacturing an
+        // inverted span and panicking on otherwise valid UTF-8 input.
+        Span::new(lo, self.prev_end.max(lo))
     }
 
     #[inline]
@@ -633,9 +645,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         program.body = self.inject_transform_temp_declaration(program.body, &transform_temps);
 
         // 用到 JSX：在模块顶部注入 automatic runtime 的 import，并记录依赖（DESIGN §4.3）。
-        // 降级产出的 `_jsx`/`_jsxs`/`_Fragment` 由此 import 绑定；codegen 与依赖扇出全走现有机制。
-        if self.used_jsx {
-            let import = self.build_jsx_runtime_import();
+        // 降级产出的实际 runtime callee/Fragment 由此 import 绑定；codegen 与依赖扇出全走现有机制。
+        if !self.jsx_runtime_usage.is_empty() {
+            let (import, dependency) = self.build_jsx_runtime_import();
             // React/Next.js 等工具把 `"use client"` / `"use server"` 当真正的 Directive
             // Prologue。运行时 import 必须位于完整的连续字符串指令之后，否则会悄悄改变
             // 文件语义。transform temp 声明也在指令之后，因此 import 会自然排在它之前。
@@ -654,7 +666,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 })
                 .count();
             program.body.insert(directive_count, import);
-            self.record_jsx_runtime_dependency();
+            self.dependencies.push(dependency);
         }
 
         program.spread_helper = self.spread_helper;

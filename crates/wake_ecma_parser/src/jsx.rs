@@ -1,9 +1,8 @@
 //! JSX 解析 + 降级（DESIGN §4.3，M4）。
 //!
 //! 路线：**解析时直接降级**为 automatic runtime 调用，产出标准 AST（`_jsx`/`_jsxs`/`_Fragment`
-//! 调用 + 对象/数组字面量），**codegen 无需任何 JSX 逻辑**。模块顶部按需注入
-//! `import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime"`，
-//! 依赖与 CJS 互操作全走现有机制。
+//! 调用 + 对象/数组字面量），**codegen 无需任何 JSX 逻辑**。模块顶部只注入实际调用的
+//! automatic-runtime binding，依赖与 CJS 互操作全走现有机制。
 //!
 //! 词法配合：`>`/`}` 之后的子节点文本由 [`wake_ecma_lexer::Lexer::next_jsx_child_token`] 扫描；
 //! 标签内部（名字/属性/`/`/`>`）用普通词法 + 少量原始字节判断（避开 `/` 的 regex 歧义、支持连字符名）。
@@ -24,12 +23,16 @@
 
 use wake_common::{Atom, Span};
 use wake_ecma_ast::{
-    ArrayExpression, CallExpression, Dependency, DependencyKind, Expression, Ident,
-    ImportDeclaration, ImportSpecifier, MemberExpression, MemberProperty, ModuleExportName,
-    ObjectExpression, ObjectMember, ObjectProperty, PropertyKey, PropertyKind, SpreadElement,
-    Statement, StringLiteral,
+    ArrayExpression, Dependency, DependencyKind, Expression, Ident, ImportDeclaration,
+    ImportSpecifier, MemberExpression, MemberProperty, ModuleExportName, ObjectExpression,
+    ObjectMember, ObjectProperty, PropertyKey, PropertyKind, SpreadElement, Statement,
+    StringLiteral,
 };
-use wake_ecma_lexer::TokenKind;
+use wake_ecma_lexer::{Lexer, TokenKind};
+use wake_ecma_transform::{
+    AutomaticJsxBinding, AutomaticJsxCall, AutomaticJsxCallKind, AutomaticJsxRuntime,
+    lower_automatic_jsx_call,
+};
 
 use crate::Parser;
 
@@ -57,7 +60,69 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         Expression::Identifier(self.alloc(Ident::new(span, name)))
     }
 
-    /// JSX 常量名的惰性预驻留：首次调用驻留 `children`/`_jsx`/`_jsxs`/`_Fragment` 并缓存，
+    fn automatic_jsx_runtime(&self) -> AutomaticJsxRuntime {
+        if self.options.jsx_dev {
+            AutomaticJsxRuntime::Development
+        } else {
+            AutomaticJsxRuntime::Production
+        }
+    }
+
+    /// Keep historical aliases when they cannot capture source identifiers. A source occurrence
+    /// selects a deterministic Wake-owned fallback; the conservative text check also protects
+    /// unresolved references which would otherwise become captured by the synthetic import.
+    fn automatic_jsx_alias(&self, binding: AutomaticJsxBinding) -> Atom {
+        let preferred = binding.preferred_local();
+        if !self.automatic_jsx_alias_taken(preferred) {
+            return self.interner.intern(preferred);
+        }
+
+        let fallback = match binding {
+            AutomaticJsxBinding::Jsx => "__wake_jsx",
+            AutomaticJsxBinding::Jsxs => "__wake_jsxs",
+            AutomaticJsxBinding::Fragment => "__wake_fragment",
+            AutomaticJsxBinding::JsxDev => "__wake_jsx_dev",
+        };
+        for suffix in 0_u32.. {
+            let candidate = if suffix == 0 {
+                fallback.to_string()
+            } else {
+                format!("{fallback}{suffix}")
+            };
+            if !self.automatic_jsx_alias_taken(&candidate) {
+                return self.interner.intern(&candidate);
+            }
+        }
+        unreachable!("the finite source cannot contain every generated JSX alias")
+    }
+
+    fn automatic_jsx_alias_taken(&self, candidate: &str) -> bool {
+        if self.source.contains(candidate) {
+            return true;
+        }
+        if !self.source.contains('\\') {
+            return false;
+        }
+        self.jsx_source_identifiers
+            .get_or_init(|| {
+                let mut identifiers = wake_common::FxHashSet::default();
+                let mut lexer = Lexer::new(self.source);
+                loop {
+                    let token = lexer.next(false);
+                    match token.kind {
+                        TokenKind::Ident => {
+                            identifiers.insert(lexer.identifier_text(token.span).into_owned());
+                        }
+                        TokenKind::Eof => break,
+                        _ => {}
+                    }
+                }
+                identifiers
+            })
+            .contains(candidate)
+    }
+
+    /// JSX 常量名的惰性预驻留：首次调用按固定顺序驻留 props/source key 与全部候选 alias，
     /// 之后复用（Atom 为 `Copy`），省去每个 JSX 元素对固定分片的锁 + 哈希 + 查找。
     fn jsx_atoms(&self) -> crate::JsxAtoms {
         if let Some(a) = self.jsx_atoms.get() {
@@ -65,10 +130,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
         let a = crate::JsxAtoms {
             children: self.interner.intern("children"),
-            jsx: self.interner.intern("_jsx"),
-            jsxs: self.interner.intern("_jsxs"),
-            fragment: self.interner.intern("_Fragment"),
-            jsx_dev: self.interner.intern("_jsxDEV"),
+            jsx: self.automatic_jsx_alias(AutomaticJsxBinding::Jsx),
+            jsxs: self.automatic_jsx_alias(AutomaticJsxBinding::Jsxs),
+            fragment: self.automatic_jsx_alias(AutomaticJsxBinding::Fragment),
+            jsx_dev: self.automatic_jsx_alias(AutomaticJsxBinding::JsxDev),
             file_name: self.interner.intern("fileName"),
             line_number: self.interner.intern("lineNumber"),
             column_number: self.interner.intern("columnNumber"),
@@ -90,7 +155,6 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 解析一个 JSX 元素或片段（`cur == <`）。返回降级后的表达式；
     /// 返回时 `self.prev_end` = 末尾 `>` 之后的字节位置，`cur` 已失效（由调用方决定后续取词方式）。
     fn parse_jsx_element_or_fragment(&mut self) -> Expression<'a> {
-        self.used_jsx = true;
         let lo = self.cur.span.lo;
         let after_lt = self.cur.span.hi;
         // 取 `<` 之后的标签 token（名字，或片段的 `>`）。
@@ -98,6 +162,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // 片段 `<> ... </>`。
         if self.at(TokenKind::Gt) {
+            self.jsx_runtime_usage.insert(AutomaticJsxBinding::Fragment);
             self.prev_end = self.cur.span.hi;
             let children = self.parse_jsx_children();
             self.parse_jsx_closing();
@@ -464,41 +529,30 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         };
 
         let atoms = self.jsx_atoms();
-        let mut args = self.new_vec::<Expression>();
-        args.push(type_expr);
-        args.push(props);
-
-        if !self.options.jsx_dev {
-            let callee = self.ident_expr_atom(span, if use_jsxs { atoms.jsxs } else { atoms.jsx });
-            if let Some(k) = key {
-                args.push(k);
-            }
-            return Expression::Call(self.alloc(CallExpression {
-                span,
-                callee,
-                arguments: args,
-                optional: false,
-            }));
-        }
-
-        // dev runtime：`_jsxDEV(type, props, key, isStaticChildren, source, self)`
-        // ——固定 6 参（对齐 tsc/Babel），额外携带源位置供 React DevTools 显示组件栈。
-        let callee = self.ident_expr_atom(span, atoms.jsx_dev);
-        args.push(key.unwrap_or_else(|| self.undefined_expr()));
-        args.push(Expression::BooleanLiteral(self.alloc(
-            wake_ecma_ast::BooleanLiteral {
-                span,
-                value: use_jsxs,
+        let kind = match self.automatic_jsx_runtime() {
+            AutomaticJsxRuntime::Production => AutomaticJsxCallKind::Production {
+                jsx: atoms.jsx,
+                jsxs: atoms.jsxs,
             },
-        )));
-        args.push(self.jsx_dev_source(span, lo));
-        args.push(Expression::This(span));
-        Expression::Call(self.alloc(CallExpression {
-            span,
-            callee,
-            arguments: args,
-            optional: false,
-        }))
+            AutomaticJsxRuntime::Development => AutomaticJsxCallKind::Development {
+                jsx_dev: atoms.jsx_dev,
+                source: self.jsx_dev_source(span, lo),
+            },
+        };
+        let (expression, binding) = lower_automatic_jsx_call(
+            self.arena,
+            self.interner,
+            kind,
+            AutomaticJsxCall {
+                span,
+                element: type_expr,
+                props,
+                key,
+                static_children: use_jsxs,
+            },
+        );
+        self.jsx_runtime_usage.insert(binding);
+        expression
     }
 
     /// dev runtime 的第 5 参：`{ fileName, lineNumber, columnNumber }`（行列均 1 基，
@@ -534,7 +588,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }))
     }
 
-    /// 字节偏移 → (行, 列)，均 **1 基**；列按 UTF-8 字符计。惰性构建换行表并缓存。
+    /// 字节偏移 → (行, 列)，均 **1 基**；列按 UTF-16 code unit 计。惰性构建换行表并缓存。
     fn line_col_1based(&self, offset: u32) -> (u32, u32) {
         let starts = self.line_starts.get_or_init(|| {
             let mut v = Vec::with_capacity(self.source.len() / 32 + 1);
@@ -548,60 +602,47 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         });
         let idx = starts.partition_point(|&s| s <= offset).saturating_sub(1);
         let line_start = starts[idx] as usize;
-        let col = self.source[line_start..offset as usize].chars().count() + 1;
+        let col = self.source[line_start..offset as usize]
+            .encode_utf16()
+            .count()
+            + 1;
         (idx as u32 + 1, col as u32)
     }
 
     /// 构造并返回按需注入的 `react/jsx-runtime` import（供 `parse_program` 在用到 JSX 时插入 body[0]）。
-    pub(crate) fn build_jsx_runtime_import(&self) -> Statement<'a> {
-        let source = self.intern_str(&self.jsx_runtime_specifier());
+    pub(crate) fn build_jsx_runtime_import(&self) -> (Statement<'a>, Dependency) {
+        let runtime = self.automatic_jsx_runtime();
+        let source = self.intern_str(&runtime.specifier(self.options.jsx_import_source));
+        let atoms = self.jsx_atoms();
         let mut specs = self.new_vec::<ImportSpecifier>();
-        // dev runtime 只导出 `jsxDEV`（无 jsx/jsxs 之分——是否静态子节点由第 4 参表达）。
-        let imports: &[(&str, &str)] = if self.options.jsx_dev {
-            &[("jsxDEV", "_jsxDEV"), ("Fragment", "_Fragment")]
-        } else {
-            &[
-                ("jsx", "_jsx"),
-                ("jsxs", "_jsxs"),
-                ("Fragment", "_Fragment"),
-            ]
-        };
-        for &(imported, local) in imports {
+        for binding in runtime.used_imports(self.jsx_runtime_usage) {
+            let local = match binding {
+                AutomaticJsxBinding::Jsx => atoms.jsx,
+                AutomaticJsxBinding::Jsxs => atoms.jsxs,
+                AutomaticJsxBinding::Fragment => atoms.fragment,
+                AutomaticJsxBinding::JsxDev => atoms.jsx_dev,
+            };
             specs.push(ImportSpecifier::Named {
                 span: Span::DUMMY,
                 imported: ModuleExportName::Ident(Ident::new(
                     Span::DUMMY,
-                    self.intern_str(imported),
+                    self.intern_str(binding.imported()),
                 )),
-                local: Ident::new(Span::DUMMY, self.intern_str(local)),
+                local: Ident::new(Span::DUMMY, local),
             });
         }
-        Statement::Import(self.alloc(ImportDeclaration {
+        let statement = Statement::Import(self.alloc(ImportDeclaration {
             span: Span::DUMMY,
             specifiers: specs,
             source,
             attributes: None,
-        }))
-    }
-
-    /// JSX 运行时说明符：`<jsxImportSource>/jsx-runtime`（dev 下 `/jsx-dev-runtime`）。
-    pub(crate) fn jsx_runtime_specifier(&self) -> String {
-        let suffix = if self.options.jsx_dev {
-            "/jsx-dev-runtime"
-        } else {
-            "/jsx-runtime"
-        };
-        format!("{}{}", self.options.jsx_import_source, suffix)
-    }
-
-    /// 记录对 JSX 运行时的依赖（供 bundler 扇出 + 建立 linker 映射）。
-    pub(crate) fn record_jsx_runtime_dependency(&mut self) {
-        let specifier = self.intern_str(&self.jsx_runtime_specifier());
-        self.dependencies.push(Dependency {
-            specifier,
+        }));
+        let dependency = Dependency {
+            specifier: source,
             kind: DependencyKind::Import,
             span: Span::DUMMY,
-        });
+        };
+        (statement, dependency)
     }
 }
 

@@ -3,6 +3,7 @@
 use wake_common::{Atom, Span};
 use wake_ecma_ast::*;
 use wake_ecma_lexer::{Keyword, TokenKind};
+use wake_ecma_transform::AutomaticJsxUsage;
 
 use crate::{Context, Parser, ParserCheckpoint};
 
@@ -20,7 +21,7 @@ struct GenericArrowCheckpoint {
     parser: ParserCheckpoint,
     ctx: Context,
     dependency_len: usize,
-    used_jsx: bool,
+    jsx_runtime_usage: AutomaticJsxUsage,
     has_top_level_await: bool,
     transform_temp: u32,
     transform_temp_scopes: Vec<Option<Vec<Atom>>>,
@@ -1549,7 +1550,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             parser: self.checkpoint(),
             ctx: self.ctx,
             dependency_len: self.dependencies.len(),
-            used_jsx: self.used_jsx,
+            jsx_runtime_usage: self.jsx_runtime_usage,
             has_top_level_await: self.has_top_level_await,
             transform_temp: self.transform_temp,
             transform_temp_scopes: self.transform_temp_scopes.clone(),
@@ -1567,7 +1568,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.rewind(checkpoint.parser);
         self.ctx = checkpoint.ctx;
         self.dependencies.truncate(checkpoint.dependency_len);
-        self.used_jsx = checkpoint.used_jsx;
+        self.jsx_runtime_usage = checkpoint.jsx_runtime_usage;
         self.has_top_level_await = checkpoint.has_top_level_await;
         self.transform_temp = checkpoint.transform_temp;
         self.transform_temp_scopes = checkpoint.transform_temp_scopes;

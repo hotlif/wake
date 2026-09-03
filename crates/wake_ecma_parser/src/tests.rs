@@ -1,6 +1,6 @@
 //! 解析器单测。用公开 [`crate::parse`] API + AST 断言。
 
-use wake_common::Interner;
+use wake_common::{Atom, Interner, Span};
 use wake_ecma_ast::*;
 
 use crate::{ParseOptions, parse, parse_with};
@@ -368,6 +368,539 @@ fn parse_ok(src: &str, st: SourceType) -> crate::ParseOutput {
         out.diagnostics
     );
     out
+}
+
+fn automatic_runtime_import<'a>(program: &'a Program<'a>) -> &'a ImportDeclaration<'a> {
+    program
+        .body
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Import(import) => Some(*import),
+            _ => None,
+        })
+        .expect("automatic-runtime import")
+}
+
+fn automatic_runtime_alias(
+    import: &ImportDeclaration<'_>,
+    interner: &Interner,
+    imported_name: &str,
+) -> Atom {
+    import
+        .specifiers
+        .iter()
+        .find_map(|specifier| match specifier {
+            ImportSpecifier::Named {
+                imported: ModuleExportName::Ident(imported),
+                local,
+                ..
+            } if interner.resolve(imported.name) == imported_name => Some(local.name),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("automatic-runtime binding `{imported_name}`"))
+}
+
+fn automatic_runtime_binding_names(
+    import: &ImportDeclaration<'_>,
+    interner: &Interner,
+) -> Vec<String> {
+    import
+        .specifiers
+        .iter()
+        .map(|specifier| match specifier {
+            ImportSpecifier::Named {
+                imported: ModuleExportName::Ident(imported),
+                ..
+            } => interner.resolve(imported.name),
+            _ => panic!("automatic-runtime imports must stay named: {specifier:?}"),
+        })
+        .collect()
+}
+
+fn variable_initializer<'a>(
+    program: &'a Program<'a>,
+    interner: &Interner,
+    name: &str,
+) -> Expression<'a> {
+    program
+        .body
+        .iter()
+        .find_map(|statement| {
+            let Statement::VariableDeclaration(declaration) = statement else {
+                return None;
+            };
+            declaration
+                .declarations
+                .iter()
+                .find_map(|declarator| match declarator.id {
+                    Pattern::Ident(ident) if interner.resolve(ident.name) == name => {
+                        declarator.init
+                    }
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| panic!("initializer for `{name}`"))
+}
+
+fn call_expression(expression: Expression<'_>) -> &CallExpression<'_> {
+    let Expression::Call(call) = expression else {
+        panic!("expected call expression, got {expression:?}")
+    };
+    call
+}
+
+fn identifier_atom(expression: Expression<'_>) -> Atom {
+    let Expression::Identifier(identifier) = expression else {
+        panic!("expected identifier, got {expression:?}")
+    };
+    identifier.name
+}
+
+fn object_property<'a>(
+    expression: Expression<'a>,
+    interner: &Interner,
+    name: &str,
+) -> Expression<'a> {
+    let Expression::Object(object) = expression else {
+        panic!("expected object expression, got {expression:?}")
+    };
+    object
+        .properties
+        .iter()
+        .find_map(|member| match member {
+            ObjectMember::Property(property)
+                if matches!(
+                    property.key,
+                    PropertyKey::Ident(identifier)
+                        if interner.resolve(identifier.name) == name
+                ) =>
+            {
+                Some(property.value)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("object property `{name}`"))
+}
+
+#[test]
+fn automatic_jsx_imports_only_the_helpers_used_by_lowered_calls() {
+    let cases: &[(&str, bool, &[&str])] = &[
+        ("const view = <C />;", false, &["jsx"]),
+        ("const view = <C>{a}</C>;", false, &["jsx"]),
+        ("const view = <C>{[a, b]}</C>;", false, &["jsx"]),
+        ("const view = <C>{a}{b}</C>;", false, &["jsxs"]),
+        ("const view = <C><i /><b /></C>;", false, &["jsx", "jsxs"]),
+        ("const view = <>{a}</>;", false, &["jsx", "Fragment"]),
+        ("const view = <>{a}{b}</>;", false, &["jsxs", "Fragment"]),
+        (
+            "const view = <><i /><b /></>;",
+            false,
+            &["jsx", "jsxs", "Fragment"],
+        ),
+        (
+            "const Fragment = C; const view = <Fragment />;",
+            false,
+            &["jsx"],
+        ),
+        ("const view = <C>{a}{b}</C>;", true, &["jsxDEV"]),
+        ("const view = <>{a}{b}</>;", true, &["jsxDEV", "Fragment"]),
+    ];
+
+    for &(source, development, expected) in cases {
+        let interner = Interner::new();
+        let output = parse_with(
+            source,
+            &interner,
+            SourceType::Tsx,
+            ParseOptions {
+                jsx_dev: development,
+                file_name: "view.tsx",
+                ..ParseOptions::default()
+            },
+        );
+        assert!(!output.has_errors(), "{source}: {:?}", output.diagnostics);
+        assert_eq!(output.dependencies.len(), 1, "{source}");
+        let dependency = &output.dependencies[0];
+        assert_eq!(dependency.kind, DependencyKind::Import, "{source}");
+        assert_eq!(dependency.span, Span::DUMMY, "{source}");
+        assert_eq!(
+            interner.resolve(dependency.specifier),
+            if development {
+                "react/jsx-dev-runtime"
+            } else {
+                "react/jsx-runtime"
+            },
+            "{source}"
+        );
+        output.module.with_ast(|program| {
+            let import = automatic_runtime_import(program);
+            assert_eq!(
+                automatic_runtime_binding_names(import, &interner),
+                expected,
+                "{source}"
+            );
+            assert_eq!(import.span, Span::DUMMY, "{source}");
+            for specifier in &import.specifiers {
+                let ImportSpecifier::Named {
+                    span,
+                    imported: ModuleExportName::Ident(imported),
+                    local,
+                } = specifier
+                else {
+                    panic!("automatic-runtime imports must stay named")
+                };
+                assert_eq!(*span, Span::DUMMY, "{source}");
+                assert_eq!(imported.span, Span::DUMMY, "{source}");
+                assert_eq!(local.span, Span::DUMMY, "{source}");
+            }
+        });
+    }
+}
+
+#[test]
+fn automatic_jsx_aliases_avoid_unicode_escaped_identifier_collisions() {
+    let interner = Interner::new();
+    let output = parse(
+        r"const _\u006asx = 1, __wake_\u{6a}sx = 2; const view = <div />;",
+        &interner,
+        SourceType::Tsx,
+    );
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    output.module.with_ast(|program| {
+        let import = automatic_runtime_import(program);
+        let jsx = automatic_runtime_alias(import, &interner, "jsx");
+        assert_eq!(interner.resolve(jsx), "__wake_jsx1");
+        let view = call_expression(variable_initializer(program, &interner, "view"));
+        assert_eq!(identifier_atom(view.callee), jsx);
+    });
+}
+
+#[test]
+fn automatic_jsx_helper_pruning_preserves_call_fragment_and_child_spans() {
+    let interner = Interner::new();
+    let source = "const element = <Box key={key}>{a}{b}</Box>; const fragment = <>{value}</>;";
+    let output = parse(source, &interner, SourceType::Tsx);
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    output.module.with_ast(|program| {
+        let element = call_expression(variable_initializer(program, &interner, "element"));
+        let element_lo = source.find("<Box").unwrap() as u32;
+        let element_hi = (source.find("</Box>").unwrap() + "</Box>".len()) as u32;
+        assert_eq!(element.span, Span::new(element_lo, element_hi));
+        let Expression::Identifier(element_callee) = element.callee else {
+            panic!("element callee must remain an identifier")
+        };
+        assert_eq!(element_callee.span, element.span);
+        let children = object_property(element.arguments[1], &interner, "children");
+        let Expression::Array(children) = children else {
+            panic!("two children must remain an array")
+        };
+        assert_eq!(children.span, element.span);
+
+        let fragment = call_expression(variable_initializer(program, &interner, "fragment"));
+        let fragment_lo = source.find("<>{value}").unwrap() as u32;
+        let fragment_hi = (source.find("</>").unwrap() + "</>".len()) as u32;
+        assert_eq!(fragment.span, Span::new(fragment_lo, fragment_hi));
+        let Expression::Identifier(fragment_name) = fragment.arguments[0] else {
+            panic!("fragment runtime argument must remain an identifier")
+        };
+        assert_eq!(fragment_name.span, Span::new(fragment_lo, fragment_lo));
+    });
+}
+
+#[test]
+fn automatic_jsx_production_children_key_and_spread_contract() {
+    let interner = Interner::new();
+    let mut transform_features = wake_ecma_transform::FeatureSet::default();
+    transform_features.insert(wake_ecma_transform::EcmaFeature::ObjectRestSpread);
+    let out = parse_with(
+        "const single = <Box key={token}>child</Box>;\n\
+         const multiple = <Box {...props}><i /><b /></Box>;",
+        &interner,
+        SourceType::Tsx,
+        ParseOptions {
+            transform_features,
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.dependencies.len(), 1);
+    assert_eq!(
+        interner.resolve(out.dependencies[0].specifier),
+        "react/jsx-runtime"
+    );
+
+    out.module.with_ast(|program| {
+        let import = automatic_runtime_import(program);
+        assert_eq!(interner.resolve(import.source), "react/jsx-runtime");
+        let jsx = automatic_runtime_alias(import, &interner, "jsx");
+        let jsxs = automatic_runtime_alias(import, &interner, "jsxs");
+        assert_eq!(interner.resolve(jsx), "_jsx");
+        assert_eq!(interner.resolve(jsxs), "_jsxs");
+
+        let single = call_expression(variable_initializer(program, &interner, "single"));
+        assert_eq!(identifier_atom(single.callee), jsx);
+        assert_eq!(
+            single.arguments.len(),
+            3,
+            "key is the production third argument"
+        );
+        let single_props = single.arguments[1];
+        assert!(
+            matches!(
+                object_property(single_props, &interner, "children"),
+                Expression::StringLiteral(_)
+            ),
+            "one child stays scalar"
+        );
+        let Expression::Object(single_props) = single_props else {
+            unreachable!()
+        };
+        assert!(
+            single_props.properties.iter().all(|member| !matches!(
+                member,
+                ObjectMember::Property(property)
+                    if matches!(
+                        property.key,
+                        PropertyKey::Ident(identifier)
+                            if interner.resolve(identifier.name) == "key"
+                    )
+            )),
+            "key must not remain in props"
+        );
+
+        let multiple = call_expression(variable_initializer(program, &interner, "multiple"));
+        assert_eq!(identifier_atom(multiple.callee), jsxs);
+        assert_eq!(
+            multiple.arguments.len(),
+            2,
+            "missing key keeps the two-argument ABI"
+        );
+        assert!(
+            matches!(multiple.arguments[1], Expression::Call(_)),
+            "legacy targets lower JSX prop spread before the runtime call"
+        );
+        assert!(program.object_spread_helper.is_some());
+    });
+}
+
+#[test]
+fn automatic_jsx_development_runtime_preserves_unicode_source_location() {
+    let interner = Interner::new();
+    let source = "const label = '界'; const view = <Box><i /><b /></Box>;";
+    let out = parse_with(
+        source,
+        &interner,
+        SourceType::Tsx,
+        ParseOptions {
+            jsx_dev: true,
+            file_name: "src/界面.tsx",
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.dependencies.len(), 1);
+    assert_eq!(
+        interner.resolve(out.dependencies[0].specifier),
+        "react/jsx-dev-runtime"
+    );
+
+    out.module.with_ast(|program| {
+        let import = automatic_runtime_import(program);
+        let jsx_dev = automatic_runtime_alias(import, &interner, "jsxDEV");
+        assert_eq!(interner.resolve(jsx_dev), "_jsxDEV");
+        let view = call_expression(variable_initializer(program, &interner, "view"));
+        assert_eq!(identifier_atom(view.callee), jsx_dev);
+        assert_eq!(
+            view.arguments.len(),
+            6,
+            "development calls always have six arguments"
+        );
+        assert!(matches!(view.arguments[2], Expression::Identifier(_)));
+        assert!(
+            matches!(view.arguments[3], Expression::BooleanLiteral(value) if value.value),
+            "multiple children are static"
+        );
+        let source_object = view.arguments[4];
+        let Expression::StringLiteral(file_name) =
+            object_property(source_object, &interner, "fileName")
+        else {
+            panic!("fileName must be a string")
+        };
+        assert_eq!(interner.resolve(file_name.value), "src/界面.tsx");
+        let Expression::NumberLiteral(line) =
+            object_property(source_object, &interner, "lineNumber")
+        else {
+            panic!("lineNumber must be numeric")
+        };
+        assert_eq!(line.value, 1.0);
+        let Expression::NumberLiteral(column) =
+            object_property(source_object, &interner, "columnNumber")
+        else {
+            panic!("columnNumber must be numeric")
+        };
+        let opening = source.find("<Box>").unwrap();
+        let expected_column = source[..opening].encode_utf16().count() as f64 + 1.0;
+        assert_eq!(
+            column.value, expected_column,
+            "columns count UTF-16 code units, not UTF-8 bytes"
+        );
+        assert!(matches!(view.arguments[5], Expression::This(_)));
+    });
+}
+
+#[test]
+fn automatic_jsx_development_columns_use_utf16_across_crlf() {
+    let interner = Interner::new();
+    let source = "const first = 1;\r\nconst emoji = '😀'; const view = <Box />;";
+    let output = parse_with(
+        source,
+        &interner,
+        SourceType::Tsx,
+        ParseOptions {
+            jsx_dev: true,
+            file_name: "src/view.tsx",
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    output.module.with_ast(|program| {
+        let view = call_expression(variable_initializer(program, &interner, "view"));
+        let source_object = view.arguments[4];
+        let Expression::NumberLiteral(line) =
+            object_property(source_object, &interner, "lineNumber")
+        else {
+            panic!("lineNumber must be numeric")
+        };
+        let Expression::NumberLiteral(column) =
+            object_property(source_object, &interner, "columnNumber")
+        else {
+            panic!("columnNumber must be numeric")
+        };
+        let opening = source.find("<Box").unwrap();
+        let line_start = source[..opening].rfind('\n').map_or(0, |index| index + 1);
+        let expected_column = source[line_start..opening].encode_utf16().count() as f64 + 1.0;
+        assert_eq!(line.value, 2.0);
+        assert_eq!(column.value, expected_column);
+    });
+}
+
+#[test]
+fn automatic_jsx_custom_source_keeps_directives_and_dependency_in_sync() {
+    let interner = Interner::new();
+    let out = parse_with(
+        "\"use client\"; \"wake marker\"; const view = <div />;",
+        &interner,
+        SourceType::Tsx,
+        ParseOptions {
+            jsx_import_source: "preact",
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.dependencies.len(), 1);
+    assert_eq!(
+        interner.resolve(out.dependencies[0].specifier),
+        "preact/jsx-runtime"
+    );
+    out.module.with_ast(|program| {
+        assert!(matches!(program.body[0], Statement::Expression(_)));
+        assert!(matches!(program.body[1], Statement::Expression(_)));
+        let Statement::Import(import) = program.body[2] else {
+            panic!("runtime import must follow the complete directive prologue")
+        };
+        assert_eq!(interner.resolve(import.source), "preact/jsx-runtime");
+    });
+}
+
+#[test]
+fn automatic_jsx_production_runtime_aliases_avoid_source_name_collisions() {
+    let interner = Interner::new();
+    let out = parse(
+        "const _jsx = 1, _jsxs = 2, _Fragment = 3;\n\
+         const view = <><i /><b /></>;",
+        &interner,
+        SourceType::Tsx,
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.module.with_ast(|program| {
+        let import = automatic_runtime_import(program);
+        let jsx = automatic_runtime_alias(import, &interner, "jsx");
+        let jsxs = automatic_runtime_alias(import, &interner, "jsxs");
+        let fragment = automatic_runtime_alias(import, &interner, "Fragment");
+        assert_ne!(interner.resolve(jsx), "_jsx");
+        assert_ne!(interner.resolve(jsxs), "_jsxs");
+        assert_ne!(interner.resolve(fragment), "_Fragment");
+
+        let view = call_expression(variable_initializer(program, &interner, "view"));
+        assert_eq!(identifier_atom(view.callee), jsxs);
+        assert_eq!(identifier_atom(view.arguments[0]), fragment);
+        let children = object_property(view.arguments[1], &interner, "children");
+        let Expression::Array(children) = children else {
+            panic!("fragment children must be an array")
+        };
+        for child in children.elements.iter().flatten() {
+            assert_eq!(identifier_atom(call_expression(*child).callee), jsx);
+        }
+    });
+}
+
+#[test]
+fn automatic_jsx_runtime_aliases_are_not_captured_by_nested_bindings() {
+    let interner = Interner::new();
+    let out = parse(
+        "const render = (_jsx, _jsxs, _Fragment) => <><i /><b /></>;",
+        &interner,
+        SourceType::Tsx,
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.module.with_ast(|program| {
+        let import = automatic_runtime_import(program);
+        let jsx = automatic_runtime_alias(import, &interner, "jsx");
+        let jsxs = automatic_runtime_alias(import, &interner, "jsxs");
+        let fragment = automatic_runtime_alias(import, &interner, "Fragment");
+        let Expression::Arrow(render) = variable_initializer(program, &interner, "render") else {
+            panic!("render must remain an arrow")
+        };
+        let ArrowBody::Expression(view) = render.body else {
+            panic!("render must keep its expression body")
+        };
+        let view = call_expression(view);
+        assert_eq!(identifier_atom(view.callee), jsxs);
+        assert_eq!(identifier_atom(view.arguments[0]), fragment);
+        let children = object_property(view.arguments[1], &interner, "children");
+        let Expression::Array(children) = children else {
+            panic!("fragment children must be an array")
+        };
+        for child in children.elements.iter().flatten() {
+            assert_eq!(identifier_atom(call_expression(*child).callee), jsx);
+        }
+    });
+}
+
+#[test]
+fn automatic_jsx_development_runtime_aliases_avoid_source_name_collisions() {
+    let interner = Interner::new();
+    let out = parse_with(
+        "const _jsxDEV = 1, _Fragment = 2; const view = <><i /></>;",
+        &interner,
+        SourceType::Tsx,
+        ParseOptions {
+            jsx_dev: true,
+            file_name: "view.tsx",
+            ..ParseOptions::default()
+        },
+    );
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.module.with_ast(|program| {
+        let import = automatic_runtime_import(program);
+        let jsx_dev = automatic_runtime_alias(import, &interner, "jsxDEV");
+        let fragment = automatic_runtime_alias(import, &interner, "Fragment");
+        assert_ne!(interner.resolve(jsx_dev), "_jsxDEV");
+        assert_ne!(interner.resolve(fragment), "_Fragment");
+        let view = call_expression(variable_initializer(program, &interner, "view"));
+        assert_eq!(identifier_atom(view.callee), jsx_dev);
+        assert_eq!(identifier_atom(view.arguments[0]), fragment);
+    });
 }
 
 #[test]
@@ -1051,6 +1584,7 @@ fn no_panic_on_garbage() {
         "if if if",
         "((((",
         "]]]",
+        "({ ; })",
     ] {
         let out = parse(src, &interner, SourceType::Module);
         let _ = out.dependencies;

@@ -1896,6 +1896,197 @@ impl Default for ReactOptions {
     }
 }
 
+/// React-compatible automatic JSX runtime selected by the frontend.
+///
+/// The parser owns JSX grammar and import placement. This type owns the runtime request and
+/// binding policy so call construction and injected imports cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AutomaticJsxRuntime {
+    Production,
+    Development,
+}
+
+/// One automatic-runtime binding. The parser may replace [`Self::preferred_local`] with a
+/// collision-free alias, but the imported name and call role stay transform-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AutomaticJsxBinding {
+    Jsx,
+    Jsxs,
+    Fragment,
+    JsxDev,
+}
+
+impl AutomaticJsxBinding {
+    pub const fn imported(self) -> &'static str {
+        match self {
+            Self::Jsx => "jsx",
+            Self::Jsxs => "jsxs",
+            Self::Fragment => "Fragment",
+            Self::JsxDev => "jsxDEV",
+        }
+    }
+
+    pub const fn preferred_local(self) -> &'static str {
+        match self {
+            Self::Jsx => "_jsx",
+            Self::Jsxs => "_jsxs",
+            Self::Fragment => "_Fragment",
+            Self::JsxDev => "_jsxDEV",
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Jsx => 1 << 0,
+            Self::Jsxs => 1 << 1,
+            Self::Fragment => 1 << 2,
+            Self::JsxDev => 1 << 3,
+        }
+    }
+}
+
+/// Module-local automatic-runtime bindings referenced by parser-produced JSX calls.
+///
+/// The bit representation stays private so the transform remains the sole owner of binding roles.
+/// The parser carries this value only as a derived usage fact and uses it to filter the canonical
+/// runtime import order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AutomaticJsxUsage(u8);
+
+impl AutomaticJsxUsage {
+    pub fn insert(&mut self, binding: AutomaticJsxBinding) {
+        self.0 |= binding.bit();
+    }
+
+    pub const fn contains(self, binding: AutomaticJsxBinding) -> bool {
+        self.0 & binding.bit() != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+const PRODUCTION_JSX_IMPORTS: [AutomaticJsxBinding; 3] = [
+    AutomaticJsxBinding::Jsx,
+    AutomaticJsxBinding::Jsxs,
+    AutomaticJsxBinding::Fragment,
+];
+
+const DEVELOPMENT_JSX_IMPORTS: [AutomaticJsxBinding; 2] =
+    [AutomaticJsxBinding::JsxDev, AutomaticJsxBinding::Fragment];
+
+impl AutomaticJsxRuntime {
+    pub fn specifier(self, import_source: &str) -> String {
+        let suffix = match self {
+            Self::Production => "/jsx-runtime",
+            Self::Development => "/jsx-dev-runtime",
+        };
+        format!("{import_source}{suffix}")
+    }
+
+    pub const fn imports(self) -> &'static [AutomaticJsxBinding] {
+        match self {
+            Self::Production => &PRODUCTION_JSX_IMPORTS,
+            Self::Development => &DEVELOPMENT_JSX_IMPORTS,
+        }
+    }
+
+    /// Iterate used imports in the runtime's canonical order, omitting every unused helper.
+    pub fn used_imports(
+        self,
+        usage: AutomaticJsxUsage,
+    ) -> impl Iterator<Item = AutomaticJsxBinding> {
+        self.imports()
+            .iter()
+            .copied()
+            .filter(move |binding| usage.contains(*binding))
+    }
+}
+
+/// Syntax-derived values already prepared by the parser for one automatic-runtime call.
+#[derive(Clone, Copy, Debug)]
+pub struct AutomaticJsxCall<'a> {
+    pub span: Span,
+    pub element: Expression<'a>,
+    pub props: Expression<'a>,
+    pub key: Option<Expression<'a>>,
+    pub static_children: bool,
+}
+
+/// Runtime-specific values for one call. Development-only source coordinates remain parser-owned,
+/// while this enum makes the two runtime ABIs impossible to mix.
+#[derive(Clone, Copy, Debug)]
+pub enum AutomaticJsxCallKind<'a> {
+    Production {
+        jsx: Atom,
+        jsxs: Atom,
+    },
+    Development {
+        jsx_dev: Atom,
+        source: Expression<'a>,
+    },
+}
+
+/// Build the final automatic-runtime call in the parser's arena.
+///
+/// JSX grammar, props construction, source coordinates, runtime aliases, import placement and
+/// dependency recording stay with the parser. This function is the sole owner of production/dev
+/// argument order and `_jsx` versus `_jsxs` selection. The returned binding role lets the parser
+/// record that decision without duplicating it.
+pub fn lower_automatic_jsx_call<'a>(
+    arena: &'a Bump,
+    interner: &Interner,
+    kind: AutomaticJsxCallKind<'a>,
+    call: AutomaticJsxCall<'a>,
+) -> (Expression<'a>, AutomaticJsxBinding) {
+    let mut arguments = AVec::with_capacity_in(6, arena);
+    arguments.push(call.element);
+    arguments.push(call.props);
+
+    let (callee, binding) = match kind {
+        AutomaticJsxCallKind::Production { jsx, jsxs } => {
+            let (callee, binding) = if call.static_children {
+                (jsxs, AutomaticJsxBinding::Jsxs)
+            } else {
+                (jsx, AutomaticJsxBinding::Jsx)
+            };
+            let callee = Expression::Identifier(arena.alloc(Ident::new(call.span, callee)));
+            if let Some(key) = call.key {
+                arguments.push(key);
+            }
+            (callee, binding)
+        }
+        AutomaticJsxCallKind::Development { jsx_dev, source } => {
+            let callee = Expression::Identifier(arena.alloc(Ident::new(call.span, jsx_dev)));
+            arguments.push(call.key.unwrap_or_else(|| {
+                Expression::Identifier(
+                    arena.alloc(Ident::new(Span::DUMMY, interner.intern("undefined"))),
+                )
+            }));
+            arguments.push(Expression::BooleanLiteral(arena.alloc(
+                wake_ecma_ast::BooleanLiteral {
+                    span: call.span,
+                    value: call.static_children,
+                },
+            )));
+            arguments.push(source);
+            arguments.push(Expression::This(call.span));
+            (callee, AutomaticJsxBinding::JsxDev)
+        }
+    };
+
+    (
+        Expression::Call(arena.alloc(CallExpression {
+            span: call.span,
+            callee,
+            arguments,
+            optional: false,
+        })),
+        binding,
+    )
+}
+
 /// 一次模块转换的统一配置。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TransformOptions {
@@ -4652,6 +4843,147 @@ mod tests {
         react.react.import_source = "preact".to_string();
         assert_ne!(base.fingerprint(), ts.fingerprint());
         assert_ne!(base.fingerprint(), react.fingerprint());
+    }
+
+    #[test]
+    fn automatic_jsx_runtime_policy_owns_requests_and_import_bindings() {
+        assert_eq!(
+            AutomaticJsxRuntime::Production.specifier("react"),
+            "react/jsx-runtime"
+        );
+        assert_eq!(
+            AutomaticJsxRuntime::Development.specifier("preact"),
+            "preact/jsx-dev-runtime"
+        );
+        assert_eq!(
+            AutomaticJsxRuntime::Production
+                .imports()
+                .iter()
+                .map(|binding| (*binding, binding.imported(), binding.preferred_local()))
+                .collect::<Vec<_>>(),
+            vec![
+                (AutomaticJsxBinding::Jsx, "jsx", "_jsx"),
+                (AutomaticJsxBinding::Jsxs, "jsxs", "_jsxs"),
+                (AutomaticJsxBinding::Fragment, "Fragment", "_Fragment"),
+            ]
+        );
+        assert_eq!(
+            AutomaticJsxRuntime::Development
+                .imports()
+                .iter()
+                .map(|binding| (*binding, binding.imported(), binding.preferred_local()))
+                .collect::<Vec<_>>(),
+            vec![
+                (AutomaticJsxBinding::JsxDev, "jsxDEV", "_jsxDEV"),
+                (AutomaticJsxBinding::Fragment, "Fragment", "_Fragment"),
+            ]
+        );
+    }
+
+    #[test]
+    fn automatic_jsx_usage_filters_runtime_imports_in_canonical_order() {
+        let mut production = AutomaticJsxUsage::default();
+        assert!(production.is_empty());
+        production.insert(AutomaticJsxBinding::Fragment);
+        production.insert(AutomaticJsxBinding::Jsxs);
+        assert_eq!(
+            AutomaticJsxRuntime::Production
+                .used_imports(production)
+                .collect::<Vec<_>>(),
+            vec![AutomaticJsxBinding::Jsxs, AutomaticJsxBinding::Fragment]
+        );
+        assert!(production.contains(AutomaticJsxBinding::Jsxs));
+        assert!(!production.contains(AutomaticJsxBinding::Jsx));
+
+        let mut development = AutomaticJsxUsage::default();
+        development.insert(AutomaticJsxBinding::Fragment);
+        development.insert(AutomaticJsxBinding::JsxDev);
+        assert_eq!(
+            AutomaticJsxRuntime::Development
+                .used_imports(development)
+                .collect::<Vec<_>>(),
+            vec![AutomaticJsxBinding::JsxDev, AutomaticJsxBinding::Fragment,]
+        );
+    }
+
+    #[test]
+    fn automatic_jsx_final_call_builder_owns_production_and_development_abi() {
+        let arena = Bump::new();
+        let interner = Interner::new();
+        let span = Span::new(4, 20);
+        let element =
+            Expression::Identifier(arena.alloc(Ident::new(span, interner.intern("Component"))));
+        let props = Expression::Object(arena.alloc(ObjectExpression {
+            span,
+            properties: AVec::new_in(&arena),
+        }));
+        let key_atom = interner.intern("key");
+        let key = Expression::Identifier(arena.alloc(Ident::new(span, key_atom)));
+        let jsx = interner.intern("_jsx");
+        let jsxs = interner.intern("_jsxs");
+        let (production, production_binding) = lower_automatic_jsx_call(
+            &arena,
+            &interner,
+            AutomaticJsxCallKind::Production { jsx, jsxs },
+            AutomaticJsxCall {
+                span,
+                element,
+                props,
+                key: Some(key),
+                static_children: true,
+            },
+        );
+        let Expression::Call(production) = production else {
+            panic!("production JSX lowering must return a call")
+        };
+        assert_eq!(production_binding, AutomaticJsxBinding::Jsxs);
+        assert!(
+            matches!(production.callee, Expression::Identifier(id) if id.name == jsxs),
+            "multiple children select jsxs"
+        );
+        assert_eq!(production.arguments.len(), 3);
+        assert!(
+            matches!(production.arguments[2], Expression::Identifier(id) if id.name == key_atom)
+        );
+
+        let jsx_dev = interner.intern("_jsxDEV");
+        let source = Expression::StringLiteral(arena.alloc(StringLiteral {
+            span,
+            value: interner.intern("source"),
+        }));
+        let (development, development_binding) = lower_automatic_jsx_call(
+            &arena,
+            &interner,
+            AutomaticJsxCallKind::Development { jsx_dev, source },
+            AutomaticJsxCall {
+                span,
+                element,
+                props,
+                key: None,
+                static_children: false,
+            },
+        );
+        let Expression::Call(development) = development else {
+            panic!("development JSX lowering must return a call")
+        };
+        assert_eq!(development_binding, AutomaticJsxBinding::JsxDev);
+        assert!(matches!(
+            development.callee,
+            Expression::Identifier(id) if id.name == jsx_dev
+        ));
+        assert_eq!(development.arguments.len(), 6);
+        assert!(
+            matches!(development.arguments[2], Expression::Identifier(id) if id.name == interner.intern("undefined"))
+        );
+        assert!(matches!(
+            development.arguments[3],
+            Expression::BooleanLiteral(value) if !value.value
+        ));
+        assert!(matches!(
+            development.arguments[4],
+            Expression::StringLiteral(_)
+        ));
+        assert!(matches!(development.arguments[5], Expression::This(value) if value == span));
     }
 
     #[test]
