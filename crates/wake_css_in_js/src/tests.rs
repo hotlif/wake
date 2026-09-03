@@ -60,6 +60,21 @@ fn only_transforms_css_imported_from_crab_package() {
 }
 
 #[test]
+fn distinguishes_empty_owned_styles_from_modules_without_a_style_slot() {
+    let empty_style = run("import { globalStyle } from '@crab-dev/css';\n\
+         globalStyle``;");
+    assert!(empty_style.diagnostics.is_empty());
+    assert!(empty_style.css.is_empty());
+    assert!(empty_style.owns_style_slot);
+
+    let runtime_only = run("import { createVar } from '@crab-dev/css';\n\
+         export const accent = createVar('accent');");
+    assert!(runtime_only.diagnostics.is_empty());
+    assert!(runtime_only.css.is_empty());
+    assert!(!runtime_only.owns_style_slot);
+}
+
+#[test]
 fn supports_import_alias() {
     let r = run("import { css as c } from '@crab-dev/css';\nconst box = c`color: red;`;");
     assert_eq!(r.replacements.len(), 1, "应支持 import 别名");

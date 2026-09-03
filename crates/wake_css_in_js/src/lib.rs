@@ -483,6 +483,10 @@ pub struct TransformResult {
     pub removable_import_binding_spans: Vec<Span>,
     /// 本模块抽取出的 CSS（已按声明序拼接）。
     pub css: String,
+    /// 此次成功转换是否遇到由本模块稳定 style slot 拥有的模板。即使最终 CSS 为空，
+    /// bundler 也必须保留该事实以发布删除 tombstone；仅使用 `cx`/`createVar` 等运行时 API
+    /// 不会取得 style slot 所有权。
+    pub owns_style_slot: bool,
     /// 静态求值与 API 使用诊断；不安全插值为 error。
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -1315,6 +1319,7 @@ impl Collector<'_, '_> {
             return;
         }
 
+        self.out.owns_style_slot = true;
         match binding.kind {
             BindingKind::Css | BindingKind::Keyframes => {
                 let fallback = if binding.kind == BindingKind::Css {
