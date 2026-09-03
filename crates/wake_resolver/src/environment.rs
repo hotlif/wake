@@ -126,21 +126,31 @@ impl ResolutionEnvironment {
         self.pnp_fs.clear_cache();
     }
 
-    /// 文件 generation 变化后使解析、清单、zip 和模块拓扑同时失效。
+    /// 文件 generation 变化后使解析状态失效。
+    ///
+    /// PnP manifest/lock 变化清除全部 registry 与 zip；物理 archive watcher 路径只驱逐
+    /// 完全匹配的 zip cache key。
     pub fn invalidate_paths<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) {
         let mut reload_pnp = false;
+        let mut archive_paths = Vec::new();
         for path in paths {
             if matches!(
                 path.file_name().and_then(|name| name.to_str()),
                 Some(".pnp.cjs" | ".pnp.data.json" | "yarn.lock")
             ) {
                 reload_pnp = true;
+            } else {
+                archive_paths.push(path);
             }
         }
         self.resolver.clear_cache();
         if reload_pnp {
             self.registry.clear();
             self.pnp_fs.clear_cache();
+        } else {
+            for path in archive_paths {
+                self.pnp_fs.invalidate_archive(path);
+            }
         }
     }
 }
@@ -418,5 +428,96 @@ mod tests {
             resolver.resolve("ghost", Path::new("project/src")).unwrap(),
             PathBuf::from("cache/v2/node_modules/ghost/index.js")
         );
+    }
+
+    #[test]
+    fn physical_archive_change_invalidates_only_that_zip_cache() {
+        let fs = Arc::new(MemoryFileSystem::new());
+        let first = Path::new("cache/first.zip");
+        let second = Path::new("cache/second.zip");
+        fs.insert(
+            first,
+            super::super::pnpfs::tests::one_entry_zip("pkg/index.js", b"first-v1"),
+        );
+        fs.insert(
+            second,
+            super::super::pnpfs::tests::one_entry_zip("pkg/index.js", b"second-v1"),
+        );
+        let base: Arc<dyn FileSystem> = fs.clone();
+        let environment = ResolutionEnvironment::new(base);
+        let projected = environment.file_system();
+
+        assert_eq!(
+            projected
+                .read(Path::new("cache/first.zip/pkg/index.js"))
+                .unwrap(),
+            b"first-v1"
+        );
+        assert_eq!(
+            projected
+                .read(Path::new("cache/second.zip/pkg/index.js"))
+                .unwrap(),
+            b"second-v1"
+        );
+
+        fs.insert(
+            first,
+            super::super::pnpfs::tests::one_entry_zip("pkg/index.js", b"first-v2"),
+        );
+        fs.insert(
+            second,
+            super::super::pnpfs::tests::one_entry_zip("pkg/index.js", b"second-v2"),
+        );
+        environment.invalidate_paths([first]);
+
+        assert_eq!(
+            projected
+                .read(Path::new("cache/first.zip/pkg/index.js"))
+                .unwrap(),
+            b"first-v2"
+        );
+        assert_eq!(
+            projected
+                .read(Path::new("cache/second.zip/pkg/index.js"))
+                .unwrap(),
+            b"second-v1"
+        );
+    }
+
+    #[test]
+    fn yarn_lock_change_invalidates_every_zip_cache() {
+        let fs = Arc::new(MemoryFileSystem::new());
+        for archive in ["cache/first.zip", "cache/second.zip"] {
+            fs.insert(
+                archive,
+                super::super::pnpfs::tests::one_entry_zip("pkg/index.js", b"v1"),
+            );
+        }
+        let base: Arc<dyn FileSystem> = fs.clone();
+        let environment = ResolutionEnvironment::new(base);
+        let projected = environment.file_system();
+        for archive in ["cache/first.zip", "cache/second.zip"] {
+            assert_eq!(
+                projected
+                    .read(&Path::new(archive).join("pkg/index.js"))
+                    .unwrap(),
+                b"v1"
+            );
+            fs.insert(
+                archive,
+                super::super::pnpfs::tests::one_entry_zip("pkg/index.js", b"v2"),
+            );
+        }
+
+        environment.invalidate_paths([Path::new("project/yarn.lock")]);
+
+        for archive in ["cache/first.zip", "cache/second.zip"] {
+            assert_eq!(
+                projected
+                    .read(&Path::new(archive).join("pkg/index.js"))
+                    .unwrap(),
+                b"v2"
+            );
+        }
     }
 }

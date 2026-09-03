@@ -4533,6 +4533,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wake_common",
+ "xxhash-rust",
 ]
 
 [[package]]

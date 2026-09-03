@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use wake_common::{FileSystem, FxHashMap, fs::normalize};
+use xxhash_rust::xxh3::xxh3_128;
 
 mod environment;
 pub mod pnp;
@@ -20,8 +21,8 @@ pub use pnp::{PnpError, PnpLoadError, PnpManifest};
 pub use pnpfs::PnpFileSystem;
 
 /// 一份 npm 包内容的逻辑身份。普通 registry 包按 `name@version` 扁平去重；
-/// `context` 仅用于 Yarn PnP/pnpm peer 虚拟实例和本地 workspace，避免把解析上下文不同的
-/// 同名同版本包错误合并。
+/// `context` 仅用于部署无关的 peer graph、Yarn PnP/pnpm 虚拟实例和本地 workspace，
+/// 避免把解析上下文不同的同名同版本包错误合并。
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PackageKey {
     pub name: String,
@@ -113,7 +114,7 @@ struct PackageConfig {
     exports: Option<OrderedJsonValue>,
     name: Option<String>,
     version: Option<String>,
-    has_peer_dependencies: bool,
+    peer_dependencies: Vec<String>,
 }
 
 impl PackageConfig {
@@ -300,6 +301,8 @@ pub struct Resolver {
     package_configs: Mutex<FxHashMap<PathBuf, Option<PackageConfig>>>,
     /// 物理文件路径 → 扁平逻辑模块身份。
     module_identities: Mutex<FxHashMap<PathBuf, ModuleIdentity>>,
+    /// package root → 部署无关的 peer/PnP/pnpm context。
+    package_contexts: Mutex<FxHashMap<PathBuf, Option<String>>>,
     /// 文件所在目录 → 最近的 package root；`None` 表示祖先链上没有。
     ///
     /// 模块身份是按文件路径缓存的，冷构建中每个文件仍是唯一 miss。这个目录级
@@ -325,6 +328,7 @@ impl Resolver {
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
             module_identities: Mutex::new(FxHashMap::default()),
+            package_contexts: Mutex::new(FxHashMap::default()),
             package_owners: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
@@ -353,6 +357,7 @@ impl Resolver {
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
             module_identities: Mutex::new(FxHashMap::default()),
+            package_contexts: Mutex::new(FxHashMap::default()),
             package_owners: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: Some(manifest),
@@ -371,6 +376,7 @@ impl Resolver {
             cache: Mutex::new(FxHashMap::default()),
             package_configs: Mutex::new(FxHashMap::default()),
             module_identities: Mutex::new(FxHashMap::default()),
+            package_contexts: Mutex::new(FxHashMap::default()),
             package_owners: Mutex::new(FxHashMap::default()),
             package_roots: Mutex::new(FxHashMap::default()),
             pnp: None,
@@ -479,6 +485,27 @@ impl Resolver {
         Ok(ResolvedModule { path, identity })
     }
 
+    /// Resolve a host-owned, exact package entry without consulting source-level aliases.
+    ///
+    /// This is deliberately narrower than [`Resolver::resolve_module_with_profile`]: callers may
+    /// only name an unqualified npm package root. The issuer's Yarn PnP dependency declaration is
+    /// still authoritative; unmanaged/classic issuers use their normal `node_modules` ancestry.
+    /// Wake uses this for internal compatibility targets whose identity must not be redirected by
+    /// a project alias intended for source-authored requests.
+    pub fn resolve_internal_package_with_profile(
+        &self,
+        package: &str,
+        issuer_dir: &Path,
+        profile: &ResolutionProfile,
+    ) -> Result<ResolvedModule, ResolveError> {
+        let package_root = self.resolve_package_root(package, issuer_dir)?;
+        let path = self
+            .resolve_package(&package_root, "", profile)
+            .ok_or_else(|| self.err(package, issuer_dir, ResolveErrorKind::NotFound))?;
+        let identity = self.module_identity(&path);
+        Ok(ResolvedModule { path, identity })
+    }
+
     /// 解析一个包名到未限定包根，供 token/docgen 等读取包内非入口元数据。
     pub fn resolve_package_root(
         &self,
@@ -529,7 +556,7 @@ impl Resolver {
         let Some(config) = self.read_package_config(&root.join("package.json")) else {
             return ModuleIdentity::File(path.to_path_buf());
         };
-        let (Some(name), Some(version)) = (config.name, config.version) else {
+        let (Some(name), Some(version)) = (&config.name, &config.version) else {
             return ModuleIdentity::File(path.to_path_buf());
         };
         let subpath = path
@@ -537,11 +564,11 @@ impl Resolver {
             .ok()
             .map(Self::path_to_logical_string)
             .unwrap_or_else(|| Self::path_to_logical_string(path));
-        let context = Self::package_context(&root, config.has_peer_dependencies);
+        let context = self.package_context(&root, &config);
         ModuleIdentity::Package {
             package: PackageKey {
-                name,
-                version,
+                name: name.clone(),
+                version: version.clone(),
                 context,
             },
             subpath,
@@ -555,6 +582,7 @@ impl Resolver {
         self.cache.lock().unwrap().clear();
         self.package_configs.lock().unwrap().clear();
         self.module_identities.lock().unwrap().clear();
+        self.package_contexts.lock().unwrap().clear();
         self.package_owners.lock().unwrap().clear();
         self.package_roots.lock().unwrap().clear();
     }
@@ -891,15 +919,95 @@ impl Resolver {
         path.to_string_lossy().replace('\\', "/")
     }
 
-    fn package_context(root: &Path, has_peer_dependencies: bool) -> Option<String> {
-        let logical = Self::path_to_logical_string(root);
-        if logical.contains("/__virtual__/") || logical.contains("/$$virtual/") {
-            return Some(format!("pnp:{logical}"));
+    fn package_context(&self, root: &Path, config: &PackageConfig) -> Option<String> {
+        if let Some(context) = self.package_contexts.lock().unwrap().get(root).cloned() {
+            return context;
         }
+        let context = self.package_context_inner(root, config, &mut Vec::new(), true);
+        self.package_contexts
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), context.clone());
+        context
+    }
+
+    fn package_context_inner(
+        &self,
+        root: &Path,
+        config: &PackageConfig,
+        visiting: &mut Vec<PathBuf>,
+        preserve_local_root: bool,
+    ) -> Option<String> {
+        let install_context = Self::portable_install_context(root);
+        if config.peer_dependencies.is_empty() {
+            if install_context.is_some() {
+                return install_context;
+            }
+            return (preserve_local_root && !Self::is_installed_package(root))
+                .then(|| format!("root:{}", Self::path_to_logical_string(root)));
+        }
+
+        let mut descriptor = String::from("wake-peer-context-v1");
+        Self::push_context_field(&mut descriptor, config.name.as_deref().unwrap_or(""));
+        Self::push_context_field(&mut descriptor, config.version.as_deref().unwrap_or(""));
+        Self::push_context_field(
+            &mut descriptor,
+            install_context.as_deref().unwrap_or("ordinary"),
+        );
+
+        visiting.push(root.to_path_buf());
+        for peer_name in &config.peer_dependencies {
+            Self::push_context_field(&mut descriptor, peer_name);
+            let Ok(peer_root) = self.resolve_package_root(peer_name, root) else {
+                Self::push_context_field(&mut descriptor, "unresolved");
+                continue;
+            };
+            let Some(peer_config) = self.read_package_config(&peer_root.join("package.json"))
+            else {
+                Self::push_context_field(&mut descriptor, "invalid-package");
+                continue;
+            };
+            Self::push_context_field(&mut descriptor, "package");
+            Self::push_context_field(
+                &mut descriptor,
+                peer_config.name.as_deref().unwrap_or(peer_name),
+            );
+            Self::push_context_field(
+                &mut descriptor,
+                peer_config.version.as_deref().unwrap_or("unknown"),
+            );
+            let peer_context = if visiting.iter().any(|candidate| candidate == &peer_root) {
+                Self::portable_install_context(&peer_root)
+                    .map_or_else(|| "cycle".to_owned(), |context| format!("cycle:{context}"))
+            } else {
+                self.package_context_inner(&peer_root, &peer_config, visiting, false)
+                    .unwrap_or_else(|| "ordinary".to_owned())
+            };
+            Self::push_context_field(&mut descriptor, &peer_context);
+        }
+        visiting.pop();
+
+        Some(format!("peers-v1:{:032x}", xxh3_128(descriptor.as_bytes())))
+    }
+
+    fn push_context_field(descriptor: &mut String, value: &str) {
+        descriptor.push_str(&value.len().to_string());
+        descriptor.push(':');
+        descriptor.push_str(value);
+    }
+
+    fn portable_install_context(root: &Path) -> Option<String> {
         let components = root
             .components()
             .filter_map(|component| component.as_os_str().to_str())
             .collect::<Vec<_>>();
+        if let Some(index) = components
+            .iter()
+            .position(|component| matches!(*component, "__virtual__" | "$$virtual"))
+            && let Some(locator) = components.get(index + 1)
+        {
+            return Some(format!("pnp:{locator}"));
+        }
         if let Some(index) = components
             .iter()
             .position(|component| *component == ".pnpm")
@@ -908,17 +1016,16 @@ impl Resolver {
         {
             return Some(format!("pnpm:{locator}"));
         }
-        let installed = components.iter().any(|component| {
-            matches!(
-                *component,
-                "node_modules" | ".pnp-store" | ".yarn" | ".pnpm"
-            )
-        });
-        if has_peer_dependencies || !installed {
-            Some(format!("root:{logical}"))
-        } else {
-            None
-        }
+        None
+    }
+
+    fn is_installed_package(root: &Path) -> bool {
+        root.components().any(|component| {
+            let Some(component) = component.as_os_str().to_str() else {
+                return false;
+            };
+            matches!(component, "node_modules" | ".pnp-store" | ".yarn" | ".pnpm")
+        })
     }
 
     fn package_roots(&self, pkg_name: &str, from_dir: &Path) -> Arc<[PathBuf]> {
@@ -970,6 +1077,18 @@ impl Resolver {
                     value.as_str().map(|value| (key.clone(), value.to_owned()))
                 })
                 .collect();
+            let mut peer_dependencies = json
+                .get("peerDependencies")
+                .and_then(OrderedJsonValue::as_object)
+                .map(|peers| {
+                    peers
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            peer_dependencies.sort_unstable();
+            peer_dependencies.dedup();
             Some(PackageConfig {
                 string_fields,
                 exports: json.get("exports").cloned(),
@@ -981,10 +1100,7 @@ impl Resolver {
                     .get("version")
                     .and_then(OrderedJsonValue::as_str)
                     .map(str::to_owned),
-                has_peer_dependencies: json
-                    .get("peerDependencies")
-                    .and_then(OrderedJsonValue::as_object)
-                    .is_some_and(|peers| !peers.is_empty()),
+                peer_dependencies,
             })
         });
         self.package_configs
@@ -1143,6 +1259,10 @@ mod tests {
     }
 
     impl FileSystem for CountingFileSystem {
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.inner.canonicalize(path)
+        }
+
         fn read_to_string(&self, path: &Path) -> io::Result<String> {
             self.inner.read_to_string(path)
         }
@@ -1279,6 +1399,49 @@ mod tests {
         let a = r.module_identity(Path::new("node_modules/a/node_modules/shared/index.js"));
         let b = r.module_identity(Path::new("node_modules/b/node_modules/shared/index.js"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn module_identity_flattens_equivalent_peer_graphs_across_project_roots() {
+        let r = resolver(&[
+            (
+                "host-project/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0","peerDependencies":{"react":"^18","scheduler":"*"}}"#,
+            ),
+            ("host-project/node_modules/widget/index.js", "// host"),
+            (
+                "host-project/node_modules/react/package.json",
+                r#"{"name":"react","version":"18.3.1"}"#,
+            ),
+            (
+                "host-project/node_modules/scheduler/package.json",
+                r#"{"name":"scheduler","version":"0.23.2"}"#,
+            ),
+            (
+                "remote-project/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0","peerDependencies":{"scheduler":"*","react":"^18"}}"#,
+            ),
+            ("remote-project/node_modules/widget/index.js", "// remote"),
+            (
+                "remote-project/node_modules/react/package.json",
+                r#"{"name":"react","version":"18.3.1"}"#,
+            ),
+            (
+                "remote-project/node_modules/scheduler/package.json",
+                r#"{"name":"scheduler","version":"0.23.2"}"#,
+            ),
+        ]);
+        let host = r.module_identity(Path::new("host-project/node_modules/widget/index.js"));
+        let remote = r.module_identity(Path::new("remote-project/node_modules/widget/index.js"));
+
+        assert_eq!(host, remote);
+        let ModuleIdentity::Package { package, .. } = host else {
+            panic!("widget should have a package identity");
+        };
+        let context = package.context.expect("peer dependencies require context");
+        assert!(context.starts_with("peers-v1:"));
+        assert!(!context.contains("host-project"));
+        assert!(!context.contains("remote-project"));
     }
 
     #[test]
@@ -1435,10 +1598,18 @@ mod tests {
             ),
             ("node_modules/x/node_modules/widget/index.js", "// react 18"),
             (
+                "node_modules/x/node_modules/react/package.json",
+                r#"{"name":"react","version":"18.3.1"}"#,
+            ),
+            (
                 "node_modules/y/node_modules/widget/package.json",
                 r#"{"name":"widget","version":"1.0.0","peerDependencies":{"react":"*"}}"#,
             ),
             ("node_modules/y/node_modules/widget/index.js", "// react 19"),
+            (
+                "node_modules/y/node_modules/react/package.json",
+                r#"{"name":"react","version":"19.1.0"}"#,
+            ),
         ]);
         assert_ne!(
             r.module_identity(Path::new("node_modules/a/node_modules/shared/index.js")),
@@ -1454,28 +1625,41 @@ mod tests {
     fn module_identity_keeps_yarn_pnp_virtual_instances_separate() {
         let r = resolver(&[
             (
-                ".yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/package.json",
+                "host-project/.yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/package.json",
                 r#"{"name":"widget","version":"1.0.0"}"#,
             ),
             (
-                ".yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/index.js",
+                "host-project/.yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/index.js",
                 "// react 18",
             ),
             (
-                ".yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/package.json",
+                "remote-project/.yarn/__virtual__/widget-react18/7/cache/widget/node_modules/widget/package.json",
                 r#"{"name":"widget","version":"1.0.0"}"#,
             ),
             (
-                ".yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/index.js",
+                "remote-project/.yarn/__virtual__/widget-react18/7/cache/widget/node_modules/widget/index.js",
+                "// equivalent react 18 virtual instance",
+            ),
+            (
+                "remote-project/.yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/package.json",
+                r#"{"name":"widget","version":"1.0.0"}"#,
+            ),
+            (
+                "remote-project/.yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/index.js",
                 "// react 19",
             ),
         ]);
+        let host_react_18 = r.module_identity(Path::new(
+            "host-project/.yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/index.js",
+        ));
+        let remote_react_18 = r.module_identity(Path::new(
+            "remote-project/.yarn/__virtual__/widget-react18/7/cache/widget/node_modules/widget/index.js",
+        ));
+        assert_eq!(host_react_18, remote_react_18);
         assert_ne!(
+            host_react_18,
             r.module_identity(Path::new(
-                ".yarn/__virtual__/widget-react18/0/cache/widget/node_modules/widget/index.js"
-            )),
-            r.module_identity(Path::new(
-                ".yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/index.js"
+                "remote-project/.yarn/__virtual__/widget-react19/0/cache/widget/node_modules/widget/index.js"
             ))
         );
     }
@@ -1778,6 +1962,81 @@ mod tests {
             .resolve(
                 "@crab-dev/css",
                 Path::new("cache/button/node_modules/@crab-dev/rc-button/esm"),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ResolveErrorKind::PnpDependency(PnpError::Undeclared)
+        );
+    }
+
+    fn browser_import_profile() -> ResolutionProfile {
+        ResolutionProfile {
+            conditions: vec!["browser".into(), "import".into(), "module".into()],
+            main_fields: vec!["module".into(), "main".into()],
+        }
+    }
+
+    #[test]
+    fn internal_package_target_bypasses_classic_source_alias() {
+        let fs = MemoryFileSystem::from_files([
+            (
+                "node_modules/@crab-dev/css/package.json",
+                r#"{"name":"@crab-dev/css","version":"2.0.0","module":"index.mjs"}"#,
+            ),
+            (
+                "node_modules/@crab-dev/css/index.mjs",
+                "export const source = 'package';",
+            ),
+            ("alias/css.mjs", "export const source = 'alias';"),
+        ]);
+        let resolver = Resolver::with_options(
+            Arc::new(fs),
+            ResolveOptions {
+                alias: vec![("@crab-dev/css".to_string(), PathBuf::from("alias/css.mjs"))],
+                ..ResolveOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve_internal_package_with_profile(
+                    "@crab-dev/css",
+                    Path::new("src"),
+                    &browser_import_profile(),
+                )
+                .unwrap()
+                .path,
+            PathBuf::from("node_modules/@crab-dev/css/index.mjs")
+        );
+        assert_eq!(
+            resolver.resolve("@crab-dev/css", Path::new("src")).unwrap(),
+            PathBuf::from("alias/css.mjs"),
+            "source-authored requests must retain normal alias behavior"
+        );
+    }
+
+    #[test]
+    fn internal_package_target_keeps_pnp_declarations_authoritative() {
+        let declared = pnp_authoritative_resolver(true);
+        assert_eq!(
+            declared
+                .resolve_internal_package_with_profile(
+                    "@crab-dev/css",
+                    Path::new("cache/button/node_modules/@crab-dev/rc-button/esm"),
+                    &browser_import_profile(),
+                )
+                .unwrap()
+                .path,
+            PathBuf::from("cache/css/node_modules/@crab-dev/css/index.js")
+        );
+
+        let undeclared = pnp_authoritative_resolver(false);
+        let error = undeclared
+            .resolve_internal_package_with_profile(
+                "@crab-dev/css",
+                Path::new("cache/button/node_modules/@crab-dev/rc-button/esm"),
+                &browser_import_profile(),
             )
             .unwrap_err();
         assert_eq!(
