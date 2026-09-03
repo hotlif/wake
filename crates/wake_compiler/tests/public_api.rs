@@ -98,10 +98,7 @@ fn public_api_snapshot_is_an_owned_facade() {
     ]);
     let actual = actual.join("\n");
     let snapshot = include_str!("fixtures/public-api-v1.txt").replace("\r\n", "\n");
-    assert_eq!(
-        actual,
-        snapshot.trim_end()
-    );
+    assert_eq!(actual, snapshot.trim_end());
 }
 
 #[test]
