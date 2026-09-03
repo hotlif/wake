@@ -210,10 +210,8 @@ fn first_block_comment(src: &str) -> Option<String> {
         }
         if bytes[i] == b'/' && bytes[i + 1] == b'/' {
             // 行注释：跳到行尾后继续。
-            match src[i..].find('\n') {
-                Some(off) => i += off + 1,
-                None => return None,
-            }
+            let off = src[i..].find('\n')?;
+            i += off + 1;
             continue;
         }
         // 遇到非注释、非空白 token → 首块注释必须在最前，放弃。
