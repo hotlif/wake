@@ -4470,6 +4470,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wake_federation_contract"
+version = "0.1.26"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "wake_graph"
 version = "0.1.26"
 dependencies = [

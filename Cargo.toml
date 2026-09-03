@@ -130,6 +130,7 @@ wake_app = { path = "crates/wake_app" }
 wake_test = { path = "crates/wake_test" }
 wake_test_contract = { path = "crates/wake_test_contract" }
 wake_test_browser = { path = "crates/wake_test_browser" }
+wake_federation_contract = { path = "crates/wake_federation_contract" }
 
 # —— 测试 / 基准（dev-dependencies 复用）——
 insta = "1.48.0"
