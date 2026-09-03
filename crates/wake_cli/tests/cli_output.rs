@@ -196,8 +196,10 @@ fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut early_status = None;
     while Instant::now() < deadline && !root.join("dist/index.html").is_file() {
-        if child.try_wait().unwrap().is_some() {
+        if let Some(status) = child.try_wait().unwrap() {
+            early_status = Some(status);
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -215,7 +217,7 @@ fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
     );
     assert!(
         recovered,
-        "watch did not recover after valid TOML: {stderr}"
+        "watch did not recover after valid TOML (early status: {early_status:?}): {stderr}"
     );
     assert!(stderr.contains("WAKE_CONFIG"), "{stderr}");
     assert!(stderr.contains("Initial build completed"), "{stderr}");
