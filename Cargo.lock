@@ -4308,6 +4308,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "wake_federation_contract",
 ]
 
 [[package]]

@@ -14,3 +14,4 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 browserslist-rs.workspace = true
+wake_federation_contract.workspace = true

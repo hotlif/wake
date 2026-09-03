@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 
+pub use wake_federation_contract::{
+    ContainerName, ExposeConfig, ExposeKey, ExposeMode, FederationConfig, FederationOptions,
+    RemoteConfig, ShadowMode, SharedConfig,
+};
+
 /// 配置文件名（固定）。
 pub const CONFIG_FILE: &str = "wake.config.toml";
 
@@ -49,6 +54,7 @@ pub struct Config {
     /// 声明式 hook（提供声明式替代 `mods`，决策④）。
     pub hooks: Hooks,
     /// 全局常量替换（`process.env.NODE_ENV` 等）。dev/prod 由 CLI 注入默认值。
+    #[serde(default, deserialize_with = "deserialize_defines")]
     pub define: BTreeMap<String, String>,
     /// 显式 Browserslist 查询。为空时依次查找 `.browserslistrc` 和
     /// `package.json#browserslist`，最终使用 [`DEFAULT_BROWSER_TARGETS`]。
@@ -59,12 +65,37 @@ pub struct Config {
     pub typescript: TypeScript,
     /// React JSX automatic runtime 选项。
     pub react: React,
+    /// Wake-native browser Module Federation configuration. Disabled unless explicitly enabled.
+    #[serde(default, deserialize_with = "deserialize_federation_config")]
+    pub federation: FederationConfig,
     /// React 组件文档站配置。
     pub docs: Docs,
     /// Wake-owned React test runner configuration.
     pub test: Test,
     /// 手动强制启用/禁用特定 Babel 风格 transform 名。
     pub transforms: TransformControl,
+}
+
+fn deserialize_federation_config<'de, D>(deserializer: D) -> Result<FederationConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    FederationConfig::deserialize(deserializer)?
+        .validate_and_normalize()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_defines<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let defines = BTreeMap::<String, String>::deserialize(deserializer)?;
+    if defines.contains_key("import.meta.hot") {
+        return Err(serde::de::Error::custom(
+            "`import.meta.hot` is reserved and always false: Wake provides Live Reload, not a module HMR API",
+        ));
+    }
+    Ok(defines)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -605,7 +636,7 @@ pub struct ComponentScan {
 
 /// 开发服务器配置（保持既定行为 `DevServer`）。
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DevServer {
     /// `"http"` | `"https"`。缺省 http。
     pub server: Option<String>,
@@ -825,6 +856,372 @@ mod tests {
         assert!(c.alias.is_empty());
         assert_eq!(c.public_path(), "/");
         assert!(c.component_scan.is_empty());
+        assert!(!c.federation.enabled);
+        assert!(c.federation.name.as_str().is_empty());
+        assert!(c.federation.remotes.is_empty());
+        assert!(c.federation.exposes.is_empty());
+        assert!(c.federation.shared.is_empty());
+    }
+
+    #[test]
+    fn live_reload_contract_rejects_fake_hmr_configuration() {
+        for source in [
+            "[dev_server]\nhmr = true\n",
+            "[dev_server]\nhot = true\n",
+            "[dev_server]\nlive_reload = false\n",
+            "[define]\n\"import.meta.hot\" = \"true\"\n",
+        ] {
+            let error = toml::from_str::<Config>(source).unwrap_err().to_string();
+            assert!(
+                error.contains("unknown field") || error.contains("reserved and always false"),
+                "{source}\n{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn federation_config_parses_and_normalizes_browser_contract() {
+        let config: Config = toml::from_str(
+            r#"
+[federation]
+enabled = true
+name = "shell"
+
+[federation.remotes.catalog]
+manifest_url = "https://catalog.example.test/assets/wake-federation.json"
+allowed_origins = ["https://catalog.example.test/", "https://catalog.example.test"]
+dev_follow = false
+
+[federation.exposes."./Button"]
+entry = "src/button.tsx"
+mode = "host-rendered"
+scope = "react18"
+shadow = "none"
+allow_global_css = true
+
+[federation.exposes.LegacyCard]
+entry = "src/legacy-card.tsx"
+mode = "isolated"
+scope = "react17"
+
+[federation.shared.react]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+fallback = false
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared."react/jsx-runtime"]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared."react/jsx-dev-runtime"]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared.react-dom]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+coherence_group = "react18"
+owner = "shell"
+
+[federation.shared."react-dom/client"]
+scope = "react18"
+required_version = "^18.3.0"
+singleton = true
+strict = true
+coherence_group = "react18"
+owner = "shell"
+"#,
+        )
+        .unwrap();
+
+        let federation = config.federation;
+        assert!(federation.enabled);
+        assert_eq!(federation.name.as_str(), "shell");
+        let remote = &federation.remotes[&ContainerName::from("catalog")];
+        assert!(!remote.dev_follow);
+        assert_eq!(
+            remote.allowed_origins,
+            ["https://catalog.example.test".to_string()]
+        );
+        assert!(!federation.exposes.contains_key(&ExposeKey::from("Button")));
+        assert!(
+            federation
+                .exposes
+                .contains_key(&ExposeKey::from("./Button"))
+        );
+        assert_eq!(
+            federation.exposes[&ExposeKey::from("./Button")].shadow,
+            ShadowMode::None
+        );
+        assert!(federation.exposes[&ExposeKey::from("./Button")].allow_global_css);
+        assert_eq!(
+            federation.exposes[&ExposeKey::from("./LegacyCard")].shadow,
+            ShadowMode::Open
+        );
+        assert_eq!(federation.shared["react"].scope, "react18");
+        assert!(!federation.shared["react"].fallback);
+    }
+
+    #[test]
+    fn federation_config_rejects_disabled_populated_or_unnamed_contract() {
+        let disabled = r#"
+[federation]
+name = "shell"
+"#;
+        assert!(
+            toml::from_str::<Config>(disabled)
+                .unwrap_err()
+                .to_string()
+                .contains("requires enabled=true")
+        );
+
+        let unnamed = r#"
+[federation]
+enabled = true
+"#;
+        assert!(
+            toml::from_str::<Config>(unnamed)
+                .unwrap_err()
+                .to_string()
+                .contains("container names must")
+        );
+    }
+
+    #[test]
+    fn federation_config_rejects_invalid_names_specifiers_and_urls() {
+        let invalid = [
+            (
+                "container name",
+                r#"
+[federation]
+enabled = true
+name = "bad/name"
+"#,
+            ),
+            (
+                "remote name",
+                r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.remotes."bad/name"]
+manifest_url = "https://catalog.example.test/wake-federation.json"
+"#,
+            ),
+            (
+                "manifest URL scheme",
+                r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.remotes.catalog]
+manifest_url = "file:///tmp/wake-federation.json"
+"#,
+            ),
+            (
+                "manifest URL credentials",
+                r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.remotes.catalog]
+manifest_url = "https://user@catalog.example.test/wake-federation.json"
+"#,
+            ),
+            (
+                "origin path",
+                r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.remotes.catalog]
+manifest_url = "https://catalog.example.test/wake-federation.json"
+allowed_origins = ["https://catalog.example.test/assets"]
+"#,
+            ),
+            (
+                "expose traversal",
+                r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.exposes."../Button"]
+entry = "src/button.tsx"
+"#,
+            ),
+            (
+                "shared relative specifier",
+                r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.shared."./react"]
+"#,
+            ),
+        ];
+
+        for (case, source) in invalid {
+            assert!(
+                toml::from_str::<Config>(source).is_err(),
+                "{case} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn federation_config_enforces_react_expose_boundaries() {
+        let invalid = [
+            r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.exposes.Button]
+entry = "src/button.tsx"
+mode = "host-rendered"
+"#,
+            r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.exposes.Button]
+entry = "src/button.tsx"
+mode = "host-rendered"
+scope = "react18"
+shadow = "open"
+"#,
+            r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.exposes.Button]
+entry = "src/button.tsx"
+mode = "isolated"
+scope = "default"
+"#,
+            r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.exposes.Button]
+entry = "src/button.tsx"
+mode = "react-component"
+"#,
+        ];
+
+        for source in invalid {
+            assert!(toml::from_str::<Config>(source).is_err());
+        }
+    }
+
+    #[test]
+    fn federation_config_enforces_host_rendered_react_coherence_only() {
+        let incomplete = r#"
+[federation]
+enabled = true
+name = "shell"
+
+[federation.exposes.Button]
+entry = "src/button.tsx"
+mode = "host-rendered"
+scope = "react18"
+
+[federation.shared.react]
+scope = "react18"
+singleton = true
+coherence_group = "react18"
+owner = "shell"
+"#;
+        let error = toml::from_str::<Config>(incomplete)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("react-dom/client"), "{error}");
+
+        let isolated = r#"
+[federation]
+enabled = true
+name = "legacy"
+
+[federation.exposes.Widget]
+entry = "src/widget.tsx"
+mode = "isolated"
+scope = "react17"
+
+[federation.shared.react]
+scope = "react17"
+"#;
+        toml::from_str::<Config>(isolated).unwrap();
+    }
+
+    #[test]
+    fn federation_global_css_opt_in_is_rejected_outside_host_rendered_mode() {
+        for mode in ["generic", "isolated"] {
+            let scope = if mode == "isolated" {
+                "scope = \"react17\""
+            } else {
+                ""
+            };
+            let source = format!(
+                r#"
+[federation]
+enabled = true
+name = "shell"
+
+[federation.exposes.Styles]
+entry = "src/styles.ts"
+mode = "{mode}"
+{scope}
+allow_global_css = true
+"#
+            );
+            let error = toml::from_str::<Config>(&source).unwrap_err().to_string();
+            assert!(error.contains("allowGlobalCss"), "{error}");
+        }
+    }
+
+    #[test]
+    fn federation_config_rejects_ambiguous_shared_and_unknown_fields() {
+        let invalid = [
+            r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.shared.react]
+strict = true
+"#,
+            r#"
+[federation]
+enabled = true
+name = "shell"
+[federation.shared.react]
+required_version = "^18"
+singleton = false
+coherence_group = "react18"
+"#,
+            r#"
+[federation]
+enabled = true
+name = "shell"
+strategy = "version-first"
+"#,
+        ];
+
+        for source in invalid {
+            assert!(toml::from_str::<Config>(source).is_err());
+        }
     }
 
     #[test]
