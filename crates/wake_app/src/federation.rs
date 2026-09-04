@@ -2437,6 +2437,7 @@ mod tests {
     use super::*;
 
     fn dev_setup_file_system(root: &Path, setup: &DevFederationSetup) -> Arc<dyn FileSystem> {
+        let root = super::super::canonical_project_root(root).unwrap();
         Arc::new(
             wake_common::OwnedOverlayFileSystem::try_new(
                 Arc::new(OsFileSystem),
@@ -2665,6 +2666,9 @@ globalThis.document={querySelectorAll(selector){globalThis.__wakeSelector=select
 
     impl CountingFileSystem {
         fn new(lock_path: PathBuf) -> Self {
+            let lock_path = wake_common::OsFileSystem
+                .canonicalize(&lock_path)
+                .unwrap_or(lock_path);
             Self {
                 lock_path,
                 lock_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -2686,7 +2690,10 @@ globalThis.document={querySelectorAll(selector){globalThis.__wakeSelector=select
         }
 
         fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-            if path == self.lock_path {
+            if wake_common::OsFileSystem
+                .canonicalize(path)
+                .is_ok_and(|path| path == self.lock_path)
+            {
                 self.lock_reads
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }

@@ -188,7 +188,6 @@ struct MountedAppState {
     base_path: String,
     published: Arc<RwLock<PublishedMountGeneration>>,
     public_dir: PathBuf,
-    federation_bootstrap: Option<String>,
     /// Remote-local protocol transport. A noisy sibling remote cannot lag or refresh this mount's
     /// subscribers because each enabled container owns a distinct bounded channel.
     federation_tx: broadcast::Sender<String>,
@@ -1401,11 +1400,6 @@ fn run_server(
                         ..PublishedMountGeneration::default()
                     })),
                     public_dir: spec.root.join("public"),
-                    federation_bootstrap: spec
-                        .federation
-                        .enabled
-                        .then(|| spec.federation.bootstrap.clone())
-                        .flatten(),
                     federation_tx,
                     loading: Arc::new(MountLoadingState::new(
                         index,
@@ -4490,15 +4484,6 @@ async fn serve_default(
             .body("wake dev: unsafe request path");
     };
 
-    if rel == "@wake/federation/bootstrap.mjs" {
-        return match &mount.federation_bootstrap {
-            Some(bootstrap) => javascript_response(bootstrap.clone(), None),
-            None => HttpResponse::NotFound()
-                .content_type("text/plain; charset=utf-8")
-                .body("wake dev: federation bootstrap is not configured"),
-        };
-    }
-
     {
         // All in-memory routes for this request are selected from one published generation. The
         // guard spans both Federation and ordinary bundle lookups so an install cannot interleave
@@ -5157,22 +5142,12 @@ fn inject_federation_bootstrap(html: &mut String, base_path: &str) {
         return;
     };
     let tag_end = script_start + relative_tag_end;
-    if !html[script_start..=tag_end].contains("type=") {
-        html.insert_str(script_start + "<script".len(), " type=\"module\"");
-    }
-    let script_end = html[script_start..]
-        .find("</script>")
-        .map(|offset| script_start + offset + "</script>".len());
-    if let Some(script_end) = script_end {
-        html.insert_str(
-            script_end,
-            &format!(
-                "<script type=\"module\" src=\"{base_path}@wake/federation/standalone.mjs\"></script>"
-            ),
-        );
-    }
-    html.insert_str(
-        script_start,
+    let Some(relative_script_end) = html[tag_end..].find("</script>") else {
+        return;
+    };
+    let script_end = tag_end + relative_script_end + "</script>".len();
+    html.replace_range(
+        script_start..script_end,
         &format!(
             "<script type=\"module\" src=\"{base_path}@wake/federation/bootstrap.mjs\"></script>"
         ),
@@ -5925,7 +5900,6 @@ mod tests {
             base_path: "/workspace/".to_owned(),
             published: Arc::new(RwLock::new(PublishedMountGeneration::default())),
             public_dir: PathBuf::new(),
-            federation_bootstrap: None,
             federation_tx,
             loading: Arc::new(MountLoadingState::new(
                 0,
@@ -7488,19 +7462,17 @@ mod tests {
     }
 
     #[test]
-    fn federation_bootstrap_is_a_module_before_the_app_bundle() {
+    fn federation_bootstrap_is_the_single_ordered_application_entry() {
         let html = default_html("/docs/", Some("rc-grid"), true);
-        let bootstrap = html
-            .find("<script type=\"module\" src=\"/docs/@wake/federation/bootstrap.mjs\"></script>")
-            .expect("federation bootstrap tag");
-        let bundle = html
-            .find("<script type=\"module\" src=\"/docs/bundle.js\"></script>")
-            .expect("module application tag");
-        let standalone = html
-            .find("<script type=\"module\" src=\"/docs/@wake/federation/standalone.mjs\"></script>")
-            .expect("standalone application loader tag");
-        assert!(bootstrap < bundle, "{html}");
-        assert!(bundle < standalone, "{html}");
+        assert!(
+            html.contains(
+                "<script type=\"module\" src=\"/docs/@wake/federation/bootstrap.mjs\"></script>"
+            ),
+            "{html}"
+        );
+        assert_eq!(html.matches("<script type=\"module\"").count(), 1, "{html}");
+        assert!(!html.contains("src=\"/docs/bundle.js\""), "{html}");
+        assert!(!html.contains("standalone.mjs"), "{html}");
     }
 
     #[test]
@@ -7533,18 +7505,19 @@ mod tests {
 
         let html = http_get(port, "/");
         let bootstrap = http_get(port, "/@wake/federation/bootstrap.mjs");
-        assert!(
-            html.find("/@wake/federation/bootstrap.mjs").unwrap()
-                < html.find("/bundle.js").unwrap(),
-            "{html}"
-        );
+        assert!(html.contains("/@wake/federation/bootstrap.mjs"), "{html}");
+        assert!(!html.contains("src=\"/bundle.js\""), "{html}");
         assert!(
             bootstrap
                 .to_ascii_lowercase()
-                .contains("content-type: application/javascript; charset=utf-8"),
+                .contains("content-type: text/javascript"),
             "{bootstrap}"
         );
-        assert!(bootstrap.ends_with("globalThis.__wake_broker_ready = true;"));
+        assert!(bootstrap.contains("globalThis.__wake_broker_ready = true;"));
+        assert!(
+            bootstrap.contains("await import(new URL('../../bundle.js',import.meta.url).href);"),
+            "{bootstrap}"
+        );
         server.close().unwrap();
     }
 

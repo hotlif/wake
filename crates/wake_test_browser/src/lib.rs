@@ -1177,6 +1177,18 @@ pub struct BrowserContext {
 
 impl BrowserContext {
     pub fn new_page(&self, url: &str) -> Result<BrowserPage, BrowserError> {
+        // Chrome 142+ gates loopback transport behind Local Network Access. Wake owns the test
+        // network policy through Fetch interception, so grant the browser permission up front and
+        // continue to let the runtime decide which requests are denied, routed, or continued.
+        self.connection.command(
+            None,
+            "Browser.setPermission",
+            json!({
+                "permission": {"name": "local-network-access"},
+                "setting": "granted",
+                "browserContextId": self.id,
+            }),
+        )?;
         let target = self.connection.command(
             None,
             "Target.createTarget",
@@ -2195,7 +2207,7 @@ mod tests {
     fn new_page_emulates_one_fixed_reduced_motion_profile() {
         let (url, worker) = start_cdp_server(|socket| {
             let mut requests = Vec::new();
-            for _ in 0..8 {
+            for _ in 0..9 {
                 let request = read_cdp_request(socket);
                 let result = match request["method"].as_str().unwrap() {
                     "Target.createTarget" => json!({"targetId": "target"}),
@@ -2229,6 +2241,17 @@ mod tests {
         drop(page);
         drop(context);
         let requests = worker.join().unwrap();
+
+        let permission = requests
+            .iter()
+            .find(|request| request["method"] == "Browser.setPermission")
+            .expect("new pages must grant deterministic loopback transport");
+        assert_eq!(permission["params"]["browserContextId"], "context");
+        assert_eq!(
+            permission["params"]["permission"]["name"],
+            "local-network-access"
+        );
+        assert_eq!(permission["params"]["setting"], "granted");
 
         let media = requests
             .iter()

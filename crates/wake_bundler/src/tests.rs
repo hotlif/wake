@@ -9725,6 +9725,43 @@ fn typed_runtime_contract_preserves_colliding_eval_and_literal_data_across_cache
 }
 
 #[test]
+fn commonjs_wrapper_assignment_targets_follow_collision_free_runtime_names() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.cjs",
+            "module.exports=require('./dep.cjs').value;",
+        ),
+        (
+            "src/dep.cjs",
+            "exports = module.exports = {}; exports.value = 42;",
+        ),
+    ]);
+    let mut bundler = IncrementalBundler::new(Arc::new(fs));
+    bundler
+        .enable_minify()
+        .set_platform(BuildPlatform::Node)
+        .set_module_format(ModuleFormat::CommonJs);
+    let output = bundler.build(Path::new("src/index.cjs"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+
+    if node_available() {
+        let run = std::process::Command::new("node")
+            .arg("-e")
+            .arg(format!(
+                "{}\nif(module.exports!==42){{console.error(module.exports);process.exit(2)}}",
+                output.bundle
+            ))
+            .output()
+            .expect("node must execute reassigned CommonJS exports");
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
 fn mixed_runtime_names_keep_only_the_noncanonical_member_out_of_concat() {
     let fs = MemoryFileSystem::from_files([
         (

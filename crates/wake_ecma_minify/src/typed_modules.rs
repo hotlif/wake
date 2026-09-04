@@ -3389,8 +3389,10 @@ fn bind_bundled_wrapper_references(
                 return None;
             };
             let occurrence = program.name(*name)?;
-            (occurrence.role() == NameRole::Reference
-                && occurrence.syntax() == NameSyntax::Identifier
+            (matches!(
+                occurrence.role(),
+                NameRole::Reference | NameRole::AssignmentTarget
+            ) && occurrence.syntax() == NameSyntax::Identifier
                 && occurrence.symbol().is_none())
             .then(|| (*name, occurrence.original().to_owned()))
         })

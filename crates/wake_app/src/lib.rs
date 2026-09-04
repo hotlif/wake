@@ -8945,10 +8945,11 @@ mod tests {
     }
 
     fn generation_seal_count(root: &Path) -> usize {
+        let root = canonical_project_root(root).unwrap();
         GENERATION_SEALS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(root)
+            .get(&root)
             .copied()
             .unwrap_or_default()
     }
@@ -10113,10 +10114,7 @@ entry = "packages/Button.tsx"
         )
         .unwrap();
 
-        assert_eq!(
-            result.output_dir.as_deref(),
-            Some(output.to_string_lossy().as_ref())
-        );
+        assert_same_existing_file(result.output_dir.as_deref().unwrap(), &output);
         assert!(output.join(OUTPUT_OWNERSHIP_FILE).is_file());
     }
 

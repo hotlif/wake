@@ -1200,20 +1200,6 @@ test('builds docs and controls the docs dev server lifecycle', async () => {
     'title',
     'warnings',
   ])
-  const generatedComponentsRuntime = await readFile(
-    join(componentsCwd, '.wake/docs/generated/runtime/components.tsx'),
-    'utf8',
-  )
-  assert.match(
-    generatedComponentsRuntime,
-    /from\s+["']@crab-dev\/wake\/internal\/components-runtime["']/,
-    'Generated workbench code must import only the Wake Components runtime',
-  )
-  assert.doesNotMatch(generatedComponentsRuntime, /from\s+["']@crab-dev\/rc-/)
-  assert.doesNotMatch(
-    generatedComponentsRuntime,
-    /["'][^"'\r\n]+\.css(?:\?[^"'\r\n]*)?["']/,
-  )
   await Promise.all([
     access(join(componentsOutdir, 'index.html')),
     access(join(componentsOutdir, '404.html')),

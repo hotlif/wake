@@ -658,7 +658,8 @@ mod tests {
             "export type { Shared } from '../.wake/generated/shared.js';\n\
              export interface Public { shared: Shared; }",
         )]);
-        let logical_dependency = project.path().join(".wake/generated/shared.ts");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let logical_dependency = root.join(".wake/generated/shared.ts");
         assert!(!logical_dependency.exists());
 
         let mut generated = wake_common::OwnedFileTreeBuilder::new();
@@ -671,7 +672,7 @@ mod tests {
         let generation: Arc<dyn FileSystem> = Arc::new(
             wake_common::OwnedOverlayFileSystem::try_new(
                 Arc::new(wake_common::OsFileSystem),
-                project.path().join(".wake"),
+                root.join(".wake"),
                 generated.seal(),
             )
             .unwrap(),
@@ -679,7 +680,7 @@ mod tests {
         let file_system = GenerationDeclarationFileSystem::new(generation);
 
         let prepared = prepare_federation_types_with_file_system(
-            project.path(),
+            &root,
             &ContainerName::new("catalog"),
             &exposed(&[("./Public", "src/index.ts")]),
             &file_system,

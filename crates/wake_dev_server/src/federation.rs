@@ -521,6 +521,13 @@ impl FederationSnapshot {
                 .to_string(),
             );
             bootstrap.push_str("));\n");
+            if options.application_loader_export.is_some() {
+                bootstrap
+                    .push_str("await import(new URL('./standalone.mjs',import.meta.url).href);\n");
+            } else {
+                bootstrap
+                    .push_str("await import(new URL('../../bundle.js',import.meta.url).href);\n");
+            }
             routes.insert(
                 "@wake/federation/bootstrap.mjs".to_owned(),
                 FederationRoute {
@@ -1538,7 +1545,7 @@ fn standalone_source(container: &str, build_id: &BuildId, loader_export: &str) -
     let build_id = serde_json::to_string(build_id.as_str()).expect("build ID JSON");
     let loader_export = serde_json::to_string(loader_export).expect("loader export JSON");
     format!(
-        "const registry=globalThis[Symbol.for('wake.federation.exposes.v1')];\nconst loader=registry?.[{container}]?.[{build_id}]?.['./__wake_container__']?.[{loader_export}];\nif(typeof loader!=='function')throw Object.assign(new Error('Wake standalone application loader is unavailable'),{{code:'FED_CONTAINER_GET'}});\nawait loader();\n"
+        "await import(new URL('../../bundle.js',import.meta.url).href);\nconst registry=globalThis[Symbol.for('wake.federation.exposes.v1')];\nconst loader=registry?.[{container}]?.[{build_id}]?.['./__wake_container__']?.[{loader_export}];\nif(typeof loader!=='function')throw Object.assign(new Error('Wake standalone application loader is unavailable'),{{code:'FED_CONTAINER_GET'}});\nawait loader();\n"
     )
 }
 
