@@ -113,7 +113,7 @@ function requireBrowserMatrix(name, source, { targetKey, runnerKey, rustTargetKe
     ]
     if (rustTargetKey) lines.push(`${rustTargetKey}: ${targetPolicy.rustTarget}`)
     lines.push(`browser_evidence: ${policy.mode}`)
-    if (policy.mode === 'reviewed-major-smoke') {
+    if (policy.mode.startsWith('reviewed-major-')) {
       lines.push(`browser_majors: '${policy.majors.join(',')}'`)
     } else if (policy.mode !== 'unavailable') {
       lines.push(`browser_major: ${policy.major}`)

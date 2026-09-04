@@ -2076,7 +2076,8 @@ fn probe_build_candidate_once(options: &BuildOptions) -> Result<PreparedBuildPro
         }
         None => (None, virtual_entry_target(&root, &config)),
     };
-    let outdir = absolute_from(
+    let outdir = absolute_from_project_root(
+        &configured_root,
         &root,
         options
             .outdir
@@ -3954,6 +3955,20 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
     } else {
         normalize_path(&root.join(path))
     }
+}
+
+fn absolute_from_project_root(
+    configured_root: &Path,
+    physical_root: &Path,
+    path: &Path,
+) -> PathBuf {
+    if !path.is_absolute() {
+        return normalize_path(&physical_root.join(path));
+    }
+    let path = normalize_path(path);
+    path.strip_prefix(configured_root)
+        .map(|relative| normalize_path(&physical_root.join(relative)))
+        .unwrap_or(path)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -6181,14 +6196,16 @@ fn build_aggregated_docs(
     let config_dir = resolve_config_dir(&cwd, options.project.config_path.as_deref())?;
     let config = wake_config::load(&config_dir)
         .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_dir))?;
-    let site_root = canonical_project_root(&normalize_path(&config.resolved_root(&config_dir)))?;
+    let configured_root = normalize_path(&config.resolved_root(&config_dir));
+    let site_root = canonical_project_root(&configured_root)?;
     let site_base = normalize_public_path(
         options
             .base_path
             .as_deref()
             .unwrap_or(&config.docs.base_path),
     );
-    let requested_outdir = absolute_from(
+    let requested_outdir = absolute_from_project_root(
+        &configured_root,
         &site_root,
         options
             .outdir
@@ -8943,6 +8960,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn absolute_project_outputs_rebase_only_the_declared_root_alias() {
+        #[cfg(unix)]
+        let (configured, physical, outside) = (
+            Path::new("/var/folders/project"),
+            Path::new("/private/var/folders/project"),
+            Path::new("/opt/wake-output"),
+        );
+        #[cfg(windows)]
+        let (configured, physical, outside) = (
+            Path::new(r"C:\Users\RUNNER~1\project"),
+            Path::new(r"C:\Users\runneradmin\project"),
+            Path::new(r"D:\wake-output"),
+        );
+
+        assert_eq!(
+            absolute_from_project_root(configured, physical, &configured.join("dist")),
+            physical.join("dist")
+        );
+        assert_eq!(
+            absolute_from_project_root(configured, physical, &configured.join("linked/dist")),
+            physical.join("linked/dist")
+        );
+        assert_eq!(
+            absolute_from_project_root(configured, physical, outside),
+            outside
+        );
     }
 
     fn generation_seal_count(root: &Path) -> usize {
