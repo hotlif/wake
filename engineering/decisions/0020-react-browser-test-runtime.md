@@ -54,7 +54,7 @@ React DOM 求值前安装，保持同 realm 构造函数标识，设置 `IS_REAC
 但每个套件都获得新的 BrowserContext 和页面。可执行文件标识与版本属于诊断、结果和缓存标识的一部分。
 浏览器二进制文件不放入 Wake 现有平台包；CI 提供并固定用于发布证据的浏览器。
 `engineering/system-browser-conformance.json` 架构 v3 将两类声明分开。实验性发布证据遵循已审查的
-托管 runner 清单：Windows x64 和 Linux x64 对 Chromium 主版本 151 运行阻塞式精确主版本一致性；
+托管 runner 清单：Windows x64 对 Chromium 主版本 151、Linux x64 对主版本 152 运行阻塞式精确主版本一致性；
 macOS x64 在托管 runner 滚动切换期间对具备不可变官方清单证据的已审查主版本 150 或 151、
 macOS arm64 对已审查的主版本 152 运行阻塞式功能浏览器冒烟测试，
 并明确不视为稳定一致性；
@@ -65,8 +65,9 @@ Chrome、Edge 或 Chromium，并始终报告完整 CDP 标识。
 
 同一 DOM 内的测试按顺序执行。不同套件可在隔离 realm 或 BrowserContext 中并行。运行时模块自动
 mock、Jest 式提升、旧版伪计时器和行内快照重写不属于契约。模块替换必须显式声明，并在模块求值前解析；
-浏览器网络 mock 在驱动边界执行。覆盖率使用 V8 范围，通过 Wake 源码映射转换为 Wake 自有架构，而非
-Babel/Istanbul 插桩语义。
+浏览器网络 mock 在驱动边界执行；临时测试浏览器关闭 Chromium 的 Local Network Access 二次门禁，
+使不透明的隔离页面也只能由 Wake 的 Fetch 拦截器显式 `route`、`allow` 或拒绝请求。覆盖率使用 V8
+范围，通过 Wake 源码映射转换为 Wake 自有架构，而非 Babel/Istanbul 插桩语义。
 
 相关测试选择及监视失效使用 `wake_js_runtime` 编译出的精确自有模块图；不复用打包器分块图或
 `wake_graph` 存活记录。运行时 sidecar 将逻辑模块 ID 与物理监视路径分离，且只含已排序的自有记录。
@@ -178,7 +179,7 @@ Wake Test 发布仍被阻塞，直到五个目标都通过共享精确主版本�
   收到信号或关闭。
 - 测试超时、无限循环、未处理 rejection、浏览器/宿主崩溃、取消、畸形 IPC、资源源认证和幂等关闭，
   确保不泄漏子进程、端口、页面或配置目录。
-- Windows x64 和 Linux x64 验证系统浏览器精确主版本 151，以及 CDP、React、截图与覆盖率一致性。
+- Windows x64 验证系统浏览器精确主版本 151、Linux x64 验证主版本 152，以及 CDP、React、截图与覆盖率一致性。
   macOS x64 验证有不可变 runner 清单证据的已审查精确主版本 150 或 151，macOS arm64 验证已审查的
   精确主版本 152 和相同功能冒烟，
   但标记为不满足稳定就绪一致性。

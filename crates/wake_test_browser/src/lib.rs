@@ -986,6 +986,9 @@ impl BrowserDriver {
                 BrowserError::new(format!("could not create browser profile: {error}"))
             })?;
         let mut command = Command::new(&installation.executable);
+        // The isolated test browser delegates all network authority to Wake's Fetch interceptor.
+        // Disable Chrome's origin-based LNA prompt so an opaque test page cannot preempt an
+        // explicit `network.allow` decision before the intercepted request reaches the driver.
         command
             .arg("--remote-debugging-address=127.0.0.1")
             .arg("--remote-debugging-port=0")
@@ -1004,7 +1007,7 @@ impl BrowserDriver {
             .arg("--metrics-recording-only")
             .arg("--disable-breakpad")
             .arg("--disable-crash-reporter")
-            .arg("--disable-features=Translate,MediaRouter")
+            .arg("--disable-features=Translate,MediaRouter,LocalNetworkAccessChecks")
             .arg(format!(
                 "--window-size={},{}",
                 options.viewport.width, options.viewport.height
@@ -1177,20 +1180,6 @@ pub struct BrowserContext {
 
 impl BrowserContext {
     pub fn new_page(&self, url: &str) -> Result<BrowserPage, BrowserError> {
-        // Chrome 142+ gates loopback transport behind Local Network Access. Wake owns the test
-        // network policy through Fetch interception, so grant the browser permission up front and
-        // continue to let the runtime decide which requests are denied, routed, or continued.
-        for permission in ["local-network", "loopback-network"] {
-            self.connection.command(
-                None,
-                "Browser.setPermission",
-                json!({
-                    "permission": {"name": permission},
-                    "setting": "granted",
-                    "browserContextId": self.id,
-                }),
-            )?;
-        }
         let target = self.connection.command(
             None,
             "Target.createTarget",
@@ -2243,29 +2232,6 @@ mod tests {
         drop(page);
         drop(context);
         let requests = worker.join().unwrap();
-
-        let permissions = requests
-            .iter()
-            .filter(|request| request["method"] == "Browser.setPermission")
-            .collect::<Vec<_>>();
-        assert_eq!(permissions.len(), 2);
-        assert!(
-            permissions
-                .iter()
-                .all(|request| request["params"]["browserContextId"] == "context")
-        );
-        assert_eq!(
-            permissions
-                .iter()
-                .map(|request| request["params"]["permission"]["name"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["local-network", "loopback-network"]
-        );
-        assert!(
-            permissions
-                .iter()
-                .all(|request| request["params"]["setting"] == "granted")
-        );
 
         let media = requests
             .iter()

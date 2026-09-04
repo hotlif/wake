@@ -773,7 +773,9 @@ impl ProjectedFileSystem {
     }
 }
 
-fn resolve_existing_prefix(path: &Path) -> PathBuf {
+/// Resolve an existing path to its physical identity. For a missing path, resolve its nearest
+/// existing ancestor and append the untouched missing suffix.
+pub fn resolve_existing_prefix(path: &Path) -> PathBuf {
     if let Ok(path) = path.canonicalize() {
         return normalize(&path);
     }

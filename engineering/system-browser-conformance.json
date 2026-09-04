@@ -41,16 +41,16 @@
       "rustTarget": "x86_64-unknown-linux-gnu",
       "experimental": {
         "mode": "exact-major-conformance",
-        "major": 151
+        "major": 152
       },
       "reviewedRunnerEvidence": [
         {
-          "source": "https://github.com/actions/runner-images/blob/cbb8df97e1dd32af7cb23a90590f12734ec11d0b/images/ubuntu/Ubuntu2404-Readme.md",
-          "imageVersion": "20260823.283.1",
+          "source": "https://github.com/actions/runner-images/blob/c9a325cf656f41546b8da92a0ccbd03e260cd42a/images/ubuntu/Ubuntu2404-Readme.md",
+          "imageVersion": "20260831.293.1",
           "browserVersions": {
-            "chrome": "151.0.7922.173",
-            "chromium": "151.0.7922.0",
-            "edge": "151.0.4129.101"
+            "chrome": "152.0.7977.64",
+            "chromium": "152.0.7977.0",
+            "edge": "152.0.4191.53"
           }
         }
       ]

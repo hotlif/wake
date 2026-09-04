@@ -628,7 +628,10 @@ pub fn generate_with_mode_in(
     docs_mode: DocsMode,
 ) -> Result<GeneratedProject, DocsError> {
     let inputs = prepare_render_inputs(project_root.as_ref(), options)?;
-    let generated_dir = absolute_from(&inputs.root, generated_dir.as_ref());
+    let generated_dir = wake_common::fs::resolve_existing_prefix(&absolute_from(
+        &inputs.root,
+        generated_dir.as_ref(),
+    ));
     validate_generation_namespace(&inputs.root, &generated_dir)?;
     let rendered = render_prepared(inputs, options, mode, docs_mode)?;
     let generation = rendered_file_map(&rendered.files);
@@ -5183,9 +5186,7 @@ mod tests {
             generate_fixture(&root, &DocsOptions::default(), BuildMode::Development).unwrap();
         assert_eq!(
             result.generated_dir,
-            fs::canonicalize(generated.parent().unwrap())
-                .unwrap()
-                .join("generated")
+            wake_common::fs::resolve_existing_prefix(&generated)
         );
         assert!(generated.join("manifest.json").is_file());
         assert!(generated.join("pages/index.tsx").is_file());

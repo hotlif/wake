@@ -827,29 +827,7 @@ fn resolve_declared_watch_path(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn normalize_watch_path(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return wake_common::fs::normalize(&path);
-    }
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-    while !ancestor.exists() {
-        let Some(file_name) = ancestor.file_name() else {
-            return wake_common::fs::normalize(path);
-        };
-        suffix.push(file_name.to_os_string());
-        let Some(parent) = ancestor.parent() else {
-            return wake_common::fs::normalize(path);
-        };
-        ancestor = parent;
-    }
-    let mut normalized = ancestor
-        .canonicalize()
-        .map(|path| wake_common::fs::normalize(&path))
-        .unwrap_or_else(|_| wake_common::fs::normalize(ancestor));
-    for component in suffix.iter().rev() {
-        normalized.push(component);
-    }
-    normalized
+    wake_common::fs::resolve_existing_prefix(path)
 }
 
 fn reported_watch_paths(paths: &[PathBuf]) -> Vec<PathBuf> {

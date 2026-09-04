@@ -38,13 +38,13 @@ const linuxChromeEvidence = validateExperimentalBrowserIdentity({
   identity: {
     kind: 'chrome',
     executable: '/usr/bin/google-chrome',
-    version: 'Google Chrome 151.0.7922.173',
+    version: 'Google Chrome 152.0.7977.64',
     headless: true,
   },
 })
-assert.equal(linuxChromeEvidence.stableConformance, true)
+assert.equal(linuxChromeEvidence.stableConformance, false)
 assert.equal(linuxChromeEvidence.browser.kind, 'chrome')
-assert.equal(linuxChromeEvidence.browser.major, 151)
+assert.equal(linuxChromeEvidence.browser.major, 152)
 assert.equal(linuxChromeEvidence.browser.executable, '/usr/bin/google-chrome')
 
 for (const major of [150, 151]) {
@@ -96,7 +96,7 @@ const readiness = evaluateStableBrowserReadiness(manifest)
 assert.equal(readiness.ready, false)
 assert.deepEqual(
   new Set(readiness.blockers.map(({ target }) => target)),
-  new Set(['linux-arm64-gnu', 'darwin-x64', 'darwin-arm64']),
+  new Set(['linux-x64-gnu', 'linux-arm64-gnu', 'darwin-x64', 'darwin-arm64']),
 )
 assert(readiness.blockers.some(({ target, code }) =>
   target === 'linux-arm64-gnu' && code === 'browser-unavailable'))
@@ -118,9 +118,9 @@ for (const [description, action, pattern] of [
     () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'linux-x64-gnu',
-      identity: { kind: 'chrome', version: 'Chrome/152.0.0.1', headless: true },
+      identity: { kind: 'chrome', version: 'Chrome/151.0.0.1', headless: true },
     }),
-    /pins experimental Chromium-family major 151/,
+    /pins experimental Chromium-family major 152/,
   ],
   [
     'unknown browser kind',
