@@ -1468,8 +1468,8 @@ test('system browser evidence separates experimental publication from stable rea
   )
   assert.equal(manifest.targets['win32-x64-msvc'].experimental.mode, 'exact-major-conformance')
   assert.equal(manifest.targets['win32-x64-msvc'].experimental.major, 151)
-  assert.equal(manifest.targets['linux-x64-gnu'].experimental.mode, 'exact-major-conformance')
-  assert.equal(manifest.targets['linux-x64-gnu'].experimental.major, 152)
+  assert.equal(manifest.targets['linux-x64-gnu'].experimental.mode, 'reviewed-major-conformance')
+  assert.deepEqual(manifest.targets['linux-x64-gnu'].experimental.majors, [151, 152])
   assert.equal(manifest.targets['linux-arm64-gnu'].experimental.mode, 'unavailable')
   assert.deepEqual(
     manifest.targets['linux-arm64-gnu'].reviewedRunnerEvidence[0].browserVersions,
@@ -1477,8 +1477,8 @@ test('system browser evidence separates experimental publication from stable rea
   )
   assert.equal(manifest.targets['darwin-x64'].experimental.mode, 'reviewed-major-smoke')
   assert.deepEqual(manifest.targets['darwin-x64'].experimental.majors, [150, 151])
-  assert.equal(manifest.targets['darwin-arm64'].experimental.mode, 'exact-major-smoke')
-  assert.equal(manifest.targets['darwin-arm64'].experimental.major, 152)
+  assert.equal(manifest.targets['darwin-arm64'].experimental.mode, 'reviewed-major-smoke')
+  assert.deepEqual(manifest.targets['darwin-arm64'].experimental.majors, [150, 152])
   for (const policy of Object.values(manifest.targets)) {
     assert(Array.isArray(policy.reviewedRunnerEvidence))
     for (const evidence of policy.reviewedRunnerEvidence) {

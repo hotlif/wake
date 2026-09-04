@@ -32,20 +32,23 @@ for (const kind of ['chrome', 'edge', 'chromium']) {
   assert.equal(checked.stableConformance, true)
 }
 
-const linuxChromeEvidence = validateExperimentalBrowserIdentity({
-  manifest,
-  target: 'linux-x64-gnu',
-  identity: {
-    kind: 'chrome',
-    executable: '/usr/bin/google-chrome',
-    version: 'Google Chrome 152.0.7977.64',
-    headless: true,
-  },
-})
-assert.equal(linuxChromeEvidence.stableConformance, false)
-assert.equal(linuxChromeEvidence.browser.kind, 'chrome')
-assert.equal(linuxChromeEvidence.browser.major, 152)
-assert.equal(linuxChromeEvidence.browser.executable, '/usr/bin/google-chrome')
+for (const major of [151, 152]) {
+  const linuxChromeEvidence = validateExperimentalBrowserIdentity({
+    manifest,
+    target: 'linux-x64-gnu',
+    identity: {
+      kind: 'chrome',
+      executable: '/usr/bin/google-chrome',
+      version: `Google Chrome ${major}.0.0.1`,
+      headless: true,
+    },
+  })
+  assert.equal(linuxChromeEvidence.stableConformance, false)
+  assert.equal(linuxChromeEvidence.mode, 'reviewed-major-conformance')
+  assert.equal(linuxChromeEvidence.browser.kind, 'chrome')
+  assert.equal(linuxChromeEvidence.browser.major, major)
+  assert.equal(linuxChromeEvidence.browser.executable, '/usr/bin/google-chrome')
+}
 
 for (const major of [150, 151]) {
   const checked = validateExperimentalBrowserIdentity({
@@ -62,26 +65,28 @@ for (const major of [150, 151]) {
   assert.equal(checked.stableConformance, false)
 }
 
-const result = {
-  schemaVersion: 'wake.test.v1',
-  success: true,
-  environment: {
-    kind: 'browser',
-    browser: {
-      name: 'chrome',
-      version: 'Chrome/152.9.8.7',
-      headless: true,
+for (const major of [150, 152]) {
+  const result = {
+    schemaVersion: 'wake.test.v1',
+    success: true,
+    environment: {
+      kind: 'browser',
+      browser: {
+        name: 'chrome',
+        version: `Chrome/${major}.9.8.7`,
+        headless: true,
+      },
     },
-  },
+  }
+  const macEvidence = validateExperimentalBrowserIdentity({
+    manifest,
+    target: 'darwin-arm64',
+    result,
+  })
+  assert.equal(macEvidence.browser.version, `Chrome/${major}.9.8.7`)
+  assert.equal(macEvidence.mode, 'reviewed-major-smoke')
+  assert.equal(macEvidence.stableConformance, false)
 }
-const macEvidence = validateExperimentalBrowserIdentity({
-  manifest,
-  target: 'darwin-arm64',
-  result,
-})
-assert.equal(macEvidence.browser.version, 'Chrome/152.9.8.7')
-assert.equal(macEvidence.mode, 'exact-major-smoke')
-assert.equal(macEvidence.stableConformance, false)
 
 const armEvidence = recordUnavailableBrowserEvidence({
   manifest,
@@ -114,13 +119,13 @@ for (const [description, action, pattern] of [
     /permits reviewed Chromium-family majors 150, 151/,
   ],
   [
-    'wrong exact major',
+    'unreviewed Linux rolling major',
     () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'linux-x64-gnu',
-      identity: { kind: 'chrome', version: 'Chrome/151.0.0.1', headless: true },
+      identity: { kind: 'chrome', version: 'Chrome/150.0.0.1', headless: true },
     }),
-    /pins experimental Chromium-family major 152/,
+    /permits reviewed Chromium-family majors 151, 152/,
   ],
   [
     'unknown browser kind',
@@ -150,7 +155,11 @@ for (const [description, action, pattern] of [
     () => validateExperimentalBrowserIdentity({
       manifest,
       target: 'darwin-x64',
-      result: { ...result, success: false },
+      result: {
+        schemaVersion: 'wake.test.v1',
+        success: false,
+        environment: {},
+      },
     }),
     /successful wake\.test\.v1 result/,
   ],

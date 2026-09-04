@@ -380,8 +380,8 @@ jobs:
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
-            browser_evidence: exact-major-conformance
-            browser_major: 152
+            browser_evidence: reviewed-major-conformance
+            browser_majors: '151,152'
             browser_path: /usr/bin/google-chrome
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
@@ -393,8 +393,8 @@ jobs:
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           - platform: darwin-arm64
             runner: macos-15
-            browser_evidence: exact-major-smoke
-            browser_major: 152
+            browser_evidence: reviewed-major-smoke
+            browser_majors: '150,152'
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:
@@ -622,8 +622,8 @@ jobs:
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
-            browser_evidence: exact-major-conformance
-            browser_major: 152
+            browser_evidence: reviewed-major-conformance
+            browser_majors: '151,152'
             browser_path: /usr/bin/google-chrome
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
@@ -635,8 +635,8 @@ jobs:
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           - platform: darwin-arm64
             runner: macos-15
-            browser_evidence: exact-major-smoke
-            browser_major: 152
+            browser_evidence: reviewed-major-smoke
+            browser_majors: '150,152'
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:

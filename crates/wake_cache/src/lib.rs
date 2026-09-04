@@ -46,7 +46,7 @@ const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 200_000;
 const MAX_CACHE_ITEMS: usize = 4_000_000;
 const MAX_CACHE_OWNED_BYTES: usize = 512 * 1024 * 1024;
-const LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

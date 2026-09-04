@@ -48,6 +48,7 @@ const browserKinds = new Set(['chrome', 'edge', 'chromium'])
 const evidenceModes = new Set([
   'exact-major-conformance',
   'exact-major-smoke',
+  'reviewed-major-conformance',
   'reviewed-major-smoke',
   'unavailable',
 ])
@@ -146,7 +147,7 @@ function validateReviewedEvidence(value, target, policy, acceptedKinds, evidence
       if (policy.mode === 'unavailable') {
         throw new Error(target + ' unavailable evidence cannot list a browser version')
       }
-      const reviewedMajors = policy.mode === 'reviewed-major-smoke'
+      const reviewedMajors = policy.mode.startsWith('reviewed-major-')
         ? policy.majors
         : [policy.major]
       if (!reviewedMajors.includes(major)) {
@@ -165,7 +166,7 @@ function validateReviewedEvidence(value, target, policy, acceptedKinds, evidence
     }
   }
   if (
-    policy.mode === 'reviewed-major-smoke' &&
+    policy.mode.startsWith('reviewed-major-') &&
     (
       observedMajors.size !== policy.majors.length ||
       policy.majors.some((major) => !observedMajors.has(major))
@@ -240,7 +241,7 @@ export function validateSystemBrowserConformanceManifest(value) {
       if (typeof policy.reason !== 'string' || policy.reason.trim() === '') {
         throw new Error(target + ' unavailable policy must include a reason')
       }
-    } else if (policy.mode === 'reviewed-major-smoke') {
+    } else if (policy.mode.startsWith('reviewed-major-')) {
       exactKeys(policy, ['mode', 'majors'], 'experimental browser policy for ' + target)
       sortedUniquePositiveIntegers(policy.majors, target + ' reviewed experimental browser majors')
     } else {
@@ -305,7 +306,7 @@ export function validateExperimentalBrowserIdentity({ manifest, target, identity
     ? identityFromResult(result)
     : record(identity, 'system browser identity')
   const kind = candidate.kind
-  const reviewedMajors = policy.mode === 'reviewed-major-smoke'
+  const reviewedMajors = policy.mode.startsWith('reviewed-major-')
     ? policy.majors
     : [policy.major]
   if (!checkedManifest.acceptedKinds.includes(kind)) {
@@ -322,7 +323,7 @@ export function validateExperimentalBrowserIdentity({ manifest, target, identity
   }
   const major = parseChromiumMajor(candidate.version)
   if (!reviewedMajors.includes(major)) {
-    if (policy.mode === 'reviewed-major-smoke') {
+    if (policy.mode.startsWith('reviewed-major-')) {
       throw new Error(
         target + ' permits reviewed Chromium-family majors ' + reviewedMajors.join(', ') +
         '; found ' + candidate.version,
