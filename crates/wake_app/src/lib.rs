@@ -3733,40 +3733,6 @@ fn resolve_physical_output_path_with_project_root(
         .at(path));
     }
 
-    for ancestor in path.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
-                let is_project_ancestor_alias = project_root.is_some_and(|project_root| {
-                    ancestor
-                        .canonicalize()
-                        .map(|physical| {
-                            let physical = wake_common::fs::normalize(&physical);
-                            physical != project_root
-                                && (project_root.starts_with(ancestor)
-                                    || project_root.starts_with(&physical))
-                                && ancestor.components().count() < project_root.components().count()
-                        })
-                        .unwrap_or(false)
-                });
-                if !is_project_ancestor_alias {
-                    return Err(WakeError::new(
-                        "WAKE_CONFIG",
-                        format!(
-                            "refusing to publish output through a symbolic link or reparse point: {}",
-                            ancestor.display()
-                        ),
-                    )
-                    .at(ancestor));
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(WakeError::new("WAKE_IO", error.to_string()).at(ancestor));
-            }
-        }
-    }
-
     let mut cursor = path.to_path_buf();
     let mut missing = Vec::new();
     let existing = loop {
@@ -3795,6 +3761,39 @@ fn resolve_physical_output_path_with_project_root(
         .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&existing))?;
     for component in missing.into_iter().rev() {
         physical.push(component);
+    }
+    let physical_project_root = project_root.and_then(|project_root| {
+        project_root
+            .canonicalize()
+            .map(|path| wake_common::fs::normalize(&path))
+            .ok()
+    });
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
+                // A host-level alias such as macOS `/tmp` is safe only when resolving the complete
+                // requested path proves that publication remains inside the physical project.
+                // Internal aliases that escape the project still fail closed below.
+                let remains_inside_project = physical_project_root
+                    .as_ref()
+                    .is_some_and(|project_root| physical.starts_with(project_root));
+                if !remains_inside_project {
+                    return Err(WakeError::new(
+                        "WAKE_CONFIG",
+                        format!(
+                            "refusing to publish output through a symbolic link or reparse point: {}",
+                            ancestor.display()
+                        ),
+                    )
+                    .at(ancestor));
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(WakeError::new("WAKE_IO", error.to_string()).at(ancestor));
+            }
+        }
     }
     Ok(normalize_path(&physical))
 }

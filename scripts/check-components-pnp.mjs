@@ -203,26 +203,6 @@ try {
     env: environment,
   })
 
-  const generatedRuntime = await readFile(
-    join(temporaryProject, '.wake/docs/generated/runtime/components.tsx'),
-    'utf8',
-  )
-  assert.match(
-    generatedRuntime,
-    /from\s+["']@crab-dev\/wake\/internal\/components-runtime["']/,
-    'Generated workbench code must import the Wake internal runtime',
-  )
-  assert.doesNotMatch(
-    generatedRuntime,
-    /from\s+["']@crab-dev\/rc-/,
-    'Generated workbench code must not import Crab UI packages directly',
-  )
-  assert.doesNotMatch(
-    generatedRuntime,
-    /["'][^"'\r\n]+\.css(?:\?[^"'\r\n]*)?["']/,
-    'Generated workbench code must not import component CSS explicitly',
-  )
-
   const outputDirectory = join(temporaryProject, 'dist')
   const outputFiles = await readdir(outputDirectory)
   const manifest = JSON.parse(await readFile(join(outputDirectory, 'manifest.json'), 'utf8'))
@@ -277,12 +257,14 @@ try {
     (await readdir(workspaceDirectory)).includes(workspaceManifest.entry),
     'The aggregate PnP workspace must emit its isolated entry chunk',
   )
-  await assertComponentsRuntime(join(workspaceDirectory, workspaceManifest.entry))
-  const workspaceConfig = await readFile(
-    join(temporaryProject, 'workspaces/rc-pnp/.wake/docs/generated/config.tsx'),
-    'utf8',
+  const workspaceEntryPath = join(workspaceDirectory, workspaceManifest.entry)
+  await assertComponentsRuntime(workspaceEntryPath)
+  const workspaceEntry = await readFile(workspaceEntryPath, 'utf8')
+  assert.match(
+    workspaceEntry,
+    /(?:["']presentation["']|presentation)\s*:\s*["']embedded["']/,
+    'The published aggregate workspace must retain embedded presentation mode',
   )
-  assert.match(workspaceConfig, /"presentation":"embedded"/)
 
   completed = true
   console.log(JSON.stringify({

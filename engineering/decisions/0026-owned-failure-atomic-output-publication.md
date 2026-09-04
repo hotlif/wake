@@ -17,7 +17,10 @@ did not use it.
 
 `wake_app` is the sole output publication owner for application and documentation directory products
 and for its exact-file products. It resolves physical output paths, rejects project/input overlap and
-link or reparse traversal, and commits through the shared backup-and-rollback engines.
+link or reparse traversal, and commits through the shared backup-and-rollback engines. A platform
+host-prefix alias such as macOS `/tmp` may be traversed only when resolving the complete requested
+path proves that the physical output remains inside the physical project; every other link or
+reparse traversal remains rejected.
 
 Every exact-file and directory publication uses one process mutex plus one environment-independent,
 machine/OS-namespace commit lock named `wake-output-publication-v1`. Windows uses a `Global\\` named
@@ -50,7 +53,9 @@ legacy manifest and provides no force bypass.
 ## Invariants
 
 1. Project roots, project ancestors, paths containing protected inputs, filesystem roots, symbolic
-   links, and Windows reparse points are never directory publication targets.
+   links, and Windows reparse points are never directory publication targets. A host-prefix alias is
+   accepted only after the complete resolved target is proven to remain inside the physical project;
+   the target itself is still a real owned directory rather than the alias.
 2. A non-empty directory without a valid matching ownership marker is never cleaned or overwritten.
 3. Application chunks, assets, Federation public files, HTML, and manifest are completely materialized
    before the public tree changes. Federation hidden source-map failure also occurs before public commit.
