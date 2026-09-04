@@ -802,10 +802,12 @@ export async function runCli(argv = process.argv.slice(2)) {
     options.outdir = takeOption(args, '--outdir')
     options.basePath = takeOption(args, '--base')
     options.mode = validateChoice(takeOption(args, '--mode') || 'site', '--mode', ['site', 'components'])
-    options.host = takeOption(args, '--host')
-    const port = takeOption(args, '--port')
-    if (port) options.port = Number(port)
-    options.open = takeFlag(args, '--open')
+    if (action === 'dev') {
+      options.host = takeOption(args, '--host')
+      const port = takeOption(args, '--port')
+      if (port) options.port = Number(port)
+      options.open = takeFlag(args, '--open')
+    }
     if (args[0]) options.cwd = args.shift()
     if (args.length) throw new Error(`unknown docs arguments: ${args.join(' ')}`)
     if (action === 'build') {

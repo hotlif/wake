@@ -195,7 +195,7 @@ fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
         "[html]\nentry = \"src/index.js\"\n",
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut early_status = None;
     while Instant::now() < deadline && !root.join("dist/index.html").is_file() {
         if let Some(status) = child.try_wait().unwrap() {

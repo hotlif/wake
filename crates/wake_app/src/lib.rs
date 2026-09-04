@@ -3742,7 +3742,8 @@ fn resolve_physical_output_path_with_project_root(
                         .map(|physical| {
                             let physical = wake_common::fs::normalize(&physical);
                             physical != project_root
-                                && project_root.starts_with(&physical)
+                                && (project_root.starts_with(ancestor)
+                                    || project_root.starts_with(&physical))
                                 && ancestor.components().count() < project_root.components().count()
                         })
                         .unwrap_or(false)
@@ -9028,6 +9029,14 @@ mod tests {
             resolve_physical_output_path_with_project_root(
                 &alias.join("project/dist"),
                 Some(&physical_project)
+            )
+            .unwrap(),
+            physical_project.join("dist")
+        );
+        assert_eq!(
+            resolve_physical_output_path_with_project_root(
+                &alias.join("project/dist"),
+                Some(&alias.join("project")),
             )
             .unwrap(),
             physical_project.join("dist")
