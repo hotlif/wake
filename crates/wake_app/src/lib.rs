@@ -9041,7 +9041,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "WAKE_CONFIG");
-        assert_eq!(error.path.as_deref(), Some(internal_alias.as_path()));
+        assert_eq!(error.path.as_deref(), internal_alias.to_str());
     }
 
     fn generation_seal_count(root: &Path) -> usize {
