@@ -1,8 +1,8 @@
 # ADR 0009: 将语义绑定作为编辑器高亮的唯一权威
 
-- Status: superseded
+- Status: accepted
 - Date: 2026-08-17
-- Superseded by: [ADR 0010](0010-shared-css-syntax-tree.md)
+- Amended by: [ADR 0010](0010-shared-css-syntax-tree.md)
 
 ## Context
 
@@ -55,6 +55,8 @@ Crab CSS 高亮依据语义标识而非标签拼写，既保留别名，又消�
 着色在语言服务器分析文档后开始，而非由 TextMate 立即执行。服务器不可用时，扩展不会猜测并应用
 可能错误的 Crab 高亮。
 
+ADR 0007 的语言服务所有权和依赖方向仍由本决策保留。
+
 ## Validation
 
 - 在 `wake_css_language` 中测试 Crab 导入别名、词法遮蔽及其他包的同名导入。
@@ -64,13 +66,11 @@ Crab CSS 高亮依据语义标识而非标签拼写，既保留别名，又消�
 
 ## Supersedes
 
-[ADR 0007](0007-css-language-intelligence.md) 中将 TextMate 着色与语义 token 结合的决策。
-其语言服务所有权和依赖方向仍然有效。
+None.
 
-## Superseded by
+## Amends
 
-[ADR 0010](0010-shared-css-syntax-tree.md) 将 CSS 语法所有权移至语言服务下层，使编译器、打包器和
-编辑器使用同一棵 CST，同时保留仅基于语义的高亮。
+- [ADR 0007](0007-css-language-intelligence.md): 以 AST 与语义绑定高亮替代 TextMate 混合权威，保留语言服务所有权和依赖方向
 
 ## Removal plan
 

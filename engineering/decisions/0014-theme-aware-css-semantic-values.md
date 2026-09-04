@@ -48,6 +48,8 @@ CSS 声明值可独立于 TypeScript 关键字设置样式，同时继续遵循�
 `crabCssValue`。已识别标准 CSS TextMate scope 的主题无需 Crab 专用规则即可获得合适回退。语义
 图例新增一个自定义类型，因此客户端必须使用图例，不能假定硬编码索引。
 
+本决策细化 [ADR 0010](0010-shared-css-syntax-tree.md) 保留的纯语义高亮路径。
+
 ## Validation
 
 - 在 `wake_css_language` 中测试声明名、嵌套声明值、插值孔洞和非声明 CSS 标识符。
@@ -57,7 +59,7 @@ CSS 声明值可独立于 TypeScript 关键字设置样式，同时继续遵循�
 
 ## Supersedes
 
-None. 本决策细化了 [ADR 0010](0010-shared-css-syntax-tree.md) 保留的纯语义高亮路径。
+None.
 
 ## Removal plan
 

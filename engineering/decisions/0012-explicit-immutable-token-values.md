@@ -63,7 +63,7 @@ ESM 导出/导入边；普通结构仍采用保守拒绝路径。打包器和语
 
 ## Supersedes
 
-None
+None.
 
 ## Removal plan
 

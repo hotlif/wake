@@ -124,6 +124,10 @@ entry/expose/style asset context 都固定 `development=false`、generation 0。
 
 None.
 
+## Amends
+
+- [ADR 0025](0025-wake-native-federation-contract.md): decision 15 及相关 invariant 的开发快照保留边界
+
 ## Removal plan
 
 旧的无界 `history: BTreeMap<String, FederationSnapshot>` 与 development `retiredBuildIds` 永久集合在本

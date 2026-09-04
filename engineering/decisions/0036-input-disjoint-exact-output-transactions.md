@@ -5,7 +5,9 @@
 
 ## Context
 
-ADR 0026 made directory products failure-atomic, but exact-file products still bypassed that owner.
+ADR 0026 established one publication owner and shared commit lock for directory and exact-file
+products, but exact-file callers still bypassed its complete-set transaction and authoritative
+input-provenance boundary.
 `bundle({ outfile, sourceMap: true })` wrote the map and JavaScript with two independent
 `atomic_write` calls. A failure after the first replacement produced a cross-generation pair. The
 outfile was also only joined to the project root, so it could be the entry, a transitive module, a
@@ -116,8 +118,11 @@ file, while the requested destination set is already fully committed.
 
 ## Supersedes
 
-None. This extends [ADR 0026](0026-owned-failure-atomic-output-publication.md) from owned directory
-products to exact-file products.
+None.
+
+## Amends
+
+- [ADR 0026](0026-owned-failure-atomic-output-publication.md): 补齐 exact-file 的完整候选集、输入 provenance 与成组回滚事务
 
 ## Removal plan
 

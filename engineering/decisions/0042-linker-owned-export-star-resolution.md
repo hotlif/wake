@@ -83,6 +83,10 @@ bindings when their unknown surfaces collide.
 
 None.
 
+## Amends
+
+- [ADR 0024](0024-linker-proven-barrel-compaction.md): 由 linker 静态解析可证明的 `export *` 表面，动态枚举仅保留为 opaque fallback
+
 ## Removal plan
 
 No compatibility bridge remains. Runtime enumeration is a permanent explicit fallback only for

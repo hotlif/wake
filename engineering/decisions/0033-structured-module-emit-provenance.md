@@ -135,7 +135,11 @@ carry a stable specifier string in addition to their small range/role record.
 
 ## Supersedes
 
-[ADR 0024](0024-linker-proven-barrel-compaction.md).
+None.
+
+## Amends
+
+- [ADR 0024](0024-linker-proven-barrel-compaction.md): 以结构化 module emit provenance 替代 emitted-text 启发式证明
 
 ## Removal plan
 

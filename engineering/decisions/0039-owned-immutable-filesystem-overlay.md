@@ -159,6 +159,10 @@ separate follow-up boundary and this decision does not claim they are config-onl
 
 None.
 
+## Amends
+
+- [ADR 0037](0037-typed-development-watch-and-candidate-generations.md): decision 8 的物理 candidate generation 改为 owner 持有的不可变生成输入 overlay
+
 ## Removal plan
 
 No product path uses `ProjectedFileSystem` or a physical candidate generation after this migration.

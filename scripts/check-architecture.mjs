@@ -7,7 +7,6 @@ import { parseSyml } from '@yarnpkg/parsers'
 const scriptPath = fileURLToPath(import.meta.url)
 const defaultRepoRoot = resolve(dirname(scriptPath), '..')
 const validAdrStatuses = new Set(['proposed', 'accepted', 'superseded', 'rejected'])
-const activeAdrStatuses = new Set(['proposed', 'accepted'])
 const requiredAdrSections = [
   'Context',
   'Decision',
@@ -18,6 +17,19 @@ const requiredAdrSections = [
   'Supersedes',
   'Removal plan',
 ]
+const adrDomains = [
+  'governance',
+  'compiler',
+  'build',
+  'css-editor',
+  'docs',
+  'federation',
+  'testing',
+  'node-release',
+  'cli',
+]
+const adrIndexStart = '<!-- ADR-INDEX:START -->'
+const adrIndexEnd = '<!-- ADR-INDEX:END -->'
 
 function display(root, path) {
   return relative(root, path).split(sep).join('/')
@@ -95,6 +107,64 @@ function expandNames(rule, field, groupField, groups, errors) {
   return unique(expanded)
 }
 
+function validIsoDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value ?? '')) return false
+  const date = new Date(`${value}T00:00:00Z`)
+  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0, 10) === value
+}
+
+function relationLink(line, suffix = '') {
+  const expression = suffix
+    ? new RegExp(`^- \\[ADR (\\d{4})\\]\\((\\d{4}-[a-z0-9][a-z0-9-]*\\.md)\\): ${suffix}$`)
+    : /^- \[ADR (\d{4})\]\((\d{4}-[a-z0-9][a-z0-9-]*\.md)\)$/
+  const match = expression.exec(line)
+  if (!match) return null
+  return { number: match[1], filename: match[2], scope: match[3] }
+}
+
+function parseRelationSection({ body, kind, path, root, errors }) {
+  if (kind === 'Supersedes' && body === 'None.') return []
+  if (body === '' || (kind === 'Amends' && /^None\.?$/i.test(body))) {
+    errors.push(`${display(root, path)}: ${kind} must contain ${kind === 'Supersedes' ? 'None. or ' : ''}at least one ADR link`)
+    return []
+  }
+  const relations = []
+  for (const line of body.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+    const relation = relationLink(line, kind === 'Amends' ? '(.+)' : '')
+    if (!relation) {
+      const expected = kind === 'Amends'
+        ? '- [ADR NNNN](NNNN-name.md): non-empty scope'
+        : '- [ADR NNNN](NNNN-name.md)'
+      errors.push(`${display(root, path)}: ${kind} entries must use ${expected}`)
+      continue
+    }
+    if (relation.number !== relation.filename.slice(0, 4)) {
+      errors.push(`${display(root, path)}: ${kind} link label ADR ${relation.number} does not match ${relation.filename}`)
+    }
+    relations.push(relation)
+  }
+  return relations
+}
+
+function parseBacklinks({ header, kind, path, root, errors }) {
+  const prefix = `- ${kind}:`
+  const backlinks = []
+  for (const rawLine of header.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line.startsWith(prefix)) continue
+    const relation = relationLink(`- ${line.slice(prefix.length).trim()}`)
+    if (!relation) {
+      errors.push(`${display(root, path)}: ${kind} must use [ADR NNNN](NNNN-name.md)`)
+      continue
+    }
+    if (relation.number !== relation.filename.slice(0, 4)) {
+      errors.push(`${display(root, path)}: ${kind} link label ADR ${relation.number} does not match ${relation.filename}`)
+    }
+    backlinks.push(relation)
+  }
+  return backlinks
+}
+
 function parseAdr(path, root, errors) {
   const source = readFileSync(path, 'utf8')
   const filename = path.split(/[\\/]/).at(-1)
@@ -104,36 +174,221 @@ function parseAdr(path, root, errors) {
     return null
   }
   const number = filenameMatch[1]
-  const heading = source.match(/^# ADR (\d{4}):\s+\S.+$/m)
+  if (number === '0000') {
+    errors.push(`${display(root, path)}: ADR 0000 is reserved for 0000-template.md`)
+  }
+  const heading = source.match(/^# ADR (\d{4}):\s+(.+\S)\s*$/m)
   if (!heading || heading[1] !== number) {
     errors.push(`${display(root, path)}: H1 must start with # ADR ${number}:`)
   }
-  const status = source.match(/^- Status:\s*([a-z]+)\s*$/m)?.[1]
+  const title = heading?.[2]?.trim() ?? ''
+  const firstSection = source.search(/^##\s+/m)
+  const header = firstSection >= 0 ? source.slice(0, firstSection) : source
+  for (const rawLine of header.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (/^- (?:superseded|amended)\s+by\s*:/i.test(line) && !/^- (?:Superseded by|Amended by):/.test(line)) {
+      errors.push(`${display(root, path)}: relation backlink metadata must use exact Superseded by or Amended by spelling`)
+    }
+  }
+  const statuses = [...header.matchAll(/^- Status:\s*([^\s]+)\s*$/gm)].map((match) => match[1])
+  const status = statuses[0]
+  if (statuses.length !== 1) errors.push(`${display(root, path)}: header must contain exactly one Status`)
   if (!status || !validAdrStatuses.has(status)) {
     errors.push(`${display(root, path)}: status must be proposed, accepted, superseded, or rejected`)
   }
-  const headings = [...source.matchAll(/^##\s+(.+?)\s*$/gm)].map((match) => match[1])
+  const dates = [...header.matchAll(/^- Date:\s*(\S+)\s*$/gm)].map((match) => match[1])
+  if (dates.length !== 1 || !validIsoDate(dates[0])) {
+    errors.push(`${display(root, path)}: header must contain exactly one valid ISO Date (YYYY-MM-DD)`)
+  }
+
+  const headingMatches = [...source.matchAll(/^##\s+(.+?)\s*$/gm)]
+  const headings = headingMatches.map((match) => match[1])
+  for (const forbidden of ['Depends on', 'Related']) {
+    if (headings.includes(forbidden)) {
+      errors.push(`${display(root, path)}: ## ${forbidden} is not an ADR relation; use ordinary links in the relevant section`)
+    }
+  }
+  const sectionBodies = new Map()
+  for (const [index, match] of headingMatches.entries()) {
+    const start = match.index + match[0].length
+    const end = headingMatches[index + 1]?.index ?? source.length
+    if (!sectionBodies.has(match[1])) sectionBodies.set(match[1], [])
+    sectionBodies.get(match[1]).push(source.slice(start, end).trim())
+  }
   for (const section of requiredAdrSections) {
-    if (!headings.includes(section)) errors.push(`${display(root, path)}: missing ## ${section}`)
+    const occurrences = sectionBodies.get(section) ?? []
+    if (occurrences.length === 0) errors.push(`${display(root, path)}: missing ## ${section}`)
+    if (occurrences.length > 1) errors.push(`${display(root, path)}: ## ${section} must be unique`)
+    if (occurrences.length === 1 && occurrences[0] === '') errors.push(`${display(root, path)}: ## ${section} must not be empty`)
   }
-  const supersedesHeading = source.match(/^## Supersedes\s*$/m)
-  const supersedesStart = supersedesHeading ? supersedesHeading.index + supersedesHeading[0].length : -1
-  const supersedesTail = supersedesStart >= 0 ? source.slice(supersedesStart) : ''
-  const nextHeading = supersedesTail.search(/^##\s/m)
-  const supersedesBody = (nextHeading >= 0 ? supersedesTail.slice(0, nextHeading) : supersedesTail).trim()
-  const supersedes = [...supersedesBody.matchAll(/\((\d{4}-[a-z0-9][a-z0-9-]*\.md)\)/g)].map((match) => match[1])
-  if (supersedesBody && !/^None\.?$/i.test(supersedesBody) && supersedes.length === 0) {
-    errors.push(`${display(root, path)}: Supersedes must be None or link to an ADR file`)
+
+  const orderedSections = requiredAdrSections.map((section) => headings.indexOf(section))
+  if (orderedSections.every((index) => index >= 0)) {
+    for (let index = 1; index < orderedSections.length; index += 1) {
+      if (orderedSections[index] <= orderedSections[index - 1]) {
+        errors.push(`${display(root, path)}: required ADR sections are out of order`)
+        break
+      }
+    }
   }
-  if (status === 'superseded' && !/^- Superseded by:\s*\[[^\]]+\]\([^)]+\)\s*$/m.test(source)) {
-    errors.push(`${display(root, path)}: superseded ADR must include a Superseded by link`)
+
+  const amendsBodies = sectionBodies.get('Amends') ?? []
+  if (amendsBodies.length > 1) errors.push(`${display(root, path)}: ## Amends must be unique`)
+  if (amendsBodies.length === 1) {
+    const amendsIndex = headings.indexOf('Amends')
+    if (amendsIndex <= headings.indexOf('Supersedes') || amendsIndex >= headings.indexOf('Removal plan')) {
+      errors.push(`${display(root, path)}: ## Amends must appear between ## Supersedes and ## Removal plan`)
+    }
   }
-  return { filename, number, path, source, status, supersedes }
+
+  const supersedes = parseRelationSection({
+    body: sectionBodies.get('Supersedes')?.[0] ?? '',
+    kind: 'Supersedes',
+    path,
+    root,
+    errors,
+  })
+  const amends = amendsBodies.length === 1
+    ? parseRelationSection({ body: amendsBodies[0], kind: 'Amends', path, root, errors })
+    : []
+  const supersededBy = parseBacklinks({ header, kind: 'Superseded by', path, root, errors })
+  const amendedBy = parseBacklinks({ header, kind: 'Amended by', path, root, errors })
+  for (const [kind, backlinks] of [['Superseded by', supersededBy], ['Amended by', amendedBy]]) {
+    if (backlinks.length !== new Set(backlinks.map((relation) => relation.filename)).size) {
+      errors.push(`${display(root, path)}: ${kind} contains duplicate backlinks`)
+    }
+  }
+  if (status === 'superseded' && supersededBy.length !== 1) {
+    errors.push(`${display(root, path)}: superseded ADR must contain exactly one Superseded by backlink`)
+  }
+  if (status !== 'superseded' && supersededBy.length > 0) {
+    errors.push(`${display(root, path)}: only a superseded ADR may contain a Superseded by backlink`)
+  }
+  return {
+    filename,
+    number,
+    title,
+    path,
+    source,
+    status,
+    date: dates[0],
+    supersedes,
+    amends,
+    supersededBy,
+    amendedBy,
+    indexed: false,
+    domain: null,
+  }
 }
 
-export function validateAdrs({ repoRoot, decisionsDir }) {
+function validateAdrIndex({ repoRoot, indexPath, records, errors }) {
+  if (!existsSync(indexPath)) {
+    errors.push(`${display(repoRoot, indexPath)}: ADR index is missing`)
+    return
+  }
+  const source = readFileSync(indexPath, 'utf8')
+  const starts = source.split(adrIndexStart).length - 1
+  const ends = source.split(adrIndexEnd).length - 1
+  if (starts !== 1 || ends !== 1) {
+    errors.push(`${display(repoRoot, indexPath)}: ADR index must contain exactly one start and end marker`)
+    return
+  }
+  const start = source.indexOf(adrIndexStart)
+  const end = source.indexOf(adrIndexEnd)
+  if (end <= start) {
+    errors.push(`${display(repoRoot, indexPath)}: ADR index markers are out of order`)
+    return
+  }
+
+  const domainOrder = []
+  const domainEntries = new Map()
+  let currentDomain = null
+  const entries = []
+  const lines = source.slice(start + adrIndexStart.length, end).split(/\r?\n/)
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (line === '') continue
+    const domainMatch = /^### ([a-z][a-z0-9-]*)$/.exec(line)
+    if (domainMatch) {
+      currentDomain = domainMatch[1]
+      domainOrder.push(currentDomain)
+      if (!domainEntries.has(currentDomain)) domainEntries.set(currentDomain, [])
+      continue
+    }
+    const entry = /^- \[ADR (\d{4}): ([^\]]+)\]\((\d{4}-[a-z0-9][a-z0-9-]*\.md)\) — `(proposed|accepted|superseded|rejected)`$/.exec(line)
+    if (!entry || !currentDomain) {
+      errors.push(`${display(repoRoot, indexPath)}: invalid ADR index line: ${line}`)
+      continue
+    }
+    const record = {
+      number: entry[1],
+      title: entry[2].trim(),
+      filename: entry[3],
+      status: entry[4],
+      domain: currentDomain,
+    }
+    entries.push(record)
+    domainEntries.get(currentDomain).push(record)
+  }
+
+  if (domainOrder.join(',') !== adrDomains.join(',')) {
+    errors.push(`${display(repoRoot, indexPath)}: domains must appear once in this order: ${adrDomains.join(', ')}`)
+  }
+  for (const domain of adrDomains) {
+    const group = domainEntries.get(domain) ?? []
+    const numbers = group.map((entry) => entry.number)
+    const sorted = [...numbers].sort()
+    if (numbers.join(',') !== sorted.join(',')) {
+      errors.push(`${display(repoRoot, indexPath)}: ${domain} ADRs must be sorted by number`)
+    }
+  }
+
+  const indexedFiles = new Map()
+  for (const entry of entries) {
+    if (indexedFiles.has(entry.filename)) {
+      errors.push(`${display(repoRoot, indexPath)}: ${entry.filename} appears more than once in the ADR index`)
+      continue
+    }
+    indexedFiles.set(entry.filename, entry)
+    const record = records.get(entry.filename)
+    if (!record) {
+      errors.push(`${display(repoRoot, indexPath)}: indexed ADR ${entry.filename} does not exist`)
+      continue
+    }
+    record.indexed = true
+    record.domain = entry.domain
+    if (entry.number !== record.number) errors.push(`${display(repoRoot, indexPath)}: ${entry.filename} has the wrong ADR number`)
+    if (entry.title !== record.title) errors.push(`${display(repoRoot, indexPath)}: ${entry.filename} title does not match its H1`)
+    if (entry.status !== record.status) errors.push(`${display(repoRoot, indexPath)}: ${entry.filename} status does not match its header`)
+  }
+  for (const record of records.values()) {
+    if (!indexedFiles.has(record.filename)) {
+      errors.push(`${display(repoRoot, indexPath)}: ${record.filename} is missing from the ADR index`)
+    }
+  }
+}
+
+function relationCycle(records) {
+  const visiting = new Set()
+  const visited = new Set()
+  const walk = (filename) => {
+    if (visiting.has(filename)) return true
+    if (visited.has(filename)) return false
+    visiting.add(filename)
+    const record = records.get(filename)
+    for (const relation of [...(record?.supersedes ?? []), ...(record?.amends ?? [])]) {
+      if (records.has(relation.filename) && walk(relation.filename)) return true
+    }
+    visiting.delete(filename)
+    visited.add(filename)
+    return false
+  }
+  return [...records.keys()].some(walk)
+}
+
+export function validateAdrs({ repoRoot, decisionsDir, indexPath = join(decisionsDir, 'README.md') }) {
   const errors = []
-  if (!existsSync(decisionsDir)) return [`${display(repoRoot, decisionsDir)}: decisions directory is missing`]
+  if (!existsSync(decisionsDir)) return { errors: [`${display(repoRoot, decisionsDir)}: decisions directory is missing`], records: new Map() }
   const files = readdirSync(decisionsDir)
     .filter((name) => /^\d{4}-.*\.md$/.test(name) && name !== '0000-template.md')
     .sort()
@@ -149,11 +404,71 @@ export function validateAdrs({ repoRoot, decisionsDir }) {
     }
     records.set(record.filename, record)
   }
+  const highestNumber = Math.max(0, ...[...numbers.keys()].map(Number))
+  for (let number = 1; number <= highestNumber; number += 1) {
+    const padded = String(number).padStart(4, '0')
+    if (!numbers.has(padded)) errors.push(`${display(repoRoot, decisionsDir)}: ADR sequence is missing ${padded}`)
+  }
   for (const record of records.values()) {
-    for (const target of record.supersedes) {
-      if (!records.has(target)) errors.push(`${display(repoRoot, record.path)}: Supersedes target ${target} does not exist`)
+    if ((record.supersedes.length > 0 || record.amends.length > 0) && record.status !== 'accepted') {
+      errors.push(`${display(repoRoot, record.path)}: only an accepted ADR may supersede or amend another ADR`)
+    }
+    const seen = new Set()
+    for (const [kind, relations] of [['Supersedes', record.supersedes], ['Amends', record.amends]]) {
+      for (const relation of relations) {
+        const key = `${kind}:${relation.filename}`
+        if (seen.has(key)) errors.push(`${display(repoRoot, record.path)}: ${kind} target ${relation.filename} is duplicated`)
+        seen.add(key)
+        const target = records.get(relation.filename)
+        if (!target) {
+          errors.push(`${display(repoRoot, record.path)}: ${kind} target ${relation.filename} does not exist`)
+          continue
+        }
+        if (target.filename === record.filename) errors.push(`${display(repoRoot, record.path)}: ${kind} cannot reference itself`)
+        if (target.number >= record.number) errors.push(`${display(repoRoot, record.path)}: ${kind} target ${relation.filename} must be an earlier ADR`)
+        const otherKind = kind === 'Supersedes' ? record.amends : record.supersedes
+        if (otherKind.some((candidate) => candidate.filename === relation.filename)) {
+          errors.push(`${display(repoRoot, record.path)}: ${relation.filename} cannot be both superseded and amended`)
+        }
+      }
+    }
+    for (const relation of record.supersedes) {
+      const target = records.get(relation.filename)
+      if (!target) continue
+      if (target.status !== 'superseded') {
+        errors.push(`${display(repoRoot, record.path)}: Supersedes target ${target.filename} must have status superseded`)
+      }
+      if (target.supersededBy.length !== 1 || target.supersededBy[0].filename !== record.filename) {
+        errors.push(`${display(repoRoot, record.path)}: Supersedes target ${target.filename} must link back with Superseded by`)
+      }
+    }
+    for (const relation of record.amends) {
+      const target = records.get(relation.filename)
+      if (!target) continue
+      if (target.status !== 'accepted') {
+        errors.push(`${display(repoRoot, record.path)}: Amends target ${target.filename} must have status accepted`)
+      }
+      if (!target.amendedBy.some((backlink) => backlink.filename === record.filename)) {
+        errors.push(`${display(repoRoot, record.path)}: Amends target ${target.filename} must link back with Amended by`)
+      }
+    }
+    for (const backlink of record.supersededBy) {
+      const successor = records.get(backlink.filename)
+      if (!successor) errors.push(`${display(repoRoot, record.path)}: Superseded by target ${backlink.filename} does not exist`)
+      else if (!successor.supersedes.some((relation) => relation.filename === record.filename)) {
+        errors.push(`${display(repoRoot, record.path)}: Superseded by target ${backlink.filename} must list this ADR in Supersedes`)
+      }
+    }
+    for (const backlink of record.amendedBy) {
+      const successor = records.get(backlink.filename)
+      if (!successor) errors.push(`${display(repoRoot, record.path)}: Amended by target ${backlink.filename} does not exist`)
+      else if (!successor.amends.some((relation) => relation.filename === record.filename)) {
+        errors.push(`${display(repoRoot, record.path)}: Amended by target ${backlink.filename} must list this ADR in Amends`)
+      }
     }
   }
+  if (relationCycle(records)) errors.push(`${display(repoRoot, decisionsDir)}: ADR relations contain a cycle`)
+  validateAdrIndex({ repoRoot, indexPath, records, errors })
   return { errors, records }
 }
 
@@ -678,9 +993,14 @@ export function validatePolicy({ policy, packages, adrRecords, policyPath = 'eng
   for (const decisionPath of decisionPaths) {
     const filename = decisionPath.split('/').at(-1)
     const record = adrRecords.get(filename)
+    if (decisionPath !== `engineering/decisions/${filename}`) {
+      errors.push(`${policyPath}: decision ${decisionPath} must use its canonical engineering/decisions path`)
+    }
     if (!record) errors.push(`${policyPath}: decision ${decisionPath} does not exist`)
-    else if (!activeAdrStatuses.has(record.status)) {
-      errors.push(`${policyPath}: decision ${decisionPath} must be proposed or accepted, found ${record.status}`)
+    else if (record.status !== 'accepted') {
+      errors.push(`${policyPath}: decision ${decisionPath} must be accepted, found ${record.status}`)
+    } else if (record.indexed !== true) {
+      errors.push(`${policyPath}: decision ${decisionPath} must appear in the validated ADR index`)
     }
   }
   return errors

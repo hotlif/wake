@@ -1,8 +1,9 @@
 # ADR 0006: 将 Crab CSS 设为唯一公共 CSS-in-JS 契约
 
-- Status: superseded
-- Superseded by: [ADR 0035](0035-parser-owned-crab-runtime-resolution.md)
+- Status: accepted
 - Date: 2026-08-14
+- Amended by: [ADR 0022](0022-yarn-pnp-ownership.md)
+- Amended by: [ADR 0035](0035-parser-owned-crab-runtime-resolution.md)
 
 ## Context
 

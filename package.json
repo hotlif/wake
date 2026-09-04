@@ -9,7 +9,7 @@
     "editors/vscode-css"
   ],
   "scripts": {
-    "architecture:check": "node scripts/check-architecture.mjs",
+    "architecture:check": "node scripts/check-skills.mjs && node scripts/check-architecture.mjs",
     "architecture:test": "wake test scripts/check-architecture.test.mjs",
     "browser:conformance:check": "node scripts/check-system-browser-conformance.mjs --manifest-only true",
     "browser:conformance:test": "node scripts/check-system-browser-conformance.test.mjs",
@@ -34,6 +34,7 @@
     "yarn:lock:check": "node scripts/check-yarn-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
+    "skill:check": "node scripts/check-skills.mjs",
     "rusty-v8:prepare:test": "node --test scripts/rusty-v8-archive-path.test.mjs",
     "vscode:css:check": "yarn workspace crab-css check",
     "versions:check": "node scripts/check-versions.mjs"

@@ -90,6 +90,10 @@ lock. Crash recovery of an interrupted rename sequence is separate future work.
 
 None.
 
+## Amends
+
+- [ADR 0038](0038-docs-generation-transaction.md): process-only 并发边界扩展为跨进程事务串行化
+
 ## Removal plan
 
 The previous process-only transaction boundary is removed in the same change. No unlocked fallback

@@ -197,26 +197,6 @@ Resolver 以两个互补缓存压缩 package-root 探测：`package_owners` 把�
 并在后续 BFS 层复用该成功结果。不同物理安装路径即使逻辑 identity 相同也不合并；失败不进入成功表，
 必须逐请求回到普通 resolver + loader，以保留 TypeScript twin、目录入口、alias、PnP 和规范诊断。
 
-## Removal plan
-
-本变更采用原子切换，不保留运行时 feature flag、兼容 emitter 或可执行旧压缩器。生产入口、bundler
-调用方、typed module finalize 和 typed emitter 必须在同一迁移中切换；生产数据流统一为结构化
-`OptimizeInput` → owned typed IR → typed emitter。外部 pass 拼装、第二套名字优化状态、4096 字节退让、
-禁用压缩 Source Map 和停用 hoist 分支一并删除。旧实现只可作为审阅过的冻结字节数字存在，不能作为
-测试时或运行时 fallback。
-
-Validated/consuming、semantic-free、trivial-effect 和 no-op finalization 都是同一 typed pipeline 的证明化
-入口；成功后不保留运行时 feature flag 或双实现。One-shot engine/terminal emission 与 retained engine
-由 `BuildSession` 的显式构造器选择，共享同一任务定义和编译产物；session 不通过运行期探测“是否可能只
-构建一次”切换生命周期或语义。
-
-压缩器版本（当前 `wake-closure-minifier-v12`）、defines/drop flags、稳定的声明保留名/公开观察名/star 链接事实、可信编辑和保留名进入稳定指纹。版本提升使旧产物自然
-miss，不做格式迁移。Map facts 可以独立缓存，但 map 开关不得改变 optimizer/body 身份或 JavaScript
-body。本轮不改变持久缓存的 opt-in 默认、schema、阶段归属或 session invalidation：retained facts、body
-和 mapping facts 仍由现有稳定 key 持久化，arena、`SymbolId`、`Vc` 与 transient engine 值仍不落盘。
-One-shot 省略的只是没有下一 generation 消费者的进程内元数据；启用持久缓存时仍按既有 key 读写，长
-生命周期 session 仍计算 fingerprint、依赖边和 revision。
-
 ## Invariants
 
 - IR lowering、编辑后的所有权交接、module planning 结果和 seal/finalize 以完整 `TypedProgram::validate`
@@ -256,6 +236,13 @@ One-shot 省略的只是没有下一 generation 消费者的进程内元数据�
 - `crates/wake_turbo/src/engine.rs`：transient engine 冻结边界、single-flight 与 128 个 cache-padded shards。
 - `crates/wake_resolver/src/lib.rs`：package owner 路径压缩、issuer/package roots 缓存及 cache clear。
 
+## Consequences
+
+优化语义只有一个拥有者和一份可变语法事实源。Structural pass 与分析通过稳定 ID 直接协作，codegen
+无法重新解释 span 决策，bundler 也不再维护第二份名字或模块 rewrite 计划。代价是 `TypedProgram` 必须
+完整覆盖 parser/lowering 的全部输出节点，任何新增语法都必须同时补 lowering、验证、分析保守语义、
+typed emitter 与测试。
+
 ## Validation
 
 完成声明必须由 locked/offline 验证支持，而不是由本 ADR 推定。最低矩阵为：
@@ -293,13 +280,26 @@ Northstar committed stdout oracle，再记录 5 个纯构建墙钟原始样本�
 `WAKE_TIMING` 诊断开销或 memory wrapper 时间计入优势。Wake 快于 Vite 的结论只能来自同轮 5 次原始
 样本的平均值，并以 checksum、重新解析/运行、产物大小和上述 crate 门禁同时通过为前提。
 
-## Consequences
-
-优化语义只有一个拥有者和一份可变语法事实源。Structural pass 与分析通过稳定 ID 直接协作，codegen
-无法重新解释 span 决策，bundler 也不再维护第二份名字或模块 rewrite 计划。代价是 `TypedProgram` 必须
-完整覆盖 parser/lowering 的全部输出节点，任何新增语法都必须同时补 lowering、验证、分析保守语义、
-typed emitter 与测试。
-
 ## Supersedes
 
 None.
+
+## Removal plan
+
+本变更采用原子切换，不保留运行时 feature flag、兼容 emitter 或可执行旧压缩器。生产入口、bundler
+调用方、typed module finalize 和 typed emitter 必须在同一迁移中切换；生产数据流统一为结构化
+`OptimizeInput` → owned typed IR → typed emitter。外部 pass 拼装、第二套名字优化状态、4096 字节退让、
+禁用压缩 Source Map 和停用 hoist 分支一并删除。旧实现只可作为审阅过的冻结字节数字存在，不能作为
+测试时或运行时 fallback。
+
+Validated/consuming、semantic-free、trivial-effect 和 no-op finalization 都是同一 typed pipeline 的证明化
+入口；成功后不保留运行时 feature flag 或双实现。One-shot engine/terminal emission 与 retained engine
+由 `BuildSession` 的显式构造器选择，共享同一任务定义和编译产物；session 不通过运行期探测“是否可能只
+构建一次”切换生命周期或语义。
+
+压缩器版本（当前 `wake-closure-minifier-v12`）、defines/drop flags、稳定的声明保留名/公开观察名/star 链接事实、可信编辑和保留名进入稳定指纹。版本提升使旧产物自然
+miss，不做格式迁移。Map facts 可以独立缓存，但 map 开关不得改变 optimizer/body 身份或 JavaScript
+body。本轮不改变持久缓存的 opt-in 默认、schema、阶段归属或 session invalidation：retained facts、body
+和 mapping facts 仍由现有稳定 key 持久化，arena、`SymbolId`、`Vc` 与 transient engine 值仍不落盘。
+One-shot 省略的只是没有下一 generation 消费者的进程内元数据；启用持久缓存时仍按既有 key 读写，长
+生命周期 session 仍计算 fingerprint、依赖边和 revision。

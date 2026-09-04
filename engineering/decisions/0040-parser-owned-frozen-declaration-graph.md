@@ -100,6 +100,9 @@ Declaration resolution deliberately skips an existing runtime literal because it
 parser-owned declaration facts; the separate component-document resolver retains its existing
 literal-file behavior.
 
+ADR 0028 的 generation ownership 与 single-read invariant 保持不变；canonical identity 现在是
+first-class frozen-graph projection，而不是 placeholder JSON rewrite。
+
 ## Validation
 
 - Parser tests cover same-line exports, classes, overloads, declaration containers, malformed
@@ -129,10 +132,11 @@ literal-file behavior.
 
 ## Supersedes
 
-[ADR 0028](0028-build-generation-ownership-and-observation-cache.md) decision 5's
-placeholder-rendering mechanism. The generation ownership and single-read
-invariant remain unchanged; canonical identity is now a first-class frozen-graph projection rather
-than a placeholder JSON rewrite.
+None.
+
+## Amends
+
+- [ADR 0028](0028-build-generation-ownership-and-observation-cache.md): decision 5 的 placeholder rendering 改为 parser-owned frozen declaration graph
 
 ## Removal plan
 

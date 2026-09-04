@@ -1,7 +1,8 @@
 # ADR 0001: 将架构演进变为可执行闭环
 
-- Status: accepted
+- Status: superseded
 - Date: 2026-08-14
+- Superseded by: [ADR 0044](0044-architecture-decision-routing.md)
 
 ## Context
 

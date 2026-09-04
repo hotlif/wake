@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-02
+- Amended by: [ADR 0036](0036-input-disjoint-exact-output-transactions.md)
 
 ## Context
 

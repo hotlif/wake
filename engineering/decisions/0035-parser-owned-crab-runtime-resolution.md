@@ -78,7 +78,11 @@ parser/linker/runtime 的完整切片决策，不能扩宽本桥。
 
 ## Supersedes
 
-[ADR 0006](0006-crab-css-public-contract.md).
+None.
+
+## Amends
+
+- [ADR 0006](0006-crab-css-public-contract.md): 仅修订旧版 `@crab-dev/rc-*` 公共入口的运行时说明符解析桥
 
 ## Removal plan
 

@@ -1,6 +1,6 @@
 # Wake 设计文档
 
-本文保留源码现有 `DESIGN §…` 引用所需的编号，但描述的是 v0.1.16 已实现设计。未来意向统一写入 [ROADMAP.md](ROADMAP.md)。
+本文保留源码现有 `DESIGN §…` 引用所需的编号，但描述的是仓库当前已实现设计。未来意向统一写入 [ROADMAP.md](ROADMAP.md)。
 
 # 1. 目标与原则
 
@@ -16,7 +16,7 @@ CLI 与 Node API 是两种调用外壳；构建行为由 `wake_app` 统一。Wak
 
 ## 3.1 Workspace 与入口
 
-36 个 crate 按基础、编译、解析/资源、执行/编排和产品边缘分层。完整列表和依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+workspace crate 按基础、编译、解析/资源、执行/编排和产品边缘分层。完整列表和依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 3.2 构建阶段
 
@@ -61,17 +61,19 @@ build context 同时保存 owner 与 retained application session；接受 watch
 或 session。
 
 Owner 内的 filesystem proxy 按 `FileSystem` method family 和精确 `OsString` 路径拼写缓存首次完成结果，
-包括可重放的 I/O failure。六个查询族互不推导；advance 会整体替换 observation epoch。因此它提供的是
+包括可重放的 I/O failure。七个查询族互不推导；advance 会整体替换 observation epoch。因此它提供的是
 lazy、query-scoped repeatability，不是时间点文件系统快照：未查询路径可能看到后续变化，先前
 `exists(false)` 也不约束另一个 family 的首次 `read`。跨产物 identity 所需的 package/config/synthetic
 source/type inputs 必须在候选准备阶段主动观察或冻结。
 
 完整 application/Federation/声明/manifest/bootstrap/HTML/asset/hidden-map 候选构造成功后只发布一次。
-声明 emitter 每个候选只读取一次，以 reserved placeholder 生成稳定图；最终 `buildId` 计算后只重绑定该
-owned graph，不重新读取源文件。开发服务器采用另一种但同样唯一的 owner 形态：一个 retained session
+声明图每个候选只通过 generation filesystem 读取、解析一次，产出与 `buildId` 无关的 canonical identity
+和 `FrozenDeclarationGraph`；最终 `buildId` 确定后只通过纯 binder 渲染 types/ambient files，不重新读取
+源文件。开发服务器采用另一种但同样唯一的 owner 形态：一个 retained session
 编译 synthetic container、application、exposes 与 shared fallback 的 combined graph，成功后才安装新的
-runtime snapshot。长期边界和明确非保证见
-[ADR 0028](decisions/0028-build-generation-ownership-and-observation-cache.md)。
+runtime snapshot。BuildGeneration 的长期边界和明确非保证见
+[ADR 0028](decisions/0028-build-generation-ownership-and-observation-cache.md)，parser-owned frozen declaration
+graph 及其纯绑定契约见 [ADR 0040](decisions/0040-parser-owned-frozen-declaration-graph.md)。
 
 Node addon、CommonJS/ESM wrapper 与 npm CLI 只是产品适配器。Federation 初始化和 lock 生成调用
 `wake_app` 的同一服务；`OutputFileKind` 与 Federation `ErrorCode` 使用闭合集合和跨语言相等门禁，

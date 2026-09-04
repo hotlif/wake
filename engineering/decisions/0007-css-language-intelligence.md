@@ -1,8 +1,8 @@
 # ADR 0007: 在编辑器产品下层拥有 CSS 语言智能
 
-- Status: superseded
+- Status: accepted
 - Date: 2026-08-14
-- Superseded by: [ADR 0009](0009-semantic-css-highlighting.md)
+- Amended by: [ADR 0009](0009-semantic-css-highlighting.md)
 
 ## Context
 
@@ -66,11 +66,6 @@ CSS 事实数据扩大了构建与发布范围。TextMate 为规范拼写即时�
 ## Supersedes
 
 None.
-
-## Superseded by
-
-[ADR 0009](0009-semantic-css-highlighting.md) 以 AST 和语义绑定驱动的 token 取代基于拼写的
-TextMate 高亮，并将其作为唯一高亮权威。
 
 ## Removal plan
 

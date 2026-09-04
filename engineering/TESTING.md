@@ -1,6 +1,6 @@
 # Wake 测试与质量门禁
 
-本文描述 v0.1.26 仓库实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `corepack yarn native:build`。
+本文描述仓库当前实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `corepack yarn native:build`。
 
 # 1. 本地最小门禁
 
@@ -31,7 +31,8 @@ cargo +1.95.0 test -p wake_federation_contract
 cargo +1.95.0 clippy -p wake_federation_contract --all-targets -- -D warnings
 ```
 
-`architecture:check` 还执行 [architecture-boundaries.json](architecture-boundaries.json) 的依赖
+`architecture:check` 同时校验仓库 `.agents/skills` 中 Skill 的 frontmatter、`agents/openai.yaml`
+调用配置和本地引用可达性，并执行 [architecture-boundaries.json](architecture-boundaries.json) 的依赖
 来源合同：tracked tree 不得包含第三方 source/binary vendor；workspace 外 Rust path dependency、
 非 crates.io lock source 或缺失 checksum 会失败；Yarn lock 的外部 locator 必须来自 npm registry、
 带 canonical checksum，声明为 conformance source 的少数 npm 包还必须精确 pin。Cargo build 与 npm
@@ -260,14 +261,15 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 
 ### 3.2.2 BuildGeneration 候选一致性门禁
 
-- generation filesystem 用可变/计数 fake filesystem 覆盖六个 method family、success/failure replay、
+- generation filesystem 用可变/计数 fake filesystem 覆盖七个 method family、success/failure replay、
   精确路径拼写、跨 retained/one-shot view 共享、并发 first-query single-flight 和 advance 后重新观察；
 - 必须单独证明明确的非保证：同一 generation 中未观察路径可以看到底层后续变化，且先观察
   `exists` 不会冻结首次 `read`。测试与文档不得把 lazy query cache 称为事务或全局 filesystem snapshot；
 - application one-shot 与 retained build context 都要证明 container/shared one-shot children 来自同一个
   `BuildGeneration` epoch；watcher batch 必须在 retained invalidation/build 之前 advance；
-- Federation 类型 emitter 每个候选只允许一次 source observation。最终 `buildId` 通过 rebinding frozen
-  declaration output 得到 types/ambient files，identity 阶段与物化阶段不得二次读取声明源；
+- Federation 类型 emitter 每个候选只允许一次 source observation。最终 `buildId` 只作为
+  `FrozenDeclarationGraph` 纯 binder 的输入并得到 types/ambient files，identity 阶段与物化阶段不得二次
+  读取声明源；冻结与绑定契约见 [ADR 0040](decisions/0040-parser-owned-frozen-declaration-graph.md)；
 - fault injection 分别覆盖 application、container、shared provider、types、manifest/bootstrap、HTML、
   hidden map 与 staging commit。任一步失败均不得改变 last-good public tree、returned inventory 或 runtime
   snapshot，成功候选只跨一次 publication boundary；

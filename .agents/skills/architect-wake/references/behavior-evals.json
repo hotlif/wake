@@ -1,0 +1,291 @@
+{
+  "version": 1,
+  "protocol": {
+    "isolation": "fresh-agent-per-case",
+    "workspaceIsolation": "enforced-read-only-or-disposable",
+    "withholdExpectedUntilAfterRun": true,
+    "selectionEvidence": "host-event-or-unsupported",
+    "grading": "observable-actions-and-order",
+    "ordinaryCi": "schema-only"
+  },
+  "cases": [
+    {
+      "id": "local-cache-hit-counter",
+      "prompt": "显式使用 $architect-wake 修复 wake_cache 首次查询命中被计为 2 的局部缺陷；缓存键、schema、持久化格式、依赖、所有权和公共 API 均不变。",
+      "invocation": "explicit",
+      "coverage": ["test-first"],
+      "expected": {
+        "selection": "selected",
+        "route": "ordinary",
+        "preImplementation": "red",
+        "evidenceScope": "focused",
+        "architectureGates": false,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "先复现现有精确失败测试，或先写最小回归测试并确认因目标缺口失败。",
+        "聚焦测试和 wake_cache crate 门禁通过后停止。"
+      ],
+      "forbidden": [
+        "在 Red 前修改生产实现。",
+        "无证据读取 ADR、CI 或运行全 workspace 门禁。"
+      ]
+    },
+    {
+      "id": "concurrency-model-change",
+      "prompt": "审查把 Wake 某子系统长期采用的串行调度模型替换为 work-stealing 并发调度；依赖和公共 API 不变。不要修改文件。",
+      "invocation": "implicit",
+      "coverage": ["implicit-positive", "concurrency", "read-only"],
+      "expected": {
+        "selection": "selected",
+        "route": "architecture",
+        "preImplementation": "none",
+        "evidenceScope": "architecture",
+        "architectureGates": false,
+        "mutation": "forbidden"
+      },
+      "assertions": [
+        "将长期并发模型和任务所有权作为架构边界处理。",
+        "只读取命中的决策、调度实现及并发测试。"
+      ],
+      "forbidden": [
+        "因公共 API 不变而跳过架构路由。",
+        "修改文件或制造失败测试。"
+      ]
+    },
+    {
+      "id": "publication-transaction-change",
+      "prompt": "审查把多个构建产物的分步发布改为单次原子发布事务，外部命令和返回类型保持不变。不要修改文件。",
+      "invocation": "implicit",
+      "coverage": ["implicit-positive", "publication-transaction"],
+      "expected": {
+        "selection": "selected",
+        "route": "architecture",
+        "preImplementation": "none",
+        "evidenceScope": "architecture",
+        "architectureGates": false,
+        "mutation": "forbidden"
+      },
+      "assertions": [
+        "审查发布 owner、事务边界、失败回滚和并发提交。",
+        "判断是在落实 accepted ADR 还是形成新决策。"
+      ],
+      "forbidden": [
+        "因外部类型不变而按普通内部重构处理。",
+        "没有实现 diff 时给出已验证结论。"
+      ]
+    },
+    {
+      "id": "documentation-typo",
+      "prompt": "修正 Wake README 中一个拼写错误，不改变命令、链接或技术含义。",
+      "invocation": "implicit",
+      "coverage": ["implicit-negative", "docs-no-red"],
+      "expected": {
+        "selection": "not-selected",
+        "route": "none",
+        "preImplementation": "none",
+        "evidenceScope": "focused",
+        "architectureGates": false,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "按普通文档任务处理。"
+      ],
+      "forbidden": [
+        "加载 ADR 工作流。",
+        "为文案修改制造失败测试。"
+      ]
+    },
+    {
+      "id": "implicit-local-bug",
+      "prompt": "修复 wake_cache 首次命中计数错误；缓存键、持久化格式、依赖、所有权和公共 API 均不变。",
+      "invocation": "implicit",
+      "coverage": ["implicit-negative", "local-bug-negative"],
+      "expected": {
+        "selection": "not-selected",
+        "route": "none",
+        "preImplementation": "none",
+        "evidenceScope": "focused",
+        "architectureGates": false,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "不自动加载架构 Skill，由普通修复流程决定聚焦验证。"
+      ],
+      "forbidden": [
+        "仅因涉及 cache 就自动进入 ADR 流程。"
+      ]
+    },
+    {
+      "id": "implicit-private-refactor",
+      "prompt": "重构 Wake 中一个私有 helper；行为、所有权、依赖、并发模型和契约保持不变。",
+      "invocation": "implicit",
+      "coverage": ["implicit-negative", "private-refactor-negative"],
+      "expected": {
+        "selection": "not-selected",
+        "route": "none",
+        "preImplementation": "none",
+        "evidenceScope": "focused",
+        "architectureGates": false,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "不自动加载架构 Skill，由普通重构流程建立验证基线。"
+      ],
+      "forbidden": [
+        "把私有行为保持重构升级为 ADR 工作。"
+      ]
+    },
+    {
+      "id": "behavior-preserving-refactor",
+      "prompt": "显式使用 $architect-wake 重构一个私有 helper；行为、所有权、依赖和契约保持不变。",
+      "invocation": "explicit",
+      "coverage": ["baseline-only"],
+      "expected": {
+        "selection": "selected",
+        "route": "ordinary",
+        "preImplementation": "baseline",
+        "evidenceScope": "focused",
+        "architectureGates": false,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "修改前运行现有聚焦测试建立基线。",
+        "仅在覆盖缺口存在时新增测试。"
+      ],
+      "forbidden": [
+        "机械制造一个失败测试。",
+        "默认进入 ADR 流程。"
+      ]
+    },
+    {
+      "id": "machine-boundary-rule",
+      "prompt": "为 architecture-boundaries.json 增加一种新的可执行依赖约束，并实现 validator 支持。",
+      "invocation": "implicit",
+      "coverage": ["test-first", "machine-boundary"],
+      "expected": {
+        "selection": "selected",
+        "route": "architecture",
+        "preImplementation": "red",
+        "evidenceScope": "architecture",
+        "architectureGates": true,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "先添加表达目标不变量的负向 fixture，并确认因缺少规则支持而失败。",
+        "实现后运行聚焦测试、架构测试和架构检查。"
+      ],
+      "forbidden": [
+        "先修改 validator 或机器策略。",
+        "让机器规则引用 proposed 或未索引 ADR。"
+      ]
+    },
+    {
+      "id": "readonly-adr-review",
+      "prompt": "只读审查 ADR 0034 与当前缓存实现是否一致，不修改文件。",
+      "invocation": "implicit",
+      "coverage": ["read-only"],
+      "expected": {
+        "selection": "selected",
+        "route": "adr-review",
+        "preImplementation": "none",
+        "evidenceScope": "direct-adr",
+        "architectureGates": false,
+        "mutation": "forbidden"
+      },
+      "assertions": [
+        "读取索引、ADR 0034、直接关系及每项不变量的实现和最近验证证据。",
+        "证据充分且无冲突后停止。"
+      ],
+      "forbidden": [
+        "遍历全部历史 ADR、调用方或测试矩阵。",
+        "创建测试、ADR 或实现修改。"
+      ]
+    },
+    {
+      "id": "proposed-is-not-authority",
+      "prompt": "只读审查一份 proposed ADR 是否可以作为当前机器边界的依据。不要修改文件。",
+      "invocation": "implicit",
+      "coverage": ["proposed-not-authority", "read-only"],
+      "expected": {
+        "selection": "selected",
+        "route": "adr-review",
+        "preImplementation": "none",
+        "evidenceScope": "direct-adr",
+        "architectureGates": false,
+        "mutation": "forbidden"
+      },
+      "assertions": [
+        "明确 proposed 只是候选决策，不能成为当前机器策略权威。"
+      ],
+      "forbidden": [
+        "把 proposed ADR 当作已实施约束。"
+      ]
+    },
+    {
+      "id": "unspecified-accepted-adr",
+      "prompt": "实现一份现有 accepted ADR，保持其决策和不变量不变；给出测试优先的实施顺序。",
+      "invocation": "implicit",
+      "coverage": ["accepted-no-duplicate-adr", "unspecified-accepted-adr"],
+      "expected": {
+        "selection": "selected",
+        "route": "architecture",
+        "preImplementation": "none",
+        "evidenceScope": "architecture",
+        "architectureGates": false,
+        "mutation": "forbidden"
+      },
+      "assertions": [
+        "请求未指定 ADR 时先从索引确认候选并请求明确目标，不擅自选择实现。",
+        "不为同一决策创建重复 ADR。"
+      ],
+      "forbidden": [
+        "仅因开始实现就新增同义 ADR。"
+      ]
+    },
+    {
+      "id": "dynamic-public-consumers",
+      "prompt": "审查公共 Node DTO 字段的兼容性变更。仓库文本搜索没有找到消费者，能否据此判定安全？不要修改文件。",
+      "invocation": "implicit",
+      "coverage": ["dynamic-consumers"],
+      "expected": {
+        "selection": "selected",
+        "route": "architecture",
+        "preImplementation": "none",
+        "evidenceScope": "dynamic-contract",
+        "architectureGates": false,
+        "mutation": "forbidden"
+      },
+      "assertions": [
+        "检查生成入口、注册或配置表、协议两端、历史形状和兼容 fixture。",
+        "分别验证新旧生产者与消费者组合，或明确剩余外部风险。"
+      ],
+      "forbidden": [
+        "把文本搜索零命中当作未受影响证明。",
+        "声称覆盖所有仓库外消费者。"
+      ]
+    },
+    {
+      "id": "mixed-local-and-architecture-change",
+      "prompt": "显式使用 $architect-wake：修复局部命中计数 bug，同时改变缓存身份组成和跨进程共享方式。",
+      "invocation": "explicit",
+      "coverage": ["mixed-scope"],
+      "expected": {
+        "selection": "selected",
+        "route": "architecture",
+        "preImplementation": "red",
+        "evidenceScope": "architecture",
+        "architectureGates": true,
+        "mutation": "allowed"
+      },
+      "assertions": [
+        "分开局部缺陷与架构子任务的证据和验证，整体遵守改变缓存身份所需的 ADR 路由。",
+        "先让每项可执行缺口有对应 Red，再实现最小完整切片。"
+      ],
+      "forbidden": [
+        "把局部 bug 当作跳过缓存身份决策的理由。",
+        "把所有普通子任务无条件扩大到无关领域。"
+      ]
+    }
+  ]
+}

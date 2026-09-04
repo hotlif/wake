@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-01
+- Amended by: [ADR 0032](0032-federation-development-snapshot-leases.md)
 
 ## Context
 
@@ -87,11 +88,6 @@ dependency direction.
     and per-module context enter retained graph/link/cache identity. If one physical module is
     reachable through both contexts, the build fails closed instead of choosing edge semantics by
    traversal order.
-
-Development snapshot retention in decision 15 is amended by
-[ADR 0032](0032-federation-development-snapshot-leases.md): accepted development builds are retained
-by bounded browser leases plus a two-generation race window rather than unconditionally for the
-page/server lifetime. Production page-lifetime caching is unchanged.
 
 ## Invariants
 

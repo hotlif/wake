@@ -1,8 +1,8 @@
 # ADR 0004: 确定样式运行时所有权并限定 Docs CSS 桥接
 
-- Status: superseded
+- Status: accepted
 - Date: 2026-08-14
-- Superseded by: [ADR 0005](0005-chunk-owned-style-artifacts.md)
+- Amended by: [ADR 0005](0005-chunk-owned-style-artifacts.md)
 
 ## Context
 
@@ -62,10 +62,6 @@
 ## Supersedes
 
 None.
-
-## Superseded by
-
-[ADR 0005](0005-chunk-owned-style-artifacts.md) 使用分块所有的样式产物替代生产环境的单分块桥接。
 
 ## Removal plan
 

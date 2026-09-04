@@ -99,9 +99,12 @@ PnP 项目的未声明依赖会稳定显示 Yarn/PnP 诊断，损坏安装不会
 
 ## Supersedes
 
-- [ADR 0021](0021-local-platform-package-links.md) 的根 npm lock 与 `file:` 平台包链接策略。
-- [ADR 0020](0020-react-browser-test-runtime.md) 中以 npm lock 拥有 JavaScript 源码依赖的部分。
-- [ADR 0006](0006-crab-css-public-contract.md) 中 Components 私有 PnP fallback 的临时部分。
+- [ADR 0021](0021-local-platform-package-links.md)
+
+## Amends
+
+- [ADR 0006](0006-crab-css-public-contract.md): 移除 Components 私有 PnP fallback，依赖可见性改由 Yarn 清单与 `packageExtensions` 拥有
+- [ADR 0020](0020-react-browser-test-runtime.md): 以 Yarn PnP 与单一根锁替代仓库源码依赖的 npm lock 所有权
 
 ## Removal plan
 

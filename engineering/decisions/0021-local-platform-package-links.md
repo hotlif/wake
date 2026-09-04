@@ -69,8 +69,6 @@ npm 11 因而曾在 `package-lock.json` 中为它们写入只有 `optional: true
 
 None.
 
-本决策已由 [ADR 0022](0022-yarn-pnp-ownership.md) 替代；根 `file:` bridge 与 npm lock 已删除。
-
 ## Removal plan
 
 删除 `internalOptionalPlaceholders` 策略、五个无版本嵌套锁条目及相关允许逻辑。原子切换到

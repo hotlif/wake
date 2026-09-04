@@ -1,7 +1,7 @@
 interface:
-  display_name: "Wake 架构演进"
-  short_description: "以证据驱动 Wake 架构变更、完整切片、验证与收敛"
-  default_prompt: "使用 $architect-wake 按风险规划并实现 Wake 架构变更。"
+  display_name: "Wake 架构审查"
+  short_description: "基于证据审查 Wake 的所有权、依赖、并发、发布事务与契约"
+  default_prompt: "使用 $architect-wake 审查这个 Wake 架构变更，明确所有权、并发或发布事务、契约和验证方案。"
 
 policy:
   allow_implicit_invocation: true

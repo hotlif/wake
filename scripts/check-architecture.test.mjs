@@ -23,31 +23,33 @@ import {
   validatePolicy,
   validateRepositorySources,
 } from './check-architecture.mjs'
+import { validateSkill } from './check-skills.mjs'
 
-const decision = 'engineering/decisions/0001-architecture-evolution-loop.md'
+const decision = 'engineering/decisions/0044-architecture-decision-routing.md'
+const indexed = (status = 'accepted') => ({ status, indexed: true })
 const activeAdrRecords = new Map([
-  ['0001-architecture-evolution-loop.md', { status: 'accepted' }],
-  ['0003-compiler-and-shell-boundaries.md', { status: 'proposed' }],
-  ['0010-shared-css-syntax-tree.md', { status: 'accepted' }],
-  ['0020-react-browser-test-runtime.md', { status: 'proposed' }],
-  ['0021-local-platform-package-links.md', { status: 'superseded' }],
-  ['0022-yarn-pnp-ownership.md', { status: 'accepted' }],
-  ['0025-wake-native-federation-contract.md', { status: 'accepted' }],
-  ['0027-build-session-ownership-and-lifetime.md', { status: 'accepted' }],
-  ['0028-build-generation-ownership-and-observation-cache.md', { status: 'accepted' }],
-  ['0029-node-contract-and-federation-control-ownership.md', { status: 'accepted' }],
-  ['0030-live-reload-capability-boundary.md', { status: 'accepted' }],
-  ['0031-docs-page-identity-and-source-provenance.md', { status: 'accepted' }],
-  ['0032-federation-development-snapshot-leases.md', { status: 'accepted' }],
-  ['0033-structured-module-emit-provenance.md', { status: 'accepted' }],
-  ['0034-transactional-persistent-cache-boundary.md', { status: 'accepted' }],
-  ['0035-parser-owned-crab-runtime-resolution.md', { status: 'accepted' }],
-  ['0036-input-disjoint-exact-output-transactions.md', { status: 'accepted' }],
-  ['0037-typed-development-watch-and-candidate-generations.md', { status: 'accepted' }],
-  ['0038-docs-generation-transaction.md', { status: 'accepted' }],
-  ['0039-owned-immutable-filesystem-overlay.md', { status: 'accepted' }],
-  ['0040-parser-owned-frozen-declaration-graph.md', { status: 'accepted' }],
-  ['0043-react-module-compiler-boundary.md', { status: 'accepted' }],
+  ['0003-compiler-and-shell-boundaries.md', indexed()],
+  ['0010-shared-css-syntax-tree.md', indexed()],
+  ['0020-react-browser-test-runtime.md', indexed()],
+  ['0021-local-platform-package-links.md', indexed('superseded')],
+  ['0022-yarn-pnp-ownership.md', indexed()],
+  ['0025-wake-native-federation-contract.md', indexed()],
+  ['0027-build-session-ownership-and-lifetime.md', indexed()],
+  ['0028-build-generation-ownership-and-observation-cache.md', indexed()],
+  ['0029-node-contract-and-federation-control-ownership.md', indexed()],
+  ['0030-live-reload-capability-boundary.md', indexed()],
+  ['0031-docs-page-identity-and-source-provenance.md', indexed()],
+  ['0032-federation-development-snapshot-leases.md', indexed()],
+  ['0033-structured-module-emit-provenance.md', indexed()],
+  ['0034-transactional-persistent-cache-boundary.md', indexed()],
+  ['0035-parser-owned-crab-runtime-resolution.md', indexed()],
+  ['0036-input-disjoint-exact-output-transactions.md', indexed()],
+  ['0037-typed-development-watch-and-candidate-generations.md', indexed()],
+  ['0038-docs-generation-transaction.md', indexed()],
+  ['0039-owned-immutable-filesystem-overlay.md', indexed()],
+  ['0040-parser-owned-frozen-declaration-graph.md', indexed()],
+  ['0043-react-module-compiler-boundary.md', indexed()],
+  ['0044-architecture-decision-routing.md', indexed()],
 ])
 
 function rustSources(directory, root = directory) {
@@ -2380,15 +2382,19 @@ test('rejects an unregistered workspace crate', () => {
   assert(errors.some((error) => error.includes('workspace crate wake_new is not registered')))
 })
 
-test('rejects boundary decisions that are not active', () => {
+test('boundary policy requires an accepted decision in the validated index', () => {
   const packages = new Map([
     ['wake_common', new Set()],
     ['wake_ecma_parser', new Set(['wake_common'])],
     ['wake_app', new Set()],
   ])
-  const rejected = new Map([['0001-architecture-evolution-loop.md', { status: 'rejected' }]])
-  const errors = validatePolicy({ policy: policy(), packages, adrRecords: rejected })
-  assert(errors.some((error) => error.includes('must be proposed or accepted')))
+  const proposed = new Map([['0044-architecture-decision-routing.md', indexed('proposed')]])
+  const proposedErrors = validatePolicy({ policy: policy(), packages, adrRecords: proposed })
+  assert(proposedErrors.some((error) => error.includes('must be accepted')))
+
+  const unindexed = new Map([['0044-architecture-decision-routing.md', { status: 'accepted', indexed: false }]])
+  const unindexedErrors = validatePolicy({ policy: policy(), packages, adrRecords: unindexed })
+  assert(unindexedErrors.some((error) => error.includes('validated ADR index')))
 })
 
 test('rejects a boundary policy without an ADR', () => {
@@ -2406,8 +2412,16 @@ test('rejects invalid ADR status and a missing supersedes target', () => {
   const root = join(tmpdir(), `wake-architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`)
   const decisionsDir = join(root, 'engineering', 'decisions')
   mkdirSync(decisionsDir, { recursive: true })
-  writeFileSync(join(decisionsDir, '0001-first.md'), `# ADR 0001: First\n\n- Status: invalid\n\n${sections('None.')}`)
-  writeFileSync(join(decisionsDir, '0002-second.md'), `# ADR 0002: Second\n\n- Status: proposed\n\n${sections('[ADR 0099](0099-missing.md)')}`)
+  writeFileSync(join(decisionsDir, '0001-first.md'), adrDocument({ number: '0001', title: 'First', status: 'invalid' }))
+  writeFileSync(join(decisionsDir, '0002-second.md'), adrDocument({
+    number: '0002',
+    title: 'Second',
+    supersedes: '- [ADR 0099](0099-missing.md)',
+  }))
+  writeFileSync(join(decisionsDir, 'README.md'), adrIndex([
+    { domain: 'governance', number: '0001', title: 'First', filename: '0001-first.md', status: 'proposed' },
+    { domain: 'governance', number: '0002', title: 'Second', filename: '0002-second.md', status: 'accepted' },
+  ]))
   try {
     const result = validateAdrs({ repoRoot: root, decisionsDir })
     assert(result.errors.some((error) => error.includes('status must be proposed')))
@@ -2421,12 +2435,393 @@ test('rejects duplicate ADR numbers', () => {
   const root = join(tmpdir(), `wake-architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`)
   const decisionsDir = join(root, 'engineering', 'decisions')
   mkdirSync(decisionsDir, { recursive: true })
-  const body = `- Status: proposed\n\n${sections('None.')}`
-  writeFileSync(join(decisionsDir, '0001-first.md'), `# ADR 0001: First\n\n${body}`)
-  writeFileSync(join(decisionsDir, '0001-second.md'), `# ADR 0001: Second\n\n${body}`)
+  writeFileSync(join(decisionsDir, '0001-first.md'), adrDocument({ number: '0001', title: 'First' }))
+  writeFileSync(join(decisionsDir, '0001-second.md'), adrDocument({ number: '0001', title: 'Second' }))
+  writeFileSync(join(decisionsDir, 'README.md'), adrIndex([
+    { domain: 'governance', number: '0001', title: 'First', filename: '0001-first.md', status: 'accepted' },
+    { domain: 'governance', number: '0001', title: 'Second', filename: '0001-second.md', status: 'accepted' },
+  ]))
   try {
     const result = validateAdrs({ repoRoot: root, decisionsDir })
     assert(result.errors.some((error) => error.includes('ADR number 0001 duplicates')))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('accepts indexed full replacements and scoped amendments', () => {
+  const root = join(tmpdir(), `wake-architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const decisionsDir = join(root, 'engineering', 'decisions')
+  mkdirSync(decisionsDir, { recursive: true })
+  writeFileSync(join(decisionsDir, '0001-original.md'), adrDocument({
+    number: '0001',
+    title: 'Original',
+    status: 'superseded',
+    supersededBy: ['- Superseded by: [ADR 0003](0003-refinement.md)'],
+  }))
+  writeFileSync(join(decisionsDir, '0002-foundation.md'), adrDocument({
+    number: '0002',
+    title: 'Foundation',
+    amendedBy: ['- Amended by: [ADR 0003](0003-refinement.md)'],
+  }))
+  writeFileSync(join(decisionsDir, '0003-refinement.md'), adrDocument({
+    number: '0003',
+    title: 'Refinement',
+    supersedes: '- [ADR 0001](0001-original.md)',
+    amends: '- [ADR 0002](0002-foundation.md): narrows the durable ownership rule',
+  }))
+  writeFileSync(join(decisionsDir, 'README.md'), adrIndex([
+    { domain: 'governance', number: '0001', title: 'Original', filename: '0001-original.md', status: 'superseded' },
+    { domain: 'governance', number: '0002', title: 'Foundation', filename: '0002-foundation.md', status: 'accepted' },
+    { domain: 'governance', number: '0003', title: 'Refinement', filename: '0003-refinement.md', status: 'accepted' },
+  ]))
+  try {
+    assert.deepEqual(validateAdrs({ repoRoot: root, decisionsDir }).errors, [])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects ADR index omissions, duplicates, status drift, and invalid domains', () => {
+  const root = join(tmpdir(), `wake-architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const decisionsDir = join(root, 'engineering', 'decisions')
+  mkdirSync(decisionsDir, { recursive: true })
+  writeFileSync(join(decisionsDir, '0001-first.md'), adrDocument({ number: '0001', title: 'First' }))
+  writeFileSync(join(decisionsDir, '0002-second.md'), adrDocument({ number: '0002', title: 'Second' }))
+  writeFileSync(join(decisionsDir, 'README.md'), adrIndex([
+    { domain: 'governance', number: '0001', title: 'First', filename: '0001-first.md', status: 'proposed' },
+    { domain: 'compiler', number: '0001', title: 'First', filename: '0001-first.md', status: 'accepted' },
+  ], testAdrDomains.map((domain) => domain === 'build' ? 'runtime' : domain)))
+  try {
+    const errors = validateAdrs({ repoRoot: root, decisionsDir }).errors
+    assert(errors.some((error) => error.includes('appears more than once')))
+    assert(errors.some((error) => error.includes('0002-second.md is missing')))
+    assert(errors.some((error) => error.includes('status does not match')))
+    assert(errors.some((error) => error.includes('domains must appear once')))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects bad ADR dates, section order, relation cycles, and missing amendment scope', () => {
+  const root = join(tmpdir(), `wake-architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const decisionsDir = join(root, 'engineering', 'decisions')
+  mkdirSync(decisionsDir, { recursive: true })
+  writeFileSync(join(decisionsDir, '0001-first.md'), adrDocument({
+    number: '0001',
+    title: 'First',
+    date: '2026-02-30',
+    amendedBy: ['- Amended by: [ADR 0002](0002-second.md)'],
+    amends: '- [ADR 0002](0002-second.md): creates a cycle',
+  }))
+  writeFileSync(join(decisionsDir, '0002-second.md'), adrDocument({
+    number: '0002',
+    title: 'Second',
+    amendedBy: ['- Amended by: [ADR 0001](0001-first.md)', '- Amended by: [ADR 0003](0003-third.md)'],
+    amends: '- [ADR 0001](0001-first.md): completes the cycle',
+    sectionOrder: ['Decision', 'Context', 'Invariants', 'Evidence', 'Consequences', 'Validation', 'Supersedes', 'Amends', 'Removal plan'],
+  }))
+  writeFileSync(join(decisionsDir, '0003-third.md'), adrDocument({
+    number: '0003',
+    title: 'Third',
+    amends: '- [ADR 0002](0002-second.md)',
+  }))
+  writeFileSync(join(decisionsDir, 'README.md'), adrIndex([
+    { domain: 'governance', number: '0001', title: 'First', filename: '0001-first.md', status: 'accepted' },
+    { domain: 'governance', number: '0002', title: 'Second', filename: '0002-second.md', status: 'accepted' },
+    { domain: 'governance', number: '0003', title: 'Third', filename: '0003-third.md', status: 'accepted' },
+  ]))
+  try {
+    const errors = validateAdrs({ repoRoot: root, decisionsDir }).errors
+    assert(errors.some((error) => error.includes('valid ISO Date')))
+    assert(errors.some((error) => error.includes('sections are out of order')))
+    assert(errors.some((error) => error.includes('relations contain a cycle')))
+    assert(errors.some((error) => error.includes('non-empty scope')))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects non-accepted ADR relations, numbering gaps, malformed backlinks, and pseudo-relations', () => {
+  const root = join(tmpdir(), `wake-architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const decisionsDir = join(root, 'engineering', 'decisions')
+  mkdirSync(decisionsDir, { recursive: true })
+  writeFileSync(join(decisionsDir, '0000-reserved.md'), adrDocument({
+    number: '0000',
+    title: 'Reserved',
+  }))
+  writeFileSync(join(decisionsDir, '0001-retired.md'), adrDocument({
+    number: '0001',
+    title: 'Retired',
+    status: 'rejected',
+    amendedBy: [
+      '- Amended by: [ADR 0003](0003-proposal.md)',
+      '- amended by: [ADR 0003](0003-proposal.md)',
+    ],
+  }))
+  writeFileSync(
+    join(decisionsDir, '0003-proposal.md'),
+    `${adrDocument({
+      number: '0003',
+      title: 'Proposal',
+      status: 'proposed',
+      amends: '- [ADR 0001](0001-retired.md): attempts to activate an unaccepted relation',
+    })}\n## Related\n\n[ADR 0001](0001-retired.md)\n`,
+  )
+  writeFileSync(join(decisionsDir, 'README.md'), adrIndex([
+    { domain: 'governance', number: '0000', title: 'Reserved', filename: '0000-reserved.md', status: 'accepted' },
+    { domain: 'governance', number: '0001', title: 'Retired', filename: '0001-retired.md', status: 'rejected' },
+    { domain: 'governance', number: '0003', title: 'Proposal', filename: '0003-proposal.md', status: 'proposed' },
+  ]))
+  try {
+    const errors = validateAdrs({ repoRoot: root, decisionsDir }).errors
+    assert(errors.some((error) => error.includes('ADR 0000 is reserved')))
+    assert(errors.some((error) => error.includes('sequence is missing 0002')))
+    assert(errors.some((error) => error.includes('only an accepted ADR may supersede or amend')))
+    assert(errors.some((error) => error.includes('Amends target 0001-retired.md must have status accepted')))
+    assert(errors.some((error) => error.includes('relation backlink metadata must use exact')))
+    assert(errors.some((error) => error.includes('## Related is not an ADR relation')))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('repository policy accepts ADR 0044 only when it is accepted and indexed', () => {
+  const packages = new Map([
+    ['wake_common', new Set()],
+    ['wake_ecma_parser', new Set(['wake_common'])],
+    ['wake_app', new Set()],
+  ])
+  assert.deepEqual(validatePolicy({ policy: policy(), packages, adrRecords: activeAdrRecords }), [])
+})
+
+test('repository architect-wake skill exposes validated behavior evaluations', () => {
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url))
+  const skillDir = join(repoRoot, '.agents', 'skills', 'architect-wake')
+  const behaviorEvals = join(skillDir, 'references', 'behavior-evals.json')
+  assert.equal(existsSync(behaviorEvals), true, 'architect-wake behavior evaluation corpus is missing')
+  assert.deepEqual(validateSkill({ repoRoot, skillDir }), [])
+  assert.equal(existsSync(join(skillDir, 'agents', 'openai.yaml')), true)
+  assert.equal(existsSync(join(skillDir, 'references', 'adr-workflow.md')), true)
+})
+
+test('skill validation rejects malformed or incomplete behavior evaluations', () => {
+  const root = join(tmpdir(), `wake-skill-evals-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const skillDir = join(root, '.agents', 'skills', 'architect-wake')
+  writeSkillFixture(skillDir)
+  try {
+    assert.deepEqual(validateSkill({ repoRoot: root, skillDir }), [])
+    const path = join(skillDir, 'references', 'behavior-evals.json')
+    const fixture = JSON.parse(readFileSync(path, 'utf8'))
+    fixture.protocol.selectionEvidence = 'agent-self-report'
+    fixture.protocol.workspaceIsolation = 'shared-working-tree'
+    fixture.cases[1].id = fixture.cases[0].id
+    fixture.cases[1].invocation = 'explicit'
+    fixture.cases[1].coverage.push('accepted-no-duplicate-adr')
+    fixture.cases[2].expected.preImplementation = 'none'
+    fixture.cases[2].coverage.push('unknown-coverage')
+    fixture.cases[6].expected.mutation = 'allowed'
+    fixture.cases[0].coverage = []
+    writeFileSync(path, `${JSON.stringify(fixture, null, 2)}\n`)
+
+    const errors = validateSkill({ repoRoot: root, skillDir })
+    assert(errors.some((error) => error.includes('selectionEvidence must be host-event-or-unsupported')))
+    assert(errors.some((error) => error.includes('workspaceIsolation must be enforced-read-only-or-disposable')))
+    assert(errors.some((error) => error.includes('case id must be unique')))
+    assert(errors.some((error) => error.includes('coverage must be a non-empty array')))
+    assert(errors.some((error) => error.includes('unknown coverage unknown-coverage')))
+    assert(errors.some((error) => error.includes('explicit cases must select the skill')))
+    assert(errors.some((error) => error.includes('test-first cases must establish an expected Red')))
+    assert(errors.some((error) => error.includes('accepted ADR cases must use architecture routing')))
+    assert(errors.some((error) => error.includes('unspecified accepted ADR cases must not mutate')))
+    assert(errors.some((error) => error.includes('missing required coverage implicit-positive')))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('skill validation rejects frontmatter drift, unsafe links, orphan references, and bad UI policy', () => {
+  const root = join(tmpdir(), `wake-skill-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+  const skillDir = join(root, '.agents', 'skills', 'architect-wake')
+  writeSkillFixture(skillDir)
+  try {
+    assert.deepEqual(validateSkill({ repoRoot: root, skillDir }), [])
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '    display_name: "Wake architecture review"',
+      '    short_description: "Evidence-based Wake architecture review"',
+      '    default_prompt: "Use $architect-wake to review this architecture change."',
+      'policy:',
+      '    allow_implicit_invocation: true',
+      '',
+    ].join('\n'))
+    assert.deepEqual(validateSkill({ repoRoot: root, skillDir }), [])
+    writeSkillFixture(skillDir)
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+        .replace('name: architect-wake', 'name: wrong-name')
+        .replace(
+          'description: Review durable Wake architecture decisions and machine boundaries.',
+          'description: 123456789012345678901234567890',
+        )
+        .concat('\n[unsafe](../../../outside.md)\n'),
+    )
+    writeFileSync(join(skillDir, 'references', 'orphan.md'), '# Orphan\n')
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '  display_name: "Wake architecture review"',
+      '  short_description: 123456789012345678901234567890',
+      '  default_prompt: "Review this architecture change."',
+      'policy:',
+      '  allow_implicit_invocation: "true"',
+      '',
+    ].join('\n'))
+
+    const errors = validateSkill({ repoRoot: root, skillDir })
+    assert(errors.some((error) => error.includes('must match directory')))
+    assert(errors.some((error) => error.includes('description must be a YAML string')))
+    assert(errors.some((error) => error.includes('escapes the skill directory')))
+    assert(errors.some((error) => error.includes('not reachable from SKILL.md')))
+    assert(errors.some((error) => error.includes('short_description must be a quoted string')))
+    assert(errors.some((error) => error.includes('default_prompt must mention')))
+    assert(errors.some((error) => error.includes('allow_implicit_invocation must be a boolean')))
+
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '  display_name: "Wake architecture review"',
+      '  short_description: "Evidence-based Wake architecture review"',
+      '  default_prompt: "Use $architect-wake to review this architecture change."',
+      'policy:',
+      '  allow_implicit_invocation: false',
+      '',
+    ].join('\n'))
+    assert(validateSkill({ repoRoot: root, skillDir })
+      .some((error) => error.includes('architect-wake must enable implicit invocation')))
+
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '  display_name: "Wake architecture review"',
+      '  display_name: "Duplicate Wake architecture review"',
+      '  short_description: "Evidence-based Wake architecture review"',
+      '  default_prompt: "Use $architect-wake to review this architecture change."',
+      'policy:',
+      '  allow_implicit_invocation: true',
+      '  allow_implicit_invocation: false',
+      '',
+    ].join('\n'))
+    const duplicateFieldErrors = validateSkill({ repoRoot: root, skillDir })
+    assert(duplicateFieldErrors.some((error) => error.includes('interface.display_name must appear exactly once')))
+    assert(duplicateFieldErrors.some((error) => error.includes('policy.allow_implicit_invocation must appear exactly once')))
+
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '  display_name: "Wake architecture review"',
+      '  short_description: "Evidence-based Wake architecture review"',
+      '  default_prompt: "Use $architect-wake to review this architecture change."',
+      'interface: {display_name: "Duplicate Wake architecture review", short_description: "Evidence-based Wake architecture review", default_prompt: "Use $architect-wake to review this architecture change."}',
+      'policy:',
+      '  allow_implicit_invocation: true',
+      'policy: {allow_implicit_invocation: false}',
+      '',
+    ].join('\n'))
+    const duplicateBlockErrors = validateSkill({ repoRoot: root, skillDir })
+    assert(duplicateBlockErrors.some((error) => error.includes('interface must appear exactly once')))
+    assert(duplicateBlockErrors.some((error) => error.includes('policy must appear exactly once')))
+
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '  display_name: "Wake architecture review"',
+      '  "display_name": "Quoted duplicate Wake architecture review"',
+      '  short_description: "Evidence-based Wake architecture review"',
+      '  default_prompt: "Use $architect-wake to review this architecture change."',
+      'policy:',
+      '  allow_implicit_invocation: true',
+      '  "allow_implicit_invocation": false',
+      '"policy":',
+      '  allow_implicit_invocation: false',
+      '',
+    ].join('\n'))
+    const quotedKeyErrors = validateSkill({ repoRoot: root, skillDir })
+    assert(quotedKeyErrors.some((error) => error.includes('mapping keys must use unquoted plain scalars')))
+
+    writeSkillFixture(skillDir)
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+        .replace('name: architect-wake', '"name": wrong-name\nname: architect-wake'),
+    )
+    assert(validateSkill({ repoRoot: root, skillDir })
+      .some((error) => error.includes('mapping keys must use unquoted plain scalars')))
+
+    writeSkillFixture(skillDir)
+    rmSync(join(skillDir, 'references', 'orphan.md'), { force: true })
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+        .replace('description: Review durable Wake architecture decisions and machine boundaries.', [
+          'description: Review durable Wake architecture decisions and machine boundaries.',
+          'metadata: |',
+          '  "example": ordinary block-scalar text',
+          '  <<: ordinary block-scalar text',
+        ].join('\n')),
+    )
+    assert.deepEqual(validateSkill({ repoRoot: root, skillDir }), [])
+
+    writeSkillFixture(skillDir)
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+        .replace('description: Review durable Wake architecture decisions and machine boundaries.', [
+          'description: Review durable Wake architecture decisions and machine boundaries.',
+          'metadata:',
+          '  examples:',
+          '    - |',
+          '      "example": ordinary sequence block-scalar text',
+          '      <<: ordinary sequence block-scalar text',
+        ].join('\n')),
+    )
+    assert.deepEqual(validateSkill({ repoRoot: root, skillDir }), [])
+
+    for (const scalar of ['.5', '1.', '1:20']) {
+      writeSkillFixture(skillDir)
+      writeFileSync(
+        join(skillDir, 'SKILL.md'),
+        readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+          .replace('description: Review durable Wake architecture decisions and machine boundaries.', `description: ${scalar}`),
+      )
+      assert(validateSkill({ repoRoot: root, skillDir })
+        .some((error) => error.includes('description must be a YAML string')))
+    }
+
+    writeSkillFixture(skillDir)
+    assert.deepEqual(validateSkill({ repoRoot: root, skillDir }), [])
+    writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+      'interface:',
+      '  display_name: "Wake architecture review"',
+      '  short_description: "Evidence-based Wake architecture review"',
+      '  default_prompt: "Use $architect-wake to review this architecture change."',
+      'defaults: &defaults',
+      '  allow_implicit_invocation: false',
+      'policy:',
+      '  <<: *defaults',
+      '  allow_implicit_invocation: true',
+      '',
+    ].join('\n'))
+    const mergeKeyErrors = validateSkill({ repoRoot: root, skillDir })
+    assert(mergeKeyErrors.some((error) => error.includes('mapping keys must use unquoted plain scalars')))
+
+    writeSkillFixture(skillDir)
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+        .replace('description: Review durable Wake architecture decisions and machine boundaries.', [
+          '? description',
+          ': Review durable Wake architecture decisions and machine boundaries.',
+        ].join('\n')),
+    )
+    assert(validateSkill({ repoRoot: root, skillDir })
+      .some((error) => error.includes('mapping keys must use unquoted plain scalars')))
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -2754,15 +3149,182 @@ test('directory and exact products share one reserved cross-process commit lock'
   assert.match(output, /fn exact_output_rejects_the_reserved_migration_lock_name\s*\(/)
 })
 
-function sections(supersedes) {
-  return [
-    '## Context\n\nContext.',
-    '## Decision\n\nDecision.',
-    '## Invariants\n\nInvariant.',
-    '## Evidence\n\nEvidence.',
-    '## Consequences\n\nConsequences.',
-    '## Validation\n\nValidation.',
-    `## Supersedes\n\n${supersedes}`,
-    '## Removal plan\n\nNone.',
-  ].join('\n\n')
+const testAdrDomains = [
+  'governance',
+  'compiler',
+  'build',
+  'css-editor',
+  'docs',
+  'federation',
+  'testing',
+  'node-release',
+  'cli',
+]
+
+function adrDocument({
+  number,
+  title,
+  status = 'accepted',
+  date = '2026-09-04',
+  supersededBy = [],
+  amendedBy = [],
+  supersedes = 'None.',
+  amends = null,
+  sectionOrder = null,
+}) {
+  const bodies = new Map([
+    ['Context', 'Context.'],
+    ['Decision', 'Decision.'],
+    ['Invariants', 'Invariant.'],
+    ['Evidence', 'Evidence.'],
+    ['Consequences', 'Consequences.'],
+    ['Validation', 'Validation.'],
+    ['Supersedes', supersedes],
+    ['Removal plan', 'None.'],
+  ])
+  if (amends !== null) bodies.set('Amends', amends)
+  const order = sectionOrder ?? [
+    'Context',
+    'Decision',
+    'Invariants',
+    'Evidence',
+    'Consequences',
+    'Validation',
+    'Supersedes',
+    ...(amends === null ? [] : ['Amends']),
+    'Removal plan',
+  ]
+  const header = [
+    `# ADR ${number}: ${title}`,
+    '',
+    `- Status: ${status}`,
+    `- Date: ${date}`,
+    ...supersededBy,
+    ...amendedBy,
+  ].join('\n')
+  return `${header}\n\n${order.map((section) => `## ${section}\n\n${bodies.get(section)}`).join('\n\n')}\n`
+}
+
+function adrIndex(entries, domains = testAdrDomains) {
+  const lines = ['# Decisions', '', '<!-- ADR-INDEX:START -->']
+  for (const domain of domains) {
+    lines.push('', `### ${domain}`)
+    for (const entry of entries.filter((candidate) => candidate.domain === domain)) {
+      lines.push(`- [ADR ${entry.number}: ${entry.title}](${entry.filename}) — \`${entry.status}\``)
+    }
+  }
+  lines.push('', '<!-- ADR-INDEX:END -->', '')
+  return lines.join('\n')
+}
+
+function writeSkillFixture(skillDir) {
+  mkdirSync(join(skillDir, 'agents'), { recursive: true })
+  mkdirSync(join(skillDir, 'references'), { recursive: true })
+  writeFileSync(join(skillDir, 'SKILL.md'), [
+    '---',
+    'name: architect-wake',
+    'description: Review durable Wake architecture decisions and machine boundaries.',
+    '---',
+    '',
+    '# Wake architecture review',
+    '',
+    'Read [ADR workflow](references/adr-workflow.md), [behavior evals](references/behavior-evals.json), and [schema](references/schema.json).',
+    '',
+    '- ````markdown',
+    '  ```markdown',
+    '  [example only](references/not-present.md)',
+    '  ```',
+    '  [still example only](references/also-not-present.md)',
+    '  [TODO: example placeholder]',
+    '  ````',
+    '',
+  ].join('\n'))
+  writeFileSync(join(skillDir, 'references', 'adr-workflow.md'), '# ADR workflow\n')
+  writeFileSync(join(skillDir, 'references', 'behavior-evals.json'), behaviorEvalFixture())
+  writeFileSync(join(skillDir, 'references', 'schema.json'), '{}\n')
+  writeFileSync(join(skillDir, 'agents', 'openai.yaml'), [
+    'interface:',
+    '# UI metadata remains part of this mapping.',
+    '  display_name: "Wake architecture review"',
+    '  short_description: "Evidence-based Wake architecture review"',
+    '  default_prompt: "Use $architect-wake to review this Wake architecture change."',
+    'policy:',
+    '# Invocation policy remains part of this mapping.',
+    '  allow_implicit_invocation: true',
+    '',
+  ].join('\n'))
+}
+
+function behaviorEvalFixture() {
+  const cases = [
+    {
+      id: 'architecture-trigger',
+      invocation: 'implicit',
+      coverage: ['implicit-positive', 'concurrency', 'publication-transaction'],
+      expected: ['selected', 'architecture', 'none', 'architecture', false, 'forbidden'],
+    },
+    {
+      id: 'ordinary-routing',
+      invocation: 'implicit',
+      coverage: ['implicit-negative', 'docs-no-red', 'local-bug-negative', 'private-refactor-negative'],
+      expected: ['not-selected', 'none', 'none', 'focused', false, 'allowed'],
+    },
+    {
+      id: 'machine-change',
+      invocation: 'explicit',
+      coverage: ['test-first', 'machine-boundary'],
+      expected: ['selected', 'architecture', 'red', 'architecture', true, 'allowed'],
+    },
+    {
+      id: 'refactor',
+      invocation: 'explicit',
+      coverage: ['baseline-only'],
+      expected: ['selected', 'ordinary', 'baseline', 'focused', false, 'allowed'],
+    },
+    {
+      id: 'readonly-review',
+      invocation: 'implicit',
+      coverage: ['read-only', 'proposed-not-authority'],
+      expected: ['selected', 'adr-review', 'none', 'direct-adr', false, 'forbidden'],
+    },
+    {
+      id: 'contract-scope',
+      invocation: 'explicit',
+      coverage: ['dynamic-consumers', 'mixed-scope'],
+      expected: ['selected', 'architecture', 'red', 'dynamic-contract', true, 'allowed'],
+    },
+    {
+      id: 'unspecified-accepted-adr',
+      invocation: 'implicit',
+      coverage: ['accepted-no-duplicate-adr', 'unspecified-accepted-adr'],
+      expected: ['selected', 'architecture', 'none', 'architecture', false, 'forbidden'],
+    },
+  ].map(({ id, invocation, coverage, expected }, index) => ({
+    id,
+    prompt: `Behavior evaluation prompt ${index + 1}.`,
+    invocation,
+    coverage,
+    expected: {
+      selection: expected[0],
+      route: expected[1],
+      preImplementation: expected[2],
+      evidenceScope: expected[3],
+      architectureGates: expected[4],
+      mutation: expected[5],
+    },
+    assertions: ['Grade observable actions and ordering.'],
+    forbidden: ['Do not grade generated wording.'],
+  }))
+  return `${JSON.stringify({
+    version: 1,
+    protocol: {
+      isolation: 'fresh-agent-per-case',
+      workspaceIsolation: 'enforced-read-only-or-disposable',
+      withholdExpectedUntilAfterRun: true,
+      selectionEvidence: 'host-event-or-unsupported',
+      grading: 'observable-actions-and-order',
+      ordinaryCi: 'schema-only',
+    },
+    cases,
+  }, null, 2)}\n`
 }

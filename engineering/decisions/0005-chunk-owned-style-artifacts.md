@@ -45,6 +45,8 @@ CSS 产物增加一个去重后的样式表 Promise。构建使用方可以直�
 独立惰性根按请求顺序激活，因此其全局 CSS 效果也遵循激活顺序。每个已激活分块图内的静态依赖
 顺序仍保持确定。
 
+ADR 0004 关于开发样式所有者的决策仍然有效，不受本产物协议影响。
+
 ## Validation
 
 - 运行打包器的浏览器形态动态 CSS 执行回归测试。
@@ -54,8 +56,11 @@ CSS 产物增加一个去重后的样式表 Promise。构建使用方可以直�
 
 ## Supersedes
 
-[ADR 0004](0004-style-runtime-and-docs-css-bridge.md) 的生产 Docs 单分块桥接。ADR 0004
-关于开发样式所有者的决策仍然有效，不受本产物协议影响。
+None.
+
+## Amends
+
+- [ADR 0004](0004-style-runtime-and-docs-css-bridge.md): 以分块所有的样式产物替代生产 Docs 单分块桥接，保留开发样式所有者
 
 ## Removal plan
 

@@ -1,8 +1,9 @@
 # ADR 0020: 拥有以 React 为先的浏览器测试运行时
 
-- Status: proposed
+- Status: accepted
 - Product maturity: experimental
 - Date: 2026-08-24
+- Amended by: [ADR 0022](0022-yarn-pnp-ownership.md)
 
 ## Context
 
@@ -195,7 +196,7 @@ Jest/Boa/jsdom/Node-API 兼容路径或过期发布承诺，要求每个受支�
 
 ## Supersedes
 
-[ADR 0019](0019-native-test-runtime.md).
+- [ADR 0019](0019-native-test-runtime.md)
 
 ## Removal plan
 

@@ -61,6 +61,8 @@ CSS 结构增加正则表达式、拼写搜索或字节扫描回退。
 新增语法支持时，必须扩展共享节点模型，而非增加局部扫描。解析器节点确立语法边界后，仍允许进行
 URL 协议策略、生成名称清理和输出序列化等纯领域文本处理。
 
+ADR 0009 中仅基于语义绑定的高亮决策及删除 TextMate 回退，仍属于本次更广泛的共享语法决策。
+
 ## Validation
 
 - 运行 `wake_css`、`wake_css_in_js`、`wake_css_language` 和 `wake_css_lsp` 测试。
@@ -71,8 +73,11 @@ URL 协议策略、生成名称清理和输出序列化等纯领域文本处理�
 
 ## Supersedes
 
-[ADR 0009](0009-semantic-css-highlighting.md)。其中仅基于语义绑定的高亮决策及删除 TextMate 回退，
-仍属于本次更广泛的共享语法决策。
+None.
+
+## Amends
+
+- [ADR 0009](0009-semantic-css-highlighting.md): 将 CSS 语法所有权下移至共享 `wake_css` CST，保留仅基于语义绑定的高亮
 
 ## Removal plan
 

@@ -82,6 +82,9 @@ LSP 根据语义事实顺序分配稳定的 `sortText` 键。因此 VS Code 会�
 Wake 常量求值器只有在 `expression` 本身为常量时，才将 `void expression` 视为可折叠。这可防止
 压缩把 `void sideEffect()` 替换为 `undefined`；它属于通用打包器正确性规则，而非编辑器专用变通。
 
+本决策完善 [ADR 0007](0007-css-language-intelligence.md) 建立的编辑器交互契约，同时保留
+[ADR 0010](0010-shared-css-syntax-tree.md) 中的共享语法与语义绑定边界。
+
 ## Validation
 
 - 测试模板内的属性、值、at-rule 和伪类补全，以及模板外返回 `None`。
@@ -93,8 +96,7 @@ Wake 常量求值器只有在 `expression` 本身为常量时，才将 `void exp
 
 ## Supersedes
 
-None. 本决策完善了 [ADR 0007](0007-css-language-intelligence.md) 建立的编辑器交互契约，同时保留
-[ADR 0010](0010-shared-css-syntax-tree.md) 中的共享语法与语义绑定边界。
+None.
 
 ## Removal plan
 

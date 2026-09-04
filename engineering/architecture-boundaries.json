@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+  "decision": "engineering/decisions/0044-architecture-decision-routing.md",
   "dependencyProvenance": {
     "decision": "engineering/decisions/0022-yarn-pnp-ownership.md",
     "forbiddenTrackedPaths": [
@@ -179,7 +179,7 @@
       "description": "compiler core cannot depend on orchestration or product edges",
       "fromGroups": ["compilerCore"],
       "deny": ["wake_bundler", "wake_cache", "wake_dev_server", "wake_docs", "wake_js_runtime", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0043-react-module-compiler-boundary.md",
       "suggestion": "Move the contract to a lower stable model or keep orchestration in the caller."
     },
     {
@@ -320,7 +320,7 @@
       "description": "wake_graph only consumes common and AST models",
       "from": ["wake_graph"],
       "allowOnly": ["wake_common", "wake_ecma_ast"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0044-architecture-decision-routing.md",
       "suggestion": "Move file, resolver, or product behavior out of wake_graph."
     },
     {
@@ -328,7 +328,7 @@
       "description": "wake_turbo only knows common infrastructure and its macros",
       "from": ["wake_turbo"],
       "allowOnly": ["wake_common", "wake_turbo_macros"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0044-architecture-decision-routing.md",
       "suggestion": "Keep Web build domain objects in the bundler or application layer."
     },
     {
@@ -336,7 +336,7 @@
       "description": "wake_cache cannot depend on arena, resolver, bundler, or product edges",
       "from": ["wake_cache"],
       "deny": ["wake_ecma_ast", "wake_resolver", "wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0034-transactional-persistent-cache-boundary.md",
       "suggestion": "Persist a stable DTO owned below the consumer instead of a process-local object."
     },
     {
@@ -344,7 +344,7 @@
       "description": "CSS layers cannot depend on bundler or product edges",
       "fromGroups": ["cssLayers"],
       "deny": ["wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0010-shared-css-syntax-tree.md",
       "suggestion": "Expose a stable CSS artifact and let the bundler integrate it."
     },
     {
@@ -360,7 +360,7 @@
       "description": "wake_bundler cannot depend on product edges",
       "from": ["wake_bundler"],
       "denyGroups": ["productEdges"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0027-build-session-ownership-and-lifetime.md",
       "suggestion": "Move HTTP, Docs, lifecycle, CLI, or Node adaptation above the bundler."
     },
     {
@@ -377,7 +377,7 @@
       "description": "wake_app is shared beneath CLI and Node shells",
       "from": ["wake_app"],
       "denyGroups": ["shells"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
       "suggestion": "Move the shared behavior into wake_app and keep shell adaptation outside it."
     },
     {
@@ -385,7 +385,7 @@
       "description": "internal crates cannot depend on CLI or Node shells",
       "fromGroups": ["nonShells"],
       "denyGroups": ["shells"],
-      "decision": "engineering/decisions/0001-architecture-evolution-loop.md",
+      "decision": "engineering/decisions/0003-compiler-and-shell-boundaries.md",
       "suggestion": "Invert the dependency through wake_app or a lower stable contract."
     },
     {

@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-02
+- Amended by: [ADR 0039](0039-owned-immutable-filesystem-overlay.md)
 
 ## Context
 

@@ -1,8 +1,9 @@
 # ADR 0024: Linker-proven barrel and trivial-module compaction
 
-- Status: superseded
+- Status: accepted
 - Date: 2026-08-31
-- Superseded by: [ADR 0033](0033-structured-module-emit-provenance.md)
+- Amended by: [ADR 0033](0033-structured-module-emit-provenance.md)
+- Amended by: [ADR 0042](0042-linker-owned-export-star-resolution.md)
 
 ## Context
 

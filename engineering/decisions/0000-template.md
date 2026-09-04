@@ -3,6 +3,8 @@
 - Status: proposed
 - Date: YYYY-MM-DD
 
+<!-- 局部修订时，在 Supersedes 与 Removal plan 之间插入 `## Amends`；格式见 README.md。 -->
+
 ## Context
 
 描述产品目标、当前架构和证据。

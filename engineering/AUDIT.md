@@ -67,7 +67,8 @@ CI 的 benchmark job 使用 `cargo bench --workspace --no-run`，只能发现编
 
 # 6. v0.1.26 工作树复核（2026-09-02）
 
-本节复核当前工作树，不改写上面的 v0.1.14 历史基线。当前 workspace 为 34 个 crate；Docs 有
+本节记录 2026-09-02 当时的工作树，不改写上面的 v0.1.14 历史基线。截至该复核点，workspace 为
+34 个 crate；Docs 有
 53 个 canonical route、106 个 Markdown 文件与 6 个 fixture page；npm 自动发布覆盖 7/7 个包
 （`@crab-dev/wake`、`@crab-dev/css` 与五个平台包）。
 
@@ -85,4 +86,5 @@ CI 的 benchmark job 使用 `cargo bench --workspace --no-run`，只能发现编
   Federation Chromium E2E；共享 exact-major stable readiness 仍被显式标记为 blocked，Docs/Live Reload
   的完整浏览器行为矩阵继续由路线图 R4 跟踪。
 
-本轮架构修复的长期边界记录在 ADR 0026—0035；当前仍开放的架构工作只有 R2、R4 与持续性的 R5。
+本轮架构修复的长期边界记录在 ADR 0026—0035；截至本次 2026-09-02 复核，仍开放的架构工作只有
+R2、R4 与持续性的 R5。
