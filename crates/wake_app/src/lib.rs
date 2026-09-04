@@ -4574,6 +4574,7 @@ impl BuildContext {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(WakeError::closed("BuildContext"));
         }
+        let invalidation = invalidation.normalized();
         let (sender, receiver) = mpsc::channel();
         self.inner
             .sender

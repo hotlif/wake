@@ -394,7 +394,7 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke
-            browser_major: 150
+            browser_major: 152
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:
@@ -636,7 +636,7 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: exact-major-smoke
-            browser_major: 150
+            browser_major: 152
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:

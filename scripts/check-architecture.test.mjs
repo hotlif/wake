@@ -1478,7 +1478,7 @@ test('system browser evidence separates experimental publication from stable rea
   assert.equal(manifest.targets['darwin-x64'].experimental.mode, 'reviewed-major-smoke')
   assert.deepEqual(manifest.targets['darwin-x64'].experimental.majors, [150, 151])
   assert.equal(manifest.targets['darwin-arm64'].experimental.mode, 'exact-major-smoke')
-  assert.equal(manifest.targets['darwin-arm64'].experimental.major, 150)
+  assert.equal(manifest.targets['darwin-arm64'].experimental.major, 152)
   for (const policy of Object.values(manifest.targets)) {
     assert(Array.isArray(policy.reviewedRunnerEvidence))
     for (const evidence of policy.reviewedRunnerEvidence) {

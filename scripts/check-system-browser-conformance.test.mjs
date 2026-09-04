@@ -69,7 +69,7 @@ const result = {
     kind: 'browser',
     browser: {
       name: 'chrome',
-      version: 'Chrome/150.9.8.7',
+      version: 'Chrome/152.9.8.7',
       headless: true,
     },
   },
@@ -79,7 +79,7 @@ const macEvidence = validateExperimentalBrowserIdentity({
   target: 'darwin-arm64',
   result,
 })
-assert.equal(macEvidence.browser.version, 'Chrome/150.9.8.7')
+assert.equal(macEvidence.browser.version, 'Chrome/152.9.8.7')
 assert.equal(macEvidence.mode, 'exact-major-smoke')
 assert.equal(macEvidence.stableConformance, false)
 

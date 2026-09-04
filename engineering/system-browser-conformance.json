@@ -101,15 +101,15 @@
       "rustTarget": "aarch64-apple-darwin",
       "experimental": {
         "mode": "exact-major-smoke",
-        "major": 150
+        "major": 152
       },
       "reviewedRunnerEvidence": [
         {
-          "source": "https://github.com/actions/runner-images/blob/564e58dbe650c507ccba1171f6159c12f26820c8/images/macos/macos-15-arm64-Readme.md",
-          "imageVersion": "20260727.0256.1",
+          "source": "https://github.com/actions/runner-images/blob/55bf90593780b5928df324f55e0bb8f34fb9bc1e/images/macos/macos-15-arm64-Readme.md",
+          "imageVersion": "20260829.0321.1",
           "browserVersions": {
-            "chrome": "150.0.7871.187",
-            "edge": "150.0.4078.99"
+            "chrome": "152.0.7977.65",
+            "edge": "152.0.4191.53"
           }
         }
       ]

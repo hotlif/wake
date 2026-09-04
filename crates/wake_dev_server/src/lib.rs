@@ -503,6 +503,20 @@ impl WatchInvalidation {
     pub fn is_rescan(&self) -> bool {
         matches!(self, Self::Rescan)
     }
+
+    /// Resolve filesystem events to the same physical identity used by watch interests and
+    /// compiler caches. Missing paths retain their suffix below the nearest existing ancestor.
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Paths(paths) => Self::Paths(
+                paths
+                    .into_iter()
+                    .map(|path| normalize_watch_path(&path))
+                    .collect(),
+            ),
+            Self::Rescan => Self::Rescan,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -5751,6 +5765,23 @@ mod tests {
             reported_watch_paths(&[verbatim, uppercase, normalized.clone()]),
             vec![normalized]
         );
+    }
+
+    #[test]
+    fn watch_invalidations_use_physical_identity_and_preserve_missing_suffixes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src/index.js");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "export default 1").unwrap();
+        let missing = root.path().join("src/missing/dependency.js");
+
+        let WatchInvalidation::Paths(paths) =
+            WatchInvalidation::Paths(vec![source.clone(), missing.clone()]).normalized()
+        else {
+            unreachable!();
+        };
+        assert_eq!(paths[0], normalize_watch_path(&source));
+        assert_eq!(paths[1], normalize_watch_path(&missing));
     }
 
     #[test]

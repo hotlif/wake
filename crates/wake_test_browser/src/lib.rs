@@ -1180,15 +1180,17 @@ impl BrowserContext {
         // Chrome 142+ gates loopback transport behind Local Network Access. Wake owns the test
         // network policy through Fetch interception, so grant the browser permission up front and
         // continue to let the runtime decide which requests are denied, routed, or continued.
-        self.connection.command(
-            None,
-            "Browser.setPermission",
-            json!({
-                "permission": {"name": "local-network-access"},
-                "setting": "granted",
-                "browserContextId": self.id,
-            }),
-        )?;
+        for permission in ["local-network", "loopback-network"] {
+            self.connection.command(
+                None,
+                "Browser.setPermission",
+                json!({
+                    "permission": {"name": permission},
+                    "setting": "granted",
+                    "browserContextId": self.id,
+                }),
+            )?;
+        }
         let target = self.connection.command(
             None,
             "Target.createTarget",
@@ -2207,7 +2209,7 @@ mod tests {
     fn new_page_emulates_one_fixed_reduced_motion_profile() {
         let (url, worker) = start_cdp_server(|socket| {
             let mut requests = Vec::new();
-            for _ in 0..9 {
+            for _ in 0..10 {
                 let request = read_cdp_request(socket);
                 let result = match request["method"].as_str().unwrap() {
                     "Target.createTarget" => json!({"targetId": "target"}),
@@ -2242,16 +2244,28 @@ mod tests {
         drop(context);
         let requests = worker.join().unwrap();
 
-        let permission = requests
+        let permissions = requests
             .iter()
-            .find(|request| request["method"] == "Browser.setPermission")
-            .expect("new pages must grant deterministic loopback transport");
-        assert_eq!(permission["params"]["browserContextId"], "context");
-        assert_eq!(
-            permission["params"]["permission"]["name"],
-            "local-network-access"
+            .filter(|request| request["method"] == "Browser.setPermission")
+            .collect::<Vec<_>>();
+        assert_eq!(permissions.len(), 2);
+        assert!(
+            permissions
+                .iter()
+                .all(|request| request["params"]["browserContextId"] == "context")
         );
-        assert_eq!(permission["params"]["setting"], "granted");
+        assert_eq!(
+            permissions
+                .iter()
+                .map(|request| request["params"]["permission"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["local-network", "loopback-network"]
+        );
+        assert!(
+            permissions
+                .iter()
+                .all(|request| request["params"]["setting"] == "granted")
+        );
 
         let media = requests
             .iter()

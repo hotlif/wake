@@ -81,7 +81,7 @@ V8/handle、fast DOM、Chromium/CDP、协议并发与 React 差分 fixture 分�
 CDP 完整版本。`engineering/system-browser-conformance.json` schema v3 区分当前 experimental
 发布证据和 stable readiness：Windows/Linux x64 对 reviewed major 151 运行 blocking conformance；
 macOS x64 在托管 runner 滚动切换期间对具备不可变官方清单证据的 reviewed major 150 或 151、
-macOS arm64 对 reviewed major 150 运行 blocking 功能 smoke，
+macOS arm64 对 reviewed major 152 运行 blocking 功能 smoke，
 但证据明确不是 stable
 conformance；Linux ARM64 对官方 hosted-runner 无系统 Chromium-family 浏览器的事实生成
 machine-readable `unavailable` 证据。major 不匹配直接失败，不下载、不 vendor、也不选择 fallback
@@ -162,7 +162,7 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 | `clippy` | Ubuntu / Rust 1.95 | workspace 全 target，warnings 视为错误 |
 | `test` | Ubuntu、Windows / Rust 1.95 + Node 24 | 全 workspace 测试 |
 | `test262-es2024` | Ubuntu / Rust 1.95 + Node 24 | checksum 固定的 Test262 ES2024 选择集 |
-| `browser-conformance` | 五个发布目标 / Rust 1.95 + Node 24 | Win/Linux x64 major 151 conformance、macOS x64 reviewed major 150/151 与 arm64 major 150 功能 smoke、Linux ARM64 reviewed unavailable 证据 |
+| `browser-conformance` | 五个发布目标 / Rust 1.95 + Node 24 | Win/Linux x64 major 151 conformance、macOS x64 reviewed major 150/151 与 arm64 major 152 功能 smoke、Linux ARM64 reviewed unavailable 证据 |
 | `browser-stable-readiness` | Ubuntu / Node 24 | 验证五平台共享 exact-major readiness 仍明确 blocked，避免把 experimental 证据误标为 stable |
 | `typescript-7` | Ubuntu、Windows / Node 24 + TypeScript 7 | TS7 CLI 版本、严格类型与 TS/TSX 兼容 fixture |
 | `miri` | Ubuntu / nightly | `wake_ecma_ast` 和 `wake_turbo` 手写 unsafe/内存模型 |
@@ -419,7 +419,7 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
 - Windows x64 与 Linux x64 执行 reviewed major 151 的显式 browser path、CDP lifecycle、React、
   screenshot 和 coverage conformance；macOS x64 在具备不可变 runner 清单证据的 reviewed major
   150 或 151、macOS arm64 在 reviewed
-  major 150 执行同类功能 smoke，
+  major 152 执行同类功能 smoke，
   但不计入 stable conformance；Linux ARM64 执行完整非 browser 合同并保存 `unavailable` 证据。
   浏览器二进制不得进入平台包，任何平台都不得在门禁内下载替代浏览器。
 
@@ -470,7 +470,7 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
    但三个待发布包必须保持可验证的 `file:` 来源，消费项目必须位于源码 PnP 根之外。每个组合执行 `wake test`、`runTests()` 和长期
    `TestContext` lifecycle。Node 24 在 Windows/Linux x64 上以系统 Chrome、Edge 或 Chromium 的
    reviewed major 151 执行 blocking conformance，在 macOS x64 上以 reviewed major 150 或 151、macOS arm64
-   上以 reviewed major 150 执行
+   上以 reviewed major 152 执行
    blocking React/browser/screenshot 功能 smoke；两者都从 `wake.test.v1` 结果校验 family/major 并
    上传证据。Linux ARM64 不伪造或 skip 浏览器测试，而是依据 immutable hosted-runner inventory
    生成 blocking、machine-readable `unavailable` 证据；其 clean install 与全部非 browser smoke

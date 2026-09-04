@@ -56,7 +56,7 @@ React DOM 求值前安装，保持同 realm 构造函数标识，设置 `IS_REAC
 `engineering/system-browser-conformance.json` 架构 v3 将两类声明分开。实验性发布证据遵循已审查的
 托管 runner 清单：Windows x64 和 Linux x64 对 Chromium 主版本 151 运行阻塞式精确主版本一致性；
 macOS x64 在托管 runner 滚动切换期间对具备不可变官方清单证据的已审查主版本 150 或 151、
-macOS arm64 对已审查的主版本 150 运行阻塞式功能浏览器冒烟测试，
+macOS arm64 对已审查的主版本 152 运行阻塞式功能浏览器冒烟测试，
 并明确不视为稳定一致性；
 Linux ARM64 记录机器可读的浏览器不可用状态，绝不下载替代品。稳定就绪策略更严格：五个目标必须在
 同一 Chromium 系精确主版本上运行一致性测试。因此，当前清单的稳定就绪结果为 `ready: false`，并
@@ -180,7 +180,7 @@ Wake Test 发布仍被阻塞，直到五个目标都通过共享精确主版本�
   确保不泄漏子进程、端口、页面或配置目录。
 - Windows x64 和 Linux x64 验证系统浏览器精确主版本 151，以及 CDP、React、截图与覆盖率一致性。
   macOS x64 验证有不可变 runner 清单证据的已审查精确主版本 150 或 151，macOS arm64 验证已审查的
-  精确主版本 150 和相同功能冒烟，
+  精确主版本 152 和相同功能冒烟，
   但标记为不满足稳定就绪一致性。
   Linux ARM64 执行所有非浏览器平台门禁并生成已审查的 `unavailable` 证据；绝不下载或选择回退浏览器。
 - 独立评估稳定浏览器就绪情况：只有 Windows x64、Linux x64/arm64 和 macOS x64/arm64 全部针对同一
