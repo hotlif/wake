@@ -510,7 +510,7 @@ requireJobMarkers('smoke', registrySmokeJob.source, [
   'Clean registry install without build tools',
   "matrix.node == 24 && matrix.browser_evidence != 'unavailable'",
   "matrix.node == 24 && matrix.browser_evidence == 'unavailable'",
-  '--browser-path "$browser"',
+  '--browser-path "$WAKE_RELEASE_BROWSER_PATH"',
   '--output browser-result.json',
   '--result browser-result.json',
   '--unavailable true',
