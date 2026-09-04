@@ -1,0 +1,10 @@
+{
+  "mean": {
+    "point_estimate": "fast",
+    "confidence_interval": {
+      "confidence_level": 0.95,
+      "lower_bound": 1,
+      "upper_bound": 2
+    }
+  }
+}

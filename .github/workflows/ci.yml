@@ -421,6 +421,7 @@ jobs:
       - run: cargo test --locked --offline -p wake_bundler --test performance_invariants --release
         env:
           CARGO_NET_OFFLINE: "true"
+      - run: corepack yarn performance:report:test
       - run: cargo bench --workspace --locked --offline --no-run
         env:
           CARGO_NET_OFFLINE: "true"

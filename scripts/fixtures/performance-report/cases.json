@@ -1,0 +1,60 @@
+[
+  {
+    "name": "stable and improved benchmarks do not fail",
+    "benchmarks": [
+      { "id": "stable", "base": [100, 99, 101], "head": [102, 101, 103] },
+      { "id": "improved", "base": [100, 99, 101], "head": [90, 89, 91] }
+    ],
+    "statuses": ["stable", "improvement"],
+    "failed": false
+  },
+  {
+    "name": "regressions above five percent warn",
+    "benchmarks": [
+      { "id": "warning", "base": [100, 99, 101], "head": [108, 107, 109] }
+    ],
+    "statuses": ["warning"],
+    "failed": false
+  },
+  {
+    "name": "one large sample without a retest only warns",
+    "benchmarks": [
+      { "id": "one-sample", "base": [100, 99, 101], "head": [120, 118, 122] }
+    ],
+    "statuses": ["warning"],
+    "failed": false
+  },
+  {
+    "name": "two confident large regressions fail a gated report",
+    "benchmarks": [
+      { "id": "confirmed", "base": [100, 99, 101], "head": [120, 118, 122], "retest": [119, 117, 121] }
+    ],
+    "statuses": ["failure"],
+    "failed": true
+  },
+  {
+    "name": "noisy confidence intervals prevent a hard failure",
+    "benchmarks": [
+      { "id": "noisy", "base": [100, 90, 110], "head": [120, 105, 135], "retest": [121, 106, 136] }
+    ],
+    "statuses": ["warning"],
+    "failed": false
+  },
+  {
+    "name": "full trend reports never enforce regressions",
+    "benchmarks": [
+      { "id": "trend", "gate": false, "base": [100, 99, 101], "head": [125, 123, 127], "retest": [126, 124, 128] }
+    ],
+    "statuses": ["warning"],
+    "failed": false
+  },
+  {
+    "name": "new and missing benchmarks are explicit",
+    "benchmarks": [
+      { "id": "new", "head": [100, 99, 101] },
+      { "id": "missing", "base": [100, 99, 101] }
+    ],
+    "statuses": ["new", "missing"],
+    "failed": false
+  }
+]

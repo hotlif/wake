@@ -1,0 +1,88 @@
+name: Performance
+
+on:
+  pull_request:
+  push:
+    branches: [canary]
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  benchmark:
+    name: ${{ github.event_name == 'pull_request' && 'key performance gate' || 'full performance trend' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: performance
+      - name: Select comparison revisions and benchmark scope
+        id: comparison
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            mode="key"
+            base_sha="$PR_BASE_SHA"
+          else
+            mode="full"
+            base_sha="$PUSH_BEFORE_SHA"
+            if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] \
+              || ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+              base_sha="$(git rev-parse HEAD^)"
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+      - name: Test performance report policy
+        run: node --test scripts/performance-report.test.mjs
+      - name: Compare Criterion benchmarks
+        id: performance
+        run: >-
+          node scripts/run-performance.mjs
+          --mode "${{ steps.comparison.outputs.mode }}"
+          --base "${{ steps.comparison.outputs.base_sha }}"
+          --head "${{ steps.comparison.outputs.head_sha }}"
+          --output .wake-performance
+      - name: Publish performance job summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f .wake-performance/summary.md ]]; then
+            node -e "require('node:fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, require('node:fs').readFileSync('.wake-performance/summary.md'))"
+          else
+            echo "Performance run did not produce a summary." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload Criterion report and raw data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ steps.comparison.outputs.mode }}-${{ github.run_id }}
+          path: .wake-performance
+          retention-days: 30
+          if-no-files-found: error

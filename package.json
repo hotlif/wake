@@ -33,6 +33,7 @@
     "pnp:conformance:check": "node scripts/check-pnp-conformance.mjs",
     "yarn:lock:check": "node scripts/check-yarn-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
+    "performance:report:test": "node --test scripts/performance-report.test.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
     "skill:check": "node scripts/check-skills.mjs",
     "rusty-v8:prepare:test": "node --test scripts/rusty-v8-archive-path.test.mjs",
