@@ -27,7 +27,9 @@ machine/OS-namespace commit lock named `wake-output-publication-v1`. Windows use
 mutex and accepts `WAIT_ABANDONED` as ownership transferred from a terminated writer. Unix uses an
 advisory lock on the fixed `/tmp/wake-output-publication-v1.lock` file; it never consults `TMPDIR`,
 `TEMP`, or another process-specific environment value. Both primitives release ownership when their
-handle/file descriptor or process exits. A bounded 30-second wait fails before target mutation.
+handle/file descriptor or process exits. The fixed Unix lock is a trusted owner-created host path, so
+its physical identity resolves a platform `/tmp` alias before scope comparison. A bounded 30-second
+wait fails before target mutation.
 
 Application and Docs candidates materialize in a temporary directory directly below their physical
 project root. A valid directory target cannot equal or contain that root, so an ancestor output

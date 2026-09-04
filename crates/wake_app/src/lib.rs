@@ -3721,6 +3721,7 @@ fn metadata_is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
 fn resolve_physical_output_path_with_project_root(
     path: &Path,
     project_root: Option<&Path>,
+    trusted_host_path: bool,
 ) -> Result<PathBuf, WakeError> {
     if !path.is_absolute() {
         return Err(WakeError::new(
@@ -3777,7 +3778,7 @@ fn resolve_physical_output_path_with_project_root(
                 let remains_inside_project = physical_project_root
                     .as_ref()
                     .is_some_and(|project_root| physical.starts_with(project_root));
-                if !remains_inside_project {
+                if !trusted_host_path && !remains_inside_project {
                     return Err(WakeError::new(
                         "WAKE_CONFIG",
                         format!(
@@ -3799,7 +3800,11 @@ fn resolve_physical_output_path_with_project_root(
 }
 
 fn resolve_physical_output_path(path: &Path) -> Result<PathBuf, WakeError> {
-    resolve_physical_output_path_with_project_root(path, None)
+    resolve_physical_output_path_with_project_root(path, None, false)
+}
+
+fn resolve_physical_lock_path(path: &Path) -> Result<PathBuf, WakeError> {
+    resolve_physical_output_path_with_project_root(path, None, true)
 }
 
 fn validate_output_ownership(target: &Path, product: OutputProduct) -> Result<(), WakeError> {
@@ -3890,7 +3895,8 @@ fn resolve_safe_output_directory(
     requested: &Path,
     product: OutputProduct,
 ) -> Result<PathBuf, WakeError> {
-    let target = resolve_physical_output_path_with_project_root(requested, Some(project_root))?;
+    let target =
+        resolve_physical_output_path_with_project_root(requested, Some(project_root), false)?;
     if target.file_name().is_none()
         || target == project_root
         || project_root.starts_with(&target)
@@ -6555,7 +6561,7 @@ fn validate_directory_output_commit_scope(
     product: &str,
 ) -> Result<(), WakeError> {
     for lock_path in lock_paths {
-        let lock_path = resolve_physical_output_path(lock_path)?;
+        let lock_path = resolve_physical_lock_path(lock_path)?;
         for scope in scopes {
             if lock_path.starts_with(scope) || scope.starts_with(&lock_path) {
                 return Err(WakeError::new(
@@ -9027,7 +9033,8 @@ mod tests {
         assert_eq!(
             resolve_physical_output_path_with_project_root(
                 &alias.join("project/dist"),
-                Some(&physical_project)
+                Some(&physical_project),
+                false,
             )
             .unwrap(),
             physical_project.join("dist")
@@ -9036,6 +9043,7 @@ mod tests {
             resolve_physical_output_path_with_project_root(
                 &alias.join("project/dist"),
                 Some(&alias.join("project")),
+                false,
             )
             .unwrap(),
             physical_project.join("dist")
@@ -9046,10 +9054,16 @@ mod tests {
         let error = resolve_physical_output_path_with_project_root(
             &internal_alias.join("escape"),
             Some(&physical_project),
+            false,
         )
         .unwrap_err();
         assert_eq!(error.code, "WAKE_CONFIG");
         assert_eq!(error.path.as_deref(), internal_alias.to_str());
+
+        assert_eq!(
+            resolve_physical_lock_path(&alias.join("wake-output-publication-v1.lock")).unwrap(),
+            real_parent.join("wake-output-publication-v1.lock")
+        );
     }
 
     fn generation_seal_count(root: &Path) -> usize {
