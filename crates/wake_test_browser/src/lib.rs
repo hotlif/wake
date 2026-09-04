@@ -987,8 +987,8 @@ impl BrowserDriver {
             })?;
         let mut command = Command::new(&installation.executable);
         // The isolated test browser delegates all network authority to Wake's Fetch interceptor.
-        // Disable Chrome's origin-based LNA prompt so an opaque test page cannot preempt an
-        // explicit `network.allow` decision before the intercepted request reaches the driver.
+        // Test pages themselves use Wake's authenticated loopback resource origin, so Chrome's
+        // Local Network Access policy remains enabled without preempting an explicit allow.
         command
             .arg("--remote-debugging-address=127.0.0.1")
             .arg("--remote-debugging-port=0")
@@ -1007,7 +1007,7 @@ impl BrowserDriver {
             .arg("--metrics-recording-only")
             .arg("--disable-breakpad")
             .arg("--disable-crash-reporter")
-            .arg("--disable-features=Translate,MediaRouter,LocalNetworkAccessChecks")
+            .arg("--disable-features=Translate,MediaRouter")
             .arg(format!(
                 "--window-size={},{}",
                 options.viewport.width, options.viewport.height
@@ -1313,6 +1313,38 @@ impl BrowserPage {
             return Err(BrowserError::new(format!("navigation failed: {error}")));
         }
         Ok(())
+    }
+
+    /// Wait until a navigation has committed the expected document and completed loading.
+    ///
+    /// `Page.navigate` returns before the renderer swaps execution contexts. Callers that install
+    /// page-owned bridges must use this boundary so those bridges cannot land in the previous
+    /// document and disappear when the navigation commits.
+    pub fn wait_until_loaded(&self, url: &str, timeout: Duration) -> Result<(), BrowserError> {
+        let started = Instant::now();
+        let expected = serde_json::to_string(url)
+            .map_err(|error| BrowserError::new(format!("could not encode page URL: {error}")))?;
+        let expression = format!(
+            "globalThis.location.href === {expected} && globalThis.document.readyState === 'complete'"
+        );
+        let mut last_error = None;
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let detail = last_error
+                    .map(|error: BrowserError| format!(": {}", error.message))
+                    .unwrap_or_default();
+                return Err(BrowserError::new(format!(
+                    "page did not finish loading {url}{detail}"
+                )));
+            }
+            match self.evaluate_with_timeout(&expression, Some(remaining.as_millis() as u64)) {
+                Ok(Value::Bool(true)) => return Ok(()),
+                Ok(_) => last_error = None,
+                Err(error) => last_error = Some(error),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn evaluate(&self, expression: &str) -> Result<Value, BrowserError> {
@@ -2198,7 +2230,7 @@ mod tests {
     fn new_page_emulates_one_fixed_reduced_motion_profile() {
         let (url, worker) = start_cdp_server(|socket| {
             let mut requests = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..8 {
                 let request = read_cdp_request(socket);
                 let result = match request["method"].as_str().unwrap() {
                     "Target.createTarget" => json!({"targetId": "target"}),

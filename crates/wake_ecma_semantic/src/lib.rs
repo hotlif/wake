@@ -109,10 +109,7 @@ impl SemanticModel {
             if let Some(&sym) = self.scopes[scope as usize].bindings.get(&name) {
                 return Some(sym);
             }
-            match self.scopes[scope as usize].parent {
-                Some(p) => scope = p,
-                None => return None,
-            }
+            scope = self.scopes[scope as usize].parent?;
         }
     }
 }
@@ -815,10 +812,7 @@ impl SemanticModel {
             if let Some(&sym) = scopes[scope as usize].bindings.get(&name) {
                 return Some(sym);
             }
-            match scopes[scope as usize].parent {
-                Some(p) => scope = p,
-                None => return None,
-            }
+            scope = scopes[scope as usize].parent?;
         }
     }
 }

@@ -3718,7 +3718,10 @@ fn metadata_is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-fn resolve_physical_output_path(path: &Path) -> Result<PathBuf, WakeError> {
+fn resolve_physical_output_path_with_project_root(
+    path: &Path,
+    project_root: Option<&Path>,
+) -> Result<PathBuf, WakeError> {
     if !path.is_absolute() {
         return Err(WakeError::new(
             "WAKE_INTERNAL",
@@ -3733,14 +3736,27 @@ fn resolve_physical_output_path(path: &Path) -> Result<PathBuf, WakeError> {
     for ancestor in path.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
-                return Err(WakeError::new(
-                    "WAKE_CONFIG",
-                    format!(
-                        "refusing to publish output through a symbolic link or reparse point: {}",
-                        ancestor.display()
-                    ),
-                )
-                .at(ancestor));
+                let is_project_ancestor_alias = project_root.is_some_and(|project_root| {
+                    ancestor
+                        .canonicalize()
+                        .map(|physical| {
+                            let physical = wake_common::fs::normalize(&physical);
+                            physical != project_root
+                                && project_root.starts_with(&physical)
+                                && ancestor.components().count() < project_root.components().count()
+                        })
+                        .unwrap_or(false)
+                });
+                if !is_project_ancestor_alias {
+                    return Err(WakeError::new(
+                        "WAKE_CONFIG",
+                        format!(
+                            "refusing to publish output through a symbolic link or reparse point: {}",
+                            ancestor.display()
+                        ),
+                    )
+                    .at(ancestor));
+                }
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3780,6 +3796,10 @@ fn resolve_physical_output_path(path: &Path) -> Result<PathBuf, WakeError> {
         physical.push(component);
     }
     Ok(normalize_path(&physical))
+}
+
+fn resolve_physical_output_path(path: &Path) -> Result<PathBuf, WakeError> {
+    resolve_physical_output_path_with_project_root(path, None)
 }
 
 fn validate_output_ownership(target: &Path, product: OutputProduct) -> Result<(), WakeError> {
@@ -3870,7 +3890,7 @@ fn resolve_safe_output_directory(
     requested: &Path,
     product: OutputProduct,
 ) -> Result<PathBuf, WakeError> {
-    let target = resolve_physical_output_path(requested)?;
+    let target = resolve_physical_output_path_with_project_root(requested, Some(project_root))?;
     if target.file_name().is_none()
         || target == project_root
         || project_root.starts_with(&target)
@@ -8989,6 +9009,39 @@ mod tests {
             absolute_from_project_root(configured, physical, outside),
             outside
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_safety_accepts_only_symlink_ancestors_above_the_physical_project() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let real_parent = outer.path().join("real");
+        let project = real_parent.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let alias = outer.path().join("alias");
+        symlink(&real_parent, &alias).unwrap();
+        let physical_project = canonical_project_root(&project).unwrap();
+
+        assert_eq!(
+            resolve_physical_output_path_with_project_root(
+                &alias.join("project/dist"),
+                Some(&physical_project)
+            )
+            .unwrap(),
+            physical_project.join("dist")
+        );
+
+        let internal_alias = project.join("internal-alias");
+        symlink(&real_parent, &internal_alias).unwrap();
+        let error = resolve_physical_output_path_with_project_root(
+            &internal_alias.join("escape"),
+            Some(&physical_project),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "WAKE_CONFIG");
+        assert_eq!(error.path.as_deref(), Some(internal_alias.as_path()));
     }
 
     fn generation_seal_count(root: &Path) -> usize {

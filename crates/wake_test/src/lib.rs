@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use regex::Regex;
@@ -41,7 +41,7 @@ use wake_test_browser::{
     BrowserCancellationToken, BrowserDriver, BrowserError, BrowserKind, BrowserLaunchOptions,
     BrowserPage, CdpEventWait, FetchFulfillResponse, FetchHeader, FetchRequestPaused,
     InputModifiers, KeyboardInput, PointerButton, PointerEventType, PointerInput, REDUCED_MOTION,
-    ScreenshotClip, Viewport,
+    ResourceOrigin, ScreenshotClip, Viewport,
 };
 
 use selection::{RelatedOrigin, SuiteGraphIndex, SuiteIdentity};
@@ -3621,11 +3621,33 @@ fn execute_browser_graph(
     let context = browser
         .create_context()
         .map_err(|error| TestError::new("WAKE_TEST_BROWSER", error.to_string()).at(path))?;
+    let mut page_token = [0_u8; 24];
+    getrandom::fill(&mut page_token).map_err(|error| {
+        TestError::new(
+            "WAKE_TEST_BROWSER",
+            format!("could not authenticate browser resource origin: {error}"),
+        )
+        .at(path)
+    })?;
+    let entry_path = format!(
+        "wake-test-{}.html",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(page_token)
+    );
+    let page_origin = ResourceOrigin::start(BTreeMap::from([(
+        entry_path.clone(),
+        b"<!doctype html><meta charset=\"utf-8\"><title>Wake Test</title>".to_vec(),
+    )]))
+    .map_err(|error| TestError::new("WAKE_TEST_BROWSER", error.to_string()).at(path))?;
     let page = Arc::new(
         context
-            .new_page("about:blank")
+            .new_page(&page_origin.url(&entry_path))
             .map_err(|error| TestError::new("WAKE_TEST_BROWSER", error.to_string()).at(path))?,
     );
+    page.wait_until_loaded(
+        &page_origin.url(&entry_path),
+        Duration::from_millis(timeout_ms.max(1)),
+    )
+    .map_err(|error| TestError::new("WAKE_TEST_BROWSER", error.to_string()).at(path))?;
     let _cancellation_guard =
         BrowserExecutionCancellationGuard::arm(Arc::clone(&page), cancellation);
     let network_interception = BrowserNetworkInterception::start(Arc::clone(&page), timeout_ms)

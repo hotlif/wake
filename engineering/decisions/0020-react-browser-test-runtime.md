@@ -65,8 +65,9 @@ Chrome、Edge 或 Chromium，并始终报告完整 CDP 标识。
 
 同一 DOM 内的测试按顺序执行。不同套件可在隔离 realm 或 BrowserContext 中并行。运行时模块自动
 mock、Jest 式提升、旧版伪计时器和行内快照重写不属于契约。模块替换必须显式声明，并在模块求值前解析；
-浏览器网络 mock 在驱动边界执行；临时测试浏览器关闭 Chromium 的 Local Network Access 二次门禁，
-使不透明的隔离页面也只能由 Wake 的 Fetch 拦截器显式 `route`、`allow` 或拒绝请求。覆盖率使用 V8
+浏览器网络 mock 在驱动边界执行；每个隔离页面先从 Wake 经认证的回环资源源加载，使 Chromium 保留
+Local Network Access 门禁时，本机请求仍只能由 Wake 的 Fetch 拦截器显式 `route`、`allow` 或拒绝。
+覆盖率使用 V8
 范围，通过 Wake 源码映射转换为 Wake 自有架构，而非 Babel/Istanbul 插桩语义。
 
 相关测试选择及监视失效使用 `wake_js_runtime` 编译出的精确自有模块图；不复用打包器分块图或
