@@ -2,6 +2,11 @@
 //!
 //! DESIGN §5.1：Node 解析算法的现代子集。v1 覆盖相对路径 + 扩展名补全 + 目录 index +
 //! `node_modules` / Yarn PnP + `package.json` 的 `exports`/`module`/`main` 字段 + 结果缓存。
+//! 包内 `#imports` 由导入方最近的包作用域拥有，支持精确键、单星号模式、声明顺序条件、
+//! 包内相对目标及依赖包目标；不穿越包作用域或以 alias 回退掩盖缺失映射。
+//! 相对目标不得越出包目录；映射循环、null 和非法目标以解析失败结束。
+//! 内部重定向最多 256 次，防止通配符重写不断增长而无法终止。
+//! `exports` 与 `imports` 的活动条件命中 null 时停止，不继续选择后面的 default。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,6 +117,7 @@ impl Default for ResolveOptions {
 struct PackageConfig {
     string_fields: FxHashMap<String, String>,
     exports: Option<OrderedJsonValue>,
+    imports: Option<OrderedJsonValue>,
     name: Option<String>,
     version: Option<String>,
     peer_dependencies: Vec<String>,
@@ -598,6 +604,34 @@ impl Resolver {
 
     fn resolution_witnesses(&self, specifier: &str, from_dir: &Path) -> Vec<PathBuf> {
         let mut witnesses = std::collections::BTreeSet::from([normalize(from_dir)]);
+        if specifier.starts_with('#') {
+            match self.pnp_route(from_dir) {
+                Ok(PnpRoute::Managed(pnp)) => {
+                    witnesses.insert(pnp.root().join(".pnp.cjs"));
+                    witnesses.insert(pnp.root().join(".pnp.data.json"));
+                    witnesses.insert(pnp.root().join("yarn.lock"));
+                }
+                Err(error) => {
+                    witnesses.insert(error.path().to_path_buf());
+                }
+                _ => {}
+            }
+            for directory in from_dir.ancestors() {
+                if directory
+                    .file_name()
+                    .is_some_and(|name| name == "node_modules")
+                {
+                    break;
+                }
+                let manifest = directory.join("package.json");
+                witnesses.insert(manifest.clone());
+                if self.fs.is_file(&manifest) {
+                    witnesses.insert(directory.to_path_buf());
+                    break;
+                }
+            }
+            return witnesses.into_iter().collect();
+        }
         if !is_valid_bare_package_specifier(specifier)
             && let Some(aliased) = self.apply_alias(specifier)
         {
@@ -672,6 +706,9 @@ impl Resolver {
         from_dir: &Path,
         profile: &ResolutionProfile,
     ) -> Result<PathBuf, ResolveErrorKind> {
+        if specifier.starts_with('#') {
+            return self.resolve_imports(specifier, from_dir, profile);
+        }
         let specifier_path = Path::new(specifier);
         if specifier.starts_with("./")
             || specifier.starts_with("../")
@@ -720,6 +757,87 @@ impl Resolver {
 
         self.resolve_node_modules(specifier, from_dir, profile)
             .ok_or(ResolveErrorKind::NotFound)
+    }
+
+    fn resolve_imports(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        profile: &ResolutionProfile,
+    ) -> Result<PathBuf, ResolveErrorKind> {
+        let root = from_dir
+            .ancestors()
+            .take_while(|directory| {
+                !directory
+                    .file_name()
+                    .is_some_and(|name| name == "node_modules")
+            })
+            .find(|directory| self.fs.is_file(&directory.join("package.json")))
+            .ok_or(ResolveErrorKind::NotFound)?;
+        let config = self
+            .read_package_config(&root.join("package.json"))
+            .ok_or(ResolveErrorKind::NotFound)?;
+        let imports = config
+            .imports
+            .as_ref()
+            .and_then(OrderedJsonValue::as_object)
+            .ok_or(ResolveErrorKind::NotFound)?;
+        let mut request = specifier.to_owned();
+        let mut visited = std::collections::BTreeSet::new();
+        loop {
+            if request == "#"
+                || request.starts_with("#/")
+                || visited.len() >= 256
+                || !visited.insert(request.clone())
+            {
+                return Err(ResolveErrorKind::NotFound);
+            }
+            let (value, capture) = if let Some((_, value)) =
+                imports.iter().find(|(key, _)| key == &request)
+            {
+                (value, None)
+            } else {
+                let mut patterns = imports
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        let (prefix, suffix) = key.split_once('*')?;
+                        if suffix.contains('*') {
+                            return None;
+                        }
+                        let capture = request.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                        Some((prefix.len(), key.len(), value, capture))
+                    })
+                    .collect::<Vec<_>>();
+                patterns.sort_by_key(|item| std::cmp::Reverse((item.0, item.1)));
+                let (_, _, value, capture) = patterns.first().ok_or(ResolveErrorKind::NotFound)?;
+                (*value, Some(*capture))
+            };
+            let target = resolve_conditional_target(value, &profile.conditions)
+                .ok_or(ResolveErrorKind::NotFound)?;
+            let target =
+                capture.map_or_else(|| target.clone(), |capture| target.replace('*', capture));
+            if let Some(relative) = target.strip_prefix("./") {
+                // Never normalize away forbidden traversal or a nested installation boundary.
+                if relative
+                    .split('/')
+                    .any(|part| matches!(part, "." | ".." | "node_modules"))
+                    || relative.contains(['\\', '%', ':'])
+                {
+                    return Err(ResolveErrorKind::NotFound);
+                }
+                return self
+                    .resolve_as_file_or_dir(&normalize(&root.join(relative)))
+                    .ok_or(ResolveErrorKind::NotFound);
+            }
+            if target.starts_with('#') {
+                request = target;
+                continue;
+            }
+            if !is_valid_bare_package_specifier(&target) {
+                return Err(ResolveErrorKind::NotFound);
+            }
+            return self.resolve_uncached(&target, root, profile);
+        }
     }
 
     fn pnp_route(&self, from_dir: &Path) -> Result<PnpRoute, PnpLoadError> {
@@ -1092,6 +1210,7 @@ impl Resolver {
             Some(PackageConfig {
                 string_fields,
                 exports: json.get("exports").cloned(),
+                imports: json.get("imports").cloned(),
                 name: json
                     .get("name")
                     .and_then(OrderedJsonValue::as_str)
@@ -1108,6 +1227,30 @@ impl Resolver {
             .unwrap()
             .insert(pkg.to_path_buf(), config.clone());
         config
+    }
+}
+
+// Outer None means no active condition; Some(None) is an explicit blocked target.
+fn resolve_condition_selection(
+    value: &OrderedJsonValue,
+    conditions: &[String],
+) -> Option<Option<String>> {
+    match value {
+        OrderedJsonValue::Null => Some(None),
+        OrderedJsonValue::String(target) => Some(Some(target.clone())),
+        OrderedJsonValue::Array(targets) => Some(
+            targets
+                .iter()
+                .find_map(|target| resolve_condition_selection(target, conditions).flatten()),
+        ),
+        OrderedJsonValue::Object(targets) => targets.iter().find_map(|(condition, target)| {
+            if condition == "default" || conditions.contains(condition) {
+                resolve_condition_selection(target, conditions)
+            } else {
+                None
+            }
+        }),
+        _ => Some(None),
     }
 }
 
@@ -1145,23 +1288,7 @@ fn resolve_exports_target(
 }
 
 fn resolve_conditional_target(value: &OrderedJsonValue, conditions: &[String]) -> Option<String> {
-    match value {
-        OrderedJsonValue::String(target) => Some(target.clone()),
-        OrderedJsonValue::Array(targets) => targets
-            .iter()
-            .find_map(|target| resolve_conditional_target(target, conditions)),
-        OrderedJsonValue::Object(targets) => {
-            for (condition, target) in targets {
-                if (condition == "default" || conditions.iter().any(|active| active == condition))
-                    && let Some(resolved) = resolve_conditional_target(target, conditions)
-                {
-                    return Some(resolved);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
+    resolve_condition_selection(value, conditions).flatten()
 }
 
 /// TS 的 `.js`-扩展名导入约定：`import "./x.js"` 磁盘上可能是 `./x.ts`/`.tsx`。
@@ -1314,6 +1441,95 @@ mod tests {
         assert_eq!(
             r2.resolve("../a", Path::new("src")).unwrap(),
             PathBuf::from("a.js")
+        );
+    }
+
+    #[test]
+    fn package_imports_scope_conditions_patterns_and_dependency_targets() {
+        let r = resolver(&[
+            (
+                "app/package.json",
+                r##"{"imports":{
+                "#minpath":{"node":"./node.js","default":"./browser.js"},
+                "#mode":{"require":"./node.js","import":"./browser.js"},
+                "#files/*":"./src/*.js", "#files/private/*":null,
+                "#alias":"#minpath", "#dep":"dep", "#cycle":"#cycle", "#grow/*":"#grow/x*",
+                "#escape":"./../outside.js", "#blocked":null
+            }}"##,
+            ),
+            ("app/browser.js", ""),
+            ("app/node.js", ""),
+            ("app/src/a.js", ""),
+            ("app/src/private/a.js", ""),
+            ("outside.js", ""),
+            (
+                "app/node_modules/dep/package.json",
+                r#"{"main":"index.js"}"#,
+            ),
+            ("app/node_modules/dep/index.js", ""),
+            ("app/nested/package.json", "{}"),
+            ("app/nested/file.js", ""),
+        ]);
+        for (request, expected) in [
+            ("#minpath", "app/browser.js"),
+            ("#alias", "app/browser.js"),
+            ("#files/a", "app/src/a.js"),
+            ("#dep", "app/node_modules/dep/index.js"),
+        ] {
+            assert_eq!(
+                r.resolve(request, Path::new("app/src")).unwrap(),
+                PathBuf::from(expected)
+            );
+        }
+        for (conditions, expected) in [
+            (vec!["node".into()], "app/node.js"),
+            (vec!["browser".into()], "app/browser.js"),
+        ] {
+            assert_eq!(
+                r.resolve_with_conditions("#minpath", Path::new("app/src"), &conditions)
+                    .unwrap(),
+                PathBuf::from(expected)
+            );
+        }
+        assert_eq!(
+            r.resolve_with_conditions("#mode", Path::new("app/src"), &["require".into()])
+                .unwrap(),
+            PathBuf::from("app/node.js")
+        );
+        for request in [
+            "#files/private/a",
+            "#blocked",
+            "#cycle",
+            "#grow/a",
+            "#escape",
+            "#missing",
+            "#",
+            "#/bad",
+        ] {
+            assert!(
+                r.resolve(request, Path::new("app/src")).is_err(),
+                "{request}"
+            );
+        }
+        assert!(r.resolve("#minpath", Path::new("app/nested")).is_err());
+        let error = r.resolve("#missing", Path::new("app/src")).unwrap_err();
+        assert!(error.witnesses.contains(&PathBuf::from("app/package.json")));
+    }
+
+    #[test]
+    fn conditional_exports_null_blocks_later_default() {
+        let r = resolver(&[
+            (
+                "node_modules/blocked/package.json",
+                r#"{"exports":{".":{"browser":null,"default":"./index.js"}}}"#,
+            ),
+            ("node_modules/blocked/index.js", ""),
+        ]);
+        assert!(r.resolve("blocked", Path::new("src")).is_err());
+        assert_eq!(
+            r.resolve_with_conditions("blocked", Path::new("src"), &["node".into()])
+                .unwrap(),
+            PathBuf::from("node_modules/blocked/index.js")
         );
     }
 
@@ -1922,6 +2138,14 @@ mod tests {
         );
         fs.insert("project/.pnp.data.json", manifest_value.to_string());
         fs.insert(
+            "cache/button/node_modules/@crab-dev/rc-button/package.json",
+            r##"{"imports":{"#css":"@crab-dev/css","#local":"./local.js"}}"##,
+        );
+        fs.insert(
+            "cache/button/node_modules/@crab-dev/rc-button/local.js",
+            "// local",
+        );
+        fs.insert(
             "cache/css/node_modules/@crab-dev/css/package.json",
             r#"{"exports":{".":"./index.js"}}"#,
         );
@@ -1952,6 +2176,59 @@ mod tests {
                 )
                 .unwrap(),
             PathBuf::from("cache/css/node_modules/@crab-dev/css/index.js")
+        );
+    }
+
+    #[test]
+    fn package_imports_keep_pnp_dependency_authority() {
+        let issuer = Path::new("cache/button/node_modules/@crab-dev/rc-button/esm");
+        for declared in [false, true] {
+            let resolver = pnp_authoritative_resolver(declared);
+            assert_eq!(
+                resolver.resolve("#local", issuer).unwrap(),
+                PathBuf::from("cache/button/node_modules/@crab-dev/rc-button/local.js")
+            );
+            let resolved = resolver.resolve("#css", issuer);
+            if declared {
+                assert_eq!(
+                    resolved.unwrap(),
+                    PathBuf::from("cache/css/node_modules/@crab-dev/css/index.js")
+                );
+            } else {
+                let error = resolved.unwrap_err();
+                assert!(matches!(*error.kind, ResolveErrorKind::PnpDependency(_)));
+                assert!(
+                    error
+                        .witnesses
+                        .contains(&PathBuf::from("project/.pnp.data.json"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn package_imports_refresh_after_manifest_change() {
+        let fs = Arc::new(MemoryFileSystem::new());
+        fs.insert("app/package.json", r##"{"imports":{"#value":"./a.js"}}"##);
+        fs.insert("app/a.js", "");
+        fs.insert("app/b.js", "");
+        let resolver = Resolver::new(fs.clone());
+        assert_eq!(
+            resolver.resolve("#value", Path::new("app")).unwrap(),
+            PathBuf::from("app/a.js")
+        );
+        fs.insert(
+            "app/package.json",
+            r##"{"imports":{"#value":"./b.js","#new":"./a.js"}}"##,
+        );
+        resolver.clear_cache();
+        assert_eq!(
+            resolver.resolve("#value", Path::new("app")).unwrap(),
+            PathBuf::from("app/b.js")
+        );
+        assert_eq!(
+            resolver.resolve("#new", Path::new("app")).unwrap(),
+            PathBuf::from("app/a.js")
         );
     }
 

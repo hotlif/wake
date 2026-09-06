@@ -11,8 +11,8 @@
 //! 3. **`resolveVirtual`**：把 `.yarn/__virtual__/<hash>/<depth>/…` 虚拟路径映射回真实 zip 路径
 //!    （虚拟目录不物理存在，仅承载 peer 依赖的不同解析）。
 //!
-//! `exports`/`imports` 字段、alias、patch 协议的真实补丁应用留后续；当前覆盖 zip-backed
-//! 常规依赖（React/lodash 等）——它们的入口都是真实文件，走 main/index 即可命中。
+//! `exports`/`imports` 和文件入口由 [`crate::Resolver`] 处理；这里仅决定包位置与依赖可见性。
+//! patch 包内容使用 Yarn 安装结果，不在解析器中重新应用补丁。
 
 use std::path::{Component, Path, PathBuf};
 
