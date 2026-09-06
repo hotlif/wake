@@ -25,6 +25,34 @@ fn empty_and_literals() {
 }
 
 #[test]
+fn async_expression_tails() {
+    for source in [
+        "const f = e => (async function(e) { await e; }(e), true);",
+        "const f = async function() {}.name;",
+        "const f = async function*() {}().next();",
+        "const f = true && async function() {}();",
+        "const f = async function() {} || fallback;",
+        "const f = async(1).value + 2;",
+        "const f = async(1)(2);",
+        "const f = async(1) ? yes : no;",
+        "const f = async instanceof Function;",
+        "const f = async in object;",
+        "const f = async (x) => await x;",
+    ] {
+        with_program(source, |program| assert_eq!(program.body.len(), 1));
+    }
+    with_program("const f = async(1).value + 2;", |program| {
+        let Statement::VariableDeclaration(declaration) = program.body[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            declaration.declarations[0].init,
+            Some(Expression::Binary(_))
+        ));
+    });
+}
+
+#[test]
 fn variable_declarations() {
     with_program("const a = 1, b = 2; let [x, y] = z; var {m, n} = o;", |p| {
         assert_eq!(p.body.len(), 3);

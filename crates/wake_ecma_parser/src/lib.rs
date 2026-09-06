@@ -2,11 +2,13 @@
 //!
 //! DESIGN §4.4：手写递归下降 + Pratt 表达式解析。一遍产出 AST 与依赖列表（[`Dependency`]）。
 //! cover grammar 处理箭头函数；ASI 处理自动分号；上下文用 bitflags 随递归传递。
+//! `async function` 表达式与普通函数表达式共享调用、成员、运算符后缀；
+//! 名为 `async` 的普通调用仅在完整 cover 后出现 `=>` 时解释为异步箭头。
 //!
 //! 入口：[`parse`]。产出 [`ParseOutput`]（自引用 [`ModuleAst`] + 依赖 + 诊断）。
 
 /// Stable parser implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v2";
+pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v3";
 
 mod declaration;
 mod expr;

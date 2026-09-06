@@ -80,28 +80,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if self.at_keyword(Keyword::Async) && !self.peek().newline_before {
             let p = self.peek();
             match p.kind {
-                TokenKind::Keyword(Keyword::Function) => {
-                    self.bump(); // async
-                    return self.parse_function_expression(lo, true);
-                }
+                TokenKind::Keyword(Keyword::Function) => {}
                 TokenKind::LParen => {
+                    let checkpoint = self.generic_arrow_checkpoint();
                     self.bump(); // async
                     let cover = self.parse_cover_paren();
                     let return_type = self.skip_arrow_return_type_if_arrow();
                     if self.at(TokenKind::Arrow) && !self.newline_before() {
                         return self.finish_arrow(lo, cover, true, return_type);
                     }
-                    // 实为调用 `async(args)`。
-                    let callee = Expression::Identifier(self.alloc(Ident::new(
-                        Span::new(lo, lo + 5),
-                        self.interner.intern("async"),
-                    )));
-                    return Expression::Call(self.alloc(CallExpression {
-                        span: self.span_to(lo),
-                        callee,
-                        arguments: cover.items,
-                        optional: false,
-                    }));
+                    // 普通调用必须继续经过完整的 Pratt / call-member 路径。
+                    self.rewind_generic_arrow(checkpoint);
                 }
                 TokenKind::Lt if self.ts => {
                     if let Some(arrow) = self.try_parse_ts_generic_arrow(lo, true) {
@@ -1006,6 +995,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     fn parse_primary_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
         let span = self.cur.span;
+        if self.at_keyword(Keyword::Async)
+            && self.peek().kind == TokenKind::Keyword(Keyword::Function)
+            && !self.peek().newline_before
+        {
+            self.bump(); // async
+            return self.parse_function_expression(lo, true);
+        }
         match self.cur.kind {
             // JSX：表达式起始处的 `<` 解析为 JSX 元素（仅 .jsx/.tsx，DESIGN §4.3）。
             TokenKind::Lt if self.jsx => self.parse_jsx_root(),
