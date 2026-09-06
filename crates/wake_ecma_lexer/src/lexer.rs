@@ -690,6 +690,10 @@ impl<'a> Lexer<'a> {
                 }
             }
             Some(b'u') => {
+                if let Some((_, length)) = surrogate_pair_escape(&self.bytes[self.pos + 1..]) {
+                    self.pos += length + 1;
+                    return;
+                }
                 self.bump();
                 self.scan_unicode_escape_value(lo);
             }
@@ -1244,13 +1248,48 @@ fn parse_number_inner(t: &str) -> f64 {
     t.parse::<f64>().unwrap_or(f64::NAN)
 }
 
+/// Read a pair starting immediately after the first `u`, without accepting isolated code units.
+fn surrogate_pair_escape(bytes: &[u8]) -> Option<(char, usize)> {
+    fn read(bytes: &[u8]) -> Option<(u32, usize)> {
+        let braced = bytes.first() == Some(&b'{');
+        let start = usize::from(braced);
+        let end = if braced {
+            bytes.iter().position(|&byte| byte == b'}')?
+        } else {
+            4
+        };
+        if start == end {
+            return None;
+        }
+        let value = bytes
+            .get(start..end)?
+            .iter()
+            .try_fold(0u32, |value, &digit| {
+                value
+                    .checked_mul(16)?
+                    .checked_add(u32::from(hex_val(digit)?))
+            })?;
+        Some((value, end + usize::from(braced)))
+    }
+    let (high, high_len) = read(bytes)?;
+    if bytes.get(high_len..high_len + 2)? != b"\\u" {
+        return None;
+    }
+    let (low, low_len) = read(&bytes[high_len + 2..])?;
+    if !(0xd800..=0xdbff).contains(&high) || !(0xdc00..=0xdfff).contains(&low) {
+        return None;
+    }
+    char::from_u32(0x10000 + ((high - 0xd800) << 10) + low - 0xdc00)
+        .map(|ch| (ch, high_len + 2 + low_len))
+}
+
 /// 解码字符串内部（不含引号）的转义序列。非法转义尽力保留原字符（错误已在扫描期报出）。
 fn decode_escapes(inner: &str) -> String {
     if !inner.contains('\\') {
         return inner.to_owned();
     }
     let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
+    let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
@@ -1264,9 +1303,11 @@ fn decode_escapes(inner: &str) -> String {
             Some('b') => out.push('\u{0008}'),
             Some('f') => out.push('\u{000C}'),
             Some('v') => out.push('\u{000B}'),
-            Some('0') if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => out.push('\0'),
+            Some('0') if !chars.clone().next().is_some_and(|c| c.is_ascii_digit()) => {
+                out.push('\0')
+            }
             Some('\n') => {}
-            Some('\r') if chars.peek() == Some(&'\n') => {
+            Some('\r') if chars.clone().next() == Some('\n') => {
                 chars.next();
             }
             Some('\r') => {}
@@ -1278,7 +1319,14 @@ fn decode_escapes(inner: &str) -> String {
                 }
             }
             Some('u') => {
-                if chars.peek() == Some(&'{') {
+                if let Some((ch, length)) = surrogate_pair_escape(chars.as_str().as_bytes()) {
+                    for _ in 0..length {
+                        chars.next();
+                    }
+                    out.push(ch);
+                    continue;
+                }
+                if chars.clone().next() == Some('{') {
                     chars.next();
                     let mut v = 0u32;
                     for c in chars.by_ref() {

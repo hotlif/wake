@@ -1,6 +1,8 @@
 //! # wake_ecma_lexer — 字节级词法分析器
 //!
 //! DESIGN §4.3。全量 ES2022 token；parser 驱动 `/` 二义（正则 vs 除号）；ASI 换行标志；错误恢复。
+//! 字符串中相邻的 UTF-16 高低代理项转义必须合并为对应 Unicode 字符，
+//! 与直接字符及 `\u{...}` 写法得到相同值；标识符仍按 Unicode 标量校验。
 //!
 //! 两种用法：
 //! - **parser 驱动**（P2）：逐 token 调 [`Lexer::next`]，由语法上下文传入 `regex_allowed`。
@@ -66,6 +68,41 @@ pub fn regex_allowed_after(prev: Option<TokenKind>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_surrogate_pairs_decode_without_data_loss() {
+        for source in [
+            r#""\ud83d\udc4d""#,
+            r#""\uD83D\uDC4D""#,
+            r#""\u{1f44d}""#,
+            "\"👍\"",
+        ] {
+            let mut lexer = Lexer::new(source);
+            let token = lexer.next(true);
+            assert!(lexer.take_diagnostics().is_empty(), "{source}");
+            assert_eq!(lexer.string_value(token.span), "👍", "{source}");
+        }
+        let source = r#""a\ud83d\udc4d\ud83d\udc4db""#;
+        let mut lexer = Lexer::new(source);
+        let token = lexer.next(true);
+        assert!(lexer.take_diagnostics().is_empty());
+        assert_eq!(lexer.string_value(token.span), "a👍👍b");
+        assert!(!tokenize(r"const \ud83d\udc4d = 1;").1.is_empty());
+    }
+
+    #[test]
+    fn string_surrogate_pairs_support_braced_and_mixed_escapes() {
+        for source in [
+            r#""\u{d83d}\udc4d""#,
+            r#""\ud83d\u{dc4d}""#,
+            r#""\u{000d83d}\u{dc4d}""#,
+        ] {
+            let mut lexer = Lexer::new(source);
+            let token = lexer.next(true);
+            assert!(lexer.take_diagnostics().is_empty(), "{source}");
+            assert_eq!(lexer.string_value(token.span), "👍", "{source}");
+        }
+    }
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         let (toks, diags) = tokenize(src);
