@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.27
+
+- Resolve package-local `#imports` with conditions, wildcard mappings, and Yarn PnP dependency
+  ownership, and stop conditional exports at explicitly blocked `null` targets.
+- Decode adjacent UTF-16 surrogate escapes without losing emoji values, including braced and mixed
+  escape forms. Isolated surrogate code units remain unsupported.
+- Preserve calls, member access, and operators after async function expressions and ordinary calls
+  to functions named `async`.
+- Add readable/minified runtime regression coverage for dependency patch compatibility and invalidate
+  older parser cache entries.
+
 ## 0.1.26
 
 - Replaced the synthetic 2,000-module benchmark with a deterministic Northstar commerce application,
