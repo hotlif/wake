@@ -12,6 +12,36 @@ exports.jsxs = element;
 exports.Fragment = "owned-fragment";
 "#;
 
+#[test]
+fn dependency_patch_compatibility_runtime() {
+    assert_runtime_differential(
+        "dependency-patch-compatibility",
+        &[
+            (
+                "app/package.json",
+                r##"{"imports":{"#platform":{"node":"./node.js","default":"./browser.js"}}}"##,
+            ),
+            ("app/browser.js", "export default 'browser';"),
+            ("app/node.js", "export default 'node';"),
+            (
+                "app/index.js",
+                r##"
+                import platform from '#platform';
+                function async(value) { return {value}; }
+                const emoji = '\ud83d\udc4d';
+                const named = async function named() {}.name;
+                const call = async(40).value + 2;
+                const immediate = e => (async function(e) { return e; }(e), true);
+                export const result = [platform, emoji, emoji.length,
+                    /[\uD800-\uDBFF][\uDC00-\uDFFF]/g.test(emoji), named, call, immediate(1)];
+            "##,
+            ),
+        ],
+        "app/index.js",
+        "__WAKE_EXPORT__{\"result\":[\"browser\",\"👍\",2,true,\"named\",42,true]}",
+    );
+}
+
 fn build(files: &[(&str, &str)], entry: &str, minify: bool, source_map: bool) -> BuildOutput {
     let fs = MemoryFileSystem::new();
     for (path, source) in files {

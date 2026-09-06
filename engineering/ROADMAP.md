@@ -88,6 +88,16 @@ local tarball 和发布后 registry smoke 都覆盖 22.14.0/24/26。发布门禁
 - DESIGN/PLAN/COMPATIBILITY 锚点检查通过；
 - 每个发布系列至少复核一次 AUDIT，旧性能数字没有环境时不得升级为 SLA。
 
+# R6 — JavaScript 字符串码元兼容（P1）
+
+2026-09-06 的 Lexical 补丁排查已修复相邻代理对转义及 async 表达式后缀。
+仍需解决孤立 UTF-16 代理项（例如 `"\ud800"`）：当前 lexer 拒绝它，而 AST 字符串
+使用 UTF-8 Atom，不能仅移除诊断，否则解码会丢失码元。
+
+验收条件：先明确字符串值跨 lexer、AST、优化器和 emitter 的无损表示契约，再覆盖孤立高/低
+代理项、代理对、字符串键、模板 cooked/raw、常量折叠，以及普通/压缩/缓存产物的运行时一致性。
+在对应契约和测试落地前，不宣称完整 UTF-16 字符串兼容。
+
 # 非路线图事项
 
 以下内容没有当前承诺：稳定 Rust 插件 ABI、任意 JS 配置执行、完整 Sass/Less 内建链、冻结 experimental AST schema。提出这些能力前需单独设计、兼容性和安全评审。
