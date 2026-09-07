@@ -8,7 +8,7 @@
 //! 入口：[`parse`]。产出 [`ParseOutput`]（自引用 [`ModuleAst`] + 依赖 + 诊断）。
 
 /// Stable parser implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v3";
+pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v4";
 
 mod declaration;
 mod expr;

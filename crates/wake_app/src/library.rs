@@ -969,6 +969,24 @@ mod tests {
     }
 
     #[test]
+    fn library_declarations_preserve_relational_call_expressions() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "package.json",
+            r#"{"name":"@demo/compare","type":"module"}"#,
+        );
+        fixture.write(
+            "src/index.ts",
+            "export function compare(value: number, scores: Map<string, number>, key: string): boolean { return value < (scores.get(key) ?? Infinity); }",
+        );
+        let result = fixture.build_library().unwrap();
+        assert!(Path::new(&result.declaration_entry).is_file());
+        let declaration = fs::read_to_string(fixture.path("declarations/index.d.ts")).unwrap();
+        assert!(declaration.contains("compare"), "{declaration}");
+        assert!(declaration.contains("boolean"), "{declaration}");
+    }
+
+    #[test]
     fn builds_library_contract_and_replaces_all_outputs_transactionally() {
         let fixture = Fixture::new();
         fixture.write("package.json", r#"{"name":"@demo/button","type":"module"}"#);

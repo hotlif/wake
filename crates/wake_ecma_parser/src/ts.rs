@@ -186,12 +186,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// 试探消费调用/`new`/标签模板处的类型实参 `<A, B>`。仅当其后紧跟 `(`/模板等
-    /// 「可跟在类型实参后的表达式 token」时才认定并保留消费，否则回溯（把 `<` 交回二元小于）。
+    /// 「可跟在类型实参后的表达式 token」且试探没有新增诊断时才保留消费；否则连同诊断和
+    /// 声明事实一起回溯，把 `<` 交回二元小于。缺失 `>` 的调用表达式不能被误认作类型实参。
     pub(crate) fn try_ts_type_arguments(&mut self) -> bool {
         debug_assert!(self.at(TokenKind::Lt));
         let cp = self.checkpoint();
         self.ts_type_arguments();
-        if self.can_follow_type_args_in_expr() {
+        if self.diagnostics.len() == cp.diag_len && self.can_follow_type_args_in_expr() {
             true
         } else {
             self.rewind(cp);

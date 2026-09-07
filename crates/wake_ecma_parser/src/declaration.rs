@@ -2302,6 +2302,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relational_calls_are_not_speculative_type_arguments() {
+        for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+            for expression in [
+                "value < (scores.get(key) ?? Infinity)",
+                "value < (scores.get(key))",
+                "value < scores.get(key)",
+                "value > (scores.get(key) ?? Infinity)",
+                "identity<number>(value) < (scores.get(key) ?? Infinity)",
+            ] {
+                let source = format!(
+                    "export function compare(value: number, scores: Map<string, number>, key: string): boolean {{ if ({expression}) return true; return false; }}"
+                );
+                let result = parse_declaration_facts(&source, source_type);
+                assert!(result.is_ok(), "{source_type:?}: {expression}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
     fn same_line_declarations_are_owned_by_the_main_parser() {
         let facts = parse_declaration_facts(
             "export interface A { value: string } export type B = import('./b').B;",
