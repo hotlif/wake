@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.28
+
+- Include the dependency compatibility fixes listed for 0.1.27, whose release stopped before publishing.
+- Simplify package-scope traversal to pass the release pipeline's pinned Rust 1.95 Clippy checks
+  without changing resolution behavior.
+
 ## 0.1.27
 
 - Resolve package-local `#imports` with conditions, wildcard mappings, and Yarn PnP dependency
