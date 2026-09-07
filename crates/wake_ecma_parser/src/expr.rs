@@ -549,9 +549,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             callee_base = self.parenthesized_expression(callee_base);
         }
         let callee = self.parse_member_tail_no_call(lo, callee_base);
-        // TS：`new C<T>(...)` 的类型实参（仅当其后紧跟 `(` 才认定，避免误吃比较）。
+        // Constructors can omit their argument list: `new C<T>` still owns the type arguments.
         if self.ts && self.at(TokenKind::Lt) {
-            self.try_ts_type_arguments();
+            self.try_ts_constructor_type_arguments();
         }
         let arguments = if self.at(TokenKind::LParen) {
             self.parse_arguments()
@@ -587,6 +587,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     fn parse_member_tail_no_call(&mut self, lo: u32, mut expr: Expression<'a>) -> Expression<'a> {
         loop {
             match self.cur.kind {
+                TokenKind::Lt if self.ts => {
+                    // A generic tag remains inside the constructor's member expression. Other
+                    // type lists belong to the enclosing `new`, including its omitted arguments.
+                    let checkpoint = self.checkpoint();
+                    if self.try_ts_type_arguments()
+                        && matches!(
+                            self.cur.kind,
+                            TokenKind::TemplateNoSub | TokenKind::TemplateHead
+                        )
+                    {
+                        continue;
+                    }
+                    self.rewind(checkpoint);
+                    break;
+                }
                 TokenKind::Bang if self.ts && !self.cur.newline_before => {
                     self.bump();
                 }
@@ -684,7 +699,19 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 }
                 TokenKind::QuestionDot => {
                     self.bump();
+                    // TS type arguments after `?.` unambiguously belong to an optional call;
+                    // erasing them must preserve receiver binding and argument short-circuiting.
                     match self.cur.kind {
+                        TokenKind::Lt if self.ts => {
+                            self.ts_type_arguments();
+                            let arguments = self.parse_arguments();
+                            expr = Expression::Call(self.alloc(CallExpression {
+                                span: self.span_to(lo),
+                                callee: expr,
+                                arguments,
+                                optional: true,
+                            }));
+                        }
                         TokenKind::LParen => {
                             let arguments = self.parse_arguments();
                             expr = Expression::Call(self.alloc(CallExpression {
@@ -731,15 +758,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 TokenKind::Bang if self.ts && !self.cur.newline_before => {
                     self.bump();
                 }
-                // TS：调用/标签模板的类型实参 `expr<T>(...)` / `` expr<T>`...` ``。
-                // 试探跳过平衡角括号，成功且后跟 `(`/模板才擦除；否则回溯，把 `<` 交回给
-                // Pratt 层当二元小于（`a < b`）。这是 `useState<number>(0)` 等高频写法的关键。
+                // TS type arguments may form a call/tag or a standalone instantiation.
+                // Failed or comparison-shaped probes rewind before Pratt consumes `<`.
                 TokenKind::Lt if self.ts => {
-                    // 语法精确的类型实参试探（`f<T>(...)` / `` tag<T>`...` ``）；失败则回溯当二元 `<`。
+                    // Keep a complete, unambiguous type list; otherwise parse a comparison.
                     if !self.try_ts_type_arguments() {
                         break;
                     }
-                    // 成功：cur 现在是 `(` 或模板头，交由下一轮循环处理调用。
+                    // Continue with a call/tag/optional call, or finish the standalone value.
                 }
                 TokenKind::LParen => {
                     if preserve_optional_chain {
@@ -1330,6 +1356,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
+    /// Object methods can start their TypeScript signature with type parameters before `(`.
+    /// This includes computed keys and ordinary methods named `async`, `get`, or `set`;
+    /// a colon still starts a property value expression, where `<` remains an operator.
     fn parse_object_property(&mut self) -> &'a ObjectProperty<'a> {
         let lo = self.start();
 
@@ -1361,7 +1390,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let (key, computed) = self.parse_property_key();
 
         // 方法（含 get/set/async/generator）。
-        if self.at(TokenKind::LParen) || kind != PropertyKind::Init || is_async || is_generator {
+        if self.at(TokenKind::LParen)
+            || (self.ts && self.at(TokenKind::Lt))
+            || kind != PropertyKind::Init
+            || is_async
+            || is_generator
+        {
             let (func, _) = self.parse_method_function(
                 lo,
                 is_async,
@@ -2163,14 +2197,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 前瞻：get/set/async 后是否直接跟键结束标记（即它们本身是键，而非修饰符）。
     fn peek_is_key_terminator(&mut self) -> bool {
-        matches!(
-            self.peek().kind,
-            TokenKind::Colon
-                | TokenKind::Comma
-                | TokenKind::RBrace
-                | TokenKind::LParen
-                | TokenKind::Eq
-        )
+        let kind = self.peek().kind;
+        (self.ts && kind == TokenKind::Lt)
+            || matches!(
+                kind,
+                TokenKind::Colon
+                    | TokenKind::Comma
+                    | TokenKind::RBrace
+                    | TokenKind::LParen
+                    | TokenKind::Eq
+            )
     }
 }
 

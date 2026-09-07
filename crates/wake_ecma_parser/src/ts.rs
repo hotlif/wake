@@ -157,6 +157,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 类型实参 `<A, B>`（非试探，假设当前 `<`）。用于 `expr as Foo<T>`、`extends Base<T>` 等。
     pub(crate) fn ts_type_arguments(&mut self) {
+        self.ts_type_arguments_inner(false);
+    }
+
+    fn ts_type_arguments_inner(&mut self, expression: bool) {
         if !self.at(TokenKind::Lt) {
             return;
         }
@@ -182,17 +186,41 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if strict && !saw_argument && !reported_missing_argument {
             self.error_expected("类型实参");
         }
-        self.consume_type_gt();
+        if expression && !self.at(TokenKind::Gt) {
+            self.error_expected("类型实参闭合的 `>`");
+        } else {
+            self.consume_type_gt();
+        }
     }
 
-    /// 试探消费调用/`new`/标签模板处的类型实参 `<A, B>`。仅当其后紧跟 `(`/模板等
-    /// 「可跟在类型实参后的表达式 token」且试探没有新增诊断时才保留消费；否则连同诊断和
-    /// 声明事实一起回溯，把 `<` 交回二元小于。缺失 `>` 的调用表达式不能被误认作类型实参。
+    /// Speculatively erase call, constructor, tag, or standalone instantiation type arguments.
+    /// The outer closing token must be a complete `>`; splitting `>=` or `>>` here would steal a
+    /// comparison/shift operator. Nested type lists may still split their own closing tokens.
+    /// Keep the parse only with an unambiguous follower and no new diagnostics; otherwise rewind
+    /// tokens, diagnostics, and declaration facts together, including an absent closing `>`.
     pub(crate) fn try_ts_type_arguments(&mut self) -> bool {
+        self.try_ts_type_arguments_with_context(false)
+    }
+
+    /// `new C<T>` owns its type arguments even when the optional argument list is absent and
+    /// followed by a comparison or unary-capable binary operator, e.g. `new C<T> + value`.
+    pub(crate) fn try_ts_constructor_type_arguments(&mut self) -> bool {
+        self.try_ts_type_arguments_with_context(true)
+    }
+
+    fn try_ts_type_arguments_with_context(&mut self, constructor: bool) -> bool {
         debug_assert!(self.at(TokenKind::Lt));
         let cp = self.checkpoint();
-        self.ts_type_arguments();
-        if self.diagnostics.len() == cp.diag_len && self.can_follow_type_args_in_expr() {
+        self.ts_type_arguments_inner(true);
+        if self.diagnostics.len() == cp.diag_len
+            && (constructor || self.can_follow_type_args_in_expr())
+        {
+            if self.at(TokenKind::Dot)
+                || (self.at(TokenKind::QuestionDot)
+                    && !matches!(self.peek().kind, TokenKind::LParen | TokenKind::Lt))
+            {
+                self.error(self.cur.span, "类型实例化表达式必须加括号后才能访问属性");
+            }
             true
         } else {
             self.rewind(cp);
@@ -200,12 +228,55 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    /// 类型实参之后、能表明这是「带类型实参的调用/标签模板」的 token。
+    /// A call/tag starts immediately; other followers may end an instantiation expression.
+    /// Prefer a comparison when the following token can begin its RHS. In particular `+`/`-`
+    /// remain unary RHS starters even across a newline, and `<`/`>` keep chained comparisons.
     fn can_follow_type_args_in_expr(&self) -> bool {
-        matches!(
-            self.cur.kind,
-            TokenKind::LParen | TokenKind::TemplateNoSub | TokenKind::TemplateHead
-        )
+        match self.cur.kind {
+            TokenKind::LParen | TokenKind::TemplateNoSub | TokenKind::TemplateHead => return true,
+            TokenKind::Lt | TokenKind::Gt | TokenKind::Plus | TokenKind::Minus => return false,
+            _ => {}
+        }
+        if self.newline_before() || self.at_keyword(Keyword::As) || self.at_contextual("satisfies")
+        {
+            return true;
+        }
+        let starts_expression = match self.cur.kind {
+            TokenKind::Ident
+            | TokenKind::PrivateIdent
+            | TokenKind::Number
+            | TokenKind::Str
+            | TokenKind::BigInt
+            | TokenKind::Regex
+            | TokenKind::LBrace
+            | TokenKind::LBracket
+            | TokenKind::Bang
+            | TokenKind::Tilde
+            | TokenKind::PlusPlus
+            | TokenKind::MinusMinus => true,
+            TokenKind::Keyword(keyword) => {
+                !keyword.is_reserved()
+                    || matches!(
+                        keyword,
+                        Keyword::This
+                            | Keyword::Super
+                            | Keyword::New
+                            | Keyword::Function
+                            | Keyword::Class
+                            | Keyword::Import
+                            | Keyword::True
+                            | Keyword::False
+                            | Keyword::Null
+                            | Keyword::Typeof
+                            | Keyword::Void
+                            | Keyword::Delete
+                            | Keyword::Await
+                            | Keyword::Yield
+                    )
+            }
+            _ => false,
+        };
+        !starts_expression
     }
 
     // ==================================================================

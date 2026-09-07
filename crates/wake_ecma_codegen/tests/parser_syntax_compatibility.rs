@@ -117,3 +117,65 @@ globalThis.result = run();
         "[7,9,11,3]",
     );
 }
+
+#[test]
+fn generic_optional_calls_preserve_receiver_and_short_circuit_arguments() {
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        assert_runtime(
+            r#"
+let calls = 0;
+const value = () => { calls++; return 7; };
+const object = { base: 1, method: function<T>(n: T) { return [this.base, n]; } };
+const absent = null as typeof object.method | null;
+const absentObject = null as typeof object | null;
+const first = object.method?.<number>(value());
+const second = absent?.<number>(value());
+const third = absentObject?.method<number>(value());
+const fourth = (object?.method)?.<number>(value());
+globalThis.result = [first, second, third, fourth, calls];
+"#,
+            source_type,
+            "[[1,7],null,null,[1,7],2]",
+        );
+    }
+}
+
+#[test]
+fn standalone_instantiations_and_bare_constructors_preserve_runtime() {
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        assert_runtime(
+            r#"
+function identity<T>(value: T): T { return value; }
+const numberIdentity = identity<number>;
+const functions = [identity<string>, identity<number>];
+class Box<T> { value = 7; valueOf() { return this.value; } }
+const bare = new Box<Map<string, number>>;
+const sum = new Box<number> + 2;
+const greater = new Box<number> > 6;
+const a=1, b=2, c=3;
+const comparisons = [a < b > c, a < b >= c, a < b >> c, a < b >>> c, a < b > +c, a < b > -c];
+globalThis.result = [numberIdentity(7), functions[0]('ok'), functions[1](8), bare.value, sum, greater, comparisons];
+"#,
+            source_type,
+            r#"[7,"ok",8,7,9,true,[false,false,false,false,false,true]]"#,
+        );
+    }
+}
+
+#[test]
+fn generic_constructor_tag_keeps_types_inside_its_member_expression() {
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        assert_runtime(
+            r#"
+function tag<T>(strings: TemplateStringsArray, value: T) {
+  return class { value = value; };
+}
+const first = new tag<number>`ok${7}`;
+const second = new tag<string>`ok${'x'}`();
+globalThis.result = [first.value, second.value];
+"#,
+            source_type,
+            r#"[7,"x"]"#,
+        );
+    }
+}

@@ -25,6 +25,233 @@ fn empty_and_literals() {
 }
 
 #[test]
+fn standalone_type_arguments_and_bare_generic_constructors() {
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        for source in [
+            "const specialized = fn<number>;",
+            "const values = [fn<number>, fn<string>];",
+            "const name = (fn<number>).name;",
+            "const result = fn<number> && other;",
+            "const result = fn<number> * other;",
+            "const result = fn<number> in other;",
+            "const result = fn<number> instanceof Function;",
+            "const result = fn<number> as unknown;",
+            "const result = fn<number> satisfies Function;",
+            "const result = fn<number>\nnext();",
+            "const instance = new C<number>;",
+            "const instance = new C<Map<string, number>>;",
+            "const result = new C<number> + other;",
+            "const result = new C<number> > other;",
+        ] {
+            let interner = Interner::new();
+            let parsed = parse(source, &interner, source_type);
+            assert!(
+                !parsed.has_errors(),
+                "{source_type:?}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            let facts = crate::parse_declaration_facts(source, source_type);
+            assert!(facts.is_ok(), "{source_type:?}: {source}: {facts:?}");
+        }
+    }
+}
+
+#[test]
+fn bare_generic_constructor_owns_types_before_binary_operators() {
+    for operator in ["+", "-", ">", "<", "instanceof"] {
+        let source = format!("new C<number> {operator} other;");
+        let interner = Interner::new();
+        let parsed = parse(&source, &interner, SourceType::TypeScript);
+        assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+        parsed.module.with_ast(|program| {
+            let Statement::Expression(statement) = program.body[0] else {
+                panic!()
+            };
+            let Expression::Binary(binary) = statement.expression else {
+                panic!("{source}")
+            };
+            assert!(
+                matches!(binary.left, Expression::New(_)),
+                "{source}: {:?}",
+                binary.left
+            );
+        });
+    }
+}
+
+#[test]
+fn instantiation_requires_grouping_before_property_access() {
+    for source in [
+        "fn<T>.name;",
+        "fn<T>?.name;",
+        "fn<T>?.[key];",
+        "new C<T>.name;",
+    ] {
+        let interner = Interner::new();
+        assert!(
+            parse(source, &interner, SourceType::TypeScript).has_errors(),
+            "{source}"
+        );
+    }
+    for source in [
+        "(fn<T>).name;",
+        "(fn<T>)?.name;",
+        "fn<T>?.();",
+        "fn<T>?.<U>();",
+    ] {
+        let interner = Interner::new();
+        let parsed = parse(source, &interner, SourceType::TypeScript);
+        assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+    }
+}
+
+#[test]
+fn type_argument_speculation_preserves_comparisons_and_shift_tokens() {
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        for expression in [
+            "a < b > c",
+            "a < b >= c",
+            "a < b >> c",
+            "a < b >>> c",
+            "a < b > +c",
+            "a < b > -c",
+            "a < b >\n+c",
+            "a < b >\n-c",
+            "a < (values.get(key) ?? Infinity)",
+            "a < ((read() ?? Infinity))",
+        ] {
+            let source = format!("const result = {expression};");
+            let interner = Interner::new();
+            let parsed = parse(&source, &interner, source_type);
+            assert!(
+                !parsed.has_errors(),
+                "{source_type:?}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            parsed.module.with_ast(|program| {
+                let Statement::VariableDeclaration(declaration) = program.body[0] else {
+                    panic!()
+                };
+                assert!(
+                    matches!(
+                        declaration.declarations[0].init,
+                        Some(Expression::Binary(_))
+                    ),
+                    "{source}"
+                );
+            });
+            let facts = crate::parse_declaration_facts(&source, source_type);
+            assert!(facts.is_ok(), "{source_type:?}: {source}: {facts:?}");
+        }
+    }
+}
+
+#[test]
+fn object_generic_methods() {
+    for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+        for (method, is_async, is_generator, computed) in [
+            (
+                "method<T>(value: T): T { return value; }",
+                false,
+                false,
+                false,
+            ),
+            (
+                "async method<T>(value: T) { return await value; }",
+                true,
+                false,
+                false,
+            ),
+            ("*method<T>(value: T) { yield value; }", false, true, false),
+            (
+                "async *method<T>(value: T) { yield await value; }",
+                true,
+                true,
+                false,
+            ),
+            (
+                "[key]<T>(value: T): T { return value; }",
+                false,
+                false,
+                true,
+            ),
+            (
+                "async [key]<T>(value: T) { return await value; }",
+                true,
+                false,
+                true,
+            ),
+            ("*[key]<T>(value: T) { yield value; }", false, true, true),
+            (
+                "async<T>(value: T): T { return value; }",
+                false,
+                false,
+                false,
+            ),
+            ("get<T>(value: T): T { return value; }", false, false, false),
+            ("set<T>(value: T): T { return value; }", false, false, false),
+        ] {
+            let source = format!("const object = {{ {method} }};");
+            let output = parse(&source, &Interner::new(), source_type);
+            assert!(!output.has_errors(), "{source}: {:?}", output.diagnostics);
+            output.module.with_ast(|program| {
+                let Statement::VariableDeclaration(declaration) = program.body[0] else {
+                    panic!("object variable");
+                };
+                let Some(Expression::Object(object)) = declaration.declarations[0].init else {
+                    panic!("object initializer");
+                };
+                let ObjectMember::Property(property) = object.properties[0] else {
+                    panic!("object method");
+                };
+                let Expression::Function(function) = property.value else {
+                    panic!("method function");
+                };
+                assert_eq!(function.is_async, is_async, "{source}");
+                assert_eq!(function.is_generator, is_generator, "{source}");
+                assert_eq!(property.computed, computed, "{source}");
+                assert_eq!(property.kind, PropertyKind::Init, "{source}");
+                assert!(property.method, "{source}");
+                assert_eq!(function.params.len(), 1, "{source}");
+                assert!(function.body.is_some(), "{source}");
+            });
+        }
+
+        for expression in ["a < b > c", "a < b >= c", "a < b >> c"] {
+            let source = format!("const object = {{ value: {expression} }};");
+            let output = parse(&source, &Interner::new(), source_type);
+            assert!(!output.has_errors(), "{source}: {:?}", output.diagnostics);
+            output.module.with_ast(|program| {
+                let Statement::VariableDeclaration(declaration) = program.body[0] else {
+                    panic!("object variable");
+                };
+                let Some(Expression::Object(object)) = declaration.declarations[0].init else {
+                    panic!("object initializer");
+                };
+                let ObjectMember::Property(property) = object.properties[0] else {
+                    panic!("value property");
+                };
+                assert!(!property.method, "{source}");
+                assert!(matches!(property.value, Expression::Binary(_)), "{source}");
+            });
+        }
+
+        let invalid = parse(
+            "const object = { method<T>: value };",
+            &Interner::new(),
+            source_type,
+        );
+        assert!(invalid.has_errors());
+    }
+    let javascript = parse(
+        "const object = { method<T>(value) {} };",
+        &Interner::new(),
+        SourceType::Module,
+    );
+    assert!(javascript.has_errors());
+}
+
+#[test]
 fn async_expression_tails() {
     for source in [
         "const f = e => (async function(e) { await e; }(e), true);",
