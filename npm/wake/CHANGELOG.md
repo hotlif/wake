@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.32
+
+- Preserve template interpolation text and tagged-template raw values during minification.
+- Keep constructor non-null assertions and tagged templates attached to the correct `new`
+  expression, including generic tags and constructor argument evaluation order.
+- Support generic optional calls, standalone TypeScript instantiations, constructors without
+  argument parentheses, and generic object methods; retain comparison and shift semantics.
+- Accept function-type predicates and ordinary type properties named `new` during declaration
+  generation, including TSX source graphs.
+- Preserve shorthand destructuring assignment defaults through typed IR validation and renaming.
+- Support private-field brand checks with lexical diagnostics, nested-class private-name
+  ownership, RHS evaluation and exceptions, and required `for` initializer grouping.
+- Invalidate earlier parser, optimizer, and code-generation cache entries.
+
 ## 0.1.31
 
 - Fix library declaration generation rejecting valid comparisons such as
