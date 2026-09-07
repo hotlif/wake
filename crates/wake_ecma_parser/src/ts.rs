@@ -609,6 +609,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         is_fn
     }
 
+    /// Function-type returns accept the same type predicates as return annotations, including
+    /// `value is T`, `asserts value is T`, and `this` predicates. Signature parameter bindings
+    /// remain active while collecting references from the return type.
     fn ts_function_type(&mut self) {
         let type_scope = self.declaration_type_scope_mark();
         let value_scope = self.declaration_value_scope_mark();
@@ -627,7 +630,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
         }
         self.expect(TokenKind::Arrow);
-        self.ts_type();
+        self.ts_type_or_predicate();
         self.declaration_restore_value_scope(value_scope);
         self.declaration_restore_type_scope(type_scope);
     }
@@ -685,6 +688,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.expect(TokenKind::RBrace);
     }
 
+    /// `new` starts a construct signature only before a parameter or type-parameter list;
+    /// otherwise it is an ordinary property name, including optional properties and methods.
     fn ts_declaration_type_member(&mut self) -> bool {
         let type_scope = self.declaration_type_scope_mark();
         let mapped = self.ts_declaration_type_member_inner();
@@ -722,7 +727,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.ts_declaration_member_signature(true);
             return false;
         }
-        if self.at_keyword(Keyword::New) {
+        if self.at_keyword(Keyword::New)
+            && matches!(self.peek().kind, TokenKind::LParen | TokenKind::Lt)
+        {
             self.bump();
             self.ts_declaration_member_signature(true);
             return false;

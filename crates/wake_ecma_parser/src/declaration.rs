@@ -2302,6 +2302,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn function_type_returns_accept_type_and_assertion_predicates() {
+        for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+            for source in [
+                "export type Guard = (value: unknown) => value is string;",
+                "export type Assert = (value: unknown) => asserts value is string;",
+                "export type Truthy = (value: unknown) => asserts value;",
+                "export type ThisGuard = (this: unknown) => this is string;",
+                "export type ThisAssert = (this: unknown) => asserts this is string;",
+                "export type GenericGuard = <T>(value: unknown) => value is T;",
+                "export type NestedGuard = { test: (value: unknown) => value is string };",
+            ] {
+                let parsed = crate::parse(source, &Interner::new(), source_type);
+                assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+                let facts = parse_declaration_facts(source, source_type).unwrap();
+                assert_eq!(facts.items().len(), 1, "{source}");
+                validate_declaration_module(source, source_type).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn function_type_predicates_keep_parameter_bindings_and_type_references_distinct() {
+        let facts = parse_declaration_facts(
+            r#"
+                import { value } from './shadowed-value.js';
+                import type { Model } from './model.js';
+                export type Guard = (value: unknown) => value is Model;
+                export type Assert = (value: unknown) => asserts value is Model;
+                export type LocalQuery = (value: unknown) => value is typeof value;
+            "#,
+            SourceType::TypeScript,
+        )
+        .unwrap();
+        let requests = facts.requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].specifier(), "./model.js");
+    }
+
+    #[test]
+    fn declaration_type_members_distinguish_new_properties_and_construct_signatures() {
+        for source_type in [SourceType::TypeScript, SourceType::Tsx] {
+            for members in [
+                "new: string;",
+                "new?: string;",
+                "new?(): boolean;",
+                "new?<T>(value: T): T;",
+                "'new'(): boolean;",
+                "new (value: string): object;",
+                "new <T>(value: T): object;",
+                "readonly new: string;",
+            ] {
+                for source in [
+                    format!("export type Public = {{ {members} }};"),
+                    format!("export interface Public {{ {members} }}"),
+                ] {
+                    let parsed = crate::parse(&source, &Interner::new(), source_type);
+                    assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+                    let facts = parse_declaration_facts(&source, source_type).unwrap();
+                    assert_eq!(facts.items().len(), 1, "{source}");
+                    validate_declaration_module(&source, source_type).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_and_new_member_validation_still_rejects_incomplete_types() {
+        for source in [
+            "export type Guard = (value: unknown) => value is;",
+            "export type Assert = (value: unknown) => asserts value is;",
+            "export type ThisGuard = (this: unknown) => this is;",
+            "export type Public = { new: };",
+            "export type Public = { new?: };",
+            "export type Public = { new?<T>(value: T): };",
+            "export type Public = { new <T>: T };",
+            "export type Public = { new (value: string): };",
+            "export type Public = { new: string = run() };",
+        ] {
+            assert!(
+                validate_declaration_module_allow_any(source, SourceType::TypeScript).is_err(),
+                "invalid declaration unexpectedly validated: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn relational_calls_are_not_speculative_type_arguments() {
         for source_type in [SourceType::TypeScript, SourceType::Tsx] {
             for expression in [
