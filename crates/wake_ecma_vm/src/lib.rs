@@ -266,6 +266,9 @@ impl Vm {
         }
     }
 
+    /// Bound each script evaluation and event-loop drain. A fired deadline is reported as
+    /// [`VmErrorKind::Timeout`] even when engine completion races with termination; termination
+    /// is cleared before returning so the caller can recover in the same realm.
     pub fn set_execution_timeout(&mut self, timeout: Option<Duration>) {
         self.execution_timeout = timeout;
     }
@@ -513,6 +516,9 @@ impl Vm {
             .runtime
             .execute_script(source_name(&source.path), source.code.clone());
         let timed_out = deadline.finish();
+        if let Some(error) = self.take_deadline_timeout(source, timed_out) {
+            return Err(error);
+        }
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
@@ -521,9 +527,7 @@ impl Vm {
                 if terminated {
                     self.runtime.v8_isolate().cancel_terminate_execution();
                 }
-                let kind = if timed_out {
-                    VmErrorKind::Timeout
-                } else if terminated {
+                let kind = if terminated {
                     VmErrorKind::Terminated
                 } else {
                     VmErrorKind::Exception
@@ -543,6 +547,9 @@ impl Vm {
             .reactor
             .block_on(self.runtime.run_event_loop(Default::default()));
         let timed_out = deadline.finish();
+        if let Some(error) = self.take_deadline_timeout(source, timed_out) {
+            return Err(error);
+        }
         result.map_err(|error| {
             let message = error.to_string();
             let terminated = message.contains("execution terminated");
@@ -550,9 +557,7 @@ impl Vm {
                 self.runtime.v8_isolate().cancel_terminate_execution();
             }
             VmError::new(
-                if timed_out {
-                    VmErrorKind::Timeout
-                } else if terminated {
+                if terminated {
                     VmErrorKind::Terminated
                 } else {
                     VmErrorKind::Exception
@@ -561,6 +566,20 @@ impl Vm {
                 message,
             )
         })
+    }
+
+    fn take_deadline_timeout(&mut self, source: &ScriptSource, timed_out: bool) -> Option<VmError> {
+        if !timed_out {
+            return None;
+        }
+        // The deadline worker has joined, so a late termination cannot leak into the next action,
+        // even when the engine returned success just before the worker fired.
+        self.runtime.v8_isolate().cancel_terminate_execution();
+        Some(VmError::new(
+            VmErrorKind::Timeout,
+            source.path.clone(),
+            "JavaScript execution exceeded its deadline",
+        ))
     }
 
     fn value_to_string(
@@ -769,6 +788,35 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(recovered, r#"["next"]"#);
+    }
+
+    #[test]
+    fn async_timer_deadline_race_preserves_completion_or_recoverable_timeout() {
+        let mut vm = Vm::new();
+        vm.register_json_host_function("__wakeHostCall", |request| Ok(request.to_owned()))
+            .unwrap();
+        for iteration in 0..100 {
+            vm.set_execution_timeout(None);
+            let source = ScriptSource::new(
+                "timer-race.js",
+                format!(
+                    "globalThis.completed = false; __wakeVmSleep({iteration}, 5).then(() => completed = true)"
+                ),
+            );
+            vm.eval(&source).unwrap();
+            vm.set_execution_timeout(Some(Duration::from_millis(5)));
+            let result = vm.run_jobs(&source);
+            vm.set_execution_timeout(Some(Duration::from_secs(1)));
+            let completed = vm
+                .execute(&ScriptSource::new("after-race.js", "String(completed)"))
+                .unwrap_or_else(|error| {
+                    panic!("iteration {iteration}, drain {result:?}: {error:?}")
+                });
+            match result {
+                Ok(()) => assert_eq!(completed, "true", "iteration {iteration}"),
+                Err(error) => assert_eq!(error.kind, VmErrorKind::Timeout),
+            }
+        }
     }
 
     #[test]

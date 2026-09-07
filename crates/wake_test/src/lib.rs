@@ -6836,6 +6836,8 @@ environment = "dom"
         let result = run_tests(options(fixture.path())).unwrap();
 
         assert!(!result.success, "{result:#?}");
+        assert_eq!(result.suites.len(), 1, "{result:#?}");
+        assert_eq!(result.suites[0].tests.len(), 2, "{result:#?}");
         assert_eq!(
             result.suites[0].tests[0].status,
             TestStatus::Failed,
