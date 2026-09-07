@@ -494,6 +494,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.parse_call_member_tail(lo, expr, mode, true)
     }
 
+    /// A constructor's member expression includes tagged templates and erased TS non-null tails.
+    /// Consume those before deciding which argument list belongs to `new`; ordinary calls remain
+    /// in the outer call/member parser so constructing a value never introduces an extra call.
     fn parse_new_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
         self.bump(); // new
@@ -559,10 +562,24 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    /// 只解析成员访问（`.x` / `[x]`），不解析调用——用于 `new` 的 callee。
+    /// Parse a constructor member expression, including tags and erased TS non-null assertions,
+    /// without consuming an ordinary argument list (which belongs to the surrounding `new`).
     fn parse_member_tail_no_call(&mut self, lo: u32, mut expr: Expression<'a>) -> Expression<'a> {
         loop {
             match self.cur.kind {
+                TokenKind::Bang if self.ts && !self.cur.newline_before => {
+                    self.bump();
+                }
+                TokenKind::TemplateNoSub | TokenKind::TemplateHead => {
+                    let Expression::TemplateLiteral(quasi) = self.parse_template_literal() else {
+                        unreachable!("template parser always produces a template literal")
+                    };
+                    expr = Expression::TaggedTemplate(self.alloc(TaggedTemplateExpression {
+                        span: self.span_to(lo),
+                        tag: expr,
+                        quasi,
+                    }));
+                }
                 TokenKind::Dot => {
                     self.bump();
                     let property = self.parse_member_property();
