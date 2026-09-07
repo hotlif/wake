@@ -5328,6 +5328,107 @@ mod tests {
         }
     }
 
+    /// Keep the allowed-fetch endpoint alive for the browser run, including graph compilation
+    /// and browser startup. The case timeout bounds fetch; a separate wall-clock server timeout
+    /// would close the endpoint before slower hosts reach the case. Cancellation also joins the
+    /// server when setup or a test assertion unwinds before normal completion.
+    struct AllowedFetchServer {
+        address: std::net::SocketAddr,
+        cancellation: std::sync::mpsc::Sender<()>,
+        worker: Option<std::thread::JoinHandle<bool>>,
+    }
+
+    impl AllowedFetchServer {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (cancellation, cancelled) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = [0_u8; 4096];
+                            let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                            let request = String::from_utf8_lossy(&request[..read]);
+                            assert!(request.starts_with("GET /allowed "), "{request}");
+                            std::io::Write::write_all(
+                            &mut stream,
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\naccess-control-allow-origin: *\r\ncontent-length: 7\r\nconnection: close\r\n\r\nallowed",
+                        )
+                        .unwrap();
+                            return true;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            match cancelled.recv_timeout(std::time::Duration::from_millis(10)) {
+                                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    return false;
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            }
+                        }
+                        Err(error) => panic!("could not accept browser request: {error}"),
+                    }
+                }
+            });
+            Self {
+                address,
+                cancellation,
+                worker: Some(worker),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/allowed", self.address)
+        }
+
+        fn finish(mut self) -> std::thread::Result<bool> {
+            let _ = self.cancellation.send(());
+            self.worker
+                .take()
+                .expect("server has not been joined")
+                .join()
+        }
+    }
+
+    impl Drop for AllowedFetchServer {
+        fn drop(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                let _ = self.cancellation.send(());
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[test]
+    fn allowed_fetch_server_can_stop_without_a_request() {
+        let server = AllowedFetchServer::start();
+        assert!(!server.finish().unwrap());
+    }
+
+    #[test]
+    fn allowed_fetch_server_serves_one_real_request() {
+        let server = AllowedFetchServer::start();
+        let mut stream = std::net::TcpStream::connect(server.address).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut stream,
+            b"GET /allowed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).unwrap();
+        let served = server.finish().unwrap();
+        assert!(served);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.ends_with("\r\n\r\nallowed"), "{response}");
+    }
+
     fn stored_zip(entries: &[(&str, &str)]) -> Vec<u8> {
         struct Record {
             name: String,
@@ -8026,39 +8127,8 @@ environment = "dom"
     #[test]
     #[ignore = "requires an installed system Chromium browser"]
     fn chromium_executes_the_same_wake_graph_and_returns_browser_metadata() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let allow_url = format!("http://{}/allowed", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                            .unwrap();
-                        let mut request = [0_u8; 4096];
-                        let read = std::io::Read::read(&mut stream, &mut request).unwrap();
-                        let request = String::from_utf8_lossy(&request[..read]);
-                        assert!(request.starts_with("GET /allowed "), "{request}");
-                        std::io::Write::write_all(
-                            &mut stream,
-                            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\naccess-control-allow-origin: *\r\ncontent-length: 7\r\nconnection: close\r\n\r\nallowed",
-                        )
-                        .unwrap();
-                        return;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "browser never continued allowed fetch"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("could not accept browser request: {error}"),
-                }
-            }
-        });
+        let server = AllowedFetchServer::start();
+        let allow_url = server.url();
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -8286,9 +8356,11 @@ environment = "dom"
         )
         .unwrap();
 
-        let result = run_tests(options(fixture.path())).unwrap();
+        let result = run_tests(options(fixture.path()));
+        let served = server.finish().unwrap();
+        let result = result.unwrap();
         assert!(result.success, "{result:#?}");
-        server.join().unwrap();
+        assert!(served, "browser never continued allowed fetch");
         assert_eq!(result.environment.kind, TestEnvironmentKind::Browser);
         let browser = result.environment.browser.expect("browser metadata");
         assert!(!browser.version.is_empty());
