@@ -987,6 +987,46 @@ mod tests {
     }
 
     #[test]
+    fn library_declarations_accept_type_predicates_and_generic_expressions() {
+        for extension in ["ts", "tsx"] {
+            let fixture = Fixture::new();
+            fixture.write("package.json", r#"{"name":"@demo/syntax","type":"module"}"#);
+            fixture.write("src/index.ts", "export * from './syntax.js';");
+            fixture.write(
+                &format!("src/syntax.{extension}"),
+                r#"
+export type Guard = (value: unknown) => value is string;
+export type Assert = (value: unknown) => asserts value is string;
+export interface Named { new: string; }
+export function run(): unknown {
+  function identity<T>(value: T): T { return value; }
+  const specialized = identity<number>;
+  const object = { method<T>(value: T): T { return value; } };
+  class Box<T> {
+    #value = 7;
+    has(value: object): boolean { return #value in value; }
+  }
+  const box = new Box<number>;
+  return [specialized(7), object.method?.<number>(8), box.has(box)];
+}
+"#,
+            );
+            let result = fixture.build_library().unwrap();
+            assert!(Path::new(&result.cjs_entry).is_file());
+            let declaration =
+                fs::read_to_string(fixture.path("declarations/_wake/src/syntax.d.ts")).unwrap();
+            for fragment in [
+                "value is string",
+                "asserts value is string",
+                "new: string",
+                "run()",
+            ] {
+                assert!(declaration.contains(fragment), "{extension}: {declaration}");
+            }
+        }
+    }
+
+    #[test]
     fn builds_library_contract_and_replaces_all_outputs_transactionally() {
         let fixture = Fixture::new();
         fixture.write("package.json", r#"{"name":"@demo/button","type":"module"}"#);

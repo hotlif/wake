@@ -19,6 +19,18 @@ status = "stable"
 
 Wake npm 主包按当前平台加载对应原生包。缺少平台产物时抛出 `WAKE_UNSUPPORTED_PLATFORM`。
 
+## JavaScript 与 TypeScript 语法
+
+普通和压缩构建保留模板字符串的文本、标签模板的 raw 值、构造调用的结合关系及解构默认值的惰性求值。
+私有字段存在性检查 `#name in value` 按类的词法作用域解析；右侧为基本类型时保留 JavaScript 的 `TypeError`。
+
+TypeScript 类型擦除支持泛型可选调用 `fn?.<T>()`、独立实例化 `const specialized = fn<T>`、
+省略参数括号的泛型构造 `new C<T>` 和对象泛型方法。实例化后访问属性需要先分组，例如 `(fn<T>).name`。
+比较与移位表达式不会因类型实参试探而被擦除。
+
+声明生成支持函数类型的 `value is T`、`asserts value is T` 返回谓词，以及名为 `new` 的普通类型属性。
+上述语法与 TSX 共用解析边界；这不表示支持全部 TypeScript 类型检查或任意第三方语法插件。
+
 ## 依赖安装布局
 
 Wake 同时支持 npm 生成的经典 `node_modules` 与 Yarn 4 Plug'n'Play。没有 `.pnp.cjs` 时，Wake 按
