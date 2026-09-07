@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.29
+
+- Include the dependency compatibility and release-check fixes listed for 0.1.27 and 0.1.28,
+  which stopped before publishing.
+- Report a VM timeout and clear termination when the deadline races with successful engine
+  completion, allowing later test cases to continue in the same realm.
+- Cover timer/deadline races and retain suite diagnostics when timeout regression results are empty.
+
 ## 0.1.28
 
 - Include the dependency compatibility fixes listed for 0.1.27, whose release stopped before publishing.
