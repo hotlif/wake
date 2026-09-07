@@ -1688,6 +1688,9 @@ impl<'program> TypedEmitter<'program> {
         }
     }
 
+    /// Preserve template raw text exactly (WAKE-COMPATIBILITY M6): the `${` boundary belongs
+    /// to the template token, so JavaScript token-separator rules must not add raw whitespace.
+    /// Expressions inside each substitution still use normal token separation and mappings.
     fn emit_template(&mut self, _id: NodeId, quasis: ListId, expressions: ListId) {
         let quasi_count = self.items(quasis).len();
         let expression_count = self.items(expressions).len();
@@ -1696,7 +1699,8 @@ impl<'program> TypedEmitter<'program> {
             let quasi = self.items(quasis)[index];
             self.emit_node(quasi);
             if index < expression_count {
-                self.syntax("${");
+                self.mark_unmapped();
+                self.raw("${");
                 let expression = self.items(expressions)[index];
                 self.emit_expr(expression, P_SEQUENCE);
                 self.syntax("}");

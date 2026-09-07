@@ -4091,6 +4091,36 @@ fn optimized_bundled_fixture(
 }
 
 #[test]
+fn typed_ir_codegen_preserves_template_raw_boundaries() {
+    for template in [
+        r#"`word${value}`"#,
+        r#"`0${value}`"#,
+        r#"`_${value}`"#,
+        r#"`$${value}`"#,
+        r#"`+${value}`"#,
+        r#"`-${value}`"#,
+        r#"`/${value}`"#,
+        r#"` ${value}`"#,
+        r#"`${value}`"#,
+        r#"`中${value}`"#,
+        r#"`\n${value}`"#,
+        r#"`x${value}y${value}z`"#,
+        r#"`x${`y${value}`}z`"#,
+        r#"inspect`x\n${value}y${value}`"#,
+    ] {
+        let source = format!("sink({template});");
+        for minify in [false, true] {
+            let (plain, mapped, _) = typed_codegen_fixture(&source, SourceType::Script, minify);
+            assert_eq!(plain, mapped, "mapping changed template bytes: {template}");
+            assert!(
+                plain.contains(template),
+                "template raw text changed (minify={minify}): {template}\n{plain}"
+            );
+        }
+    }
+}
+
+#[test]
 fn typed_ir_codegen_groups_problematic_expression_statement_prefixes() {
     for source in [
         "(function(value){return value})(1);",

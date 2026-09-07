@@ -315,6 +315,40 @@ try{{
 }
 
 #[test]
+fn typed_pipeline_template_raw_text_and_expression_separators_match_source() {
+    let source = r#"
+function inspect(strings,...values){return {raw:strings.raw,cooked:[...strings],values}}
+function render(value,other){
+  return [
+    `x${value}`,
+    `x${`y${value}`}z`,
+    inspect`x\n${value}y${other}`,
+    inspect`0${value}_${other}$${value}`,
+    inspect`+${value}-${other}/${value} ${other}${value}`,
+    inspect`中${value}`,
+    `sum${value+ +other}difference${value- -other}type${typeof value}regex${/x/.test("x")}`
+  ];
+}
+globalThis.__wake_result=render(7,2);
+"#;
+    let build = build_typed(source, SourceType::Script);
+    assert_eq!(build.optimized, build.mapped);
+    assert_reparses("template-raw-readable", &build.readable);
+    assert_reparses("template-raw-optimized", &build.optimized);
+    if node_available() {
+        let expected = execute_in_node(source);
+        assert!(expected.contains("\"kind\":\"return\""));
+        for generated in [&build.readable, &build.optimized] {
+            assert_eq!(
+                execute_in_node(generated),
+                expected,
+                "template raw text or substitution token semantics changed:\n{generated}"
+            );
+        }
+    }
+}
+
+#[test]
 fn typed_pipeline_corpus_reparses_maps_inertly_and_matches_readable_runtime() {
     let run_node = node_available();
     let node_supports_explicit_resource_management =
