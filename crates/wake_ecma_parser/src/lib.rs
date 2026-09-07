@@ -8,11 +8,12 @@
 //! 入口：[`parse`]。产出 [`ParseOutput`]（自引用 [`ModuleAst`] + 依赖 + 诊断）。
 
 /// Stable parser implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v4";
+pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v5";
 
 mod declaration;
 mod expr;
 mod jsx;
+mod private_names;
 mod stmt;
 mod ts;
 mod ts_value;
@@ -248,6 +249,9 @@ pub(crate) struct Parser<'a, 'src, const LOWER: bool> {
     line_starts: OnceCell<Vec<u32>>,
     /// 本模块顶层是否出现过 `await` / `for await`（见 [`ParseOutput::has_top_level_await`]）。
     has_top_level_await: bool,
+    /// Conservative trigger for private-brand lexical validation. Speculation may leave this
+    /// true after rewind; that only adds a harmless validation pass over the final AST.
+    saw_private_in: bool,
     diagnostics: Vec<Diagnostic>,
     dependencies: Vec<Dependency>,
     /// Installed only by `parse_declaration_facts`/`validate_declaration_module`; ordinary builds
@@ -322,6 +326,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             jsx: source_type.is_jsx(),
             jsx_runtime_usage: AutomaticJsxUsage::default(),
             has_top_level_await: false,
+            saw_private_in: false,
             diagnostics: Vec::new(),
             dependencies: Vec::new(),
             declaration: None,
@@ -695,6 +700,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         program.span = self.span_to(lo);
         let lex_diags = self.lexer.take_diagnostics();
         self.diagnostics.extend(lex_diags);
+        if self.saw_private_in {
+            private_names::validate(&program, &mut self.diagnostics);
+        }
         program
     }
 

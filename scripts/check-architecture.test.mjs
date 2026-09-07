@@ -198,7 +198,7 @@ test('generated JavaScript remains output-only at the bundler emit boundary', ()
   )
   assert.match(
     optimizer,
-    /pub const PIPELINE_VERSION:\s*&str\s*=\s*"wake-closure-minifier-v15"/,
+    /pub const PIPELINE_VERSION:\s*&str\s*=\s*"wake-closure-minifier-v16"/,
     'changing retained request identity must invalidate optimized artifacts',
   )
   assert.doesNotMatch(

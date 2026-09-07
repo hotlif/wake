@@ -9,7 +9,7 @@
 //! 入口：[`codegen`]（默认 dev 可读风格）。往返 `parse → codegen → parse` 语义等价（见测试）。
 
 /// Stable emitter implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-codegen-v1";
+pub const PIPELINE_VERSION: &str = "wake-ecma-codegen-v2";
 
 use std::error::Error;
 use std::fmt::{self, Write as _};
@@ -1083,8 +1083,8 @@ impl<'i> Codegen<'i> {
                 self.push("for (");
                 if let Some(init) = &s.init {
                     match init {
-                        ForInit::Variable(d) => self.emit_var_decl(d),
-                        ForInit::Expression(e) => self.emit_expr(e, P_SEQUENCE),
+                        ForInit::Variable(d) => self.emit_var_decl_in_context(d, true),
+                        ForInit::Expression(e) => self.emit_no_in_expr(e, P_SEQUENCE),
                     }
                 }
                 self.punct("; ");
@@ -1235,6 +1235,10 @@ impl<'i> Codegen<'i> {
     }
 
     fn emit_var_decl(&mut self, d: &VariableDeclaration) {
+        self.emit_var_decl_in_context(d, false);
+    }
+
+    fn emit_var_decl_in_context(&mut self, d: &VariableDeclaration, no_in: bool) {
         self.push(d.kind.as_str());
         self.sp();
         for (i, decl) in d.declarations.iter().enumerate() {
@@ -1244,8 +1248,23 @@ impl<'i> Codegen<'i> {
             self.emit_pattern(&decl.id);
             if let Some(init) = &decl.init {
                 self.punct(" = ");
-                self.emit_expr(init, P_ASSIGN);
+                if no_in {
+                    self.emit_no_in_expr(init, P_ASSIGN);
+                } else {
+                    self.emit_expr(init, P_ASSIGN);
+                }
             }
+        }
+    }
+
+    fn emit_no_in_expr(&mut self, expression: &Expression, min_precedence: u8) {
+        let wrap = contains_in_operator(expression);
+        if wrap {
+            self.push("(");
+        }
+        self.emit_expr(expression, min_precedence);
+        if wrap {
+            self.push(")");
         }
     }
 
@@ -2065,6 +2084,12 @@ impl<'i> Codegen<'i> {
                 self.binop(b.operator.as_str());
                 self.emit_expr(&b.right, right_min);
             }
+            Expression::PrivateIn(p) => {
+                self.push("#");
+                self.push(&self.name(p.name.name));
+                self.binop("in");
+                self.emit_expr(&p.right, P_RELATIONAL + 1);
+            }
             Expression::Logical(l) => {
                 let prec = logical_prec(l.operator);
                 let group_left =
@@ -2349,6 +2374,40 @@ fn starts_with_problematic(expr: &Expression) -> bool {
     }
 }
 
+/// Protect relational expressions from a surrounding `for-in` delimiter. Nested function,
+/// class and literal contexts establish their own grammar and need no extra grouping here.
+fn contains_in_operator(expression: &Expression) -> bool {
+    match expression {
+        Expression::PrivateIn(_) => true,
+        Expression::Binary(binary) => {
+            binary.operator == BinaryOperator::In
+                || contains_in_operator(&binary.left)
+                || contains_in_operator(&binary.right)
+        }
+        Expression::Logical(logical) => {
+            contains_in_operator(&logical.left) || contains_in_operator(&logical.right)
+        }
+        Expression::Assignment(assignment) => {
+            contains_in_operator(&assignment.left) || contains_in_operator(&assignment.right)
+        }
+        Expression::Conditional(conditional) => {
+            contains_in_operator(&conditional.test)
+                || contains_in_operator(&conditional.consequent)
+                || contains_in_operator(&conditional.alternate)
+        }
+        Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_in_operator),
+        Expression::Yield(yield_expression) => yield_expression
+            .argument
+            .as_ref()
+            .is_some_and(contains_in_operator),
+        Expression::Arrow(arrow) => match &arrow.body {
+            ArrowBody::Expression(expression) => contains_in_operator(expression),
+            ArrowBody::Block(_) => false,
+        },
+        _ => false,
+    }
+}
+
 fn same_name(a: &ModuleExportName, b: &ModuleExportName) -> bool {
     match (a, b) {
         (ModuleExportName::Ident(x), ModuleExportName::Ident(y)) => x.name == y.name,
@@ -2412,6 +2471,7 @@ fn expr_precedence(expr: &Expression) -> u8 {
         Expression::Conditional(_) => P_CONDITIONAL,
         Expression::Logical(l) => logical_prec(l.operator),
         Expression::Binary(b) => binary_prec(b.operator),
+        Expression::PrivateIn(_) => P_RELATIONAL,
         Expression::Unary(_) | Expression::Await(_) | Expression::Spread(_) => P_UNARY,
         Expression::Update(u) => {
             if u.prefix {

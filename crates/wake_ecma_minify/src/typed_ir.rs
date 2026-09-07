@@ -271,6 +271,7 @@ pub enum ChildRole {
     Arguments,
     Object,
     MemberProperty,
+    PrivateName,
     SequenceItems,
     Tag,
     Template,
@@ -619,6 +620,12 @@ pub enum IrNodeData {
         left: NodeId,
         right: NodeId,
     },
+    /// Lexical private-brand name plus a sole evaluated RHS; primitive RHS values may throw.
+    /// The name participates in private-property planning and is never a variable reference.
+    PrivateInExpression {
+        name: NodeId,
+        right: NodeId,
+    },
     LogicalExpression {
         operator: LogicalOperator,
         left: NodeId,
@@ -946,6 +953,7 @@ fn is_presemantic_inert_initializer(expression: Expression<'_>) -> bool {
         | Expression::Class(_)
         | Expression::Update(_)
         | Expression::Binary(_)
+        | Expression::PrivateIn(_)
         | Expression::Logical(_)
         | Expression::Assignment(_)
         | Expression::Conditional(_)
@@ -2217,6 +2225,11 @@ impl TypedProgram {
                     return Err(invalid("identifier must own an identifier-syntax name"));
                 }
             }
+            IrNodeData::PrivateInExpression { name, .. } => {
+                if !self.name_node_has_syntax(*name, NameSyntax::PrivateIdentifier) {
+                    return Err(invalid("private-brand check must own a private name"));
+                }
+            }
             IrNodeData::MetaProperty { meta, property } => {
                 if !self.name_node_has_syntax(*meta, NameSyntax::Keyword)
                     || !self.name_node_has_syntax(*property, NameSyntax::Identifier)
@@ -2503,6 +2516,7 @@ impl TypedProgram {
                 | IrNodeData::UnaryExpression { .. }
                 | IrNodeData::UpdateExpression { .. }
                 | IrNodeData::BinaryExpression { .. }
+                | IrNodeData::PrivateInExpression { .. }
                 | IrNodeData::LogicalExpression { .. }
                 | IrNodeData::AssignmentExpression { .. }
                 | IrNodeData::ConditionalExpression { .. }
@@ -3059,6 +3073,7 @@ impl IrNodeData {
             | Self::UnaryExpression { .. }
             | Self::UpdateExpression { .. }
             | Self::BinaryExpression { .. }
+            | Self::PrivateInExpression { .. }
             | Self::LogicalExpression { .. }
             | Self::AssignmentExpression { .. }
             | Self::ConditionalExpression { .. }
@@ -3167,6 +3182,7 @@ fn role_accepts(role: ChildRole, category: NodeCategory) -> bool {
         | R::MetaKeyword
         | R::MetaProperty
         | R::ModuleSource => matches!(category, C::Name | C::Expression),
+        R::PrivateName => category == C::Name,
         R::FunctionBody => category == C::FunctionBody,
         R::ArrowBody => matches!(category, C::FunctionBody | C::Expression | C::Identifier),
         R::ClassMembers => category == C::ClassMember,
@@ -3362,6 +3378,10 @@ impl IrNodeData {
             | Self::LogicalExpression { left, right, .. }
             | Self::AssignmentExpression { left, right, .. } => {
                 child!(R::Left, left);
+                child!(R::Right, right);
+            }
+            Self::PrivateInExpression { name, right } => {
+                child!(R::PrivateName, name);
                 child!(R::Right, right);
             }
             Self::ConditionalExpression {
@@ -3643,6 +3663,10 @@ impl IrNodeData {
                 slot!(left);
                 slot!(right);
             }
+            Self::PrivateInExpression { name, right } => {
+                slot!(name);
+                slot!(right);
+            }
             Self::ConditionalExpression {
                 test,
                 consequent,
@@ -3841,6 +3865,7 @@ impl IrNodeData {
             | Self::UnaryExpression { .. }
             | Self::UpdateExpression { .. }
             | Self::BinaryExpression { .. }
+            | Self::PrivateInExpression { .. }
             | Self::LogicalExpression { .. }
             | Self::AssignmentExpression { .. }
             | Self::ConditionalExpression { .. }
@@ -4920,6 +4945,14 @@ impl Lowerer<'_> {
                         left,
                         right,
                     },
+                )
+            }
+            Expression::PrivateIn(private) => {
+                let name = self.ident(private.name, NameRole::PrivateProperty);
+                let right = self.expression(&private.right, NameRole::Reference);
+                self.finish(
+                    private.span,
+                    IrNodeData::PrivateInExpression { name, right },
                 )
             }
             Expression::Logical(logical) => {

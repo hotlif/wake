@@ -44,7 +44,7 @@ fn public_optimize_returns_only_valid_owned_typed_state() {
 
 #[test]
 fn pass_order_is_an_explicit_stable_contract() {
-    assert_eq!(PIPELINE_VERSION, "wake-closure-minifier-v15");
+    assert_eq!(PIPELINE_VERSION, "wake-closure-minifier-v16");
     assert_eq!(
         ONE_TIME_PASS_ORDER,
         &[

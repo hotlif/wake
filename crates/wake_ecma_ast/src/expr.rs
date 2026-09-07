@@ -1,4 +1,9 @@
 //! 表达式节点与运算符。复合节点用 `&'a T`，[`Expression`] 本体 ≤ 16 字节。
+//!
+//! Private-brand checks (`#name in object`) retain a lexical private name separately from the
+//! sole evaluated operand. They have relational precedence, evaluate the right side once, and
+//! may throw on primitive right sides even when the boolean result is unused. Private names
+//! are never represented as ordinary identifier references (WAKE-COMPATIBILITY M5/M6).
 
 use wake_common::{Atom, Span};
 
@@ -33,6 +38,7 @@ pub enum Expression<'a> {
     Unary(&'a UnaryExpression<'a>),
     Update(&'a UpdateExpression<'a>),
     Binary(&'a BinaryExpression<'a>),
+    PrivateIn(&'a PrivateInExpression<'a>),
     Logical(&'a LogicalExpression<'a>),
     Assignment(&'a AssignmentExpression<'a>),
     Conditional(&'a ConditionalExpression<'a>),
@@ -75,6 +81,7 @@ impl Expression<'_> {
             Unary(u) => u.span,
             Update(u) => u.span,
             Binary(b) => b.span,
+            PrivateIn(p) => p.span,
             Logical(l) => l.span,
             Assignment(a) => a.span,
             Conditional(c) => c.span,
@@ -277,6 +284,15 @@ pub struct BinaryExpression<'a> {
     pub span: Span,
     pub operator: BinaryOperator,
     pub left: Expression<'a>,
+    pub right: Expression<'a>,
+}
+
+/// A lexical private-brand check, not a binary operation on two evaluated expressions.
+#[derive(Debug)]
+pub struct PrivateInExpression<'a> {
+    pub span: Span,
+    /// The spelling excludes the syntactic `#`, as for private member/property names.
+    pub name: Ident,
     pub right: Expression<'a>,
 }
 

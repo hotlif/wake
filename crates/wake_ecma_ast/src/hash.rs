@@ -121,6 +121,7 @@ impl<'a> Visit<'a> for HashFold {
             Expression::NumberLiteral(n) => self.mix_u64(n.value.to_bits()),
             Expression::StringLiteral(s) => self.mix_u64(s.value.as_u32() as u64),
             Expression::BooleanLiteral(b) => self.mix_u64(b.value as u64),
+            Expression::PrivateIn(p) => self.mix_u64(p.name.name.as_u32() as u64),
             Expression::BigIntLiteral(b) => self.mix_u64(b.raw.as_u32() as u64),
             Expression::RegExpLiteral(r) => {
                 self.mix_u64(r.pattern.as_u32() as u64);

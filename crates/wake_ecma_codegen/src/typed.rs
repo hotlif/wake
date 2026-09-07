@@ -517,7 +517,15 @@ impl<'program> TypedEmitter<'program> {
                 self.emit_node(binding);
                 if let Some(initializer) = initializer {
                     self.syntax(" = ");
+                    let wrap_in = self.is_for_initializer_declarator(id)
+                        && self.contains_in_operator(initializer);
+                    if wrap_in {
+                        self.syntax("(");
+                    }
                     self.emit_expr(initializer, P_ASSIGN);
+                    if wrap_in {
+                        self.syntax(")");
+                    }
                 }
             }
             IrNodeData::Function {
@@ -792,6 +800,12 @@ impl<'program> TypedEmitter<'program> {
                 left,
                 right,
             } => self.emit_binary(id, operator, left, right),
+            IrNodeData::PrivateInExpression { name, right } => {
+                self.syntax("#");
+                self.emit_node(name);
+                self.binop(id, "in");
+                self.emit_expr(right, P_RELATIONAL + 1);
+            }
             IrNodeData::LogicalExpression {
                 operator,
                 left,
@@ -1087,6 +1101,19 @@ impl<'program> TypedEmitter<'program> {
         }
     }
 
+    fn is_for_initializer_declarator(&self, id: NodeId) -> bool {
+        let Some(declaration) = self.node(id).parent().map(|link| link.parent()) else {
+            return false;
+        };
+        self.node(declaration).parent().is_some_and(|link| {
+            matches!(
+                self.node(link.parent()).data(),
+                IrNodeData::ForStatement { initializer: Some(initializer), .. }
+                    if *initializer == declaration
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_function(
         &mut self,
@@ -1350,6 +1377,7 @@ impl<'program> TypedEmitter<'program> {
 
     fn contains_in_operator(&self, id: NodeId) -> bool {
         match self.node(id).data() {
+            IrNodeData::PrivateInExpression { .. } => true,
             IrNodeData::BinaryExpression {
                 operator: BinaryOperator::In,
                 ..
@@ -1363,6 +1391,14 @@ impl<'program> TypedEmitter<'program> {
                 .items(*expressions)
                 .iter()
                 .any(|expression| self.contains_in_operator(*expression)),
+            IrNodeData::YieldExpression { argument, .. } => {
+                argument.is_some_and(|argument| self.contains_in_operator(argument))
+            }
+            IrNodeData::ArrowFunction {
+                body,
+                body_kind: ArrowBodyKind::Expression,
+                ..
+            } => self.contains_in_operator(*body),
             IrNodeData::ConditionalExpression {
                 test,
                 consequent,
@@ -1465,6 +1501,7 @@ impl<'program> TypedEmitter<'program> {
             IrNodeData::ConditionalExpression { .. } => P_CONDITIONAL,
             IrNodeData::LogicalExpression { operator, .. } => logical_precedence(*operator),
             IrNodeData::BinaryExpression { operator, .. } => binary_precedence(*operator),
+            IrNodeData::PrivateInExpression { .. } => P_RELATIONAL,
             IrNodeData::UnaryExpression { .. }
             | IrNodeData::AwaitExpression { .. }
             | IrNodeData::SpreadElement { .. } => P_UNARY,

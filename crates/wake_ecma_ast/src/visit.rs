@@ -202,6 +202,7 @@ pub fn walk_expression<'a, V: Visit<'a>>(v: &mut V, node: &Expression<'a>) {
             v.visit_expression(&b.left);
             v.visit_expression(&b.right);
         }
+        PrivateIn(p) => v.visit_expression(&p.right),
         Logical(l) => {
             v.visit_expression(&l.left);
             v.visit_expression(&l.right);

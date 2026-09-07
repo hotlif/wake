@@ -531,6 +531,7 @@ impl<'a> Visit<'a> for AstCoverage {
                 });
                 "binary"
             }
+            Expression::PrivateIn(_) => "private-in",
             Expression::Logical(logical) => {
                 self.logical_operators.insert(match logical.operator {
                     LogicalOperator::And => "and",
@@ -856,8 +857,9 @@ class Everything extends Parent {
   static staticMethod(): number { return this.staticField; }
   #privateMethod(): number { return this.#privateField; }
   readPrivate(): number { return this.#privateMethod(); }
+  static hasPrivate(value: object): boolean { return #privateField in value && #privateMethod in value; }
 }
-export const observation = new Everything().readPrivate() + Everything.staticMethod();
+export const observation = Everything.hasPrivate(new Everything()) && new Everything().readPrivate() + Everything.staticMethod();
 "#,
 )];
 
@@ -1289,6 +1291,7 @@ fn matrix_covers_every_ast_enum_variant_and_operator() {
             "unary",
             "update",
             "binary",
+            "private-in",
             "logical",
             "assignment",
             "conditional",

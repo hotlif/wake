@@ -1029,6 +1029,13 @@ impl<'program> Analyzer<'program> {
                 }
                 effect
             }
+            IrNodeData::PrivateInExpression { name, right } => {
+                self.visit(name, RequestedAccess::Default);
+                let mut effect = self.visit(right, RequestedAccess::Read);
+                // Brand checking does not coerce the RHS, but primitives always throw.
+                effect.may_throw = true;
+                effect
+            }
             IrNodeData::LogicalExpression {
                 operator: _,
                 left,
@@ -1392,6 +1399,7 @@ impl<'program> Analyzer<'program> {
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -1563,6 +1571,7 @@ impl<'program> Analyzer<'program> {
             IrNodeData::NumberLiteral { .. } => Some(DefinitePrimitiveKind::Number),
             IrNodeData::StringLiteral { .. } => Some(DefinitePrimitiveKind::String),
             IrNodeData::BooleanLiteral { .. } => Some(DefinitePrimitiveKind::Boolean),
+            IrNodeData::PrivateInExpression { .. } => Some(DefinitePrimitiveKind::Boolean),
             IrNodeData::NullLiteral => Some(DefinitePrimitiveKind::Null),
             IrNodeData::BigIntLiteral { .. } => Some(DefinitePrimitiveKind::BigInt),
             IrNodeData::TemplateLiteral { expressions, .. } => self
@@ -1722,6 +1731,7 @@ impl<'program> Analyzer<'program> {
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -2354,6 +2364,7 @@ impl<'program, 'analysis> CfgBuilder<'program, 'analysis> {
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }

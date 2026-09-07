@@ -213,7 +213,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_binary_expression(&mut self, min_prec: u8) -> Expression<'a> {
         let lo = self.start();
-        let mut left = self.parse_unary_expression();
+        let mut left = if self.at(TokenKind::PrivateIdent) && min_prec <= 8 && self.ctx.allow_in {
+            self.parse_private_in_expression()
+        } else {
+            self.parse_unary_expression()
+        };
 
         let features = self.options.transform_features;
         loop {
@@ -289,6 +293,22 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             let _ = logical;
         }
         left
+    }
+
+    /// `PrivateIdentifier in ShiftExpression` is only a relational-expression production.
+    /// Keeping it out of primary/unary parsing rejects bare names and higher-precedence uses.
+    fn parse_private_in_expression(&mut self) -> Expression<'a> {
+        self.saw_private_in = true;
+        let span = self.cur.span;
+        self.bump();
+        let name = self.intern_ident(Span::new(span.lo + 1, span.hi));
+        self.expect(TokenKind::Keyword(Keyword::In));
+        let right = self.parse_binary_expression(9);
+        Expression::PrivateIn(self.alloc(PrivateInExpression {
+            span: self.span_to(span.lo),
+            name: Ident::new(span, name),
+            right,
+        }))
     }
 
     /// 读取当前 token 对应的二元/逻辑运算符与优先级。`in` 在 `!allow_in` 时不作运算符。

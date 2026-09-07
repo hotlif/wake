@@ -433,6 +433,13 @@ impl<'dst> ProgramCloner<'dst> {
                     right: self.expression(expression.right),
                 }))
             }
+            Expression::PrivateIn(expression) => {
+                Expression::PrivateIn(self.arena.alloc(PrivateInExpression {
+                    span: expression.span,
+                    name: expression.name,
+                    right: self.expression(expression.right),
+                }))
+            }
             Expression::Logical(expression) => {
                 Expression::Logical(self.arena.alloc(LogicalExpression {
                     span: expression.span,

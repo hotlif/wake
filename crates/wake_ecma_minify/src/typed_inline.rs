@@ -393,6 +393,7 @@ fn plan_closed_functions(
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -776,6 +777,7 @@ fn specialization_body_is_observable(
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -939,6 +941,7 @@ fn primitive_profile(program: &TypedProgram, node: NodeId) -> Option<(PrimitiveK
         | IrNodeData::ObjectProperty { .. }
         | IrNodeData::UpdateExpression { .. }
         | IrNodeData::BinaryExpression { .. }
+        | IrNodeData::PrivateInExpression { .. }
         | IrNodeData::LogicalExpression { .. }
         | IrNodeData::AssignmentExpression { .. }
         | IrNodeData::ConditionalExpression { .. }
@@ -1081,6 +1084,7 @@ fn plan_locals_and_dce(
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -1489,6 +1493,7 @@ fn declaration_is_unread_and_removable(
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -2033,6 +2038,7 @@ mod tests {
                 | IrNodeData::UnaryExpression { .. }
                 | IrNodeData::UpdateExpression { .. }
                 | IrNodeData::BinaryExpression { .. }
+                | IrNodeData::PrivateInExpression { .. }
                 | IrNodeData::LogicalExpression { .. }
                 | IrNodeData::AssignmentExpression { .. }
                 | IrNodeData::ConditionalExpression { .. }
@@ -2142,6 +2148,7 @@ mod tests {
                 | IrNodeData::UnaryExpression { .. }
                 | IrNodeData::UpdateExpression { .. }
                 | IrNodeData::BinaryExpression { .. }
+                | IrNodeData::PrivateInExpression { .. }
                 | IrNodeData::LogicalExpression { .. }
                 | IrNodeData::AssignmentExpression { .. }
                 | IrNodeData::ConditionalExpression { .. }

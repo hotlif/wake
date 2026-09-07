@@ -24,7 +24,7 @@ impl From<wake_ecma_ast::DependencyKind> for ModuleRequestKind {
 }
 
 /// Bump whenever pass semantics, ordering, or fingerprint inputs change.
-pub const PIPELINE_VERSION: &str = "wake-closure-minifier-v15";
+pub const PIPELINE_VERSION: &str = "wake-closure-minifier-v16";
 pub const MAX_FIXED_POINT_ITERATIONS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

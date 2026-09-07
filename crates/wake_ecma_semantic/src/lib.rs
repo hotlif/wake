@@ -747,6 +747,7 @@ impl Resolver {
                 self.visit_expression(&b.left);
                 self.visit_expression(&b.right);
             }
+            Expression::PrivateIn(p) => self.visit_expression(&p.right),
             Expression::Logical(l) => {
                 self.visit_expression(&l.left);
                 self.visit_expression(&l.right);

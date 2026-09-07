@@ -46,7 +46,7 @@ origin 提供源位置，改名 occurrence 通过 V3 `names` 保留原标识符�
 
 ## M4e — 压缩语义边界
 
-`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v13`），不要求第二个
+`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v16`），不要求第二个
 名字优化开关，也不因模块源码长度改变行为。这里的“Closure 风格”只表示 Wake 对 pass 排序、变更跟踪和收敛模型的架构选择；
 不兼容 Closure `ADVANCED`、Closure modules、externs、类型优化、全局属性 flattening 或逐字输出。
 普通 ESM/CommonJS、公开成员和宿主协议按 Wake 的局部可证明安全边界保留。实现只使用 workspace

@@ -474,6 +474,7 @@ fn is_expression_occurrence(program: &TypedProgram, node: NodeId) -> bool {
         | IrNodeData::UnaryExpression { .. }
         | IrNodeData::UpdateExpression { .. }
         | IrNodeData::BinaryExpression { .. }
+        | IrNodeData::PrivateInExpression { .. }
         | IrNodeData::LogicalExpression { .. }
         | IrNodeData::AssignmentExpression { .. }
         | IrNodeData::ConditionalExpression { .. }
@@ -598,6 +599,7 @@ fn is_statement_occurrence(program: &TypedProgram, node: NodeId) -> bool {
         | IrNodeData::UnaryExpression { .. }
         | IrNodeData::UpdateExpression { .. }
         | IrNodeData::BinaryExpression { .. }
+        | IrNodeData::PrivateInExpression { .. }
         | IrNodeData::LogicalExpression { .. }
         | IrNodeData::AssignmentExpression { .. }
         | IrNodeData::ConditionalExpression { .. }
@@ -700,6 +702,7 @@ fn is_binding_occurrence(program: &TypedProgram, node: NodeId) -> bool {
         | ChildRole::Arguments
         | ChildRole::Object
         | ChildRole::MemberProperty
+        | ChildRole::PrivateName
         | ChildRole::SequenceItems
         | ChildRole::Tag
         | ChildRole::Template

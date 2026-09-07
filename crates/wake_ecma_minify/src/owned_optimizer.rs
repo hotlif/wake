@@ -328,6 +328,7 @@ fn is_semantic_free_trivial_owner(program: &TypedProgram) -> bool {
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }

@@ -238,7 +238,7 @@ Generation filesystem 仅对每个精确路径拼写的 `read_to_string`、`read
 压缩器版本、defines/drop flags、链接活跃性、可信编辑和包装器保留名参与优化身份；图、优化器指纹与持久任务
 都用稳定的声明保留名、公开观察名、star specifier/ordinal、精确转发名和 opaque 排除名作为身份，解析得到的 `SymbolId` 只在当前 optimizer 调用内有效。optimizer key 不含最终
 chunk 编号，retained edges 收敛后才形成 final-layout body key；map 开关不进入二者。当前
-`wake-closure-minifier-v15` 与缓存 schema 13 使旧压缩缓存自然失效。持久层除 JavaScript 与 mapping
+`wake-closure-minifier-v16` 与缓存 schema 13 使旧压缩缓存自然失效。持久层除 JavaScript 与 mapping
 facts 外，只保存 codegen 生成的目标字面量字节区间、稳定 request specifier/role，以及与 body 配对的
 collision-free runtime 参数名和真实的 `metaUrl` runtime capability；default/star interop 已由 typed
 finalizer 内联，不存在 compact helper capability；optimizer

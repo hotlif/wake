@@ -12,8 +12,8 @@ use wake_ecma_semantic::{DeclKind, SymbolId};
 
 use crate::typed_analysis::{TypedAnalysis, TypedScopeId};
 use crate::typed_ir::{
-    ClassContext, FunctionContext, IrNodeData, ListId, NameId, NameRole, NodeId, PropertyKeyKind,
-    TypedIrError, TypedProgram,
+    ChildRole, ClassContext, FunctionContext, IrNodeData, ListId, NameId, NameRole, NodeId,
+    PropertyKeyKind, TypedIrError, TypedProgram,
 };
 
 const RUNTIME_NAMES: &[&str] = &[
@@ -494,6 +494,7 @@ impl Metadata {
                 | IrNodeData::UnaryExpression { .. }
                 | IrNodeData::UpdateExpression { .. }
                 | IrNodeData::BinaryExpression { .. }
+                | IrNodeData::PrivateInExpression { .. }
                 | IrNodeData::LogicalExpression { .. }
                 | IrNodeData::ConditionalExpression { .. }
                 | IrNodeData::NewExpression { .. }
@@ -624,6 +625,7 @@ fn is_anonymous_runtime_value(program: &TypedProgram, node: NodeId) -> bool {
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }
@@ -705,6 +707,7 @@ fn static_property_spelling(program: &TypedProgram, node: NodeId) -> Option<Stri
         | IrNodeData::UnaryExpression { .. }
         | IrNodeData::UpdateExpression { .. }
         | IrNodeData::BinaryExpression { .. }
+        | IrNodeData::PrivateInExpression { .. }
         | IrNodeData::LogicalExpression { .. }
         | IrNodeData::AssignmentExpression { .. }
         | IrNodeData::ConditionalExpression { .. }
@@ -1100,6 +1103,7 @@ fn symbol_rename_does_not_grow(
                 | IrNodeData::UnaryExpression { .. }
                 | IrNodeData::UpdateExpression { .. }
                 | IrNodeData::BinaryExpression { .. }
+                | IrNodeData::PrivateInExpression { .. }
                 | IrNodeData::LogicalExpression { .. }
                 | IrNodeData::AssignmentExpression { .. }
                 | IrNodeData::ConditionalExpression { .. }
@@ -1282,6 +1286,7 @@ fn plan_private_names(
                 | IrNodeData::UnaryExpression { .. }
                 | IrNodeData::UpdateExpression { .. }
                 | IrNodeData::BinaryExpression { .. }
+                | IrNodeData::PrivateInExpression { .. }
                 | IrNodeData::LogicalExpression { .. }
                 | IrNodeData::AssignmentExpression { .. }
                 | IrNodeData::ConditionalExpression { .. }
@@ -1343,9 +1348,41 @@ fn plan_private_names(
         }
     }
 
+    // A nested class can capture an outer private name. Reserve both original and already
+    // planned spellings in overlapping class environments, including unrenamed declarations,
+    // so shortening two different brands never makes the inner declaration capture the outer.
+    let mut overlapping = BTreeMap::<NodeId, BTreeSet<usize>>::new();
+    for (index, class) in classes.iter().enumerate() {
+        if class.declarations.is_empty() {
+            continue;
+        }
+        let node = class.node.expect("private class node");
+        overlapping.entry(node).or_default().insert(index);
+        let mut cursor = parent_node(program, node);
+        while let Some(parent) = cursor {
+            if let Some(&ancestor) = class_indices.get(&parent)
+                && !classes[ancestor].declarations.is_empty()
+            {
+                overlapping.entry(node).or_default().insert(ancestor);
+                overlapping.entry(parent).or_default().insert(index);
+            }
+            cursor = parent_node(program, parent);
+        }
+    }
+    let mut planned = BTreeMap::<NodeId, BTreeSet<String>>::new();
     let mut renamed = 0usize;
-    for class in classes.iter().filter(|class| !class.invalid) {
-        let occupied = class.declarations.keys().cloned().collect::<BTreeSet<_>>();
+    for class in classes
+        .iter()
+        .filter(|class| !class.invalid && !class.declarations.is_empty())
+    {
+        let node = class.node.expect("private class node");
+        let mut occupied = BTreeSet::new();
+        for &other in overlapping.get(&node).expect("private class overlap plan") {
+            let other = &classes[other];
+            let other_node = other.node.expect("private class node");
+            occupied.extend(other.declarations.keys().cloned());
+            occupied.extend(planned.get(&other_node).into_iter().flatten().cloned());
+        }
         let mut generated = BTreeSet::new();
         let mut ordered = class.occurrences.iter().collect::<Vec<_>>();
         ordered.sort_unstable_by(|(left, left_occurrences), (right, right_occurrences)| {
@@ -1374,6 +1411,7 @@ fn plan_private_names(
             }
             renamed += 1;
         }
+        planned.insert(node, generated);
     }
     renamed
 }
@@ -1385,13 +1423,20 @@ fn nearest_declaring_class(
     indices: &BTreeMap<NodeId, usize>,
     classes: &[PrivateClassPlan],
 ) -> Option<usize> {
+    let mut child_role = None;
     loop {
         if let Some(&class) = indices.get(&node)
+            && !matches!(
+                child_role,
+                Some(ChildRole::ClassSuper | ChildRole::Decorators)
+            )
             && classes[class].declarations.contains_key(spelling)
         {
             return Some(class);
         }
-        node = parent_node(program, node)?;
+        let link = program.node(node)?.parent()?;
+        child_role = Some(link.role());
+        node = link.parent();
     }
 }
 
@@ -1666,6 +1711,7 @@ fn closed_object_keys(
             | IrNodeData::UnaryExpression { .. }
             | IrNodeData::UpdateExpression { .. }
             | IrNodeData::BinaryExpression { .. }
+            | IrNodeData::PrivateInExpression { .. }
             | IrNodeData::LogicalExpression { .. }
             | IrNodeData::AssignmentExpression { .. }
             | IrNodeData::ConditionalExpression { .. }

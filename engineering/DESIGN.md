@@ -376,7 +376,7 @@ chunk 后，final-layout key 才标识 JavaScript body。body 发射始终记录
 collision-free runtime 参数名和真实的 `metaUrl` runtime capability；default/star interop 已结构化
 内联，不进入 compact runtime 注入；最终布局只能修改经整组校验的 typed
 range，任一界外、重叠、非规范字面量或当代 target 不匹配都使整模块 no-op。它参与 body hash 并随
-mapping facts 持久化。当前 `wake-closure-minifier-v15` 与 schema 13 使旧路径产物自然 miss，不做格式迁移；当前
+mapping facts 持久化。当前 `wake-closure-minifier-v16` 与 schema 13 使旧路径产物自然 miss，不做格式迁移；当前
 AST 的 `SymbolId`/`NodeId` 只可进入本次 optimize/codegen 内部，不进入指纹或持久 key。缓存命中必须与
 冷构建产物等价。SCC/拓扑/concat 只消费 retained `ModuleEdges`，wrapper 名称和 Federation expose 在 typed
 codegen/body identity 中决定；非 canonical runtime 名称的 concat 候选保守保留独立 factory，禁止从生成
