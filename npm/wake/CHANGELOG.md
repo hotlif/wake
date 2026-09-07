@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.31
+
+- Fix library declaration generation rejecting valid comparisons such as
+  `value < (scores.get(key) ?? Infinity)`: failed type-argument speculation now rewinds its
+  diagnostics and declaration facts before parsing the relational expression.
+- Cover TypeScript/TSX comparisons, generic-call comparisons, and library declaration output;
+  invalidate older parser cache entries.
+
 ## 0.1.30
 
 - Include the compatibility and VM deadline fixes listed below; releases 0.1.27 through 0.1.29
