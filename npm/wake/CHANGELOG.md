@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.30
+
+- Include the compatibility and VM deadline fixes listed below; releases 0.1.27 through 0.1.29
+  stopped before publishing.
+- Restore the original third-party `sys_traits` lock entry after the release version update.
+
 ## 0.1.29
 
 - Include the dependency compatibility and release-check fixes listed for 0.1.27 and 0.1.28,
