@@ -3,6 +3,11 @@
 //! This arena does not retain a [`Program`] or encode rewrites as source-span overlays. Every
 //! syntax occurrence owns the data required to
 //! emit it again, while stable node/list/name IDs make structural passes deterministic.
+//!
+//! Object assignment targets retain expression-shaped syntax. Their initialized shorthand
+//! properties (`{ value = fallback }`) lower to explicit properties (`{ value: value = fallback }`),
+//! so ordinary object shorthand remains identifier-only. The property key keeps its spelling while
+//! the assignment target and default-value references retain their distinct semantic identities.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -4797,6 +4802,22 @@ impl Lowerer<'_> {
                     .iter()
                     .map(|member| match member {
                         ObjectMember::Property(property) => {
+                            let initialized_shorthand = name_role == NameRole::AssignmentTarget
+                                && property.kind == PropertyKind::Init
+                                && !property.method
+                                && !property.computed
+                                && !property.prototype_setter
+                                && match (property.key, &property.value) {
+                                    (PropertyKey::Ident(key), Expression::Assignment(default))
+                                        if default.operator == AssignmentOperator::Assign =>
+                                    {
+                                        matches!(
+                                            default.left,
+                                            Expression::Identifier(target) if target.name == key.name
+                                        )
+                                    }
+                                    _ => false,
+                                };
                             let key = self.property_key(property.key, NameRole::Property);
                             let value = self.expression(&property.value, name_role);
                             self.finish(
@@ -4806,7 +4827,7 @@ impl Lowerer<'_> {
                                     value,
                                     kind: property.kind,
                                     method: property.method,
-                                    shorthand: property.shorthand,
+                                    shorthand: property.shorthand && !initialized_shorthand,
                                     computed: property.computed,
                                     prototype_setter: property.prototype_setter,
                                 },
@@ -5436,6 +5457,107 @@ export default <Card title={"owned" as string} />;
             ir.node(object.1.unwrap()).unwrap().data(),
             IrNodeData::RestPattern { .. }
         ));
+    }
+
+    #[test]
+    fn lowers_initialized_object_assignment_targets_with_owned_default_values() {
+        for source in [
+            "let target=0;({target=7}={});",
+            "let target=0;({key:target=7}={});",
+            "let target=0;({nested:{target=7}={}}={});",
+            "let target=0;([{target=7}={}]=[]);",
+            "let target=0;for({target=7} of [{}]){}",
+        ] {
+            let ir = lower_source(source, SourceType::Script);
+            ir.validate().unwrap();
+            let default = ir
+                .nodes()
+                .iter()
+                .find_map(|node| match node.data() {
+                    IrNodeData::AssignmentExpression { left, right, .. }
+                        if matches!(
+                            ir.node(*right).unwrap().data(),
+                            IrNodeData::NumberLiteral { value: 7.0 }
+                        ) =>
+                    {
+                        Some(*left)
+                    }
+                    _ => None,
+                })
+                .expect("assignment default must remain a structured expression");
+            let IrNodeData::Identifier { name } = ir.node(default).unwrap().data() else {
+                panic!("default must write to the target identifier: {source}")
+            };
+            let IrNodeData::Name { name } = ir.node(*name).unwrap().data() else {
+                unreachable!()
+            };
+            assert_eq!(ir.name(*name).unwrap().role(), NameRole::AssignmentTarget);
+        }
+    }
+
+    #[test]
+    fn initialized_assignment_property_preserves_key_and_reference_identity_when_renamed() {
+        let mut ir = lower_source(
+            "let target=0,fallback=7;({target=fallback}={});",
+            SourceType::Script,
+        );
+        let binding_symbol = ir
+            .names()
+            .iter()
+            .find(|name| name.original() == "target" && name.role() == NameRole::Binding)
+            .and_then(IrName::symbol)
+            .expect("target binding must have a semantic symbol");
+        let target_names = ir
+            .names()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                (name.symbol() == Some(binding_symbol)).then_some(NameId(index as u32))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            target_names.len(),
+            2,
+            "binding and assignment target must resolve together"
+        );
+        for name in target_names {
+            ir.set_emitted_name(name, "a").unwrap();
+        }
+        ir.validate().unwrap();
+        let property = ir
+            .names()
+            .iter()
+            .find(|name| name.original() == "target" && name.role() == NameRole::Property)
+            .unwrap();
+        assert_eq!(property.emitted(), "target");
+        assert_eq!(property.symbol(), None);
+        let default_reference = ir
+            .names()
+            .iter()
+            .find(|name| name.original() == "fallback" && name.role() == NameRole::Reference)
+            .unwrap();
+        assert!(default_reference.symbol().is_some());
+        assert_ne!(default_reference.symbol(), Some(binding_symbol));
+    }
+
+    #[test]
+    fn initialized_shorthand_remains_invalid_in_object_literal_values() {
+        for source in [
+            "let target=0;const object={target=7};",
+            "let target=0;({target}={target=7});",
+            "let target=0;({nested:{target}={target=7}}={});",
+        ] {
+            let interner = Interner::new();
+            let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Script);
+            parsed.module.with_ast(|program| {
+                let error = TypedProgram::lower_analyzed(program, &interner)
+                    .expect_err("initialized shorthand cannot become an ordinary object value");
+                assert!(
+                    error.message.contains("object shorthand"),
+                    "{source}: {error:?}"
+                );
+            });
+        }
     }
 
     #[test]

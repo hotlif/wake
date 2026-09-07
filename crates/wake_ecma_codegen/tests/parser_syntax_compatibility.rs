@@ -94,3 +94,26 @@ globalThis.result = [first.value, second.value, third.value, events];
         r#"[1,9,11,["receiver","ok",7,"construct","receiver","next",8,"construct","receiver","group",10,"construct"]]"#,
     );
 }
+
+#[test]
+fn destructuring_assignment_defaults_preserve_writes_and_lazy_evaluation() {
+    assert_runtime(
+        r#"
+function run() {
+  let calls = 0;
+  const fallback = () => { calls++; return 7; };
+  let descriptiveTarget = 0;
+  ({ descriptiveTarget = fallback() } = {});
+  const first = descriptiveTarget;
+  ({ descriptiveTarget = fallback() } = { descriptiveTarget: 9 });
+  const second = descriptiveTarget;
+  ({ nested: { descriptiveTarget = fallback() } } = { nested: {} });
+  for ({ descriptiveTarget = fallback() } of [{}, { descriptiveTarget: 11 }]) {}
+  return [first, second, descriptiveTarget, calls];
+}
+globalThis.result = run();
+"#,
+        SourceType::Script,
+        "[7,9,11,3]",
+    );
+}
