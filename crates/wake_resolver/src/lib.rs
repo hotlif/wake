@@ -768,9 +768,9 @@ impl Resolver {
         let root = from_dir
             .ancestors()
             .take_while(|directory| {
-                !directory
+                directory
                     .file_name()
-                    .is_some_and(|name| name == "node_modules")
+                    .is_none_or(|name| name != "node_modules")
             })
             .find(|directory| self.fs.is_file(&directory.join("package.json")))
             .ok_or(ResolveErrorKind::NotFound)?;
