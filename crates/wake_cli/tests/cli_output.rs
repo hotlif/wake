@@ -1,5 +1,7 @@
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -186,6 +188,22 @@ fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let stdout_reader = thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+    let stderr = child.stderr.take().unwrap();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let stderr_reader = thread::spawn(move || {
+        let mut captured = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line?;
+            if line.contains("Initial build completed") {
+                let _ = completed_tx.send(());
+            }
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+        Ok::<_, std::io::Error>(captured)
+    });
     thread::sleep(Duration::from_millis(500));
     let stayed_alive = child.try_wait().unwrap().is_none();
     let untouched_before_recovery = !root.join(".wake").exists() && !root.join("dist").exists();
@@ -197,7 +215,11 @@ fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut early_status = None;
-    while Instant::now() < deadline && !root.join("dist/index.html").is_file() {
+    let mut completed = false;
+    // Publication precedes the completion diagnostic. Observe both before stopping the process,
+    // while the reader threads keep either output pipe from blocking the watch lifecycle.
+    while Instant::now() < deadline && (!root.join("dist/index.html").is_file() || !completed) {
+        completed |= completed_rx.try_recv().is_ok();
         if let Some(status) = child.try_wait().unwrap() {
             early_status = Some(status);
             break;
@@ -206,8 +228,9 @@ fn build_watch_recovers_invalid_toml_without_exiting_or_writing_early() {
     }
     let recovered = root.join("dist/index.html").is_file();
     let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    child.wait().unwrap();
+    stdout_reader.join().unwrap().unwrap();
+    let stderr = stderr_reader.join().unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 
     assert!(stayed_alive, "watch exited on recoverable TOML: {stderr}");
