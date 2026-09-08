@@ -547,11 +547,8 @@ impl<'program> Analyzer<'program> {
             cfg_builder.build_function(*region);
         }
         let cfg = cfg_builder.finish();
-        let definitely_initialized_reads = solve_definite_initialization(
-            &cfg,
-            self.program.names().len(),
-            self.program.symbols().len(),
-        );
+        let definitely_initialized_reads =
+            solve_definite_initialization(&cfg, self.program.names().len());
 
         for (name_index, initialized) in definitely_initialized_reads.iter().enumerate() {
             let Some(initialized) = initialized else {
@@ -1769,7 +1766,13 @@ impl<'program> Analyzer<'program> {
         };
         let boundary = self.scopes[root_scope.index()].function_boundary;
         let mut symbols = BTreeSet::new();
-        let Ok(nodes) = self.program.subtree_preorder(root) else {
+        let Ok(nodes) = same_boundary_preorder(
+            self.program,
+            &self.scopes,
+            &self.node_scopes,
+            root,
+            boundary,
+        ) else {
             return;
         };
         for node in nodes {
@@ -1834,7 +1837,7 @@ struct CfgBuilder<'program, 'analysis> {
     scopes: &'analysis [TypedScopeFacts],
     node_scopes: &'analysis [Option<TypedScopeId>],
     name_uses: &'analysis [Option<NameUse>],
-    symbols: &'analysis [TypedSymbolFacts],
+    initialized_by_boundary: BTreeMap<usize, BTreeSet<SymbolId>>,
     cfg: TypedControlFlowGraph,
     exit_stack: Vec<TypedCfgBlockId>,
     break_stack: Vec<TypedCfgBlockId>,
@@ -1850,12 +1853,28 @@ impl<'program, 'analysis> CfgBuilder<'program, 'analysis> {
         name_uses: &'analysis [Option<NameUse>],
         symbols: &'analysis [TypedSymbolFacts],
     ) -> Self {
+        let mut initialized_by_boundary: BTreeMap<usize, BTreeSet<SymbolId>> = BTreeMap::new();
+        for facts in symbols {
+            if let Some(scope) = facts.declaration_scope
+                && program.symbol(facts.symbol).is_some_and(|symbol| {
+                    matches!(
+                        symbol.decl_kind(),
+                        DeclKind::Var | DeclKind::Function | DeclKind::Import | DeclKind::Param
+                    )
+                })
+            {
+                initialized_by_boundary
+                    .entry(scopes[scope.index()].function_boundary.index())
+                    .or_default()
+                    .insert(facts.symbol);
+            }
+        }
         Self {
             program,
             scopes,
             node_scopes,
             name_uses,
-            symbols,
+            initialized_by_boundary,
             cfg: TypedControlFlowGraph::default(),
             exit_stack: Vec::new(),
             break_stack: Vec::new(),
@@ -1920,20 +1939,10 @@ impl<'program, 'analysis> CfgBuilder<'program, 'analysis> {
 
     fn entry_initialized(&self, scope: TypedScopeId) -> BTreeSet<SymbolId> {
         let boundary = self.scopes[scope.index()].function_boundary;
-        self.symbols
-            .iter()
-            .filter(|facts| {
-                facts.declaration_scope.is_some_and(|declaration_scope| {
-                    self.scopes[declaration_scope.index()].function_boundary == boundary
-                }) && self.program.symbol(facts.symbol).is_some_and(|symbol| {
-                    matches!(
-                        symbol.decl_kind(),
-                        DeclKind::Var | DeclKind::Function | DeclKind::Import | DeclKind::Param
-                    )
-                })
-            })
-            .map(|facts| facts.symbol)
-            .collect()
+        self.initialized_by_boundary
+            .get(&boundary.index())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn new_block(&mut self, _owner: Option<NodeId>, kind: TypedCfgBlockKind) -> TypedCfgBlockId {
@@ -1990,8 +1999,7 @@ impl<'program, 'analysis> CfgBuilder<'program, 'analysis> {
             return Vec::new();
         };
         let boundary = self.scopes[root_scope.index()].function_boundary;
-        self.program
-            .subtree_preorder(root)
+        same_boundary_preorder(self.program, self.scopes, self.node_scopes, root, boundary)
             .expect("CFG reads a validated live subtree")
             .into_iter()
             .filter_map(|node| {
@@ -2434,6 +2442,19 @@ impl<'program, 'analysis> CfgBuilder<'program, 'analysis> {
     }
 }
 
+fn same_boundary_preorder(
+    program: &TypedProgram,
+    scopes: &[TypedScopeFacts],
+    node_scopes: &[Option<TypedScopeId>],
+    root: NodeId,
+    boundary: TypedScopeId,
+) -> Result<Vec<NodeId>, TypedIrError> {
+    program.subtree_preorder_pruned(root, |node| {
+        node_scopes[node.index()]
+            .is_none_or(|scope| scopes[scope.index()].function_boundary == boundary)
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DenseSymbolSet {
     words: Vec<u64>,
@@ -2481,8 +2502,126 @@ impl DenseSymbolSet {
 fn solve_definite_initialization(
     cfg: &TypedControlFlowGraph,
     name_count: usize,
-    symbol_count: usize,
 ) -> Vec<Option<bool>> {
+    let mut reads = vec![None; name_count];
+    for domain in initialization_domains(cfg) {
+        solve_initialization_domain(&domain.cfg, domain.symbol_count, &mut reads);
+    }
+    reads
+}
+
+struct InitializationDomain {
+    cfg: TypedControlFlowGraph,
+    symbol_count: usize,
+}
+
+/// Initialization bits only flow along CFG edges. Weak components can therefore be solved
+/// independently, including components with no root or several roots. Projecting onto symbols
+/// read in a component preserves intersection/transfer and removes unobservable state bits.
+/// These dense symbol indices are private scratch data, never identities in TypedAnalysis.
+fn initialization_domains(cfg: &TypedControlFlowGraph) -> Vec<InitializationDomain> {
+    let mut neighbors = vec![Vec::new(); cfg.blocks.len()];
+    let mut outgoing = vec![Vec::new(); cfg.blocks.len()];
+    for edge in &cfg.edges {
+        neighbors[edge.from.index()].push(edge.to.index());
+        neighbors[edge.to.index()].push(edge.from.index());
+        outgoing[edge.from.index()].push(*edge);
+    }
+    let mut seen = vec![false; cfg.blocks.len()];
+    let mut local_indices = vec![0; cfg.blocks.len()];
+    let mut domains = Vec::new();
+    for start in 0..cfg.blocks.len() {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut blocks = vec![start];
+        let mut cursor = 0;
+        while cursor < blocks.len() {
+            for &neighbor in &neighbors[blocks[cursor]] {
+                if !seen[neighbor] {
+                    seen[neighbor] = true;
+                    blocks.push(neighbor);
+                }
+            }
+            cursor += 1;
+        }
+        blocks.sort_unstable();
+        let symbols: BTreeSet<_> = blocks
+            .iter()
+            .flat_map(|&block| {
+                cfg.blocks[block]
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        FlowEvent::Read { symbol, .. } => Some(*symbol),
+                        FlowEvent::Initialize(_) => None,
+                    })
+            })
+            .collect();
+        // With no reads, the component has no observable solver result.
+        if symbols.is_empty() {
+            continue;
+        }
+        let symbols: BTreeMap<_, _> = symbols
+            .into_iter()
+            .enumerate()
+            .map(|(index, symbol)| (symbol, index as SymbolId))
+            .collect();
+        for (local, &block) in blocks.iter().enumerate() {
+            local_indices[block] = local;
+        }
+        let mut projected = TypedControlFlowGraph::default();
+        for &block in &blocks {
+            let original = &cfg.blocks[block];
+            let id = TypedCfgBlockId(local_indices[block] as u32);
+            projected.blocks.push(TypedCfgBlock {
+                id,
+                kind: original.kind,
+                events: original
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        FlowEvent::Read { name, symbol } => Some(FlowEvent::Read {
+                            name: *name,
+                            symbol: symbols[symbol],
+                        }),
+                        FlowEvent::Initialize(symbol) => {
+                            symbols.get(symbol).copied().map(FlowEvent::Initialize)
+                        }
+                    })
+                    .collect(),
+            });
+            if let Some(initialized) = cfg.roots.get(&original.id) {
+                projected.roots.insert(
+                    id,
+                    initialized
+                        .iter()
+                        .filter_map(|symbol| symbols.get(symbol).copied())
+                        .collect(),
+                );
+            }
+            projected
+                .edges
+                .extend(outgoing[block].iter().map(|edge| TypedCfgEdge {
+                    from: id,
+                    to: TypedCfgBlockId(local_indices[edge.to.index()] as u32),
+                    kind: edge.kind,
+                }));
+        }
+        domains.push(InitializationDomain {
+            cfg: projected,
+            symbol_count: symbols.len(),
+        });
+    }
+    domains
+}
+
+fn solve_initialization_domain(
+    cfg: &TypedControlFlowGraph,
+    symbol_count: usize,
+    reads: &mut [Option<bool>],
+) {
     let mut all_symbols = DenseSymbolSet::empty(symbol_count);
     for initialized in cfg.roots.values() {
         for &symbol in initialized {
@@ -2545,7 +2684,6 @@ fn solve_definite_initialization(
         }
     }
 
-    let mut reads = vec![None; name_count];
     for block in &cfg.blocks {
         let mut initialized = incoming[block.id.index()].clone();
         for event in &block.events {
@@ -2560,7 +2698,6 @@ fn solve_definite_initialization(
             }
         }
     }
-    reads
 }
 
 fn transfer(input: &DenseSymbolSet, block: &TypedCfgBlock) -> DenseSymbolSet {
@@ -2572,6 +2709,10 @@ fn transfer(input: &DenseSymbolSet, block: &TypedCfgBlock) -> DenseSymbolSet {
     }
     output
 }
+
+#[cfg(test)]
+#[path = "typed_analysis_reference.rs"]
+mod initialization_reference;
 
 #[cfg(test)]
 mod tests {
@@ -2740,10 +2881,61 @@ mod tests {
     }
 
     #[test]
+    fn initialization_matches_full_module_reference_for_control_flow_and_captures() {
+        let source = r#"
+            consume(outer); let outer = 1;
+            function left(flag) {
+                consume(local); let local;
+                if (flag) local = outer;
+                while (flag) { consume(local); if (outer) break; flag--; }
+                try { consume(local); } catch (error) { consume(error); }
+                finally { consume(outer); }
+                return () => local + outer;
+            }
+            function right(flag) {
+                for (let i = 0; i < flag; i++) consume(i);
+                switch (flag) { case 0: let branch = 1; consume(branch); break; default: consume(outer); }
+                return outer;
+            }
+        "#;
+        let program = lower_source(source, SourceType::Script);
+        let analysis = TypedAnalysis::rebuild(&program).unwrap();
+        for seed in 0..32 {
+            let mut cfg = analysis.cfg.clone();
+            if seed != 0 {
+                // Exercise disconnected blocks, rootless cycles and joins between multiple
+                // roots in addition to graphs currently produced by the syntax builder.
+                cfg.edges
+                    .retain(|edge| (edge.from.index() * 7 + edge.to.index() + seed) % 5 != 0);
+                for from in 0..cfg.blocks.len() {
+                    if (from + seed) % 7 == 0 {
+                        cfg.edges.push(TypedCfgEdge {
+                            from: cfg.blocks[from].id,
+                            to: cfg.blocks[(from * 13 + seed) % cfg.blocks.len()].id,
+                            kind: TypedCfgEdgeKind::Normal,
+                        });
+                    }
+                }
+            }
+            assert_eq!(
+                solve_definite_initialization(&cfg, program.names().len()),
+                initialization_reference::solve_definite_initialization(
+                    &cfg,
+                    program.names().len(),
+                    program.symbols().len()
+                ),
+                "graph variant {seed}",
+            );
+        }
+    }
+
+    #[test]
     fn dense_tdz_state_tracks_symbols_across_multiple_machine_words() {
         let mut source = String::new();
         for index in 0..130 {
-            source.push_str(&format!("let filler{index}={index};"));
+            source.push_str(&format!(
+                "let filler{index}={index};consume(filler{index});"
+            ));
         }
         source.push_str("consume(wide);let wide=1;consume(wide);");
         let program = lower_source(&source, SourceType::Script);
@@ -2763,6 +2955,140 @@ mod tests {
             analysis.read_is_definitely_initialized(reads[1]),
             Some(true)
         );
+    }
+
+    #[test]
+    fn independent_function_initialization_state_scales_with_local_reads() {
+        let mut source = String::from("let captured=1;");
+        for index in 0..256 {
+            source.push_str(&format!(
+                "function f{index}(flag){{consume(value);let value=flag;consume(value,captured);}}"
+            ));
+        }
+        let program = lower_source(&source, SourceType::Script);
+        let analysis = TypedAnalysis::rebuild(&program).unwrap();
+        let domains = initialization_domains(&analysis.cfg);
+        assert_eq!(domains.len(), 256);
+        assert!(domains.iter().all(|domain| domain.symbol_count == 3));
+        let local_words: usize = domains
+            .iter()
+            .map(|domain| domain.cfg.blocks.len() * domain.symbol_count.div_ceil(64))
+            .sum();
+        let full_words = analysis.cfg.blocks.len() * program.symbols().len().div_ceil(64);
+        assert!(
+            local_words * 8 < full_words,
+            "state must not multiply each function by unrelated symbols"
+        );
+        assert_eq!(
+            analysis.definitely_initialized_reads,
+            initialization_reference::solve_definite_initialization(
+                &analysis.cfg,
+                program.names().len(),
+                program.symbols().len()
+            )
+        );
+
+        let builder = CfgBuilder::new(
+            &program,
+            &analysis.scopes,
+            &analysis.node_scopes,
+            &analysis.name_uses,
+            &analysis.symbols,
+        );
+        for (index, scope) in analysis.scopes.iter().enumerate() {
+            let expected = analysis
+                .symbols
+                .iter()
+                .filter(|facts| {
+                    facts.declaration_scope.is_some_and(|declaration| {
+                        analysis.scopes[declaration.index()].function_boundary
+                            == scope.function_boundary
+                    }) && matches!(
+                        program.symbol(facts.symbol).unwrap().decl_kind(),
+                        DeclKind::Var | DeclKind::Function | DeclKind::Import | DeclKind::Param
+                    )
+                })
+                .map(|facts| facts.symbol)
+                .collect();
+            assert_eq!(
+                builder.entry_initialized(TypedScopeId(index as u32)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_pruning_preserves_the_full_walks_name_queries() {
+        let program = lower_source(
+            r#"
+            const outer=1;
+            function parent(arg=()=>outer) {
+                const object={ [outer](value=outer) { return ()=>value+outer; } };
+                class Child extends factory(outer) {
+                    [outer]=outer;
+                    method(value=outer) { return value+outer; }
+                    static { consume(outer); }
+                }
+                return consume(object, Child, function nested(local=outer){return ()=>local;});
+            }
+        "#,
+            SourceType::Script,
+        );
+        let analysis = TypedAnalysis::rebuild(&program).unwrap();
+        for root in program.preorder().unwrap() {
+            let Some(scope) = analysis.node_scopes[root.index()] else {
+                continue;
+            };
+            let boundary = analysis.scopes[scope.index()].function_boundary;
+            let names = |nodes: Vec<NodeId>| {
+                nodes
+                    .into_iter()
+                    .filter_map(|node| {
+                        let IrNodeData::Name { name } = program.node(node)?.data() else {
+                            return None;
+                        };
+                        let usage = analysis.name_uses[name.index()]?;
+                        (usage.access.reads()
+                            && analysis.scopes[usage.scope.index()].function_boundary == boundary)
+                            .then_some(*name)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                names(
+                    same_boundary_preorder(
+                        &program,
+                        &analysis.scopes,
+                        &analysis.node_scopes,
+                        root,
+                        boundary
+                    )
+                    .unwrap()
+                ),
+                names(program.subtree_preorder(root).unwrap()),
+                "root {root:?}",
+            );
+        }
+        let mut source = String::from("consume(function nested(){");
+        for _ in 0..1024 {
+            source.push_str("consume(globalValue);");
+        }
+        source.push_str("});");
+        let large = lower_source(&source, SourceType::Script);
+        let analysis = TypedAnalysis::rebuild(&large).unwrap();
+        let local = same_boundary_preorder(
+            &large,
+            &analysis.scopes,
+            &analysis.node_scopes,
+            large.root(),
+            TypedScopeId(0),
+        )
+        .unwrap();
+        assert!(
+            local.len() < 20,
+            "outer query must not visit the nested function body"
+        );
+        assert!(large.preorder().unwrap().len() > 4096);
     }
 
     #[test]

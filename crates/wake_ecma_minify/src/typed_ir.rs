@@ -1717,14 +1717,31 @@ impl TypedProgram {
     /// for local escape and CFG queries. Re-scanning every name in the module for each expression
     /// made those queries quadratic on generated modules.
     pub(crate) fn subtree_preorder(&self, root: NodeId) -> Result<Vec<NodeId>, TypedIrError> {
+        self.subtree_preorder_pruned(root, |_| true)
+    }
+
+    /// Internal current-tree traversal which omits a rejected node and its descendants. The
+    /// caller owns the proof that no descendant contributes to its query; ordinary preorder
+    /// always accepts every node and retains exactly the same traversal order.
+    pub(crate) fn subtree_preorder_pruned(
+        &self,
+        root: NodeId,
+        mut include: impl FnMut(NodeId) -> bool,
+    ) -> Result<Vec<NodeId>, TypedIrError> {
         self.ensure_live(root)?;
         let mut output = Vec::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
+            if !include(node) {
+                continue;
+            }
             output.push(node);
-            let mut children = self.child_ids(node)?;
-            children.reverse();
-            stack.extend(children);
+            self.nodes
+                .get(node.index())
+                .ok_or_else(|| error(Some(node), "unknown node"))?;
+            let start = stack.len();
+            self.append_child_ids_unchecked(node, &mut stack);
+            stack[start..].reverse();
         }
         Ok(output)
     }
@@ -1905,7 +1922,9 @@ impl TypedProgram {
                 self.validate_template_lengths(node.id, quasis, expressions)?;
             }
         }
-        let mut reachable = HashSet::new();
+        // Arena identity/bounds were checked above; a dense marker preserves cycle and duplicate
+        // detection without hashing every node in every complete validation pass.
+        let mut reachable = vec![false; self.nodes.len()];
         let mut stack = self
             .nodes
             .iter()
@@ -1913,16 +1932,16 @@ impl TypedProgram {
             .map(IrNode::id)
             .collect::<Vec<_>>();
         while let Some(node) = stack.pop() {
-            if !reachable.insert(node) {
+            if std::mem::replace(&mut reachable[node.index()], true) {
                 return Err(error(
                     Some(node),
                     "live structure contains a cycle or duplicate child",
                 ));
             }
-            stack.extend(self.child_ids_unchecked(node));
+            self.append_child_ids_unchecked(node, &mut stack);
         }
         for node in &self.nodes {
-            if !node.tombstone && !reachable.contains(&node.id) {
+            if !node.tombstone && !reachable[node.id.index()] {
                 return Err(error(
                     Some(node.id),
                     "live node is unreachable from every detached root",
@@ -1955,15 +1974,13 @@ impl TypedProgram {
         Ok(())
     }
 
-    fn child_ids(&self, node: NodeId) -> Result<Vec<NodeId>, TypedIrError> {
-        self.nodes
-            .get(node.index())
-            .ok_or_else(|| error(Some(node), "unknown node"))?;
-        Ok(self.child_ids_unchecked(node))
-    }
-
     fn child_ids_unchecked(&self, node: NodeId) -> Vec<NodeId> {
         let mut children = Vec::new();
+        self.append_child_ids_unchecked(node, &mut children);
+        children
+    }
+
+    fn append_child_ids_unchecked(&self, node: NodeId, children: &mut Vec<NodeId>) {
         for edge in self.nodes[node.index()].data.edges() {
             match edge {
                 Edge::Child(_, child) => children.push(child),
@@ -1972,7 +1989,6 @@ impl TypedProgram {
                 }
             }
         }
-        children
     }
 
     fn validate_node_grammar(&self, node: NodeId) -> Result<(), TypedIrError> {
@@ -2988,6 +3004,44 @@ enum Edge {
     List(ChildRole, ListId),
 }
 
+/// A node has at most four structural fields. Variable-length children live in the referenced
+/// lists, so enumerating fields needs no heap allocation regardless of module/list size.
+struct NodeEdges {
+    items: [Edge; 4],
+    len: usize,
+}
+
+impl NodeEdges {
+    fn new() -> Self {
+        Self {
+            items: [Edge::List(ChildRole::ProgramBody, ListId(0)); 4],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, edge: Edge) {
+        self.items[self.len] = edge;
+        self.len += 1;
+    }
+}
+
+impl std::ops::Deref for NodeEdges {
+    type Target = [Edge];
+
+    fn deref(&self) -> &[Edge] {
+        &self.items[..self.len]
+    }
+}
+
+impl IntoIterator for NodeEdges {
+    type Item = Edge;
+    type IntoIter = std::iter::Take<std::array::IntoIter<Edge, 4>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter().take(self.len)
+    }
+}
+
 fn same_edges(left: &[Edge], right: &[Edge]) -> bool {
     left == right
 }
@@ -3212,9 +3266,9 @@ fn role_accepts(role: ChildRole, category: NodeCategory) -> bool {
 }
 
 impl IrNodeData {
-    fn edges(&self) -> Vec<Edge> {
+    fn edges(&self) -> NodeEdges {
         use ChildRole as R;
-        let mut edges = Vec::new();
+        let mut edges = NodeEdges::new();
         macro_rules! child {
             ($role:expr, $value:expr) => {
                 edges.push(Edge::Child($role, $value))
