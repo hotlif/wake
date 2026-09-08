@@ -31,8 +31,7 @@ use wake_cache::{
     CachedRetainedRequest, CachedUse, ModuleSummary,
 };
 use wake_common::{
-    Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, Label, Severity, SourceFile, Span,
-    fs::normalize,
+    Diagnostic, FileSystem, FxHashMap, FxHashSet, Interner, Label, Severity, Span, fs::normalize,
 };
 use wake_compiler_core::{
     CompilerBackend, CompilerDiagnostic, CompilerMappings, CompilerStage as CoreCompilerStage,
@@ -7213,25 +7212,105 @@ pub(crate) fn map_source_name(path: &Path, cwd: Option<&Path>) -> String {
 
 /// 序列化 [`SourceMap`] 为 V3 JSON：把各映射的**源字节偏移**换算为 0 基行 + UTF-16 列。
 ///
-/// 每个源文件建一次换行表（[`SourceFile`]）即可对该文件的全部映射做 O(log n) 二分，
-/// 避免逐条映射重复扫描源文本。缺源文本的模块无法换算，其映射被丢弃（宁缺毋错）。
+/// 按源文件批量计算坐标，避免压成一行的依赖被每条映射从行首重新扫描。
+/// 缺源文本时保持已有的 (0, 0) 回退。
 fn serialize_map(sm: &SourceMap, sources: &FxHashMap<u32, (String, Option<String>)>) -> String {
-    // sm.sources 的下标序 = merge_bundle_map 的登记序；按同序建换行表。
     let by_name: FxHashMap<&str, &str> = sources
         .values()
         .filter_map(|(n, c)| c.as_deref().map(|c| (n.as_str(), c)))
         .collect();
-    let files: Vec<Option<SourceFile>> = sm
+    let mut offsets = vec![Vec::new(); sm.sources.len()];
+    for mapping in &sm.mappings {
+        if !mapping.is_unmapped
+            && let Some(requested) = offsets.get_mut(mapping.src_index as usize)
+        {
+            requested.push(mapping.src_offset);
+        }
+    }
+    let locations: Vec<FxHashMap<u32, (u32, u32)>> = sm
         .sources
         .iter()
-        .map(|n| by_name.get(n.as_str()).map(|c| SourceFile::new(n, *c)))
+        .zip(offsets)
+        .map(|(name, mut requested)| {
+            let mut locations = FxHashMap::default();
+            let Some(source) = by_name.get(name.as_str()) else {
+                return locations;
+            };
+            requested.sort_unstable();
+            requested.dedup();
+            let (mut byte, mut line, mut column) = (0, 0, 0);
+            for offset in requested {
+                let target = (offset as usize).min(source.len());
+                for ch in source[byte..target].chars() {
+                    if ch == '\n' {
+                        line += 1;
+                        column = 0;
+                    } else {
+                        column += ch.len_utf16() as u32;
+                    }
+                }
+                byte = target;
+                locations.insert(offset, (line, column));
+            }
+            locations
+        })
         .collect();
     sm.to_json(|src_index, offset| {
-        files
+        locations
             .get(src_index as usize)
-            .and_then(|f| f.as_ref())
-            .map_or((0, 0), |f| f.location0_utf16(offset))
+            .and_then(|locations| locations.get(&offset))
+            .copied()
+            .unwrap_or((0, 0))
     })
+}
+
+#[cfg(test)]
+mod source_map_serialization_tests {
+    use super::*;
+
+    #[test]
+    fn source_coordinates_preserve_unicode_crlf_reordering_and_clamping() {
+        let source = format!("{}𝒳中文\r\n{}😀\n", "x;".repeat(4_000), "y;".repeat(2_000));
+        let mut offsets = source
+            .char_indices()
+            .map(|(offset, _)| offset as u32)
+            .collect::<Vec<_>>();
+        offsets.extend([source.len() as u32, source.len() as u32 + 10, 0]);
+        offsets.reverse();
+        let mut sm = SourceMap::new();
+        sm.add_source("input.js", Some(source.clone()));
+        sm.add_source("missing.js", None);
+        let final_line = offsets.len() as u32;
+        for (index, offset) in offsets.into_iter().enumerate() {
+            sm.mappings.push(Mapping {
+                gen_line: index as u32,
+                gen_col: 0,
+                src_index: 0,
+                src_offset: offset,
+                name_index: None,
+                is_unmapped: false,
+            });
+        }
+        sm.mappings.push(Mapping {
+            gen_line: final_line,
+            gen_col: 0,
+            src_index: 1,
+            src_offset: 15,
+            name_index: None,
+            is_unmapped: false,
+        });
+        sm.mappings.push(Mapping::unmapped(final_line + 1, 0));
+        let sources = FxHashMap::from_iter([(0, ("input.js".into(), Some(source.clone())))]);
+        let file = wake_common::SourceFile::new("input.js", source);
+        let reference = sm.to_json(|index, offset| {
+            if index == 0 {
+                file.location0_utf16(offset)
+            } else {
+                (0, 0)
+            }
+        });
+        assert_eq!(serialize_map(&sm, &sources), reference);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

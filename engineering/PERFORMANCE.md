@@ -150,6 +150,10 @@ Source Map 合并必须对每个 module placement 只索引一次 generated toke
 `(line, UTF-16 column)` 做精确或单列 separator 回退查询。不得让每条 mapping 从 token 列表头重新
 扫描，否则 React 等大型模块会形成 `O(mapping × token)`，使 mapped code-split/lazy 构建退化。
 
+Source Map 序列化也必须批量计算源坐标：按每个源文件的所需字节偏移排序并去重，单次推进 UTF-16
+行列位置，避免为压成一行的依赖反复从行首扫描。该优化保持原有 CRLF、Unicode、越界夹取与映射
+JSON 字节语义；不通过关闭 Source Map 缩短开发构建。
+
 # 7. 建立回归门禁的前置条件
 
 接入自动阈值前需要：
