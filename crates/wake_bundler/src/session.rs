@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wake_common::FileSystem;
 use wake_ecma_transform::TargetEnv;
@@ -66,7 +66,7 @@ pub struct FederationBuildPlan {
 
 /// 一次构建使用的稳定配置。配置在 session 创建时归一化，避免构建过程中通过 setter
 /// 改变任务语义。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildOptions {
     /// 项目根，用于生成跨 checkout/跨平台稳定的 CSS module identity。
     pub project_root: Option<PathBuf>,
@@ -156,6 +156,10 @@ impl BuildRequest {
 /// 唯一构建会话入口。普通构建、增量构建和未来的 watch 构建应复用此类型。
 pub struct BuildSession {
     bundler: IncrementalBundler,
+    options: BuildOptions,
+    // Inherited pure emit callbacks share counters. Serialize related builds, while each build
+    // retains its internal parallelism and unrelated sessions keep independent gates.
+    build_gate: Arc<Mutex<()>>,
     lifetime: SessionLifetime,
     generation: u64,
     committed: Option<CommittedBuild>,
@@ -176,10 +180,12 @@ struct CommittedBuild {
 impl BuildSession {
     pub fn new(fs: Arc<dyn FileSystem>, options: BuildOptions) -> Self {
         let mut bundler = IncrementalBundler::new(fs);
-        apply_options(&mut bundler, options);
+        apply_options(&mut bundler, options.clone());
         bundler.enable_load_cache();
         Self {
             bundler,
+            options,
+            build_gate: Arc::new(Mutex::new(())),
             lifetime: SessionLifetime::Retained,
             generation: 0,
             committed: None,
@@ -192,9 +198,11 @@ impl BuildSession {
     /// for future generations. Call [`BuildSession::build_once`] to consume it.
     pub fn new_one_shot(fs: Arc<dyn FileSystem>, options: BuildOptions) -> Self {
         let mut bundler = IncrementalBundler::new_one_shot(fs);
-        apply_options(&mut bundler, options);
+        apply_options(&mut bundler, options.clone());
         Self {
             bundler,
+            options,
+            build_gate: Arc::new(Mutex::new(())),
             lifetime: SessionLifetime::OneShot,
             generation: 0,
             committed: None,
@@ -251,6 +259,10 @@ impl BuildSession {
     }
 
     fn rebuild_and_commit(&mut self, request: BuildRequest) -> &BuildOutput {
+        let _guard = self
+            .build_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let output = self.bundler.build(&request.entry);
         self.committed = Some(CommittedBuild {
             generation: self.generation,
@@ -277,6 +289,36 @@ impl BuildSession {
         self.generation = self.generation.wrapping_add(1);
         self.bundler.invalidate_paths(paths, structural);
         self.generation
+    }
+
+    /// Derive an isolated candidate against a new filesystem, with no committed output.
+    ///
+    /// `None` means authoritative Rescan: reread every source. `Some((paths, structural))`
+    /// follows the same explicit-invalidation contract as `invalidate_paths`; callers must include
+    /// all source and generated changes since this accepted session. Changed options cold-start.
+    /// The candidate starts at generation zero and never mutates this session's input cells.
+    pub fn fork(
+        &mut self,
+        fs: Arc<dyn FileSystem>,
+        options: BuildOptions,
+        changes: Option<(&[PathBuf], bool)>,
+    ) -> Self {
+        self.assert_retained_api();
+        let _guard = self
+            .build_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut candidate = Self::new(fs, options);
+        if candidate.options == self.options
+            && candidate.bundler.inherit_compilation(&mut self.bundler)
+        {
+            candidate.build_gate = Arc::clone(&self.build_gate);
+            match changes {
+                None => candidate.bundler.invalidate_filesystem(),
+                Some((paths, structural)) => candidate.bundler.invalidate_paths(paths, structural),
+            }
+        }
+        candidate
     }
 
     /// Return the exact decorated filesystem used by this compilation session.

@@ -574,6 +574,7 @@ struct MemoryScanSummary {
     block_info: ConcatBlockInfo,
 }
 
+#[derive(Clone)]
 struct StableModuleGraph {
     entry: PathBuf,
     next_id: u32,
@@ -959,6 +960,7 @@ pub struct IncrementalBundler {
 }
 
 /// 扫描完成的一个模块记录。
+#[derive(Clone)]
 struct ModuleRec {
     path: PathBuf,
     federation_resolution_context: FederationResolutionContext,
@@ -1022,6 +1024,34 @@ struct PendingModule {
 }
 
 impl IncrementalBundler {
+    /// Options are checked by BuildSession before entering this boundary. Resolver/FS state
+    /// stays fresh; the copied tasks capture compiler values and Vc handles, never filesystem I/O.
+    pub(crate) fn inherit_compilation(&mut self, accepted: &mut Self) -> bool {
+        let Some(engine) = Arc::get_mut(&mut accepted.engine) else {
+            return false;
+        };
+        self.engine = Arc::new(engine.fork());
+        self.compiler = accepted.compiler.clone();
+        self.interner = Arc::clone(&accepted.interner);
+        self.content_cells = accepted.content_cells.clone();
+        self.optimize_linker_cells = accepted.optimize_linker_cells.clone();
+        self.emit_linker_cells = accepted.emit_linker_cells.clone();
+        self.css_codegen_cells = accepted.css_codegen_cells.clone();
+        self.optimize_options_cells = accepted.optimize_options_cells.clone();
+        self.codegen_exec_counts = accepted.codegen_exec_counts.clone();
+        *self.load_cache.lock().unwrap() = accepted.load_cache.lock().unwrap().clone();
+        self.memory_summaries = accepted.memory_summaries.clone();
+        self.memory_parse_vcs = accepted.memory_parse_vcs.clone();
+        self.stable_graph = accepted.stable_graph.clone();
+        self.link_plan = accepted.link_plan.clone();
+        self.topology_invalidated.store(
+            accepted.topology_invalidated.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.last_module_count = accepted.last_module_count;
+        true
+    }
+
     pub fn new(fs: Arc<dyn FileSystem>) -> IncrementalBundler {
         Self::new_with_lifetime(fs, false)
     }
@@ -3002,11 +3032,17 @@ impl IncrementalBundler {
         }
 
         // 3b. Retained-fact misses must optimize before chunk planning. Parse only those modules;
-        // a complete persistent hit keeps the parser and optimizer cold.
+        // a complete persistent hit keeps the parser and optimizer cold. CSS static evaluation
+        // also needs the AST view of summary hits: a retained parse Vc alone does not populate
+        // ModuleRec::parsed after BFS/Rescan. Requesting it replays the memo without reparsing.
         let need_parse: Vec<usize> = plans
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.retained_requests.is_none() && modules[&p.id].parse_vc.is_none())
+            .filter(|(_, p)| {
+                let module = &modules[&p.id];
+                p.retained_requests.is_none()
+                    && (module.parse_vc.is_none() || (cij_active && module.parsed.is_none()))
+            })
             .map(|(i, _)| i)
             .collect();
         if !need_parse.is_empty() {
@@ -4563,6 +4599,29 @@ fn content_key_with_parse_version(
     path: &Path,
     parse_pipeline_version: &str,
 ) -> u64 {
+    content_key_with_pipeline_versions(
+        src,
+        st,
+        jsx,
+        target_fingerprint,
+        css_in_js,
+        path,
+        parse_pipeline_version,
+        "scope-aware-require-v1",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn content_key_with_pipeline_versions(
+    src: &str,
+    st: SourceType,
+    jsx: &JsxRuntimeOptions,
+    target_fingerprint: u64,
+    css_in_js: bool,
+    path: &Path,
+    parse_pipeline_version: &str,
+    dependency_scan_version: &str,
+) -> u64 {
     let mut seed = match st {
         SourceType::Module => 1,
         SourceType::Script => 2,
@@ -4571,6 +4630,8 @@ fn content_key_with_parse_version(
         SourceType::Jsx => 5,
     };
     seed ^= xxh3_64_with_seed(parse_pipeline_version.as_bytes(), 0x7061_7273_652d_7631);
+    // Scan summaries persist file edges, not the parser's syntactic dependency candidates.
+    seed ^= xxh3_64_with_seed(dependency_scan_version.as_bytes(), 0x7363_616e_2d64_6570);
     // JSX 口径改变解析产出的依赖（`react/jsx-runtime` ↔ `react/jsx-dev-runtime`），
     // 必须参与主键，否则跨 dev/prod 复用摘要会带错依赖。
     seed ^= jsx.salt() ^ target_fingerprint;
@@ -4699,6 +4760,23 @@ mod pipeline_cache_identity_tests {
     use wake_ecma_ast::SourceType;
 
     use super::{JsxRuntimeOptions, body_key_with_emit_version, content_key_with_parse_version};
+
+    #[test]
+    fn dependency_scan_version_invalidates_persisted_summary_identity() {
+        let key = |scan| {
+            super::content_key_with_pipeline_versions(
+                "function local(require){return require('./internal.js')}",
+                SourceType::Module,
+                &JsxRuntimeOptions::default(),
+                17,
+                false,
+                Path::new("index.js"),
+                "same-parser",
+                scan,
+            )
+        };
+        assert_ne!(key("syntactic-require"), key("scope-aware-require-v1"));
+    }
 
     #[test]
     fn parse_pipeline_version_invalidates_the_content_key() {
@@ -5744,7 +5822,7 @@ fn parse_module(
             };
         }
     };
-    let deps = compiler_module
+    let mut deps: Vec<_> = compiler_module
         .dependencies()
         .iter()
         .map(|dependency| ParsedDep {
@@ -5758,6 +5836,14 @@ fn parse_module(
             span: dependency.span(),
         })
         .collect();
+    if deps
+        .iter()
+        .any(|dependency| dependency.kind == DependencyKind::Require)
+    {
+        compiler_module.ast_owner().with_ast(|program| {
+            exclude_locally_bound_require(program, compiler.interner(), &mut deps);
+        });
+    }
     let diagnostics = compiler_module
         .diagnostics()
         .iter()
@@ -5771,6 +5857,60 @@ fn parse_module(
         has_top_level_await: compiler_module.has_top_level_await(),
         compiler: compiler_module,
     }
+}
+
+/// Parser candidates remain unchanged in compiler core. File-graph construction can discard a
+/// require call only when its callee is proven locally bound; unresolved or ambiguous identities
+/// retain the ordinary resolver/diagnostic path. All reads borrow the original parser owner.
+fn exclude_locally_bound_require(
+    program: &Program<'_>,
+    interner: &Interner,
+    deps: &mut Vec<ParsedDep>,
+) {
+    use wake_ecma_ast::{Expression, Visit, walk_expression};
+    let require = interner.intern("require");
+    let semantic = wake_ecma_semantic::analyze(program);
+    let mut bindings: FxHashMap<Span, bool> = FxHashMap::default();
+    for reference in &semantic.references {
+        if reference.name == require && !reference.span.is_dummy() {
+            let bound = reference.resolved.is_some();
+            bindings
+                .entry(reference.span)
+                .and_modify(|all_bound| *all_bound &= bound)
+                .or_insert(bound);
+        }
+    }
+    struct Calls<'a> {
+        require: wake_common::Atom,
+        bindings: &'a FxHashMap<Span, bool>,
+        local: FxHashMap<Span, bool>,
+    }
+    impl<'ast> Visit<'ast> for Calls<'_> {
+        fn visit_expression(&mut self, node: &Expression<'ast>) {
+            if let Expression::Call(call) = node
+                && let Expression::Identifier(callee) = call.callee
+                && callee.name == self.require
+                && !call.span.is_dummy()
+            {
+                let bound = self.bindings.get(&callee.span).copied().unwrap_or(false);
+                self.local
+                    .entry(call.span)
+                    .and_modify(|all_bound| *all_bound &= bound)
+                    .or_insert(bound);
+            }
+            walk_expression(self, node);
+        }
+    }
+    let mut calls = Calls {
+        require,
+        bindings: &bindings,
+        local: FxHashMap::default(),
+    };
+    calls.visit_program(program);
+    deps.retain(|dependency| {
+        dependency.kind != DependencyKind::Require
+            || calls.local.get(&dependency.span) != Some(&true)
+    });
 }
 
 fn compiler_diagnostic_to_wake(diagnostic: &CompilerDiagnostic) -> Diagnostic {

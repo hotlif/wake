@@ -139,6 +139,7 @@ jobs:
           CARGO_NET_OFFLINE: "true"
       - run: corepack yarn release:check
       - run: ./target/debug/wake test scripts/check-architecture.test.mjs --serial
+      - run: ./target/debug/wake test crates/wake_docs/runtime/dev-loader.test.mjs --serial
       - run: corepack yarn architecture:check
 
   fmt:

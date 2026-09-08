@@ -80,7 +80,7 @@ type ResolutionCache =
 type PackageRootCache = FxHashMap<PathBuf, FxHashMap<String, Arc<[PathBuf]>>>;
 
 /// 解析选项。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveOptions {
     /// 扩展名补全顺序。
     pub extensions: Vec<String>,
@@ -92,6 +92,11 @@ pub struct ResolveOptions {
     /// 匹配规则：说明符 == 前缀 或以 `前缀/` 开头；命中最长前缀，重写后走文件/目录解析。
     /// 保持既定行为 webpack `resolve.alias`（WAKE-COMPATIBILITY §H）。默认空 → 行为与接入前逐字节一致。
     pub alias: Vec<(String, PathBuf)>,
+    /// Host-owned exact replacements for successfully resolved entry paths. Dependency authority
+    /// (including PnP declarations and exports) is checked first; this cannot admit an invalid
+    /// request. Targets must exist. Both sides are normalized paths, never request prefixes.
+    /// Used by Docs to share the host's already loaded React entry through a generated adapter.
+    pub resolved_redirects: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Default for ResolveOptions {
@@ -109,6 +114,7 @@ impl Default for ResolveOptions {
                 .map(|value| value.to_string())
                 .collect(),
             alias: Vec::new(),
+            resolved_redirects: Vec::new(),
         }
     }
 }
@@ -446,7 +452,20 @@ impl Resolver {
         }
         // 未命中：昂贵的 FS 探测在锁外进行（并行的收益全在这里）。两个线程同 key 竞争时都会算一遍
         // 再各自 insert——幂等无害，换取零锁争用。
-        let resolved = self.resolve_uncached(specifier, from_dir, profile);
+        let resolved = self
+            .resolve_uncached(specifier, from_dir, profile)
+            .and_then(|path| {
+                match self
+                    .options
+                    .resolved_redirects
+                    .iter()
+                    .find(|(source, _)| source == &path)
+                {
+                    Some((_, target)) if self.fs.is_file(target) => Ok(target.clone()),
+                    Some(_) => Err(ResolveErrorKind::NotFound),
+                    None => Ok(path),
+                }
+            });
         self.cache
             .lock()
             .unwrap()
@@ -2177,6 +2196,29 @@ mod tests {
                 .unwrap(),
             PathBuf::from("cache/css/node_modules/@crab-dev/css/index.js")
         );
+    }
+
+    #[test]
+    fn resolved_redirects_preserve_pnp_authority_and_cached_identity() {
+        let issuer = Path::new("cache/button/node_modules/@crab-dev/rc-button/esm");
+        for declared in [false, true] {
+            let mut resolver = pnp_authoritative_resolver(declared);
+            resolver.options.resolved_redirects.push((
+                PathBuf::from("cache/css/node_modules/@crab-dev/css/index.js"),
+                PathBuf::from("alias/crab-css.js"),
+            ));
+            for _ in 0..2 {
+                let result = resolver.resolve("@crab-dev/css", issuer);
+                if declared {
+                    assert_eq!(result.unwrap(), PathBuf::from("alias/crab-css.js"));
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().kind(),
+                        &ResolveErrorKind::PnpDependency(PnpError::Undeclared)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

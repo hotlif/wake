@@ -41,6 +41,7 @@
 - [ADR 0036: Input-disjoint exact-output transactions](0036-input-disjoint-exact-output-transactions.md) — `accepted`
 - [ADR 0037: Typed development watches and isolated candidate generations](0037-typed-development-watch-and-candidate-generations.md) — `accepted`
 - [ADR 0039: Owned immutable generated-input overlay](0039-owned-immutable-filesystem-overlay.md) — `accepted`
+- [ADR 0045: Isolated incremental candidate sessions](0045-isolated-incremental-candidate-sessions.md) — `accepted`
 
 ### css-editor
 
@@ -62,6 +63,7 @@
 - [ADR 0031: Wake Docs 统一页面身份、语法所有权与源码溯源](0031-docs-page-identity-and-source-provenance.md) — `accepted`
 - [ADR 0038: Docs generation directory transaction](0038-docs-generation-transaction.md) — `accepted`
 - [ADR 0041: Cross-process Docs generation transaction](0041-cross-process-docs-generation-transaction.md) — `accepted`
+- [ADR 0046: Docs 开发按访问构建页面与演示](0046-docs-development-demand-bundles.md) — `accepted`
 
 ### federation
 

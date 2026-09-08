@@ -438,6 +438,7 @@ struct PreparedBuild {
     aliases: Vec<(String, PathBuf)>,
     core_generation: GenerationView,
     generation: GenerationView,
+    docs_demand: Option<DocsDemand>,
 }
 
 #[derive(Clone)]
@@ -673,12 +674,20 @@ struct PreparedDocsRefresh {
 struct PreparedDocsProbe {
     prepared: PreparedBuildProbe,
     docs: wake_docs::DocsOptions,
+    demand: Option<DocsDemand>,
+}
+
+#[derive(Clone, Default)]
+struct DocsDemand {
+    modules: Option<Arc<Vec<wake_docs::DevModule>>>,
+    target: Option<wake_docs::DevModule>,
 }
 
 fn docs_probe_from_refresh(prepared: &PreparedDocsRefresh) -> PreparedDocsProbe {
     PreparedDocsProbe {
         prepared: build_probe_from_prepared(&prepared.prepared),
         docs: prepared.docs.clone(),
+        demand: prepared.prepared.docs_demand.clone(),
     }
 }
 
@@ -2145,6 +2154,7 @@ fn materialize_build_probe(
         aliases,
         core_generation: generation.clone(),
         generation,
+        docs_demand: None,
     })
 }
 
@@ -2573,16 +2583,50 @@ fn app_dev_plan(
     entry: PathBuf,
     aliases: Vec<(String, PathBuf)>,
 ) -> Result<wake_dev_server::DevMountPlan, WakeError> {
+    let mut resolve_options = ResolveOptions {
+        alias: aliases,
+        conditions: ["browser", "development", "import", "module", "default"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        ..ResolveOptions::default()
+    };
+    if prepared
+        .docs_demand
+        .as_ref()
+        .is_some_and(|demand| demand.target.is_some())
+    {
+        let host = wake_resolver::ResolutionEnvironment::with_options(
+            prepared.generation.file_system(),
+            resolve_options.clone(),
+        );
+        let resolver = host.resolver();
+        for (index, request) in wake_docs::DEV_SHARED_REQUESTS.iter().enumerate() {
+            if request.starts_with("@@wake/") {
+                continue;
+            }
+            for kind in ["import", "require"] {
+                let conditions = ["browser", "development", kind, "module", "default"]
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>();
+                let source = resolver
+                    .resolve_with_conditions(request, &prepared.root, &conditions)
+                    .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
+                resolve_options.resolved_redirects.push((
+                    source,
+                    prepared
+                        .root
+                        .join(format!(".wake/docs/generated/dev/shared/{index}.js")),
+                ));
+            }
+        }
+        resolve_options.resolved_redirects.sort();
+        resolve_options.resolved_redirects.dedup();
+    }
     Ok(wake_dev_server::DevMountPlan {
         entry,
-        resolve_options: ResolveOptions {
-            alias: aliases,
-            conditions: ["browser", "development", "import", "module", "default"]
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
-            ..ResolveOptions::default()
-        },
+        resolve_options,
         define: build_defines(&prepared.config, true),
         target_env: resolve_target_env(&prepared.config, &prepared.root)?,
         jsx_import_source: prepared.config.react.jsx_import_source.clone(),
@@ -7051,8 +7095,15 @@ fn start_docs_dev_server_leaf(
         base_path: None,
         presentation: None,
     };
+    let mut probe = probe_docs_candidate(&docs_options, docs_mode)?;
+    if docs_mode == DocsMode::Site
+        && probe.docs.preview.is_none()
+        && probe.prepared.config.react.jsx_import_source == "react"
+    {
+        probe.demand = Some(DocsDemand::default());
+    }
     let (prepared, docs, _routes, _demos, warnings, _changed_files) =
-        prepare_docs(&docs_options, wake_docs::BuildMode::Development, docs_mode)?;
+        materialize_docs_probe(probe, wake_docs::BuildMode::Development, docs_mode)?;
     let config = &prepared.config;
     let port = options.port.or(config.dev_server.port).unwrap_or(5173);
     let host = options
@@ -7072,6 +7123,8 @@ fn start_docs_dev_server_leaf(
     });
     let docs_base_path = docs.base_path.clone();
     let watch_interests = docs_watch_interests(&prepared, &docs);
+    let deferred_mounts =
+        docs_demand_mounts(&docs_options, &dev_options, &prepared, &docs, &event_tx);
     let refresh = docs_refresh(
         docs_options,
         dev_options,
@@ -7120,7 +7173,7 @@ fn start_docs_dev_server_leaf(
         quiet: true,
         event_handler: Some(event_handler),
         mounts: Vec::new(),
-        deferred_mounts: Vec::new(),
+        deferred_mounts,
         federation: wake_dev_server::FederationBuildOptions::default(),
     };
     let handle = wake_dev_server::start(&prepared.root, port, serve_options)
@@ -7130,6 +7183,49 @@ fn start_docs_dev_server_leaf(
         events: Arc::new(Mutex::new(event_rx)),
         federation_type_monitor: None,
     })
+}
+
+fn docs_demand_mounts(
+    options: &DocsBuildOptions,
+    dev_options: &DevServerOptions,
+    prepared: &PreparedBuild,
+    docs: &wake_docs::DocsOptions,
+    event_tx: &mpsc::Sender<DevServerEvent>,
+) -> Vec<wake_dev_server::DeferredMountedServeOptions> {
+    let Some(demand) = &prepared.docs_demand else {
+        return Vec::new();
+    };
+    let Some(modules) = &demand.modules else {
+        return Vec::new();
+    };
+    modules
+        .iter()
+        .map(|module| {
+            let mut probe = docs_probe_from_refresh(&PreparedDocsRefresh {
+                prepared: prepared.clone(),
+                docs: docs.clone(),
+                warnings: Vec::new(),
+            });
+            probe.demand.as_mut().expect("demand enabled").target = Some(module.clone());
+            let name = format!("docs:{}", module.key);
+            wake_dev_server::DeferredMountedServeOptions {
+                name: name.clone(),
+                root: prepared.root.clone(),
+                base_path: module.base_path.clone(),
+                watch_interests: docs_probe_watch_interests(&probe),
+                refresh: deferred_docs_refresh(
+                    options.clone(),
+                    dev_options.clone(),
+                    probe,
+                    DocsMode::Site,
+                    event_tx.clone(),
+                    Some(name),
+                ),
+                validation: wake_dev_server::DeferredValidation::OnRequest,
+                federation: wake_dev_server::FederationBuildOptions::default(),
+            }
+        })
+        .collect()
 }
 
 fn start_aggregated_docs_dev_server(
@@ -7203,6 +7299,7 @@ fn start_aggregated_docs_dev_server(
                 base_path: workspace.base_path,
                 watch_interests,
                 refresh,
+                validation: wake_dev_server::DeferredValidation::OnChange,
                 federation: wake_dev_server::FederationBuildOptions::default(),
             });
             continue;
@@ -7582,6 +7679,7 @@ fn docs_refresh(
     workspace: Option<String>,
 ) -> wake_dev_server::RefreshMount {
     let initial_topology = docs_dev_topology(prepared, docs, &dev_options, owns_server);
+    let initial_demand = prepared.docs_demand.clone();
     let config_interest =
         WatchInterest::exact_file(prepared.config_dir.join(wake_config::CONFIG_FILE))
             .resolve_against(&prepared.root);
@@ -7750,7 +7848,7 @@ fn docs_refresh(
                 });
             }
         }
-        let refreshed = match probe_docs_candidate(&options, docs_mode) {
+        let mut refreshed = match probe_docs_candidate(&options, docs_mode) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut state = state
@@ -7775,6 +7873,7 @@ fn docs_refresh(
                 });
             }
         };
+        refreshed.demand = initial_demand.clone();
         let topology = docs_probe_topology(&refreshed, &dev_options, owns_server);
         if let Some(reason) = docs_topology_change(&initial_topology, &topology) {
             let diagnostic = wake_error_diagnostic(restart_required_error(reason));
@@ -7859,7 +7958,7 @@ fn deferred_docs_refresh(
             });
         }
 
-        let refreshed = match probe_docs_candidate(&options, docs_mode) {
+        let mut refreshed = match probe_docs_candidate(&options, docs_mode) {
             Ok(refreshed) => refreshed,
             Err(error) => {
                 let mut state = state
@@ -7880,6 +7979,7 @@ fn deferred_docs_refresh(
                 });
             }
         };
+        refreshed.demand = initial_probe.demand.clone();
         if let Some(reason) = docs_topology_change(
             &initial_topology,
             &docs_probe_topology(&refreshed, &dev_options, false),
@@ -8071,6 +8171,7 @@ fn probe_docs_candidate_once(
             control_fingerprints,
         },
         docs,
+        demand: None,
     })
 }
 
@@ -8079,6 +8180,9 @@ fn materialize_docs_probe(
     mode: wake_docs::BuildMode,
     docs_mode: DocsMode,
 ) -> Result<PreparedDocs, WakeError> {
+    let timing = std::env::var_os("WAKE_TIMING")
+        .is_some()
+        .then(std::time::Instant::now);
     let PreparedDocsProbe {
         prepared:
             PreparedBuildProbe {
@@ -8091,11 +8195,30 @@ fn materialize_docs_probe(
                 control_fingerprints,
             },
         docs,
+        mut demand,
     } = probe;
     let mut generation = GenerationDraft::new(&root);
     let mut aliases = prepare_generation_aliases(&config, &root, &mut generation)?;
-    let rendered = wake_docs::render_with_mode(&root, &docs, mode, docs_mode)
-        .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
+    let selected = demand
+        .as_ref()
+        .and_then(|demand| demand.modules.as_ref())
+        .map(|modules| {
+            modules
+                .iter()
+                .map(|module| module.key.clone())
+                .collect::<BTreeSet<_>>()
+        });
+    let rendered = if demand.is_some() {
+        wake_docs::render_for_dev_server(&root, &docs, selected.as_ref())
+    } else {
+        wake_docs::render_with_mode(&root, &docs, mode, docs_mode)
+    }
+    .map_err(|error| WakeError::new("WAKE_BUILD", error.to_string()))?;
+    if let Some(demand) = &mut demand {
+        demand
+            .modules
+            .get_or_insert_with(|| Arc::new(rendered.dev_modules.clone()));
+    }
     let docs_root = root.join(".wake/docs/generated");
     let changed_files = rendered
         .files
@@ -8108,17 +8231,35 @@ fn materialize_docs_probe(
         ("@@wake/docs".to_string(), docs_root.clone()),
         ("@@wake/docs-project".to_string(), root.clone()),
     ]);
-    let entry = docs_root.join(rendered.entry_relative.as_path());
+    let logical_entry = docs_root.join(rendered.entry_relative.as_path());
+    let entry = if let Some(target) = demand.as_ref().and_then(|demand| demand.target.as_ref()) {
+        for (index, request) in wake_docs::DEV_SHARED_REQUESTS.iter().enumerate() {
+            if !request.starts_with("@@wake/") {
+                continue;
+            }
+            aliases.retain(|(name, _)| name != request);
+            aliases.push((
+                request.to_string(),
+                docs_root.join(format!("dev/shared/{index}.js")),
+            ));
+        }
+        docs_root.join(&target.entry_relative)
+    } else {
+        logical_entry.clone()
+    };
     let routes = rendered.routes;
     let demos = rendered.demos;
     let warnings = rendered.warnings;
     let generation = generation.seal()?;
+    if let Some(started) = timing {
+        eprintln!("[wake-docs] materialize={:.1?}", started.elapsed());
+    }
     Ok((
         PreparedBuild {
             config_dir,
             root: root.clone(),
             entry: entry.clone(),
-            logical_entry: entry,
+            logical_entry,
             explicit_entry: None,
             outdir,
             config,
@@ -8126,6 +8267,7 @@ fn materialize_docs_probe(
             aliases,
             core_generation: generation.clone(),
             generation,
+            docs_demand: demand,
         },
         docs,
         routes,
@@ -10320,6 +10462,225 @@ entry = "packages/Button.tsx"
         );
         assert!(reported.contains("robots.txt"));
         assert!(reported.contains("index.html"));
+    }
+
+    #[test]
+    fn docs_dev_does_not_compile_unvisited_page_dependencies() {
+        let fixture = Fixture::new("docs-demand-startup");
+        fixture.write(
+            "docs/navigation.toml",
+            "[[group]]\nid = \"start\"\ntitle = \"Start\"\npages = [\"index\", \"other\"]\n",
+        );
+        let page = "import { value } from '@@/src/a.js'\nimport '@@/src/b.js'\n\n# Home\n\n{value}\n\nFirst paragraph.\n";
+        fixture.write("docs/index.mdx", page);
+        fixture.write(
+            "docs/other.mdx",
+            "import './broken.js'\n\n# Other\n\nUnchanged page.\n",
+        );
+        fixture.write("src/a.js", "export const value = 'accepted';\n");
+        fixture.write("src/b.js", "console.log('before');\n");
+        fixture.write(
+            "package.json",
+            r#"{"dependencies":{"react":"^19.2.8","react-dom":"^19.2.8"}}"#,
+        );
+        fixture.write("node_modules/react/package.json", r#"{"name":"react","version":"19.2.8","type":"module","exports":{".":"./index.js","./jsx-runtime":"./jsx-runtime.js","./jsx-dev-runtime":"./jsx-runtime.js"}}"#);
+        fixture.write("node_modules/react/index.js", "export default {}; export const Suspense = Symbol(); export const startTransition = f => f(); export const useCallback = f => f; export const useEffect = () => {}; export const useId = () => 'id'; export const useLayoutEffect = () => {}; export const useMemo = f => f(); export const useRef = v => ({ current: v }); export const useState = v => [v, () => {}];\n");
+        fixture.write("node_modules/react/jsx-runtime.js", "export const Fragment = Symbol(); export const jsx = () => ({}); export const jsxs = jsx; export const jsxDEV = jsx;\n");
+        fixture.write("node_modules/react-dom/package.json", r#"{"name":"react-dom","version":"19.2.8","type":"module","exports":{".":"./index.js","./client":"./client.js"}}"#);
+        fixture.write("node_modules/react-dom/index.js", "export default {};\n");
+        fixture.write(
+            "node_modules/react-dom/client.js",
+            "export const createRoot = () => ({ render() {} });\n",
+        );
+        fixture.write("docs/broken.js", "export const broken = (;\n");
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let server = start_docs_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            open: Some(false),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        struct Close<'a>(&'a DevServer);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+            }
+        }
+        let _close = Close(&server);
+        let shell = http_get(port, "/bundle.js");
+        assert!(shell.starts_with("HTTP/1.1 200"), "{shell}");
+        assert!(!shell.contains("Unchanged page."));
+        assert!(!shell.contains("First paragraph."));
+        let home = http_get(port, "/@wake/docs/page-696e646578/bundle.js");
+        assert!(home.starts_with("HTTP/1.1 200"), "{home}");
+        let broken = http_get(port, "/@wake/docs/page-6f74686572/bundle.js");
+        assert!(broken.starts_with("HTTP/1.1 503"), "{broken}");
+        assert!(
+            http_get(port, "/bundle.js")
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .1
+                == shell.split_once("\r\n\r\n").unwrap().1,
+            "a failed page must not replace the shell"
+        );
+        fixture.write("docs/broken.js", "console.log('recovered-demand-page');\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let response = http_get(port, "/@wake/docs/page-6f74686572/bundle.js");
+            if response.starts_with("HTTP/1.1 200") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "page did not recover");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        server.close().unwrap();
+        fixture.write("wake.config.toml", "[docs]\npreview = 'src/preview.tsx'\n");
+        fixture.write(
+            "src/preview.tsx",
+            "export default function Preview({ children }) { return children; }\n",
+        );
+        let preview_server = start_docs_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            open: Some(false),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        let preview_bundle = http_get(port, "/bundle.js");
+        preview_server.close().unwrap();
+        assert!(
+            !preview_bundle.contains("wake.docs.development.v1"),
+            "custom Preview must retain a single graph for arbitrary shared Context modules"
+        );
+    }
+    #[test]
+    fn docs_dev_candidates_reuse_compilation_and_retry_all_uncommitted_sources() {
+        let fixture = Fixture::new("docs-incremental-candidates");
+        fixture.write(
+            "docs/navigation.toml",
+            "[[group]]\nid = \"start\"\ntitle = \"Start\"\npages = [\"index\", \"other\"]\n",
+        );
+        let page = "import { value } from '@@/src/a.js'\nimport '@@/src/b.js'\n\n# Home\n\n{value}\n\nFirst paragraph.\n";
+        fixture.write("docs/index.mdx", page);
+        fixture.write("docs/other.mdx", "# Other\n\nUnchanged page.\n");
+        fixture.write("src/a.js", "export const value = 'accepted';\n");
+        fixture.write("src/b.js", "console.log('before');\n");
+        fixture.write(
+            "package.json",
+            r#"{"dependencies":{"react":"^19.2.8","react-dom":"^19.2.8"}}"#,
+        );
+        fixture.write("node_modules/react/package.json", r#"{"name":"react","version":"19.2.8","type":"module","exports":{".":"./index.js","./jsx-runtime":"./jsx-runtime.js","./jsx-dev-runtime":"./jsx-runtime.js"}}"#);
+        fixture.write("node_modules/react/index.js", "export default {}; export const Suspense = Symbol(); export const startTransition = f => f(); export const useCallback = f => f; export const useEffect = () => {}; export const useId = () => 'id'; export const useLayoutEffect = () => {}; export const useMemo = f => f(); export const useRef = v => ({ current: v }); export const useState = v => [v, () => {}];\n");
+        fixture.write("node_modules/react/jsx-runtime.js", "export const Fragment = Symbol(); export const jsx = () => ({}); export const jsxs = jsx; export const jsxDEV = jsx;\n");
+        fixture.write("node_modules/react-dom/package.json", r#"{"name":"react-dom","version":"19.2.8","type":"module","exports":{".":"./index.js","./client":"./client.js"}}"#);
+        fixture.write("node_modules/react-dom/index.js", "export default {};\n");
+        fixture.write(
+            "node_modules/react-dom/client.js",
+            "export const createRoot = () => ({ render() {} });\n",
+        );
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let server = start_docs_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            open: Some(false),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        struct Close<'a>(&'a DevServer);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+            }
+        }
+        let _close = Close(&server);
+        let initial = server
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                DevServerEvent::Rebuilt {
+                    updated_modules,
+                    cached_modules,
+                    ..
+                } => Some((updated_modules, cached_modules)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(initial.len(), 2);
+        assert!(initial[0].0 > 10);
+        assert_eq!(initial[1], (0, initial[0].0));
+        assert!(
+            http_get(port, "/@wake/docs/page-696e646578/bundle.js").starts_with("HTTP/1.1 200")
+        );
+        let target_modules = server
+            .drain_events()
+            .into_iter()
+            .find_map(|event| match event {
+                DevServerEvent::Rebuilt {
+                    modules,
+                    workspace: Some(workspace),
+                    ..
+                } if workspace == "docs:page-696e646578" => Some(modules),
+                _ => None,
+            })
+            .expect("first page build");
+        fn next_result(server: &DevServer) -> DevServerEvent {
+            let receiver = server.events.lock().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let event = receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if matches!(&event, DevServerEvent::Diagnostic { .. })
+                    || matches!(
+                        &event, DevServerEvent::Rebuilt { workspace: Some(workspace), .. }
+                            if workspace == "docs:page-696e646578"
+                    )
+                {
+                    return event;
+                }
+            }
+        }
+        fixture.write(
+            "docs/index.mdx",
+            page.replace("First paragraph", "Edited paragraph"),
+        );
+        match next_result(&server) {
+            DevServerEvent::Rebuilt {
+                updated_modules,
+                cached_modules,
+                ..
+            } => {
+                assert!(
+                    updated_modules > 0 && updated_modules <= 4,
+                    "{updated_modules} modules updated"
+                );
+                assert!(cached_modules >= target_modules - 4);
+            }
+            event => panic!("expected incremental page build, got {event:?}"),
+        }
+        fixture.write("src/a.js", "export const value = (;\n");
+        assert!(matches!(
+            next_result(&server),
+            DevServerEvent::Diagnostic { .. }
+        ));
+        // A second event omits a.js. A failed candidate must not make its broken source disappear
+        // by reusing the accepted loader snapshot on this unrelated edit.
+        fixture.write("src/b.js", "console.log('after');\n");
+        assert!(matches!(
+            next_result(&server),
+            DevServerEvent::Diagnostic { .. }
+        ));
+        fixture.write("src/a.js", "export const value = 'recovered';\n");
+        assert!(matches!(
+            next_result(&server),
+            DevServerEvent::Rebuilt { .. }
+        ));
+        assert!(!fixture.0.join(".wake").exists());
     }
 
     #[cfg(unix)]

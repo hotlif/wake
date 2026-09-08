@@ -37,6 +37,17 @@ impl BuildGeneration {
         BuildSession::new(self.fs.view(), options)
     }
 
+    /// Derive a candidate compilation using this owner's fresh observation view.
+    /// See [`BuildSession::fork`] for the explicit invalidation contract.
+    pub fn candidate_session(
+        &self,
+        accepted: &mut BuildSession,
+        options: BuildOptions,
+        changes: Option<(&[PathBuf], bool)>,
+    ) -> BuildSession {
+        accepted.fork(self.fs.view(), options, changes)
+    }
+
     /// Share the current observation proxy with product-owned planning that must precede a view.
     pub fn file_system_view(&self) -> Arc<dyn FileSystem> {
         self.fs.view()

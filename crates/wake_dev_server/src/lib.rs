@@ -882,7 +882,18 @@ pub struct DeferredMountedServeOptions {
     pub base_path: String,
     pub watch_interests: Vec<WatchInterest>,
     pub refresh: DeferredRefreshMount,
+    pub validation: DeferredValidation,
     pub federation: FederationBuildOptions,
+}
+
+/// When a deferred mount observes its authoritative configuration. Both policies materialize and
+/// publish only after a request and after candidate watch coverage is registered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeferredValidation {
+    #[default]
+    OnChange,
+    /// Keep only initial watch interests until requested; always probe fresh on the first request.
+    OnRequest,
 }
 
 /// Compile inputs that may be replaced atomically while a server mount remains live. Server
@@ -1163,6 +1174,7 @@ struct MountSpec {
     watch_interests: Vec<WatchInterest>,
     refresh: Option<RefreshMount>,
     deferred_refresh: Option<DeferredRefreshMount>,
+    deferred_validation: DeferredValidation,
     federation: FederationBuildOptions,
     federation_updates_url: String,
 }
@@ -1258,6 +1270,7 @@ fn run_server(
         watch_interests,
         refresh,
         deferred_refresh: None,
+        deferred_validation: DeferredValidation::OnChange,
         federation,
         federation_updates_url: primary_updates_url,
     }];
@@ -1299,6 +1312,7 @@ fn run_server(
             watch_interests: mount.watch_interests,
             refresh: mount.refresh,
             deferred_refresh: None,
+            deferred_validation: DeferredValidation::OnChange,
             federation: mount.federation,
             federation_updates_url: mount_updates_url,
         });
@@ -1329,6 +1343,7 @@ fn run_server(
             watch_interests: mount.watch_interests,
             refresh: None,
             deferred_refresh: Some(mount.refresh),
+            deferred_validation: mount.validation,
             federation: mount.federation,
             federation_updates_url: mount_updates_url,
         });
@@ -1982,6 +1997,9 @@ fn watch_and_rebuild(
         /// over-watch after a failed candidate and only shrinks after a successful commit.
         watch_interests: Vec<WatchInterest>,
         lazy_retry_on_source: bool,
+        /// A failed candidate may contain source changes absent from the next event batch.
+        /// Its successor must reread all sources before inheriting accepted compilation state.
+        candidate_needs_rescan: bool,
     }
 
     let _mount_waiter_finalizer = MountWaiterFinalizer::new(&mounts);
@@ -1991,6 +2009,7 @@ fn watch_and_rebuild(
         .map(|spec| {
             let watch_interests = mount_watch_interests(&spec);
             Worker {
+                candidate_needs_rescan: false,
                 spec,
                 session: None,
                 pending_candidate: None,
@@ -2270,6 +2289,12 @@ fn watch_and_rebuild(
         // authoritative Rescan has superseded any candidate captured before that gap; otherwise a
         // request could publish stale configuration before recovery observes it.
         while let Some(ticket) = next_mount_load(&load_rx, recovery_rescan) {
+            if std::env::var_os("WAKE_TIMING").is_some() {
+                eprintln!(
+                    "[wake-lazy] dequeue mount={} epoch={}",
+                    ticket.index, ticket.epoch
+                );
+            }
             let index = ticket.index;
             if index == 0 || index >= workers.len() {
                 continue;
@@ -2843,6 +2868,24 @@ fn watch_and_rebuild(
             let recovering_eager =
                 is_recovering_eager_mount(recovery_batch, workers[index].spec.loading);
             if workers[index].session.is_none() && workers[index].spec.loading == DevLoading::Lazy {
+                if workers[index].spec.deferred_validation == DeferredValidation::OnRequest {
+                    let previous = workers[index].pending_candidate.take();
+                    commit_or_recover!(commit_watch_backend_publication(
+                        &watcher_lease,
+                        previous,
+                        RefreshOutcome::Superseded,
+                        || {
+                            // No accepted plan can become stale. Source/control notifications
+                            // invalidate failures; the load path re-probes configuration before
+                            // registering candidate coverage and materializing any inputs.
+                            workers[index].lazy_retry_on_source = false;
+                            mounts[index]
+                                .loading
+                                .set_idle_phase(MountIdlePhase::Pending);
+                        },
+                    ));
+                    continue;
+                }
                 // Lazy mounts defer source regeneration until first request. Exact configuration
                 // inputs still refresh the pending plan so that first request cannot use stale
                 // compile settings.
@@ -3109,6 +3152,7 @@ fn watch_and_rebuild(
                     base_path: workspace.as_ref().map(|_| mount_base.clone()),
                 });
             }
+            let candidate_rescan = mount_rescan || workers[index].candidate_needs_rescan;
             let refresh = refresh_mount(&workers[index].spec, &invalidation);
             let mut invalidated = mount_changed.clone();
             match refresh {
@@ -3224,6 +3268,7 @@ fn watch_and_rebuild(
                     }
                 }
                 Ok(DevMountRefresh::Candidate(mut candidate)) => {
+                    workers[index].candidate_needs_rescan = true;
                     // Preliminary coverage must be confirmed before a candidate is allowed to
                     // allocate/write generated inputs.
                     workers[index].watch_interests = union_watch_interests(
@@ -3289,7 +3334,7 @@ fn watch_and_rebuild(
                     let DevMountMaterialization {
                         plan,
                         watch_interests,
-                        generated_paths: _,
+                        generated_paths,
                     } = materialized;
                     if let Err(diagnostic) = validate_replacement_plan(&plan) {
                         commit_or_recover!(report_refresh_failure(
@@ -3352,7 +3397,32 @@ fn watch_and_rebuild(
                         );
                         continue 'watch;
                     }
-                    let candidate_session = create_mount_session(&candidate_spec);
+                    let generated_structural = generated_paths.iter().any(|path| {
+                        workers[index]
+                            .spec
+                            .plan
+                            .as_ref()
+                            .expect("accepted plan")
+                            .file_system
+                            .is_file(path)
+                            != candidate_spec
+                                .plan
+                                .as_ref()
+                                .expect("candidate plan")
+                                .file_system
+                                .is_file(path)
+                    });
+                    invalidated.extend(generated_paths);
+                    invalidated.sort();
+                    invalidated.dedup();
+                    let candidate_session = create_candidate_mount_session(
+                        &candidate_spec,
+                        workers[index].session.as_mut(),
+                        (!candidate_rescan).then_some((
+                            invalidated.as_slice(),
+                            mount_structural || generated_structural,
+                        )),
+                    );
                     let committed_spec = candidate_spec.clone();
                     let committed_interests = candidate_interests.clone();
                     let outcome = rebuild_mount(
@@ -3371,6 +3441,7 @@ fn watch_and_rebuild(
                                 workers[index].watch_interests = committed_interests;
                                 workers[index].spec = committed_spec;
                                 workers[index].session = Some(session);
+                                workers[index].candidate_needs_rescan = false;
                                 mark_mount_rebuild_succeeded(
                                     &mounts,
                                     index,
@@ -3727,7 +3798,11 @@ fn union_watch_interests(left: &[WatchInterest], right: &[WatchInterest]) -> Vec
 
 fn watch_targets(interests: &[WatchInterest]) -> BTreeMap<PathBuf, RecursiveMode> {
     let mut targets = BTreeMap::<PathBuf, RecursiveMode>::new();
-    for (path, mode) in interests.iter().flat_map(WatchInterest::registrations) {
+    // Many demand entries share one source/control tree. Deduplicate declarations before the
+    // filesystem observations in `registrations`, while still observing every distinct interest
+    // on each reconciliation (including missing-tree promotion and retargeted symlinks).
+    let unique = interests.iter().collect::<BTreeSet<_>>();
+    for (path, mode) in unique.into_iter().flat_map(WatchInterest::registrations) {
         targets
             .entry(path)
             .and_modify(|current| {
@@ -3937,6 +4012,15 @@ fn capture_diagnostic_sources(
 }
 
 fn create_mount_session(spec: &MountSpec) -> MountBuildSession {
+    create_candidate_mount_session(spec, None, None)
+}
+
+fn create_candidate_mount_session(
+    spec: &MountSpec,
+    accepted: Option<&mut MountBuildSession>,
+    changes: Option<(&[PathBuf], bool)>,
+) -> MountBuildSession {
+    let started = Instant::now();
     let plan = spec
         .plan
         .as_ref()
@@ -3978,7 +4062,7 @@ fn create_mount_session(spec: &MountSpec) -> MountBuildSession {
         }
     }
     let generation = BuildGeneration::new(Arc::clone(&plan.file_system));
-    let session = generation.retained_session(BundlerBuildOptions {
+    let options = BundlerBuildOptions {
         project_root: Some(spec.root.clone()),
         // 别名（@/@@）+ define（dev 口径）须在首次 build 前固定，dev 与 build 一致。
         resolve: plan.resolve_options.clone(),
@@ -3997,7 +4081,14 @@ fn create_mount_session(spec: &MountSpec) -> MountBuildSession {
         federation,
         target_env: plan.target_env.clone(),
         ..BundlerBuildOptions::default()
-    });
+    };
+    let session = match accepted {
+        Some(accepted) => generation.candidate_session(&mut accepted.session, options, changes),
+        None => generation.retained_session(options),
+    };
+    if std::env::var_os("WAKE_TIMING").is_some() {
+        eprintln!("[wake-candidate] prepare={:.1?}", started.elapsed());
+    }
     MountBuildSession {
         generation,
         session,
@@ -4596,6 +4687,12 @@ async fn ensure_loading_ready(
             MountReadiness::Ready => return Ok(()),
             MountReadiness::Failed(error) => return Err(error),
             MountReadiness::Enqueue(ticket) => {
+                if std::env::var_os("WAKE_TIMING").is_some() {
+                    eprintln!(
+                        "[wake-lazy] enqueue mount={} epoch={}",
+                        ticket.index, ticket.epoch
+                    );
+                }
                 loading.enqueue(ticket);
                 continue;
             }
@@ -6270,6 +6367,7 @@ mod tests {
             watch_interests: vec![WatchInterest::tree(root.path().join("extra"))],
             refresh: None,
             deferred_refresh: None,
+            deferred_validation: DeferredValidation::OnChange,
             federation: FederationBuildOptions::default(),
             federation_updates_url: String::new(),
         };
@@ -6605,6 +6703,7 @@ mod tests {
             watch_interests: Vec::new(),
             refresh: None,
             deferred_refresh: None,
+            deferred_validation: DeferredValidation::OnChange,
             federation: FederationBuildOptions {
                 enabled: true,
                 container_name: "shell".to_string(),
@@ -6673,6 +6772,7 @@ mod tests {
             watch_interests: Vec::new(),
             refresh: None,
             deferred_refresh: None,
+            deferred_validation: DeferredValidation::OnChange,
             federation: FederationBuildOptions {
                 enabled: true,
                 container_name: "shell".to_owned(),
@@ -6722,6 +6822,7 @@ mod tests {
             watch_interests: Vec::new(),
             refresh: None,
             deferred_refresh: None,
+            deferred_validation: DeferredValidation::OnChange,
             federation: FederationBuildOptions::default(),
             federation_updates_url: "ws://localhost/__wake_federation_updates?remote=catalog"
                 .to_owned(),
@@ -7967,6 +8068,7 @@ mod tests {
                     base_path: "/lazy/".to_owned(),
                     watch_interests: Vec::new(),
                     refresh,
+                    validation: DeferredValidation::OnChange,
                     federation: FederationBuildOptions::default(),
                 }],
                 ..ServeOptions::default()
@@ -8009,6 +8111,86 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)]
+    fn demand_validation_waits_for_requests_and_observes_latest_control() {
+        let _network_guard = lock_network_test();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/index.js"), "export default 'shell';").unwrap();
+        std::fs::write(
+            root.path().join("src/before.js"),
+            "export default 'before';",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/after.js"),
+            "export default 'fresh-demand-control';",
+        )
+        .unwrap();
+        let control = root.path().join("entry.txt");
+        std::fs::write(&control, "before").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let observed_root = root.path().to_path_buf();
+        let observed_control = control.clone();
+        let refresh: DeferredRefreshMount = Arc::new(move |_| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            let selected = std::fs::read_to_string(&observed_control).unwrap();
+            let plan = DevMountPlan {
+                entry: observed_root.join(format!("src/{selected}.js")),
+                resolve_options: ResolveOptions::default(),
+                define: Vec::new(),
+                target_env: TargetEnv::default(),
+                jsx_import_source: "react".into(),
+                file_system: Arc::new(OsFileSystem),
+            };
+            Ok(DevMountRefresh::Candidate(DevMountCandidate::new(
+                vec![WatchInterest::exact_file(&observed_control)],
+                move || {
+                    Ok(DevMountMaterialization {
+                        plan,
+                        watch_interests: Vec::new(),
+                        generated_paths: Vec::new(),
+                    })
+                },
+                |_| {},
+            )))
+        });
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let server = start(
+            root.path(),
+            port,
+            ServeOptions {
+                entry: root.path().join("src/index.js"),
+                quiet: true,
+                deferred_mounts: vec![DeferredMountedServeOptions {
+                    name: "demand".into(),
+                    root: root.path().to_path_buf(),
+                    base_path: "/demand/".into(),
+                    watch_interests: vec![WatchInterest::exact_file(&control)],
+                    refresh,
+                    validation: DeferredValidation::OnRequest,
+                    federation: FederationBuildOptions::default(),
+                }],
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unrequested entry must not probe configuration"
+        );
+        std::fs::write(&control, "after").unwrap();
+        let response = http_get(port, "/demand/bundle.js");
+        assert!(response.starts_with("HTTP/1.1 200") && response.contains("fresh-demand-control"));
+        assert!(http_get(port, "/demand/bundle.js").starts_with("HTTP/1.1 200"));
+        server.close().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
     fn startup_rescan_failure_is_not_reported_as_ready() {
         let _network_guard = lock_network_test();
         let root = tempfile::Builder::new()
@@ -8044,6 +8226,68 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("startup configuration changed"));
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn startup_candidate_rescan_reuses_module_compilation() {
+        let _network_guard = lock_network_test();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/index.js"),
+            "import './leaf.js'; export default 1;",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/leaf.js"), "console.log('leaf');").unwrap();
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let server = start(
+            root.path(),
+            port,
+            ServeOptions {
+                entry: root.path().join("src/index.js"),
+                quiet: true,
+                refresh: Some(Arc::new(|plan, _| {
+                    let plan = plan.clone();
+                    Ok(DevMountRefresh::Candidate(DevMountCandidate::new(
+                        Vec::new(),
+                        move || {
+                            Ok(DevMountMaterialization {
+                                plan,
+                                watch_interests: Vec::new(),
+                                generated_paths: Vec::new(),
+                            })
+                        },
+                        |_| {},
+                    )))
+                })),
+                event_handler: Some(Arc::new(move |event| {
+                    if let ServerEvent::Rebuilt {
+                        updated_modules,
+                        cached_modules,
+                        ..
+                    } = event
+                    {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push((updated_modules, cached_modules));
+                    }
+                })),
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+        server.close().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![(2, 0), (0, 2)],
+            "startup must retain its Rescan fence without recompiling unchanged modules"
+        );
     }
 
     #[test]

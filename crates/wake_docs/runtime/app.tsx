@@ -1,5 +1,5 @@
 import React, { Suspense, startTransition, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { apiDocs, demos, pages } from "@@wake/docs/registry.ts";
+import { apiDocs, demos, pages, developmentDemand } from "@@wake/docs/registry.ts";
 import { Preview, siteConfig } from "@@wake/docs/config.tsx";
 import { docsRouteHref, findPageForPath, routePathFromLocation } from "./routes.mjs";
 import { createSearchIndex, searchDocs } from "./search.mjs";
@@ -22,6 +22,7 @@ function loadPage(page: PageRecord): Promise<any> {
   if (cached) return cached;
   const pending = page.load().catch((reason) => {
     pageLoads.delete(page.slug);
+    lazyPages.delete(page.slug);
     throw reason;
   });
   pageLoads.set(page.slug, pending);
@@ -665,6 +666,20 @@ type DemoErrorBoundaryProps = {
   children: React.ReactNode;
 };
 
+class PageErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: string }> {
+  state = { error: "" };
+  static getDerivedStateFromError(reason: unknown) {
+    return { error: String((reason as any)?.message || reason) };
+  }
+  render() {
+    return this.state.error ? <div className="frame-error" role="alert">
+      <h1>{text("Page compilation failed", "页面编译失败")}</h1>
+      <pre>{this.state.error}</pre>
+      <button type="button" onClick={() => location.reload()}>{text("Retry", "重试")}</button>
+    </div> : this.props.children;
+  }
+}
+
 class DemoErrorBoundary extends React.Component<DemoErrorBoundaryProps, { error: string }> {
   state = { error: "" };
 
@@ -840,6 +855,7 @@ export function App() {
   useEffect(() => {
     const anchorFor = (event: Event) => event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
     const preload = (event: Event) => {
+      if (developmentDemand) return;
       const anchor = anchorFor(event);
       if (!anchor) return;
       const link = internalPageLink(anchor);
@@ -886,7 +902,7 @@ export function App() {
     {drawer && <div className="drawer-backdrop" onMouseDown={() => setDrawer(false)}><aside id="wake-docs-drawer" className="drawer" role="dialog" aria-modal="true" aria-label={text("Documentation navigation", "文档导航")} onKeyDown={trapDialogFocus} onMouseDown={(event) => event.stopPropagation()}><div className="drawer-head"><Logo onNavigate={() => { suppressDrawerFocusRestore(); setDrawer(false); }} /><button ref={drawerClose} type="button" className="icon-button" onClick={() => setDrawer(false)} aria-label={text("Close navigation", "关闭导航")}>×</button></div><Sidebar current={page?.slug || ""} close={() => { suppressDrawerFocusRestore(); setDrawer(false); }} /></aside></div>}
     <main className="content" id="wake-docs-content" tabIndex={-1}>
       {page && <MobileTableOfContents page={page} />}
-      <Suspense fallback={<div className="page-loading" role="status"><span aria-hidden="true" /><span className="sr-only">{text("Loading page…", "正在加载页面…")}</span></div>}>{LazyPage ? <LazyPage /> : <NotFound />}</Suspense>
+      <PageErrorBoundary key={routePath}><Suspense fallback={<div className="page-loading" role="status"><span aria-hidden="true" /><span className="sr-only">{text("Loading page…", "正在加载页面…")}</span></div>}>{LazyPage ? <LazyPage /> : <NotFound />}</Suspense></PageErrorBoundary>
     </main>
     <aside className="toc-column">{page && <TableOfContents page={page} />}</aside>
     <Search open={search} close={() => setSearch(false)} go={go} />

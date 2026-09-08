@@ -130,6 +130,7 @@ impl<V> Sharded<V> {
 }
 
 /// 输入 cell：文件内容、配置切片……由引擎递增分配、外部显式写入。
+#[derive(Clone)]
 struct InputCell {
     value: AnyValue,
     fingerprint: Hash64,
@@ -266,6 +267,33 @@ fn record_dependency(raw: RawVc) {
 }
 
 impl Engine {
+    /// Snapshot a quiescent retained graph, sharing only immutable payloads and callbacks.
+    ///
+    /// Input cells, memo metadata, revisions and execution locks are independent. Input handles
+    /// remain valid in both graphs. Callback captures are NOT deep-cloned: callers must use pure
+    /// callbacks with engine-relative handles and immutable configuration, and coordinate any
+    /// shared instrumentation separately. Exclusive access prevents snapshotting an active graph.
+    pub fn fork(&mut self) -> Self {
+        assert!(!self.one_shot, "one-shot graphs cannot be forked");
+        let next = Self::new();
+        next.revision.store(self.revision(), Ordering::Relaxed);
+        *next.inputs.write().unwrap() = self.inputs.read().unwrap().clone();
+        for (source, target) in self.memos.shards.iter().zip(next.memos.shards.iter()) {
+            *target.lock().unwrap() = source.lock().unwrap().clone();
+        }
+        for (source, target) in self
+            .recomputers
+            .shards
+            .iter()
+            .zip(next.recomputers.shards.iter())
+        {
+            *target.lock().unwrap() = source.lock().unwrap().clone();
+        }
+        next.incremental
+            .store(self.is_incremental(), Ordering::Relaxed);
+        next
+    }
+
     pub fn new() -> Engine {
         Self::with_mode(false)
     }

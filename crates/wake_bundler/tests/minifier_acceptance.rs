@@ -13,6 +13,22 @@ exports.Fragment = "owned-fragment";
 "#;
 
 #[test]
+fn bundled_local_loader_and_external_require_keep_distinct_runtime_semantics() {
+    assert_runtime_differential(
+        "local-loader",
+        &[
+            (
+                "index.js",
+                "function loader(require){return require('./internal.js')}export const result=[loader(name=>'local:'+name),require('./external.js')];",
+            ),
+            ("external.js", "module.exports=42;"),
+        ],
+        "index.js",
+        "__WAKE_EXPORT__{\"result\":[\"local:./internal.js\",42]}",
+    );
+}
+
+#[test]
 fn dependency_patch_compatibility_runtime() {
     assert_runtime_differential(
         "dependency-patch-compatibility",

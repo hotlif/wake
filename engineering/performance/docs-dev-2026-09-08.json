@@ -1,0 +1,544 @@
+{
+  "date": "2026-09-08",
+  "timezone": "Asia/Singapore",
+  "engineBase": "c69a16a",
+  "engineVersion": "0.1.32",
+  "uncommittedOptimizationPatch": true,
+  "workload": "crab-dev/.website, existing component outputs and metadata; Wake/Crab CSS package dependencies remain 0.1.30",
+  "modules": 3705,
+  "chunks": 620,
+  "environment": {
+    "os": "Windows NT 10.0.26200.0",
+    "cpu": "Intel64 Family 6 Model 165 Stepping 5, GenuineIntel",
+    "logicalCores": 20,
+    "ram": "Unavailable: system inventory query denied",
+    "rust": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "node": "v22.15.0; not on the measured Rust service path",
+    "profile": "release",
+    "powerMode": "GameTurbo (High Performance)",
+    "backgroundLoad": "No overlapping agent builds during final samples; other host activity uncontrolled",
+    "persistentCache": "disabled",
+    "filesystemCache": "not flushed"
+  },
+  "command": "cargo run --offline --locked --release -p wake_app --example docs_dev_startup -- <crab-dev>/.website [docs/components/rc-tree-select.mdx]",
+  "timedBoundary": "start_docs_dev_server invocation to return; excludes executable loading, component builds and metadata preparation",
+  "samples": [
+    {
+      "variant": "candidate reuse and CSS snapshot repair, before source-coordinate batching",
+      "wakeTiming": true,
+      "readyMs": 65877.7956,
+      "initialBuildMs": 41936.817,
+      "rescanBuildMs": 23314.844,
+      "rescanUpdatedModules": 0,
+      "rescanCachedModules": 3705,
+      "initialEmitMsApprox": 22500
+    },
+    {
+      "variant": "complete optimization",
+      "wakeTiming": true,
+      "readyMs": 22144.969,
+      "initialBuildMs": 19951.9361,
+      "rescanBuildMs": 1559.2949,
+      "rescanUpdatedModules": 0,
+      "rescanCachedModules": 3705,
+      "initialEmitMsApprox": 844,
+      "rescanEmitMsApprox": 827,
+      "initialOptimizeMsApprox": 16700
+    },
+    {
+      "variant": "complete optimization with paragraph edit and restoration",
+      "wakeTiming": false,
+      "readyMs": 22255.1617,
+      "initialBuildMs": 20097.7868,
+      "rescanBuildMs": 1526.3921,
+      "rescanUpdatedModules": 0,
+      "rescanCachedModules": 3705,
+      "edit": {
+        "page": "docs/components/rc-tree-select.mdx",
+        "feedbackMs": 1735.3964,
+        "buildMs": 1366.4582,
+        "updatedModules": 2,
+        "cachedModules": 3703,
+        "restored": true,
+        "beforeAndAfterSha256": "6AD6310B424FBEB7D02A99D7D013E7D73DC97E55D875BFC5A8FC56B6DD4D3C19"
+      }
+    }
+  ],
+  "startupFollowup": {
+    "change": "Index initialized symbols by function boundary; solve independent CFG components over locally read symbols",
+    "sameEnvironmentAndWorkload": true,
+    "temporaryProbesRemovedFromFinalSource": true,
+    "moduleProfilingBeforeMs": {
+      "elk.bundled.js": 16571.562,
+      "elk-worker.min.js": 14268.1
+    },
+    "moduleProfilingAfterMs": {
+      "elk.bundled.js": 7644.512,
+      "elk-worker.min.js": 5344.087
+    },
+    "initialElkBundledAnalysis": {
+      "nodes": 870502,
+      "symbols": 42210,
+      "roots": 11119,
+      "blocks": 125285,
+      "oldIncomingOutgoingPayloadBytesCalculated": 1323009600,
+      "payloadIsNotMeasuredRss": true
+    },
+    "finalSamples": [
+      {
+        "wakeTiming": true,
+        "readyMs": 13342.1577,
+        "initialBuildMs": 11029.2921,
+        "rescanBuildMs": 1671.767,
+        "initialOptimizeMsApprox": 7600,
+        "initialBodyMsApprox": 1347.5,
+        "initialEmitMsApprox": 913.9,
+        "rescanUpdatedModules": 0,
+        "rescanCachedModules": 3705
+      },
+      {
+        "wakeTiming": false,
+        "readyMs": 13109.5367,
+        "initialBuildMs": 10866.2625,
+        "rescanBuildMs": 1612.8818,
+        "rescanUpdatedModules": 0,
+        "rescanCachedModules": 3705
+      }
+    ],
+    "validation": {
+      "minifyCoreCodegenUnitTests": 363,
+      "bundlerMinifierAcceptanceTests": 29,
+      "bundlerPerformanceInvariantTests": 4,
+      "clippyAllMinifyTargets": "passed",
+      "releaseCliAndMeasurementExample": "rebuilt"
+    },
+    "limitations": [
+      "Per-module probe durations overlap across workers and are not additive",
+      "Two final startup samples without temporary probes; WAKE_TIMING enabled in one sample",
+      "No Crab source edits or browser paint measurement in this followup",
+      "Scope-aware filtering of bundled libraries' local require calls remains followup work"
+    ]
+  },
+  "requireAndTraversalFollowup": {
+    "sameEnvironmentAndServiceBoundary": true,
+    "modules": 3702,
+    "chunks": 620,
+    "changes": [
+      "Bundler excludes proven locally bound require calls from file dependency candidates and versions scan summary identity",
+      "IR structural edges use stack arrays and child traversal reuses its stack",
+      "Validated dense arena IDs replace hashed reachability state",
+      "Escape and CFG read queries prune subtrees outside their established function boundary"
+    ],
+    "intermediateSamplesWithTemporaryProbes": [
+      {
+        "variant": "local require filtering only",
+        "readyMs": 13289.0265,
+        "initialBuildMs": 10907.188,
+        "initialOptimizeMsApprox": 7700
+      },
+      {
+        "variant": "local require filtering plus allocation and reachability improvements",
+        "readyMs": 9044.1118,
+        "initialOptimizeMsApprox": 4000
+      }
+    ],
+    "finalSamplesWithoutTemporaryProbes": [
+      {
+        "wakeTiming": true,
+        "readyMs": 8009.4201,
+        "initialBuildMs": 5725.8779,
+        "rescanBuildMs": 1652.6243,
+        "initialScanMsApprox": 650.2,
+        "initialOptimizeMsApprox": 2900,
+        "initialBodyMsApprox": 924.6,
+        "initialEmitMsApprox": 880.6,
+        "rescanEmitMsApprox": 959.6,
+        "rescanUpdatedModules": 0,
+        "rescanCachedModules": 3702
+      },
+      {
+        "wakeTiming": false,
+        "readyMs": 7932.4618,
+        "initialBuildMs": 5739.78,
+        "rescanBuildMs": 1583.0548,
+        "rescanUpdatedModules": 0,
+        "rescanCachedModules": 3702
+      }
+    ],
+    "validation": {
+      "minifyCoreCodegenBundlerUnitTests": 715,
+      "bundlerMinifierAcceptanceTests": 30,
+      "bundlerPerformanceInvariantTests": 6,
+      "bundlerOneShotTests": 2,
+      "totalRustTestsPassed": 753,
+      "clippyAllMinifyAndBundlerTargets": "passed",
+      "documentationCheck": "passed",
+      "releaseCliAndMeasurementExample": "rebuilt"
+    },
+    "limitations": [
+      "Two final startup samples, no cold-filesystem or P95 claim",
+      "No Crab source edits or browser paint measurement",
+      "Persistent cache disabled; demos, CSS, source maps and startup Rescan retained",
+      "Initial compilation still discovers the full site and Rescan still assembles final outputs",
+      "Local release binary only; npm packages were not published or replaced"
+    ]
+  },
+  "comparison": {
+    "source": "crab-dev/rfc/inline-docs-performance-root-cause-2026-09-08.md and its diagnostic JSON",
+    "version": "0.1.30",
+    "readyMs": 85322.6948,
+    "editFeedbackMs": 43074.2385,
+    "editBuildMs": 42337.0903,
+    "editUpdatedModules": 3705,
+    "editCachedModules": 0
+  },
+  "limitations": [
+    "Historical report comparison, not a new controlled before/after run of the same binary version",
+    "Two final startup samples, one final edit sample; not a P95 or cold-filesystem result",
+    "Edit timing ends at receipt of a rebuild event with 10 ms polling, not browser paint",
+    "Both initial and authoritative Rescan builds remain; the latter reuses module compilation",
+    "First startup still discovers and compiles the complete route dependency graph"
+  ],
+  "onDemandFollowup": {
+    "date": "2026-09-09",
+    "implementation": "Final source with OnRequest validation and post-resolution React entry redirects; release CLI/example rebuilt",
+    "boundary": "start_docs_dev_server to return; shell and watcher startup fence only; first payload requests recorded separately",
+    "priorEagerReadyMs": [
+      7932.4618,
+      8009.4201
+    ],
+    "startupModules": 29,
+    "firstHomeModules": 5,
+    "finalSamples": [
+      {
+        "edit": null,
+        "events": [
+          {
+            "assets": 0,
+            "cachedModules": 0,
+            "chunks": 2,
+            "durationMs": 616.6078,
+            "initial": true,
+            "modules": 29,
+            "type": "rebuilt",
+            "updatedModules": 29
+          },
+          {
+            "failed": 0,
+            "failedNames": [],
+            "loaded": 0,
+            "total": 73,
+            "type": "workspaceState"
+          },
+          {
+            "changedPaths": [],
+            "type": "rebuildStart"
+          },
+          {
+            "assets": 0,
+            "cachedModules": 29,
+            "chunks": 2,
+            "durationMs": 95.8586,
+            "initial": false,
+            "modules": 29,
+            "type": "rebuilt",
+            "updatedModules": 0
+          },
+          {
+            "failed": 0,
+            "failedNames": [],
+            "loaded": 0,
+            "total": 73,
+            "type": "workspaceState"
+          }
+        ],
+        "readyMs": 1894.395,
+        "requests": [
+          {
+            "bytes": 480,
+            "durationMs": 1.4507999999999999,
+            "events": [],
+            "path": "/",
+            "status": "HTTP/1.1 200 OK"
+          },
+          {
+            "bytes": 1414688,
+            "durationMs": 2.9928,
+            "events": [],
+            "path": "/bundle.js",
+            "status": "HTTP/1.1 200 OK"
+          },
+          {
+            "bytes": 27353,
+            "durationMs": 299.7355,
+            "events": [
+              {
+                "current": "docs:page-696e646578",
+                "failed": 0,
+                "failedNames": [],
+                "loaded": 0,
+                "total": 73,
+                "type": "workspaceState"
+              },
+              {
+                "assets": 0,
+                "basePath": "/@wake/docs/page-696e646578/",
+                "cachedModules": 0,
+                "chunks": 1,
+                "durationMs": 20.7055,
+                "initial": true,
+                "modules": 5,
+                "type": "rebuilt",
+                "updatedModules": 5,
+                "workspace": "docs:page-696e646578"
+              },
+              {
+                "failed": 0,
+                "failedNames": [],
+                "loaded": 1,
+                "total": 73,
+                "type": "workspaceState"
+              }
+            ],
+            "path": "/@wake/docs/page-696e646578/bundle.js",
+            "status": "HTTP/1.1 200 OK"
+          },
+          {
+            "bytes": 27353,
+            "durationMs": 0.6151000000000001,
+            "events": [],
+            "path": "/@wake/docs/page-696e646578/bundle.js",
+            "status": "HTTP/1.1 200 OK"
+          }
+        ]
+      },
+      {
+        "edit": null,
+        "events": [
+          {
+            "assets": 0,
+            "cachedModules": 0,
+            "chunks": 2,
+            "durationMs": 654.7036,
+            "initial": true,
+            "modules": 29,
+            "type": "rebuilt",
+            "updatedModules": 29
+          },
+          {
+            "failed": 0,
+            "failedNames": [],
+            "loaded": 0,
+            "total": 73,
+            "type": "workspaceState"
+          },
+          {
+            "changedPaths": [],
+            "type": "rebuildStart"
+          },
+          {
+            "assets": 0,
+            "cachedModules": 29,
+            "chunks": 2,
+            "durationMs": 107.29220000000001,
+            "initial": false,
+            "modules": 29,
+            "type": "rebuilt",
+            "updatedModules": 0
+          },
+          {
+            "failed": 0,
+            "failedNames": [],
+            "loaded": 0,
+            "total": 73,
+            "type": "workspaceState"
+          }
+        ],
+        "readyMs": 1960.4536,
+        "requests": [
+          {
+            "bytes": 480,
+            "durationMs": 0.7583,
+            "events": [],
+            "path": "/",
+            "status": "HTTP/1.1 200 OK"
+          },
+          {
+            "bytes": 1414688,
+            "durationMs": 15.2283,
+            "events": [],
+            "path": "/bundle.js",
+            "status": "HTTP/1.1 200 OK"
+          },
+          {
+            "bytes": 27353,
+            "durationMs": 308.76169999999996,
+            "events": [
+              {
+                "current": "docs:page-696e646578",
+                "failed": 0,
+                "failedNames": [],
+                "loaded": 0,
+                "total": 73,
+                "type": "workspaceState"
+              },
+              {
+                "assets": 0,
+                "basePath": "/@wake/docs/page-696e646578/",
+                "cachedModules": 0,
+                "chunks": 1,
+                "durationMs": 25.232999999999997,
+                "initial": true,
+                "modules": 5,
+                "type": "rebuilt",
+                "updatedModules": 5,
+                "workspace": "docs:page-696e646578"
+              },
+              {
+                "failed": 0,
+                "failedNames": [],
+                "loaded": 1,
+                "total": 73,
+                "type": "workspaceState"
+              }
+            ],
+            "path": "/@wake/docs/page-696e646578/bundle.js",
+            "status": "HTTP/1.1 200 OK"
+          },
+          {
+            "bytes": 27353,
+            "durationMs": 0.5693,
+            "events": [],
+            "path": "/@wake/docs/page-696e646578/bundle.js",
+            "status": "HTTP/1.1 200 OK"
+          }
+        ]
+      }
+    ],
+    "firstHeavyPage": {
+      "edit": null,
+      "events": [
+        {
+          "assets": 0,
+          "cachedModules": 0,
+          "chunks": 2,
+          "durationMs": 629.9402,
+          "initial": true,
+          "modules": 29,
+          "type": "rebuilt",
+          "updatedModules": 29
+        },
+        {
+          "failed": 0,
+          "failedNames": [],
+          "loaded": 0,
+          "total": 73,
+          "type": "workspaceState"
+        },
+        {
+          "changedPaths": [],
+          "type": "rebuildStart"
+        },
+        {
+          "assets": 0,
+          "cachedModules": 29,
+          "chunks": 2,
+          "durationMs": 95.3115,
+          "initial": false,
+          "modules": 29,
+          "type": "rebuilt",
+          "updatedModules": 0
+        },
+        {
+          "failed": 0,
+          "failedNames": [],
+          "loaded": 0,
+          "total": 73,
+          "type": "workspaceState"
+        }
+      ],
+      "readyMs": 1895.8879,
+      "requests": [
+        {
+          "bytes": 3858887,
+          "durationMs": 3909.2857,
+          "events": [
+            {
+              "current": "docs:page-636f6d706f6e656e74732f72632d666c6f772d6469616772616d",
+              "failed": 0,
+              "failedNames": [],
+              "loaded": 0,
+              "total": 73,
+              "type": "workspaceState"
+            },
+            {
+              "assets": 0,
+              "basePath": "/@wake/docs/page-636f6d706f6e656e74732f72632d666c6f772d6469616772616d/",
+              "cachedModules": 0,
+              "chunks": 493,
+              "durationMs": 3633.9625,
+              "initial": true,
+              "modules": 792,
+              "type": "rebuilt",
+              "updatedModules": 792,
+              "workspace": "docs:page-636f6d706f6e656e74732f72632d666c6f772d6469616772616d"
+            },
+            {
+              "failed": 0,
+              "failedNames": [],
+              "loaded": 1,
+              "total": 73,
+              "type": "workspaceState"
+            }
+          ],
+          "path": "/@wake/docs/page-636f6d706f6e656e74732f72632d666c6f772d6469616772616d/bundle.js",
+          "status": "HTTP/1.1 200 OK"
+        }
+      ]
+    },
+    "browser": {
+      "executable": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+      "version": "152.0.7977.76",
+      "cdp": {
+        "protocolVersion": "1.3",
+        "product": "Chrome/152.0.7977.76",
+        "revision": "@0d89dfa2dd7c1ec4b8a14b9f303f887bb63b6174",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/152.0.0.0 Safari/537.36",
+        "jsVersion": "15.2.124.19"
+      },
+      "homeVisibleMsAfterServerReady": 590,
+      "buttonVisibleAndNetworkIdleMs": 2359,
+      "loadedEntries": [
+        {
+          "base": "/",
+          "shared": [
+            "react",
+            "react/jsx-runtime",
+            "react/jsx-dev-runtime",
+            "react-dom",
+            "react-dom/client",
+            "@@wake/docs/runtime/app.tsx"
+          ],
+          "loaded": [
+            "page-696e646578",
+            "page-636f6d706f6e656e74732f72632d627574746f6e"
+          ],
+          "reactVersion": "19.2.8"
+        }
+      ],
+      "hookCounterVerified": 1,
+      "observedConsoleMessages": [
+        "Failed to load resource: the server responded with a status of 404 (Not Found)"
+      ],
+      "followupResourceFailures": [],
+      "scope": "Windows Chrome manual functional smoke; not reviewed-major or cross-platform conformance"
+    },
+    "limitations": [
+      "Persistent cache disabled; filesystem cache not flushed; uncontrolled external host load; no concurrent task builds/tests during timing samples",
+      "Existing Crab component outputs and metadata preparation excluded; installed npm packages unchanged",
+      "MDX parsing, navigation and metadata remain startup work; page/demo JS/TS dependencies are on demand",
+      "New entries are eager until restart; aggregated/Components/custom Preview/custom JSX runtime retain the eager graph",
+      "Heavy first-page compilation and repeated nonshared dependencies across loaded pages remain"
+    ]
+  }
+}

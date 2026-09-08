@@ -53,6 +53,12 @@ tarball 目标及 PnP 树外 NodeNext 消费。决策见
 - 性能报告同时验证输出与诊断等价；
 - CI 文档明确区分 compile smoke 和 regression gate。
 
+Docs 大依赖的局部 `require` 候选过滤已完成，避免把内置加载器调用当作外部 CommonJS 依赖提前
+解析/编译；局部绑定、真实未绑定调用、缓存摘要、增量编辑和缺失依赖诊断进入回归测试。
+2026-09-09 已为独立 Docs Site 接入按访问编译依赖，并处理 PnP 下的 React 共享；范围与测量见
+[PERFORMANCE](PERFORMANCE.md) 第 13 节。后续重点是图标 barrel 裁剪、跨页非共享依赖复用、元数据
+重复扫描与最终产物组装；聚合站、Components、自定义 Preview/JSX runtime 尚未接入按需路径。
+
 # R3 — 覆盖声明的 Node 支持下界（已完成，持续门禁）
 
 结果：常规 CI 以仓库外、非 PnP 的干净 npm consumer 在 Windows/Linux 覆盖精确下界
