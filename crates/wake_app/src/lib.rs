@@ -9088,6 +9088,110 @@ mod tests {
         assert!(output.bundle.contains("__wake__.s"));
     }
 
+    #[test]
+    fn docs_shared_react_preserves_default_imports_in_dynamic_chunks() {
+        let fixture = Fixture::new("docs-shared-react-interop");
+        fixture.write(
+            "package.json",
+            r#"{"dependencies":{"react":"19.2.8","react-dom":"19.2.8"}}"#,
+        );
+        fixture.write(
+            "docs/navigation.toml",
+            "[[group]]\nid = 'start'\ntitle = 'Start'\npages = ['index']\n",
+        );
+        fixture.write("docs/index.mdx", "# Home\n");
+        let rendered =
+            wake_docs::render_for_dev_server(&fixture.0, &wake_docs::DocsOptions::default(), None)
+                .unwrap();
+        let mut files = rendered
+            .files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    format!(
+                        "generated/{}",
+                        path.as_path().to_string_lossy().replace('\\', "/")
+                    ),
+                    bytes.to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.push((
+            "entry.js".into(),
+            br#"
+import React, { PureComponent } from './generated/dev/shared/0.js';
+import * as namespace from './generated/dev/shared/0.js';
+const required = require('./generated/dev/shared/0.js');
+export const identities = [React, namespace.default, required, PureComponent];
+export const load = () => import('./highlighter.js');
+"#
+            .to_vec(),
+        ));
+        files.push((
+            "highlighter.js".into(),
+            br#"
+import React from './generated/dev/shared/0.js';
+export class Highlighter extends React.PureComponent {}
+export const shared = React;
+"#
+            .to_vec(),
+        ));
+        for minify in [false, true] {
+            for tree_shaking in [false, true] {
+                let mut session = BuildSession::new(
+                    Arc::new(wake_common::MemoryFileSystem::from_files(files.clone())),
+                    BundlerBuildOptions {
+                        resolve: ResolveOptions {
+                            alias: vec![("@@wake/docs".into(), PathBuf::from("generated"))],
+                            ..ResolveOptions::default()
+                        },
+                        platform: BuildPlatform::Node,
+                        module_format: ModuleFormat::CommonJs,
+                        code_splitting: true,
+                        minify,
+                        tree_shaking,
+                        ..BundlerBuildOptions::default()
+                    },
+                );
+                let output = session.build(BuildRequest::new("entry.js"));
+                assert!(!output.has_errors(), "{:?}", output.diagnostics);
+                assert!(
+                    output.chunks.len() > 1,
+                    "the lazy consumer must remain split"
+                );
+                let outdir = format!("out-{minify}-{tree_shaking}");
+                for chunk in &output.chunks {
+                    fixture.write(&format!("{outdir}/{}", chunk.file_name), &chunk.code);
+                }
+                let result = Command::new("node")
+                    .arg("-e")
+                    .arg(
+                        r#"
+const assert = require('node:assert/strict');
+const React = { PureComponent: class PureComponent {} };
+globalThis[Symbol.for('wake.docs.development.v1')] = new Map([
+  ['/', { shared: new Map([['react', React]]) }],
+]);
+const entry = require(process.argv[1]);
+entry.load().then(highlighter => {
+  assert.ok(new highlighter.Highlighter() instanceof React.PureComponent);
+  assert.equal(highlighter.shared, React);
+  assert.deepEqual(entry.identities, [React, React, React, React.PureComponent]);
+}).catch(error => { console.error(error); process.exitCode = 1; });
+"#,
+                    )
+                    .arg(fixture.0.join(&outdir).join(&output.entry().file_name))
+                    .output()
+                    .expect("Node must execute the generated Docs shared adapter");
+                assert!(
+                    result.status.success(),
+                    "minify={minify} tree_shaking={tree_shaking}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+
     struct Fixture(PathBuf);
 
     impl Fixture {

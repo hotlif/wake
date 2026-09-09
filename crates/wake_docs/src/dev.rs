@@ -1,4 +1,9 @@
 //! Private development entry inventory; HTTP/build ownership stays with the application/server.
+//!
+//! Shared adapters are CommonJS modules (ADR 0046), including their loader dependency. ESM default,
+//! named and namespace imports and CommonJS consumers must all observe the host's original object,
+//! including consumers in dynamically imported chunks. ESM syntax in an adapter would incorrectly
+//! advertise an ESM default export while `module.exports` actually returns the shared object.
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +105,7 @@ pub(super) fn render_dev_entries(
             js_string(request)
         ));
         let shim = format!(
-            "import {{ docsDevContext }} from '@@wake/docs/runtime/dev-loader.mjs';\nmodule.exports = docsDevContext({}).shared.get({});\nif (!module.exports) throw new Error('Docs host shared module is unavailable');\n",
+            "const {{ docsDevContext }} = require('@@wake/docs/runtime/dev-loader.mjs');\nmodule.exports = docsDevContext({}).shared.get({});\nif (!module.exports) throw new Error('Docs host shared module is unavailable');\n",
             js_string(base_path),
             js_string(request),
         );
