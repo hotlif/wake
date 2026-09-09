@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.33
+
+- Compile standalone React Docs Site pages and demos on first access, so the navigation shell can
+  become available before heavy page dependencies. Page dependency errors are reported on access;
+  production builds, aggregated sites, Components mode and custom Preview/JSX runtimes remain eager.
+- Share React and JSX runtime identity across demand bundles after normal dependency resolution,
+  including strict Yarn PnP, and support failed page retries and updates to visited pages.
+- Reuse pure compilation work in isolated development candidates while preserving authoritative
+  startup/recovery checks and the last successful output after a failed rebuild.
+- Batch UTF-16 source-map coordinates for large single-line dependencies without dropping mappings.
+- Reduce control-flow initialization state and typed IR traversal work in large generated modules.
+- Exclude locally bound `require` calls from external dependency resolution; invalidate obsolete
+  dependency scan summaries while retaining real CommonJS missing-dependency diagnostics.
+- Recognize both positional and metadata Lucide icon factories in the Components PnP release smoke.
+
 ## 0.1.32
 
 - Preserve template interpolation text and tagged-template raw values during minification.

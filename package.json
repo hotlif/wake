@@ -1,7 +1,7 @@
 {
   "name": "wake-workspace",
   "private": true,
-  "version": "0.1.32",
+  "version": "0.1.33",
   "type": "module",
   "packageManager": "yarn@4.16.0",
   "workspaces": [
@@ -41,7 +41,7 @@
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {
-    "@crab-dev/css": "0.1.32",
+    "@crab-dev/css": "0.1.33",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-card": "^0.0.2",
