@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.34
+
+- Fix `Cannot read properties of undefined (reading 'PureComponent')` when a Docs demand bundle
+  loads a React consumer such as a source-code highlighter. Generated shared adapters now remain
+  CommonJS throughout, preserving default, named, namespace and require access to the host React
+  object, including dynamically imported chunks with minification or tree shaking enabled.
+
 ## 0.1.33
 
 - Compile standalone React Docs Site pages and demos on first access, so the navigation shell can
