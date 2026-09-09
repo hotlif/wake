@@ -74,6 +74,14 @@ function isComponent(value) {
   return value !== null && (typeof value === 'function' || typeof value === 'object')
 }
 
+export function isSlidersHorizontalFactory(factory) {
+  const positional = /(?:createLucideIcon|\(\s*0\s*,\s*[$\w]+\.default\s*\))\(\s*["']sliders-horizontal["']/.test(factory)
+  // Lucide 1.43 passes icon metadata instead of the name as a positional argument.
+  const metadata = /[{,]\s*(?:name|["']name["'])\s*:\s*["']sliders-horizontal["']/.test(factory)
+    && /(?:createLucideIcon|\(\s*0\s*,\s*[$\w]+\.default\s*\))\(/.test(factory)
+  return positional || metadata
+}
+
 export async function assertComponentsRuntime(entryPath) {
   const source = await readFile(entryPath, 'utf8')
   const smokeSource = exposeRuntime(source)
@@ -94,10 +102,7 @@ export async function assertComponentsRuntime(entryPath) {
 
   const [iconModuleId] = findSingleModule(
     runtime,
-    (factory) =>
-      /(?:createLucideIcon|\(\s*0\s*,\s*[$\w]+\.default\s*\))\(\s*["']sliders-horizontal["']/.test(
-        factory,
-      ),
+    isSlidersHorizontalFactory,
     'SlidersHorizontal icon',
   )
   const iconModule = runtime.require(Number(iconModuleId))
