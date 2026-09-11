@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.35
+
+- Add the typed `@crab-dev/wake/docs` rendering API and `docs.ui` configuration, allowing sites
+  to replace individual components or the complete interface while retaining navigation, search,
+  theme, page loading and Demo behavior.
+- Scope default presentation styles away from custom components and inline demos; preserve
+  Root-to-page React Context and the last valid output when custom UI development builds fail.
+- Reorganize the Chinese handbook around practical tasks, improve mobile and dark-theme reading,
+  and add complete remote module, React component, isolated lifecycle and deployment guides.
+
 ## 0.1.34
 
 - Fix `Cannot read properties of undefined (reading 'PureComponent')` when a Docs demand bundle
