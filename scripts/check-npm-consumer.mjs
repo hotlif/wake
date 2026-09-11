@@ -185,7 +185,7 @@ const optionalDependencies = Object.fromEntries(
   [...optionalPlatformArchives].map(([name, value]) => [name, fileDependency(project, value.archive)]),
 )
 const devDependencies = Object.fromEntries(
-  ['@types/node', 'typescript'].map((name) => {
+  ['@types/node', '@types/react', 'typescript'].map((name) => {
     const value = workspaceManifest.devDependencies?.[name]
     if (typeof value !== 'string' || value.length === 0) {
       throw new Error(`The workspace must pin ${name} for the external npm typecheck`)

@@ -51,3 +51,12 @@ tracked files inside ignored directories; its implementation and source rules ar
 The complete native release consumer/platform matrix was not run for this JavaScript
 entry addition. The focused declaration, package-content and packed-export checks above
 cover the new entry; release validation remains governed by `engineering/TESTING.md`.
+
+## Release consumer follow-up (2026-09-11)
+
+The 0.1.35 prepublish matrix exposed a missing `@types/react` dependency in the isolated
+consumer fixture after it started importing `@crab-dev/wake/docs`. Publication was skipped.
+The fixture now installs the workspace's React type dependency and keeps full declaration
+checking enabled. Using the seven actual 0.1.35 CI tarballs, the Windows x64 external npm
+consumer passed clean installation, TypeScript, CLI, CommonJS/ESM APIs, workspace build,
+CSS and Wake Test checks. Architecture tests (55) and the architecture check also passed.
