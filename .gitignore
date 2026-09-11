@@ -35,6 +35,8 @@ fixtures/*/input/src/
 !.vscode/extensions.json
 .DS_Store
 
+# 按任务隔离的本地临时产物；不忽略源码或 fixture 内同名目录
+/.tmp/
 # Local Node-API build outputs; release jobs copy only the matching binary into
 # a platform package staging directory.
 /npm/*/*.node
