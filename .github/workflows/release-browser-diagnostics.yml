@@ -24,7 +24,6 @@ jobs:
       WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts
       WAKE_NPM_PLATFORM: win32-x64-msvc
       WAKE_NPM_VERSION: ${{ inputs.version }}
-      WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer
       WAKE_RELEASE_BROWSER_PATH: C:/Program Files/Google/Chrome/Application/chrome.exe
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +37,11 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - name: Select an external npm consumer project
+        shell: pwsh
+        run: |
+          $consumerPath = Join-Path $env:RUNNER_TEMP 'wake-npm-consumer'
+          "WAKE_NPM_PROJECT=$consumerPath" >> $env:GITHUB_ENV
       - name: Clean install the existing release tarballs
         run: node scripts/check-npm-consumer.mjs
       - name: Run browser smoke and print its diagnostic result
