@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.1.36
+## 0.1.37
 
-Version 0.1.35 was not published because its prepublish consumer fixture lacked React types.
-This version adds that dependency and retains full declaration checks before publication.
+Versions 0.1.35 and 0.1.36 were stopped by prepublish checks and were not published.
+This version installs React declarations in the clean consumer fixture, reviews Windows
+Chromium 152 against the official runner inventory, and retains browser failure diagnostics.
 
 - Add the typed `@crab-dev/wake/docs` rendering API and `docs.ui` configuration, allowing sites
   to replace individual components or the complete interface while retaining navigation, search,
