@@ -1,0 +1,8 @@
+**/dist/
+**/docs-dist/
+**/esm/
+**/cjs/
+**/declarations/
+**/css/
+**/wake-federation.d.ts
+**/*.tgz

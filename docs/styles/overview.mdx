@@ -1,61 +1,46 @@
 +++
-title = "CSS-in-JS"
-description = "使用 @crab-dev/css 编写局部、组合、动态、动画与全局样式，并由 Wake 在构建时抽取 CSS"
+title = "选择样式方案"
+description = "沿用普通 CSS，或把组件样式写进 TypeScript。"
 kind = "overview"
 status = "experimental"
 +++
 
-import { CompareCard, CompareCards, PageActions, TaskCard, TaskGrid } from "../site/components.tsx"
+# 选择样式方案
 
-# CSS-in-JS
+import { OverviewLead } from "../site/components.tsx"
 
-<PageActions
-  primaryHref="/styles/local-styles"
-  primaryLabel="编写第一个样式"
-  secondaryHref="/reference/css-api"
-  secondaryLabel="查看 CSS API"
- />
+<OverviewLead primaryHref="/styles/local-styles" primaryLabel="编写组件样式" secondaryHref="/app/assets" secondaryLabel="使用普通 CSS">应用可以直接导入 CSS；希望样式与组件源码放在一起时，可以使用 @crab-dev/css。后者仍为 experimental。</OverviewLead>
 
 ## 两条样式路径
 
-<CompareCards>
-  <CompareCard title="构建时">
-    用 `css`、`keyframes` 和 `globalStyle` 声明规则。Wake 生成稳定名称，并把规则抽取到 CSS 产物。
-  </CompareCard>
-  <CompareCard title="运行时">
-    用 `cx` 组合类名；必须随状态变化的值通过 `createVar` 和 `assignVars` 写入 CSS 自定义属性。
-  </CompareCard>
-</CompareCards>
+| 需求 | 普通 CSS | 构建期 CSS-in-JS |
+| --- | --- | --- |
+| 复用现有样式表 | 直接 import | 按需要逐步迁移 |
+| CSS 中相对资源 URL | 由资源管线处理 | 相对 url 暂不支持，移到普通 CSS |
+| 组件局部规则 | 自行维护选择器 | css 生成局部类名 |
+| 运行时状态 | 类名或自定义属性 | cx、createVar 与 assignVars |
+| 全局 reset | 普通 CSS 文件 | 显式顶层 globalStyle |
+
+```bash
+npm install @crab-dev/css
+```
+
+把依赖声明放在实际导入它的项目中。这个包由 Wake 原生编译，不提供其他构建器的转换插件；不能把未经转换的模板直接交给浏览器执行。
 
 ## 按任务开始
 
-<TaskGrid>
-  <TaskCard kicker="推荐起点" href="/styles/local-styles" title="编写局部样式" description="完成一个包含伪类和嵌套规则的静态样式。" />
-  <TaskCard kicker="交互状态" href="/styles/dynamic-values" title="连接动态值" description="把 React 状态安全地传给静态 CSS。" />
-  <TaskCard kicker="站点基础" href="/styles/global-styles" title="声明全局样式" description="集中管理 reset、字体和根级主题。" />
-  <TaskCard kicker="构建诊断" href="/styles/static-boundary" title="理解静态边界" description="识别不能在构建期安全求值的表达式。" />
-</TaskGrid>
+从[局部样式](/styles/local-styles)开始，用[类名组合](/styles/composition)表达状态，再用[动态变量](/styles/dynamic-values)传入颜色或进度。页面 reset 放在[全局样式](/styles/global-styles)，运动效果见[动画](/styles/animation)。
+
+遇到样式值无法提取的诊断时，查看[静态求值范围](/styles/static-boundary)，选择常量、CSS 变量或普通 CSS 资源路径。
 
 ## VS Code 编辑体验
 
-仓库同时构建 `Crab CSS` VSIX。安装与当前平台匹配的包后，JavaScript、TypeScript、JSX 和 TSX 中的
-模板会获得 CSS 高亮、补全、悬停、颜色预览、诊断和显式格式化。服务按 import binding 识别 API，
-因此别名可用，局部遮蔽不会被误判：
+仓库提供 Crab CSS 扩展，可为 JS、TS、JSX、TSX 中按 import binding 识别的模板提供高亮、补全、悬停、颜色与诊断。别名 import 可识别，局部同名变量不应被当作样式 API。
 
-```tsx
-import { css as style } from "@crab-dev/css";
-
-const card = style`
-  display: grid;
-  &:hover { color: rebeccapurple; }
-`;
-```
-
-输入期间执行容错 CSS 检查，保存时再运行与 Wake 构建相同的静态求值诊断。TypeScript 的定义、引用
-与重命名仍由 VS Code 内置服务负责；插件不会执行项目 JavaScript，也不会默认开启 format-on-save。
+编辑器辅助不是构建前提。TypeScript 定义、引用与重命名继续由其语言服务负责；最终以项目类型检查和 Wake 构建结果验证。高亮和补全用于辅助编辑，发布前仍需执行构建。
 
 ## 可运行示例
 
-下面的示例直接经过 `@crab-dev/css` 编译；打开源码可以对照局部样式、组合、动态变量、动画、全局规则和静态求值边界。
+每个示例都对应独立的源文件和主题边界。查看源码，修改交互状态，再比较生成的类名和计算样式。
 
 <Demos glob="../examples/styles/*.demo.tsx" columns={2} />

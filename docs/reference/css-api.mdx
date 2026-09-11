@@ -1,6 +1,6 @@
 +++
 title = "CSS API"
-description = "查询 @crab-dev/css 的六个公开 API 与运行时边界"
+description = "查询样式模板、类名组合和 CSS 变量的六个公开接口。"
 kind = "reference"
 status = "experimental"
 +++
@@ -15,6 +15,8 @@ status = "experimental"
 | `globalStyle` | `void` | 抽取显式全局规则 |
 | `createVar` | `CSSVar` | 创建 CSS 自定义属性引用 |
 | `assignVars` | `Record<string, string \| number>` | 生成 inline style 变量对象 |
+
+首次使用请先阅读[样式教程](/styles/overview)。
 
 ## 模板 API
 

@@ -1,43 +1,43 @@
 +++
 title = "Wake"
-description = "用一套 Rust 原生工具链开发、构建和发布 React 应用"
+description = "用 Wake 开发应用、编写组件、运行测试和建立文档站。"
 kind = "overview"
 status = "beta"
 +++
 
-import { Callout, FeatureCard, FeatureGrid, HomeLead, Step, StepFlow } from "./site/components.tsx"
+import { HomeLead, TaskGrid, TaskCard, StepFlow, Step, Callout } from "./site/components.tsx"
 
 # Wake
 
-<HomeLead
-  title="Wake"
-  description="用一套 Rust 原生工具链开发、构建和发布 React 应用。"
-  status="Beta"
-  primaryHref="/start/install"
-  primaryLabel="安装 Wake"
-  secondaryHref="/start/create-react-app"
-  secondaryLabel="创建 React 应用"
->
-  TypeScript、React、CSS、静态资源、开发服务器与生产构建共享同一份配置。
+<HomeLead title="从代码，到可用的界面。" description="开发应用，验证交互，让组件和文档一起交付。" status="Wake · 0.1.x Beta" primaryHref="/start/create-react-app" primaryLabel="创建第一个应用" secondaryHref="/start/existing-project" secondaryLabel="接入已有项目">
+  Wake 为 JavaScript、TypeScript 和 React 项目提供开发服务器、构建、样式、测试和文档工具。先跑起一个小项目，再按需要加入其他能力。
 </HomeLead>
 
-## 你想完成什么
+## 从你要做的事开始
 
-<FeatureGrid>
-  <FeatureCard icon="app" href="/start/create-react-app" title="React 应用开发" description="获得开发服务器、Live Reload、资源处理与生产构建。" />
-  <FeatureCard icon="style" href="/styles/overview" title="构建期 CSS-in-JS" description="让样式靠近组件，向浏览器交付普通 CSS。" />
-  <FeatureCard icon="docs" href="/wake-docs/overview" title="Wake Docs" description="用 MDX、交互 Demo 和类型信息建设文档站。" />
-  <FeatureCard icon="search" href="/reference/troubleshooting" title="配置、API 与诊断" description="查询命令、配置、Node.js API 与错误码。" />
-</FeatureGrid>
+<TaskGrid>
+  <TaskCard kicker="应用开发" href="/start/create-react-app" title="做一个能交互的页面" description="从三个文件开始，运行 React 计数器，保存后通过 Live Reload 自动刷新页面。" />
+  <TaskCard kicker="组件样式" href="/styles/overview" title="给组件加上样式" description="继续使用 CSS，或把局部样式、主题和动画写在组件旁边。" />
+  <TaskCard kicker="测试" href="/testing/overview" title="确认代码按预期工作" description="检查函数返回值、按钮点击，再验证浏览器里的布局与截图。" />
+  <TaskCard kicker="构建与发布" href="/app/production-build" title="把应用交给用户" description="生成完整产物，检查资源与子路由，再放进部署和 CI 流程。" />
+  <TaskCard kicker="远程组件" href="/integration/remote-components" title="接入独立部署的组件" description="在当前应用加载另一个项目的界面，选择共享 React 或隔离挂载。" />
+  <TaskCard kicker="Wake Docs" href="/wake-docs/overview" title="为项目写一份好文档" description="把说明、真实 Demo 和属性表组织成可搜索的静态站点。" />
+</TaskGrid>
 
-## 三步启动
+## 第一次使用，走这三步
 
 <StepFlow>
-  <Step number="01" title="安装">安装 React 与 @crab-dev/wake。</Step>
-  <Step number="02" title="配置">声明浏览器入口和 React 转换。</Step>
-  <Step number="03" title="运行">执行 wake dev，修改即更新。</Step>
+  <Step number="01" title="安装工具">准备 Node.js，在项目里安装 Wake 和所需依赖。</Step>
+  <Step number="02" title="运行示例">打开本地页面，点击按钮，修改一行文字。</Step>
+  <Step number="03" title="构建发布">生成 dist，用 HTTP 服务检查页面与资源。</Step>
 </StepFlow>
 
-<Callout title="Beta 状态" tone="info">
-Wake 当前为 0.1.x Beta。团队项目请锁定版本，并在 CI 中运行类型检查与生产构建。
+按[安装](/start/install) → [创建 React 应用](/start/create-react-app) → [生产构建](/app/production-build)阅读即可。已有源码时，从[接入现有项目](/start/existing-project)开始。
+
+## 用到时再查
+
+想发布可安装的组件包，阅读[库构建](/app/library)；需要组合自动化步骤，使用[Node.js API](/integration/overview)。参数、默认值和错误码集中在左侧“参考与排错”，不必在入门前全部读完。
+
+<Callout title="使用前了解当前范围">
+  Wake 当前处于 Beta。样式提取、Wake Test、库构建和低层 API 各有实验性范围；页面会标明状态。运行环境和主要限制见[支持范围](/start/support)。
 </Callout>

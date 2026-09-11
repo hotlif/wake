@@ -1,35 +1,42 @@
 +++
-title = "故障排查"
-description = "按症状快速进入唯一的权威排查页面"
+title = "排错指南"
+description = "从页面空白、导入失败或资源 404 开始排查。"
 kind = "reference"
 status = "stable"
 +++
 
-import { OverviewLead, TaskCard, TaskGrid } from "../site/components.tsx"
+# 排错指南
 
-# 故障排查
+先记录执行命令、工作目录、Wake 版本和第一条有效诊断。构建错误以终端的文件、行列和错误码为起点，浏览器问题再结合 Console 与 Network；不要先清空所有缓存或删除锁文件。
 
-<OverviewLead
-  primaryHref="/reference/errors"
-  primaryLabel="查询错误码"
-  secondaryHref="/reference/configuration/project"
-  secondaryLabel="检查配置"
->
-  <strong>先定位最早失败的阶段。</strong>
-  不要同时修改配置、依赖和源码；先根据症状进入唯一的权威页面。
-</OverviewLead>
+## 页面空白
 
-## 常见症状
+检查开发服务器是否启动成功、配置入口是否真实存在、HTML 容器与 createRoot 是否一致。网络成功但页面空白时检查运行时异常；HTML 返回 200 不能证明 JavaScript 已执行。复现到[最小应用](/start/create-react-app)，逐个加入原项目依赖。
 
-<TaskGrid>
-  <TaskCard href="/start/install" title="Wake 无法启动" description="检查 Node.js、原生包和安装结果。" />
-  <TaskCard href="/app/dev-server" title="开发页面空白" description="从终端诊断和浏览器第一条异常开始。" />
-  <TaskCard href="/app/live-reload" title="修改后没有自动刷新" description="检查监听、Live Reload WebSocket 和构建诊断。" />
-  <TaskCard href="/app/deployment" title="生产路由或资源 404" description="核对输出目录、回退规则和 public_path。" />
-  <TaskCard href="/styles/static-boundary" title="CSS 插值失败" description="确认表达式可静态求值或改用 CSS 变量。" />
-  <TaskCard href="/wake-docs/pages-and-navigation" title="文档页面缺失" description="检查文件路径、导航清单和 Frontmatter。" />
-</TaskGrid>
+## 依赖或别名无法解析
 
-## 报告问题
+先确认依赖安装完成和文件名大小写。PnP 项目检查发起 import 的工作区是否声明直接依赖；经典安装检查实际 node_modules。编辑器认识别名而构建失败时，同时核对 Wake alias 和 TypeScript paths。详见[模块解析](/app/modules)。
 
-请提供 Wake 与 Node 版本、操作系统、最小复现、完整命令、第一条 diagnostic，以及开发和生产是否都失败。敏感路径或源码请先脱敏。
+## 保存后没有更新
+
+先看重建是否失败，再检查页面是否连到当前开发服务。普通 Live Reload 会刷新整页；计数归零属于预期，页面一直旧内容则需排查连接或构建诊断。更改项目根、Docs UI 路径等拓扑配置后按诊断重启。参见[自动刷新](/app/live-reload)。
+
+## 开发正常，生产资源 404
+
+检查部署子路径、public_path、HTML 引用和静态服务器真实根目录。手写 `/image.png` 指向域名根，不一定指向项目挂载目录。动态导入失败时检查是否混合发布了不同构建的 HTML 和 chunk。参见[部署](/app/deployment)。
+
+## 输出目录被拒绝
+
+Wake 不自动接管非空、未标记目录，也不覆盖源码或项目根。使用新的输出目录验证；确需清理旧产物时先人工确认归属。不要伪造 `.wake-output.json` 以绕过保护。[构建参考](/reference/cli/build)列出准确规则。
+
+## 测试未发现或无法运行
+
+检查 `--root`、include/exclude、路径与名称筛选；`--project` 是项目名而不是目录。浏览器测试找不到浏览器时安装或指定系统浏览器路径。React 测试的 react/react-dom 版本必须匹配。Mock 没生效时检查注册是否晚于静态导入。详见[测试配置](/testing/configuration)与[环境](/testing/environments)。
+
+## 文档页面、Demo 或 API 失败
+
+核对导航页面 ID、MDX Frontmatter，以及相对当前页面的 Demo/API 路径。src、glob、symbol 必须能在编译时确定。Provider 缺失时判断它应安装在站点 Root 还是 iframe Preview。切换 ui 配置后重启，组件异常按错误修复，不期待默认实现接管。参见[Docs UI](/wake-docs/ui)。
+
+## 错误码与进一步反馈
+
+在[错误码](/reference/errors)定位错误所属阶段。反馈时提供最小配置、触发命令、完整诊断和最小源码；去掉凭据与业务数据。若只能在生产前缀、PnP 或特定浏览器复现，把这些条件保留在复现步骤中。

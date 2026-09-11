@@ -1,0 +1,145 @@
++++
+title = "第一次加载远程模块"
+description = "先用两个本地项目，跑通一次远程模块加载。"
+kind = "tutorial"
+status = "stable"
++++
+
+import { ResultPanel } from "../site/components.tsx"
+
+# 第一次加载远程模块
+
+<ResultPanel title="点击按钮，显示 Hello, Wake" label="完成效果">
+页面在 host 中运行，问候函数由 remote 提供。先用一个普通函数跑通连接，再把它换成 React 组件。
+</ResultPanel>
+
+## 1. 准备两个项目
+
+创建相邻的 `host` 和 `remote` 目录，在每个目录中运行：
+
+```bash title="分别在 host 和 remote 执行"
+npm init -y
+npm install -D @crab-dev/wake@0.1.34 typescript
+```
+
+此例只使用 TypeScript 和 DOM，不需要 React。以下路径分别相对各自项目根。在两个项目中都创建这份 TypeScript 配置；`wake-federation.d.ts` 会在后面的类型同步步骤生成：
+
+```json title="host/tsconfig.json 与 remote/tsconfig.json"
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "wake-federation.d.ts"]
+}
+```
+
+## 2. 在 remote 公开函数
+
+```toml title="remote/wake.config.toml"
+[html]
+entry = "src/entry.ts"
+
+[dev_server]
+host = "127.0.0.1"
+port = 4174
+
+[federation]
+enabled = true
+name = "catalog"
+
+[federation.exposes."./greeting"]
+entry = "src/greeting.ts"
+mode = "generic"
+```
+
+```ts title="remote/src/greeting.ts"
+export function greeting(name: string): string {
+  return `Hello, ${name}`;
+}
+```
+
+```ts title="remote/src/entry.ts"
+document.body.textContent = "catalog remote 已启动";
+```
+
+## 3. 从 host 加载函数
+
+```toml title="host/wake.config.toml"
+[html]
+entry = "src/entry.ts"
+
+[dev_server]
+host = "127.0.0.1"
+port = 4173
+
+[federation]
+enabled = true
+name = "shell"
+
+[federation.remotes.catalog]
+manifest_url = "http://127.0.0.1:4174/wake-federation.json"
+allowed_origins = ["http://127.0.0.1:4174"]
+dev_follow = true
+```
+
+```ts title="host/src/entry.ts"
+const button = document.createElement("button");
+button.textContent = "加载远程问候";
+button.onclick = async () => {
+  try {
+    const { greeting } = await import("catalog/greeting");
+    button.textContent = greeting("Wake");
+  } catch (error) {
+    button.textContent = "远程加载失败";
+    console.error(error);
+  }
+};
+document.body.append(button);
+```
+
+## 4. 启动与类型
+
+打开两个终端，分别执行：
+
+```bash title="终端一 · remote 项目根"
+npx wake dev . --port 4174
+```
+
+```bash title="终端二 · host 项目根"
+npx wake federation init .
+npx wake dev . --port 4173
+```
+
+把生成的 `wake-federation.d.ts` 纳入 host 的 TypeScript include。访问 `http://127.0.0.1:4173/`，点击按钮应显示 `Hello, Wake`。显式传入端口，确保它与 Manifest 地址一致。
+
+远程模块使用字面量动态 import。不要改成静态 import 或 require；协议也不是其他构建器的 container ABI。开发时类型和代码按 remote build 同步，失败诊断不能通过随意声明 any 模块隐藏。
+
+## 从开发走向生产
+
+本地 HTTP 示例仅用于开发。生产 remote 先发布完整产物与 HTTPS Manifest，host 配置生产 URL 和允许 origin，再运行 `wake federation lock .`，最后构建 host。lock 绑定 build、声明和资源完整性；配置不匹配或 remote 缺失时应修复，不跳过校验。
+
+具体发布顺序和检查项见[开发与发布](/integration/remote-delivery)。
+
+## 接入 React 时的选择
+
+`host-rendered` 进入宿主 React 树，需要完整、一致的 React/JSX/React DOM singleton 组和 owner；`isolated` 使用独立 root，只传递支持的结构化数据、事件与 DOM slots。不要把 React element 或函数当普通结构化 props 跨隔离边界传递。继续阅读[使用 React 远程组件](/integration/remote-react)中的配置和挂载示例；完整契约见[项目配置](/reference/configuration/project)。
+
+## 验证方式
+
+验证按钮首次加载、直接刷新及 remote 修改后的更新。停止 remote 并观察明确错误；恢复后重试。检查 host 类型声明和浏览器网络请求的 remote origin。生产 lock 使用[CLI 参考](/reference/cli/federation)和现有回归测试验证。
+
+## 常见错误
+
+- origin 不匹配：`localhost` 和 `127.0.0.1` 不是同一个 origin，配置与访问地址保持一致。
+- 导入名称错误：配置名 catalog 与 expose greeting 组合为 `catalog/greeting`。
+- 生产缺 lock：先发布 remote，再生成匹配生产配置的 lock，不使用开发 HTTP 地址。
+
+## 下一步
+
+继续[在 React 中使用远程组件](/integration/remote-react)，或让组件使用[独立的 React root](/integration/remote-isolated)。查询命令时再看[Federation CLI](/reference/cli/federation)。

@@ -1,0 +1,25 @@
+{
+  "name": "wake-handbook-greeting",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@crab-dev/wake": "0.1.34"
+  },
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "types": "./declarations/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./declarations/index.d.ts",
+      "import": "./esm/index.mjs",
+      "require": "./cjs/index.cjs"
+    }
+  },
+  "files": [
+    "esm",
+    "cjs",
+    "declarations",
+    "css"
+  ]
+}

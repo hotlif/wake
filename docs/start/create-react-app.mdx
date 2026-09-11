@@ -1,17 +1,21 @@
 +++
 title = "创建 React 应用"
-description = "从空目录创建一个可以开发和生产构建的 React 19 应用"
+description = "从三个文件开始，做出一个可以点击的 React 计数器。"
 kind = "tutorial"
 status = "stable"
 +++
 
-import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+import { ResultPanel } from "../site/components.tsx"
 
 # 创建 React 应用
 
-<ResultPanel title="完成后">
-  浏览器显示 React 页面，修改组件会立即更新，并能生成可部署的 `dist`。
+<ResultPanel title="一个可以点击的 React 计数器" label="完成效果">
+浏览器显示一个可以点击的计数器。修改源码后页面自动刷新，并可以生成生产目录。
 </ResultPanel>
+
+## 准备项目
+
+按[安装 Wake](/start/install)准备依赖。以下命令和路径都相对于项目根；不依赖脚手架生成器。
 
 ## 创建三个文件
 
@@ -25,39 +29,84 @@ jsx_import_source = "react"
 ```
 
 ```tsx title="src/entry.tsx"
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
 function App() {
-  return <main><h1>Wake 已就绪</h1></main>;
+  const [count, setCount] = useState(0);
+  return <main>
+    <h1>我的第一个 Wake 应用</h1>
+    <button onClick={() => setCount(value => value + 1)}>点击次数：{count}</button>
+  </main>;
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+const container = document.getElementById("root");
+if (!container) throw new Error("缺少 #root 容器");
+createRoot(container).render(<App />);
 ```
 
 ```css title="src/style.css"
-:root { font-family: system-ui, sans-serif; }
-body { margin: 0; padding: 3rem; }
+:root { font-family: system-ui, sans-serif; color: #18181b; background: #fafafa; }
+body { margin: 0; padding: 2rem; }
+button { font: inherit; padding: .6rem 1rem; cursor: pointer; }
+button:focus-visible { outline: 3px solid #7c3aed; outline-offset: 3px; }
+```
+
+未指定 HTML 模板时，Wake 生成包含 `id="root"` 的默认页面。入口负责挂载 React，CSS 通过导入进入构建。
+
+## 添加类型检查
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+先为 CSS 副作用导入添加类型声明，使严格检查认识这类资源模块：
+
+```ts title="src/assets.d.ts"
+declare module "*.css" {}
+```
+
+将以下条目合并进 `package.json` 的 `scripts`，保留安装生成的依赖声明：
+
+```json title="package.json 中的 scripts"
+{
+  "dev": "wake dev .",
+  "typecheck": "tsc --noEmit",
+  "build": "wake build --outdir dist"
+}
 ```
 
 ## 运行并验证
 
-<StepFlow>
-  <Step number="01" title="启动">运行 npx wake dev .，打开终端给出的地址。</Step>
-  <Step number="02" title="编辑">修改标题，页面应在不刷新时更新。</Step>
-  <Step number="03" title="构建">运行 npx wake build --outdir dist。</Step>
-</StepFlow>
+```bash
+npm run typecheck
+npm run dev
+```
 
-`dist` 应包含 HTML，以及带内容哈希的 JavaScript 和 CSS。用静态服务器打开它，页面应与开发环境一致。
+打开终端给出的 URL。连续点击按钮，次数应该增加。把标题文字改掉并保存：重建成功后浏览器整页刷新，标题改变，计数恢复为 0。这是 Live Reload 的预期行为。
+
+另开终端执行 `npm run build`，应得到包含 HTML、JavaScript 和 CSS 的 `dist`。不要直接双击 HTML 判断部署效果；用静态服务器检查，具体步骤见[生产构建](/app/production-build)。
 
 ## 常见错误
 
-- 页面空白：确认 HTML 中存在 `id="root"` 的元素。
-- 找不到 React：先安装 `react`、`react-dom` 和对应类型包。
+- 找不到入口：核对配置与 `src/entry.tsx` 的文件名，包括大小写。
+- 页面空白：查看终端诊断及浏览器控制台；使用自定义 HTML 时确认有 `#root`。
+- 构建成功但类型错误：构建不替代 `npm run typecheck`，两个命令都应通过。
+- 保存后计数归零：整页刷新会重新创建 React 状态，不能以此判断 Hooks 失效。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/app/project-structure" title="整理项目结构" description="分清入口、业务模块、公开资源与产物。" />
-  <NextLink href="/app/dev-server" title="进入日常开发" description="配置端口并理解开发请求。" />
-</NextActions>
+阅读[项目结构](/app/project-structure)拆出可复用组件，再进入[React 与 TypeScript](/app/react-typescript)。

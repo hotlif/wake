@@ -1,55 +1,57 @@
 +++
-title = "项目结构"
-description = "明确入口、源码、公开资源、配置与产物目录的职责"
+title = "项目结构与最小配置"
+description = "把入口、组件和资源放在容易维护的位置。"
 kind = "guide"
 status = "stable"
 +++
 
-import { NextActions, NextLink, OverviewLead, Step, StepFlow } from "../site/components.tsx"
+# 项目结构与最小配置
 
-# 项目结构
+应用入口只负责启动页面，组件单独导出。这样，同一个组件可以用于应用、测试和文档示例。
 
-<OverviewLead
-  primaryHref="/app/dev-server"
-  primaryLabel="启动开发服务器"
-  secondaryHref="/app/react-typescript"
-  secondaryLabel="配置 React"
->
-  <strong>让入口保持小，让业务模块保持独立。</strong>
-  Wake 分析 src 中的依赖，复制 public 中的固定资源，并把结果写入 dist。
-</OverviewLead>
+## 推荐结构
 
-## 推荐目录
+沿用[快速开始](/start/create-react-app)，把可独立测试的组件从入口拆出：
 
 ```text
 my-app/
-├─ public/              # 固定路径资源
-├─ src/
-│  ├─ entry.tsx         # 创建 React root
-│  ├─ app.tsx           # 应用根组件
-│  └─ styles.css
-├─ package.json
-├─ tsconfig.json
-└─ wake.config.toml
+  package.json
+  wake.config.toml
+  tsconfig.json
+  public/
+    robots.txt
+  src/
+    entry.tsx
+    Counter.tsx
+    Counter.test.tsx
+    style.css
 ```
 
-<StepFlow>
-  <Step number="SRC" title="参与构建">可分析导入、删除无用代码并重写资源 URL。</Step>
-  <Step number="PUB" title="原样复制">适合 favicon、robots.txt 等固定路径文件。</Step>
-  <Step number="OUT" title="随时重建">dist 不提交源码分支，也不混入旧构建。</Step>
-</StepFlow>
+`entry.tsx` 负责找到 HTML 容器并挂载应用；`Counter.tsx` 只导出组件。测试导入组件即可，不必触发整页挂载。`public` 存放固定 URL 的公开文件，组件专属图片可以和组件放在一起并通过 import 引用。
 
 ## 入口原则
 
-入口只加载全局样式、创建 React root 并挂载应用。路由、状态和业务页面放入独立模块。
+```tsx title="src/Counter.tsx"
+import { useState } from "react";
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(value => value + 1)}>点击次数：{count}</button>;
+}
+```
+
+在入口中导入 `Counter` 并渲染。组件模块不调用 `createRoot`，使它可以同时被应用、测试和文档 Demo 使用。配置中的相对路径以有效项目根为基准；使用 `root_dir` 调整根时，所有相关路径都需要一起核对。
+
+## 源码和产物
+
+`dist` 是应用输出，`.wake` 是 Wake 的生成或缓存目录。不要手改这些目录来修复源码问题，也不要从中导入业务模块。它们的内容应当能由源码和配置重新生成。
+
+提交源码、配置和依赖锁文件。通常忽略 `dist/`、`.wake/`、`node_modules/`；测试快照是否提交取决于它是不是需要审核的预期基线。库构建和文档构建有独立产物，见对应教程。
 
 ## 验证方式
 
-删除 `dist` 后重新构建；产物必须能完全重建，`public` 资源保持固定路径，源码资源由模块图生成。
+从项目根执行类型检查和构建。确认删除入口之外的演示文件不会改变应用；改变实际导入的组件会触发更新。若从子目录运行命令，检查终端识别的配置和根目录是否符合预期。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/app/react-typescript" title="配置 React 与 TypeScript" description="建立可靠 JSX 转换和类型检查。" />
-  <NextLink href="/app/dev-server" title="进入日常开发" description="启动本地服务并验证增量更新。" />
-</NextActions>
+阅读[React 与 TypeScript](/app/react-typescript)或[开发服务器](/app/dev-server)。

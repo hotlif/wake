@@ -1,39 +1,60 @@
 # Wake 中文文档
 
-`docs/` 是 Wake 面向使用者的中文文档源码。它按任务组织内容，页面路径就是公开 URL，导航顺序只由 [`navigation.toml`](navigation.toml) 管理。
+`docs/` 面向掌握基本 JavaScript、TypeScript 和 React 的使用者。正文按任务编写，参考按接口查询；
+页面路径是公开 URL，导航顺序由 [navigation.toml](navigation.toml) 管理。
 
 ## 内容边界
 
-- `start/`：安装、创建应用和接入现有项目。
-- `app/`：日常开发、构建与部署。
-- `styles/`：普通 CSS 与 `@crab-dev/css`。
-- `wake-docs/`：使用 Wake Docs 建设技术文档。
-- `reference/`：配置、CLI、Node API、错误与术语。
-- `site/`、`examples/`：本站运行组件和可执行示例，不进入公共导航。
+| 阅读章节 | 内容来源 | 写作目的 |
+| --- | --- | --- |
+| 认识 Wake | 首页、start 中的工作方式和支持范围 | 定位、能力关系、选择条件 |
+| 快速开始 | start 与项目结构 | 从安装到可运行应用 |
+| 开发应用 | app 中的开发与资源页面 | 日常操作与排错 |
+| 编写样式 | styles | 普通 CSS 与构建期 CSS-in-JS |
+| 测试代码 | testing | 逻辑、React、浏览器与 CI |
+| 构建与发布 | app 中的构建、库、部署、CI 页面 | 可验证的交付产物 |
+| 远程组件 | integration 中的 Federation 与远程组件页面 | 远程模块、React 渲染边界、类型与独立部署 |
+| 建设文档站 | wake-docs | 内容、展示接口、工作台与部署 |
+| 脚本与自动化 | integration 中的 Node API、构建流水线与实验 API | Node 自动化与工具集成 |
+| 参考与排错 | reference | 精确接口、配置、诊断与术语 |
 
-UI 组件库拥有独立的发布节奏和文档系统，本目录不维护 `@crab-dev/rc-*` 组件参考。Wake 的编译器设计、测试、性能和发布流程统一放在 [`engineering/`](../engineering/README.md)。
+原有公开文件路径保留，不为调整导航移动页面。拆出的教程从旧参考页链接，既有字段约束不能随文案简化丢失。
+逐页处理记录见 [REWRITE-MAP.md](REWRITE-MAP.md)。
+`site` 是本站展示组件，`examples` 是可执行示例，不进入导航。Crab UI 组件参考属于其自己的文档；
+本目录只说明如何将其接入 Wake。编译器、性能门禁、临时目录与发布维护放在 engineering。
 
-## 页面规则
+## 阅读与展示约定
 
-每个 `.mdx` 页面只声明自身信息：
+全站以中文任务为导航入口，保留既有页面 URL。章节入口常显，较长的教程和参考列表放入可展开分区；
+当前页面所在分区由现有导航状态展开。首页按应用开发、样式、测试、远程组件和文档站提供直接入口。
 
-```toml
-+++
-title = "动态样式"
-description = "使用 CSS 自定义属性连接 React 状态与静态 CSS"
-kind = "tutorial"
-status = "experimental"
-+++
-```
+页面描述用一句话说明用途，正文第一段解释适用场景。教程先展示完成结果，再按实际操作顺序给出文件、
+命令和预期表现；补充解释放在操作之后，排错集中在末尾。长配置可折叠查看，但必需步骤应明确提示展开复制。
+参考页保留签名、默认值、错误码和限制，按主题分节，避免用内部实现过程代替使用说明。
 
-路由由文件路径生成，例如 `styles/dynamic-values.mdx` 对应 `/styles/dynamic-values`。不要添加 `slug`、`group`、`group_order` 或 `order`；构建器会直接拒绝这些旧字段。新增页面后必须把页面 ID 加入 `navigation.toml`，除非页面明确声明 `hidden = true`。
+正文使用舒适的中文行距和受限行宽，次要说明不能依赖过小或过淡的文字。代码块保留文件名和复制入口，
+仅在块内横向滚动；导航和本页目录在窄屏切换为现有移动界面。布局、链接、展开控件和键盘焦点应同时检查
+桌面、手机及明暗主题。本站主题样式不得作用到 Demo 内容。
+
+## 内容格式
+
+Frontmatter 使用 TOML，至少声明 title、description、kind 和 status。kind 为 overview、tutorial、
+guide、reference 或 component；状态依据实际能力，不因重写说明而升级。路由来自文件路径，不能添加
+slug、group、group_order、order 等旧字段。非 hidden 页面必须在导航中恰好出现一次。
+
+教程包含完成结果、准备条件、带文件名的完整代码、验证、常见错误和下一步。指南说明适用条件与验证方法；
+参考页维护类型、默认值、限制和最小例子，并链接教程。全中文解释，英文仅保留必要的 API 名称和代码。
+不要把参考表重复粘贴进每篇教程，不用实现历史、内部架构或无关维护门禁打断使用步骤。
 
 ## 本地验证
 
-```powershell
-npm run docs:check
-npm run docs:build
-cargo test -p wake_docs
+```bash
+corepack yarn docs:check
+corepack yarn docs:build
 ```
 
-文档检查会验证 Frontmatter、导航完整性、路由唯一性和内部链接。生产构建默认输出到 `docs-dist/`。
+docs:check 校验 Frontmatter、内容结构、导航、公开配置字段和链接。新增示例需要按正文运行，
+TypeScript 通过类型检查，Demo 通过站点构建和浏览器检查。截图、失败日志和临时脚本按任务保存，
+不能成为正文运行依赖。可执行入门示例和复现命令见
+[示例说明](../fixtures/docs-handbook/README.md)，实际验证范围见
+[验证记录](../fixtures/docs-handbook/VALIDATION.md)。

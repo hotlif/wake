@@ -1,0 +1,58 @@
++++
+title = "编写第一个测试"
+description = "测试一个加法函数，亲手看到通过、失败和修复。"
+kind = "tutorial"
+status = "experimental"
++++
+
+import { ResultPanel } from "../site/components.tsx"
+
+# 编写第一个测试
+
+<ResultPanel title="两个能运行的逻辑测试" label="完成效果">
+你会测试一个带参数校验的加法函数，看到成功、失败和修复后的结果。先按[安装](/start/install)把 Wake 加入项目。
+</ResultPanel>
+
+## 创建源码和测试
+
+```ts title="src/add.ts"
+export function add(a: number, b: number): number {
+  if (!Number.isFinite(a) || !Number.isFinite(b)) throw new Error("请输入有限数字");
+  return a + b;
+}
+```
+
+```ts title="src/add.test.ts"
+import { expect, test } from "@crab-dev/wake/test";
+import { add } from "./add";
+
+test("两个数字相加", () => {
+  expect(add(2, 3)).toBe(5);
+});
+
+test("拒绝无限值", () => {
+  expect(() => add(Infinity, 1)).toThrow("请输入有限数字");
+});
+```
+
+## 运行测试
+
+```bash
+npx wake test src/add.test.ts --serial
+```
+
+路径筛选使本次只运行目标文件，`--serial` 便于入门时阅读输出。没有筛选时，Wake 按项目发现规则收集 suite；如何组织多项目见[配置](/testing/configuration)。
+
+## 验证方式
+
+输出应有两个通过的测试。将第一个预期值暂时改为 6，重跑后应显示断言失败和非零退出码；恢复为 5 后再次通过。异常断言必须传函数，避免在 `expect` 执行前就抛出。
+
+## 常见错误
+
+- `test` 未定义：API 不作为全局变量注入，补充显式 import。
+- 未找到测试：检查工作目录、文件名和 include/exclude，不急于加 `--allow-no-tests`。
+- 类型错误没有被测试发现：另行执行 `tsc --noEmit`，测试运行不等于完整类型检查。
+
+## 下一步
+
+继续[断言与异步](/testing/assertions)，或给[Counter 组件添加测试](/testing/react)。

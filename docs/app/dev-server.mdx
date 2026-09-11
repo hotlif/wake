@@ -1,44 +1,53 @@
 +++
 title = "开发服务器"
-description = "启动本地应用、选择端口并理解开发请求的处理方式"
+description = "启动本地应用，修改代码，并在出现错误时快速定位。"
 kind = "tutorial"
 status = "stable"
 +++
 
-import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+import { ResultPanel } from "../site/components.tsx"
 
 # 开发服务器
 
-<ResultPanel title="完成后">
-  本地 HTTP、Live Reload WebSocket 和文件监听全部在线，终端给出可访问地址。
+<ResultPanel title="本地页面与修改后的自动刷新" label="完成效果">
+应用通过 HTTP 在本机运行，源码修改能够触发重建，终端和浏览器可以显示构建结果。准备条件是已完成[应用入门](/start/create-react-app)。
 </ResultPanel>
 
 ## 启动
 
 ```bash
-npx wake dev . --port 5173
+npx wake dev .
 ```
 
-<StepFlow>
-  <Step number="01" title="构建">解析当前入口，输出可读的开发诊断。</Step>
-  <Step number="02" title="服务">启动 HTTP 与 Live Reload WebSocket。</Step>
-  <Step number="03" title="监听">文件变化只让受影响模块失效。</Step>
-</StepFlow>
+打开终端打印的 URL，以实际输出为准。保持进程运行可以复用增量构建状态；停止时在终端按 Ctrl+C。
+
+```toml title="wake.config.toml 中的开发服务配置"
+[dev_server]
+host = "127.0.0.1"
+port = 5173
+open = false
+```
+
+默认只需本机访问。需要在手机上测试时，可显式监听局域网地址或 `0.0.0.0`，用电脑的局域网 IP 访问，并检查防火墙。开发服务用于开发，不作为生产静态服务器。
+
+CLI 的 `dev` 命令默认传入端口 5173；要使用其他端口，显式执行 `npx wake dev . --port 5191`。不要仅根据 TOML 中的 port 推断 CLI 最终监听地址，始终核对终端输出。
+
+## 请求与错误
+
+入口和静态资源由 Wake 提供，API 请求可以交给[开发代理](/app/aliases-and-proxy)。成功重建会刷新整页。语法或导入错误应先修复终端指出的文件和位置，不要通过删除构建目录隐藏问题。
+
+配置拓扑与普通源码修改不同。改变项目根、主要配置路径或文档挂载结构时，按照诊断重启服务；不要假定所有配置都能在原会话中切换。
 
 ## 验证方式
 
-修改组件文本、CSS 和一个依赖模块；每次成功重建后浏览器都会刷新整个页面。页面 state 会重置，
-入口和模块顶层副作用会在新文档中重新执行。
+先打开首页，点击应用中的按钮。修改标题并保存，确认整页刷新。临时制造一个 TSX 语法错误，观察诊断，再修复，确认页面恢复。最后关闭进程，确认端口不再提供页面。
 
 ## 常见错误
 
-- 端口占用：换端口或关闭旧进程。
-- 页面空白：先看浏览器第一条异常，再看终端诊断。
-- 子路由刷新失败：确认请求到达 Wake，而不是另一个静态服务器。
+- 连接被拒绝：核对进程是否存活、端口与终端输出是否一致。
+- 手机无法访问：检查监听地址、同一局域网和防火墙，不要在手机上访问电脑的 `127.0.0.1`。
+- 页面一直旧版本：先检查重建是否失败，再检查浏览器连接和缓存。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/app/live-reload" title="理解 Live Reload" description="区分服务端增量重建与浏览器整页刷新。" />
-  <NextLink href="/app/aliases-and-proxy" title="连接后端 API" description="配置源码别名与开发代理。" />
-</NextActions>
+阅读[Live Reload](/app/live-reload)了解状态边界，再配置[别名与代理](/app/aliases-and-proxy)。

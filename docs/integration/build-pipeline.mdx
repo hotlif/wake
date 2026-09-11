@@ -1,0 +1,80 @@
++++
+title = "组合构建与开发流程"
+description = "串联测试和构建，复用上下文，并在结束时关闭服务。"
+kind = "guide"
+status = "stable"
++++
+
+# 组合构建与开发流程
+
+下面的例子分别演示“测试后构建”“连续重建”和“启动开发服务”。按实际需求选用，长期运行的对象都要在结束时关闭。
+
+## 测试成功后再构建
+
+```js title="tools/verify.mjs"
+import { build, runTests } from "@crab-dev/wake";
+
+try {
+  const tests = await runTests({ root: process.cwd(), patterns: ["src"] });
+  if (!tests.success) {
+    console.error("测试未通过", tests.counts);
+    process.exitCode = 1;
+  } else {
+    const result = await build({ cwd: process.cwd(), outdir: "dist" });
+    console.log(result.files);
+  }
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
+}
+```
+
+类型检查可以作为调用此脚本前的独立 CI 步骤。不要在同一项目中同时向相同输出目录启动多个发布流程。
+
+## 复用构建上下文
+
+```js title="tools/rebuild.mjs"
+import { createBuildContext } from "@crab-dev/wake";
+
+const context = await createBuildContext({ cwd: process.cwd(), outdir: "dist" });
+try {
+  const first = await context.rebuild();
+  console.log(first.files);
+  const second = await context.rebuild();
+  console.log(second.files);
+} finally {
+  await context.close();
+}
+```
+
+此例执行两轮同配置重建，用于理解复用与释放。真实编辑流程应按需求触发重建，不建立没有间隔的无限循环。无法共享配置的不同项目分别创建上下文。
+
+## 管理开发服务器
+
+```js title="tools/dev.mjs"
+import { startDevServer } from "@crab-dev/wake";
+
+const server = await startDevServer({ cwd: process.cwd(), port: 5173, open: false });
+const stop = () => { void server.close(); };
+process.once("SIGINT", stop);
+process.once("SIGTERM", stop);
+try {
+  console.log(server.url);
+  server.on("diagnostic", diagnostic => console.error(diagnostic));
+  await server.waitUntilClosed();
+} finally {
+  process.removeListener("SIGINT", stop);
+  process.removeListener("SIGTERM", stop);
+  await server.close();
+}
+```
+
+事件用于观察重建和诊断，不承担替代内部 watcher 的职责。测试和自动化中务必在 finally 关闭资源，避免任务结束后端口仍被占用。
+
+## 验证方式
+
+让一个测试失败，确认 verify 不进入构建分支。运行 dev 脚本再中断，确认端口释放。运行两轮 rebuild 后检查进程正常退出。测试 API 仍为 experimental，不改变其稳定性边界。
+
+## 下一步
+
+浏览[开发服务器 API](/reference/node-api/dev-server)，或需要跨应用模块时阅读[Federation](/integration/federation)。

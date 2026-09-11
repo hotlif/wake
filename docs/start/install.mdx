@@ -1,60 +1,67 @@
 +++
 title = "安装 Wake"
-description = "安装运行时与构建工具，并确认本机可以执行 Wake"
+description = "安装项目依赖，确认 Wake 可以在本机运行。"
 kind = "tutorial"
 status = "stable"
 +++
 
+import { ResultPanel } from "../site/components.tsx"
+
 # 安装 Wake
 
-## 完成本页后
-
-你会得到可执行的 Wake CLI、React 19 和 TypeScript 开发环境。
+<ResultPanel title="项目里的 Wake 可以运行" label="完成效果">
+项目中有固定版本的 Wake，终端可以执行 CLI。本文只完成工具安装，下一篇提供应用文件。
+</ResultPanel>
 
 ## 前置条件
 
-- Node.js `>=22.14 <27`；
-- npm，或通过 Corepack 使用 Yarn 4；
-- 一个包含 `package.json` 的项目目录。
+准备 Node.js `>=22.14 <27` 和 npm，或使用 Corepack 管理 Yarn 4。执行 `node --version` 确认当前终端使用的版本。使用发布包不需要 Rust；源码贡献者才需要仓库指定的 Rust 工具链。
 
-Rust 只用于参与 Wake 自身开发，业务项目无需安装 Rust。
+所有安装命令在项目根执行。从空目录开始时：
+
+```bash
+mkdir wake-app
+cd wake-app
+npm init -y
+```
+
+已有项目直接进入其根目录，保留自己的 `package.json`。
 
 ## 使用 npm 安装
 
 ```bash
-npm install react react-dom
-npm install --save-dev @crab-dev/wake typescript @types/react @types/react-dom
+npm install react@19 react-dom@19
+npm install --save-dev --save-exact @crab-dev/wake@0.1.34
+npm install --save-dev typescript @types/react@19 @types/react-dom@19
+npx wake --version
 ```
 
-为团队项目提交 `package-lock.json`，并让 CI 使用 `npm ci`。
+React 是应用运行依赖，Wake 和类型工具是开发依赖。示例固定 Wake 版本以便复现；升级时同时验证开发、测试和生产构建。提交 `package.json` 与 `package-lock.json`，CI 使用 `npm ci`。
 
 ## 使用 Yarn Plug'n'Play 安装
 
 ```bash
-corepack yarn add react react-dom
-corepack yarn add --dev @crab-dev/wake typescript @types/react @types/react-dom
+corepack yarn add react@19 react-dom@19
+corepack yarn add --dev --exact @crab-dev/wake@0.1.34
+corepack yarn add --dev typescript @types/react@19 @types/react-dom@19
+corepack yarn wake --version
 ```
 
-提交 `yarn.lock` 与 `.yarnrc.yml`，并让 CI 使用 `corepack yarn install --immutable`。项目存在
-`.pnp.cjs` 时，Wake 以 Yarn 的 locator、依赖可见性、peer/virtual 和 ignore 结果为准；Yarn 拒绝的
-未声明依赖不会退回偶然存在的 `node_modules`。
+在已配置 Yarn 4 的项目中使用这些命令，并提交项目选定的 Yarn 配置和锁文件。不要为同一工作树同时维护 npm 与 Yarn 的安装结果。Wake 自动识别有效 PnP 环境，无需设置“解析器模式”。
 
 ## 验证安装
 
-```bash
-npx wake --version
-# Yarn PnP 项目也可运行：corepack yarn wake --version
-```
-
-命令应输出与 `package.json` 中 `@crab-dev/wake` 一致的版本。
+版本命令成功只证明 CLI 和对应平台包能够启动。随后运行 `npx wake --help`，应能看到应用、文档、库和测试等命令；下一篇再验证真实 TSX 编译。
 
 ## 常见错误
 
-- 找不到 `wake`：使用 `npx wake` 或 npm script，不依赖全局安装。
-- React 18 被拒绝：将 `react` 和 `react-dom` 一起升级到 19。
-- 原生包缺失：删除不完整的安装目录后重新运行 `npm ci`。
-- Yarn PnP 清单损坏：重新运行 `corepack yarn install --immutable`；Wake 不会静默改用 `node_modules`。
+| 症状 | 排查与处理 |
+| --- | --- |
+| Node 版本不满足条件 | 切换 Node 后重新打开终端，再检查版本 |
+| 找不到原生平台包 | 确认安装未省略 optional dependencies，并在当前系统重新安装依赖 |
+| PnP 报未声明依赖 | 在真正导入该包的工作区中声明依赖，再执行安装 |
+| CLI 版本与预期不同 | 用项目本地 `npx wake` 或 Yarn 命令，检查锁文件中的版本 |
 
 ## 下一步
 
-继续[创建 React 应用](/start/create-react-app)，或把 Wake [接入现有项目](/start/existing-project)。
+继续[创建 React 应用](/start/create-react-app)。已有源码时进入[接入现有项目](/start/existing-project)。

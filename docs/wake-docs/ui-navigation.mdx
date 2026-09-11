@@ -1,0 +1,122 @@
++++
+title = "定制导航与搜索"
+description = "连接自定义导航与搜索，保留键盘操作和正确的焦点位置。"
+kind = "guide"
+status = "stable"
++++
+
+# 定制导航与搜索
+
+Wake 提供当前页面、展开状态和搜索结果。你的组件负责把它们展示出来，并把用户操作交回对应函数。
+
+## 连接导航操作
+
+`groups` 已包含页面 href、当前 section 的展开状态。使用 `toggleSection` 更新用户偏好，使用 `onNavigate` 完成导航并在适用时关闭移动菜单。
+
+```tsx title="site/navigation.tsx"
+import type { NavigationProps, PageLink } from "@crab-dev/wake/docs";
+
+export function Navigation({ groups, current, toggleSection, onNavigate }: NavigationProps) {
+  const link = (page: PageLink) => <a key={page.slug} href={page.href}
+    aria-current={current === page.slug ? "page" : undefined}
+    onClick={event => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      onNavigate(page.slug);
+    }}>{page.title}</a>;
+  return <nav aria-label="文档">{groups.map(group => <section key={group.id}>
+    <h2>{group.title}</h2>{group.pages.map(link)}
+    {group.sections.map(section => <div key={section.id}>
+      <button aria-expanded={section.expanded} onClick={() => toggleSection(section.id)}>{section.title}</button>
+      {section.expanded && section.pages.map(link)}
+    </div>)}
+  </section>)}</nav>;
+}
+```
+
+保留 href 和修饰键行为，使用者仍能在新标签页打开链接。桌面和移动导航使用同一组展开状态，存储与恢复交给 Wake。
+
+## 搜索数据和操作
+
+SearchDialog 接收 `search.open/query/results/activeIndex/loading/error`。输入变化调用 `setQuery`，方向键选择调用 `setActiveIndex`，确认结果调用 `select(result.slug)`。`select` 负责 Wake 路由和关闭状态；界面负责结果行、加载提示与错误提示。
+
+键盘移动时把 activeIndex 限制在实际结果范围，空结果不执行选择。若使用 combobox 模式，需要 aria-controls、aria-activedescendant 和实际结果 ID 对齐；原生按钮列表则按其自身键盘模型实现，不混用不完整的 ARIA 属性。
+
+## 可运行的弹层适配
+
+本例选择 Crab Dialog 处理模态框与退出动画，LineEdit 提供输入框。先在文档项目安装直接依赖：
+
+```bash
+npm install @crab-dev/rc-button@0.0.2 @crab-dev/rc-dialog@0.0.2 @crab-dev/rc-line-edit@0.0.4
+```
+
+创建以下文件，将导出的 SearchDialog、MobileNavigation 与前面的 Navigation 一起加入现有注册表。
+不要在每次打开时重新创建注册表。此处保留原生按钮列表的语义：方向键改变候选，Enter 选择，
+Tab 仍能逐项访问结果按钮。
+
+```tsx title="site/dialogs.tsx"
+import { useEffect, useRef } from "react";
+import type * as UI from "@crab-dev/wake/docs";
+import Button from "@crab-dev/rc-button";
+import Dialog from "@crab-dev/rc-dialog";
+import LineEdit from "@crab-dev/rc-line-edit";
+
+export function MobileNavigation({ open, setOpen, navigation, route }: UI.MobileNavigationProps) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const dismissed = useRef(false);
+  const focusContent = useRef(route.focusContent);
+  focusContent.current = route.focusContent;
+  useEffect(() => { if (open) dismissed.current = false; }, [open]);
+  useEffect(() => {
+    const element = dialog.current;
+    const closed = () => { if (!dismissed.current) focusContent.current(); };
+    element?.addEventListener('close', closed);
+    return () => element?.removeEventListener('close', closed);
+  }, []);
+  return <Dialog ref={dialog} title="文档导航" open={open} onOpenChange={value => { dismissed.current = !value; setOpen(value); }}>{navigation}</Dialog>;
+}
+export function SearchDialog({ search, route }: UI.SearchDialogProps) {
+  const input = useRef<HTMLInputElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const navigating = useRef(false);
+  const focusContent = useRef(route.focusContent);
+  focusContent.current = route.focusContent;
+  useEffect(() => {
+    const element = dialog.current;
+    const closed = () => { if (navigating.current) { navigating.current = false; focusContent.current(); } };
+    element?.addEventListener('close', closed);
+    return () => element?.removeEventListener('close', closed);
+  }, []);
+  const select = (slug: string) => { navigating.current = true; search.select(slug); };
+  useEffect(() => { if (search.open) input.current?.focus(); }, [search.open]);
+  return <Dialog ref={dialog} title="搜索文档" open={search.open} onOpenChange={search.setOpen}>
+    <LineEdit ref={input} aria-label="搜索文档" value={search.query} onChange={event => search.setQuery(event.target.value)}
+      onKeyDown={event => {
+        if (event.key === 'ArrowDown' && search.results.length > 0) { event.preventDefault(); search.setActiveIndex(Math.min(search.activeIndex + 1, search.results.length - 1)); }
+        if (event.key === 'ArrowUp') { event.preventDefault(); search.setActiveIndex(Math.max(search.activeIndex - 1, 0)); }
+        if (event.key === 'Enter' && search.results[search.activeIndex]) { event.preventDefault(); select(search.results[search.activeIndex].slug); }
+      }} />
+    {search.loading && <p role="status">正在搜索…</p>}{search.error && <p role="alert">{search.error}</p>}
+    <ul>{search.results.map((result, index) => <li key={result.slug + index}><Button aria-pressed={index === search.activeIndex} onClick={() => select(result.slug)}>{result.title}</Button></li>)}</ul>
+  </Dialog>;
+}
+```
+
+导航弹层直接渲染收到的 navigation 节点，这样桌面和移动端使用同一个覆盖后的 Navigation。
+SearchDialog 记录本次关闭是否源于选择页面，只在这种情况下把最终焦点交还正文；取消搜索时
+让 Dialog 恢复触发器。不要删掉 close 事件监听，否则关闭动画可能把焦点从新页面拉回旧按钮。
+品牌颜色和 Portal 作用域按[Crab UI 接入](/wake-docs/crab-ui)配置。
+
+## 弹层与焦点
+
+自定义 SearchDialog 和 MobileNavigation 拥有 Portal、遮罩、焦点陷阱、Escape、滚动锁定及关闭后的焦点恢复。优先复用经过验证的 Dialog 组件，不用一个固定定位 div 冒充完整模态框。
+
+普通取消回到触发按钮；选择页面后应回到新页面正文。带关闭动画的 Dialog 可能在动画末尾恢复触发器焦点，此时在关闭完成通知中调用 `route.focusContent()`，避免覆盖 Wake 已完成的页面焦点。不能只在 open 变为 false 的瞬间假定动画已经结束。
+
+## 验证方式
+
+测试深层链接、浏览器后退、展开偏好刷新后保留，以及 Ctrl/Meta+K 搜索。移动端从菜单跳转新页，检查菜单关闭、焦点到标题；取消时检查触发器恢复。完整可运行适配见[Crab UI](/wake-docs/crab-ui)。
+
+## 下一步
+
+继续[定制内容展示](/wake-docs/ui-content)，需要字段签名时查看[API](/reference/docs-ui)。

@@ -1,25 +1,27 @@
 +++
 title = "创建文档站"
-description = "创建最小 Wake Docs 项目并生成第一篇静态页面"
+description = "写一个首页和导航清单，启动你的第一个文档站。"
 kind = "tutorial"
 status = "stable"
 +++
 
-import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+import { ResultPanel } from "../site/components.tsx"
 
 # 创建文档站
 
-<ResultPanel title="完成后">
-  一个包含导航、首页和 404 的最小静态文档站可以本地预览并生产构建。
+<ResultPanel title="带导航、搜索和主题切换的站点" label="完成效果">
+本地出现一个带默认导航、搜索和主题切换的站点，并能够生成静态目录。先按[安装](/start/install)准备 Wake、React 和 React DOM；Docs 使用 React 19。
 </ResultPanel>
 
 ## 创建三个入口
+
+文档可以放在应用仓库中，也可以独立成项目。在项目根创建配置：
 
 ```toml title="wake.config.toml"
 [docs]
 source_dir = "docs"
 title = "My Docs"
-description = "团队技术文档"
+description = "组件和项目使用指南"
 locale = "zh-CN"
 ```
 
@@ -33,34 +35,42 @@ pages = ["index"]
 ```mdx title="docs/index.mdx"
 +++
 title = "My Docs"
-description = "从这里开始"
-kind = "overview"
+description = "从这里了解项目"
+kind = "guide"
 status = "stable"
 +++
 
 # My Docs
 
-这是第一篇页面。
+这里介绍项目的使用方式。
+
+## 第一步
+
+先运行项目，再逐步添加组件示例。
 ```
+
+上面页面中的围栏以外内容保存为文件；Frontmatter 使用三个加号。配置路径相对项目根，导航中的 `index` 相对 `source_dir` 且不带 `.mdx`。
 
 ## 运行并验证
 
-<StepFlow>
-  <Step number="01" title="预览">运行 npx wake docs dev .。</Step>
-  <Step number="02" title="检查">侧栏应出现“开始”，首页标题与描述正确。</Step>
-  <Step number="03" title="构建">运行 npx wake docs build . --outdir docs-dist。</Step>
-</StepFlow>
+```bash
+npx wake docs dev .
+```
 
-生产目录应包含首页、404 页面和带哈希资源；直接打开首页即可阅读。
+打开终端显示的 URL，检查站点名、首页、导航和主题。修改首页描述后保存，重建成功时应刷新。然后停止开发服务并执行：
+
+```bash
+npx wake docs build . --outdir docs-dist
+```
+
+用 HTTP 静态服务器提供 `docs-dist`，验证首页和资源请求。`kind` 用于描述页面类型。上面的页面可以直接运行；本文档站中的卡片等装饰组件不是创建站点的必需依赖。
 
 ## 常见错误
 
-- 页面未列入 navigation.toml：构建会失败，而不是静默隐藏。
-- Frontmatter 保留旧排序字段：删除 group、order 和 slug。
+- 未列入导航的页面：加入清单，或对确实不应出现在导航中的页面声明 `hidden = true`。
+- 把源码目录作为输出：输出必须独立，不覆盖 docs 或项目根。
+- 路径不匹配：确认有效项目根、`source_dir` 和文件名大小写。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/wake-docs/pages-and-navigation" title="扩展导航" description="添加页面并组织三级目录。" />
-  <NextLink href="/wake-docs/mdx" title="编写 MDX" description="使用统一页面结构和受控 JSX。" />
-</NextActions>
+添加[页面与导航](/wake-docs/pages-and-navigation)，再学习[MDX](/wake-docs/mdx)。

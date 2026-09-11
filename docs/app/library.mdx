@@ -1,0 +1,77 @@
++++
+title = "构建组件库和工具包"
+description = "把组件或工具函数打包成可安装的包，附带类型和样式。"
+kind = "tutorial"
+status = "experimental"
++++
+
+import { ResultPanel } from "../site/components.tsx"
+
+# 构建组件库和工具包
+
+<ResultPanel title="带类型声明的组件或工具包" label="完成效果">
+一个带明确公开类型的包会生成 ESM、CommonJS 和声明入口。本能力仍是 experimental；先用真实公开 API 验证声明生成，再用于发布流程。
+</ResultPanel>
+
+## 准备包入口
+
+在独立包目录中安装 Wake，创建 `package.json`，并加入下面的源码。工具函数示例不需要 React。
+
+```ts title="src/index.ts"
+export interface GreetingOptions {
+  name: string;
+}
+
+export function greet(options: GreetingOptions): string {
+  return `Hello, ${options.name}`;
+}
+```
+
+```bash
+npx wake library build . --entry src/index.ts
+```
+
+## 输出和包声明
+
+输出入口为 `esm/index.mjs`、`cjs/index.cjs` 和 `declarations/index.d.ts`；存在静态样式时再生成 `css/index.css`。本地模块保持真实模块图，不保证只生成这三个文件。应包含各目录中被入口引用的辅助文件。
+
+将以下字段合并进包清单，填写自己的包名与版本：
+
+```json title="package.json 发布字段"
+{
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "types": "./declarations/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./declarations/index.d.ts",
+      "import": "./esm/index.mjs",
+      "require": "./cjs/index.cjs"
+    }
+  },
+  "files": ["esm", "cjs", "declarations", "css"]
+}
+```
+
+有 CSS 时显式提供样式子路径，并告诉使用者如何导入；不要给没有生成样式的包声明一个不存在的文件。React 组件包应根据实际消费要求声明 React peer dependency。
+
+## 类型和依赖边界
+
+裸包依赖保持 external，消费项目必须能够解析它们。本地源码会进入输出模块图。为公开返回值和 props 提供明确类型。无法生成可靠声明时，构建会指出错误；补齐公开类型后再构建。
+
+应用构建、单文件 bundle 和 library build 不可互换：库构建不生成应用 HTML。Token 和 docgen 是独立辅助命令，见[CLI 参考](/reference/cli/library)。
+
+## 验证方式
+
+执行 `npm pack --dry-run` 检查清单，再执行 `npm pack` 生成本地包。在另一个消费项目安装该 tarball，分别用 ESM import、CommonJS require 调用 `greet`，并用 TypeScript 检查参数。先在本地消费项目验证 tarball，确认入口与类型正确后再发布。
+
+## 常见错误
+
+- 包能在源码仓库用、安装后失败：检查 exports、辅助文件和 external 依赖。
+- 声明生成失败：收窄公开入口并补充显式类型，不把旧声明冒充本次输出。
+- 构建成功但样式缺失：核对是否生成 CSS，以及消费者是否导入公开样式入口。
+
+## 下一步
+
+为库建立[文档站](/wake-docs/create-site)，在[CI](/app/ci)中加入构建和消费检查。

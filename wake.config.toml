@@ -1,7 +1,7 @@
 [docs]
 source_dir = "docs"
 title = "Wake"
-description = "React 19 应用与技术文档的 Rust 构建工具"
+description = "从 React 应用开发、样式与测试，到生产构建和技术文档"
 locale = "zh-CN"
 repository_url = "https://github.com/hotlif/wake"
 base_path = "/"

@@ -1,0 +1,5 @@
+[docs]
+source_dir = "docs"
+title = "My Docs"
+description = "组件和项目使用指南"
+locale = "zh-CN"

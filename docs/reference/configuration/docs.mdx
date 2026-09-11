@@ -1,11 +1,13 @@
 +++
 title = "Wake Docs 配置"
-description = "查询文档目录、站点信息、预览、主题和部署路径"
+description = "查找文档目录、导航、主题、UI、Preview 和聚合配置。"
 kind = "reference"
 status = "stable"
 +++
 
 # Wake Docs 配置
+
+文档相关字段放在 [docs] 中；多项目聚合使用 [[docs.workspace]]。相对路径以项目根为基准。
 
 ## 字段
 
@@ -19,25 +21,27 @@ logo = "/logo.svg"
 repository_url = "https://github.com/example/project"
 base_path = "/"
 preview = "docs/preview.tsx"
+ui = "site/ui.tsx"
 theme_css = "docs/theme.css"
 default_theme = "system"
 accent_color = "#7c3aed"
 ```
 
-| 字段 | 说明 |
-| --- | --- |
-| `source_dir` | MDX、Demo 和 `navigation.toml` 所在目录 |
-| `title` | 站点名称，同时用于页面标题 |
-| `description` | 站点默认描述 |
-| `locale` | 文档语言，例如 `zh-CN` |
-| `logo` | 位于公开资源目录中的 Logo 路径 |
-| `repository_url` | 源码仓库地址，用于页面的仓库入口 |
-| `base_path` | 部署子路径，首尾使用 `/` |
-| `preview` | Demo 公共 React 包装器 |
-| `theme_css` | 文档外壳主题覆盖 |
-| `default_theme` | `light`、`dark` 或 `system` |
-| `accent_color` | 可选的六位十六进制强调色；未设置时不覆盖主题 CSS |
-| `workspace` | 可重复的组件工作区发现与挂载规则，见下文 |
+| 字段 | TOML 类型 | 省略时 | 说明 |
+| --- | --- | --- | --- |
+| `source_dir` | 字符串 | `"docs"` | MDX、Demo 和 `navigation.toml` 所在目录 |
+| `title` | 字符串 | `"Wake Docs"` | 站点名称，同时用于页面标题 |
+| `description` | 字符串 | 空字符串 | 站点默认描述 |
+| `locale` | 字符串 | `"zh-CN"` | 文档语言 |
+| `logo` | 字符串 | 不显示 Logo 图片 | 位于公开资源目录中的 Logo 路径 |
+| `repository_url` | 字符串 | 不显示仓库入口 | 源码仓库地址 |
+| `base_path` | 字符串 | `"/"` | 部署子路径，首尾使用 `/` |
+| `preview` | 字符串 | 不添加用户包装器 | Demo iframe 公共 React 包装器模块路径 |
+| `ui` | 字符串 | 全部使用默认组件 | 站点 React 展示注册模块，路径相对于项目根目录；只支持 Site 模式 |
+| `theme_css` | 字符串 | 不加载用户主题文件 | 文档外壳主题覆盖文件路径 |
+| `default_theme` | 字符串 | `"system"` | 接受 `light`、`dark` 或 `system`，已持久化的用户选择优先 |
+| `accent_color` | 字符串 | 不覆盖主题 CSS | 六位十六进制强调色，例如 `"#7c3aed"` |
+| `workspace` | 表数组 | 空数组 | 可重复的组件工作区发现与挂载规则，见下文 |
 
 `navigation.toml` 必须位于 `source_dir` 根。页面路由始终由相对文件路径生成。
 
@@ -65,3 +69,23 @@ dev_loading = "lazy"
 Wake 只检查 `root` 的直接子目录。`include` 使用大小写敏感的 `*`、`?` 名称匹配，工作区
 名称必须是 URL 安全的单个路径段。站点 `base_path` 会成为所有工作台的统一前缀。重复、
 嵌套、逃逸或遮蔽站点路由的挂载会在启动或构建前失败。
+
+## 可覆盖展示组件
+
+`ui` 是相对项目根的模块路径，默认导出 `defineDocsUI` 注册表。辅助函数和 props 类型来自
+`@crab-dev/wake/docs`。未注册项使用默认实现；需要隐藏时提供返回 null 的组件。注册、导入和组件
+错误会报告，不静默回退。仅支持 Site；主站不向独立 Components 工作台传递注册表。
+
+UI 模块内容参与开发监听。配置路径改变或启停 UI 需要重启；启用时使用完整单图构建以共享
+Root 与页面 Context。完整操作见[覆盖第一个组件](/wake-docs/ui)，字段见[Docs UI API](/reference/docs-ui)。
+
+`preview` 独立包装 iframe 内 Demo 内容，不等于站点 Root 或 Demo 卡片；可与 ui 同时配置。
+
+## 默认样式与自定义主题
+
+`theme_css` 在默认样式之后加载。默认组件样式有独立作用域，正文选择器排除自定义组件和 Demo 边界。
+`--wake-docs-*` 是内部变量，不注入应用根，也不作为稳定公共主题接口。自定义组件自行管理字体、
+颜色、token 与 Portal 主题。默认 Root 仅在挂载期间移除 body 外边距。
+
+MDX 内联示例可使用 `data-wake-demo` 排除正文选择器；这不是 Shadow DOM 或安全隔离，也不阻断祖先 CSS 自定义属性的继承。
+详细选择方式与示例见[文档主题](/wake-docs/theming)和[Preview](/wake-docs/preview)。

@@ -1,6 +1,6 @@
 +++
 title = "Node.js 构建 API"
-description = "在脚本中执行单次构建、内存 bundle 和可复用增量上下文"
+description = "查询构建、打包、库产物生成和增量上下文接口。"
 kind = "reference"
 status = "stable"
 +++
@@ -10,6 +10,8 @@ status = "stable"
 ```ts
 import { build, buildLibrary, bundle, createBuildContext, generateCssToken, generateDocgen } from "@crab-dev/wake";
 ```
+
+首次使用请先阅读[Node 构建教程](/integration/node-api)。
 
 ## `build(options)`
 
@@ -117,7 +119,7 @@ Promise 以 `WAKE_OUTPUT_COLLISION` 拒绝。`sourceMap: false` 不会删除无�
 
 ## `buildLibrary(options)`
 
-构建组件发布合同：真实 ESM、CommonJS、声明入口和可选静态 CSS。所有裸包保持 external，四个
+生成组件包产物：ESM、CommonJS、声明入口和可选静态 CSS。所有裸包保持 external，四个
 输出目录使用 staging 与备份交换统一提交。公开类型无法安全生成或静态 CSS 无法证明时 Promise
 会拒绝，上一份有效产物保持不变。
 
@@ -149,7 +151,7 @@ console.log(result.outputFile);
 使用与 `wake library docgen` 相同的 Rust 后端生成 `public/docgen.json`。`entry` 相对 `cwd`
 解析；省略时先读取 `package.json.docgen.entry`，再追踪 `src/index.ts` 的默认导出。解析、
 公开 props 类型推断或写盘失败都会拒绝 Promise，且不会覆盖上一份有效输出。入口解析和递归类型
-解析会返回实际读取 provenance；`public/docgen.json` 与任一输入或物理 alias 重合时以
+解析会返回实际读取文件清单；`public/docgen.json` 与任一输入或物理 alias 重合时以
 `WAKE_OUTPUT_COLLISION` 拒绝。
 
 ```ts

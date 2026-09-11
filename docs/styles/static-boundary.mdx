@@ -1,37 +1,50 @@
 +++
-title = "静态边界"
-description = "判断哪些 CSS 插值可以构建，以及如何处理动态或有副作用的值"
-kind = "reference"
+title = "理解静态求值边界"
+description = "遇到样式提取错误时，判断哪些值需要改为运行时变量。"
+kind = "guide"
 status = "experimental"
 +++
 
-# 静态边界
+# 理解静态求值边界
+
+css 模板中的值需要在构建时确定。固定间距直接写在模板中；由 props 或用户操作决定的值，通过 CSS 变量传入。
 
 ## 可以求值
 
-Wake 接受能够证明无副作用的字面量、模板、数字运算、字符串拼接、模块顶层不可变常量，以及 ESM 传递的叶子字符串和数字。
+构建期样式要求值可以在不执行业务副作用的前提下确定。常见支持项包括字面量、模板、数字运算、字符串拼接、模块顶层不可变常量，以及经 ESM 传递的叶子字符串和数字。
 
-```ts
+```tsx title="src/StaticCard.tsx"
+import { css } from "@crab-dev/css";
 const unit = 4;
 const gap = `${unit * 2}px`;
 const box = css`padding: ${gap};`;
+export function StaticCard() { return <div className={box}>固定间距</div>; }
 ```
 
 <Demo src="../examples/styles/static-boundary.demo.tsx" />
 
 ## 会被拒绝
 
-- 用户函数调用和 tagged template；
-- getter、可变对象和逃逸引用；
-- `window`、`process`、文件系统、网络和随机值；
-- 相对 `url()`。
-
-Wake 不会执行用户代码来“猜”结果。无法证明安全时构建失败，而不是删除声明后继续。
+用户函数调用、getter、可变对象和逃逸引用，以及 window、process、网络、文件系统和随机值，不能作为任意可执行插值。相对 `url()` 也需要移到普通 CSS 资源管线。无法确定值时，构建会指出具体表达式；按下面的表格选择调整方式。
 
 ## 解决方法
 
-固定值整理成模块顶层纯常量；运行时变化值使用 `createVar` / `assignVars`；资源 URL 使用普通 CSS 或显式 import。
+| 不能静态确定的来源 | 调整方式 |
+| --- | --- |
+| React props 或状态 | 用 createVar/assignVars 写运行时值 |
+| 固定设计常量 | 提取为清楚的不可变叶子常量 |
+| 主题选择 | 分配 CSS 自定义属性，模板保持静态 |
+| 相对图片、字体 | 使用普通 CSS url 或资源 import |
+| 第三方函数计算 | 在可控构建前置步骤生成固定值，或在运行时传变量 |
 
 ## 错误码
 
-常见诊断包括 `CRAB_CSS_STATIC_VALUE`、`CRAB_CSS_RELATIVE_URL` 和 `ERR_WAKE_CSS_NOT_COMPILED`。异步 chunk 的静态样式会作为 chunk-owned CSS artifact，在对应 JavaScript 执行前加载。完整 API 见[CSS API](/reference/css-api)。
+`CRAB_CSS_STATIC_VALUE` 表示值无法安全求出；`CRAB_CSS_RELATIVE_URL` 指向资源路径限制；`ERR_WAKE_CSS_NOT_COMPILED` 表示样式 API 没有经过要求的编译路径。从诊断指出的表达式开始检查。修改 TypeScript 类型不会使运行时值变成构建时常量。
+
+## 验证方式
+
+先构建上面的常量示例，再将 gap 改成读取运行时状态，确认诊断清楚。按动态变量教程调整后再次构建，检查 CSS 中保留变量引用、DOM 上有实际赋值。
+
+## 下一步
+
+阅读[动态样式](/styles/dynamic-values)和[CSS API](/reference/css-api)。

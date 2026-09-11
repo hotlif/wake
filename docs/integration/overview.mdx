@@ -1,0 +1,27 @@
++++
+title = "用脚本组合 Wake"
+description = "需要自动化时，在 Node.js 脚本中组合 Wake 的能力。"
+kind = "overview"
+status = "stable"
++++
+
+# 用脚本组合 Wake
+
+import { OverviewLead, TaskGrid, TaskCard } from "../site/components.tsx"
+
+<OverviewLead primaryHref="/integration/node-api" primaryLabel="调用 Node API" secondaryHref="/integration/build-pipeline" secondaryLabel="组合测试与构建">当命令行脚本不足以描述项目流程时，用公开 API 组合 Wake 能力。应用入门不需要先了解这些接口。</OverviewLead>
+
+## 选择集成方式
+
+<TaskGrid>
+  <TaskCard href="/integration/node-api" title="执行一次构建" description="传入项目路径，获得文件清单、耗时和诊断。" />
+  <TaskCard href="/integration/build-pipeline" title="组合长期运行的流程" description="复用构建上下文，启动服务，并在结束时关闭。" />
+</TaskGrid>
+
+独立部署组件见[远程组件](/integration/remote-components)。研究解析和转换等低层能力时，可以查看[实验 API](/reference/experimental)。
+
+## 先验证结果，再扩展流程
+
+使用返回的结构化结果和诊断，不解析终端文字。每一步明确输入、输出和结束条件。构建后检查产物，启动服务后验证所需路由，关闭时等待资源释放。
+
+普通构建 API 与实验接口有不同稳定性。不要因为它们来自同一个 npm 包，就把实验性的编译器原语或测试接口提升为稳定承诺。

@@ -1,0 +1,51 @@
++++
+title = "Wake 的工作方式"
+description = "从一份入口文件出发，了解开发、构建和发布分别做什么。"
+kind = "guide"
+status = "stable"
++++
+
+# Wake 的工作方式
+
+Wake 是项目中的开发和构建工具。安装后，你可以用命令行操作整个项目，也可以在 Node.js 脚本中调用同一组能力。React 是主要使用场景之一，普通 JavaScript 和 TypeScript 模块也可以编译与打包。
+
+## 从入口开始
+
+`wake.config.toml` 描述项目。应用通过 `[html].entry` 指定浏览器入口，入口再导入组件、样式和资源。Wake 根据这些真实导入建立模块依赖关系；没有被入口引用的业务文件不会因为放在 `src` 中就自动执行。
+
+```toml title="wake.config.toml"
+[html]
+entry = "src/entry.tsx"
+
+[react]
+enabled = true
+jsx_import_source = "react"
+```
+
+配置文件使用 TOML。安装依赖仍由 npm 或 Yarn 负责；Wake 读取已有依赖布局，不代替包管理器。TypeScript 转换负责去除类型语法，类型正确性另用 `tsc --noEmit` 检查。
+
+## 开发与构建
+
+`wake dev .` 启动持续运行的服务，监听参与构建的文件。成功修改触发整页 Live Reload，页面内存状态会重建。构建失败时展示错误，修复后恢复。
+
+`wake build --outdir dist` 执行一次生产构建并结束进程。输出供静态服务器读取，不要求线上继续运行 Wake。部署平台仍需要负责 HTTPS、应用路由回退和 API 转发。
+
+## 根据产物选择命令
+
+| 目标 | 入口 | 产物或结果 |
+| --- | --- | --- |
+| 浏览器应用 | `wake build` | HTML、JavaScript、CSS、资源清单 |
+| 单个脚本 | `wake bundle` | 独立 bundle，可选 Source Map |
+| 组件或工具包 | `wake library build` | 模块、声明与可选样式目录 |
+| 技术文档站 | `wake docs build` | 文档页面、搜索数据和示例资源 |
+| 验证代码 | `wake test` | 测试结果与按需生成的报告 |
+
+CLI 与 Node API 面向相同任务；只有需要组合多步自动化时才必需编写调用脚本。不要通过内部生成目录导入能力，公共入口以[参考区](/reference/node-api/build)为准。
+
+## 验证理解
+
+打开一个项目，找到配置中的入口，再沿导入确认组件和样式来源。分别执行类型检查和生产构建：前者检查类型，后者确认 Wake 能够生成产物，两者不能互相替代。
+
+## 下一步
+
+从[安装](/start/install)开始，或先阅读[支持范围](/start/support)评估现有项目。

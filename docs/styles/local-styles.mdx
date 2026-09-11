@@ -1,6 +1,6 @@
 +++
 title = "局部样式"
-description = "编写声明、伪类、嵌套选择器和条件 at-rule"
+description = "为一个组件编写局部样式、悬停效果和窄屏规则。"
 kind = "tutorial"
 status = "experimental"
 +++
@@ -9,8 +9,8 @@ import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/comp
 
 # 局部样式
 
-<ResultPanel title="完成后">
-  一个模板生成一个稳定类名，局部规则被抽取到 CSS，嵌套顺序保持不变。
+<ResultPanel title="带悬停与窄屏样式的组件" label="完成效果">
+  做出一张带紫色悬停边框的卡片，窄屏下自动缩小内边距。组件样式会随构建生成，无需在浏览器里计算模板。
 </ResultPanel>
 
 ## 编写完整样式
@@ -22,6 +22,7 @@ const card = css`
   display: grid;
   gap: 12px;
   padding: 16px;
+  border: 1px solid transparent;
 
   &:hover { border-color: #7c3aed; }
   & > h2 { margin: 0; }
@@ -43,6 +44,14 @@ export function Card() {
   <Step number="02" title="嵌套">& 指向当前类；子选择器和媒体查询保持就近。</Step>
   <Step number="03" title="抽取">生产构建把规则放入 CSS，模板不进入浏览器。</Step>
 </StepFlow>
+
+## 在应用中使用
+
+先安装 `@crab-dev/css`，将 Card 从模块中导出，在应用入口或页面中 import 并渲染 `<Card />`。顶层 css 模板在构建时变成规则和类名，不应放进点击事件中尝试即时生成 CSS。
+
+嵌套的 `&` 表示当前生成类，`& > h2` 只选择直接子标题。上例先设置透明边框，hover 再改变 border-color，因此交互时能看见颜色变化而不改变盒子尺寸。
+
+页面窄于 640px 时 padding 应由 16px 变为 12px。检查元素计算样式与媒体查询命中情况，不能只靠肉眼判断间距是否改变。
 
 ## 验证方式
 

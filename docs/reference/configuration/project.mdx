@@ -1,6 +1,6 @@
 +++
 title = "项目配置"
-description = "查询项目根、入口、别名、Federation、React、TypeScript、define 和浏览器目标"
+description = "查找应用入口、资源、构建选项和 Federation 配置。"
 kind = "reference"
 status = "stable"
 +++
@@ -8,6 +8,8 @@ status = "stable"
 # 项目配置
 
 Wake 从命令目标向上寻找 `wake.config.toml`。配置使用静态 TOML，不执行 JavaScript。
+
+首次使用请先阅读[项目接入](/start/existing-project)。
 
 ## 根级字段
 
@@ -51,6 +53,9 @@ Federation 是浏览器 CSR 的 Wake-native 协议，不兼容 Webpack/Rspack co
 启用时必须提供页面内唯一的容器 `name`。远程模块只能通过字面量动态导入
 （例如 `import("catalog/Button")`）或 Federation runtime 加载；静态 `import`、`require()`、
 Node、SSR 和 Worker 构建不在 v1 范围内。
+
+<details className="wake-details">
+<summary>展开完整示例：Module Federation（67 行）</summary>
 
 ```toml
 [federation]
@@ -121,6 +126,8 @@ fallback = false
 coherence_group = "react18"
 owner = "shell"
 ```
+
+</details>
 
 远程名必须是 ASCII 标识符；Manifest 必须是绝对 `http://` 或 `https://` URL，
 `allowed_origins` 只接受 origin，不能包含路径、查询、fragment 或凭据。开发服务器在

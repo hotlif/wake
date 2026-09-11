@@ -1,14 +1,16 @@
 +++
 title = "library 命令"
-description = "生成组件库辅助产物"
+description = "查询库构建、设计 token 和组件属性信息的生成命令。"
 kind = "reference"
 status = "experimental"
 +++
 
 # library 命令
 
-`library` 是组件包产品边界，不会生成应用 HTML、manifest 或浏览器 runtime。目前已发布的
-原生子命令包括 token 和组件 API 文档生成：
+`library build` 生成可发布的组件或工具包；`token` 生成设计变量，`docgen` 生成组件属性信息。
+这些命令不生成应用 HTML。
+
+首次使用请先阅读[库构建教程](/app/library)。
 
 ## 用法
 
@@ -17,6 +19,8 @@ wake library token [PROJECT] [--config token.toml]
 wake library docgen [PROJECT] [--entry src/button.tsx]
 wake library build [PROJECT] [--entry src/index.ts]
 ```
+
+## 生成设计 token
 
 `PROJECT` 默认为当前目录，`--config` 相对项目根解析。配置中的 `[build].output` 决定唯一
 写盘目标。生成器递归读取 `[build].imports` 指向的包，后导入覆盖先导入，并把字符串中的
@@ -27,12 +31,16 @@ wake library build [PROJECT] [--entry src/index.ts]
 archive 是同一物理文件或 alias；碰撞以 `WAKE_OUTPUT_COLLISION` 失败，且输入保持不变。Yarn
 PnP（包括 zip 包）与传统 `node_modules` 均受支持。
 
+## 生成组件属性信息
+
 `docgen` 的入口优先级是 `--entry`、`package.json` 的 `docgen.entry`，最后是从
 `src/index.ts` 的默认导出沿 import、re-export 和局部别名追踪。它原子写入紧凑且确定性的
 `public/docgen.json`，保持 react-docgen 的 `displayName`、`description`、`props`、
 `tsType` 和 `defaultValue` 消费结构。公开 props 无法安全确定时命令严格失败。
 Docgen 会保留递归类型解析的实际读取清单；固定输出若与入口、索引、package 配置或传递类型源
 重合，也会在写入前以 `WAKE_OUTPUT_COLLISION` 拒绝。
+
+## 构建可安装的包
 
 `build` 生成 `esm/index.mjs`、`cjs/index.cjs`、`declarations/index.d.ts`，有静态样式时再生成
 `css/index.css`。裸包保持 external，本地源码进入真实 ESM/CJS 保留模块图。全部输出先在包根的

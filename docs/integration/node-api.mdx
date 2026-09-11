@@ -1,0 +1,62 @@
++++
+title = "在 Node.js 中调用 Wake"
+description = "在脚本中构建项目，读取结果并处理错误。"
+kind = "guide"
+status = "stable"
++++
+
+# 在 Node.js 中调用 Wake
+
+已有脚本需要读取构建结果或组合多个步骤时，可以直接调用 Node.js API。普通开发仍可继续使用 CLI。
+
+## 选择 API
+
+| 任务 | API | 结果 |
+| --- | --- | --- |
+| 应用构建 | `build` | 文件清单、统计和诊断 |
+| 内存或单文件打包 | `bundle` | code 和按选项生成的映射或文件 |
+| 库构建 | `buildLibrary` | ESM、CJS、声明与可选样式入口 |
+| 文档构建 | `buildDocs` | 构建结果、路由、Demo 和工作区 |
+| 测试 | `runTests` | 含 success 的测试结果 |
+
+从安装了 Wake 的项目根执行 `.mjs`，无需为了调用工具 API 再经过 Wake 编译该脚本。
+
+## 单次构建
+
+```js title="tools/build.mjs"
+import { build, WakeError } from "@crab-dev/wake";
+
+try {
+  const result = await build({ cwd: process.cwd(), outdir: "dist", cache: true });
+  console.log("输出文件", result.files);
+  for (const diagnostic of result.diagnostics) console.error(diagnostic.message);
+} catch (error) {
+  if (error instanceof WakeError) {
+    console.error(error.code, error.message);
+    for (const diagnostic of error.diagnostics ?? []) console.error(diagnostic);
+  } else {
+    console.error(error);
+  }
+  process.exitCode = 1;
+}
+```
+
+```bash
+node tools/build.mjs
+```
+
+`cwd` 明确项目位置，`outdir` 相对项目解析。不要只依赖脚本文件的位置猜项目根。输出目录与 CLI 使用相同的所有权约束。
+
+## 取消和错误
+
+支持 signal 的一次性 API 可以传入 `AbortSignal.timeout(30_000)`。取消会返回对应错误，不应继续把旧目录发布为新结果。长生命周期对象有自己的关闭方法，不能假定丢弃变量就释放监听或端口。
+
+测试断言失败与构建异常不同：`runTests` 可以正常返回 `success: false`。组合流程时同时处理返回结果和 Promise 拒绝，见[构建流程](/integration/build-pipeline)。
+
+## 验证方式
+
+先用有效项目运行，再临时写错入口，确认脚本以非零退出码结束并显示 WakeError。修复后核对结果清单和实际输出。接口默认值与完整类型见[Node API 参考](/reference/node-api/build)。
+
+## 下一步
+
+需要重建或服务控制时阅读[组合构建流程](/integration/build-pipeline)。

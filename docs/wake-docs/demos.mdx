@@ -1,6 +1,6 @@
 +++
 title = "交互 Demo"
-description = "创建隔离运行、可查看源码并支持多视口预览的 React 示例"
+description = "把可点击的组件示例放进文档，附上源码和视口切换。"
 kind = "tutorial"
 status = "stable"
 +++
@@ -9,7 +9,7 @@ import { NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/comp
 
 # 交互 Demo
 
-<ResultPanel title="完成后">
+<ResultPanel title="可以点击并查看源码的示例" label="完成效果">
   页面内出现可运行预览、源码切换和多视口工具，示例错误不会拖垮整页。
 </ResultPanel>
 
@@ -47,6 +47,12 @@ export default function CounterDemo() {
   <Step number="02" title="保持独立">不依赖外部网络、不稳定时间或页面外状态。</Step>
   <Step number="03" title="完整验证">检查交互、源码、复制、视口和全屏模式。</Step>
 </StepFlow>
+
+## 视口与展示定制
+
+一个示例默认导出 React 组件，可选 meta 描述标题、说明和初始视口。先让示例在最小环境中运行，再通过 Preview 添加共同 Provider。视口按钮改变预览容器，不能代替真实手机浏览器验证。
+
+源码展示来自 Demo 源文件，修改示例后不需要在 MDX 复制第二份代码。全屏展示可能重建 iframe，因此不要承诺所有切换都保持示例内部状态。需要替换卡片与工具栏时使用 [Demo 展示接口](/wake-docs/ui-content)。
 
 ## 验证方式
 

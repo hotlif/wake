@@ -1,36 +1,58 @@
 +++
 title = "资源与 public"
-description = "正确处理图片、字体、CSS URL 和无需编译的公开文件"
+description = "让图片、字体和固定下载文件出现在正确的公开地址。"
 kind = "guide"
 status = "stable"
 +++
 
 # 资源与 public
 
+跟随组件一起更新的图片适合通过 import 引用；必须保留固定文件名的资源放进 public。
+
 ## 进入模块图的资源
 
-从 TypeScript 或 CSS 相对导入的图片、字体和其他文件属于模块图。Wake 会计算内容哈希、决定内联或独立输出，并把引用重写到最终地址。
+组件专属图片和 CSS 引用的字体适合通过相对路径导入。Wake 根据文件内容处理资源，可能内联，也可能输出独立文件，并重写最终引用。
 
-```tsx
+```tsx title="src/Logo.tsx"
 import logoUrl from "./logo.svg";
 
 export function Logo() {
-  return <img src={logoUrl} alt="Wake" />;
+  return <img src={logoUrl} alt="项目标志" width={64} height={64} />;
 }
 ```
 
+```ts title="src/assets.d.ts"
+declare module "*.svg" {
+  const url: string;
+  export default url;
+}
+```
+
+类型声明让 TypeScript 理解资源导入，不负责复制文件。普通 CSS 的 `url('./font.woff2')` 相对 CSS 文件解析；构建后检查重写的 URL，不硬编码哈希文件名。
+
 ## public 文件
 
-robots.txt、固定站点图标或必须保持文件名的资源放在 `public`。代码使用从站点根开始的 URL 引用它们。
+把 `robots.txt`、固定名称的下载文件或站点图标放到 `public`。代码使用它们的公开 URL；文件内容中的路径不会因为它位于 public 就自动获得模块导入的重写语义。
+
+```html title="链接固定公开文件"
+<a href="/guide.pdf">下载指南</a>
+```
+
+这条 URL 指向域名根。部署到 `/portal/` 时，项目需要使用相应公开前缀，例如 `/portal/guide.pdf`。不要假定任意字符串 URL 会随 `public_path` 自动改变。
 
 ## 选择原则
 
-需要版本化和依赖追踪时使用 import；需要固定公开路径时使用 public。不要把同一资源同时放入两条管线。
+| 需求 | 推荐方式 |
+| --- | --- |
+| 图片跟随组件版本变化 | 相对 import |
+| CSS 中的字体或背景 | 普通 CSS 的相对 `url()` |
+| 必须保留固定文件名 | public 文件 |
+| 远程用户上传图片 | 应用使用服务端提供的 URL |
 
 ## 验证方式
 
-生产构建后检查资源请求没有 404，并确认部署子路径下的 `public_path` 与 HTML 引用一致。
+执行生产构建，查看页面实际的 `src` 与 CSS URL。使用部署前缀打开页面并检查网络面板；小文件内联时不产生独立请求属于正常情况。检查 public 文件是否能按固定路径直接访问。
 
 ## 下一步
 
-生成[生产构建](/app/production-build)。
+进入[生产构建](/app/production-build)，了解这些文件如何共同交付。

@@ -1,0 +1,62 @@
++++
+title = "Mock 与依赖替换"
+description = "记录回调调用，并在测试中替换依赖的返回结果。"
+kind = "guide"
+status = "experimental"
++++
+
+# Mock 与依赖替换
+
+当测试只关心回调是否调用，或需要固定依赖返回值时，使用 Mock。模块替换要在目标模块加载前注册。
+
+## 函数 Mock
+
+```ts title="src/callback.test.ts"
+import { expect, mock, test } from "@crab-dev/wake/test";
+
+test("把结果通知调用者", () => {
+  const notify = mock.fn<(value: number) => void>();
+  notify(3);
+  expect(notify).toHaveBeenCalledWith(3);
+  expect(notify).toHaveBeenCalledTimes(1);
+});
+```
+
+Wake 方法包括 `implement`、`return`、`resolve`、`reject` 及其一次性版本。不要从其他 runner 直接复制 `mockResolvedValue` 等方法名。`clear` 清调用记录，`reset` 重置 Mock 状态，spy 的 `restore` 恢复原属性；具体签名见[Test API](/reference/test-api)。
+
+## 显式模块替换
+
+```ts title="src/profile.ts"
+import { loadName } from "./profile-api";
+export async function profileTitle(): Promise<string> {
+  return `用户：${await loadName()}`;
+}
+```
+
+```ts title="src/profile-api.ts"
+export async function loadName(): Promise<string> {
+  return "真实用户";
+}
+```
+
+```ts title="src/profile.test.ts"
+import { expect, mock, test } from "@crab-dev/wake/test";
+
+test("使用替换后的接口", async () => {
+  mock.module("./profile-api", () => ({
+    loadName: async () => "Ada",
+  }));
+  const { profileTitle } = await mock.import<typeof import("./profile")>("./profile");
+  await expect(profileTitle()).resolves.toBe("用户：Ada");
+});
+```
+
+注册发生在加载之前。已经静态导入并执行的模块不会被后来声明的 Mock 改写。需要不同模块缓存时使用 `mock.isolate`，不要依赖提升、自动 Mock 或 `__mocks__` 目录。
+
+## 验证方式
+
+先确认替换后的名称出现，再去掉注册，让结果恢复为真实用户。若始终使用真实实现，检查目标模块是否已经被静态 import。若调用次数累积，检查共享 Mock 的创建和清理位置。
+
+## 下一步
+
+阅读[时间与网络](/testing/time-and-network)，或在[React 测试](/testing/react)中把 Mock 作为 props 回调传入。

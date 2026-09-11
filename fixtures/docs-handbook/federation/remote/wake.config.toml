@@ -1,0 +1,14 @@
+[html]
+entry = "src/entry.ts"
+
+[dev_server]
+host = "127.0.0.1"
+port = 4174
+
+[federation]
+enabled = true
+name = "catalog"
+
+[federation.exposes."./greeting"]
+entry = "src/greeting.ts"
+mode = "generic"

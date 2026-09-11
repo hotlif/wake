@@ -1,0 +1,46 @@
++++
+title = "快照、截图与覆盖率"
+description = "保存预期结果，查看变化差异，再用覆盖率寻找遗漏。"
+kind = "guide"
+status = "experimental"
++++
+
+# 快照、截图与覆盖率
+
+快照记录预期结果，截图记录界面，覆盖率记录执行过的代码。它们回答不同问题，可以按需要分别使用。
+
+## 文本快照
+
+```ts title="src/result.test.ts"
+import { expect, test } from "@crab-dev/wake/test";
+
+test("稳定的数据输出", () => {
+  expect({ title: "Wake", sections: ["开始", "参考"] }).toMatchSnapshot();
+});
+```
+
+快照适合有意义且稳定的整体结果。首次生成或有意变更时使用 `--update-snapshots`，随后审查生成文件，再在普通运行中校验。Wake 保存外部文本快照，不改写测试源码，也不支持 inline snapshots。
+
+## 浏览器截图
+
+在完成组件渲染并等待页面稳定后，使用 `await expect(document).toMatchScreenshot('page')` 捕获视口，或对 Element 捕获其可见布局区域。只在 browser 环境可用。
+
+基线按系统、浏览器版本、视口和主题等 profile 隔离。失败保留原基线并生成实际图片与 HTML diff。当前采用精确比较，没有像素容差或字体归一化；不同平台分别维护基线。
+
+## 覆盖率
+
+```bash
+npx wake test --coverage --serial
+```
+
+在 `[test.coverage]` 选择 `text`、`json`、`lcov` 或 `html` 报告，在 threshold 中配置需要的指标。报告属于 experimental，尤其是 V8 到 TSX 源码的映射边界；出现 `WAKE_TEST_COVERAGE` 时应处理诊断，不把空报告当作成功。
+
+覆盖率说明哪些代码被执行，不证明断言充分。先测试关键成功、失败与交互边界，再用覆盖率寻找遗漏，而不是只提高百分比。
+
+## 验证方式
+
+有意修改快照中的一个文本，普通运行应失败；检查 diff 后再决定更新或修复。截图在相同 profile 中重跑，确认基线稳定。覆盖率开启后检查报告文件实际存在，且包含被执行源码。
+
+## 下一步
+
+将基线审核与报告检查加入[测试 CI](/testing/ci)。完整字段见[测试配置](/reference/configuration/test)。

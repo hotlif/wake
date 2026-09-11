@@ -1,15 +1,17 @@
 +++
 title = "编写 MDX"
-description = "用统一 Frontmatter、Markdown 和受控 JSX 编写清晰页面"
+description = "把说明文字、代码和 React 组件放进同一篇文档。"
 kind = "tutorial"
 status = "stable"
 +++
 
+import { ResultPanel } from "../site/components.tsx"
+
 # 编写 MDX
 
-## 完成本页后
-
+<ResultPanel title="一篇带代码与章节的文档" label="完成效果">
 一个页面同时具有可搜索元数据、唯一标题、清晰章节和可验证的下一步。
+</ResultPanel>
 
 ## 页面模板
 
@@ -34,14 +36,19 @@ status = "stable"
 
 普通段落、列表、表格、任务列表、代码围栏、链接和静态 JSX 都会编译成 React。导入语句必须位于 Frontmatter 后、正文前。
 
-Wake 会在 AST 层把 flow JSX、HTML 块元素、块 fragment 和独占段落的自定义组件提升到
-段落外；混合内容会拆成合法的兄弟节点。普通文本与行内 JSX 仍保留在 `<p>` 中，组件内部
-显式编写的 Markdown children 也继续生成段落。无需用空行、字符串替换或 CSS 修补
-`<p><div>` 一类非法结构。
+块组件会作为独立内容显示，文字和行内 JSX 保留在段落中。组件内部的 Markdown 仍会生成正常段落；Wake 会处理块元素的结构，无需手动用 HTML 段落包住卡片或示例。
 
 ## 编译期组件
 
 `<Demo>`、`<Demos>` 和 `<API>` 的路径、glob、symbol 等属性必须是静态字面量。Wake 在构建前收集它们，动态表达式会得到带行列的诊断。
+
+## 组织一篇可维护的页面
+
+标题和 description 用于识别页面和搜索。先写读者要完成的任务，再给带文件名的代码块；同一配置只解释一次，完整字段链接参考区。站点目录从章节标题生成，因此标题应说明内容，不用“步骤一”替代真实含义。
+
+代码围栏可以写语言和 `title="文件名"`。MDX 中 import 的组件是普通项目依赖，会参与构建；只导入实际使用的组件。不要把 shell 命令的占位文本伪装成可直接执行的完整脚本。
+
+新增页面后同时验证导航引用、相对 Demo/API 路径及部署后的链接。MDX 路径属性相对当前页面，而不是始终相对项目根。
 
 ## 验证方式
 

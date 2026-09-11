@@ -1,15 +1,17 @@
 +++
 title = "动画"
-description = "用 keyframes 声明局部动画并在静态样式中引用"
+description = "声明局部动画，并照顾偏好减少动态效果的用户。"
 kind = "tutorial"
 status = "experimental"
 +++
 
+import { ResultPanel } from "../site/components.tsx"
+
 # 动画
 
-## 完成本页后
-
+<ResultPanel title="尊重用户偏好的局部动画" label="完成效果">
 组件拥有局部动画名称；用户开启减少动态效果时，内容仍可直接阅读和操作。
+</ResultPanel>
 
 ```tsx
 import { css, keyframes } from "@crab-dev/css";
@@ -35,6 +37,12 @@ const panel = css`
 ## 无障碍要求
 
 非必要动画应尊重 `prefers-reduced-motion`。不要用动画作为唯一状态反馈，也不要让闪烁影响可读性。
+
+## 渲染带动画的组件
+
+上面的模板可以直接用于导出的组件：`export function Panel() { return <section className={panel}>内容已就绪</section>; }`。重新挂载 Panel 时进入动画重新开始；单纯修改文本不意味着 animation 必然重播。
+
+需要等待动画后移动焦点或卸载 DOM 时，由组件管理相关生命周期。CSS 提取只生成动画规则，不替代交互状态机。在减少动态效果模式下仍应能完成同一操作。
 
 ## 验证方式
 

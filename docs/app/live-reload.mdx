@@ -1,15 +1,15 @@
 +++
-title = "Live Reload"
-description = "理解 Wake 的增量重建与整页自动刷新边界"
+title = "保存后自动刷新"
+description = "保存代码后，页面何时刷新，哪些状态会重新开始。"
 kind = "guide"
 status = "stable"
 +++
 
 import { NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from "../site/components.tsx"
 
-# Live Reload
+# 保存后自动刷新
 
-<ResultPanel title="完成后">
+<ResultPanel title="这一页做出来的结果" label="动手之前">
   源码修改成功重建后，浏览器刷新整个页面并加载最新产物；页面内存状态会重新创建。
 </ResultPanel>
 
@@ -25,15 +25,20 @@ Wake 当前提供 Live Reload，不提供模块级 HMR。开发服务器会复�
 
 <StepFlow>
   <Step number="01" title="监听">文件监听器合并同一批变化。</Step>
-  <Step number="02" title="重建">长期 BuildSession 失效并增量生成完整候选。</Step>
-  <Step number="03" title="发布">构建成功后原子替换服务中的产物。</Step>
-  <Step number="04" title="刷新">目标挂载收到 reload 消息，浏览器重新加载页面。</Step>
+  <Step number="02" title="重建">复用已有结果，只重新处理受影响的文件。</Step>
+  <Step number="03" title="发布">全部构建成功后，服务器切换到新产物。</Step>
+  <Step number="04" title="刷新">浏览器收到更新通知，重新加载页面。</Step>
 </StepFlow>
 
 构建失败时不会发布半成品，也不会刷新页面；浏览器显示诊断 overlay。修复错误并成功重建后，
 overlay 清除并执行一次整页刷新。
 
-## Federation 更新
+## 远程组件如何更新
+
+远程组件可能只更新类型、重新挂载隔离组件，或刷新整个页面。日常开发先按[远程组件更新指南](/integration/remote-delivery)检查界面；以下内容用于排查断线或旧资源无法加载的问题。
+
+<details className="wake-details">
+<summary>排查远程连接：版本保留与恢复规则</summary>
 
 Federation 的 `types-only`、`isolated-remount` 和 `full-reload` 是独立的版本化协议。
 `isolated-remount` 可以只重建隔离组件，但它不表示普通应用具备模块 HMR。
@@ -47,6 +52,8 @@ Federation 的 `types-only`、`isolated-remount` 和 `full-reload` 是独立的�
 裁剪后的 build asset 返回 `410 Gone` 和版本化恢复控制。浏览器只在控制中的 remote/build 与自己本次
 请求完全匹配且 generation 严格更新时刷新；equal-generation、无效或跨 remote 响应只作为网络错误
 处理，不会刷新其他页面。Wake 保留的 Federation 路径缺失时直接 404，不会回退到 public 文件或 SPA。
+
+</details>
 
 ## 验证方式
 
@@ -63,5 +70,5 @@ Federation 的 `types-only`、`isolated-remount` 和 `full-reload` 是独立的�
 
 <NextActions>
   <NextLink href="/app/aliases-and-proxy" title="配置别名与代理" description="让日常导入和 API 请求更稳定。" />
-  <NextLink href="/reference/troubleshooting" title="继续排错" description="按症状查找权威诊断路径。" />
+  <NextLink href="/reference/troubleshooting" title="继续排错" description="从当前看到的现象开始检查。" />
 </NextActions>

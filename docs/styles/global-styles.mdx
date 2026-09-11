@@ -1,15 +1,17 @@
 +++
 title = "全局样式"
-description = "用 globalStyle 显式声明 reset、字体和根级主题"
+description = "集中管理 reset、字体和页面级样式。"
 kind = "tutorial"
 status = "experimental"
 +++
 
+import { ResultPanel } from "../site/components.tsx"
+
 # 全局样式
 
-## 完成本页后
-
+<ResultPanel title="集中管理的页面基础样式" label="完成效果">
 Reset、字体和根主题集中在一个入口可达模块中，开发更新不会重复追加规则。
+</ResultPanel>
 
 ```ts title="src/global-styles.ts"
 import { globalStyle } from "@crab-dev/css";
@@ -32,6 +34,12 @@ import "./global-styles";
 ## 边界
 
 `globalStyle` 必须位于入口可达模块的顶层。不要在组件渲染、事件处理器或条件分支中调用。局部 `css` 不允许通过 `:global` 隐藏全局副作用。
+
+## 决定全局规则的所有者
+
+应用入口拥有页面 reset，组件库通常不应在被导入时擅自修改宿主 body 或按钮样式。需要全局样式的包应提供清楚的公开入口，供应用显式导入。
+
+上面的规则只有被入口静态引用后才进入构建。文档 Demo 在 iframe 中运行时，可通过 Preview 导入所需 reset；它与文档站外壳不是同一个样式环境。
 
 ## 验证方式
 

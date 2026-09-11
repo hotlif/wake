@@ -1,0 +1,71 @@
++++
+title = "覆盖第一个展示组件"
+description = "先替换顶栏，其余导航、搜索和内容继续使用默认界面。"
+kind = "tutorial"
+status = "stable"
++++
+
+import { ResultPanel } from "../site/components.tsx"
+
+# 覆盖第一个展示组件
+
+<ResultPanel title="你自己的顶栏" label="完成效果">
+站点使用自己的顶栏，其余界面继续使用默认组件。你无需复制路由、搜索索引或主题存储逻辑。先建立文档站，并使用包含 `@crab-dev/wake/docs` 入口的 Wake 版本；安装版本应提供该公共入口。
+</ResultPanel>
+
+## 注册组件
+
+```tsx title="site/ui.tsx"
+import { defineDocsUI, type HeaderProps } from "@crab-dev/wake/docs";
+import "./ui.css";
+
+function Header({ site, search, theme, mobileNavigation }: HeaderProps) {
+  return <header className="site-header">
+    <a href={site.homeHref}>{site.title}</a>
+    <button onClick={() => mobileNavigation.setOpen(true)}>导航</button>
+    <button onClick={() => search.setOpen(true)}>搜索</button>
+    <button onClick={() => theme.setTheme(theme.resolved === "dark" ? "light" : "dark")}>
+      切换主题（当前 {theme.resolved}）
+    </button>
+  </header>;
+}
+
+export default defineDocsUI({ Header });
+```
+
+```css title="site/ui.css"
+.site-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px; font: 16px/1.5 system-ui; color: #18181b; background: #fff; }
+.site-header a { color: inherit; }
+.site-header button { font: inherit; }
+html[data-theme="dark"] .site-header { color: #fafafa; background: #18181b; }
+```
+
+```toml title="wake.config.toml 中的 Docs 配置"
+[docs]
+source_dir = "docs"
+ui = "site/ui.tsx"
+```
+
+路径相对项目根。Wake 不自动扫描某个约定目录；必须显式配置模块。使用 `site.homeHref` 保留子路径部署语义，而不是把首页写死为 `/`。
+
+## 覆盖与默认实现
+
+注册表按组件覆盖，缺省项由默认实现补齐。想隐藏某一项时注册返回 `null` 的组件，例如 `TableOfContents: () => null`；不要把组件值直接写成 null。未知名称、无效注册、导入失败或组件异常需要修复，不会静默改用默认组件。
+
+## 开发行为
+
+编辑 UI 模块会重建并刷新。启用自定义 UI 后，开发服务会一起构建站点内容，让 Root 与页面可以使用同一个 Context。切换 UI 路径或启停配置需要重启开发服务。编译失败保留上一份有效产物，修复后恢复。
+
+## 验证方式
+
+确认只有 Header 改变。搜索按钮应打开默认搜索框，快捷键仍有效；主题刷新后保留；窄屏导航仍能打开。为一个组件临时返回 null，确认其余默认项正常。
+
+## 常见错误
+
+- 找不到公共入口：检查当前 Wake 安装是否包含新入口，以及工作区是否声明直接依赖。
+- 顶栏没有默认字体：自定义组件拥有自己的外观，补充显式 CSS。
+- 子路径首页错误：使用提供的 href，不拼接内部生成路径。
+
+## 下一步
+
+学习[组织完整界面](/wake-docs/ui-layout)，或查询[Docs UI API](/reference/docs-ui)。

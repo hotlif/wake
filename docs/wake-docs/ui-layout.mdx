@@ -1,0 +1,93 @@
++++
+title = "组织完整文档界面"
+description = "安排顶栏、导航和正文，让页面使用同一套 Provider。"
+kind = "guide"
+status = "stable"
++++
+
+# 组织完整文档界面
+
+Root 安装共享环境，Layout 安排页面区域，Page 展示一篇文档。先把这三层连起来，再逐个定制控件。
+
+## 三层职责
+
+| 组件 | 接收内容 | 用来做什么 |
+| --- | --- | --- |
+| Root | children 与公共状态 | 安装应用级 Provider |
+| Layout | 已解析覆盖关系的导航、顶栏、目录、浮层与正文 | 安排页面结构 |
+| Page | 页面信息、面包屑、前后页与正文 children | 展示单篇文档 |
+
+Wake 保留内容加载、元数据更新、页面完成通知与错误捕获。自定义页面不重新读取 MDX 文件或维护另一份路由状态。
+
+## Provider 与布局
+
+```tsx title="site/shell.tsx"
+import { createContext, useContext } from "react";
+import type { RootProps, LayoutProps, PageProps } from "@crab-dev/wake/docs";
+import "./shell.css";
+
+export const BrandContext = createContext("未提供品牌");
+
+export function BrandLabel() {
+  return <strong>{useContext(BrandContext)}</strong>;
+}
+
+export function Root({ children }: RootProps) {
+  return <BrandContext.Provider value="我的项目">{children}</BrandContext.Provider>;
+}
+
+export function Layout(props: LayoutProps) {
+  return <div className="site-layout">
+    <div className="site-header">{props.header}</div>
+    <aside className="site-navigation">{props.navigation}</aside>
+    <div className="site-content">{props.children}</div>
+    <aside className="site-toc">{props.tableOfContents}</aside>
+    {props.mobileNavigation}
+    {props.searchDialog}
+  </div>;
+}
+
+export function Page({ page, breadcrumbs, children, previous, next }: PageProps) {
+  return <article className="site-page">
+    <p>{breadcrumbs.join(" / ")}</p>
+    <h1>{page.title}</h1>
+    <p>{page.description}</p>
+    <div className="site-prose">{children}</div>
+    <nav aria-label="前后页">
+      {previous && <a href={previous.href}>{previous.title}</a>}
+      {next && <a href={next.href}>{next.title}</a>}
+    </nav>
+  </article>;
+}
+```
+
+把三个组件加入 `defineDocsUI`。相关样式必须由项目提供：桌面可以用 grid 安排侧栏，窄屏隐藏桌面导航并保留 mobileNavigation 的入口。Layout 的 children 已含 Wake 的正文焦点目标，不再嵌套一个额外 main。
+
+以下是可起步的结构样式。它只调整本例的元素；字体、颜色和正文排版再由品牌组件明确提供。
+
+```css title="site/shell.css"
+.site-layout { display: grid; grid-template-columns: 15rem minmax(0, 1fr) 13rem; gap: 1.5rem; }
+.site-header { grid-column: 1 / -1; }
+.site-content { min-width: 0; }
+.site-page { padding: 1.5rem; font: 1rem/1.75 system-ui, sans-serif; }
+.site-prose > h1:first-child { display: none; }
+@media (max-width: 900px) {
+  .site-layout { grid-template-columns: minmax(0, 1fr); }
+  .site-navigation, .site-toc { display: none; }
+  .site-page { padding: 1rem; }
+}
+```
+
+## 内容只渲染一次
+
+Layout 渲染正文 children 一次，Page 同样渲染自己的正文一次。不要为了移动布局复制完整正文树。自定义 Page 若自己显示标题，应处理 MDX 正文自带 H1 的展示，避免出现两个视觉标题；完整 fixture 在正文容器内处理此情况。
+
+Root 与页面可以导入同一个普通模块中的 Context。Demo iframe 独立，仍通过 Preview 配置环境。公共接口不提供内部 registry 或可变状态容器。
+
+## 验证方式
+
+在 `docs/index.mdx` 的 Frontmatter 后导入 `BrandLabel`：`import { BrandLabel } from "../site/shell";`，再在正文写 `<BrandLabel />`。应显示“我的项目”，而不是默认的“未提供品牌”。检查浏览器标题、前后页、搜索跳转、返回操作和页面焦点；断开页面依赖时错误应由 Wake 包装层报告。
+
+## 下一步
+
+实现[导航与搜索](/wake-docs/ui-navigation)，或使用[Crab UI 示例](/wake-docs/crab-ui)中的完整布局。

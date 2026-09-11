@@ -1,0 +1,25 @@
+[html]
+entry = "src/entry.tsx"
+
+[react]
+enabled = true
+jsx_import_source = "react"
+
+[alias]
+"@" = "./src"
+
+[[dev_server.proxy]]
+context = ["/api"]
+target = "http://127.0.0.1:3000"
+change_origin = true
+ws = false
+
+[dev_server.proxy.path_rewrite]
+"^/api" = ""
+
+[test]
+environment = "dom"
+include = ["src/**/*.test.ts", "src/**/*.test.tsx"]
+
+[test.react]
+act_warnings = "error"

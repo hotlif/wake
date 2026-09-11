@@ -1,40 +1,54 @@
 +++
-title = "Preview 环境"
-description = "为全部 Demo 注入 Provider、全局样式和稳定运行边界"
+title = "为 Demo 配置 Preview"
+description = "为多个 Demo 统一安装主题、Provider 和基础样式。"
 kind = "guide"
 status = "stable"
 +++
 
-# Preview 环境
+# 为 Demo 配置 Preview
+
+多个 Demo 需要相同主题或 Context 时，统一放进 Preview。每个示例只需保留自己的组件逻辑。
 
 ## 创建包装器
 
-```tsx title="docs/preview.tsx"
-import type { ReactNode } from "react";
+当多个 Demo 都需要主题、语言或业务 Context 时，把共同环境放进 Preview，避免每个示例重复安装。以下模块位于项目根下的 `site`，与 docs 内容目录相邻。
+
+```tsx title="site/preview.tsx"
+import { createContext, type ReactNode } from "react";
 import "./preview.css";
 
+export const DemoLocale = createContext("zh-CN");
+
 export default function Preview({ children }: { children: ReactNode }) {
-  return <div className="preview-root">{children}</div>;
+  return <DemoLocale.Provider value="zh-CN"><div className="demo-environment">{children}</div></DemoLocale.Provider>;
 }
 ```
 
-```toml title="wake.config.toml"
-[docs]
-preview = "docs/preview.tsx"
+```css title="site/preview.css"
+body { margin: 0; }
+.demo-environment { padding: 24px; font-family: system-ui, sans-serif; }
 ```
 
-Preview 适合注入路由、主题、国际化和数据客户端。它不应替 Demo 隐藏真实依赖，也不应启动共享的不可清理副作用。
-
-未配置 `preview` 时，Wake 会在普通文档站和组件工作台中默认将 Demo 水平、垂直居中；超出视口的内容仍从可滚动的起始边显示。配置自定义 Preview 后，包装器将完全接管布局，Wake 不再叠加默认居中样式。
+```toml title="wake.config.toml 中的 Docs 配置"
+[docs]
+source_dir = "docs"
+preview = "site/preview.tsx"
+```
 
 ## 隔离原则
 
-Demo 默认在 iframe 中运行，错误、样式和尺寸不会污染文档外壳。Preview 本身也进入每个 iframe，因此应保持轻量和确定性。
+Preview 在 Demo iframe 的 React 根内运行，包装传入的 children。站点顶栏、搜索和导航不属于这个树。反过来，站点 `ui.Root` 安装的 Provider 不会自动进入 iframe，需要在 Preview 中安装示例需要的环境。
+
+修改 Preview 不等于修改预览卡片工具栏。需要替换源码按钮、视口选择或全屏展示时使用 `ui.Demo`，见[内容组件](/wake-docs/ui-content)。两项配置可以同时存在。
+
+## 样式与主题
+
+为 iframe 内容导入自己的样式。若组件库要求 token，显式加载其公开样式入口。Wake 会传递主题消息，但组件如何使用主题和 Provider 由该环境决定；不要依赖默认站点向全局注入组件库 token。
 
 ## 验证方式
 
-打开两个不同 Demo，确认状态互不共享；切换文档主题时两个 iframe 都能收到主题更新。
+让一个 Demo 读取 `DemoLocale` 并显示值，确认 Provider 生效。切换明暗主题，检查 iframe 内容和站点外壳分别正确。打开源码和全屏，确认包装器依旧存在，错误能归因到当前示例。
 
 ## 下一步
 
-调整[文档主题](/wake-docs/theming)。
+调整[默认主题](/wake-docs/theming)，或开始[覆盖展示组件](/wake-docs/ui)。

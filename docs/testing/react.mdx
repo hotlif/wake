@@ -1,0 +1,57 @@
++++
+title = "测试 React 组件"
+description = "渲染组件、点击按钮，检查用户能看到的变化。"
+kind = "tutorial"
+status = "experimental"
++++
+
+import { ResultPanel } from "../site/components.tsx"
+
+# 测试 React 组件
+
+<ResultPanel title="一个验证点击计数的组件测试" label="完成效果">
+测试会渲染 Counter、点击按钮并验证计数变化。准备 React 和 React DOM 同版本，满足 `>=19.2.8 <19.3.0`，再使用[项目结构](/app/project-structure)中的独立 Counter 组件。
+</ResultPanel>
+
+## 创建交互测试
+
+```tsx title="src/Counter.test.tsx"
+import { expect, test } from "@crab-dev/wake/test";
+import { render, screen, userEvent } from "@crab-dev/wake/test/react";
+import { Counter } from "./Counter";
+
+test("点击后显示新计数", async () => {
+  const user = userEvent.setup();
+  await render(<Counter />);
+  await user.click(screen.getByRole("button", { name: "点击次数：0" }));
+  expect(screen.getByRole("button", { name: "点击次数：1" })).toBeInTheDocument();
+});
+```
+
+```bash
+npx wake test src/Counter.test.tsx --environment dom --serial
+```
+
+## 查询与等待
+
+优先用 role 和可访问名称查询，测试同时帮助发现按钮没有名称、表单没有标签等问题。`getBy*` 要求元素已经存在，`queryBy*` 适合检查不存在，`findBy*` 等待异步出现。重复区域使用 `within` 缩小范围。
+
+`render`、`rerender`、用户操作和相关等待都返回 Promise。Wake 使用异步 React act，并默认在每个测试后清理挂载。手动执行会触发状态变化的外部代码时，使用公开 `act` 包装；不要通过关闭警告隐藏未等待的交互。
+
+## Provider 与属性更新
+
+`render` 的 `wrapper` 接收 children，可安装组件需要的 Context Provider。返回的视图提供 `rerender` 和 `unmount`，适合验证属性变化和卸载清理。组件测试导入组件模块，不导入调用 `createRoot` 的应用入口。
+
+## 验证方式
+
+运行测试，临时去掉 Counter 的点击处理器，测试应失败；恢复后通过。需要证明按钮位置、实际焦点移动或 CSS 时，将对应行为放到 browser 环境验证。
+
+## 常见错误
+
+- React 版本诊断：确保 react 与 react-dom 是同一个项目解析的匹配版本。
+- 找不到按钮：先看可访问名称是否符合实际渲染内容，再检查是否遗漏 await。
+- act 警告：检查状态更新的来源和等待链，不用固定睡眠绕过。
+
+## 下一步
+
+阅读[DOM 与浏览器环境](/testing/environments)，必要时加入[截图](/testing/snapshots)。

@@ -1,42 +1,46 @@
 +++
 title = "页面与导航"
-description = "使用文件路径生成路由，并通过 navigation.toml 维护三级导航"
+description = "决定页面地址、章节层级和前后篇阅读顺序。"
 kind = "guide"
 status = "stable"
 +++
 
 # 页面与导航
 
+文件位置决定页面地址，导航清单决定阅读顺序。只想调整章节时，通常只需修改导航清单。
+
 ## 路由来自文件路径
 
-`docs/app/live-reload.mdx` 对应 `/app/live-reload`，`docs/index.mdx` 对应 `/`。Frontmatter 不允许自定义 slug，避免文件位置、路由和导航出现三套事实来源。
+假设 `source_dir = "docs"`：`docs/index.mdx` 对应首页，`docs/guide/install.mdx` 对应 `/guide/install`，目录中的 `index.mdx` 对应该目录路径。部署前缀由 `base_path` 处理，不写进页面文件名。
+
+改变文件路径会改变公开 URL。已经分享的链接应保留对应页面；重新组织导航通常无需移动源文件。
 
 ## 导航来自单一清单
 
 ```toml title="docs/navigation.toml"
 [[group]]
-id = "app"
-title = "应用开发"
+id = "guide"
+title = "使用指南"
+pages = ["index"]
 
 [[group.section]]
-id = "development"
-title = "开发"
-pages = ["app/dev-server", "app/live-reload"]
+id = "setup"
+title = "准备项目"
+pages = ["guide/install", "guide/configuration"]
 ```
 
-一级 group 始终可见，section 在侧栏中可折叠，pages 的顺序就是阅读顺序。
+先创建三个相应 MDX 文件。group 拥有顶层页面与 section，section 中的 pages 明确顺序。页面标题来自 Frontmatter；导航清单只负责结构，不重复维护整篇页面信息。
 
 ## 构建约束
 
-- 导航引用不存在页面时失败；
-- 页面出现两次时失败；
-- 未列入导航的页面必须声明 `hidden = true`；
-- group 和 section ID 只允许小写字母、数字与连字符。
+导航 ID 保持稳定且不重复，引用的页面必须存在。页面 Frontmatter 不再使用 `slug`、`group`、`group_order` 或 `order`。需要从导航隐藏时使用页面自身的 `hidden` 字段，而不是遗漏清单后期待自动隐藏。
+
+导航当前分区的展开状态来自当前路由；用户主动展开的偏好独立持久化。因此浏览很多页面，不应不断把所有访问分区写入用户偏好。
 
 ## 验证方式
 
-运行文档检查后，分别从桌面侧栏、移动抽屉和搜索打开当前页面；三处必须显示同一层级路径。
+点击页面链接，再直接输入深层 URL 并刷新。检查面包屑、前后页和移动导航。调整 pages 顺序后检查阅读顺序变化；不移动文件时原 URL 应继续可访问。
 
 ## 下一步
 
-开始[编写 MDX](/wake-docs/mdx)。
+阅读[MDX](/wake-docs/mdx)，发布子目录时核对[部署](/wake-docs/deployment)。

@@ -1,0 +1,258 @@
++++
+title = "Docs UI API"
+description = "查询文档界面的 14 个可替换组件及其 props。"
+kind = "reference"
+status = "stable"
++++
+
+# Docs UI API
+
+通过 defineDocsUI 注册需要替换的组件，未注册部分继续使用默认实现。下面按页面区域列出组件和输入数据。
+
+## 注册入口
+
+```tsx
+import { defineDocsUI, type DocsUI, type HeaderProps } from "@crab-dev/wake/docs";
+
+const Header = ({ site }: HeaderProps) => <header>{site.title}</header>;
+export default defineDocsUI({ Header });
+```
+
+`defineDocsUI` 校验并返回只读注册表，保留组件身份。支持普通 React 组件以及 memo、forwardRef、lazy 组件。未提供的字段（或 undefined）使用默认实现；隐藏界面需传返回 null 的组件。未知字段、无效值和访问器式注册等配置错误会报告。
+
+模块通过 `[docs].ui` 显式配置，不是运行时插件扫描。普通使用从[组件覆盖教程](/wake-docs/ui)开始；下面按公开类型描述数据，不公开内部 registry、生成路径或可变状态容器。
+
+## 公共 props
+
+所有组件继承 `CommonProps`。除操作函数外，数据字段均视为只读。
+
+| 数据 | 字段与类型 | 行为 |
+| --- | --- | --- |
+| `site: SiteInfo` | title、description、locale、basePath、homeHref 为 string；logo、repositoryUrl、accentColor 可选或 null | 站点元数据及公开链接 |
+| `theme: ThemeState` | theme 为 light/dark/system；resolved 为 light/dark；setTheme(theme) | 读取并修改 Wake 主题状态 |
+| `route: RouteState` | path: string；page: PageInfo 或 null；navigate(slug)、href(slug)、focusContent() | 导航、生成链接及关闭动画后恢复正文焦点 |
+
+`PageLink` 含 slug、title、href；`PageInfo` 增加 description、status、draft 和 headings。Heading 含 id、title、depth、href。优先使用提供的 href，避免破坏部署前缀。navigate 接受文档 slug，可含章节 fragment。
+
+## 外壳组件
+
+| 名称与 props 类型 | 专有输入 | 渲染职责 |
+| --- | --- | --- |
+| Root / RootProps | children: ReactNode | Provider 和应用环境；渲染 children |
+| Layout / LayoutProps | header、navigation、mobileNavigation、tableOfContents、searchDialog、children: ReactNode | 安排已选择的节点；正文 children 只渲染一次 |
+| Header / HeaderProps | search: SearchState；mobileNavigation 的 open 和 setOpen | 顶栏、导航及搜索入口 |
+| Navigation / NavigationProps | groups、current；toggleSection(id)、onNavigate(slug) | 导航树、当前项和展开操作 |
+| MobileNavigation / MobileNavigationProps | open、setOpen、navigation: ReactNode | 移动导航容器及弹层交互 |
+| SearchDialog / SearchDialogProps | search: SearchState | 搜索输入、结果、焦点与弹层 |
+| TableOfContents / TableOfContentsProps | headings、activeId、variant: desktop/mobile；navigate(id) | 目录链接和当前章节 |
+
+`NavigationGroup` 包含 id、title、pages 和 sections；`NavigationSection` 包含 id、title、pages、expanded、active。current 是当前页面 slug。展开操作维护 Wake 的用户偏好；当前路由派生的展开不会自动累积为偏好。
+
+`SearchState` 包含 open、query、results、activeIndex、loading、error 和 shortcut。操作为 setOpen、setQuery、setActiveIndex、select。SearchResult 含 slug、title、detail、kind 和 href。空结果、加载与错误都是需要展示的状态；选中操作不要求自定义组件重新实现搜索排序。
+
+## 页面与状态组件
+
+| 名称与 props 类型 | 专有输入 | 渲染职责 |
+| --- | --- | --- |
+| Page / PageProps | page、breadcrumbs: readonly string[]、previous/next: PageLink 或 null、children | 页面标题、正文、面包屑和阅读导航 |
+| PageLoading / PageLoadingProps | 无额外字段 | 页面加载提示 |
+| PageError / PageErrorProps | error: string；retry() | 显示错误并允许重试 |
+| NotFound / NotFoundProps | 无额外字段 | 未找到页面和返回入口 |
+
+元数据更新、正文加载、完成通知和错误捕获由 Wake 的不可替换包装层执行。Page 必须渲染 children；自定义错误组件本身出错也会由外层报告。
+
+## 内容组件
+
+| 名称与 props 类型 | 数据 | 操作 |
+| --- | --- | --- |
+| CodeBlock / CodeBlockProps | language、code、可选 title、高亮 children、copyStatus: idle/copied/error | copy(): Promise&lt;void&gt; |
+| ApiTable / ApiTableProps | symbol、description、properties、total、inherited、warnings、filter、error | setFilter(filter) |
+| Demo / DemoProps | id、title、description、loading、background、padding、error、source、highlightedSource、sourceLanguage、codeOpen、fullscreen、viewport、copied、preview | setCodeOpen、setFullscreen、setViewport、copy |
+
+ApiProperty 含 name、description、type_text、required、deprecated，以及可选或 null 的 default_value、since。inherited 的每项包含 name、source、type_text；warnings 是字符串数组。properties 已经反映 Wake 筛选结果，total 表示完整属性数。
+
+Demo 的 viewport 为 responsive/tablet/mobile。highlightedSource 与 preview 是 ReactNode，copy 返回 Promise。preview 在普通与全屏界面之间只渲染一次，不通过公开 id 拼接私有生成路径。`docs.preview` 仍负责 iframe 内内容包装，与此组件并存。
+
+## 完整 TypeScript 契约
+
+以下签名对应公共入口，可用于编写适配组件。不要修改输入数组或将状态对象缓存为另一份本地状态。
+
+<details className="wake-details">
+<summary>展开完整示例：完整 TypeScript 契约（164 行）</summary>
+
+```ts
+import type { ComponentType, ReactNode } from 'react';
+
+export type Theme = 'light' | 'dark' | 'system';
+export type ResolvedTheme = 'light' | 'dark';
+export type Viewport = 'responsive' | 'tablet' | 'mobile';
+export interface SiteInfo {
+  readonly title: string;
+  readonly description: string;
+  readonly locale: string;
+  readonly logo?: string | null;
+  readonly repositoryUrl?: string | null;
+  readonly basePath: string;
+  readonly homeHref: string;
+  readonly accentColor?: string | null;
+}
+export interface ThemeState {
+  readonly theme: Theme;
+  readonly resolved: ResolvedTheme;
+  setTheme(theme: Theme): void;
+}
+export interface PageLink { readonly slug: string; readonly title: string; readonly href: string }
+export interface Heading { readonly id: string; readonly title: string; readonly depth: number; readonly href: string }
+export interface PageInfo extends PageLink {
+  readonly description: string;
+  readonly status: string;
+  readonly draft: boolean;
+  readonly headings: readonly Heading[];
+}
+export interface RouteState {
+  readonly path: string;
+  readonly page: PageInfo | null;
+  /** 文档 slug，可带章节 fragment。 */
+  navigate(slug: string): void;
+  href(slug: string): string;
+  /** 在自定义弹层完成关闭动画后恢复正文焦点。 */
+  focusContent(): void;
+}
+export interface SearchResult { readonly slug: string; readonly title: string; readonly detail: string; readonly kind: string; readonly href: string }
+export interface SearchState {
+  readonly open: boolean;
+  readonly query: string;
+  readonly results: readonly SearchResult[];
+  readonly activeIndex: number;
+  readonly loading: boolean;
+  readonly error: string | null;
+  readonly shortcut: string;
+  setOpen(open: boolean): void;
+  setQuery(query: string): void;
+  setActiveIndex(index: number): void;
+  select(slug: string): void;
+}
+export interface CommonProps { readonly site: SiteInfo; readonly theme: ThemeState; readonly route: RouteState }
+export interface RootProps extends CommonProps { readonly children: ReactNode }
+export interface LayoutProps extends CommonProps {
+  readonly header: ReactNode;
+  readonly navigation: ReactNode;
+  readonly mobileNavigation: ReactNode;
+  readonly tableOfContents: ReactNode;
+  readonly searchDialog: ReactNode;
+  /** 包含正文焦点目标、加载与错误边界；只渲染一次。 */
+  readonly children: ReactNode;
+}
+export interface HeaderProps extends CommonProps {
+  readonly search: SearchState;
+  readonly mobileNavigation: { readonly open: boolean; setOpen(open: boolean): void };
+}
+export interface NavigationSection { readonly id: string; readonly title: string; readonly pages: readonly PageLink[]; readonly expanded: boolean; readonly active: boolean }
+export interface NavigationGroup { readonly id: string; readonly title: string; readonly pages: readonly PageLink[]; readonly sections: readonly NavigationSection[] }
+export interface NavigationProps extends CommonProps {
+  readonly groups: readonly NavigationGroup[];
+  readonly current: string;
+  toggleSection(id: string): void;
+  /** 执行 Wake 路由，并在适用时关闭移动导航。 */
+  onNavigate(slug: string): void;
+}
+export interface MobileNavigationProps extends CommonProps {
+  readonly open: boolean;
+  readonly navigation: ReactNode;
+  setOpen(open: boolean): void;
+}
+export interface SearchDialogProps extends CommonProps { readonly search: SearchState }
+export interface TableOfContentsProps extends CommonProps {
+  readonly headings: readonly Heading[];
+  readonly activeId: string;
+  readonly variant: 'desktop' | 'mobile';
+  navigate(id: string): void;
+}
+export interface PageProps extends CommonProps {
+  readonly page: PageInfo;
+  readonly breadcrumbs: readonly string[];
+  readonly previous: PageLink | null;
+  readonly next: PageLink | null;
+  readonly children: ReactNode;
+}
+export interface CodeBlockProps extends CommonProps {
+  readonly language: string;
+  readonly code: string;
+  readonly title?: string;
+  readonly children: ReactNode;
+  readonly copyStatus: 'idle' | 'copied' | 'error';
+  copy(): Promise<void>;
+}
+export interface ApiProperty {
+  readonly name: string;
+  readonly description: string;
+  readonly type_text: string;
+  readonly default_value?: string | null;
+  readonly required: boolean;
+  readonly deprecated: boolean;
+  readonly since?: string | null;
+}
+export interface ApiTableProps extends CommonProps {
+  readonly symbol: string;
+  readonly description: string;
+  readonly properties: readonly ApiProperty[];
+  readonly total: number;
+  readonly inherited: readonly { readonly name: string; readonly source: string; readonly type_text: string }[];
+  readonly warnings: readonly string[];
+  readonly filter: string;
+  readonly error: string | null;
+  setFilter(filter: string): void;
+}
+export interface DemoProps extends CommonProps {
+  readonly id: string;
+  readonly title: string;
+  readonly description: string;
+  readonly loading: boolean;
+  readonly background: string;
+  readonly padding: string;
+  readonly error: string | null;
+  readonly source: string;
+  readonly highlightedSource: ReactNode;
+  readonly sourceLanguage: string;
+  readonly codeOpen: boolean;
+  readonly fullscreen: boolean;
+  readonly viewport: Viewport;
+  readonly copied: boolean;
+  /** 只渲染一次；fullscreen 时放入全屏区域。 */
+  readonly preview: ReactNode;
+  setCodeOpen(open: boolean): void;
+  setFullscreen(open: boolean): void;
+  setViewport(viewport: Viewport): void;
+  copy(): Promise<void>;
+}
+export interface PageLoadingProps extends CommonProps {}
+export interface PageErrorProps extends CommonProps { readonly error: string; retry(): void }
+export interface NotFoundProps extends CommonProps {}
+export interface DocsUI {
+  readonly Root?: ComponentType<RootProps>;
+  readonly Layout?: ComponentType<LayoutProps>;
+  readonly Header?: ComponentType<HeaderProps>;
+  readonly Navigation?: ComponentType<NavigationProps>;
+  readonly MobileNavigation?: ComponentType<MobileNavigationProps>;
+  readonly SearchDialog?: ComponentType<SearchDialogProps>;
+  readonly TableOfContents?: ComponentType<TableOfContentsProps>;
+  readonly Page?: ComponentType<PageProps>;
+  readonly Demo?: ComponentType<DemoProps>;
+  readonly CodeBlock?: ComponentType<CodeBlockProps>;
+  readonly ApiTable?: ComponentType<ApiTableProps>;
+  readonly PageLoading?: ComponentType<PageLoadingProps>;
+  readonly PageError?: ComponentType<PageErrorProps>;
+  readonly NotFound?: ComponentType<NotFoundProps>;
+}
+export function defineDocsUI<T extends DocsUI>(components: T & Record<Exclude<keyof T, keyof DocsUI>, never>): Readonly<T>;
+```
+
+</details>
+
+## 样式、生命周期与支持范围
+
+自定义组件负责自己的字体、颜色、token、Portal、遮罩、焦点和控件键盘交互。正文选择器排除自定义边界，但 CSS 自定义属性仍可能从默认祖先继承；默认变量不是公开主题 API。Root 与页面共享 Context，但隔离 iframe 不共享这个 React 根。
+
+配置 UI 的 Site 开发采用完整单图，UI 模块参与监听；改变路径或启停配置需重启。缺省注册不改变默认站点。Components 模式不支持 ui；聚合主站不会向独立工作台传递注册表。
+
+精确 TypeScript 签名以安装包的 `docs.d.ts` 为准。示例见[完整布局](/wake-docs/ui-layout)、[导航搜索](/wake-docs/ui-navigation)和[内容展示](/wake-docs/ui-content)。

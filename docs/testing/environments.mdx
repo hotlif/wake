@@ -1,0 +1,53 @@
++++
+title = "选择 DOM 或浏览器环境"
+description = "普通交互用 DOM 环境，布局和截图用真实浏览器。"
+kind = "guide"
+status = "experimental"
++++
+
+# 选择 DOM 或浏览器环境
+
+测试文本和交互时先使用 DOM 环境；需要检查 CSS、元素位置或截图时，切换到 browser 环境。
+
+## 如何选择
+
+| 需要证明的行为 | 环境 |
+| --- | --- |
+| 函数返回值、组件条件渲染、props 更新 | dom |
+| 用户操作后文本和可访问状态变化 | 优先 dom，涉及浏览器语义时用 browser |
+| 元素几何位置、CSS 和媒体查询 | browser |
+| 原生输入、导航、浏览器敏感 hydration、截图 | browser |
+
+DOM 环境提供 Wake 支持范围内的 Window 和 Document，不是完整浏览器。它的通过结果不代表样式布局正确。browser 使用系统安装的 Chrome、Edge 或 Chromium，为 suite 创建独立 BrowserContext。
+
+## 运行浏览器测试
+
+沿用 Counter 测试，文件名改为 `Counter.browser.test.tsx`，并在配置中纳入 `browser_include`；或显式运行：
+
+```bash
+npx wake test src/Counter.browser.test.tsx --environment browser --serial
+```
+
+发现不到浏览器时通过 `--browser-path` 指定本机可执行文件。`--headful` 用于观察测试过程。Wake 不会在运行期替项目下载浏览器；本地支持范围不要求项目使用 Wake 发布 CI 固定的某个主版本。
+
+## 环境配置
+
+```toml title="wake.config.toml"
+[test.browser]
+headless = true
+sandbox = true
+viewport = { width = 1280, height = 720, device_scale_factor = 1.0 }
+locale = "zh-CN"
+timezone = "Asia/Shanghai"
+color_scheme = "light"
+```
+
+截图比较还受到系统、浏览器版本和渲染配置影响。Wake 固定减少动画偏好用于该环境的稳定比较；不把截图基线跨不同 profile 混用。
+
+## 验证方式
+
+检查结果中的环境和浏览器身份，确认实际运行在 browser。布局断言保留在 browser 环境中。找不到浏览器时，检查安装位置或显式指定路径。
+
+## 下一步
+
+阅读[快照和覆盖率](/testing/snapshots)以及[测试 CI](/testing/ci)。

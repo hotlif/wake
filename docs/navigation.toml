@@ -1,77 +1,134 @@
 [[group]]
+id = "introduction"
+title = "认识 Wake"
+pages = ["index"]
+
+[[group.section]]
+id = "understand"
+title = "了解 Wake"
+pages = ["start/how-it-works", "start/support"]
+
+[[group]]
 id = "start"
-title = "开始"
-pages = ["index", "start/install", "start/create-react-app", "start/existing-project", "start/next-steps"]
+title = "快速开始"
+pages = ["start/install", "start/create-react-app"]
+
+[[group.section]]
+id = "start-more"
+title = "已有项目与下一步"
+pages = ["start/existing-project", "app/project-structure", "start/next-steps"]
 
 [[group]]
 id = "app"
-title = "应用开发"
+title = "开发应用"
+pages = ["app/dev-server"]
 
 [[group.section]]
-id = "foundation"
-title = "基础"
-pages = ["app/project-structure", "app/react-typescript"]
-
-[[group.section]]
-id = "development"
-title = "开发"
-pages = ["app/dev-server", "app/live-reload", "app/aliases-and-proxy"]
-
-[[group.section]]
-id = "build"
-title = "构建与发布"
-pages = ["app/assets", "app/production-build", "app/performance", "app/deployment"]
+id = "app-guides"
+title = "组件、依赖与资源"
+pages = ["app/react-typescript", "app/live-reload", "app/modules", "app/aliases-and-proxy", "app/assets"]
 
 [[group]]
 id = "styles"
-title = "样式"
+title = "编写样式"
 pages = ["styles/overview"]
 
 [[group.section]]
-id = "css-in-js"
-title = "教程"
-pages = ["styles/local-styles", "styles/composition", "styles/dynamic-values", "styles/animation", "styles/global-styles", "styles/static-boundary"]
+id = "style-guides"
+title = "组件样式教程"
+pages = ["styles/local-styles", "styles/composition", "styles/dynamic-values", "styles/global-styles", "styles/animation", "styles/static-boundary"]
+
+[[group]]
+id = "testing"
+title = "测试代码"
+pages = ["testing/overview"]
+
+[[group.section]]
+id = "test-basics"
+title = "开始写测试"
+pages = ["testing/first-test", "testing/configuration", "testing/assertions", "testing/mocks", "testing/time-and-network"]
+
+[[group.section]]
+id = "test-browser"
+title = "组件、浏览器与 CI"
+pages = ["testing/react", "testing/environments", "testing/snapshots", "testing/ci"]
+
+[[group]]
+id = "build"
+title = "构建与发布"
+pages = ["app/production-build"]
+
+[[group.section]]
+id = "build-guides"
+title = "产物、优化与部署"
+pages = ["app/output", "app/performance", "app/library", "app/deployment", "app/ci"]
+
+[[group]]
+id = "remote-components"
+title = "远程组件"
+pages = ["integration/remote-components"]
+
+[[group.section]]
+id = "remote-guides"
+title = "接入与发布"
+pages = ["integration/federation", "integration/remote-react", "integration/remote-isolated", "integration/remote-delivery"]
 
 [[group]]
 id = "wake-docs"
-title = "Wake Docs"
+title = "建设文档站"
 pages = ["wake-docs/overview"]
 
 [[group.section]]
-id = "foundation"
-title = "建立文档站"
-pages = ["wake-docs/create-site", "wake-docs/pages-and-navigation", "wake-docs/mdx"]
+id = "content"
+title = "写页面和示例"
+pages = ["wake-docs/create-site", "wake-docs/mdx", "wake-docs/pages-and-navigation", "wake-docs/demos", "wake-docs/props-api"]
 
 [[group.section]]
-id = "interactive"
-title = "交互内容"
-pages = ["wake-docs/demos", "wake-docs/props-api", "wake-docs/preview", "wake-docs/theming"]
+id = "presentation"
+title = "定制站点界面"
+pages = ["wake-docs/preview", "wake-docs/theming", "wake-docs/ui", "wake-docs/ui-layout", "wake-docs/ui-navigation", "wake-docs/ui-content", "wake-docs/crab-ui"]
 
 [[group.section]]
 id = "release"
-title = "发布"
-pages = ["wake-docs/deployment"]
+title = "聚合与发布"
+pages = ["wake-docs/workspaces", "wake-docs/deployment"]
+
+[[group]]
+id = "integration"
+title = "脚本与自动化"
+pages = ["integration/overview"]
+
+[[group.section]]
+id = "automation-guides"
+title = "调用 Node.js API"
+pages = ["integration/node-api", "integration/build-pipeline", "reference/experimental"]
 
 [[group]]
 id = "reference"
-title = "参考"
+title = "参考与排错"
+pages = ["reference/troubleshooting"]
 
 [[group.section]]
 id = "configuration"
 title = "配置"
-pages = ["reference/configuration/project", "reference/configuration/test", "reference/configuration/dev-server", "reference/configuration/docs"]
+pages = ["reference/configuration/project", "reference/configuration/dev-server", "reference/configuration/test", "reference/configuration/docs"]
 
 [[group.section]]
 id = "cli"
-title = "CLI"
-pages = ["reference/cli/build", "reference/cli/test", "reference/cli/bundle", "reference/cli/library", "reference/cli/dev", "reference/cli/federation", "reference/cli/docs"]
+title = "命令行"
+pages = ["reference/cli/build", "reference/cli/dev", "reference/cli/bundle", "reference/cli/library", "reference/cli/test", "reference/cli/docs", "reference/cli/federation"]
 
 [[group.section]]
 id = "node-api"
 title = "Node.js API"
-pages = ["reference/node-api/build", "reference/node-api/federation", "reference/node-api/test", "reference/node-api/dev-server", "reference/node-api/docs"]
+pages = ["reference/node-api/build", "reference/node-api/dev-server", "reference/node-api/test", "reference/node-api/docs", "reference/node-api/federation"]
 
 [[group.section]]
-id = "language"
-title = "API 与诊断"
-pages = ["reference/css-api", "reference/test-api", "reference/compatibility", "reference/errors", "reference/troubleshooting", "reference/experimental", "reference/glossary"]
+id = "api"
+title = "专用 API"
+pages = ["reference/css-api", "reference/test-api", "reference/docs-ui"]
+
+[[group.section]]
+id = "help"
+title = "排错与支持范围"
+pages = ["reference/errors", "reference/compatibility", "reference/glossary"]

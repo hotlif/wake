@@ -1,57 +1,65 @@
 +++
 title = "接入现有项目"
-description = "在不重写业务代码的前提下把 React 项目迁入 Wake"
+description = "保留现有流程，逐步验证 Wake 能否接管项目的开发和构建。"
 kind = "tutorial"
 status = "stable"
 +++
 
-import { CompareCard, CompareCards, NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+import { ResultPanel } from "../site/components.tsx"
 
 # 接入现有项目
 
-<ResultPanel title="完成后">
-  旧构建链与 Wake 可以并行运行，并在独立目录中比较开发与生产结果。
+<ResultPanel title="用 Wake 开发和构建已有源码" label="完成效果">
+同一份业务源码能够通过 Wake 开发和构建。切换前完成行为核对，不根据一次成功启动就移除原有构建流程。
 </ResultPanel>
+
+## 先检查项目依赖
+
+记录浏览器入口、HTML 模板、路径别名、公开资源、API 代理、环境常量以及构建插件承担的任务。Wake 不直接读取其他构建器的配置或插件。需要特殊代码生成时，把它作为显式前置步骤运行。
+
+按[安装](/start/install)添加 Wake。React 教程采用 19；旧版项目先确认升级条件，不在接入构建工具时盲目更换运行依赖。
 
 ## 添加最小配置
 
 ```toml title="wake.config.toml"
 [html]
-entry = "src/main.tsx"
+entry = "src/entry.tsx"
 
 [react]
 enabled = true
 jsx_import_source = "react"
+
+[dev_server]
+host = "127.0.0.1"
+port = 5173
+open = false
 ```
 
-入口不同时使用真实路径。先不要复制旧 bundler 的全部选项。
+把 `entry` 改成项目真实的客户端入口。默认 HTML 提供 `#root`；如果旧入口使用其他容器，调整入口或按[项目配置](/reference/configuration/project)声明 HTML 模板。
 
 ## 分阶段切换
 
-<StepFlow>
-  <Step number="01" title="跑通入口">执行 npx wake dev .，验证 React 和裸包导入。</Step>
-  <Step number="02" title="补齐行为">按需配置别名、代理、CSS 与资源。</Step>
-  <Step number="03" title="比较产物">构建到 dist-wake，确认路由和交互后再切 scripts。</Step>
-</StepFlow>
+先新增脚本 `dev:wake`（`wake dev .`）和 `build:wake`（`wake build --outdir dist-wake`），使用独立输出目录。完成以下对应关系后再替换原脚本：
 
-<CompareCards>
-  <CompareCard title="迁移前记录" tone="neutral">开发命令、生产文件、环境变量、别名、代理和动态导入。</CompareCard>
-  <CompareCard title="切换前验证" tone="positive">开发和生产都测试子路由、刷新、动态导入与静态资源。</CompareCard>
-</CompareCards>
+| 旧项目配置 | Wake 接入位置 |
+| --- | --- |
+| 别名 | `[alias]`，同时保留 TypeScript paths |
+| 后端代理 | `[[dev_server.proxy]]` |
+| 构建常量 | `[define]`；只放可公开到浏览器的值 |
+| 图片、字体和 CSS | 保留源码导入，核对公开文件 URL |
+| 类型检查 | 保留独立 `tsc --noEmit` |
+| 模块热替换 | 按[整页刷新](/app/live-reload)验证状态重新初始化 |
 
 ## 验证方式
 
-关键路由、请求和交互结果一致，Wake 产物位于独立目录后，再替换 npm scripts。
+执行类型检查、Wake 开发、Wake 生产构建和项目测试。逐项检查首页、一个直接访问的子路由、一个动态导入页面、图片和字体、代理请求及刷新后的行为。记录需要外部插件才能实现的功能，确认有可执行替代步骤后再迁移。
 
 ## 常见错误
 
-- 浏览器入口依赖 Node 内置模块：换成 Web API 或服务端接口。
-- 旧环境变量由插件注入：迁移到 Wake `define`。
-- 别名只写在 tsconfig：Wake 仍需要自己的 alias 配置。
+- 开发正常但生产接口失败：开发代理不随静态文件发布，生产网关需要单独配置。
+- 只配置 TypeScript paths：编辑器认识路径不代表 Wake 能解析，补充对应 alias。
+- 输出目录被拒绝：不要让新构建接管未标记的旧产物目录，先使用新的空目录。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/app/react-typescript" title="校准类型环境" description="固定 React JSX 与 TypeScript 行为。" />
-  <NextLink href="/app/aliases-and-proxy" title="迁移别名与代理" description="补齐源码路径和开发 API 请求。" />
-</NextActions>
+进入[别名与代理](/app/aliases-and-proxy)或[部署](/app/deployment)，完成项目所需的剩余配置。

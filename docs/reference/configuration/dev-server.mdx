@@ -1,6 +1,6 @@
 +++
 title = "开发服务器配置"
-description = "查询端口、主机、自动打开、代理和路径重写配置"
+description = "查找监听地址、端口、自动打开和 API 代理字段。"
 kind = "reference"
 status = "stable"
 +++
@@ -24,20 +24,26 @@ ws = false
 "^/api" = ""
 ```
 
+首次使用请先阅读[开发服务器教程](/app/dev-server)。
+
 ## 字段
 
-| 字段 | 说明 |
-| --- | --- |
-| `server` | 预留的协议字段；当前开发服务器仍以 HTTP 启动 |
-| `host` | 监听地址 |
-| `port` | 默认端口 |
-| `open` | 启动后打开浏览器 |
-| `proxy` | 按声明顺序执行的代理规则数组 |
-| `context` | 由当前代理匹配的路径前缀 |
-| `target` | 后端服务地址 |
-| `ws` | 是否代理 WebSocket |
-| `change_origin` | 是否重写请求 Host |
-| `path_rewrite` | 转发前的路径替换表 |
+| 字段 | TOML 类型 | 默认行为 | 说明 |
+| --- | --- | --- | --- |
+| `server` | 字符串 | HTTP | 预留的协议字段；当前仍以 HTTP 启动 |
+| `host` | 字符串 | `127.0.0.1` | 监听地址 |
+| `port` | 整数 | CLI 使用 `5173` | 配置端口；CLI 选项优先，见下文 |
+| `open` | 布尔值 | `false` | 启动后打开浏览器 |
+| `proxy` | 表数组 | 空数组 | 按声明顺序执行的代理规则 |
+| `context` | 字符串数组 | 空数组 | 当前代理匹配的路径前缀；配置规则时显式提供 |
+| `target` | 字符串 | 空字符串 | 后端地址；配置规则时提供完整 URL |
+| `ws` | 布尔值 | `false` | 是否代理 WebSocket |
+| `change_origin` | 布尔值 | `false` | 是否重写请求 Host |
+| `path_rewrite` | 字符串映射表 | 空表 | 转发前的路径替换 |
+
+当前 `wake dev` 的 `--port` 自带默认值 `5173`，会覆盖 TOML 中的端口。需要其他端口时执行
+`wake dev . --port 3001`，不能只修改此处的 `port`。Node API 的端口选项见
+[开发服务器 API](/reference/node-api/dev-server)。
 
 代理仅用于开发，不写入生产产物。生产转发由部署平台配置。
 

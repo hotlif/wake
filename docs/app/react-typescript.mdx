@@ -1,39 +1,65 @@
 +++
 title = "React 与 TypeScript"
-description = "配置 React 19 JSX 转换和可靠的 TypeScript 类型检查"
+description = "让 TSX 编译、编辑器提示和类型检查使用一致的配置。"
 kind = "guide"
 status = "stable"
 +++
 
 # React 与 TypeScript
 
+Wake 负责把 TSX 编译成浏览器代码，TypeScript 负责检查类型。下面把这两部分配置对齐。
+
 ## 配置 JSX
 
-```toml title="wake.config.toml"
+Wake 处理 `.jsx` 和 `.tsx`，React 应用使用 React 19 的 JSX runtime。Wake 配置负责生成代码，TypeScript 配置负责编辑器和独立检查，两者都要设置。
+
+```toml title="wake.config.toml 中的 React 配置"
 [react]
 enabled = true
 jsx_import_source = "react"
 ```
 
-Wake 转换 TypeScript 和 TSX，但构建器不替代完整类型检查。项目应保留独立的 `tsc` 门禁：
-
-```json title="package.json"
+```json title="tsconfig.json"
 {
-  "scripts": {
-    "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && wake build --outdir dist"
-  }
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
 }
 ```
 
+## 组件和类型导入
+
+```tsx title="src/Message.tsx"
+import type { ReactNode } from "react";
+
+export interface MessageProps {
+  title: string;
+  children?: ReactNode;
+}
+
+export function Message({ title, children }: MessageProps) {
+  return <section><h2>{title}</h2>{children}</section>;
+}
+```
+
+类型专用导入使用 `import type`，避免把只有类型意义的名称当成运行时依赖。Wake 擦除类型并转换 JSX，不会替你发现所有 props 类型错误，也不会自动生成应用的类型声明。
+
 ## 版本约束
 
-Wake 应用和 Wake Docs 使用 React 19。让 `react` 与 `react-dom` 保持相同主版本，并避免在 workspace 中安装多份 React。
+React、React DOM 和对应类型包使用一致的主版本。本教程使用 React 19；Wake Test 对 React 版本有独立校验，接入测试时再核对其[环境要求](/testing/environments)。自定义 JSX runtime 需要显式配置并在真实项目中验证。
 
 ## 验证方式
 
-故意传入一个错误 Props：`npm run typecheck` 应失败；修复后 Wake 才进入生产构建。
+执行 `npx tsc --noEmit`。把 `<Message title="通知" />` 暂时改成数字 title，类型检查应失败；恢复后再执行 `npx wake build --outdir dist`。这证明类型检查与生成产物是两道独立步骤。
 
 ## 下一步
 
-启动[开发服务器](/app/dev-server)。
+为组件添加[React 测试](/testing/react)，或者了解[模块解析](/app/modules)。

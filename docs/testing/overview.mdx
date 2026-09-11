@@ -1,0 +1,31 @@
++++
+title = "编写和运行测试"
+description = "从一个断言开始，逐步验证组件交互和浏览器中的真实表现。"
+kind = "overview"
+status = "experimental"
++++
+
+# 编写和运行测试
+
+import { OverviewLead, TaskGrid, TaskCard } from "../site/components.tsx"
+
+<OverviewLead primaryHref="/testing/first-test" primaryLabel="编写第一个测试" secondaryHref="/testing/react" secondaryLabel="测试 React 组件">Wake Test 提供显式导入的测试 API，以及 DOM 和系统 Chromium 两种执行环境。当前仍为 experimental。</OverviewLead>
+
+## 从要证明的行为开始
+
+<TaskGrid>
+  <TaskCard href="/testing/first-test" title="第一个逻辑测试" description="从输入和返回值开始，理解断言、异常与异步结果。" />
+  <TaskCard href="/testing/react" title="测试组件交互" description="点击一个按钮，验证用户能看到的变化。" />
+  <TaskCard href="/testing/mocks" title="替换依赖" description="记录回调，固定依赖返回值，让测试只关注当前行为。" />
+  <TaskCard href="/testing/time-and-network" title="控制时间与请求" description="主动推进定时器，模拟接口成功和失败。" />
+  <TaskCard href="/testing/environments" title="检查真实界面" description="需要布局、焦点和截图时，使用系统浏览器。" />
+  <TaskCard href="/testing/ci" title="每次提交自动运行" description="配置测试选择、失败报告和 CI 退出行为。" />
+</TaskGrid>
+
+优先测试用户可观察的行为。断言按钮点击后显示的结果，比断言组件内部调用了哪一个 state setter 更能保护后续重构。
+
+## 先记住这两点
+
+`describe`、`test`、`expect` 等名称需要从 `@crab-dev/wake/test` 导入；React 辅助工具来自 `@crab-dev/wake/test/react`。API 具有熟悉的写法，但第三方测试框架的配置、插件、Mock 提升或结果格式不能直接迁移。
+
+DOM 环境适合快速交互测试，真实样式、布局、截图和浏览器敏感行为使用 browser 环境。不要用 DOM 模拟环境的结果推断实际像素位置。升级 Wake、React 或浏览器后重新运行项目代表性测试。

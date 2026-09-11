@@ -1,0 +1,39 @@
++++
+title = "支持范围与当前限制"
+description = "接入前，确认运行环境、可用能力和当前限制。"
+kind = "guide"
+status = "stable"
++++
+
+# 支持范围与当前限制
+
+在选择工具时，先用自己项目的入口、依赖和构建要求验证。Wake 适合浏览器应用、组件包及文档站；需要 Node 脚本打包时也有独立的 bundle 入口。
+
+## 环境和依赖
+
+运行 npm 包需要 Node.js `>=22.14 <27`。React 应用教程和文档运行时采用 React 19。Windows、Linux、macOS 的支持取决于已发布的原生平台包；正常使用 npm 包无需安装 Rust。精确平台与解析规则见[兼容性](/reference/compatibility)。
+
+支持 npm 的 `node_modules` 与 Yarn 4 PnP。存在有效 `.pnp.cjs` 时，包依赖由 Yarn 解析。切换包管理器时，应一起调整配置、锁文件和安装目录。
+
+## 接入前确认
+
+| 项目依赖的行为 | Wake 当前边界 | 接入方式 |
+| --- | --- | --- |
+| TypeScript 检查 | 编译阶段擦除类型，不执行完整类型检查 | 保留独立 `tsc --noEmit` |
+| 修改组件保留状态 | 普通开发服务使用整页自动刷新 | 按刷新后重新初始化状态验证 |
+| 第三方构建插件 | 不提供其他构建器的插件兼容层 | 逐项核对插件承担的工作 |
+| Web API 补齐 | 浏览器语法目标不等于 polyfill | 显式安装和加载所需实现 |
+| React/DOM 测试 | Wake Test 仍为 experimental | 对项目交互建立测试后再替换现有流程 |
+| 微前端 | 使用 Wake-native 浏览器 Federation | 先运行最小 host/remote，不直接复用其他 container |
+
+## 如何理解状态标记
+
+整体项目处于 Beta。页面的 `stable` 表示该页面所描述接口的状态，不能推导为整条工具链已经获得所有平台和场景的保证。CSS-in-JS、测试、库构建和低层实验 API 的页面保留各自状态，升级时需要重新验证。
+
+## 验证接入可行性
+
+选取一个有真实依赖、资源、动态导入和类型检查的页面，按[接入现有项目](/start/existing-project)运行开发和生产流程。记录失败的具体依赖和诊断，而不是只用空白页面判断兼容性。
+
+## 下一步
+
+确认条件后进入[安装 Wake](/start/install)；遇到现有工程错误时查看[排错指南](/reference/troubleshooting)。

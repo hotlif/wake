@@ -1,0 +1,47 @@
++++
+title = "模块解析与依赖"
+description = "分清相对路径、npm 包和别名，解决导入找不到的问题。"
+kind = "guide"
+status = "stable"
++++
+
+# 模块解析与依赖
+
+遇到导入失败时，先判断它指向当前项目的文件，还是已经安装的包。两者需要检查的位置不同。
+
+## 三类导入
+
+```tsx title="src/App.tsx 中的导入"
+import { useState } from "react";
+import { Counter } from "./Counter";
+import { Message } from "@/Message";
+```
+
+`react` 是包依赖，需要安装并声明；`./Counter` 相对当前文件；`@` 是项目配置的别名。安装失败、别名缺失和源文件不存在是不同问题，应根据诊断逐项处理。
+
+## 安装布局
+
+没有有效 PnP 配置时，Wake 按经典 Node 规则读取 `node_modules`，支持包的条件 exports、嵌套安装与 workspace 链接。有 `.pnp.cjs` 时，受管理模块的解析结果由 Yarn 决定，不会在 PnP 拒绝后偷偷寻找其他安装目录。
+
+在 monorepo 中，每个直接导入包的工作区都应声明自己的依赖。根工作区安装过某个包，不代表子包可以无声明导入它。类型声明与运行时模块也可能使用不同导出条件，二者需要同时检查。
+
+## 模块格式与异步入口
+
+业务代码优先使用 ESM 的 `import`/`export`。Wake 也处理 CommonJS；混合第三方包时，按该包公开 exports 选择入口，不导入未公开的内部文件。
+
+```ts title="按需加载功能"
+export async function showReport() {
+  const { renderReport } = await import("./report");
+  return renderReport();
+}
+```
+
+动态导入适合真正延后执行的功能，不保证每次构建都生成某个固定名字的 chunk。[生产优化](/app/performance)说明如何检查实际请求。
+
+## 验证方式
+
+执行依赖安装、类型检查、开发启动和生产构建。若只有 PnP 报错，检查 issuer 所属工作区的直接依赖；若只有类型检查失败，检查 `paths` 和类型入口；若 Linux 才失败，检查文件名大小写。
+
+## 下一步
+
+配置[别名与代理](/app/aliases-and-proxy)，或阅读[资源处理](/app/assets)。

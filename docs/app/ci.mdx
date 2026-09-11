@@ -1,0 +1,59 @@
++++
+title = "在 CI 中验证和构建"
+description = "把安装、类型检查、测试和构建放进每次提交的检查流程。"
+kind = "guide"
+status = "stable"
++++
+
+# 在 CI 中验证和构建
+
+先在本地跑通一组固定命令，再让 CI 按同样顺序执行。任何一步失败，都应停止本次交付。
+
+## 从本地命令开始
+
+先确认以下命令在开发机上能够逐个成功，再移入 CI。npm 项目提交锁文件并使用 `npm ci`；Yarn 4 项目采用 `corepack yarn install --immutable` 和对应脚本，不在 CI 临时切换安装方式。
+
+```json title="package.json 中的 scripts"
+{
+  "typecheck": "tsc --noEmit",
+  "test": "wake test --serial",
+  "build": "wake build --outdir dist",
+  "docs:build": "wake docs build . --outdir docs-dist"
+}
+```
+
+只加入项目真实存在的任务；没有文档站就不运行 Docs 构建。测试示例见[首个测试](/testing/first-test)，默认无测试应视为需要确认的配置问题。
+
+## GitHub Actions 示例
+
+```yaml title=".github/workflows/check.yml"
+name: check
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+```
+
+示例运行纯逻辑和 DOM 测试。包含真实浏览器测试时，还需要 runner 提供可发现或显式指定的系统 Chromium 浏览器，见[测试 CI](/testing/ci)。不要把“测试没运行”当作成功。
+
+## 缓存与产物
+
+优先缓存包管理器下载缓存；跨平台不要复用完整原生安装目录。Wake 构建缓存可以按项目需要启用，但缓存缺失不应影响正确性。只有前序命令全部成功后，才将本轮完整输出交给部署阶段。
+
+## 验证方式
+
+提交前在干净安装环境运行相同命令。临时让一个断言失败，确认构建作业失败；恢复后再验证产物。将通过检查的完整产物交给部署步骤，部署目标和权限在 CI 中单独配置。
+
+## 下一步
+
+配置[静态部署](/app/deployment)，或为[库构建](/app/library)增加 tarball 消费验证。

@@ -1,0 +1,70 @@
++++
+title = "使用 Crab UI 实现文档界面"
+description = "用 Crab UI 的按钮、输入框和弹层组成文档界面。"
+kind = "guide"
+status = "stable"
++++
+
+# 使用 Crab UI 实现文档界面
+
+先用 Crab UI 替换一个顶栏或搜索框，验证主题和交互，再逐步组合完整界面。下面也提供仓库中的对照示例。
+
+## 示例覆盖了什么
+
+Wake 仓库的 `fixtures/docs-ui` 提供三个配置：默认界面、替换 Root/Header/SearchDialog/Demo 的局部覆盖、替换全部组件的完整覆盖。它们共享内容，便于对照哪些行为来自 Wake、哪些来自展示组件。
+
+在 Wake 仓库根构建当前 CLI 后运行：
+
+```bash
+cargo build -p wake_cli
+cargo run -p wake_cli -- docs dev fixtures/docs-ui
+```
+
+改用 `fixtures/docs-ui/full` 查看完整覆盖，`fixtures/docs-ui/default` 查看默认界面。浏览器使用终端 URL 下的 `/handbook/`。这些是源码仓库命令，不要求普通使用者安装 Rust。
+
+## 接入自己的项目
+
+先安装组件中实际直接导入的依赖。在 monorepo 中把声明放在文档项目自身的 package.json：
+
+```bash
+npm install @crab-dev/rc-button@0.0.2 @crab-dev/rc-dialog@0.0.2 @crab-dev/rc-line-edit@0.0.4
+```
+
+准备 `site/components.tsx` 实现展示组件，再注册。下面的 Header 可以独立使用：
+
+```tsx title="site/ui.tsx"
+import Button from "@crab-dev/rc-button";
+import { defineDocsUI, type HeaderProps } from "@crab-dev/wake/docs";
+
+function Header({ site, search, mobileNavigation, theme }: HeaderProps) {
+  return <header className="brand-header">
+    <a href={site.homeHref}>{site.title}</a>
+    <Button onClick={() => mobileNavigation.setOpen(true)}>导航</Button>
+    <Button onClick={() => search.setOpen(true)}>搜索</Button>
+    <Button onClick={() => theme.setTheme(theme.resolved === "dark" ? "light" : "dark")}>切换主题</Button>
+  </header>;
+}
+export default defineDocsUI({ Header });
+```
+
+在 `[docs]` 配置 `ui = "site/ui.tsx"`。复制 fixture 适配时同时带上被导入的模块与样式，不只复制注册文件。
+
+## Provider、token 和 Portal
+
+Root 安装站点需要的 Provider，Page 或 MDX 组件从同一个模块导入 Context。站点拥有 Crab token 的来源和明暗值；不能等待 Wake 默认主题把 token 注入根元素。
+
+Dialog 的 Portal 若挂到 body，可能离开品牌容器。应按组件支持方式设置 Portal 容器，或给弹层建立自己的主题作用域。默认样式隔离不能代替组件库的主题配置。
+
+## 逐步替换
+
+先覆盖 Header，验证搜索、主题和移动入口；再覆盖 SearchDialog、Navigation 和 MobileNavigation；最后替换 Layout、Page 与内容组件。每次保留可用默认项，便于定位问题。
+
+fixture 的 Dialog 适配包含关闭完成后的页面焦点恢复；Demo 适配在退出动画期间维持单一 preview。正式接入时保留这些行为，不仅复制外观 JSX。接入自己的项目时，将适配放到 site 目录并显式配置，内容和工作台继续使用各自的入口。
+
+## 验证方式
+
+先对照默认与局部覆盖，再检查完整覆盖：明暗主题、嵌套组件、Portal、390px 布局、搜索键盘操作、导航持久化、源码与 API 表、全屏 iframe。再用项目自己的页面和组件重复这些检查。
+
+## 下一步
+
+查询[Docs UI API](/reference/docs-ui)，完成[部署验证](/wake-docs/deployment)。

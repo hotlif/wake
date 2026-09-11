@@ -1,0 +1,58 @@
++++
+title = "断言与异步测试"
+description = "检查返回值、对象、异常和异步结果。"
+kind = "guide"
+status = "experimental"
++++
+
+# 断言与异步测试
+
+断言描述你期待的结果。同步值直接比较，Promise 和异步交互要等待完成后再判断。
+
+## 按结果选择断言
+
+```ts title="src/assertions.test.ts"
+import { expect, test } from "@crab-dev/wake/test";
+
+test("结果具有需要的结构", () => {
+  const user = { id: 1, name: "Ada", roles: ["reader"] };
+  expect(user.id).toBe(1);
+  expect(user).toEqual({ id: 1, name: "Ada", roles: ["reader"] });
+  expect(user.roles).toContain("reader");
+});
+
+test("等待 Promise 成功和失败", async () => {
+  await expect(Promise.resolve({ saved: true })).resolves.toEqual({ saved: true });
+  await expect(Promise.reject(new Error("保存失败"))).rejects.toThrow("保存失败");
+});
+```
+
+`toBe` 适合标量与身份，结构比较使用 `toEqual` 或按需使用严格比较。错误行为单独测试，避免只检查成功路径。
+
+## 等待异步完成
+
+测试回调可以返回 Promise 或声明为 async。对异步 matcher、render、用户交互和时钟操作都应按公开签名等待。未等待的 Promise 可能在测试完成后才失败，无法可靠表达本次断言。
+
+对 React 中稍后出现的元素使用 `findBy*`，或用 `waitFor` 重试包含断言的回调。不要为接口完成随意睡眠固定毫秒；优先等待具体状态。
+
+## 超时与断言计数
+
+```ts title="设置单个测试的等待边界"
+import { expect, test } from "@crab-dev/wake/test";
+
+test("异步分支确实执行", async () => {
+  expect.assertions(1);
+  const value = await Promise.resolve(42);
+  expect(value).toBe(42);
+}, { timeout: 10_000 });
+```
+
+超时用于限制失控任务，不应用来掩盖无法结束的等待。Wake 不提供 `done` 回调式完成协议。
+
+## 验证方式
+
+执行这些测试，再改变 Promise 返回值，确认错误归因到对应断言。遇到偶发失败时先检查是否遗漏 await、条件分支未执行或依赖真实时间。
+
+## 下一步
+
+用[Mock](/testing/mocks)控制依赖，用[时间与网络](/testing/time-and-network)消除不必要的不确定性。

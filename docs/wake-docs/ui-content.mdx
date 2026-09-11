@@ -1,0 +1,129 @@
++++
+title = "定制内容展示与状态页面"
+description = "定制代码块、属性表和 Demo，同时保留内容加载与操作。"
+kind = "guide"
+status = "stable"
++++
+
+# 定制内容展示与状态页面
+
+可以分别替换代码块、属性表、Demo 和错误页面。内容数据继续由 Wake 提供，你只需安排展示和操作入口。
+
+## 代码块
+
+CodeBlock 接收原始 code、language、title、高亮 children，以及 copy/copyStatus。保留 children 的高亮内容，复制操作交给 Wake。
+
+```tsx title="site/code.tsx"
+import type { CodeBlockProps } from "@crab-dev/wake/docs";
+
+export function CodeBlock({ title, language, children, copy, copyStatus }: CodeBlockProps) {
+  return <figure className="site-code">
+    <figcaption>{title || language}
+      <button onClick={copy}>{copyStatus === "copied" ? "已复制" : copyStatus === "error" ? "复制失败" : "复制"}</button>
+    </figcaption>
+    <pre tabIndex={0}><code>{children}</code></pre>
+  </figure>;
+}
+```
+
+## API 表
+
+ApiTable 接收 symbol、description、已筛选 properties、total、inherited、warnings 和 error。筛选框使用 filter/setFilter，不重新解析 TypeScript。展示属性名、type_text、required、default_value、description 时保留缺省值的区别；缺少默认值不等于默认 false。
+
+保留错误、继承信息和 warnings 的查看入口；内容较多时可以折叠展示。字段全集见[API](/reference/docs-ui)。
+
+```tsx title="site/api-table.tsx"
+import type { ApiTableProps } from "@crab-dev/wake/docs";
+
+export function ApiTable(props: ApiTableProps) {
+  return <section>
+    <h2>{props.symbol}</h2><p>{props.description}</p>
+    <label>筛选属性 <input value={props.filter} onChange={event => props.setFilter(event.target.value)} /></label>
+    <p>显示 {props.properties.length} / {props.total} 项</p>
+    {props.error && <p role="alert">{props.error}</p>}
+    <div style={{ overflowX: "auto" }}><table>
+      <thead><tr><th>属性</th><th>类型</th><th>默认值</th><th>说明</th></tr></thead>
+      <tbody>{props.properties.map(prop => <tr key={prop.name}>
+        <td>{prop.name}{prop.required ? "（必填）" : ""}{prop.deprecated ? "（已弃用）" : ""}</td>
+        <td><code>{prop.type_text}</code></td><td>{prop.default_value ?? "未声明"}</td>
+        <td>{prop.description}{prop.since && `（自 ${prop.since}）`}</td>
+      </tr>)}</tbody>
+    </table></div>
+    {!props.properties.length && <p>没有匹配的属性。</p>}
+    {props.inherited.length > 0 && <details><summary>继承属性</summary><ul>
+      {props.inherited.map((item, index) => <li key={index}>{item.name}：{item.type_text}，来源 {item.source}</li>)}
+    </ul></details>}
+    {props.warnings.length > 0 && <details><summary>提取提示</summary><ul>
+      {props.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
+    </ul></details>}
+  </section>;
+}
+```
+
+## Demo 卡片和全屏
+
+Demo 的 `preview` 是 Wake 提供的预览节点，源码加载、复制、主题传递和 iframe 通信仍由 Wake 负责。使用 `codeOpen/setCodeOpen`、`viewport/setViewport`、`fullscreen/setFullscreen` 连接自定义工具栏；使用 source 或 highlightedSource 展示源码。
+
+preview 在任何时刻只渲染一次。进入全屏时把它安排到全屏区域；若 Dialog 关闭后仍保留退出动画中的 children，应等退出完成再在普通卡片中渲染，避免两个 iframe 同时挂载。完整示例已经处理该过程。
+
+`background`、`padding`、loading 和 error 都是展示输入，自定义组件应决定如何反馈。不要从内部生成路径重新构造 iframe。Demo 的上下文仍由独立 `docs.preview` 包装器负责。
+
+以下版本与可运行 fixture 使用相同的单 iframe 安排。依赖 Button 和 Dialog，安装方式见
+[导航与搜索](/wake-docs/ui-navigation)。将 Demo 加入现有注册表即可使用；卡片尺寸和颜色由项目 CSS 设置。
+
+```tsx title="site/demo.tsx"
+import { useEffect, useRef, useState } from "react";
+import type * as UI from "@crab-dev/wake/docs";
+import Button from "@crab-dev/rc-button";
+import Dialog from "@crab-dev/rc-dialog";
+
+export function Demo(props: UI.DemoProps) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [dialogSurface, setDialogSurface] = useState(false);
+  useEffect(() => { if (props.fullscreen) setDialogSurface(true); }, [props.fullscreen]);
+  useEffect(() => {
+    const element = dialog.current;
+    const closed = () => setDialogSurface(false);
+    element?.addEventListener('close', closed);
+    return () => element?.removeEventListener('close', closed);
+  }, []);
+  // Dialog 退出动画尚未结束时，继续把唯一的 iframe 留在弹层内。
+  const inDialog = props.fullscreen || dialogSurface;
+  return <section className="crab-demo"><h3>{props.title}</h3><p>{props.description}</p>
+    {props.error && <p role="alert">{props.error}</p>}
+    {!inDialog && <div style={{ maxWidth: props.viewport === 'mobile' ? 390 : props.viewport === 'tablet' ? 768 : '100%' }}>{props.preview}</div>}
+    <Button onClick={() => props.setCodeOpen(!props.codeOpen)}>源码</Button>
+    <Button onClick={() => props.setViewport(props.viewport === 'mobile' ? 'responsive' : 'mobile')}>视口： {props.viewport}</Button>
+    <Button onClick={() => props.setFullscreen(true)}>全屏</Button>
+    <Button onClick={props.copy}>{props.copied ? '已复制' : '复制'}</Button>
+    {props.codeOpen && <pre><code>{props.highlightedSource || props.source}</code></pre>}
+    <Dialog ref={dialog} title={props.title} open={props.fullscreen} onOpenChange={props.setFullscreen}>
+      {inDialog && props.preview}
+    </Dialog>
+  </section>;
+}
+```
+
+## 状态界面
+
+```tsx title="site/states.tsx"
+import type { PageErrorProps, NotFoundProps } from "@crab-dev/wake/docs";
+
+export function PageLoading() { return <p role="status">正在加载页面…</p>; }
+export function PageError({ error, retry }: PageErrorProps) {
+  return <section role="alert"><h1>页面加载失败</h1><pre>{error}</pre><button onClick={retry}>重试</button></section>;
+}
+export function NotFound({ site }: NotFoundProps) {
+  return <section><h1>找不到页面</h1><a href={site.homeHref}>返回首页</a></section>;
+}
+```
+
+只替换展示，不移除能力层的错误边界。错误组件自身也抛出异常时，外层保护会报告 UI 错误，不通过默认页面掩盖。
+
+## 验证方式
+
+分别检查代码复制反馈、API 筛选与空结果、Demo 视口和全屏、无效页面及失败重试。检查全屏动画期间 iframe 数量，并验证旧 Preview 仍生效。
+
+## 下一步
+
+使用[Crab UI 接入示例](/wake-docs/crab-ui)组合完整界面，完成后[构建部署](/wake-docs/deployment)。

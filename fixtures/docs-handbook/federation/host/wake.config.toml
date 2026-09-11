@@ -1,0 +1,15 @@
+[html]
+entry = "src/entry.ts"
+
+[dev_server]
+host = "127.0.0.1"
+port = 4173
+
+[federation]
+enabled = true
+name = "shell"
+
+[federation.remotes.catalog]
+manifest_url = "http://127.0.0.1:4174/wake-federation.json"
+allowed_origins = ["http://127.0.0.1:4174"]
+dev_follow = true

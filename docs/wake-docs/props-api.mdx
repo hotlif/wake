@@ -1,15 +1,17 @@
 +++
 title = "Props API"
-description = "从 TypeScript 类型与 JSDoc 生成可筛选的 Props 表格"
+description = "从源码生成属性说明，减少手工维护两份文档。"
 kind = "tutorial"
 status = "stable"
 +++
 
+import { ResultPanel } from "../site/components.tsx"
+
 # Props API
 
-## 完成本页后
-
+<ResultPanel title="随源码更新的属性表" label="完成效果">
 Props 表直接来自公开 TypeScript 声明；类型、默认值和 JSDoc 不再在 MDX 中重复维护。
+</ResultPanel>
 
 ## 编写类型说明
 
@@ -37,6 +39,12 @@ Wake 提取属性名、类型、必填状态、默认值和 JSDoc。继承的 DO
 ## 约束
 
 `source` 相对当前 MDX 解析，`symbol` 必须是该文件可找到的类型。不要在 MDX 中手工复制一份 Props 表，否则代码与文档会漂移。
+
+## 路径和说明维护
+
+上面的 `../../src/notice.tsx` 假定页面位于 `docs/components/notice.mdx`。若页面位于 `docs/index.mdx`，对应路径应改为 `../src/notice.tsx`。API 属性是编译输入，不能用运行时变量计算 source 或 symbol。
+
+先为公开类型写清楚必填性、默认值和联合值含义，再生成表格。复杂继承无法完整展开时保留诊断，必要时简化公开类型。只想改变表格样式或筛选输入时覆盖 ApiTable，不重新生成一份手工数据。
 
 ## 验证方式
 

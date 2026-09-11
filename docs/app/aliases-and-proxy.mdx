@@ -1,38 +1,71 @@
 +++
 title = "别名与代理"
-description = "统一源码导入路径，并在开发时把 API 请求转发到后端"
+description = "缩短源码导入路径，把本地 API 请求转发给后端。"
 kind = "guide"
 status = "stable"
 +++
 
 # 别名与代理
 
-## 路径别名
+用别名缩短组件导入路径，用代理把 `/api` 请求转发给本地后端。下面假设源码位于 `src`，后端监听 3000 端口。
 
-别名让深层模块使用稳定的逻辑路径。别名必须同时被 Wake 和 TypeScript 识别；不要只修改 `tsconfig.json`。
+## 路径别名
 
 ```toml title="wake.config.toml"
 [alias]
-"@app" = "./src"
+"@" = "./src"
 ```
 
-```json title="tsconfig.json"
+在现有 `tsconfig.json` 的 `compilerOptions` 中合并以下字段：
+
+```json title="TypeScript 路径配置"
 {
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": { "@app/*": ["src/*"] }
-  }
+  "paths": { "@/*": ["./src/*"] }
 }
 ```
 
+此后 `import { Counter } from "@/Counter"` 指向 `src/Counter`。两个配置分别供 Wake 和类型工具使用；不要把路径别名当成 npm 包发布后的依赖解析方案。
+
+Wake 默认已有 `@` 指向项目 `src`、`@@` 指向项目根；这里显式写出映射，便于以后调整源码目录。Yarn PnP 会优先解析形如 `@scope/package` 的包名；不要用 `@app/Counter` 这类包形态的请求绕过依赖声明。项目源码使用 `@/Counter` 等路径别名。
+
 ## API 代理
 
-开发代理只解决本地跨域和地址差异，不会被写入生产产物。生产环境仍需由部署平台把 `/api` 转发到真实服务。
+```toml title="wake.config.toml"
+[[dev_server.proxy]]
+context = ["/api"]
+target = "http://127.0.0.1:3000"
+change_origin = true
+ws = false
+
+[dev_server.proxy.path_rewrite]
+"^/api" = ""
+```
+
+应用请求 `/api/health` 时，Wake 将请求转发到后端 `/health`。`change_origin` 调整转发的 Host；`ws` 控制 WebSocket 代理。规则按声明顺序匹配，先配置更具体的规则。
+
+创建一个最小后端，单独用 Node 运行：
+
+```js title="tools/api.mjs"
+import { createServer } from "node:http";
+
+createServer((request, response) => {
+  response.setHeader("Content-Type", "application/json");
+  response.end(JSON.stringify({ path: request.url, ok: request.url === "/health" }));
+}).listen(3000, "127.0.0.1");
+```
+
+```bash
+node tools/api.mjs
+```
+
+另一个终端启动 Wake，在应用页面的浏览器控制台执行 `fetch('/api/health').then(r => r.json()).then(console.log)`，应得到 `path: '/health'` 和 `ok: true`。
 
 ## 验证方式
 
-从两层以上的目录导入 `@app/...`，再请求一个代理接口。类型检查、开发构建和生产构建都必须成功。
+从深层组件导入 `@/Counter`，运行类型检查与生产构建。代理验证时同时检查后端是否收到重写后的路径。停止后端再请求，确认能识别转发失败；恢复后端后应恢复正常。
+
+代理只用于开发。生产应用仍请求 `/api` 时，需要部署网关提供相同转发，或由应用显式使用生产 API 地址。不要把后端密钥写入浏览器构建常量。
 
 ## 下一步
 
-了解[资源与 public](/app/assets)。
+继续[资源与 public](/app/assets)，发布前阅读[部署](/app/deployment)。

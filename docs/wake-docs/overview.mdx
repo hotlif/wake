@@ -1,34 +1,39 @@
 +++
-title = "Wake Docs"
-description = "用 MDX 编写页面、运行 React Demo、生成 Props API，并输出可部署的静态文档站"
+title = "建设文档站"
+description = "用文字、真实组件示例和类型说明，建立一个可搜索的文档站。"
 kind = "overview"
 status = "stable"
 +++
 
-import { PageActions, Step, StepFlow, TaskCard, TaskGrid } from "../site/components.tsx"
+# 建设文档站
 
-# Wake Docs
+import { OverviewLead, TaskGrid, TaskCard } from "../site/components.tsx"
 
-<PageActions
-  primaryHref="/wake-docs/create-site"
-  primaryLabel="创建文档站"
-  secondaryHref="/wake-docs/demos"
-  secondaryLabel="查看交互 Demo"
- />
+<OverviewLead primaryHref="/wake-docs/create-site" primaryLabel="创建文档站" secondaryHref="/wake-docs/ui" secondaryLabel="定制站点组件">Wake Docs 把 MDX 内容、React 示例和 TypeScript 类型生成可搜索的静态站点。默认界面可以直接使用，也可以逐步替换。</OverviewLead>
 
 ## 从内容到站点
 
-<StepFlow>
-  <Step number="01" title="组织内容">文件路径生成 URL，`navigation.toml` 只管理导航层级和顺序。</Step>
-  <Step number="02" title="加入交互">Demo 运行真实 React 代码，Props 表直接读取 TypeScript 类型。</Step>
-  <Step number="03" title="静态发布">Wake 输出页面、搜索索引和哈希资源，不需要文档服务端。</Step>
-</StepFlow>
+页面文件决定 URL，导航清单决定阅读顺序。MDX 描述说明文字，Demo 展示真实交互，API 表从源码提取属性。开发时运行本地服务器；发布时输出静态页面和资源，不需要线上运行文档后端。
 
 ## 选择下一项能力
 
 <TaskGrid>
-  <TaskCard kicker="内容模型" href="/wake-docs/pages-and-navigation" title="设计页面与导航" description="分离文件路由与导航清单，建立稳定信息架构。" />
-  <TaskCard kicker="交互示例" href="/wake-docs/demos" title="运行 React Demo" description="在文档中运行可检查、可复制的真实示例。" />
-  <TaskCard kicker="类型文档" href="/wake-docs/props-api" title="生成 Props API" description="从公开 TypeScript 声明生成可搜索属性表。" />
-  <TaskCard kicker="发布路径" href="/wake-docs/deployment" title="构建并部署" description="生成可直接交给静态托管平台的目录。" />
+  <TaskCard href="/wake-docs/create-site" title="写第一篇文档" description="创建首页、导航和本地服务，再逐步加入更多页面。" />
+  <TaskCard href="/wake-docs/pages-and-navigation" title="组织阅读顺序" description="安排章节、链接和前后篇，保留已经分享的地址。" />
+  <TaskCard href="/wake-docs/demos" title="展示真实组件" description="用可以点击的 Demo 解释行为，附上源码与 Props 表。" />
+  <TaskCard href="/wake-docs/theming" title="调整站点外观" description="先改颜色和排版；需要更多控制时，再替换展示组件。" />
+  <TaskCard href="/wake-docs/workspaces" title="集中浏览组件项目" description="把多个项目的工作台挂到同一个站点。" />
+  <TaskCard href="/wake-docs/deployment" title="发布文档站" description="构建完整静态目录，检查子路径、搜索和示例资源。" />
 </TaskGrid>
+
+## 三种定制需求
+
+| 想修改什么 | 使用哪项配置 | 继续阅读 |
+| --- | --- | --- |
+| 颜色、字体和排版 | `theme_css` | [调整主题](/wake-docs/theming) |
+| 顶栏、导航、搜索或内容卡片 | `ui` | [替换第一个组件](/wake-docs/ui)、[Crab UI](/wake-docs/crab-ui) |
+| Demo 内的主题、Provider 和基础样式 | `preview` | [配置 Preview](/wake-docs/preview) |
+
+三项配置可以组合使用。属性表从[公开类型](/wake-docs/props-api)生成，页面写法见[MDX](/wake-docs/mdx)。
+
+内容和组件都是可信项目源码。应在仓库中审核后构建，不把 MDX 编译当作处理不可信用户内容的安全沙箱。

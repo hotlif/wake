@@ -1,0 +1,152 @@
++++
+title = "挂载隔离的远程组件"
+description = "让组件管理自己的 React root，用数据和 DOM 事件与应用交互。"
+kind = "tutorial"
+status = "stable"
++++
+
+import { ResultPanel, Callout, NextActions, NextLink } from "../site/components.tsx"
+
+# 挂载隔离的远程组件
+
+<ResultPanel title="可以更新、发出事件和卸载的远程卡片" label="完成效果">
+host 传入标题，remote 在自己的 React root 中展示卡片。点击卡片发出 selected 事件，host 还可以更新标题或卸载整个组件。
+</ResultPanel>
+
+## 开始之前
+
+沿用[最小远程模块](/integration/federation)的两个项目、端口和 remotes 配置。本页是独立方案，不需要上一页的 host-rendered expose 和五项 React shared 设置。
+
+在 remote 安装 React 和类型包：
+
+```bash title="remote 项目根"
+npm install react@19.2.8 react-dom@19.2.8
+npm install -D @types/react@19 @types/react-dom@19
+```
+
+在 remote 的 `tsconfig.json` 中增加 `compilerOptions.jsx = "react-jsx"`。host 只操作 DOM，不需要 React。
+
+## 1. 声明隔离入口
+
+在 remote 现有配置末尾增加：
+
+```toml title="remote/wake.config.toml"
+[federation.exposes."./Card"]
+entry = "src/Card.tsx"
+mode = "isolated"
+scope = "catalog-react19"
+shadow = "open"
+```
+
+`isolated` 使用独立且非 default 的 scope，样式和挂载容器放在 open ShadowRoot 中。
+
+## 2. 实现三个生命周期
+
+| 方法 | 什么时候调用 | 本例做什么 |
+| --- | --- | --- |
+| mount | host 首次挂载时 | 创建 React root，返回实例 |
+| update | host 传入新 props 时 | 用新标题再次渲染 |
+| unmount | host 移除组件时 | 清理 React root |
+
+```tsx title="remote/src/Card.tsx"
+import { createRoot, type Root } from "react-dom/client";
+import type { ReactElement } from "react";
+import type { IsolatedLifecycle, IsolatedLifecycleContext } from "@crab-dev/wake/federation/react";
+
+type Props = { title: string };
+
+function view(context: IsolatedLifecycleContext<Props>): ReactElement {
+  return <button onClick={() => context.emit("selected", { title: context.props.title })}>
+    {context.props.title}
+  </button>;
+}
+
+const lifecycle: IsolatedLifecycle<Props, Root> = {
+  mount(context) {
+    const root = createRoot(context.mountRoot);
+    root.render(view(context));
+    return root;
+  },
+  update(root, context) {
+    root.render(view(context));
+  },
+  unmount(root) {
+    root.unmount();
+  },
+};
+
+export default lifecycle;
+```
+
+`context.emit()` 发出 DOM 事件。数据通过 props 进入组件，交互结果通过事件返回 host。
+
+## 3. 在 host 挂载和更新
+
+桥接器使用 Wake 已初始化的页面运行时，先连接 ShadowRoot 和样式，再加载远程代码。保持下面的调用顺序：
+
+```ts title="host/src/entry.ts"
+import { getFederationRuntime } from "@crab-dev/wake/federation";
+import { createFederatedIsolatedBridge } from "@crab-dev/wake/federation/react";
+
+async function start() {
+  const host = document.createElement("div");
+  const update = document.createElement("button");
+  const remove = document.createElement("button");
+  update.textContent = "更新标题";
+  remove.textContent = "卸载组件";
+  document.body.append(host, update, remove);
+  host.addEventListener("selected", event => {
+    console.log((event as CustomEvent).detail);
+  });
+
+  const bridge = await createFederatedIsolatedBridge<{ title: string }>(
+    getFederationRuntime(), "catalog/Card",
+  );
+  await bridge.mount(host, { title: "远程卡片" });
+  update.onclick = () => {
+    void bridge.update({ title: "标题已更新" }).catch(console.error);
+  };
+  remove.onclick = () => {
+    update.disabled = true;
+    remove.disabled = true;
+    void bridge.unmount().then(() => host.remove()).catch(console.error);
+  };
+}
+
+void start().catch(console.error);
+```
+
+路由切换时也要等待 `bridge.unmount()` 完成，再移除 host 元素。组件的弹层应挂在 `context.portalRoot`；挂到 document.body 会离开这里的样式范围。
+
+## 4. 启动并验证
+
+remote 运行 `npx wake dev . --port 4174`。host 先运行 `npx wake federation init .`，再运行 `npx wake dev . --port 4173`，并把生成的声明入口加入 TypeScript include。
+
+打开 `http://127.0.0.1:4173/`，依次完成：
+
+1. 点击远程卡片，在控制台看到 selected 的标题数据。
+2. 点击“更新标题”，确认卡片文字改变。
+3. 点击“卸载组件”，确认卡片消失，旧实例已清理。
+4. 在两个项目分别运行 `npx tsc --noEmit`。
+
+## 可以传哪些内容
+
+props 与事件 detail 支持有限数字、字符串、布尔值、null、稠密数组和普通数据对象。回调通过 DOM 事件表达；需要插入宿主内容时，使用 `bridge.mount(host, props, { slots })` 传入真实 DOM Node，remote 从 `context.slots` 取用。
+
+React element、ref、函数、循环对象和 getter 不能作为结构化数据跨过这条边界。ShadowRoot 用于组织样式与界面，remote JavaScript 仍在当前页面执行。
+
+## 常见错误
+
+| 错误 | 调整方式 |
+| --- | --- |
+| `FED_BRIDGE_PROPS` | 检查是否传入函数、React 值或非普通数据对象；改用事件或 DOM slots |
+| `FED_BRIDGE_LIFECYCLE` | 确认 expose 为 isolated，且模块提供 mount、update、unmount |
+| 弹层没有组件样式 | 使用 portalRoot，检查弹层是否离开 ShadowRoot |
+| 卸载后仍有副作用 | 在 unmount 中释放组件自行创建的资源，并等待桥接器完成清理 |
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/integration/remote-delivery" title="开发更新与发布" description="理解重挂载和生产版本锁定。" />
+  <NextLink href="/integration/remote-react" title="使用宿主 React 树" description="需要共享 Context 和回调时选择这条路径。" />
+</NextActions>

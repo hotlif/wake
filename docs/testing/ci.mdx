@@ -1,0 +1,41 @@
++++
+title = "在 CI 中运行测试"
+description = "在 CI 中运行测试、保存报告，并让失败正确阻止后续步骤。"
+kind = "guide"
+status = "experimental"
++++
+
+# 在 CI 中运行测试
+
+CI 应使用固定依赖和经过审查的快照，保留失败报告，并在浏览器测试开始前准备好浏览器。
+
+## 固定可重复条件
+
+提交依赖锁文件、测试源码和经审核的快照。CI 使用不可变安装，禁止遗留 `.only`，让未发现测试成为需要处理的失败。不要在 CI 默认加 `--update-snapshots`，否则会把非预期变化写成新基线。
+
+```toml title="wake.config.toml"
+[test]
+forbid_only = true
+environment = "auto"
+```
+
+## 运行与报告
+
+```bash
+npx wake test --serial
+npx wake test --reporter junit --output reports/tests.xml
+```
+
+第二条是需要 JUnit 时的替代运行方式，不要求每次重复整个测试集。JSON reporter 提供 `wake.test.v1` 结构化结果；自动化读取退出码和报告，不解析终端进度文字。失败为 1，参数、配置和宿主等错误为 2，取消为 130。
+
+## 浏览器准备
+
+browser suite 需要 runner 上可用的系统 Chrome、Edge 或 Chromium。按运行器实际安装位置发现或指定 `--browser-path`，保留返回的浏览器身份。截图任务固定操作系统和渲染条件，单独维护对应 profile 基线；不要把找不到浏览器改成跳过测试来获得绿色结果。
+
+## 验证方式
+
+在干净环境执行安装、类型检查与测试。让一个断言失败，确认 CI 作业失败且报告中有该用例；让配置无效，确认它被识别为运行错误。两者恢复后保存报告和需要的 diff 产物。
+
+## 下一步
+
+接入[应用 CI](/app/ci)，或通过[Node.js 测试 API](/reference/node-api/test)组合更复杂的任务。

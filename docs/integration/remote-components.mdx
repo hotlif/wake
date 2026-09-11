@@ -1,0 +1,46 @@
++++
+title = "远程组件"
+description = "在当前应用中使用另一个项目独立部署的组件。"
+kind = "overview"
+status = "stable"
++++
+
+import { OverviewLead, CompareCards, CompareCard, StepFlow, Step, TaskGrid, TaskCard, Callout } from "../site/components.tsx"
+
+# 远程组件
+
+<OverviewLead primaryHref="/integration/federation" primaryLabel="先跑一个最小示例" secondaryHref="/integration/remote-react" secondaryLabel="直接接入 React">
+  例如：商品团队单独发布一个选购组件，主应用需要时再加载它。Wake Federation 负责加载组件代码、同步类型和检查依赖；你负责约定组件接收什么、展示什么。
+</OverviewLead>
+
+## 先认识两个项目
+
+<CompareCards>
+  <CompareCard title="remote：提供组件的项目">包含组件源码，声明哪些模块可以被使用，并发布代码、样式和类型。示例中叫 catalog。</CompareCard>
+  <CompareCard title="host：使用组件的应用">配置 remote 地址，在页面中加载并展示组件。示例中叫 shell。</CompareCard>
+</CompareCards>
+
+请求 `catalog/Button` 时，`catalog` 是项目名，`Button` 是它公开的入口。开发时两个项目分别启动本地服务；生产时 host 使用锁定的远程版本。
+
+## 选择组件怎样进入页面
+
+<TaskGrid>
+  <TaskCard kicker="共用一棵 React 树" href="/integration/remote-react" title="像普通组件一样使用" description="需要宿主 Context、children 或交互回调时，选择 host-rendered。两边统一使用同一组 React 实例。" />
+  <TaskCard kicker="独立管理界面" href="/integration/remote-isolated" title="挂载一个隔离组件" description="需要独立 React 版本或样式范围时，选择 isolated。用数据更新界面，用 DOM 事件通知宿主。" />
+</TaskGrid>
+
+还不确定选哪种时，先运行[普通函数示例](/integration/federation)。它使用 `generic` 模式，先确认远程地址、导入名称和类型同步都能工作。
+
+## 从开发到上线
+
+<StepFlow>
+  <Step number="01" title="公开入口">remote 在配置里指出组件源码文件。</Step>
+  <Step number="02" title="接入应用">host 配置地址，加载组件并验证交互。</Step>
+  <Step number="03" title="锁定版本">发布 remote，再生成 lock 并构建 host。</Step>
+</StepFlow>
+
+完整流程见[开发与发布](/integration/remote-delivery)。如果只想把组件装进项目、随应用一起构建，使用[组件库](/app/library)会更直接。
+
+<Callout title="接入范围">
+  这里使用 Wake 自有的浏览器协议，host 和 remote 都需支持它；不能直接复用其他构建器的 remoteEntry。当前不支持 Node、SSR 或 Worker。isolated 的 ShadowRoot 用来组织界面和样式，不是运行不可信代码的安全沙箱。
+</Callout>

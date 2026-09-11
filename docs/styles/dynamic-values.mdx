@@ -1,6 +1,6 @@
 +++
 title = "动态样式"
-description = "使用 CSS 自定义属性连接 React 状态与静态 CSS"
+description = "让颜色、进度和主题随 React 状态变化。"
 kind = "tutorial"
 status = "experimental"
 +++
@@ -9,7 +9,7 @@ import { NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from
 
 # 动态样式
 
-<ResultPanel title="完成后">
+<ResultPanel title="随状态变化的颜色与进度" label="完成效果">
   React 只更新元素上的自定义属性；生成类名与抽取样式表保持稳定。
 </ResultPanel>
 
@@ -44,6 +44,14 @@ export function Meter({ color, value }: { color: string; value: number }) {
   <Step number="02" title="写入模板">直接插值变量，不再额外包一层 var()。</Step>
   <Step number="03" title="赋运行时值">用 assignVars 把 props 写入元素 style。</Step>
 </StepFlow>
+
+## 用同一组变量表达主题
+
+上例把运行时 color 和 value 写入元素，不重新生成模板。对 value 先限定业务范围，例如把进度限制到 0–1；把外部输入直接当 CSS 值前先做应用层校验。
+
+主题容器也可以一次分配多个颜色变量，让后代规则使用这些引用。变量遵循 CSS 继承：Portal 不在主题容器下时，需要自己的赋值节点或受控挂载位置。文档站自定义 UI 同样遵循此原则。
+
+演示中 Meter 若要直观看见长度，还需设置高度和背景，例如 `height: 8px; background: currentColor;`，再改变 value 验证缩放，而不是只观察空 div。
 
 ## 验证方式
 

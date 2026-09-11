@@ -1,0 +1,55 @@
++++
+title = "组件工作台与聚合站点"
+description = "把多个组件项目的工作台集中到一个文档站。"
+kind = "guide"
+status = "stable"
++++
+
+# 组件工作台与聚合站点
+
+组件工作台用于单独浏览和调试组件。项目多起来后，可以把它们挂载到同一个文档站，并保留各自的构建配置。
+
+## 单项目工作台
+
+工作台用于浏览组件项目中的示例与组件信息。先确认项目的源码扫描、入口与 Demo 配置可用，再在该项目运行：
+
+```bash
+npx wake docs dev . --mode components
+npx wake docs build . --mode components --outdir docs-dist
+```
+
+工作台是独立产品入口。站点的 `docs.ui` 不会覆盖工作台，Components 模式直接配置 ui 会明确报首期不支持。
+
+## 聚合多个项目
+
+在主站配置发现规则：
+
+```toml title="主站 wake.config.toml"
+[docs]
+source_dir = "docs"
+base_path = "/handbook/"
+
+[[docs.workspace]]
+root = "components"
+include = ["rc-*"]
+base_path = "/components/{name}/workbench/"
+mode = "components"
+presentation = "embedded"
+dev_loading = "lazy"
+```
+
+主站只扫描 components 的直接子目录。假设发现 `rc-button`，工作台挂载到 `/handbook/components/rc-button/workbench/`。每个项目仍有自己的配置、依赖和编译边界；主站不把 UI 注册表传给它。
+
+## 选择展示和开发加载方式
+
+`presentation` 控制 embedded 或 standalone 展示，`dev_loading` 控制 lazy 或 eager 开发加载。lazy 适合工作区多而只访问少数的情况；首次访问需要等待该工作台准备。生产构建仍需要验证整个发布集合。
+
+include 使用大小写敏感的名称匹配。挂载前缀必须包含 `{name}`，不能与站点路由、其他工作台重叠或逃逸。不要用不同名称指向互相覆盖的输出位置。
+
+## 验证方式
+
+先单独运行两个组件项目，再聚合运行。依次访问工作台、刷新深层路径，检查终端工作区状态。主站配置自定义 UI 后，独立工作台仍应保持自己的界面；生产构建要包含全部匹配项目。
+
+## 下一步
+
+查询[Docs 配置](/reference/configuration/docs)，然后按[部署](/wake-docs/deployment)验证统一前缀。

@@ -1,53 +1,51 @@
 +++
 title = "生产构建"
-description = "生成可部署产物，并理解 HTML、chunk、CSS 与 manifest"
+description = "把应用构建成 dist，并用本地 HTTP 服务检查发布效果。"
 kind = "tutorial"
 status = "stable"
 +++
 
-import { Metric, MetricStrip, NextActions, NextLink, ResultPanel, Step, StepFlow, VisualFigure } from "../site/components.tsx"
+import { ResultPanel } from "../site/components.tsx"
 
 # 生产构建
 
-<ResultPanel title="完成后">
-  `dist` 中包含互相匹配的 HTML、JavaScript、CSS、资源和 manifest，可直接交给静态服务器验证。
+<ResultPanel title="可交给静态服务器的 dist" label="完成效果">
+你会得到一份可交给静态服务器的 `dist`。以下步骤以[应用入门](/start/create-react-app)的项目和脚本为基础。
 </ResultPanel>
-
-<VisualFigure visual="build" alt="源码模块经过分析、分割与压缩打包成生产资源" caption="生产构建生成互相匹配的一组 HTML、JavaScript、CSS 和资源。" />
 
 ## 执行构建
 
 ```bash
-npx wake build --outdir dist
+npm run typecheck
+npm run build
 ```
 
-<StepFlow>
-  <Step number="01" title="分析">从入口建立生产模块图并删除无用代码。</Step>
-  <Step number="02" title="优化">压缩代码、分割 chunk、抽取 CSS 和重写资源。</Step>
-  <Step number="03" title="命名">为可缓存资源加入内容哈希并写入 manifest。</Step>
-</StepFlow>
+`build` 脚本执行 `wake build --outdir dist`。Wake 分析入口依赖，生成并优化 JavaScript，抽取 CSS，处理资源，输出 HTML 与 manifest。需要排查压缩后的错误时使用 `npx wake build --outdir dist --sourcemap`。
 
-<MetricStrip>
-  <Metric value="HTML" label="应用入口" />
-  <Metric value="JS + CSS" label="按模块图生成" />
-  <Metric value="manifest" label="逻辑入口映射" />
-</MetricStrip>
+## 输出目录
+
+`dist` 必须是新目录、空目录或由 Wake 标记拥有的应用输出目录。已有 `.wake-output.json` 用于确认所有权，不应手工伪造或从其他目录复制。
+
+构建失败会报告诊断并保留上一份有效输出。因此“目录存在”不能证明本次成功，自动化必须检查退出码。不要把项目根、源码目录或包含用户文件的目录当作输出位置。
 
 ## 验证方式
 
-用静态服务器测试首页、直接子路由、动态导入和强制刷新；浏览器不应请求开发 WebSocket。
+在项目根运行一个本地静态服务器，例如已经安装 Python 时：
+
+```bash
+python -m http.server 8080 --directory dist
+```
+
+打开 `http://127.0.0.1:8080/`，验证按钮、样式和图片。该简单服务器用于首页和真实文件检查，不提供 SPA 回退；应用子路由的直接访问需要[部署配置](/app/deployment)。不要用 `file://` 打开 HTML 来替代 HTTP 验证。
+
+检查 Network 面板中的资源返回成功，Console 没有异常，页面没有尝试连接开发 WebSocket。再比较[输出清单](/app/output)中的实际文件。
 
 ## 常见错误
 
-不要依赖具体哈希文件名，也不要把旧 dist 与新构建混合部署。
-
-Wake 只会更新带有自身 `.wake-output.json` 标记的非空目录。升级后首次遇到未标记的旧 `dist`
-时，先确认它仅含可丢弃构建产物并删除该目录，再重新构建；Wake 不会冒险猜测目录所有权。
-不要把项目根、源码目录或共享文件目录作为 `--outdir`。
+- 非空旧目录被拒绝：确认它只是可丢弃产物后自行清理，或使用新的输出目录。
+- 新 HTML 搭配旧资源：发布整份输出，不逐个替换不匹配的文件。
+- 只构建成功，类型仍错误：生产构建不替代 `typecheck` 和测试。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/app/performance" title="设置缓存策略" description="理解代码分割与内容哈希。" />
-  <NextLink href="/app/deployment" title="部署生产目录" description="配置静态托管和路由回退。" />
-</NextActions>
+阅读[产物说明](/app/output)、[性能与缓存](/app/performance)，最后完成[部署](/app/deployment)。

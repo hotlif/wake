@@ -1,34 +1,59 @@
 +++
-title = "文档主题"
-description = "使用稳定 CSS 变量定制品牌、明暗主题和内容排版"
+title = "调整文档主题"
+description = "调整站点颜色和排版，选择适合自己的定制方式。"
 kind = "guide"
 status = "stable"
 +++
 
-# 文档主题
+# 调整文档主题
+
+只改颜色和排版，从配置与 theme_css 开始；需要改变顶栏、导航或内容结构时，再替换展示组件。
 
 ## 配置主题文件
 
+仅修改站点名称、默认明暗模式和强调色时，先使用公开配置：
+
 ```toml title="wake.config.toml"
 [docs]
-theme_css = "docs/theme.css"
+theme_css = "site/theme.css"
 default_theme = "system"
 accent_color = "#7c3aed"
 ```
 
-主题文件通过 CSS 变量覆盖页面表面、文字、边框和强调色。优先改变语义变量，不依赖生成类名或深层 DOM 结构。
-
-`accent_color` 是可选的快捷配置。未设置时，Wake 不会在根节点写入内联强调色，因此主题文件可以直接覆盖 `--wake-accent`。
-强调色派生的组件语义变量只在 Demo 预览容器内生效，不会覆盖文档根节点或工作台的全局语义颜色。
+`theme_css` 在默认样式之后加载。用户 CSS 可以为自己在 MDX 中使用的组件定义样式；修改默认界面的深层选择器则需要自己维护与当前版本的关系。
 
 ## 明暗主题
 
-使用 `html[data-theme="light"]` 和 `html[data-theme="dark"]` 覆盖变量。两套主题都要检查正文、代码块、表格、焦点环和 Demo 背景。
+```css title="site/theme.css"
+.brand-note {
+  padding: 1rem;
+  border: 1px solid #c4b5fd;
+  background: #f5f3ff;
+  color: #3b0764;
+}
+html[data-theme="dark"] .brand-note {
+  border-color: #7c3aed;
+  background: #2e1065;
+  color: #ede9fe;
+}
+```
+
+在 MDX 中使用 `<aside className="brand-note">说明内容</aside>`。系统主题、用户选择和持久化由 Wake 负责，样式根据当前主题展示；自定义 UI 也可直接使用 props 中的 `theme.resolved`。
+
+## 默认样式边界
+
+默认样式限定在默认组件表面，并排除自定义 UI 和 Demo 边界。默认 `--wake-docs-*` 变量是内部实现，不是稳定公共主题 token；这些变量不会注入 `:root`。`accent_color` 是公开快捷配置，未设置时不会用配置值覆盖默认组件上的强调色。
+
+MDX 中的内联组件示例可放在 `data-wake-demo` 元素中，使正文排版选择器不匹配该边界及后代。它不是 Shadow DOM 或安全边界；组件自己的字体、颜色和变量仍应显式管理。
+
+选择器排除不等于阻断 CSS 自定义属性的继承。保留默认 Page 时，内嵌组件仍可能读到默认祖先的私有变量；不要消费这些变量，也不要把“所有继承变量都为空”作为该标记的保证。使用自己的变量命名空间和显式外观；需要独立文档环境的示例使用 Demo iframe。
+
+需要长期拥有顶栏、菜单和卡片外观时，使用[组件覆盖](/wake-docs/ui)，避免大量依赖默认 DOM 结构的 CSS。
 
 ## 验证方式
 
-在 1440px、1024px 和 390px 下切换主题，确认没有横向溢出、不可见焦点或只有颜色才能识别的状态。
+在桌面和 390px 窄屏检查明暗主题、焦点环、正文、代码表格及 Demo。检查实际计算样式，而不只看 CSS 文件是否加载。Portal 的主题作用域也需由自定义组件设置。
 
 ## 下一步
 
-完成[构建与部署](/wake-docs/deployment)。
+开始[覆盖第一个组件](/wake-docs/ui)，或直接[构建部署](/wake-docs/deployment)。

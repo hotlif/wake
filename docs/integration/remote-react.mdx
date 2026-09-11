@@ -1,0 +1,181 @@
++++
+title = "在 React 中使用远程组件"
+description = "把远程按钮放进应用的 React 树，并统一 React 依赖。"
+kind = "tutorial"
+status = "stable"
++++
+
+import { ResultPanel, Callout, NextActions, NextLink } from "../site/components.tsx"
+
+# 在 React 中使用远程组件
+
+<ResultPanel title="一个来自另一项目的计数按钮" label="完成效果">
+在 host 页面点击“远程计数”，数字会递增。按钮代码来自 catalog，渲染仍在 host 的 React 树中。
+</ResultPanel>
+
+## 开始之前
+
+先跑通[最小远程模块](/integration/federation)，保留其中的 host、remote 和地址配置。本页使用 `host-rendered` 模式，适合需要 Context、children 或回调的组件。需要独立 React 版本时，阅读[隔离组件](/integration/remote-isolated)。
+
+在两个项目根分别安装相同版本的依赖：
+
+```bash title="分别在 host 和 remote 执行"
+npm install react@19.2.8 react-dom@19.2.8
+npm install -D @types/react@19 @types/react-dom@19
+```
+
+在两边的 `tsconfig.json` 中启用 `compilerOptions.jsx = "react-jsx"`。以下文件路径分别相对各自项目根。
+
+## 1. 在 remote 写一个按钮
+
+```tsx title="remote/src/Button.tsx"
+import { useState, type ReactElement } from "react";
+
+export interface ButtonProps {
+  label: string;
+}
+
+export function Button(props: ButtonProps): ReactElement {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>{props.label}：{count}</button>;
+}
+```
+
+这里显式写出 props 和返回类型，方便 Wake 发布供 host 使用的类型声明。
+
+## 2. 公开按钮，并统一 React
+
+在 remote 现有配置末尾增加：
+
+```toml title="remote/wake.config.toml"
+[federation.exposes."./Button"]
+entry = "src/Button.tsx"
+mode = "host-rendered"
+scope = "react19"
+```
+
+两个项目必须使用同一组 React、JSX 和 React DOM 实例。展开并复制下面的五项配置到两边的配置文件末尾。这是本例的必需步骤，内容可以先保持不变。
+
+<details className="wake-details">
+<summary>必需配置：复制到 host 和 remote 的五项 React 共享设置</summary>
+
+```toml title="host/wake.config.toml 与 remote/wake.config.toml"
+[federation.shared.react]
+scope = "react19"
+required_version = "19.2.8"
+singleton = true
+strict = true
+fallback = true
+coherence_group = "react19"
+owner = "catalog"
+
+[federation.shared."react/jsx-runtime"]
+scope = "react19"
+required_version = "19.2.8"
+singleton = true
+strict = true
+fallback = true
+coherence_group = "react19"
+owner = "catalog"
+
+[federation.shared."react/jsx-dev-runtime"]
+scope = "react19"
+required_version = "19.2.8"
+singleton = true
+strict = true
+fallback = true
+coherence_group = "react19"
+owner = "catalog"
+
+[federation.shared.react-dom]
+scope = "react19"
+required_version = "19.2.8"
+singleton = true
+strict = true
+fallback = true
+coherence_group = "react19"
+owner = "catalog"
+
+[federation.shared."react-dom/client"]
+scope = "react19"
+required_version = "19.2.8"
+singleton = true
+strict = true
+fallback = true
+coherence_group = "react19"
+owner = "catalog"
+```
+
+</details>
+
+本例的 `owner = "catalog"` 表示由 catalog 提供共享实现；host 的 React 树也使用这一组实例。`scope` 和 `coherence_group` 将五个入口作为整体选择，`fallback = true` 让 remote 发布可加载的共享代码。
+
+<details className="wake-details">
+<summary>以后修改版本或 owner 时，检查哪些地方？</summary>
+
+同时更新两边的 React 版本与 `required_version`。五个入口的 scope、coherence_group 和 owner 保持一致。owner 必须是当前容器或已配置的 remote；catalog 没有配置 shell 时，不能直接把 owner 改成 shell。完整限制见[项目配置](/reference/configuration/project)。
+
+</details>
+
+## 3. 在 host 渲染按钮
+
+将 host 配置中的 `[html].entry` 改为 `src/entry.tsx`，用下面的入口替换原普通 DOM 示例：
+
+```tsx title="host/src/entry.tsx"
+import { lazy, Suspense } from "react";
+import { createRoot } from "react-dom/client";
+
+const Button = lazy(() => import("catalog/Button").then(module => ({ default: module.Button })));
+const container = document.createElement("div");
+document.body.append(container);
+
+createRoot(container).render(
+  <Suspense fallback={<p>正在加载远程组件…</p>}>
+    <Button label="远程计数" />
+  </Suspense>,
+);
+```
+
+`lazy` 把远程加载接到 React，`Suspense` 在等待时显示提示。本例把命名导出 `Button` 转成 lazy 所需的 default 形状。`lazy` 放在模块顶层即可。
+
+需要统一选择导出、适配组件或记录加载完成时，可使用 `@crab-dev/wake/federation/react` 的 `createHostRenderedLazyFactory`。它接受 `loadModule` 和可选的 `exportName`、`adapt`、`onResolved`，返回传给 React `lazy` 的加载函数；`exportName` 默认为 `default`，本例应设为 `Button`。
+
+## 4. 启动并验证
+
+```bash title="终端一 · remote 项目根"
+npx wake dev . --port 4174
+```
+
+```bash title="终端二 · host 项目根"
+npx wake federation init .
+npx wake dev . --port 4173
+```
+
+将生成的 `wake-federation.d.ts` 加入 host 的 TypeScript include。打开 `http://127.0.0.1:4173/`，确认按钮出现、点击递增，再在两个项目分别运行 `npx tsc --noEmit`。
+
+## 接入实际页面时
+
+- **Context**：双方需要引用同一个 Context 对象。共用 React 不会合并分别创建的 Context。
+- **加载失败**：在外层设置 React Error Boundary。Suspense 只表示等待，不负责展示错误；已失败的 lazy 组件不会因普通重渲染自动重试。
+- **组件样式**：默认使用 CSS Modules 或 Wake CSS-in-JS。普通全局 CSS 需要在 expose 中显式设置 `allow_global_css = true`，它会影响宿主 document。
+
+## 常见错误
+
+| 现象 | 先检查 |
+| --- | --- |
+| Hooks 或版本冲突 | 五项 shared 是否完整，两个项目的版本、scope、group 和 owner 是否一致 |
+| `FED_CONFIG_INVALID` | expose 模式、共享配置，以及依赖是否导入了未作用域 CSS |
+| 声明同步报 `FED_MANIFEST_SCHEMA` | 查看生成的远程声明；使用本例的命名导出和显式 `ReactElement` 返回类型 |
+
+当前声明解析对部分默认导出函数和推导出的 `import("react").JSX.Element` 声明有限制。源码构建成功后，仍需检查 host 类型同步；不要用宽泛的 any 声明替代诊断。
+
+## 用独立 root 挂载
+
+如果组件需要自己的 React 版本或样式范围，改走[隔离组件教程](/integration/remote-isolated)。它通过明确的挂载、更新和卸载方法与 host 交互。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/integration/remote-delivery" title="准备发布" description="同步类型，锁定版本，检查生产资源。" />
+  <NextLink href="/integration/remote-isolated" title="了解隔离组件" description="让组件独立管理 React root。" />
+</NextActions>

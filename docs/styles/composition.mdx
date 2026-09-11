@@ -1,17 +1,19 @@
 +++
 title = "组合类名"
-description = "使用 cx 组合字符串、条件、数组和对象"
+description = "根据组件状态组合类名，理解类名顺序与 CSS 优先级的区别。"
 kind = "tutorial"
 status = "experimental"
 +++
 
+import { ResultPanel } from "../site/components.tsx"
+
 # 组合类名
 
-## 完成本页后
-
+<ResultPanel title="随组件状态变化的类名" label="完成效果">
 一个组件可以按状态组合局部类名，同时保持确定的类名顺序。
 
 `cx` 保留输入顺序并忽略 `false`、`null` 和 `undefined`。
+</ResultPanel>
 
 ```tsx
 import { css, cx } from "@crab-dev/css";
@@ -30,10 +32,17 @@ export function Item({ active, small }: { active: boolean; small: boolean }) {
 条件对象适合外部普通类名：
 
 ```ts
+const dragging = true;
 const className = cx(base, { "is-dragging": dragging });
 ```
 
 `cx` 不生成 atomic class，也不负责解决两个类对同一属性的冲突。冲突结果仍由 CSS cascade 决定。
+
+## 组合不等于覆盖顺序
+
+class 属性中哪个类名写在后面，不直接决定同权重 CSS 规则谁胜出。上例 compact 与 base 都设置 padding，最后结果仍由样式表中的规则顺序和层叠决定。
+
+更可靠的组件设计是让尺寸、选中状态分别拥有清楚的属性职责，并通过四种 active/small 组合验证。父组件传来的普通 className 可以作为 cx 的一个参数，但不应假定它天然具有最高优先级。
 
 ## 验证方式
 

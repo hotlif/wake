@@ -1,0 +1,102 @@
++++
+title = "远程组件开发与发布"
+description = "让组件类型跟上开发变化，并锁定生产应用使用的远程版本。"
+kind = "guide"
+status = "stable"
++++
+
+import { CompareCards, CompareCard, StepFlow, Step, Callout, NextActions, NextLink } from "../site/components.tsx"
+
+# 远程组件开发与发布
+
+组件能在本地加载后，还需要处理两件事：开发时跟上代码和类型变化，发布时明确应用使用哪个远程版本。
+
+<CompareCards>
+  <CompareCard title="开发：跟随更新">启动两个项目，自动同步声明。修改可能更新类型、重挂载隔离组件，或刷新页面。</CompareCard>
+  <CompareCard title="生产：固定版本">先发布 remote，再生成 lock 并构建 host。新的 remote 发布后，旧 host 继续使用它锁定的版本。</CompareCard>
+</CompareCards>
+
+## 让编辑器认识远程组件
+
+在 host 项目根执行一次：
+
+```bash title="host 项目根"
+npx wake federation init .
+```
+
+把生成的 `wake-federation.d.ts` 加入 TypeScript 的 include。之后启动 `wake dev`，Wake 会同步远程声明；`.wake/federation/types` 中的文件由工具维护。
+
+默认的 `dev_follow = true` 会跟随 remote 变化。声明与组件的 `buildId` 绑定，同步失败时保留旧索引并继续重试。如果编辑器仍显示旧提示，先检查终端诊断，再运行类型检查。
+
+<details className="wake-details">
+<summary>开发时也想固定远程版本？</summary>
+
+设置 `dev_follow = false`。此时不再探测新版本，启动时的声明、Manifest 和 build 必须与 `wake-federation.lock` 匹配。这项配置用于固定版本，不会关闭类型校验。
+
+</details>
+
+## 修改后，页面会怎样更新
+
+| 看到的变化 | 更新动作 | 你需要留意 |
+| --- | --- | --- |
+| 编辑器类型改变，组件继续运行 | `types-only` | 类型同步是否成功 |
+| 隔离组件重新出现，内部状态重置 | `isolated-remount` | 旧实例的副作用是否已清理 |
+| 整个页面重新加载 | `full-reload` | 应用状态是否能正常初始化 |
+
+`createFederatedIsolatedBridge` 默认接收开发重挂载事件；传入 `{ dev: false }` 可以关闭桥接器的自动重挂载。Wake 根据实际变化选择更新方式，不保证每次修改都保留组件状态。
+
+## 发布时，按这个顺序
+
+<StepFlow>
+  <Step number="01" title="发布组件">构建 remote，把完整输出部署到 HTTPS 地址。</Step>
+  <Step number="02" title="锁定版本">host 使用生产地址生成 lock，检查这次版本变化。</Step>
+  <Step number="03" title="发布应用">构建 host，将对应产物一起交付。</Step>
+</StepFlow>
+
+### 1. 构建并部署 remote
+
+```bash title="remote 项目根"
+npx wake build
+```
+
+上传完整输出，包括 Manifest、远程入口、同步与异步 JavaScript、CSS 和类型文件。若 remote 还依赖其他 remote，先为它生成相应的生产 lock。
+
+### 2. 更新 host 地址并生成 lock
+
+把 host 的 `manifest_url` 改为生产 HTTPS URL，将 Manifest 和资源实际使用的 origin 加入 `allowed_origins`。origin 只写协议、域名和端口，不带文件路径。
+
+```bash title="host 项目根"
+npx wake federation lock .
+npx wake build
+```
+
+lock 记录 Manifest、build、类型摘要和资源集合。公开组件必须有同 build 的类型，singleton 必须有明确 owner；校验失败时先修复配置或远程资源，旧 lock 不会被半成品替换。
+
+### 3. 发布 host，保留回退所需文件
+
+将 `wake-federation.lock` 纳入版本管理，部署本次 host 产物。下次升级组件时，重新生成 lock、检查差异，再构建 host。
+
+保留旧 build 的 remote 资源。还在使用旧 host 的页面可能继续请求旧的延迟加载文件，回滚应用也需要这些资源。
+
+## 检查部署是否可用
+
+- 打开首页、直接刷新，再首次打开延迟加载组件，确认代码和样式完整。
+- 执行 host 类型检查与构建；查看网络面板，确认资源来自预期 origin。
+- 检查服务器的 CORS 和 MIME。资源丢失应返回错误，不能把 JavaScript 的 404 请求改成 HTML 页面。
+- 模拟远程服务不可用，确认错误界面可见；恢复后重新加载。
+- 检查隔离组件的更新与卸载，再确认旧 host 和回滚版本仍能加载资源。
+
+需要 CSP 时，按[项目配置](/reference/configuration/project)授权脚本、样式和连接来源。本地 HTTP 开发成功后，还要使用准备发布的 HTTPS 地址完成上述检查。
+
+## 加载失败时从哪里看
+
+捕获 `FederationError` 后保留 `code`、`phase`、`retryable` 和 `details`。它们可以区分网络问题、版本冲突和生命周期错误。
+
+排查共享依赖选择时，在应用中调用 `getFederationRuntime().explain("catalog/Button")` 查看决策。origin 配置不代替服务器 CORS 响应，重复注册 remote 也不能修复资源完整性错误。
+
+## 下一步
+
+<NextActions>
+  <NextLink href="/reference/cli/federation" title="查命令参数" description="类型初始化与生产锁定的准确约束。" />
+  <NextLink href="/reference/node-api/federation" title="接入自动化" description="在 Node.js 脚本中初始化类型和生成 lock。" />
+</NextActions>

@@ -1,0 +1,60 @@
++++
+title = "测试发现与配置"
+description = "选择要运行的测试文件，配置监听模式和多个项目。"
+kind = "guide"
+status = "experimental"
++++
+
+# 测试发现与配置
+
+把测试配置写进现有的 wake.config.toml。先选中文件，再决定这些文件在哪种环境运行。
+
+## 项目配置
+
+在项目根 `wake.config.toml` 中加入以下配置。已有应用配置保留，不需要另建一种测试配置文件。
+
+```toml title="wake.config.toml"
+[test]
+environment = "auto"
+include = ["src/**/*.test.ts", "src/**/*.test.tsx"]
+browser_include = ["src/**/*.browser.test.tsx"]
+exclude = ["**/node_modules/**", "**/dist/**"]
+timeout_ms = 5000
+forbid_only = true
+
+[test.react]
+cleanup = true
+act_warnings = "error"
+```
+
+`auto` 根据 `browser_include` 选择环境。浏览器文件也必须先被 `include` 选中；不要把两者理解为互不相关的文件集合。
+
+## 根目录与筛选
+
+`--root` 指定测试项目根；`--project` 选择已声明的项目名称，两者不能互换。普通路径参数用于缩小测试文件范围，`--name-pattern` 根据测试名称筛选。
+
+```bash
+npx wake test --root . --name-pattern "数字" --serial
+npx wake test --watch
+```
+
+watch 是长期进程，修改后重跑所选测试。退出时正常关闭进程，不把它当作一次性 CI 命令。
+
+## 多项目
+
+```toml title="添加到根 wake.config.toml"
+[[test.projects]]
+name = "client"
+root = "packages/client"
+environment = "dom"
+```
+
+执行 `npx wake test --project client`。每个项目的字段仅限公开配置支持的名称；不接受其他 runner 的环境或 transformer 插件路径。完整默认值见[测试配置参考](/reference/configuration/test)。
+
+## 验证方式
+
+先分别运行一个普通测试和一个 browser 测试，检查结果记录的环境。临时添加一个不匹配 include 的文件，确认它不被选中。测试少于预期时先核对选择条件，而不是修改测试本身。
+
+## 下一步
+
+学习[环境选择](/testing/environments)，再把相同命令放入[CI](/testing/ci)。

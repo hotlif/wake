@@ -1,16 +1,16 @@
 +++
-title = "部署"
-description = "把生产目录发布到静态托管，并正确处理缓存和子路由"
+title = "部署应用"
+description = "让首页、子路由和静态资源在部署后都能正常访问。"
 kind = "tutorial"
 status = "stable"
 +++
 
-import { CompareCard, CompareCards, NextActions, NextLink, ResultPanel, Step, StepFlow } from "../site/components.tsx"
+import { ResultPanel } from "../site/components.tsx"
 
-# 部署
+# 部署应用
 
-<ResultPanel title="完成后">
-  静态托管只接收一次生产构建生成的完整目录，路由与缓存策略经过验证。
+<ResultPanel title="可以直接访问的应用与子路由" label="完成效果">
+生产目录在目标公开路径可访问，首页、子路由、动态加载和接口转发均经过检查。先完成[生产构建](/app/production-build)，部署账户和目标由项目自行选择。
 </ResultPanel>
 
 ## 构建可发布目录
@@ -21,32 +21,31 @@ npm run typecheck
 npm run build
 ```
 
-不要发布源码、node_modules 或 Wake 缓存。
+需要子路径时，在项目配置顶层设置 `public_path = "/portal/"`，然后重新构建。不要只在上传完成后挪动目录而不检查构建引用。应用路由库的 base 与手写资源 URL 也需要匹配。
 
 ## 配置静态托管
 
-<CompareCards>
-  <CompareCard title="短缓存" tone="neutral">HTML 使用短缓存或重新验证，确保及时指向新资源。</CompareCard>
-  <CompareCard title="长缓存" tone="positive">带内容哈希的 JS、CSS、图片和字体可以长期缓存。</CompareCard>
-</CompareCards>
+静态服务器的公开目录指向完整构建产物。根部署时首页位于 `/`；子路径部署时产物需映射到 `/portal/`。应用使用 history 路由时，未命中真实静态文件的应用页面请求回退到对应 index.html；API 请求和丢失的资源不能无差别返回 HTML。
 
-<StepFlow>
-  <Step number="01" title="路由">未命中真实文件的应用路径回退到 index.html。</Step>
-  <Step number="02" title="路径">部署子目录时保持 public_path 一致。</Step>
-  <Step number="03" title="原子发布">HTML 与它引用的资源必须来自同一次构建。</Step>
-</StepFlow>
+| 内容 | 建议处理 |
+| --- | --- |
+| HTML | 短缓存或重新验证 |
+| 内容哈希资源 | 长缓存，可使用 immutable |
+| 固定名称公开文件 | 根据更新要求设置缓存 |
+| `/api` 请求 | 交给生产网关，不依赖开发代理 |
+
+新 HTML 与它引用的全部资源应来自同一份构建。保留完整上一版发布集合便于回退，不只备份 HTML。
 
 ## 验证方式
 
-首页、直接子路由、刷新和动态 import 均应成功；网络面板没有资源 404，新版本 HTML 指向同一批新资源。
+依次检查首页、直接输入子路由、刷新、前进后退、动态导入、图片字体和 API。Network 面板中 JavaScript 请求不能返回 HTML。更新一处内容重新构建后，确认页面使用新版本资源，旧版本回退也能完整加载。
 
 ## 常见错误
 
-不要只测试客户端跳转。直接访问子路由才能验证静态服务器的回退规则。
+- 客户端跳转成功，刷新 404：补充对应挂载路径的应用路由回退。
+- JS 报意外的 `<`：静态资源缺失却被回退成 HTML，检查公开路径。
+- 生产 API 失败：开发 proxy 不会随 dist 发布，需要生产转发。
 
 ## 下一步
 
-<NextActions>
-  <NextLink href="/reference/configuration/project" title="查询部署字段" description="核对 public_path 与浏览器目标。" />
-  <NextLink href="/reference/troubleshooting" title="定位生产失败" description="按路由、资源和构建阶段排查。" />
-</NextActions>
+把检查加入[CI](/app/ci)，必要时查看[排错指南](/reference/troubleshooting)。
