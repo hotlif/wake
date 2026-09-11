@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.1.37
+## 0.1.38
 
-Versions 0.1.35 and 0.1.36 were stopped by prepublish checks and were not published.
+Versions 0.1.35–0.1.37 were stopped by release checks and were not published.
 This version installs React declarations in the clean consumer fixture, reviews Windows
 Chromium 152 against the official runner inventory, and retains browser failure diagnostics.
+The registry lock for `tracing-core` remains at its original version, 0.1.36.
 
 - Add the typed `@crab-dev/wake/docs` rendering API and `docs.ui` configuration, allowing sites
   to replace individual components or the complete interface while retaining navigation, search,
