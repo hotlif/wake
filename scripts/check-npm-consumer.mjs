@@ -240,6 +240,9 @@ writeFileSync(
   "import { test, expect } from '@crab-dev/wake/test'; test('npm consumer host', () => expect(42).toBe(42));\n",
 )
 writeFileSync(join(project, 'consumer.ts'), `import { build, type BuildOptions, type FederationOptions } from '@crab-dev/wake'
+import { defineDocsUI, type HeaderProps } from '@crab-dev/wake/docs'
+const docsUI = defineDocsUI({ Header: (_props: HeaderProps) => null })
+void docsUI
 import {
   FEDERATION_RUNTIME_ABI,
   createFederationRuntime,

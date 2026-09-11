@@ -1,0 +1,7 @@
+[docs]
+title = "Crab UI rendering fixture"
+source_dir = "docs"
+ui = "site/partial.tsx"
+base_path = "/handbook/"
+preview = "site/preview.tsx"
+theme_css = "site/theme.css"

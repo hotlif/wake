@@ -110,6 +110,7 @@ for (const { directory, value: packageManifest } of manifests) {
     for (const subpath of [
       '.',
       './experimental',
+      './docs',
       './federation',
       './federation/react',
       './test',

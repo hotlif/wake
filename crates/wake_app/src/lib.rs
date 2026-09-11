@@ -7098,6 +7098,7 @@ fn start_docs_dev_server_leaf(
     let mut probe = probe_docs_candidate(&docs_options, docs_mode)?;
     if docs_mode == DocsMode::Site
         && probe.docs.preview.is_none()
+        && probe.docs.ui.is_none()
         && probe.prepared.config.react.jsx_import_source == "react"
     {
         probe.demand = Some(DocsDemand::default());
@@ -7408,6 +7409,7 @@ struct DocsDevTopology {
     entry: PathBuf,
     source_dir: PathBuf,
     preview: Option<PathBuf>,
+    ui: Option<PathBuf>,
     theme_css: Option<PathBuf>,
     base_path: String,
     presentation: DocsPresentation,
@@ -7465,6 +7467,7 @@ fn docs_dev_topology_from(
         entry: logical_entry.to_path_buf(),
         source_dir: docs.source_dir.clone(),
         preview: docs.preview.clone(),
+        ui: docs.ui.clone(),
         theme_css: docs.theme_css.clone(),
         base_path: docs.base_path.clone(),
         presentation: docs.presentation,
@@ -7528,9 +7531,10 @@ fn docs_topology_change(current: &DocsDevTopology, candidate: &DocsDevTopology) 
     }
     if current.source_dir != candidate.source_dir
         || current.preview != candidate.preview
+        || current.ui != candidate.ui
         || current.theme_css != candidate.theme_css
     {
-        return Some("Docs source, Preview, or theme topology changed".to_owned());
+        return Some("Docs source, Preview, UI, or theme topology changed".to_owned());
     }
     if current.base_path != candidate.base_path || current.presentation != candidate.presentation {
         return Some("Docs mount URL or presentation changed".to_owned());
@@ -8050,6 +8054,9 @@ fn docs_watch_interests_from(
     if let Some(preview) = &docs.preview {
         interests.push(WatchInterest::tree(root.join(preview)));
     }
+    if let Some(ui) = &docs.ui {
+        interests.push(WatchInterest::tree(root.join(ui)));
+    }
     if let Some(theme_css) = &docs.theme_css {
         interests.push(WatchInterest::tree(root.join(theme_css)));
     }
@@ -8292,6 +8299,7 @@ fn docs_options(
         repository_url: docs.repository_url.clone(),
         base_path: base_path.unwrap_or(&docs.base_path).to_string(),
         preview: docs.preview.as_deref().map(PathBuf::from),
+        ui: docs.ui.as_deref().map(PathBuf::from),
         theme_css: docs.theme_css.as_deref().map(PathBuf::from),
         default_theme: docs.default_theme.clone(),
         accent_color: docs.accent_color.clone(),
@@ -8324,6 +8332,9 @@ fn validate_reserved_docs_inputs(
         validate_not_reserved(root, kind, &path)?;
     }
     validate_not_reserved(root, "Docs source", &absolute_from(root, &docs.source_dir))?;
+    if let Some(ui) = &docs.ui {
+        validate_not_reserved(root, "Docs UI", &absolute_from(root, ui))?;
+    }
     if let Some(preview) = &docs.preview {
         validate_not_reserved(root, "Docs Preview", &absolute_from(root, preview))?;
     }
@@ -10659,6 +10670,82 @@ entry = "packages/Button.tsx"
             !preview_bundle.contains("wake.docs.development.v1"),
             "custom Preview must retain a single graph for arbitrary shared Context modules"
         );
+        fixture.write("wake.config.toml", "[docs]\nui = 'site/ui.tsx'\n");
+        fixture.write(
+            "node_modules/@crab-dev/wake/package.json",
+            r#"{"name":"@crab-dev/wake","type":"module","exports":{"./docs":"./docs.mjs"}}"#,
+        );
+        fixture.write(
+            "node_modules/@crab-dev/wake/docs.mjs",
+            include_str!("../../../npm/wake/docs.mjs"),
+        );
+        fixture.write(
+            "site/ui.tsx",
+            "export default { Header: () => 'ui-original' };\n",
+        );
+        let ui_server = start_docs_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            open: Some(false),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        let _ui_close = Close(&ui_server);
+        let original = http_get(port, "/bundle.js");
+        assert!(original.contains("ui-original"));
+        assert!(!original.contains("wake.docs.development.v1"));
+        fixture.write(
+            "site/ui.tsx",
+            "export default { Header: () => 'ui-updated' };\n",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let updated = loop {
+            let response = http_get(port, "/bundle.js");
+            if response.contains("ui-updated") {
+                break response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "UI edit did not rebuild"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        ui_server.drain_events();
+        fixture.write("site/ui.tsx", "export default { Header: (;\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if ui_server
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, DevServerEvent::Diagnostic { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "UI failure was not reported"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            http_get(port, "/bundle.js")
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .1,
+            updated.split_once("\r\n\r\n").unwrap().1
+        );
+        fixture.write(
+            "site/ui.tsx",
+            "export default { Header: () => 'ui-recovered' };\n",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !http_get(port, "/bundle.js").contains("ui-recovered") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "UI edit did not recover"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     #[test]
     fn docs_dev_candidates_reuse_compilation_and_retry_all_uncommitted_sources() {

@@ -12,6 +12,11 @@
   "module": "./index.mjs",
   "types": "./index.d.ts",
   "exports": {
+    "./docs": {
+      "types": "./docs.d.ts",
+      "import": "./docs.mjs",
+      "default": "./docs.mjs"
+    },
     ".": {
       "types": "./index.d.ts",
       "import": "./index.mjs",
@@ -58,6 +63,7 @@
     "*.cjs",
     "*.mjs",
     "index.d.ts",
+    "docs.d.ts",
     "experimental.d.ts",
     "federation.d.mts",
     "federation-react.d.ts",

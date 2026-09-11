@@ -1,0 +1,9 @@
+[[group]]
+id = "guide"
+title = "Guide"
+pages = ["index"]
+
+[[group.section]]
+id = "start"
+title = "Start"
+pages = ["second"]

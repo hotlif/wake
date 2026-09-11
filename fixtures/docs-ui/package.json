@@ -1,0 +1,13 @@
+{
+  "name": "wake-docs-ui-fixture",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@crab-dev/wake": "0.1.34",
+    "@crab-dev/rc-button": "^0.0.2",
+    "@crab-dev/rc-dialog": "^0.0.2",
+    "@crab-dev/rc-line-edit": "^0.0.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  }
+}

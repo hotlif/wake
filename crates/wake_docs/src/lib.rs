@@ -27,6 +27,9 @@ use wake_ecma_ast::{DependencyKind, SourceType};
 use wake_ecma_lexer::{Keyword, Lexer, Token, TokenKind, tokenize};
 use wake_ecma_parser::parse;
 
+const RUNTIME_DEFAULTS: &str = include_str!("../runtime/defaults.tsx");
+const RUNTIME_UI: &str = include_str!("../runtime/ui.tsx");
+const RUNTIME_STATE: &str = include_str!("../runtime/state.mjs");
 const RUNTIME_APP: &str = include_str!("../runtime/app.tsx");
 const RUNTIME_COMPONENTS: &str = include_str!("../runtime/components.tsx");
 const RUNTIME_COMPONENT_STATE: &str = include_str!("../runtime/components-state.mjs");
@@ -35,6 +38,8 @@ const RUNTIME_SEARCH: &str = include_str!("../runtime/search.mjs");
 const RUNTIME_SITE_ENTRY: &str = include_str!("../runtime/site-entry.tsx");
 const RUNTIME_COMPONENTS_ENTRY: &str = include_str!("../runtime/components-entry.tsx");
 const RUNTIME_STYLE: &str = include_str!("../runtime/styles.css");
+const RUNTIME_CONTENT_STYLE: &str = include_str!("../runtime/content.css");
+const RUNTIME_WORKBENCH_STYLE: &str = include_str!("../runtime/workbench-base.css");
 const RUNTIME_COMPONENT_STYLE: &str = include_str!("../runtime/components.css");
 const MINIMUM_REACT_MAJOR: u64 = 19;
 static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -93,6 +98,8 @@ pub struct DocsOptions {
     pub repository_url: Option<String>,
     pub base_path: String,
     pub preview: Option<PathBuf>,
+    /// Optional Site rendering component module, relative to the project root.
+    pub ui: Option<PathBuf>,
     pub theme_css: Option<PathBuf>,
     pub default_theme: String,
     pub accent_color: Option<String>,
@@ -110,6 +117,7 @@ impl Default for DocsOptions {
             repository_url: None,
             base_path: "/".to_string(),
             preview: None,
+            ui: None,
             theme_css: None,
             default_theme: "system".to_string(),
             accent_color: None,
@@ -796,9 +804,13 @@ fn render_prepared(
         ("search-corpus.ts", search_corpus.as_str()),
         ("config.tsx", config.as_str()),
         ("runtime/app.tsx", RUNTIME_APP),
+        ("runtime/defaults.tsx", RUNTIME_DEFAULTS),
+        ("runtime/ui.tsx", RUNTIME_UI),
+        ("runtime/state.mjs", RUNTIME_STATE),
         ("runtime/routes.mjs", RUNTIME_ROUTES),
         ("runtime/search.mjs", RUNTIME_SEARCH),
         ("runtime/styles.css", RUNTIME_STYLE),
+        ("runtime/content.css", RUNTIME_CONTENT_STYLE),
     ];
     let entry_relative = match docs_mode {
         DocsMode::Site => {
@@ -811,6 +823,7 @@ fn render_prepared(
                 ("runtime/components-state.mjs", RUNTIME_COMPONENT_STATE),
                 ("runtime/components-entry.tsx", RUNTIME_COMPONENTS_ENTRY),
                 ("runtime/components.css", RUNTIME_COMPONENT_STYLE),
+                ("runtime/workbench-base.css", RUNTIME_WORKBENCH_STYLE),
             ]);
             "runtime/components-entry.tsx"
         }
@@ -829,6 +842,9 @@ fn render_prepared(
     let entry_relative = projected_generation_path(Path::new(entry_relative))?;
 
     let mut watch_roots = vec![source_dir.clone(), root.join("src")];
+    if let Some(ui) = &options.ui {
+        watch_roots.push(absolute_from(&root, ui));
+    }
     if let Some(preview) = &options.preview {
         watch_roots.push(absolute_from(&root, preview));
     }
@@ -1979,6 +1995,24 @@ fn render_config(
     docs_mode: DocsMode,
 ) -> Result<String, DocsError> {
     let mut output = String::from("import React from \"react\";\n");
+    if let Some(ui) = &options.ui {
+        if docs_mode != DocsMode::Site {
+            return Err(DocsError::InvalidConfig(
+                "docs.ui is only supported in Site mode".into(),
+            ));
+        }
+        if ui.as_os_str().is_empty() {
+            return Err(DocsError::InvalidConfig(
+                "docs.ui must name a module".into(),
+            ));
+        }
+        output.push_str(&format!(
+            "import {{ defineDocsUI }} from '@crab-dev/wake/docs';\nimport customUI from {};\nexport const ui = customUI;\nexport function resolveUI() {{ return defineDocsUI(ui); }}\n",
+            js_string(&root_relative_alias(root, &absolute_from(root, ui))?)
+        ));
+    } else {
+        output.push_str("export const ui = {};\nexport function resolveUI() { return ui; }\n");
+    }
     if let Some(css) = &options.theme_css {
         output.push_str(&format!(
             "import {};\n",
@@ -2002,6 +2036,7 @@ fn render_config(
         "title": options.title, "description": options.description, "locale": options.locale, "logo": logo,
         "repositoryUrl": options.repository_url, "basePath": base_path,
         "defaultTheme": options.default_theme, "accentColor": options.accent_color,
+        "customPreview": options.preview.is_some(),
         "presentation": options.presentation.as_str(),
         "mode": docs_mode.as_str(),
     });
@@ -4774,15 +4809,97 @@ mod tests {
     }
 
     #[test]
+    fn docs_ui_is_an_explicit_site_input_and_preserves_preview() {
+        let options = DocsOptions {
+            ui: Some(PathBuf::from("site/ui.tsx")),
+            preview: Some(PathBuf::from("docs/preview.tsx")),
+            ..DocsOptions::default()
+        };
+        let config = render_config(Path::new("project"), &options, DocsMode::Site).unwrap();
+        assert!(config.contains("@@wake/docs-project/site/ui.tsx"));
+        assert!(config.contains("@@wake/docs-project/docs/preview.tsx"));
+        assert!(config.contains("defineDocsUI"));
+        assert!(render_config(Path::new("project"), &options, DocsMode::Components).is_err());
+        let default = render_config(
+            Path::new("project"),
+            &DocsOptions::default(),
+            DocsMode::Site,
+        )
+        .unwrap();
+        assert!(!default.contains("@crab-dev/wake/docs"));
+        assert!(default.contains("export const ui = {}"));
+    }
+
+    #[test]
+    fn docs_theme_boundaries_keep_custom_styles_and_inline_components_authoritative() {
+        assert!(
+            RUNTIME_STYLE
+                .contains("@scope ([data-wake-default]) to ([data-wake-custom], [data-wake-demo])")
+        );
+        assert!(!RUNTIME_STYLE.contains(":root"));
+        assert!(!RUNTIME_STYLE.contains("--token-semantic-"));
+        assert!(!RUNTIME_SITE_ENTRY.contains("styles.css"));
+        assert!(RUNTIME_DEFAULTS.starts_with("import \"./styles.css\";"));
+        assert!(RUNTIME_UI.contains("data-wake-custom"));
+    }
+
+    #[test]
+    fn workbench_theme_keeps_its_existing_component_defaults() {
+        assert!(RUNTIME_WORKBENCH_STYLE.contains("@layer wake-theme-fallback"));
+        assert!(
+            RUNTIME_WORKBENCH_STYLE.contains(":not(:where([data-wake-demo], [data-wake-demo] *))")
+        );
+        assert!(RUNTIME_APP.contains("data-wake-demo"));
+        let fallback_root = RUNTIME_WORKBENCH_STYLE
+            .split_once(":root {")
+            .unwrap()
+            .1
+            .split_once('}')
+            .unwrap()
+            .0;
+        for legacy in [
+            "--token-semantic-color-feedback-error:",
+            "--token-semantic-color-feedback-warning:",
+            "--token-semantic-color-feedback-success:",
+            "--token-semantic-color-feedback-info:",
+            "--dropdown-container-box-shadow:",
+            "--switch-handle-background-color:",
+        ] {
+            assert!(
+                !fallback_root.contains(legacy),
+                "legacy input leaks into an explicit component theme: {legacy}"
+            );
+        }
+        assert!(RUNTIME_WORKBENCH_STYLE.contains(":is(.workbench-shell, .demo-frame-root) {"));
+        let base = RUNTIME_COMPONENTS_ENTRY
+            .find("import \"@@wake/docs/runtime/workbench-base.css\";")
+            .unwrap();
+        let app = RUNTIME_COMPONENTS_ENTRY.find("import { App }").unwrap();
+        assert!(
+            base < app,
+            "base CSS must load before App imports the custom theme"
+        );
+        for line in RUNTIME_WORKBENCH_STYLE.lines() {
+            if line.trim_start().starts_with(".mdx-content") {
+                assert!(
+                    line.contains("data-wake-demo"),
+                    "unscoped prose rule: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn component_preview_scopes_configured_accent_without_mutating_document_root() {
         assert!(
-            RUNTIME_STYLE.contains(".workbench-shell { --wake-accent: var(--workbench-accent); }")
+            RUNTIME_WORKBENCH_STYLE
+                .contains(".workbench-shell { --wake-accent: var(--workbench-accent); }")
         );
         assert!(
-            !RUNTIME_STYLE.contains(":root:has(.demo-frame-root)"),
+            !RUNTIME_WORKBENCH_STYLE.contains(":root:has(.demo-frame-root)"),
             "Demo 不能在文档根节点重写语义颜色"
         );
-        let demo_scope = RUNTIME_STYLE
+        let demo_scope = RUNTIME_WORKBENCH_STYLE
             .split_once(".demo-frame-root {")
             .expect("Demo token scope")
             .1
@@ -4809,9 +4926,9 @@ mod tests {
                 "缺少 Demo 强调色映射: {expected}"
             );
         }
-        for runtime in [RUNTIME_APP, RUNTIME_COMPONENTS] {
+        for runtime in [RUNTIME_UI, RUNTIME_COMPONENTS] {
             assert!(
-                runtime.contains("if (siteConfig.accentColor)"),
+                runtime.contains("accentColor"),
                 "Docs runtime 必须只在显式配置时写入强调色"
             );
         }
@@ -6624,20 +6741,20 @@ pages = ["build"]
 
     #[test]
     fn sidebar_keeps_status_in_the_page_header_instead_of_navigation_items() {
-        let runtime = include_str!("../runtime/app.tsx");
-        let sidebar_start = runtime.find("function Sidebar").expect("sidebar");
+        let runtime = RUNTIME_DEFAULTS;
+        let sidebar_start = runtime.find("function DefaultNavigation").expect("sidebar");
         let sidebar_end = runtime[sidebar_start..]
-            .find("function TableOfContents")
+            .find("function DefaultMobileNavigation")
             .map(|offset| sidebar_start + offset)
             .expect("table of contents");
         let sidebar = &runtime[sidebar_start..sidebar_end];
 
         assert!(!sidebar.contains("StatusBadge"));
-        assert!(sidebar.contains("aria-current={active ? \"page\" : undefined}"));
+        assert!(sidebar.contains("aria-current={page.slug === current ? 'page' : undefined}"));
         assert!(runtime.contains("className=\"breadcrumbs\""));
         assert!(runtime.contains("<StatusBadge status={meta.status} />"));
-        assert!(runtime.contains("sessionStorage"));
-        assert!(runtime.contains("wake-docs-user-expanded-sections"));
+        assert!(RUNTIME_APP.contains("sessionStorage"));
+        assert!(RUNTIME_APP.contains("wake-docs-user-expanded-sections"));
         assert!(!runtime.contains("wake-docs-expanded-sections"));
         assert!(!runtime.contains("setExpanded((current) => current.has(activeKey)"));
     }

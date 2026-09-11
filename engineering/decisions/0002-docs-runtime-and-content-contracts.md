@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-08-14
+- Amended by: [ADR 0047](0047-docs-rendering-interfaces.md)
 
 ## Context
 

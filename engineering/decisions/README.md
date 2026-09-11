@@ -64,6 +64,7 @@
 - [ADR 0038: Docs generation directory transaction](0038-docs-generation-transaction.md) — `accepted`
 - [ADR 0041: Cross-process Docs generation transaction](0041-cross-process-docs-generation-transaction.md) — `accepted`
 - [ADR 0046: Docs 开发按访问构建页面与演示](0046-docs-development-demand-bundles.md) — `accepted`
+- [ADR 0047: Docs 能力与可覆盖展示接口](0047-docs-rendering-interfaces.md) — `accepted`
 
 ### federation
 

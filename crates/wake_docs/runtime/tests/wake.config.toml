@@ -1,0 +1,6 @@
+[test]
+environment = "dom"
+include = ["*.test.tsx"]
+
+[test.react]
+act_warnings = "error"

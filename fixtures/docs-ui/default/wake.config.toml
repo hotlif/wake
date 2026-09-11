@@ -1,0 +1,8 @@
+root_dir = ".."
+
+[docs]
+title = "Default rendering fixture"
+source_dir = "docs"
+base_path = "/handbook/"
+preview = "site/preview.tsx"
+theme_css = "site/theme.css"

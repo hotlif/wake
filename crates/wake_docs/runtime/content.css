@@ -1,0 +1,9 @@
+/* Structural output of the MDX Demos macro, independent of the chosen Page UI. */
+.wake-docs-demos-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--demo-columns, 1), minmax(0, 1fr));
+  gap: 18px;
+}
+@media (max-width: 760px) {
+  .wake-docs-demos-grid { grid-template-columns: 1fr; }
+}

@@ -514,6 +514,8 @@ pub struct Docs {
     pub repository_url: Option<String>,
     pub base_path: String,
     pub preview: Option<String>,
+    /// Optional Site rendering component module, relative to the project root.
+    pub ui: Option<String>,
     pub theme_css: Option<String>,
     pub default_theme: String,
     pub accent_color: Option<String>,
@@ -531,6 +533,7 @@ impl Default for Docs {
             repository_url: None,
             base_path: "/".to_string(),
             preview: None,
+            ui: None,
             theme_css: None,
             default_theme: "system".to_string(),
             accent_color: None,
@@ -1599,6 +1602,7 @@ strategy = "version-first"
             locale = "en-US"
             base_path = "/crab/"
             preview = "docs/preview.tsx"
+            ui = "site/ui.tsx"
             theme_css = "docs/theme.css"
             default_theme = "dark"
             accent_color = "#7c3aed"
@@ -1609,6 +1613,7 @@ strategy = "version-first"
         assert_eq!(config.docs.title, "Crab UI");
         assert_eq!(config.docs.locale, "en-US");
         assert_eq!(config.docs.preview.as_deref(), Some("docs/preview.tsx"));
+        assert_eq!(config.docs.ui.as_deref(), Some("site/ui.tsx"));
         assert_eq!(config.docs.default_theme, "dark");
         assert_eq!(config.docs.accent_color.as_deref(), Some("#7c3aed"));
     }

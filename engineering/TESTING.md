@@ -390,6 +390,11 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
 
 ## 3.5 Docs
 
+可覆盖展示接口使用 `corepack yarn docs:ui:test` 验证注册、默认回退、Context、异常和导航操作；
+`npm:typecheck:wake` 验证公共 props。`fixtures/docs-ui` 的默认、局部和完整覆盖配置都须完成开发与
+生产构建。在真实浏览器检查子路径、搜索快捷键与焦点、前进后退、明暗主题、移动导航、Demo iframe
+与源码操作，并比较 inline/Portal 探针的计算样式。自定义 UI 的刷新失败须保留旧产物并能修复重试。
+
 - Frontmatter 必填字段、重复 route、MDX 静态属性，以及 multiline side-effect/import-from/export-from/
   literal dynamic import；普通字符串、模板、注释、import attribute 同值诱饵和非字面量 dynamic import
   必须保持原样；

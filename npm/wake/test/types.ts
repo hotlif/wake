@@ -579,3 +579,13 @@ void wakeTestContract.network.get
 void wakeTestContract.test.concurrent
 // @ts-expect-error Wake snapshots are external artifacts, not inline source rewrites.
 expect('Wake').toMatchInlineSnapshot('"Wake"')
+import { defineDocsUI, type DocsUI, type HeaderProps, type PageProps, type DemoProps } from '@crab-dev/wake/docs';
+const docsUI: DocsUI = defineDocsUI({ Header: (_props: HeaderProps) => null });
+void docsUI;
+defineDocsUI({ Page: (_props: PageProps) => null, Demo: (_props: DemoProps) => null });
+// @ts-expect-error UI overrides must be components, not rendered elements or strings.
+defineDocsUI({ Header: 'header' });
+// @ts-expect-error Unknown slots fail at the registration boundary.
+defineDocsUI({ Headre: () => null });
+// @ts-expect-error Incorrect props cannot be registered for a slot.
+defineDocsUI({ Header: (_props: { wrong: number }) => null });
