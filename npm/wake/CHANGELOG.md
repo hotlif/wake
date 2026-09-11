@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.1.35
+## 0.1.36
+
+Version 0.1.35 was not published because its prepublish consumer fixture lacked React types.
+This version adds that dependency and retains full declaration checks before publication.
 
 - Add the typed `@crab-dev/wake/docs` rendering API and `docs.ui` configuration, allowing sites
   to replace individual components or the complete interface while retaining navigation, search,
