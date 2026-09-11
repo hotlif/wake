@@ -233,8 +233,8 @@ jobs:
           - target: win32-x64-msvc
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            browser_evidence: exact-major-conformance
-            browser_major: 151
+            browser_evidence: reviewed-major-conformance
+            browser_majors: '151,152'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - target: linux-x64-gnu
             os: ubuntu-24.04

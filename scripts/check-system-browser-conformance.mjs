@@ -20,7 +20,10 @@ const targetDefinitions = {
   'win32-x64-msvc': {
     runner: 'windows-latest',
     rustTarget: 'x86_64-pc-windows-msvc',
-    evidencePath: '/images/windows/Windows2025-Readme.md',
+    evidencePath: [
+      '/images/windows/Windows2025-Readme.md',
+      '/images/windows/Windows2025-VS2026-Readme.md',
+    ],
   },
   'linux-x64-gnu': {
     runner: 'ubuntu-24.04',
@@ -126,7 +129,7 @@ function validateReviewedEvidence(value, target, policy, acceptedKinds, evidence
     if (
       typeof evidence.source !== 'string' ||
       !/^https:\/\/github\.com\/actions\/runner-images\/blob\/[0-9a-f]{40}\//.test(evidence.source) ||
-      !evidence.source.endsWith(evidencePath)
+      ![evidencePath].flat().some((path) => evidence.source.endsWith(path))
     ) {
       throw new Error(
         target + ' runner evidence must use its immutable official runner-images inventory',

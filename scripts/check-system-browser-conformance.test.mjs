@@ -28,9 +28,32 @@ for (const kind of ['chrome', 'edge', 'chromium']) {
   assert.equal(checked.browser.major, 151)
   assert.equal(checked.browser.kind, kind)
   assert.equal(checked.schemaVersion, 'wake.browser.evidence.v2')
-  assert.equal(checked.mode, 'exact-major-conformance')
-  assert.equal(checked.stableConformance, true)
+  assert.equal(checked.mode, 'reviewed-major-conformance')
+  assert.equal(checked.stableConformance, false)
 }
+
+const windows152 = validateExperimentalBrowserIdentity({
+  manifest,
+  target: 'win32-x64-msvc',
+  identity: { kind: 'chrome', version: 'Chrome/152.0.7977.83', headless: true },
+})
+assert.equal(windows152.browser.major, 152)
+assert.equal(windows152.stableConformance, false)
+assert.throws(() => validateExperimentalBrowserIdentity({
+  manifest,
+  target: 'win32-x64-msvc',
+  identity: { kind: 'chrome', version: 'Chrome/153.0.0.1', headless: true },
+}), /permits reviewed Chromium-family majors 151, 152/)
+
+const missingWindowsEvidence = structuredClone(manifest)
+missingWindowsEvidence.targets['win32-x64-msvc'].reviewedRunnerEvidence.pop()
+assert.throws(() => validateSystemBrowserConformanceManifest(missingWindowsEvidence),
+  /must cover every reviewed experimental major/)
+const wrongWindowsInventory = structuredClone(manifest)
+wrongWindowsInventory.targets['win32-x64-msvc'].reviewedRunnerEvidence[0].source =
+  manifest.targets['linux-x64-gnu'].reviewedRunnerEvidence[0].source
+assert.throws(() => validateSystemBrowserConformanceManifest(wrongWindowsInventory),
+  /immutable official runner-images inventory/)
 
 for (const major of [151, 152]) {
   const linuxChromeEvidence = validateExperimentalBrowserIdentity({
@@ -101,7 +124,7 @@ const readiness = evaluateStableBrowserReadiness(manifest)
 assert.equal(readiness.ready, false)
 assert.deepEqual(
   new Set(readiness.blockers.map(({ target }) => target)),
-  new Set(['linux-x64-gnu', 'linux-arm64-gnu', 'darwin-x64', 'darwin-arm64']),
+  new Set(['win32-x64-msvc', 'linux-x64-gnu', 'linux-arm64-gnu', 'darwin-x64', 'darwin-arm64']),
 )
 assert(readiness.blockers.some(({ target, code }) =>
   target === 'linux-arm64-gnu' && code === 'browser-unavailable'))

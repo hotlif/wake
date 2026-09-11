@@ -1466,8 +1466,8 @@ test('system browser evidence separates experimental publication from stable rea
       'win32-x64-msvc',
     ],
   )
-  assert.equal(manifest.targets['win32-x64-msvc'].experimental.mode, 'exact-major-conformance')
-  assert.equal(manifest.targets['win32-x64-msvc'].experimental.major, 151)
+  assert.equal(manifest.targets['win32-x64-msvc'].experimental.mode, 'reviewed-major-conformance')
+  assert.deepEqual(manifest.targets['win32-x64-msvc'].experimental.majors, [151, 152])
   assert.equal(manifest.targets['linux-x64-gnu'].experimental.mode, 'reviewed-major-conformance')
   assert.deepEqual(manifest.targets['linux-x64-gnu'].experimental.majors, [151, 152])
   assert.equal(manifest.targets['linux-arm64-gnu'].experimental.mode, 'unavailable')

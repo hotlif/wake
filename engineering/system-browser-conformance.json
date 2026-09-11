@@ -22,8 +22,8 @@
       "runner": "windows-latest",
       "rustTarget": "x86_64-pc-windows-msvc",
       "experimental": {
-        "mode": "exact-major-conformance",
-        "major": 151
+        "mode": "reviewed-major-conformance",
+        "majors": [151, 152]
       },
       "reviewedRunnerEvidence": [
         {
@@ -32,6 +32,14 @@
           "browserVersions": {
             "chrome": "151.0.7922.170",
             "edge": "151.0.4129.86"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/c240f76fa0dd523af7376dbe8480964a3cb0af47/images/windows/Windows2025-VS2026-Readme.md",
+          "imageVersion": "20260907.229.1",
+          "browserVersions": {
+            "chrome": "152.0.7977.83",
+            "edge": "152.0.4191.66"
           }
         }
       ]

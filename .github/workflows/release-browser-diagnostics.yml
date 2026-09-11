@@ -45,11 +45,12 @@ jobs:
       - name: Clean install the existing release tarballs
         run: node scripts/check-npm-consumer.mjs
       - name: Run browser smoke and print its diagnostic result
-        shell: pwsh
+        shell: bash
         run: |
-          Set-Location -LiteralPath $env:WAKE_NPM_PROJECT
-          (Get-Item -LiteralPath $env:WAKE_RELEASE_BROWSER_PATH).VersionInfo | Select-Object ProductVersion, FileVersion
-          @'
+          set -euo pipefail
+          cd "$WAKE_NPM_PROJECT"
+          trap 'status=$?; if [[ -f browser-result.json ]]; then cat browser-result.json; fi; exit "$status"' EXIT
+          cat > visual.browser.test.mjs <<'JS'
           import React from 'react';
           import {test,expect} from '@crab-dev/wake/test';
           import {render,screen} from '@crab-dev/wake/test/react';
@@ -58,11 +59,8 @@ jobs:
             expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');
             await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('local-ready');
           });
-          '@ | Set-Content -LiteralPath visual.browser.test.mjs
-          node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs --serial --browser-path $env:WAKE_RELEASE_BROWSER_PATH --reporter json --output browser-result.json
-          $testExit = $LASTEXITCODE
-          if (Test-Path -LiteralPath browser-result.json) { Get-Content -LiteralPath browser-result.json -Raw }
-          exit $testExit
+          JS
+          node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs --serial --browser-path "$WAKE_RELEASE_BROWSER_PATH" --reporter json --output browser-result.json
       - name: Validate browser evidence and compare the saved screenshot
         shell: pwsh
         run: |

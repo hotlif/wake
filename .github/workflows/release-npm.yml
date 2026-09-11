@@ -375,8 +375,8 @@ jobs:
         include:
           - platform: win32-x64-msvc
             runner: windows-latest
-            browser_evidence: exact-major-conformance
-            browser_major: 151
+            browser_evidence: reviewed-major-conformance
+            browser_majors: '151,152'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
@@ -496,6 +496,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WAKE_NPM_PROJECT"
+          trap 'status=$?; if [[ -f browser-result.json ]]; then cat browser-result.json; fi; exit "$status"' EXIT
           node -e "require('node:fs').writeFileSync('visual.browser.test.mjs',\"import React from 'react';import {test,expect} from '@crab-dev/wake/test';import {render,screen} from '@crab-dev/wake/test/react';test('local browser runtime',async()=>{await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('local-ready')})\\n\")"
           node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs \
             --serial \
@@ -520,13 +521,15 @@ jobs:
           node scripts/check-system-browser-conformance.mjs \
             --stable-readiness blocked > "$RUNNER_TEMP/wake-browser-stable-readiness.json"
       - name: Upload prepublish browser evidence
-        if: matrix.node == '24'
+        if: always() && matrix.node == '24'
         uses: actions/upload-artifact@v4
         with:
           name: browser-evidence-prepublish-${{ matrix.platform }}
           path: |
             ${{ runner.temp }}/wake-browser-evidence.json
             ${{ runner.temp }}/wake-browser-stable-readiness.json
+            ${{ runner.temp }}/wake-npm-consumer/browser-result.json
+            ${{ runner.temp }}/wake-npm-consumer/__screenshots__
           if-no-files-found: error
 
   publish:
@@ -617,8 +620,8 @@ jobs:
         include:
           - platform: win32-x64-msvc
             runner: windows-latest
-            browser_evidence: exact-major-conformance
-            browser_major: 151
+            browser_evidence: reviewed-major-conformance
+            browser_majors: '151,152'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
@@ -680,6 +683,7 @@ jobs:
         run: |
           set -euo pipefail
           cd smoke
+          trap 'status=$?; if [[ -f browser-result.json ]]; then cat browser-result.json; fi; exit "$status"' EXIT
           npm install --ignore-scripts --prefer-online "react@19.2.8" "react-dom@19.2.8"
           if [[ ! -f "$WAKE_RELEASE_BROWSER_PATH" ]]; then
             echo "::error::Reviewed system browser is unavailable at $WAKE_RELEASE_BROWSER_PATH on $RUNNER_OS/$RUNNER_ARCH"
@@ -709,11 +713,13 @@ jobs:
           node scripts/check-system-browser-conformance.mjs \
             --stable-readiness blocked > "$RUNNER_TEMP/wake-browser-stable-readiness.json"
       - name: Upload postpublish browser evidence
-        if: matrix.node == 24
+        if: always() && matrix.node == 24
         uses: actions/upload-artifact@v4
         with:
           name: browser-evidence-postpublish-${{ matrix.platform }}
           path: |
             ${{ runner.temp }}/wake-browser-evidence.json
             ${{ runner.temp }}/wake-browser-stable-readiness.json
+            smoke/browser-result.json
+            smoke/__screenshots__
           if-no-files-found: error
