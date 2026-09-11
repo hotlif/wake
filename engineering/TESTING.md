@@ -83,6 +83,11 @@ CLI、CommonJS/ESM Node API、build、workspace link、CSS 与 Wake Test；项�
 消费验证包含 `@crab-dev/wake/docs` 的 React 组件类型。独立项目须显式安装工作区声明的
 `@types/react`、`@types/node` 和 TypeScript，并保持 `skipLibCheck: false`，避免依赖仓库类型泄漏。
 
+Windows 发布前浏览器检查失败且日志缺少结果时，可手动运行 `Release browser diagnostics`，
+填写产生已审计 tarball 的运行 ID 和版本。它在 Windows / Node 24 上复用同一仓库的产物，
+保留完整消费检查、浏览器测试退出状态与浏览器版本审查，并在失败时上传 JSON 和截图证据；
+该流程不构建或发布包，不能代替正常发布门禁。
+
 JavaScript 测试统一显式导入 `@crab-dev/wake/test`，由 `wake test` 执行；不得新增
 `node:test`、Jest/Deno runner 或调用官方 Node/Deno 的产品回退路径。测试 API 采用熟悉的
 `describe`/`test`/`expect` 形态，但门禁验证 Wake 自有契约而不是 Jest 兼容性。测试运行时的

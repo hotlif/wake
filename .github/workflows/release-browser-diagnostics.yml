@@ -1,0 +1,78 @@
+name: Release browser diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Run containing the audited npm artifacts in this repository
+        required: true
+        type: string
+      version:
+        description: Package version matching the checked-out source
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-browser:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      WAKE_NPM_ARTIFACTS: ${{ github.workspace }}/artifacts
+      WAKE_NPM_PLATFORM: win32-x64-msvc
+      WAKE_NPM_VERSION: ${{ inputs.version }}
+      WAKE_NPM_PROJECT: ${{ runner.temp }}/wake-npm-consumer
+      WAKE_RELEASE_BROWSER_PATH: C:/Program Files/Google/Chrome/Application/chrome.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.artifact_run_id }}
+          pattern: npm-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Clean install the existing release tarballs
+        run: node scripts/check-npm-consumer.mjs
+      - name: Run browser smoke and print its diagnostic result
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:WAKE_NPM_PROJECT
+          (Get-Item -LiteralPath $env:WAKE_RELEASE_BROWSER_PATH).VersionInfo | Select-Object ProductVersion, FileVersion
+          @'
+          import React from 'react';
+          import {test,expect} from '@crab-dev/wake/test';
+          import {render,screen} from '@crab-dev/wake/test/react';
+          test('local browser runtime',async()=>{
+            await render(React.createElement('button',{'aria-label':'Ready',style:{width:120,height:48}},'Ready'));
+            expect(screen.getByRole('button',{name:'Ready'}).textContent).toBe('Ready');
+            await expect(screen.getByRole('button',{name:'Ready'})).toMatchScreenshot('local-ready');
+          });
+          '@ | Set-Content -LiteralPath visual.browser.test.mjs
+          node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs --serial --browser-path $env:WAKE_RELEASE_BROWSER_PATH --reporter json --output browser-result.json
+          $testExit = $LASTEXITCODE
+          if (Test-Path -LiteralPath browser-result.json) { Get-Content -LiteralPath browser-result.json -Raw }
+          exit $testExit
+      - name: Validate browser evidence and compare the saved screenshot
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:WAKE_NPM_PROJECT
+          node "$env:GITHUB_WORKSPACE/scripts/check-system-browser-conformance.mjs" --target win32-x64-msvc --result browser-result.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node node_modules/@crab-dev/wake/bin/wake.mjs test visual.browser.test.mjs --serial --browser-path $env:WAKE_RELEASE_BROWSER_PATH
+          exit $LASTEXITCODE
+      - name: Preserve browser diagnostics even when a test fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-browser-diagnostics
+          path: |
+            ${{ runner.temp }}/wake-npm-consumer/browser-result.json
+            ${{ runner.temp }}/wake-npm-consumer/__screenshots__
+          if-no-files-found: warn
