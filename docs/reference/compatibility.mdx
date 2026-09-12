@@ -61,7 +61,8 @@ JSON、TS、TSX 与 JSX，执行目标为嵌入式 V8。产品路径不启动外
 runner，也不兼容它们的 CLI、配置、插件、snapshot 或结果 schema。
 
 `dom` 为每个 suite 创建隔离的 V8 realm、module registry、Window 和 Document。其私有 DOM
-adapter 只保证 Wake 固定的 React 19.2 conformance manifest，不宣称完整浏览器兼容。layout、
+adapter 只保证 Wake 固定的 React 19.2.8 / 19.3.0 适配回归，具体 Wake 发布版本范围见
+[React 版本支持](/testing/react)，不宣称完整浏览器兼容。layout、
 CSS 渲染、原生输入、导航、截图和浏览器敏感 hydration 只以 `browser` 环境中的系统 Chrome、
 Edge 或 Chromium 为权威；结果会记录浏览器身份、版本与 headless 状态。
 

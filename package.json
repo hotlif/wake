@@ -1,12 +1,13 @@
 {
   "name": "wake-workspace",
   "private": true,
-  "version": "0.1.38",
+  "version": "0.1.39",
   "type": "module",
   "packageManager": "yarn@4.16.0",
   "workspaces": [
     "npm/*",
-    "editors/vscode-css"
+    "editors/vscode-css",
+    "fixtures/react-19-3"
   ],
   "scripts": {
     "architecture:check": "node scripts/check-skills.mjs && node scripts/check-architecture.mjs",
@@ -42,7 +43,7 @@
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {
-    "@crab-dev/css": "0.1.38",
+    "@crab-dev/css": "0.1.39",
     "@crab-dev/rc-alert": "^0.0.2",
     "@crab-dev/rc-button": "^0.0.2",
     "@crab-dev/rc-card": "^0.0.2",

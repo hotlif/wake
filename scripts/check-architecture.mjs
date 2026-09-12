@@ -712,24 +712,32 @@ export function validateYarnProvenance({
     }
   }
 
-  for (const [name, version] of Object.entries(policy.exactPackages ?? {})) {
+  for (const [name, configuredVersions] of Object.entries(policy.exactPackages ?? {})) {
+    const versions = Array.isArray(configuredVersions) ? configuredVersions : [configuredVersions]
+    if (!versions.length || versions.some(version => typeof version !== 'string' || !exactSemver(version))
+      || new Set(versions).size !== versions.length) {
+      errors.push(`[dependency-provenance:yarn-pin] ${name} must configure distinct exact versions`)
+      continue
+    }
     const declarations = []
     for (const [manifestPath, manifest] of manifests) {
       for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
         if (Object.hasOwn(manifest[field] ?? {}, name)) declarations.push([manifestPath || 'package.json', field, manifest[field][name]])
       }
     }
-    if (declarations.length === 0) {
-      errors.push(`[dependency-provenance:yarn-pin] no install-bearing manifest pins ${name}@${version}`)
-    }
     for (const [manifestPath, field, locator] of declarations) {
-      if (locator !== version) {
-        errors.push(`[dependency-provenance:yarn-pin] ${manifestPath} ${field}.${name} must equal ${version}; found ${locator}`)
+      if (!versions.includes(locator)) {
+        errors.push(`[dependency-provenance:yarn-pin] ${manifestPath} ${field}.${name} must equal one of ${versions.join(', ')}; found ${locator}`)
       }
     }
-    const locked = Object.values(lock).find((entry) => entry?.resolution === `${name}@npm:${version}`)
-    if (!locked) {
-      errors.push(`[dependency-provenance:yarn-pin] yarn.lock must pin ${name}@npm:${version}`)
+    for (const version of versions) {
+      if (!declarations.some(([, , locator]) => locator === version)) {
+        errors.push(`[dependency-provenance:yarn-pin] no install-bearing manifest pins ${name}@${version}`)
+      }
+      const locked = Object.values(lock).find((entry) => entry?.resolution === `${name}@npm:${version}`)
+      if (!locked) {
+        errors.push(`[dependency-provenance:yarn-pin] yarn.lock must pin ${name}@npm:${version}`)
+      }
     }
   }
   return errors

@@ -2268,6 +2268,35 @@ test('Yarn provenance allows manifest ranges while the lock owns exact npm artif
   assert.deepEqual(validateYarnProvenance(yarnFixture()), [])
 })
 
+test('Yarn conformance matrices require each exact version to be declared and locked', () => {
+  const fixture = yarnFixture()
+  fixture.policy.exactPackages.react = ['19.2.8', '19.3.0']
+  fixture.workspaceManifests.set('fixtures/react-19-3', {
+    name: 'wake-react-19-3-conformance', private: true,
+    dependencies: { react: '19.3.0' },
+  })
+  fixture.lock['react@npm:19.3.0'] = {
+    ...fixture.lock['react@npm:19.2.8'], version: '19.3.0', resolution: 'react@npm:19.3.0',
+  }
+  fixture.lock['wake-react-19-3-conformance@workspace:fixtures/react-19-3'] = {
+    version: '0.0.0-use.local',
+    resolution: 'wake-react-19-3-conformance@workspace:fixtures/react-19-3', linkType: 'soft',
+  }
+  assert.deepEqual(validateYarnProvenance(fixture), [])
+  for (const versions of [[], ['^19.3.0'], ['19.3.0', '19.3.0']]) {
+    fixture.policy.exactPackages.react = versions
+    assert(validateYarnProvenance(fixture).some(error => error.includes('distinct exact versions')))
+  }
+  fixture.policy.exactPackages.react = ['19.2.8', '19.3.0']
+  fixture.workspaceManifests.get('fixtures/react-19-3').dependencies.react = '^19.3.0'
+  assert(validateYarnProvenance(fixture).some(error => error.includes('yarn-pin')))
+  fixture.workspaceManifests.get('fixtures/react-19-3').dependencies.react = '19.3.0'
+  delete fixture.lock['react@npm:19.3.0']
+  assert(validateYarnProvenance(fixture).some(error => error.includes('yarn-pin')))
+  fixture.workspaceManifests.delete('fixtures/react-19-3')
+  assert(validateYarnProvenance(fixture).some(error => error.includes('no install-bearing')))
+})
+
 test('Yarn provenance owns platform packages through workspace locators', () => {
   const mismatchedPin = yarnFixture()
   mismatchedPin.workspaceManifests.get('npm/wake').optionalDependencies[

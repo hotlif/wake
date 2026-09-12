@@ -1,0 +1,9 @@
+{
+  "name": "wake-react-19-3-conformance",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
+}

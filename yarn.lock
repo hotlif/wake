@@ -195,7 +195,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@crab-dev/css@npm:0.1.38, @crab-dev/css@workspace:npm/css":
+"@crab-dev/css@npm:0.1.39, @crab-dev/css@workspace:npm/css":
   version: 0.0.0-use.local
   resolution: "@crab-dev/css@workspace:npm/css"
   dependencies:
@@ -438,31 +438,31 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@crab-dev/wake-darwin-arm64@npm:0.1.38, @crab-dev/wake-darwin-arm64@workspace:npm/wake-darwin-arm64":
+"@crab-dev/wake-darwin-arm64@npm:0.1.39, @crab-dev/wake-darwin-arm64@workspace:npm/wake-darwin-arm64":
   version: 0.0.0-use.local
   resolution: "@crab-dev/wake-darwin-arm64@workspace:npm/wake-darwin-arm64"
   languageName: unknown
   linkType: soft
 
-"@crab-dev/wake-darwin-x64@npm:0.1.38, @crab-dev/wake-darwin-x64@workspace:npm/wake-darwin-x64":
+"@crab-dev/wake-darwin-x64@npm:0.1.39, @crab-dev/wake-darwin-x64@workspace:npm/wake-darwin-x64":
   version: 0.0.0-use.local
   resolution: "@crab-dev/wake-darwin-x64@workspace:npm/wake-darwin-x64"
   languageName: unknown
   linkType: soft
 
-"@crab-dev/wake-linux-arm64-gnu@npm:0.1.38, @crab-dev/wake-linux-arm64-gnu@workspace:npm/wake-linux-arm64-gnu":
+"@crab-dev/wake-linux-arm64-gnu@npm:0.1.39, @crab-dev/wake-linux-arm64-gnu@workspace:npm/wake-linux-arm64-gnu":
   version: 0.0.0-use.local
   resolution: "@crab-dev/wake-linux-arm64-gnu@workspace:npm/wake-linux-arm64-gnu"
   languageName: unknown
   linkType: soft
 
-"@crab-dev/wake-linux-x64-gnu@npm:0.1.38, @crab-dev/wake-linux-x64-gnu@workspace:npm/wake-linux-x64-gnu":
+"@crab-dev/wake-linux-x64-gnu@npm:0.1.39, @crab-dev/wake-linux-x64-gnu@workspace:npm/wake-linux-x64-gnu":
   version: 0.0.0-use.local
   resolution: "@crab-dev/wake-linux-x64-gnu@workspace:npm/wake-linux-x64-gnu"
   languageName: unknown
   linkType: soft
 
-"@crab-dev/wake-win32-x64-msvc@npm:0.1.38, @crab-dev/wake-win32-x64-msvc@workspace:npm/wake-win32-x64-msvc":
+"@crab-dev/wake-win32-x64-msvc@npm:0.1.39, @crab-dev/wake-win32-x64-msvc@workspace:npm/wake-win32-x64-msvc":
   version: 0.0.0-use.local
   resolution: "@crab-dev/wake-win32-x64-msvc@workspace:npm/wake-win32-x64-msvc"
   languageName: unknown
@@ -472,7 +472,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@crab-dev/wake@workspace:npm/wake"
   dependencies:
-    "@crab-dev/css": "npm:0.1.38"
+    "@crab-dev/css": "npm:0.1.39"
     "@crab-dev/rc-alert": "npm:^0.0.2"
     "@crab-dev/rc-button": "npm:^0.0.2"
     "@crab-dev/rc-dialog": "npm:^0.0.2"
@@ -487,11 +487,11 @@ __metadata:
     "@crab-dev/rc-text-edit": "npm:^0.0.1"
     "@crab-dev/rc-tooltip": "npm:^0.0.2"
     "@crab-dev/rc-tree": "npm:^0.1.2"
-    "@crab-dev/wake-darwin-arm64": "npm:0.1.38"
-    "@crab-dev/wake-darwin-x64": "npm:0.1.38"
-    "@crab-dev/wake-linux-arm64-gnu": "npm:0.1.38"
-    "@crab-dev/wake-linux-x64-gnu": "npm:0.1.38"
-    "@crab-dev/wake-win32-x64-msvc": "npm:0.1.38"
+    "@crab-dev/wake-darwin-arm64": "npm:0.1.39"
+    "@crab-dev/wake-darwin-x64": "npm:0.1.39"
+    "@crab-dev/wake-linux-arm64-gnu": "npm:0.1.39"
+    "@crab-dev/wake-linux-x64-gnu": "npm:0.1.39"
+    "@crab-dev/wake-win32-x64-msvc": "npm:0.1.39"
     "@types/react": "npm:19.2.18"
     "@types/react-dom": "npm:19.2.4"
     clipboardy: "npm:5.3.2"
@@ -501,8 +501,8 @@ __metadata:
     react-dom: "npm:19.2.8"
     string-width: "npm:8.2.2"
   peerDependencies:
-    react: ">=19.2.8 <19.3.0"
-    react-dom: ">=19.2.8 <19.3.0"
+    react: ">=19.2.8 <19.3.0 || =19.3.0"
+    react-dom: ">=19.2.8 <19.3.0 || =19.3.0"
   dependenciesMeta:
     "@crab-dev/wake-darwin-arm64":
       optional: true
@@ -5323,6 +5323,17 @@ __metadata:
   languageName: node
   linkType: hard
 
+"react-dom@npm:19.3.0":
+  version: 19.3.0
+  resolution: "react-dom@npm:19.3.0"
+  dependencies:
+    scheduler: "npm:^0.28.0"
+  peerDependencies:
+    react: ^19.3.0
+  checksum: 10c0/c513044b724dd6bfe9500a9682d60973e7f8a48cffba00b6b16d3e910e27dcc459bf71bf0a5c33d7d62a3843ca30de1bd1e2098058aa4ed71f618a24b6061da5
+  languageName: node
+  linkType: hard
+
 "react-is@npm:^17.0.1":
   version: 17.0.2
   resolution: "react-is@npm:17.0.2"
@@ -5334,6 +5345,13 @@ __metadata:
   version: 19.2.8
   resolution: "react@npm:19.2.8"
   checksum: 10c0/5f86bdb56426652fd6d989d30a6f2e603c057272c47c9ca3a3fbe190a3a39ee9ccce937d63cfc039717abed1b8891d6a499134bc35311acc07eafdacd86537cd
+  languageName: node
+  linkType: hard
+
+"react@npm:19.3.0":
+  version: 19.3.0
+  resolution: "react@npm:19.3.0"
+  checksum: 10c0/dd3099c3c43a7122bc01223bb26b0f8d5ba13cca569af6fb94a005fb54fa73223c9cb203bb226d40cfd49a82cbeef2e36ce84062a3a6d5b9fe8f4437694c7b52
   languageName: node
   linkType: hard
 
@@ -5495,6 +5513,13 @@ __metadata:
   version: 0.27.0
   resolution: "scheduler@npm:0.27.0"
   checksum: 10c0/4f03048cb05a3c8fddc45813052251eca00688f413a3cee236d984a161da28db28ba71bd11e7a3dd02f7af84ab28d39fb311431d3b3772fed557945beb00c452
+  languageName: node
+  linkType: hard
+
+"scheduler@npm:^0.28.0":
+  version: 0.28.0
+  resolution: "scheduler@npm:0.28.0"
+  checksum: 10c0/783c8e5ce89d41273a02ed6dc0e3d24bd60e05c9e8f7e3adfc6c82e7c69935500d90e343f1ee26d592fc7504e8a2532573c6368def3e93bfe812391fa53efaf4
   languageName: node
   linkType: hard
 
@@ -6230,11 +6255,20 @@ __metadata:
   languageName: node
   linkType: hard
 
+"wake-react-19-3-conformance@workspace:fixtures/react-19-3":
+  version: 0.0.0-use.local
+  resolution: "wake-react-19-3-conformance@workspace:fixtures/react-19-3"
+  dependencies:
+    react: "npm:19.3.0"
+    react-dom: "npm:19.3.0"
+  languageName: unknown
+  linkType: soft
+
 "wake-workspace@workspace:.":
   version: 0.0.0-use.local
   resolution: "wake-workspace@workspace:."
   dependencies:
-    "@crab-dev/css": "npm:0.1.38"
+    "@crab-dev/css": "npm:0.1.39"
     "@crab-dev/rc-alert": "npm:^0.0.2"
     "@crab-dev/rc-button": "npm:^0.0.2"
     "@crab-dev/rc-card": "npm:^0.0.2"

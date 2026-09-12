@@ -46,3 +46,16 @@ Docgen 会保留递归类型解析的实际读取清单；固定输出若与入�
 `css/index.css`。裸包保持 external，本地源码进入真实 ESM/CJS 保留模块图。全部输出先在包根的
 临时 staging 中完成，随后通过备份交换一次提交；扫描、CSS、声明或写盘失败会保留上一份四目录。
 首版声明后端保留模块化 `.d.ts` 辅助文件，公开值缺少显式可证明类型时严格失败，不降级为 `any`。
+
+当前已知限制：带默认值的函数参数可能被原样保留进生成的声明，例如
+`export function value(input: number = 1): number;`。这会触发 `TS2371`，在 TypeScript 6.0.2
+也能复现，与 Yarn PnP 无关。修复前可将默认值移到函数体：
+
+```ts
+export function value(input?: number): number {
+  return input === undefined ? 1 : input;
+}
+```
+
+重新构建声明后用 `skipLibCheck: false` 验证发布产物。排除生成目录只能收窄源码检查范围，
+不能修复消费者收到的非法声明；不要把忽略声明检查作为产物已合法的证据。

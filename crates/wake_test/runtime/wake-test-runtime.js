@@ -1267,7 +1267,7 @@
     const React = wakeRequire('react')
     const ReactDOM = wakeRequire('react-dom/client')
     if (!React || typeof React.act !== 'function' || !ReactDOM || typeof ReactDOM.createRoot !== 'function') {
-      throw Object.assign(new Error('React 19.2 and react-dom/client are required by @crab-dev/wake/test/react'), { code: 'WAKE_TEST_REACT_VERSION' })
+      throw Object.assign(new Error('Supported React and react-dom/client are required by @crab-dev/wake/test/react'), { code: 'WAKE_TEST_REACT_VERSION' })
     }
     return { React, ReactDOM }
   }

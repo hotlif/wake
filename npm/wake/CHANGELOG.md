@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.39
+
+- Support matching React / React DOM 19.3.0 in Wake Test, retaining the existing 19.2.8
+  baseline and rejecting unverified releases and prereleases. Synchronize npm peer ranges.
+- Validate both React versions in DOM and system Chromium, including async act, automatic
+  and explicit cleanup, StrictMode, rerender, hooks, Suspense, transitions and hydration.
+- Document the verified TypeScript 6 API / TypeScript 7 CLI arrangement for Yarn PnP and
+  ESLint 10, and distinguish it from unresolved TS7 module resolution and declaration
+  default-parameter TS2371 issues. Those declaration issues are not fixed in this release.
+
 ## 0.1.38
 
 Versions 0.1.35–0.1.37 were stopped by release checks and were not published.

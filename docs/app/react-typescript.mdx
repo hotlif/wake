@@ -60,6 +60,79 @@ React、React DOM 和对应类型包使用一致的主版本。本教程使用 R
 
 执行 `npx tsc --noEmit`。把 `<Message title="通知" />` 暂时改成数字 title，类型检查应失败；恢复后再执行 `npx wake build --outdir dist`。这证明类型检查与生成产物是两道独立步骤。
 
+### TypeScript 与 ESLint 分开选择版本
+
+Wake 的 TS/TSX 转换不调用 TypeScript API；独立类型检查和 ESLint 的支持范围各自决定。
+截至 2026-09-12，推荐需要 ESLint 的 PnP 项目将 `typescript` 固定为 `6.0.2`。
+`typescript-eslint@8.70.0` 声明 TypeScript `>=4.8.4 <6.1.0`、ESLint
+`^8.57.0 || ^9.0.0 || ^10.0.0`；直接把它解析到 TypeScript 7 不受支持。
+上游范围见 [typescript-eslint 依赖要求](https://typescript-eslint.io/users/dependency-versions/)。
+
+本次隔离验证使用 Windows、Node 22.15.0、Yarn 4.18.0 strict PnP、ESM：
+
+| 用途 | 精确依赖 | 验证 |
+| --- | --- | --- |
+| ESLint 与 JS API | TypeScript 6.0.2、ESLint 10.10.0、typescript-eslint 8.70.0 | typed lint 正例通过；未处理 Promise 被规则拒绝 |
+| 独立 TS7 CLI | `@typescript/native: npm:typescript@7.0.2` | 报告 7.0.2；无外部包导入的严格类型 fixture 通过 |
+
+要同时安装两个编译器，可使用以下依赖声明。这里的 `@typescript/native` 是项目定义的别名：
+
+```json title="package.json 的 devDependencies"
+{
+  "typescript": "6.0.2",
+  "@typescript/native": "npm:typescript@7.0.2",
+  "eslint": "10.10.0",
+  "typescript-eslint": "8.70.0"
+}
+```
+
+把 `typescript` 这个 peer 名称留给 TS6；仅添加一个 TS6 别名不能改变 ESLint 实际解析到的
+TypeScript。各 workspace 的直接依赖和共享 ESLint preset 的 peer 必须一起对齐，不能通过忽略
+peer 警告宣称已兼容。Wake 仓库不包含 `@crab-dev/standards-eslint-preset`，该预设需要在其所属
+仓库独立验证；这里的结果不覆盖所有第三方规则。
+
+两个包提供的 CLI 名称可能相同，调用 TS7 时显式定位别名，避免依赖二进制选择顺序：
+
+```js title="scripts/typecheck-ts7.mjs"
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+
+const require = createRequire(import.meta.url);
+const compiler = resolve(dirname(require.resolve("@typescript/native/package.json")), "bin/tsc");
+execFileSync(process.execPath, [compiler, "-p", "tsconfig.json", "--pretty", "false"], {
+  stdio: "inherit",
+});
+```
+
+通过 `corepack yarn node scripts/typecheck-ts7.mjs` 启动，保留 Yarn 的 PnP 加载环境。
+
+### TS7 / PnP 的模块解析边界
+
+上述并行安装解决的是 ESLint API 依赖，不保证 TS7 原生编译器能解析整个 PnP 项目。
+Wake 仓库的 `typescript:7:check` 显式将 `react`、`react/*`、`csstype` 映射到 PnP 解析出的
+物理类型路径，并准备了需要的 unplugged 包。同一 fixture 去掉这层映射后，直接运行 TS7
+仍可复现 `TS2307`（react）和 JSX 类型错误。因此该门禁只证明指定 fixture 的兼容性。
+
+项目出现模块错误时，分别检查执行 workspace 是否声明所需依赖、React 类型包是否安装、
+共享 `extends` 是否实际加载，以及 `exports.types` 入口是否可达。用实际编译器的
+`--showConfig`、`--traceResolution` 和 `--listFilesOnly` 保留证据；不要只检查 Wake 构建结果。
+TS7 下共享配置如果位于 PnP zip 中，也需要单独证明可读取。没有原项目的解析日志，不能把
+`react`、`@crab-dev/wake/test` 和 `@crab-dev/css` 的缺失认定为同一个原因。
+
+需要立即恢复完整 PnP 检查时，可先使用 TS6；Wake 仓库的 TS6 类型门禁通过
+`yarn exec pnpify tsc` 执行。保留 TS7 时，应为项目明确准备可访问的依赖和类型路径并逐项验证；
+Wake 尚不提供自动覆盖任意 PnP 包图及共享配置的 TS7 解析桥接。
+
+### 生成声明与源码检查
+
+源码配置使用窄范围 `include: ["src"]`，并按项目输出显式排除 `declarations`、`esm`、`cjs`、
+`dist`。`exclude` 只影响文件发现，被源码导入或通过包类型入口引用的文件仍会进入检查。
+用 `--listFilesOnly` 确认 `declarations/_wake/` 的进入路径。
+
+生成声明中的 `TS2371` 属于语法合法性问题，不会因切换模块解析或降低 TypeScript 版本消失。
+默认参数的已知声明生成限制和临时写法见 [Library CLI](/reference/cli/library)。
+
 ## 下一步
 
 为组件添加[React 测试](/testing/react)，或者了解[模块解析](/app/modules)。

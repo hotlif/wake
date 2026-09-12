@@ -5207,7 +5207,7 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
             TestError::new(
                 "WAKE_TEST_REACT_VERSION",
                 format!(
-                    "{package} is required by @crab-dev/wake/test/react; install matching react and react-dom >=19.2.8 <19.3.0 ({error})"
+                    "{package} is required by @crab-dev/wake/test/react; install matching react and react-dom >=19.2.8 <19.3.0 || =19.3.0 ({error})"
                 ),
             )
             .at(importer)
@@ -5216,8 +5216,10 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
     }
 
     fn supported(version: &str) -> bool {
-        let core = version.split_once('-').map_or(version, |(core, _)| core);
-        let mut parts = core.split('.').map(str::parse::<u64>);
+        if version == "19.3.0" {
+            return true;
+        }
+        let mut parts = version.split('.').map(str::parse::<u64>);
         matches!(
             (parts.next(), parts.next(), parts.next(), parts.next()),
             (Some(Ok(19)), Some(Ok(2)), Some(Ok(patch)), None) if patch >= 8
@@ -5230,7 +5232,7 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
         return Err(TestError::new(
             "WAKE_TEST_REACT_VERSION",
             format!(
-                "Wake Test requires one matching react/react-dom version >=19.2.8 <19.3.0; resolved react {react:?} at {} and react-dom {react_dom:?} at {}",
+                "Wake Test requires one matching react/react-dom version >=19.2.8 <19.3.0 || =19.3.0; resolved react {react:?} at {} and react-dom {react_dom:?} at {}",
                 react_manifest.display(),
                 react_dom_manifest.display()
             ),
@@ -8084,6 +8086,43 @@ environment = "dom"
         let error = run_tests(options(fixture.path())).unwrap_err();
         assert_eq!(error.code(), "WAKE_TEST_REACT_VERSION");
         assert!(error.to_string().contains("react-dom \"19.2.7\""));
+    }
+
+    #[test]
+    fn react_version_gate_keeps_verified_releases_and_matching_versions() {
+        for (react, react_dom, accepted) in [
+            ("19.2.8", "19.2.8", true),
+            ("19.2.9", "19.2.9", true),
+            ("19.3.0", "19.3.0", true),
+            ("19.3.0", "19.2.8", false),
+            ("19.2.7", "19.2.7", false),
+            ("19.3.1", "19.3.1", false),
+            ("19.4.0", "19.4.0", false),
+            ("20.0.0", "20.0.0", false),
+            ("19.3.0-rc.0", "19.3.0-rc.0", false),
+            ("19.2.8-canary", "19.2.8-canary", false),
+            ("19.3", "19.3", false),
+        ] {
+            let fixture = fixture("");
+            for (package, version) in [("react", react), ("react-dom", react_dom)] {
+                let directory = fixture.path().join("node_modules").join(package);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(
+                    directory.join("package.json"),
+                    serde_json::json!({"name": package, "version": version}).to_string(),
+                )
+                .unwrap();
+            }
+            let result = validate_react_versions(&fixture.path().join("math.test.ts"));
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "react {react}, react-dom {react_dom}: {result:?}"
+            );
+            if let Err(error) = result {
+                assert_eq!(error.code(), "WAKE_TEST_REACT_VERSION");
+            }
+        }
     }
 
     #[test]

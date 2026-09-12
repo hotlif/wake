@@ -72,6 +72,6 @@ import { render, renderHook, screen, within, userEvent, fireEvent, act, waitFor,
 | act / waitFor / waitForElementToBeRemoved | 等待更新、断言成立或元素移除 |
 | cleanup / prettyDOM | 卸载测试树、格式化 DOM |
 
-render options 包括 container、baseElement、hydrate、strict、wrapper、identifierPrefix 和 React 错误回调。操作使用异步 act，默认测试后清理挂载。react 与 react-dom 必须来自匹配的项目实例、版本相同且满足 `>=19.2.8 <19.3.0`。
+render options 包括 container、baseElement、hydrate、strict、wrapper、identifierPrefix 和 React 错误回调。操作使用异步 act，默认测试后清理挂载。react 与 react-dom 必须来自匹配的项目实例、版本相同且满足 `>=19.2.8 <19.3.0 || =19.3.0`。已发布版本与当前源码的区别见 [React 版本支持](/testing/react)。预发布版本不在支持范围。
 
 DOM 和 browser 的选择见[环境教程](/testing/environments)，运行参数见[test 命令](/reference/cli/test)。

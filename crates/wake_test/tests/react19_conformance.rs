@@ -12,9 +12,35 @@ fn repository_root() -> &'static Path {
 
 #[test]
 fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
+    react_conformance("19.2.8", "dom");
+}
+
+#[test]
+fn react_19_3_dom_conformance() {
+    react_conformance("19.3.0", "dom");
+}
+
+#[test]
+#[ignore = "requires an installed system Chromium browser"]
+fn react_19_browser_conformance() {
+    react_conformance("19.2.8", "browser");
+}
+
+#[test]
+#[ignore = "requires an installed system Chromium browser"]
+fn react_19_3_browser_conformance() {
+    react_conformance("19.3.0", "browser");
+}
+
+fn react_conformance(version: &str, environment: &str) {
+    let parent = repository_root().join(if version == "19.3.0" {
+        "fixtures/react-19-3"
+    } else {
+        "target"
+    });
     let fixture = tempfile::Builder::new()
         .prefix("wake-react19-conformance-")
-        .tempdir_in(repository_root().join("target"))
+        .tempdir_in(parent)
         .unwrap();
     fs::write(fixture.path().join("package.json"), "{}").unwrap();
     fs::write(
@@ -34,7 +60,7 @@ fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
               useState,
               useTransition,
             } from 'react'
-            import {createPortal} from 'react-dom'
+            import {createPortal, flushSync} from 'react-dom'
             import {createRoot, hydrateRoot} from 'react-dom/client'
             import {renderToReadableStream, renderToString} from 'react-dom/server'
             import {prerender} from 'react-dom/static'
@@ -48,6 +74,38 @@ fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
               test,
               userEvent,
             } from '@crab-dev/wake/test/react'
+
+            let automaticCleanups = 0
+            test('act flushes updates and rerender preserves state before explicit unmount', async () => {
+              expect(globalThis.IS_REACT_ACT_ENVIRONMENT).toBe(true)
+              let update
+              function Counter({label}) {
+                const [count, setCount] = useState(0)
+                update = setCount
+                return <output>{label}: {count}</output>
+              }
+              const view = await render(<Counter label="first" />, {strict: true})
+              await act(async () => { await Promise.resolve(); update(2) })
+              expect(screen.getByText('first: 2')).toBeInTheDocument()
+              await view.rerender(<Counter label="second" />)
+              expect(screen.getByText('second: 2')).toBeInTheDocument()
+              await view.unmount()
+              expect(screen.queryByText('second: 2')).toBe(null)
+            })
+
+            test('leave a mount for automatic cleanup', async () => {
+              function AutomaticCleanup() {
+                useEffect(() => () => { automaticCleanups++ }, [])
+                return <output>automatic cleanup marker</output>
+              }
+              await render(<AutomaticCleanup />)
+              expect(automaticCleanups).toBe(0)
+            })
+
+            test('the next test observes unmount and an empty document', () => {
+              expect(automaticCleanups).toBe(1)
+              expect(screen.queryByText('automatic cleanup marker')).toBe(null)
+            })
 
             test('StrictMode repeats render, effect, layout effect, and ref setup with cleanup', async () => {
               expect(globalThis.Deno).toBe(undefined)
@@ -200,7 +258,10 @@ fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
               // React 19.2's act() owns thrown render errors and therefore does not also call the
               // root callback. Wake's render helper preserves that official behavior.
               expect(uncaught.length).toBe(0)
+            })
 
+            test('raw roots report uncaught errors outside act', () => {
+              function Broken() { throw new Error('expected render failure') }
               const rawContainer = document.createElement('div')
               document.body.appendChild(rawContainer)
               const rawUncaught = []
@@ -210,8 +271,7 @@ fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
                 const rawRoot = createRoot(rawContainer, {
                   onUncaughtError(error, info) { rawUncaught.push([error.message, info.componentStack]) },
                 })
-                rawRoot.render(<Broken />)
-                await new Promise(resolve => setTimeout(resolve, 20))
+                flushSync(() => rawRoot.render(<Broken />))
                 expect(rawUncaught.length).toBe(1)
                 expect(rawUncaught[0][0]).toBe('expected render failure')
                 expect(rawUncaught[0][1]).toContain('Broken')
@@ -287,13 +347,35 @@ fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
     let result = run_tests(TestOptions {
         root: Some(fixture.path().to_path_buf()),
         patterns: vec!["react19.test.tsx".to_string()],
-        environment: Some("dom".to_string()),
+        environment: Some(environment.to_string()),
+        browser_path: std::env::var_os("WAKE_SYSTEM_BROWSER_PATH")
+            .filter(|path| !path.is_empty())
+            .map(Into::into),
         serial: true,
         ..TestOptions::default()
     })
     .unwrap();
-    assert!(result.success, "{result:#?}");
-    assert_eq!(result.counts.tests.passed, 8, "{result:#?}");
-    assert_eq!(result.environment.react.as_deref(), Some("19.2.8"));
-    assert_eq!(result.environment.react_dom.as_deref(), Some("19.2.8"));
+    let failures: Vec<_> = result
+        .suites
+        .iter()
+        .flat_map(|suite| &suite.tests)
+        .filter(|test| !test.failures.is_empty())
+        .collect();
+    assert!(
+        result.success,
+        "React {version} / {environment}: {failures:#?}; {:?}",
+        result.diagnostics
+    );
+    assert_eq!(result.counts.tests.passed, 12, "{result:#?}");
+    assert_eq!(result.environment.react.as_deref(), Some(version));
+    assert_eq!(result.environment.react_dom.as_deref(), Some(version));
+    if environment == "browser" {
+        let browser = result
+            .environment
+            .browser
+            .as_ref()
+            .expect("real browser identity");
+        assert!(!browser.version.is_empty());
+        eprintln!("React {version}: {browser:#?}");
+    }
 }

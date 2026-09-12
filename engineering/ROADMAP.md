@@ -104,6 +104,19 @@ local tarball 和发布后 registry smoke 都覆盖 22.14.0/24/26。发布门禁
 代理项、代理对、字符串键、模板 cooked/raw、常量折叠，以及普通/压缩/缓存产物的运行时一致性。
 在对应契约和测试落地前，不宣称完整 UTF-16 字符串兼容。
 
+# R7 — 声明与 TS7/PnP 兼容（P1）
+
+2026-09-12 已复现，后续验收：
+
+- 声明默认参数：`parse_declaration_facts` 将
+  `export function value(input: number = 1): number { return input; }` 输出为带 initializer 的
+  函数声明，TypeScript 6.0.2 报 TS2371。需在 ADR 0040 的 parser-owned 模型中处理普通函数、
+  arrow、方法、构造器及解构参数的默认值、可选性与类型引用，再以真实 TS6/TS7 检查发布声明。
+  此问题独立于 React 19.3 适配，当前尚未修复。
+- TS7 / PnP：当前 TS7 门禁显式映射 React 类型；直接对同一 fixture 执行 TS7 仍报 TS2307。
+  任意 PnP zip 包、共享 tsconfig、Wake/CSS 包类型入口的通用解析尚无完整验证。
+  TS6 API 与 TS7 CLI 并行方案仅解决工具依赖选择，不能替代模块解析证据。
+
 # 非路线图事项
 
 以下内容没有当前承诺：稳定 Rust 插件 ABI、任意 JS 配置执行、完整 Sass/Less 内建链、冻结 experimental AST schema。提出这些能力前需单独设计、兼容性和安全评审。

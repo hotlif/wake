@@ -10,10 +10,22 @@ import { ResultPanel } from "../site/components.tsx"
 # 测试 React 组件
 
 <ResultPanel title="一个验证点击计数的组件测试" label="完成效果">
-测试会渲染 Counter、点击按钮并验证计数变化。准备 React 和 React DOM 同版本，满足 `>=19.2.8 <19.3.0`，再使用[项目结构](/app/project-structure)中的独立 Counter 组件。
+测试会渲染 Counter、点击按钮并验证计数变化。准备 React 和 React DOM 同版本，满足 `>=19.2.8 <19.3.0 || =19.3.0`，再使用[项目结构](/app/project-structure)中的独立 Counter 组件。
 </ResultPanel>
 
-## 创建交互测试
+## 版本支持
+
+| Wake 版本 | React / React DOM 范围 | 验证边界 |
+| --- | --- | --- |
+| 0.1.38 | `>=19.2.8 <19.3.0` | 固定 19.2.8 conformance |
+| 0.1.39 | `>=19.2.8 <19.3.0` 或 `19.3.0` | 19.2.8 与 19.3.0 的 DOM / browser 适配回归 |
+
+两包必须版本完全一致。19.3.0 支持覆盖异步 act、自动和手动 cleanup、StrictMode、
+rerender、unmount、hook、Suspense、transition 与 hydration；不意味着 fast DOM 支持全部
+19.3 浏览器 API。View Transitions、布局和原生输入仍需真实 browser 验证。
+未验证的 19.3 后续补丁和 19.4 不自动进入支持范围。
+
+## 编写测试
 
 ```tsx title="src/Counter.test.tsx"
 import { expect, test } from "@crab-dev/wake/test";
