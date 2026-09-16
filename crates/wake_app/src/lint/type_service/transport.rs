@@ -532,8 +532,13 @@ mod tests {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded["data"].as_str().unwrap())
             .unwrap();
-        let wire =
-            super::super::wire::WireSource::parse(&bytes, source_text, Path::new(&source)).unwrap();
+        let wire = super::super::wire::WireSource::parse(
+            &bytes,
+            source_text,
+            Path::new(&source),
+            initialized["useCaseSensitiveFileNames"].as_bool().unwrap(),
+        )
+        .unwrap();
         let span = wake_common::Span::new(
             source_text.rfind("read()").unwrap() as u32,
             (source_text.len() - 1) as u32,

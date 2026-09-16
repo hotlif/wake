@@ -166,11 +166,11 @@ fn structural(
     let mut names = vec![None; parsed.syntax.len()];
     for node in &parsed.syntax {
         match node.kind {
-            SourceNodeKind::TsTypeArguments | SourceNodeKind::TsTypeParameters => {
-                if node.span.hi > node.span.lo + 1 {
-                    depth.add(node.span.lo + 1, node.span.hi - 1);
-                    closing.insert(node.span.hi - 1);
-                }
+            SourceNodeKind::TsTypeArguments | SourceNodeKind::TsTypeParameters
+                if node.span.hi > node.span.lo + 1 =>
+            {
+                depth.add(node.span.lo + 1, node.span.hi - 1);
+                closing.insert(node.span.hi - 1);
             }
             SourceNodeKind::JsxName => {
                 if let Some(parent) = node.parent

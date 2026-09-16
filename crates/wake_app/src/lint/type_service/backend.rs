@@ -279,7 +279,7 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
-        service
+        let initialized = service
             .request("initialize", Value::Null, |method, path| {
                 fs.callback(method, path)
             })
@@ -312,7 +312,13 @@ mod tests {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded["data"].as_str().unwrap())
             .unwrap();
-        let wire = WireSource::parse(&bytes, source, &file).unwrap();
+        let wire = WireSource::parse(
+            &bytes,
+            source,
+            &file,
+            initialized["useCaseSensitiveFileNames"].as_bool().unwrap(),
+        )
+        .unwrap();
         let address = wire
             .address(
                 214,

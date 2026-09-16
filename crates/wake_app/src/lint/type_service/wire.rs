@@ -85,6 +85,7 @@ impl<'source> WireSource<'source> {
         bytes: &[u8],
         source: &'source str,
         path: &Path,
+        case_sensitive: bool,
     ) -> Result<Self, WakeError> {
         let offsets = Offsets::new(source)?;
         let word = |offset: usize| -> Result<u32, WakeError> {
@@ -104,15 +105,15 @@ impl<'source> WireSource<'source> {
         let extended = word(32)? as usize;
         let structured = word(36)? as usize;
         let nodes = word(40)? as usize;
-        if !(44 <= table
+        let sections_valid = 44 <= table
             && table <= strings
             && strings <= extended
             && extended <= structured
             && structured <= nodes
-            && nodes <= bytes.len())
-            || !(strings - table).is_multiple_of(4)
-            || !(bytes.len() - nodes).is_multiple_of(28)
-        {
+            && nodes <= bytes.len()
+            && (strings - table).is_multiple_of(4)
+            && (bytes.len() - nodes).is_multiple_of(28);
+        if !sections_valid {
             return Err(invalid("invalid wire section offsets"));
         }
         let count = (bytes.len() - nodes) / 28;
@@ -163,12 +164,13 @@ impl<'source> WireSource<'source> {
         let native_path = backend_path;
         let actual = wake_common::fs::normalize(Path::new(&native_path));
         let expected = wake_common::fs::normalize(path);
-        #[cfg(windows)]
-        let matches = actual
-            .as_os_str()
-            .eq_ignore_ascii_case(expected.as_os_str());
-        #[cfg(not(windows))]
-        let matches = actual == expected;
+        let matches = if case_sensitive {
+            actual == expected
+        } else {
+            actual
+                .as_os_str()
+                .eq_ignore_ascii_case(expected.as_os_str())
+        };
         if !actual.is_absolute() || !matches || backend_path.contains('\0') {
             return Err(invalid(&format!(
                 "backend path differs from the requested source: {} != {}",
@@ -600,7 +602,7 @@ mod tests {
                     .copy_from_slice(&value.to_le_bytes());
             }
         }
-        let wire = WireSource::parse(&bytes, "f(1)", &path).unwrap();
+        let wire = WireSource::parse(&bytes, "f(1)", &path, true).unwrap();
         let call = Span::new(0, 4);
         assert!(
             wire.head_address(214, call, Span::new(0, 1))
@@ -615,7 +617,7 @@ mod tests {
         assert!(wire.child_address(214, call, Span::new(2, 4)).is_err());
         assert!(wire.child_address(214, call, Span::new(0, 5)).is_err());
         bytes[nodes + 5 * 28 + 16..nodes + 5 * 28 + 20].copy_from_slice(&2u32.to_le_bytes());
-        let ambiguous = WireSource::parse(&bytes, "f(1)", &path).unwrap();
+        let ambiguous = WireSource::parse(&bytes, "f(1)", &path, true).unwrap();
         assert!(ambiguous.head_address(214, call, Span::new(0, 1)).is_err());
     }
 
@@ -632,7 +634,7 @@ mod tests {
             full_start,
             source[..end].encode_utf16().count() as u32,
         );
-        let wire = WireSource::parse(&bytes, source, &path).unwrap();
+        let wire = WireSource::parse(&bytes, source, &path, true).unwrap();
         let span = wake_common::Span::new(start as u32, end as u32);
         let address = wire.address(214, span).unwrap();
         assert!(address.starts_with("2.214."));
@@ -654,18 +656,18 @@ mod tests {
             )
             .is_err()
         );
-        assert!(WireSource::parse(&bytes, "/* changed */\r\nrun();", &path).is_err());
-        assert!(WireSource::parse(&bytes, source, &path.with_file_name("other.ts")).is_err());
+        assert!(WireSource::parse(&bytes, "/* changed */\r\nrun();", &path, true).is_err());
+        assert!(WireSource::parse(&bytes, source, &path.with_file_name("other.ts"), true).is_err());
         for mutate in [0usize, 24, 28, 32, 36, 40] {
             let mut bad = bytes.clone();
             bad[mutate..mutate + 4].copy_from_slice(&u32::MAX.to_le_bytes());
             assert!(
-                WireSource::parse(&bad, source, &path).is_err(),
+                WireSource::parse(&bad, source, &path, true).is_err(),
                 "header offset {mutate}"
             );
         }
         for length in 0..bytes.len() {
-            if let Ok(partial) = WireSource::parse(&bytes[..length], source, &path) {
+            if let Ok(partial) = WireSource::parse(&bytes[..length], source, &path, true) {
                 assert!(
                     partial.address(214, span).is_err(),
                     "truncated address table {length}"
@@ -677,9 +679,23 @@ mod tests {
             WireSource::parse(
                 &fixture(source, &path.to_string_lossy(), midpoint, midpoint),
                 source,
-                &path
+                &path,
+                true
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn source_paths_follow_the_initialized_backend_case_policy() {
+        let source = "f()";
+        let path = std::env::temp_dir().join("WireCase").join("Input.ts");
+        let backend = path.to_string_lossy().to_ascii_lowercase();
+        let bytes = fixture(source, &backend, 0, 3);
+        assert!(WireSource::parse(&bytes, source, &path, false).is_ok());
+        assert!(WireSource::parse(&bytes, source, &path, true).is_err());
+        assert!(
+            WireSource::parse(&bytes, source, &path.with_file_name("other.ts"), false).is_err()
         );
     }
 
@@ -692,8 +708,13 @@ mod tests {
             ("//?/UNC/server/share/a.ts", r"\\server\share\a.ts"),
         ] {
             assert!(
-                WireSource::parse(&fixture(source, backend, 0, 3), source, Path::new(input))
-                    .is_ok(),
+                WireSource::parse(
+                    &fixture(source, backend, 0, 3),
+                    source,
+                    Path::new(input),
+                    false
+                )
+                .is_ok(),
                 "{backend}"
             );
         }

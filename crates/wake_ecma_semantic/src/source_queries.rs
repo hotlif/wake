@@ -231,14 +231,14 @@ impl QueryCollector {
                         && span.hi <= region.span.hi
                         && resolved.is_some_and(|id| source_symbols.contains(&id))
                 });
+                let complete_source = ambient_local
+                    || signature_source
+                    || (incomplete_external_names.contains(&name)
+                        && !blocked_by_local_region
+                        && resolved.is_some_and(|id| source_symbols.contains(&id)));
                 let unavailable = unknown.get(unknown_index).is_some_and(|range| {
                     range.lo < span.hi && span.lo < range.hi && !ambient_local && !signature_source
-                }) || (incomplete_names.contains(&name)
-                    && !ambient_local
-                    && !signature_source
-                    && !(incomplete_external_names.contains(&name)
-                        && !blocked_by_local_region
-                        && resolved.is_some_and(|id| source_symbols.contains(&id))));
+                }) || (incomplete_names.contains(&name) && !complete_source);
                 if unavailable {
                     return SourceTypeQuery {
                         name,

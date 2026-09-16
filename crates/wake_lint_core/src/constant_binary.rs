@@ -36,8 +36,7 @@ pub(crate) fn check(expression: Expression<'_>, interner: &Interner) -> Option<&
                 || (strict
                     && (left_fresh || right_fresh || types(value.left) & types(value.right) == 0))
                 || (loose
-                    && ((left_fresh && right_fresh)
-                        || (left_fresh && nullish(value.right) == Some(true))
+                    && ((left_fresh && (right_fresh || nullish(value.right) == Some(true)))
                         || (right_fresh && nullish(value.left) == Some(true))));
             fixed.then_some("constant-comparison")
         }

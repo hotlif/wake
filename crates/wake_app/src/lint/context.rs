@@ -411,7 +411,11 @@ mod tests {
         .unwrap();
         context.check(CancellationToken::default()).unwrap();
         let first = context.watch_dependencies();
-        assert!(first.contains(&wake_common::fs::normalize(&root.path().join("missing.ts"))));
+        let canonical_root = wake_common::fs::normalize(&root.path().canonicalize().unwrap());
+        assert!(
+            first.contains(&canonical_root.join("missing.ts")),
+            "{first:?}"
+        );
         let obsolete = context.prepare_check(CancellationToken::default()).unwrap();
         context.invalidate().unwrap();
         assert_eq!(obsolete.run().unwrap_err().code, "WAKE_CANCELLED");
@@ -426,8 +430,11 @@ mod tests {
             "WAKE_LINT_ANALYSIS"
         );
         let failed = context.watch_dependencies();
-        assert!(failed.contains(&wake_common::fs::normalize(&root.path().join(".pnp.cjs"))));
-        assert!(!failed.contains(&wake_common::fs::normalize(&root.path().join("missing.ts"))));
+        assert!(
+            failed.contains(&canonical_root.join(".pnp.cjs")),
+            "{failed:?}"
+        );
+        assert!(!failed.contains(&canonical_root.join("missing.ts")));
         std::fs::write(
             root.path().join("wake.config.toml"),
             "[lint]\nrecommended=false",

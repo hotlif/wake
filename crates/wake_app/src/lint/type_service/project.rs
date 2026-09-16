@@ -282,7 +282,7 @@ impl TypeProject {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(failure)?;
-            WireSource::parse(&bytes, source, file)
+            WireSource::parse(&bytes, source, file, self.case_sensitive)
         })();
         if result.is_err() {
             self.process.shutdown();
