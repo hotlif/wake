@@ -152,7 +152,10 @@ test('package metadata has no runtime dependencies and publishes only artifacts'
   )
 
   assert.equal(packageJson.name, '@crab-dev/css')
-  assert.equal(packageJson.version, '0.1.39')
+  const workspaceJson = JSON.parse(
+    await readFile(new URL('../../../package.json', import.meta.url), 'utf8'),
+  )
+  assert.equal(packageJson.version, workspaceJson.version)
   assert.equal(packageJson.sideEffects, false)
   assert.equal(packageJson.dependencies, undefined)
   assert.deepEqual(packageJson.files, [
