@@ -1,10 +1,12 @@
 # Changelog
 
-## 0.1.42
+## 0.1.43
 
-Versions 0.1.40 and 0.1.41 were stopped before publication during release validation and were not published.
+Versions 0.1.40–0.1.42 were stopped during release validation and were not published.
 The final candidate also includes SDK repository metadata required for npm provenance.
 
+- Hold early browser requests until the network bridge is installed, within the existing timeout
+  budget, fixing an intermittent browser startup failure caught by release smoke tests.
 - Add experimental native lint with 77 baseline rules, CLI/Node APIs, declarative configuration,
   safe fixes, caching, suppressions, baselines, watch mode and native TypeScript analysis.
 - Add LSP quick fixes, the source VS Code client, Markdown diagnostics and the standalone
