@@ -1,6 +1,6 @@
 # Wake 原生 lint 实施契约
 
-状态：实施中。0.1.40 以实验性能力交付 `wake lint` 和 Node 入口；完整 P0–P7 尚未完成。
+状态：实施中。0.1.41 以实验性能力交付 `wake lint` 和 Node 入口；完整 P0–P7 尚未完成。
 长期候选边界见 [ADR 0049](decisions/0049-native-lint-product.md)。
 
 ## 范围与完成定义

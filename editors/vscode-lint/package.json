@@ -2,7 +2,7 @@
   "name": "wake-lint",
   "displayName": "Wake Lint",
   "description": "Native Wake lint diagnostics for JavaScript and TypeScript.",
-  "version": "0.1.40",
+  "version": "0.1.41",
   "publisher": "wake",
   "private": true,
   "license": "MIT OR Apache-2.0",

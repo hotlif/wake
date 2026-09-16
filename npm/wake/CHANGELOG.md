@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.41
+
+Version 0.1.40 was stopped before publication by release checks and was not published.
+
+- Add experimental native lint with 77 baseline rules, CLI/Node APIs, declarative configuration,
+  safe fixes, caching, suppressions, baselines, watch mode and native TypeScript analysis.
+- Add LSP quick fixes, the source VS Code client, Markdown diagnostics and the standalone
+  `@crab-dev/wake-lint-sdk`. Automatic third-party rule loading remains future work.
+- Preserve source semantic facts and UTF-16 JavaScript strings, templates and import attributes.
+  Advanced type semantics and runtime static module specifier migration remain incomplete.
+- Honor the native type backend's path case policy, verify with Rust 1.95, and publish the SDK
+  alongside the existing audited packages. This release does not claim full ESLint compatibility.
+
 ## 0.1.39
 
 - Support matching React / React DOM 19.3.0 in Wake Test, retaining the existing 19.2.8
