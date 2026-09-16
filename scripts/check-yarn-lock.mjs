@@ -61,6 +61,7 @@ const workspacePaths = [
     .filter((entry) => entry.isDirectory() && existsSync(join(root, 'npm', entry.name, 'package.json')))
     .map((entry) => `npm/${entry.name}`),
   'editors/vscode-css',
+  'editors/vscode-lint',
 ]
 const workspaces = new Map(workspacePaths.map((path) => {
   const workspace = JSON.parse(readFileSync(join(root, path, 'package.json'), 'utf8'))

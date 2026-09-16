@@ -14,9 +14,11 @@ import { verifyNativePackage } from './verify-native-package.mjs'
 const root = resolve(import.meta.dirname, '..')
 const wakePackageDir = 'npm/wake'
 const cssPackageDir = 'npm/css'
+const sdkPackageDir = 'npm/wake-lint-sdk'
 const allPackageDirs = [
   cssPackageDir,
   wakePackageDir,
+  sdkPackageDir,
   'npm/wake-win32-x64-msvc',
   'npm/wake-linux-x64-gnu',
   'npm/wake-linux-arm64-gnu',
@@ -87,7 +89,8 @@ const npmPrefix = []
 for (const { directory, value: packageManifest } of manifests) {
   const isWake = directory === wakePackageDir
   const isCss = directory === cssPackageDir
-  const isJavaScript = isWake || isCss
+  const isSdk = directory === sdkPackageDir
+  const isJavaScript = isWake || isCss || isSdk
   const nativeVerification = isJavaScript
     ? undefined
     : verifyNativePackage(resolve(root, directory))
@@ -142,6 +145,19 @@ for (const { directory, value: packageManifest } of manifests) {
       throw new Error(`${directory} must contain exactly: ${expected.join(', ')}`)
     }
   }
+  if (isSdk) {
+    const expected = [
+      'LICENSE-APACHE',
+      'LICENSE-MIT',
+      'README.md',
+      'index.d.ts',
+      'index.mjs',
+      'package.json',
+    ]
+    if (JSON.stringify(files.slice().sort()) !== JSON.stringify(expected)) {
+      throw new Error(`${directory} must contain exactly: ${expected.join(', ')}`)
+    }
+  }
   if (!isJavaScript && nativeFiles.length !== 1) {
     throw new Error(`${directory} must contain exactly one native binary`)
   }
@@ -160,7 +176,7 @@ for (const { directory, value: packageManifest } of manifests) {
       throw new Error(`${directory} test host must be executable`)
     }
   }
-  const limit = isCss
+  const limit = isCss || isSdk
     ? 128 * 1024
     : isWake
       ? 500 * 1024

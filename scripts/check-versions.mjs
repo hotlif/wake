@@ -24,6 +24,7 @@ function cargoPackage(name) {
 const publishedDirectories = [
   'npm/css',
   'npm/wake',
+  'npm/wake-lint-sdk',
   'npm/wake-win32-x64-msvc',
   'npm/wake-linux-x64-gnu',
   'npm/wake-linux-arm64-gnu',
@@ -231,7 +232,9 @@ for (const manifest of [workspaceManifest, mainManifest]) {
   }
 }
 const platformNames = [...manifests.keys()]
-  .filter((name) => name.startsWith('@crab-dev/wake-'))
+  // The lint SDK is a published Wake package, but it is not a native platform
+  // package and must not be mirrored into @crab-dev/wake optionalDependencies.
+  .filter((name) => name.startsWith('@crab-dev/wake-') && name !== '@crab-dev/wake-lint-sdk')
   .sort()
 const optionalNames = Object.keys(mainManifest.optionalDependencies ?? {}).sort()
 if (JSON.stringify(optionalNames) !== JSON.stringify(platformNames)) {

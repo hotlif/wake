@@ -201,6 +201,41 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
 
+  lint-product:
+    name: native lint product / ${{ matrix.os }}
+    needs: yarn-pnp
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-product-${{ matrix.os }}
+      - run: npm install --global corepack@0.34.6 --force
+      - run: corepack yarn install --immutable --check-cache
+      - run: node scripts/find-native-typescript.mjs --github-env
+      - run: node --test scripts/find-native-typescript.test.mjs
+      - run: cargo fetch --locked
+      - run: cargo build -p wake_cli -p wake_lint_lsp --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: cargo test -p wake_lint_core -p wake_app --test lint -p wake_lint_lsp --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: cargo test -p wake_app --lib lint::type_service --locked --offline -- --ignored
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: node scripts/lint-real-project-smoke.mjs
+      - run: node scripts/lint-lsp-smoke.mjs
+      - run: node --test scripts/lint-migration-report.test.mjs npm/wake-lint-sdk/test/index.test.mjs
+
   test262-es2024:
     name: selected Test262 ES2024 / embedded V8
     needs: yarn-pnp

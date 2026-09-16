@@ -27,6 +27,45 @@ import { validateSkill } from './check-skills.mjs'
 
 const decision = 'engineering/decisions/0044-architecture-decision-routing.md'
 const indexed = (status = 'accepted') => ({ status, indexed: true })
+
+test('npm release publishes the audited lint SDK before the root package', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/release-npm.yml', import.meta.url), 'utf8')
+  const publish = workflow.match(/^  publish:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:\r?$)/m)?.[0]
+  assert.ok(publish, 'the npm release must retain its gated publish job')
+  const sdk = 'npm publish "./artifacts/crab-dev-wake-lint-sdk-${{ needs.verify.outputs.version }}.tgz"'
+  const root = 'npm publish "./artifacts/crab-dev-wake-${{ needs.verify.outputs.version }}.tgz"'
+  assert.ok(publish.includes(sdk), 'packing and auditing the SDK does not publish it')
+  assert.ok(publish.indexOf(sdk) < publish.indexOf(root), 'the root package must remain last')
+})
+
+test('lint cache persists opaque bytes without depending on analysis owners', () => {
+  const saved = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
+  const rule = saved.rules.find((candidate) => candidate.id === 'lint-cache-keeps-payloads-opaque')
+  assert.ok(rule, 'lint cache payload ownership needs an enforced boundary')
+  const names = ['wake_cache', 'wake_common', 'wake_lint_core', 'wake_ecma_parser', 'wake_ecma_semantic', 'wake_app']
+  const fixture = policy({ crates: names, groups: {}, rules: [rule] })
+  for (const owner of names.slice(2, 5)) {
+    const packages = new Map(names.map((name) => [name, new Set()]))
+    packages.get('wake_cache').add('wake_common')
+    assert.deepEqual(validatePolicy({ policy: fixture, packages, adrRecords: activeAdrRecords }), [])
+    packages.get('wake_cache').add(owner)
+    assert(validatePolicy({ policy: fixture, packages, adrRecords: activeAdrRecords }).some((error) => error.includes('[lint-cache-keeps-payloads-opaque]')))
+  }
+})
+
+test('native lint core rejects product dependencies at its registered boundary', () => {
+  const saved = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
+  const rule = saved.rules.find((candidate) => candidate.id === 'lint-core-is-source-analysis')
+  assert.ok(rule, 'the native lint core needs an enforced ownership boundary')
+  const names = ['wake_lint_core', 'wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic', 'wake_app']
+  const fixture = policy({ crates: names, groups: {}, rules: [rule] })
+  const packages = new Map(names.map((name) => [name, new Set()]))
+  packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
+  const adrRecords = activeAdrRecords
+  assert.deepEqual(validatePolicy({ policy: fixture, packages, adrRecords }), [])
+  packages.get('wake_lint_core').add('wake_app')
+  assert(validatePolicy({ policy: fixture, packages, adrRecords }).some((error) => error.includes('[lint-core-is-source-analysis]')))
+})
 const activeAdrRecords = new Map([
   ['0003-compiler-and-shell-boundaries.md', indexed()],
   ['0010-shared-css-syntax-tree.md', indexed()],
@@ -50,7 +89,27 @@ const activeAdrRecords = new Map([
   ['0040-parser-owned-frozen-declaration-graph.md', indexed()],
   ['0043-react-module-compiler-boundary.md', indexed()],
   ['0044-architecture-decision-routing.md', indexed()],
+  ['0050-native-single-file-lint-core.md', indexed()],
+  ['0051-lint-source-fix-transactions.md', indexed()],
+  ['0052-lint-effective-configuration.md', indexed()],
+  ['0053-source-semantic-facts-for-lint.md', indexed()],
+  ['0054-lint-control-flow-completions.md', indexed()],
+  ['0055-content-addressed-lint-cache.md', indexed()],
 ])
+
+test('lint source fixes use snapshot validation and the shared publication owner', () => {
+  const app = readFileSync(new URL('../crates/wake_app/src/lint.rs', import.meta.url), 'utf8')
+  const output = readFileSync(new URL('../crates/wake_app/src/output.rs', import.meta.url), 'utf8')
+  assert.match(app, /LintSourceSnapshot::read/)
+  assert.match(app, /cancellation\.commit\(\|\|\s*(?:\{\s*)?replace_lint_source/)
+  assert.doesNotMatch(app, /std::fs::write|atomic_write|publish_exact_outputs|\.persist\(/)
+  const replacement = /fn replace_lint_source_with\s*\([\s\S]*?\n}\r?\n/.exec(output)?.[0]
+  assert.ok(replacement)
+  assert.match(replacement, /acquire_output_commit_lock[\s\S]*snapshot\.validate\(\)[\s\S]*tempfile_in[\s\S]*sync_all\(\)[\s\S]*snapshot\.validate\(\)[\s\S]*drop\(snapshot\.identity\)[\s\S]*persist/)
+  assert.match(output, /self\.identity != current\.identity/)
+  assert.match(output, /self\.text != current\.text/)
+  assert.match(output, /lint_link_count/)
+})
 
 function rustSources(directory, root = directory) {
   const sources = []
@@ -198,7 +257,7 @@ test('generated JavaScript remains output-only at the bundler emit boundary', ()
   )
   assert.match(
     optimizer,
-    /pub const PIPELINE_VERSION:\s*&str\s*=\s*"wake-closure-minifier-v16"/,
+    /pub const PIPELINE_VERSION:\s*&str\s*=\s*"wake-closure-minifier-v22"/,
     'changing retained request identity must invalidate optimized artifacts',
   )
   assert.doesNotMatch(
@@ -883,7 +942,7 @@ test('Node boundary unions, runtime exports, and event contracts remain exact', 
   assert.match(nodeTypes, /export function bundle\(options\?: BundleOptions\): Promise<BundleResult>/)
   assert.match(commonJs, /const INTERNAL_CONTEXT_CONSTRUCTOR = Symbol\(/)
   assert.match(commonJs, /function assertInternalContextConstructor\(token, name, factory\)/)
-  for (const className of ['BuildContext', 'DevServer', 'TestContext']) {
+  for (const className of ['BuildContext', 'DevServer', 'LintContext', 'TestContext']) {
     const declaration = new RegExp(
       `export class ${className}(?: extends EventEmitter)? \\{([\\s\\S]*?)^\\}`,
       'm',
@@ -899,6 +958,7 @@ test('Node boundary unions, runtime exports, and event contracts remain exact', 
 
   const expectedExports = [
     'BuildContext',
+    'LintContext',
     'DevServer',
     'TestContext',
     'WakeError',
@@ -907,11 +967,13 @@ test('Node boundary unions, runtime exports, and event contracts remain exact', 
     'buildLibrary',
     'bundle',
     'createBuildContext',
+    'createLintContext',
     'createTestContext',
     'generateCssToken',
     'generateDocgen',
     'generateFederationLock',
     'initializeFederation',
+    'lint',
     'runTests',
     'startDevServer',
     'startDocsDevServer',
@@ -1938,6 +2000,7 @@ test('repository policy rejects foundation, parser, and shell boundary regressio
 test('repository policy keeps the public compiler facade above one pure backend', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
   packages.get('wake_compiler_core').add('wake_ecma_parser')
   packages.get('wake_compiler_core').add('wake_ecma_minify')
   packages.get('wake_compiler_core').add('wake_ecma_codegen')
@@ -1968,6 +2031,7 @@ test('repository policy keeps the public compiler facade above one pure backend'
 test('repository policy keeps browser policy above the driver', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
   packages.get('wake_test').add('wake_test_browser')
   packages.get('wake_test').add('wake_test_contract')
   packages.get('wake_test_host').add('wake_test_contract')
@@ -1997,6 +2061,7 @@ test('repository policy keeps browser policy above the driver', () => {
 test('repository policy separates the test contract, runner, host, and app', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
   packages.get('wake_test').add('wake_test_contract')
   packages.get('wake_test_host').add('wake_test_contract')
   packages.get('wake_test_host').add('wake_test')

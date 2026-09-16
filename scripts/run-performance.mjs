@@ -22,6 +22,7 @@ const CRITERION_BASELINE = 'wake-base'
 const keyBenchmarks = [
   { package: 'wake_ecma_lexer', bench: 'lexer', filter: 'lexer/tokenize' },
   { package: 'wake_ecma_parser', bench: 'parser', filter: 'parser/parse_module' },
+  { package: 'wake_lint_core', bench: 'lint', filter: 'lint/lint_text' },
   { package: 'wake_compiler', bench: 'transpile', filter: 'compiler/transpile_tsx_module' },
   { package: 'wake_turbo', bench: 'engine', filter: 'shallow_green/request_1000_memoized' },
   { package: 'wake_bundler', bench: 'bundle', filter: 'bundle_2k/cold' },
@@ -31,6 +32,7 @@ const fullBenchmarks = [
   { package: 'wake_common', bench: 'interner' },
   { package: 'wake_ecma_lexer', bench: 'lexer' },
   { package: 'wake_ecma_parser', bench: 'parser' },
+  { package: 'wake_lint_core', bench: 'lint' },
   { package: 'wake_compiler', bench: 'transpile' },
   { package: 'wake_turbo', bench: 'engine' },
   { package: 'wake_resolver', bench: 'resolve' },
@@ -186,7 +188,14 @@ export function runPerformance(args = process.argv.slice(2)) {
     command('cargo', ['fetch', '--locked', '--manifest-path', join(baseWorktree, 'Cargo.toml')])
     command('cargo', ['fetch', '--locked', '--manifest-path', join(root, 'Cargo.toml')])
 
-    for (const spec of specs) {
+    // A benchmark added in the current revision has no executable base. Keep it
+    // in the report as `new` instead of failing the whole comparison before the
+    // compatibility check can explain why the result is report-only.
+    const baseSpecs = specs.filter((spec) =>
+      existsSync(join(baseWorktree, 'crates', spec.package, 'Cargo.toml'))
+      && existsSync(join(baseWorktree, 'crates', spec.package, 'benches', `${spec.bench}.rs`)),
+    )
+    for (const spec of baseSpecs) {
       cargoBench(baseWorktree, spec, ['--save-baseline', CRITERION_BASELINE], targetDir)
     }
     const base = readCriterionSnapshot(criterionDir, CRITERION_BASELINE)

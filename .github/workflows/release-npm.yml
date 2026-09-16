@@ -54,7 +54,7 @@ jobs:
       - run: corepack yarn npm:typecheck:css
       - run: corepack yarn npm:pack:check
         env:
-          WAKE_PACK_TARGETS: npm/css,npm/wake
+          WAKE_PACK_TARGETS: npm/css,npm/wake,npm/wake-lint-sdk
       - name: Test and build from verified inputs
         run: |
           cargo test --workspace --locked --offline
@@ -247,9 +247,10 @@ jobs:
       - run: mkdir -p artifacts
       - run: corepack yarn npm:pack:check
         env:
-          WAKE_PACK_TARGETS: npm/css,npm/wake
+          WAKE_PACK_TARGETS: npm/css,npm/wake,npm/wake-lint-sdk
       - run: npm pack ./npm/wake --ignore-scripts --pack-destination artifacts
       - run: npm pack ./npm/css --ignore-scripts --pack-destination artifacts
+      - run: npm pack ./npm/wake-lint-sdk --ignore-scripts --pack-destination artifacts
       - uses: actions/upload-artifact@v4
         with:
           name: npm-javascript
@@ -282,6 +283,7 @@ jobs:
           expected_names=(
             '@crab-dev/css'
             '@crab-dev/wake'
+            '@crab-dev/wake-lint-sdk'
             '@crab-dev/wake-win32-x64-msvc'
             '@crab-dev/wake-linux-x64-gnu'
             '@crab-dev/wake-linux-arm64-gnu'
@@ -324,6 +326,13 @@ jobs:
                   test.cjs test.mjs test.d.ts \
                   test-react.cjs test-react.mjs test-react.d.ts \
                   internal/components-runtime.mjs internal/components-runtime.d.ts; do
+                  grep -qx "package/$required" <<<"$list"
+                done
+                ;;
+              '@crab-dev/wake-lint-sdk')
+                test "$native_count" -eq 0
+                test "$(stat -c%s "$archive")" -le 131072
+                for required in index.mjs index.d.ts; do
                   grep -qx "package/$required" <<<"$list"
                 done
                 ;;
@@ -562,6 +571,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish CSS package
         run: npm publish "./artifacts/crab-dev-css-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish lint extension SDK
+        run: npm publish "./artifacts/crab-dev-wake-lint-sdk-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish root package last
