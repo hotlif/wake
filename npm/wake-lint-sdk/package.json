@@ -3,6 +3,11 @@
   "version": "0.1.41",
   "description": "Versioned, isolated SDK for Wake native lint extensions",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hotlif/wake.git",
+    "directory": "npm/wake-lint-sdk"
+  },
   "type": "module",
   "main": "./index.mjs",
   "module": "./index.mjs",

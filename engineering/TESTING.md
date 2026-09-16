@@ -80,6 +80,10 @@ npm 经典解析或发布消费修改还必须运行聚焦 resolver/watch 测试
 CLI、CommonJS/ESM Node API、build、workspace link、CSS 与 Wake Test；项目任一祖先存在 `.pnp.cjs`
 都会失败，防止把 npm 门禁误测成 PnP。
 
+`release:check` 要求每个公共 npm 包声明与发布工作流一致的 Git 仓库 URL
+`git+https://github.com/hotlif/wake.git`，避免缺失或错误的 `repository` 使 npm 来源证明
+在有序发布中途被拒绝。该检查覆盖新增加的公共包，包括 Lint SDK。
+
 消费验证包含 `@crab-dev/wake/docs` 的 React 组件类型。独立项目须显式安装工作区声明的
 `@types/react`、`@types/node` 和 TypeScript，并保持 `skipLibCheck: false`，避免依赖仓库类型泄漏。
 

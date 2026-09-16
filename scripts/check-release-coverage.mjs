@@ -565,6 +565,10 @@ for (const { directory, directoryName, manifest } of packages) {
   if (manifest.publishConfig?.provenance !== true) {
     throw new Error(`${manifest.name} must enable publishConfig.provenance`)
   }
+  if (manifest.repository?.type !== 'git'
+    || manifest.repository?.url !== 'git+https://github.com/hotlif/wake.git') {
+    throw new Error(`${manifest.name} must declare the Wake Git repository for npm provenance`)
+  }
 
   const directoryCovered = workflow.includes(directory)
     || workflow.includes(`package_dir: ${directoryName}`)
