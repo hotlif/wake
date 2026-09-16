@@ -120,6 +120,8 @@
     "wake_graph",
     "wake_html",
     "wake_js_runtime",
+    "wake_lint_core",
+    "wake_lint_lsp",
     "wake_node",
     "wake_resolver",
     "wake_scan",
@@ -145,14 +147,14 @@
       "wake_ecma_transform"
     ],
     "cssLayers": ["wake_css", "wake_css_in_js", "wake_css_language"],
-    "productEdges": ["wake_dev_server", "wake_docs", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
+    "productEdges": ["wake_dev_server", "wake_docs", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp", "wake_lint_lsp"],
     "shells": ["wake_cli", "wake_node"],
     "nonShells": [
       "wake_app", "wake_bundler", "wake_cache", "wake_common", "wake_compiler", "wake_compiler_core", "wake_config",
       "wake_css", "wake_css_in_js", "wake_css_language", "wake_css_lsp", "wake_dev_server", "wake_docs", "wake_ecma_ast",
       "wake_ecma_codegen", "wake_ecma_lexer", "wake_ecma_minify", "wake_ecma_parser",
       "wake_ecma_semantic", "wake_ecma_transform", "wake_ecma_vm", "wake_federation_contract", "wake_graph", "wake_html",
-      "wake_js_runtime", "wake_resolver", "wake_scan", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_tsdoc", "wake_turbo", "wake_turbo_macros"
+      "wake_js_runtime", "wake_lint_core", "wake_lint_lsp", "wake_resolver", "wake_scan", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_tsdoc", "wake_turbo", "wake_turbo_macros"
     ]
   },
   "cargoTreeRules": [
@@ -175,10 +177,19 @@
   ],
   "rules": [
     {
+      "id": "lint-core-is-source-analysis",
+      "description": "single-file lint owns pure source rules without filesystem or product orchestration",
+      "from": ["wake_lint_core"],
+      "allowOnly": ["wake_common", "wake_ecma_ast", "wake_ecma_parser", "wake_ecma_semantic"],
+      "require": ["wake_common", "wake_ecma_ast", "wake_ecma_parser", "wake_ecma_semantic"],
+      "decision": "engineering/decisions/0053-source-semantic-facts-for-lint.md",
+      "suggestion": "Keep configuration discovery, resolution, caches, runtimes, shells and source publication above the pure lint core."
+    },
+    {
       "id": "compiler-core-no-orchestration",
       "description": "compiler core cannot depend on orchestration or product edges",
       "fromGroups": ["compilerCore"],
-      "deny": ["wake_bundler", "wake_cache", "wake_dev_server", "wake_docs", "wake_js_runtime", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
+      "deny": ["wake_bundler", "wake_cache", "wake_dev_server", "wake_docs", "wake_js_runtime", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp", "wake_lint_lsp"],
       "decision": "engineering/decisions/0043-react-module-compiler-boundary.md",
       "suggestion": "Move the contract to a lower stable model or keep orchestration in the caller."
     },
@@ -338,6 +349,14 @@
       "deny": ["wake_ecma_ast", "wake_resolver", "wake_bundler", "wake_dev_server", "wake_docs", "wake_app", "wake_cli", "wake_node", "wake_css_lsp"],
       "decision": "engineering/decisions/0034-transactional-persistent-cache-boundary.md",
       "suggestion": "Persist a stable DTO owned below the consumer instead of a process-local object."
+    },
+    {
+      "id": "lint-cache-keeps-payloads-opaque",
+      "description": "blob storage must not depend on the owners of lint or source analysis payloads",
+      "from": ["wake_cache"],
+      "deny": ["wake_lint_core", "wake_ecma_parser", "wake_ecma_semantic"],
+      "decision": "engineering/decisions/0055-content-addressed-lint-cache.md",
+      "suggestion": "Keep lint identity and diagnostic validation in the caller; cache stores bounded opaque bytes."
     },
     {
       "id": "css-does-not-own-products",

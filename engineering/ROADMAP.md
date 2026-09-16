@@ -97,8 +97,36 @@ local tarball 和发布后 registry smoke 都覆盖 22.14.0/24/26。发布门禁
 # R6 — JavaScript 字符串码元兼容（P1）
 
 2026-09-06 的 Lexical 补丁排查已修复相邻代理对转义及 async 表达式后缀。
-仍需解决孤立 UTF-16 代理项（例如 `"\ud800"`）：当前 lexer 拒绝它，而 AST 字符串
-使用 UTF-8 Atom，不能仅移除诊断，否则解码会丢失码元。
+当时仍未解决孤立 UTF-16 代理项（例如 `"\ud800"`）：lexer 拒绝它，而 AST 字符串
+使用 UTF-8 Atom，仅移除诊断会造成解码丢失码元。
+
+2026-09-15 已先锁定模板字符串的 raw/cooked 双值契约：模板 raw 保留源码转义，cooked 按
+ECMAScript 转义解码；已补齐 CR/CRLF 的 cooked 归一化及 LF/CR/CRLF/LS/PS 行接续，普通、
+压缩与模板降级输出通过 Node 原始源码对照。孤立代理项仍需在同一无损表示设计中完成，
+不能用替换字符代替。
+
+2026-09-16 已完成无损值基础设施：`JsString` 保留任意 UTF-16 码元，`JsAtom` 使用独立的
+进程内驻留身份，lexer 新增无损解码入口。全部单码元、代理对、跨拼接边界、内容身份和
+并发驻留回归通过。候选跨层契约见 [ADR 0068](decisions/0068-lossless-ecmascript-string-values.md)。
+同日已继续迁移运行时字符串、属性键、enum 字符串成员、模板 cooked、原始 JSX/switch 值事实、
+优化 IR、常量折叠、两类 emitter 和定义值缓存身份。孤立代理项现在保留并以 Unicode 转义
+输出；普通/压缩/模板降级、装饰器及全新会话持久缓存命中和内容失效均有 Node 运行时对照。
+lexer 同时修复 `\u{z}` 的漏报，标识符仍拒绝代理项。
+
+import attributes 的字符串键和值已接入 JsAtom/JsString，包含静态导入/重导出、TS import-type、
+动态 import options 与重复导入判断。普通和优化 ESM 产物通过 Node 模块链接回调验证实际码元，
+静态重复键按解码值拒绝，动态对象保留后写覆盖语义。
+ambient 模块名称、擦除的 TS import/export-type、原始模块请求及冻结声明请求已接入无损值；
+同值转义共享 ambient 类型/值作用域，不同代理项保持独立。声明模板保留外部请求原文，
+相对请求在 UTF-8 文件系统边界明确失败；动态字面量模块请求不再因孤立代理项降为未知。
+剩余边界：运行时静态 import/export AST 与依赖记录仍使用 UTF-8 契约，含孤立代理项时明确
+诊断，尚未完成整个模块输出链路迁移。原生类型服务已复现 JSON 通道对
+孤立代理项的替换，普通字符串字面量现在通过同一类型的无截断表示及 Wake parser 恢复
+为 JsString；字面量联合、类型别名、模板实例与跨文件长字符串有回归。含替换字符歧义的
+枚举值和结构属性名称仍无法通用恢复，必须报告分析失败，不再用失真值证明类型等价；
+这些类型服务边界继续实施。tagged 模板中非法转义对应的 cooked undefined 已补齐：每段 raw 保留，非法
+转义仅使所在段 cooked 缺失；无标签模板与 TS 模板字面量类型继续诊断，嵌套模板和 TS
+推测解析有回归覆盖，普通/压缩及启用模板降级的产物通过 Node 原始源码对照。R6/P1 保持实施中。
 
 验收条件：先明确字符串值跨 lexer、AST、优化器和 emitter 的无损表示契约，再覆盖孤立高/低
 代理项、代理对、字符串键、模板 cooked/raw、常量折叠，以及普通/压缩/缓存产物的运行时一致性。
@@ -108,14 +136,33 @@ local tarball 和发布后 registry smoke 都覆盖 22.14.0/24/26。发布门禁
 
 2026-09-12 已复现，后续验收：
 
-- 声明默认参数：`parse_declaration_facts` 将
-  `export function value(input: number = 1): number { return input; }` 输出为带 initializer 的
-  函数声明，TypeScript 6.0.2 报 TS2371。需在 ADR 0040 的 parser-owned 模型中处理普通函数、
-  arrow、方法、构造器及解构参数的默认值、可选性与类型引用，再以真实 TS6/TS7 检查发布声明。
-  此问题独立于 React 19.3 适配，当前尚未修复。
-- TS7 / PnP：当前 TS7 门禁显式映射 React 类型；直接对同一 fixture 执行 TS7 仍报 TS2307。
-  任意 PnP zip 包、共享 tsconfig、Wake/CSS 包类型入口的通用解析尚无完整验证。
-  TS6 API 与 TS7 CLI 并行方案仅解决工具依赖选择，不能替代模块解析证据。
+- 已修复（2026-09-15）：`parse_declaration_facts` 在 ADR 0040 的 parser-owned 模型中处理普通函数、
+  arrow、方法、构造器及嵌套解构参数的默认值，保留类型注解并从实现声明模板删除可执行初始化器；
+  重载签名同样去除默认值，避免生成触发 TS2371 的 `.d.ts`。对应 parser 回归已覆盖。
+- TS7 / PnP：已修复并验证 TS7.0.2 compatibility fixture（`scripts/check-typescript-7.mjs`）通过；
+  Yarn lock/provenance 检查也通过。任意 PnP zip 包、共享 tsconfig、Wake/CSS 包类型入口的通用
+  解析仍需独立 fixture 矩阵；本机 `check-pnp-conformance.mjs` 在临时项目执行 Yarn install 时因
+  Corepack 需要联网下载 Yarn 4.16.0 且网络策略拒绝连接，暂不能登记为通过。
+
+# R8 — Wake 原生 lint（实施中）
+
+目标、有限规则基线、P0–P7 顺序和验收见 [LINT.md](LINT.md)。用户已选择原生完整能力并允许
+ESLint 规则/配置迁移；不要求运行原有 JS 插件。候选架构见
+[ADR 0049](decisions/0049-native-lint-product.md)，尚未成为机器边界。
+
+已建立真实注释、原始 token、静态 import/export、JSX 值、数组与 TS 原始结构、77 条规则和共享 Rust/Node 项目入口。
+已接入规则参数、版本化预设、配置来源解释、安全修复迭代、预览与按文件原子写回；原生 TypeScript 类型服务、LSP/VS Code
+quick-fix、ESLint 迁移报告、lint Criterion 性能基线、独立扩展 SDK 和内建 Markdown 处理器已接入；类型联合字面量、枚举成员
+switch 覆盖证明和版本化 browser/node environments 也已接入。真实 CLI smoke 已覆盖 JS/MJS/CJS/JSX/TS/MTS/CTS/TSX/Markdown 代表矩阵；第三方规则自动启用和目标平台
+发布验收仍需逐项完成。
+不能将源码采集或少量规则标记为完整 lint。规则目录及单文件诊断缓存已接入，覆盖内容/配置失效、
+跨进程写入、损坏恢复与修复绕过。显式批量抑制基线已支持生成/检查/清理、上下文唯一匹配、
+修复过滤、缓存失效和冲突保护发布。手动 LintContext 已提供多文档版本、代次取消和安全 Node
+生命周期；CLI/Node 已共用自动监听、去抖、配置恢复和有界结果队列。独立文件共用进程线程池和
+两个批次的准入上限，串行/并行结果等价验证通过；真实 CLI smoke 与扩展 SDK 已闭环，继续推进
+完整生态项目矩阵与目标平台实际构建验证。当前真实 CLI smoke 已覆盖 JS/MJS/CJS/JSX/TS/MTS/CTS/TSX/Markdown，且增加 npm package、workspace
+monorepo、PnP 风格 manifest、React/Docs/PnP 仓库以及两个独立 Docs workspace 根 fixture；Preact `8101ff8` 和 p-map `bc8380d` 的外部
+快照也已完成 CLI smoke。Linux x64/ARM64 平台包已在本机交叉构建并完成 manifest 验证，macOS 与 Unix 可执行位仍需目标 runner 的发布门禁。
 
 # 非路线图事项
 

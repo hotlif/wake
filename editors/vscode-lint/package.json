@@ -1,0 +1,69 @@
+{
+  "name": "wake-lint",
+  "displayName": "Wake Lint",
+  "description": "Native Wake lint diagnostics for JavaScript and TypeScript.",
+  "version": "0.1.39",
+  "publisher": "wake",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hotlif/wake.git",
+    "directory": "editors/vscode-lint"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist/**",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Wake Lint",
+      "properties": {
+        "wakeLint.serverPath": {
+          "type": "string",
+          "default": "wake-lint-language-server",
+          "description": "Path to the Wake lint language server."
+        },
+        "wakeLint.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Wake lint diagnostics."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "wakeLint.restart",
+        "title": "Wake Lint: Restart Language Server"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "yarn exec pnpify tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
+    "check": "yarn compile && node scripts/check-manifest.mjs"
+  },
+  "dependencies": {
+    "vscode-languageclient": "10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/vscode": "1.96.0",
+    "@yarnpkg/pnpify": "4.1.7",
+    "typescript": "6.0.2"
+  }
+}

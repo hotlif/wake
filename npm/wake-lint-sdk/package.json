@@ -1,0 +1,28 @@
+{
+  "name": "@crab-dev/wake-lint-sdk",
+  "version": "0.1.39",
+  "description": "Versioned, isolated SDK for Wake native lint extensions",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./index.mjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "default": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

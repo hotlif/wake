@@ -4550,6 +4550,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wake_lint_lsp"
+version = "0.1.39"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-lsp-server",
+ "wake_app",
+]
+
+[[package]]
 name = "wake_node"
 version = "0.1.39"
 dependencies = [

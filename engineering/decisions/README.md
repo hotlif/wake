@@ -28,6 +28,26 @@
 - [ADR 0033: Structured module emit provenance](0033-structured-module-emit-provenance.md) — `accepted`
 - [ADR 0042: Linker-owned `export *` resolution](0042-linker-owned-export-star-resolution.md) — `accepted`
 - [ADR 0043: React 单模块编译边界](0043-react-module-compiler-boundary.md) — `accepted`
+- [ADR 0049: Wake 原生 lint 产品边界](0049-native-lint-product.md) — `proposed`
+- [ADR 0050: 原生单文件 lint 核心](0050-native-single-file-lint-core.md) — `accepted`
+- [ADR 0051: lint 文本修复与源码替换事务](0051-lint-source-fix-transactions.md) — `accepted`
+- [ADR 0052: lint 有效配置与规则参数所有权](0052-lint-effective-configuration.md) — `accepted`
+- [ADR 0053: lint 复用原生语义事实](0053-source-semantic-facts-for-lint.md) — `accepted`
+- [ADR 0054: lint 控制流 completion 事实](0054-lint-control-flow-completions.md) — `accepted`
+- [ADR 0055: 按内容寻址的 lint 诊断缓存](0055-content-addressed-lint-cache.md) — `accepted`
+- [ADR 0056: 显式 lint 抑制基线](0056-lint-suppression-baselines.md) — `accepted`
+- [ADR 0057: 带版本的 lint 项目上下文](0057-versioned-lint-project-context.md) — `accepted`
+- [ADR 0058: lint 文件监听与结果生命周期](0058-lint-watch-lifecycle.md) — `accepted`
+- [ADR 0059: 有界 lint 文件并行执行](0059-bounded-lint-file-execution.md) — `accepted`
+- [ADR 0060: 原始类型符号身份](0060-source-type-symbol-identities.md) — `accepted`
+- [ADR 0061: 显式 lint 全局绑定](0061-explicit-lint-global-bindings.md) — `accepted`
+- [ADR 0062: 原生调用执行路径事实](0062-native-call-execution-paths.md) — `accepted`
+- [ADR 0063: lint 模块图快照与项目分析](0063-lint-module-graph-snapshots.md) — `accepted`
+- [ADR 0064: 原生 lint 类型服务](0064-native-lint-type-service.md) — `proposed`
+- [ADR 0065: Wake lint 独立扩展 SDK](0065-lint-extension-sdk.md) — `accepted`
+- [ADR 0066: lint 宿主环境集合与版本身份](0066-lint-host-environments.md) — `accepted`
+- [ADR 0067: 顶层 ambient 值绑定投影](0067-top-level-ambient-value-projection.md) — `accepted`
+- [ADR 0068: 无损 ECMAScript 字符串值](0068-lossless-ecmascript-string-values.md) — `proposed`
 
 ### build
 

@@ -140,6 +140,28 @@ corepack yarn architecture:test
 corepack yarn architecture:check
 ```
 
+Lint 产品修改还必须运行核心规则、原生 TypeScript 项目查询、LSP 坐标和迁移报告门禁：
+
+在运行被 `--ignored` 标记的原生类型服务测试前，执行 `node scripts/find-native-typescript.mjs
+--github-env`，由仓库 PnP 安装选择当前 runner 的 `@typescript/typescript-*` 原生编译器并设置
+`WAKE_LINT_TYPESCRIPT_EXE`。
+
+```bash
+cargo test -p wake_lint_core
+cargo test -p wake_app --test lint
+cargo test -p wake_app --lib lint::type_service -- --ignored
+cargo test -p wake_lint_lsp
+node --test scripts/lint-migration-report.test.mjs
+node --test npm/wake-lint-sdk/test/index.test.mjs
+node --test scripts/find-native-typescript.test.mjs
+# after building target/debug/wake; covers JS/MJS/CJS/JSX/TS/MTS/CTS/TSX/Markdown, module rules, and npm/package/workspace/PnP project-root plus repository React/Docs/PnP fixtures
+node scripts/lint-real-project-smoke.mjs
+node editors/vscode-lint/scripts/check-manifest.mjs
+cargo bench -p wake_lint_core --bench lint --no-run --locked --offline
+# after building wake-lint-language-server in target/debug
+node scripts/lint-lsp-smoke.mjs
+```
+
 测试必须同时覆盖 parser-owned `Import`、`ExportFrom`、`Require` 和不映射的 `DynamicImport`；
 loader 输入字节及字符串、模板、注释、正则诱饵；应用、其他第三方、组件内部/嵌套入口和伪 manifest
 负例；classic/workspace/virtual/unplugged/zip manifest identity；source alias 隔离；PnP declared 与
@@ -196,6 +218,7 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 | `fmt` | Ubuntu / Rust 1.95 | rustfmt 无差异 |
 | `clippy` | Ubuntu / Rust 1.95 | workspace 全 target，warnings 视为错误 |
 | `test` | Ubuntu、Windows / Rust 1.95 + Node 24 | 全 workspace 测试 |
+| `lint-product` | Ubuntu、Windows、macOS / Rust 1.95 + Node 24 | Wake 原生 lint 核心/应用/LSP、真实多语言项目、协议 smoke、迁移与独立 SDK 门禁 |
 | `test262-es2024` | Ubuntu / Rust 1.95 + Node 24 | checksum 固定的 Test262 ES2024 选择集 |
 | `browser-conformance` | 五个发布目标 / Rust 1.95 + Node 24 | Windows x64 reviewed major 151/152、Linux x64 reviewed major 151/152 conformance、macOS x64 reviewed major 150/151 与 arm64 reviewed major 150/152 功能 smoke、Linux ARM64 reviewed unavailable 证据 |
 | `browser-stable-readiness` | Ubuntu / Node 24 | 验证五平台共享 exact-major readiness 仍明确 blocked，避免把 experimental 证据误标为 stable |
@@ -481,6 +504,10 @@ CI 当前执行：
 cargo test -p wake_bundler --test performance_invariants --release
 cargo bench --workspace --no-run
 ```
+
+Lint 的专用基线为 `cargo bench -p wake_lint_core --bench lint`，覆盖 16 KiB 与 128 KiB
+源码的冷解析/规则执行吞吐；`scripts/run-performance.mjs --mode key` 会把该基线纳入
+跨 revision 的 Criterion 报告，并与 parser/compiler 等关键路径共同执行回归判定。
 
 第一条用稳定 work-count 检查 edit-one 的 loader、resolver、link/optimize/chunk 与 codegen 工作局部性；
 第二条保证 benchmark 可编译。`typed_pipeline_owned_payload_never_grows_and_shrinks_in_aggregate` 使用四个

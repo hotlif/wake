@@ -72,6 +72,8 @@ Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应�
 - `wake_app`：配置、构建会话、文档构建、错误和取消的统一应用层。
 - `wake_cli`、`wake_node`：面向用户的 Rust CLI 与 JavaScript 绑定。
 - `wake_css_lsp`：增量 LSP 文档、受限依赖缓存和保存时静态分析；`editors/vscode-css` 是启动该服务的薄 VS Code 客户端。
+- `wake_lint_lsp`：Wake lint 的 stdio LSP 边缘，拥有文档快照、完整变更同步、诊断发布、UTF-16 坐标转换和安全 quick-fix 编辑；规则与项目分析继续由 `wake_app`/`wake_lint_core` 负责。
+- `@crab-dev/wake-lint-sdk`：独立扩展协议边缘，只传递冻结的源码事实、UTF-8 编辑和诊断；不持有内部 AST、类型服务句柄或配置执行权。
 
 ## 3. 依赖方向
 
@@ -238,7 +240,7 @@ Generation filesystem 仅对每个精确路径拼写的 `read_to_string`、`read
 压缩器版本、defines/drop flags、链接活跃性、可信编辑和包装器保留名参与优化身份；图、优化器指纹与持久任务
 都用稳定的声明保留名、公开观察名、star specifier/ordinal、精确转发名和 opaque 排除名作为身份，解析得到的 `SymbolId` 只在当前 optimizer 调用内有效。optimizer key 不含最终
 chunk 编号，retained edges 收敛后才形成 final-layout body key；map 开关不进入二者。当前
-`wake-closure-minifier-v16` 与缓存 schema 13 使旧压缩缓存自然失效。持久层除 JavaScript 与 mapping
+`wake-closure-minifier-v22` 与缓存 schema 13 使旧压缩缓存自然失效。持久层除 JavaScript 与 mapping
 facts 外，只保存 codegen 生成的目标字面量字节区间、稳定 request specifier/role，以及与 body 配对的
 collision-free runtime 参数名和真实的 `metaUrl` runtime capability；default/star interop 已由 typed
 finalizer 内联，不存在 compact helper capability；optimizer

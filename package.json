@@ -7,6 +7,7 @@
   "workspaces": [
     "npm/*",
     "editors/vscode-css",
+    "editors/vscode-lint",
     "fixtures/react-19-3"
   ],
   "scripts": {
@@ -36,6 +37,14 @@
     "yarn:lock:check": "node scripts/check-yarn-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
     "performance:report:test": "node --test scripts/performance-report.test.mjs",
+    "performance:lint": "node scripts/run-performance.mjs --mode key",
+    "lint:migration:report": "node scripts/lint-migration-report.mjs",
+    "lint:migration:test": "node --test scripts/lint-migration-report.test.mjs",
+    "lint:typescript-host:test": "node --test scripts/find-native-typescript.test.mjs",
+    "lint:extension:test": "node --test npm/wake-lint-sdk/test/index.test.mjs",
+    "lint:real-project:test": "node scripts/lint-real-project-smoke.mjs",
+    "lint:lsp:smoke": "node scripts/lint-lsp-smoke.mjs",
+    "vscode:lint:check": "node editors/vscode-lint/scripts/check-manifest.mjs",
     "release:check": "node scripts/check-release-coverage.mjs",
     "skill:check": "node scripts/check-skills.mjs",
     "rusty-v8:prepare:test": "node --test scripts/rusty-v8-archive-path.test.mjs",

@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-08-26
+- Amended by: [ADR 0063](0063-lint-module-graph-snapshots.md)
 
 ## Context
 
