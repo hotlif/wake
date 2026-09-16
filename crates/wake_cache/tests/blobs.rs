@@ -82,7 +82,22 @@ fn concurrent_authored_batches_survive_cold_reads() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                cache.store(&[([id; 32], vec![id; 128])]).unwrap();
+                // Store has a bounded lock budget: contention may legitimately return
+                // WouldBlock. Retry the same authored batch while retaining a test deadline;
+                // every successful writer must still survive a fresh cache instance below.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    match cache.store(&[([id; 32], vec![id; 128])]) {
+                        Ok(_) => break,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::yield_now();
+                        }
+                        Err(error) => panic!("concurrent blob writer {id}: {error}"),
+                    }
+                }
             })
         })
         .collect();
