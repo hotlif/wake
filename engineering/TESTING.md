@@ -469,6 +469,9 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
   boundary、async `act`、SSR 解析与 hydration 诊断；
 - Chromium BrowserContext/page 隔离、真实 keyboard/pointer/default action、focus/selection、
   CSS/layout、导航、accessibility、hydration、截图、network interception 与 V8 coverage；
+- 浏览器网络拦截先于模块图求值启用；桥接函数安装前到达的请求必须保持暂停并在现有请求
+  超时预算内等待就绪。用可观察 getter 强制先发生一次缺失读取，再安装桥接函数，验证请求
+  恰好交付一次；桥接函数始终缺失时须有界失败，不能放行请求或无限等待；
 - fast DOM 与 Chromium 对 Wake conformance manifest 的差分结果；layout、原生输入、截图和
   browser-sensitive hydration 只接受真实 Chromium 证据；
 - 显式测试 API、hooks、focus/skip/todo/each、assertion count、function mock/spy、网络 mock、

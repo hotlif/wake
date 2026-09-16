@@ -2153,10 +2153,37 @@ fn handle_browser_network_request(
     page: &BrowserPage,
     paused: &FetchRequestPaused,
     timeout_ms: u64,
+    bridge_ready: &mut bool,
+    cancellation: &BrowserCancellationToken,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    let budget = Duration::from_millis(timeout_ms.max(1));
+    while !*bridge_ready {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err("browser network bridge was not ready within the request timeout".into());
+        }
+        *bridge_ready = page
+            .evaluate_with_timeout(
+                "typeof globalThis.__wakeHandleBrowserNetworkRequest === 'function'",
+                Some((remaining.as_millis() as u64).max(1)),
+            )
+            .map_err(|error| format!("browser network bridge readiness failed: {error}"))?
+            == serde_json::Value::Bool(true);
+        if !*bridge_ready {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err("browser network bridge exhausted the request timeout".into());
+    }
     let expression = browser_network_bridge_expression(&paused.into())?;
     let value = page
-        .evaluate_with_timeout(&expression, Some(timeout_ms.max(1)))
+        .evaluate_with_timeout(&expression, Some((remaining.as_millis() as u64).max(1)))
         .map_err(|error| format!("browser network bridge evaluation failed: {error}"))?;
     let serialized = value
         .as_str()
@@ -2202,6 +2229,9 @@ fn service_browser_network(
     timeout_ms: u64,
 ) -> Result<(), String> {
     let mut first_error = None;
+    // The runtime installs a non-configurable bridge once per page; only the first request
+    // needs the readiness handshake, including browser-generated requests during bootstrap.
+    let mut bridge_ready = false;
     loop {
         let paused = page
             .wait_for_fetch_request(std::time::Duration::from_millis(50), &cancellation)
@@ -2215,7 +2245,13 @@ fn service_browser_network(
                     let _ = page.fail_fetch_request(&paused.request_id, "Failed");
                     continue;
                 }
-                if let Err(error) = handle_browser_network_request(&page, &paused, timeout_ms) {
+                if let Err(error) = handle_browser_network_request(
+                    &page,
+                    &paused,
+                    timeout_ms,
+                    &mut bridge_ready,
+                    &cancellation,
+                ) {
                     if cancellation.is_cancelled() {
                         return Ok(());
                     }
@@ -2234,6 +2270,8 @@ fn service_browser_network(
     }
 }
 
+/// Owns Fetch interception before and during module graph evaluation. Requests that arrive before
+/// the runtime installs its bridge stay paused until it is ready, within the request timeout budget.
 struct BrowserNetworkInterception {
     page: Arc<BrowserPage>,
     cancellation: BrowserCancellationToken,
@@ -7499,6 +7537,73 @@ environment = "dom"
 
         let result = run_tests(options(fixture.path())).unwrap();
         assert!(result.success, "{result:#?}");
+    }
+
+    #[test]
+    #[ignore = "requires an installed system Chromium browser"]
+    fn browser_network_bridge_waits_for_runtime_installation_and_times_out_when_absent() {
+        let browser = BrowserDriver::launch(BrowserLaunchOptions {
+            executable: std::env::var_os("WAKE_SYSTEM_BROWSER_PATH").map(Into::into),
+            sandbox: false,
+            ..BrowserLaunchOptions::default()
+        })
+        .unwrap();
+        for install in [true, false] {
+            let context = browser.create_context().unwrap();
+            let page = Arc::new(context.new_page("about:blank").unwrap());
+            page.evaluate(
+                "globalThis.bridgeReads = 0; globalThis.bridgeCalls = 0; \
+                 globalThis.requestSettled = false; \
+                 Object.defineProperty(globalThis, '__wakeHandleBrowserNetworkRequest', { \
+                   configurable: true, get() { globalThis.bridgeReads++; return undefined; } \
+                 }); true;",
+            )
+            .unwrap();
+            let interception = BrowserNetworkInterception::start(
+                Arc::clone(&page),
+                if install { 3_000 } else { 100 },
+            )
+            .unwrap();
+            let started = Instant::now();
+            page.evaluate(
+                "void fetch('https://wake-bridge.test/early', {mode:'no-cors'}) \
+                 .then(() => { globalThis.requestSettled = true; }, \
+                       () => { globalThis.requestSettled = true; });",
+            )
+            .unwrap();
+            // The getter is a handshake: the worker must actually observe the missing bridge
+            // before installation. No sleep or scheduling assumption can hide the startup race.
+            page.evaluate_with_timeout(
+                "(async () => { while (globalThis.bridgeReads === 0) \
+                   await new Promise(resolve => setTimeout(resolve, 1)); return true; })()",
+                Some(3_000),
+            )
+            .unwrap();
+            if install {
+                page.evaluate(
+                    "Object.defineProperty(globalThis, '__wakeHandleBrowserNetworkRequest', { \
+                       value() { globalThis.bridgeCalls++; \
+                         return JSON.stringify({action:'fail',errorReason:'BlockedByClient'}); } \
+                     }); true;",
+                )
+                .unwrap();
+            }
+            page.evaluate_with_timeout(
+                "(async () => { while (!globalThis.requestSettled) \
+                   await new Promise(resolve => setTimeout(resolve, 1)); return true; })()",
+                Some(3_000),
+            )
+            .unwrap();
+            let result = interception.finish();
+            if install {
+                result.unwrap();
+                assert_eq!(page.evaluate("globalThis.bridgeCalls").unwrap(), 1);
+            } else {
+                assert!(result.unwrap_err().contains("network bridge was not ready"));
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert_eq!(page.evaluate("globalThis.bridgeCalls").unwrap(), 0);
+            }
+        }
     }
 
     #[test]
