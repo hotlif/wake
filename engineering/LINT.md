@@ -1,6 +1,6 @@
 # Wake 原生 lint 实施契约
 
-状态：实施中。工作树已提供实验性 `wake lint` 和 Node 入口；完整 P0–P7 尚未完成，也未发布。
+状态：实施中。0.1.40 以实验性能力交付 `wake lint` 和 Node 入口；完整 P0–P7 尚未完成。
 长期候选边界见 [ADR 0049](decisions/0049-native-lint-product.md)。
 
 ## 范围与完成定义
@@ -619,6 +619,12 @@ issuer 最近 manifest 的 production/dev/optional/peer/self 声明事实。未�
   ESLint 对照使用锁定 registry 版本和外部依赖，不复制第三方源码进入仓库。
 
 ## 实施日志与门禁
+
+- 0.1.40 候选发布汇总：77 条基线规则、CLI/Node 项目流程、LSP 和独立 SDK 已拆分提交。
+  parser v41 / 核心 v74 保留类型导入、ambient 模块、声明请求及动态 import/require 的 UTF-16
+  字符串身份；解析器无法接收的路径明确报告 unresolved，不把已知字面量误作动态未知请求。
+  最新应用、核心、声明生成和 LSP 回归已通过。静态运行时模块说明符、完整高级类型语义、
+  第三方规则宿主与完整 P7 验收仍未完成，本次发布不代表 P0–P7 全部完成。
 
 - `ts/restrict-template-expressions` 已通过类别/参数、联合/交叉/约束、缺失事实/抑制三组核心
   测试、真实编译器及未保存依赖测试，Node 边界 33 项、核心全量、应用 lint 单元 43 项、
