@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.1.41
+## 0.1.42
 
-Version 0.1.40 was stopped before publication by release checks and was not published.
+Versions 0.1.40 and 0.1.41 were stopped before publication during release validation and were not published.
+The final candidate also includes SDK repository metadata required for npm provenance.
 
 - Add experimental native lint with 77 baseline rules, CLI/Node APIs, declarative configuration,
   safe fixes, caching, suppressions, baselines, watch mode and native TypeScript analysis.
