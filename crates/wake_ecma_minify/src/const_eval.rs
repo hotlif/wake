@@ -6,7 +6,7 @@
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConstVal {
     Bool(bool),
-    Str(String),
+    Str(wake_common::JsString),
     Num(f64),
     Null,
     Undefined,
@@ -89,10 +89,19 @@ fn try_exponential(decimal: &str) -> Option<String> {
     (exponential.len() < decimal.len()).then_some(exponential)
 }
 
-fn write_string_literal(value: &str) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
+fn write_string_literal(value: &wake_common::JsString) -> String {
+    let mut output = String::with_capacity(value.len_utf16() + 2);
     output.push('"');
-    for character in value.chars() {
+    for character in char::decode_utf16(value.code_units()) {
+        let character = match character {
+            Ok(character) => character,
+            Err(surrogate) => {
+                use std::fmt::Write as _;
+                write!(&mut output, "\\u{:04x}", surrogate.unpaired_surrogate())
+                    .expect("writing into String cannot fail");
+                continue;
+            }
+        };
         match character {
             '"' => output.push_str("\\\""),
             '\\' => output.push_str("\\\\"),
@@ -127,7 +136,7 @@ mod tests {
     fn primitive_truthiness_matches_javascript() {
         assert!(!ConstVal::Bool(false).truthy());
         assert!(ConstVal::Str("value".into()).truthy());
-        assert!(!ConstVal::Str(String::new()).truthy());
+        assert!(!ConstVal::Str(String::new().into()).truthy());
         assert!(!ConstVal::Num(-0.0).truthy());
         assert!(!ConstVal::Num(f64::NAN).truthy());
         assert!(!ConstVal::Null.truthy());

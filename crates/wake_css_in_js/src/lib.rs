@@ -146,7 +146,7 @@ struct BindingRegistry {
 
 impl BindingRegistry {
     fn collect(program: &Program, interner: &Interner) -> Self {
-        let semantic = analyze(program);
+        let semantic = analyze(program, interner);
         let mut imported_symbols = FxHashMap::default();
         for (id, symbol) in semantic.symbols.iter().enumerate() {
             if symbol.decl_kind == DeclKind::Import {

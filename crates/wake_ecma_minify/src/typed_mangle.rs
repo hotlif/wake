@@ -662,7 +662,7 @@ fn is_anonymous_runtime_value(program: &TypedProgram, node: NodeId) -> bool {
 fn static_property_spelling(program: &TypedProgram, node: NodeId) -> Option<String> {
     match program.node(node)?.data() {
         IrNodeData::Name { name } => Some(program.name(*name)?.original().to_owned()),
-        IrNodeData::StringLiteral { value } => Some(value.clone()),
+        IrNodeData::StringLiteral { value } => value.as_str().map(str::to_owned),
         IrNodeData::Program { .. }
         | IrNodeData::VariableDeclaration { .. }
         | IrNodeData::VariableDeclarator { .. }
@@ -1802,7 +1802,7 @@ mod tests {
             parsed.diagnostics
         );
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }

@@ -9,7 +9,7 @@
 //! 入口：[`codegen`]（默认 dev 可读风格）。往返 `parse → codegen → parse` 语义等价（见测试）。
 
 /// Stable emitter implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-codegen-v2";
+pub const PIPELINE_VERSION: &str = "wake-ecma-codegen-v4";
 
 use std::error::Error;
 use std::fmt::{self, Write as _};
@@ -1344,9 +1344,12 @@ impl<'i> Codegen<'i> {
             if i > 0 {
                 self.punct(", ");
             }
-            self.emit_module_export_name(&item.key);
+            match item.key {
+                ImportAttributeKey::Ident(id) => self.push_name(id.name),
+                ImportAttributeKey::String(value) => self.emit_js_string_atom(value),
+            }
             self.punct(": ");
-            self.emit_string_atom(item.value);
+            self.emit_js_string_atom(item.value);
         }
         self.punct(" }");
     }
@@ -1529,7 +1532,7 @@ impl<'i> Codegen<'i> {
         // 收集被装饰成员：(内部变量前缀, 属性名, kind, 是否静态)
         struct Decorated<'x, 'a> {
             var: String,
-            name: String,
+            name: wake_common::JsString,
             kind: DecoratedKind,
             is_static: bool,
             decorators: &'x AVec<'a, Expression<'a>>,
@@ -1786,13 +1789,13 @@ impl<'i> Codegen<'i> {
     fn emit_es_decorate_call(
         &mut self,
         var: &str,
-        name: &str,
+        name: &wake_common::JsString,
         kind: crate::decorators::DecoratedKind,
         is_static: bool,
     ) {
         use crate::decorators::DecoratedKind;
         // 名字作为 JS 字符串字面量嵌入（属性名可能含引号/反斜杠）。
-        let key = format!("{name:?}");
+        let key = typed::quote_string(name, false);
         // field 的 target 为 null（值经 initializers 注入），其余挂到 ctor/prototype 上。
         let ctor = if kind == DecoratedKind::Field {
             "null"
@@ -1828,11 +1831,11 @@ impl<'i> Codegen<'i> {
     }
 
     /// 取静态可知的成员名（标识符/字符串/数字键）；计算键返回 `None`（不降级）。
-    fn static_key_name(&self, key: &PropertyKey) -> Option<String> {
+    fn static_key_name(&self, key: &PropertyKey) -> Option<wake_common::JsString> {
         match key {
-            PropertyKey::Ident(id) => Some(self.name(id.name)),
-            PropertyKey::String(s) => Some(self.name(s.value)),
-            PropertyKey::Number(n) => Some(format!("{}", n.value)),
+            PropertyKey::Ident(id) => Some(self.name(id.name).into()),
+            PropertyKey::String(s) => Some(self.interner.resolve_js(s.value)),
+            PropertyKey::Number(n) => Some(format!("{}", n.value).into()),
             _ => None,
         }
     }
@@ -1897,7 +1900,7 @@ impl<'i> Codegen<'i> {
         }
         match key {
             PropertyKey::Ident(id) => self.push_name(id.name),
-            PropertyKey::String(s) => self.emit_string_atom(s.value),
+            PropertyKey::String(s) => self.emit_js_string_atom(s.value),
             PropertyKey::Number(n) => {
                 let before = self.out.len();
                 write_number(&mut self.out, n.value);
@@ -2011,7 +2014,7 @@ impl<'i> Codegen<'i> {
                 write_number(&mut self.out, n.value);
                 self.sync_from(before);
             }
-            Expression::StringLiteral(s) => self.emit_string_atom(s.value),
+            Expression::StringLiteral(s) => self.emit_js_string_atom(s.value),
             Expression::BooleanLiteral(b) => self.push(if b.value { "true" } else { "false" }),
             Expression::NullLiteral(_) => self.push("null"),
             Expression::BigIntLiteral(b) => {
@@ -2327,6 +2330,11 @@ impl<'i> Codegen<'i> {
             }
         }
         self.push("`");
+    }
+
+    fn emit_js_string_atom(&mut self, atom: wake_common::JsAtom) {
+        let value = self.interner.resolve_js(atom);
+        self.push(&typed::quote_string(&value, false));
     }
 
     fn emit_string_atom(&mut self, atom: Atom) {

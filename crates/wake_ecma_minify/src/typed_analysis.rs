@@ -3,6 +3,9 @@
 //! This module deliberately accepts only [`TypedProgram`]. It never projects facts through parser
 //! spans or consults the frozen parser AST: a structural edit followed by [`TypedAnalysis::rebuild`]
 //! therefore has exactly one source of truth, the current live IR tree.
+//! Distinct parameter/body-var symbols with the same original name retain that spelling and
+//! their declarations: function instantiation implicitly copies the parameter into the body var.
+//! This constraint is rebuilt from live declaration scopes, not from saved parser coordinates.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,6 +32,8 @@ impl TypedScopeId {
 pub enum TypedScopeKind {
     Module,
     Function,
+    FunctionName,
+    StaticBlock,
     Block,
     Catch,
     Class,
@@ -361,6 +366,7 @@ struct FunctionRegion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypedAnalysis {
     revision: u64,
+    legacy_block_functions: bool,
     scopes: Vec<TypedScopeFacts>,
     node_scopes: Vec<Option<TypedScopeId>>,
     name_uses: Vec<Option<NameUse>>,
@@ -371,6 +377,11 @@ pub struct TypedAnalysis {
 }
 
 impl TypedAnalysis {
+    /// Current syntax requires preserving Annex B's implicit name-sensitive var copies.
+    pub const fn has_legacy_block_functions(&self) -> bool {
+        self.legacy_block_functions
+    }
+
     /// Rebuild every fact from the current live typed tree.
     pub fn rebuild(program: &TypedProgram) -> Result<Self, TypedIrError> {
         program.validate()?;
@@ -497,6 +508,8 @@ struct Analyzer<'program> {
     effects: Vec<Option<TypedEffectSummary>>,
     function_regions: Vec<FunctionRegion>,
     dynamic_region_depth: usize,
+    strict: bool,
+    legacy_block_functions: bool,
 }
 
 impl<'program> Analyzer<'program> {
@@ -525,6 +538,8 @@ impl<'program> Analyzer<'program> {
             effects: vec![None; program.nodes().len()],
             function_regions: Vec::new(),
             dynamic_region_depth: 0,
+            strict: false,
+            legacy_block_functions: false,
         }
     }
 
@@ -581,6 +596,7 @@ impl<'program> Analyzer<'program> {
 
         Ok(TypedAnalysis {
             revision: self.program.revision(),
+            legacy_block_functions: self.legacy_block_functions,
             scopes: self.scopes,
             node_scopes: self.node_scopes,
             name_uses: self.name_uses,
@@ -662,7 +678,10 @@ impl<'program> Analyzer<'program> {
             .data()
             .clone();
         let mut effect = match data {
-            IrNodeData::Program { body, .. } => self.visit_list(body, RequestedAccess::Default),
+            IrNodeData::Program { body, strict, .. } => {
+                self.strict = strict;
+                self.visit_list(body, RequestedAccess::Default)
+            }
             IrNodeData::VariableDeclaration { declarations, .. } => {
                 self.visit_list(declarations, RequestedAccess::Default)
             }
@@ -682,23 +701,41 @@ impl<'program> Analyzer<'program> {
                 name,
                 parameters,
                 body,
-                is_async: _,
-                is_generator: _,
+                is_async,
+                is_generator,
             } => {
+                if context == FunctionContext::Declaration
+                    && !self.strict
+                    && !is_async
+                    && !is_generator
+                    && self.current_scope() != self.nearest_function_scope()
+                {
+                    self.legacy_block_functions = true;
+                }
+                let saved_strict = self.strict;
+                self.strict |= body.is_some_and(|body| {
+                    matches!(
+                        self.program.node(body).unwrap().data(),
+                        IrNodeData::FunctionBody { strict: true, .. }
+                    )
+                });
                 if matches!(
                     context,
                     FunctionContext::Declaration | FunctionContext::ExportDefault
                 ) {
                     self.visit_optional(name, RequestedAccess::Default);
                 }
-                let function_scope = self.push_scope(TypedScopeKind::Function, node);
-                self.set_node_scope(node, scope);
-                if matches!(
-                    context,
-                    FunctionContext::Expression | FunctionContext::Method
-                ) {
+                let name_environment = name.is_some()
+                    && matches!(
+                        context,
+                        FunctionContext::Expression | FunctionContext::Method
+                    );
+                if name_environment {
+                    self.push_scope(TypedScopeKind::FunctionName, node);
                     self.visit_optional(name, RequestedAccess::Default);
                 }
+                let function_scope = self.push_scope(TypedScopeKind::Function, node);
+                self.set_node_scope(node, scope);
                 self.visit_list(parameters, RequestedAccess::Default);
                 if let Some(body) = body {
                     self.visit(body, RequestedAccess::Default);
@@ -710,11 +747,19 @@ impl<'program> Analyzer<'program> {
                     });
                 }
                 self.pop_scope();
+                if name_environment {
+                    self.pop_scope();
+                }
+                self.strict = saved_strict;
                 // Creating an ordinary function does not execute its body.
                 TypedEffectSummary::default()
             }
-            IrNodeData::FunctionBody { statements, .. } => {
-                self.visit_list(statements, RequestedAccess::Default)
+            IrNodeData::FunctionBody { statements, strict } => {
+                let saved_strict = self.strict;
+                self.strict |= strict;
+                let effect = self.visit_list(statements, RequestedAccess::Default);
+                self.strict = saved_strict;
+                effect
             }
             IrNodeData::Class {
                 context,
@@ -730,15 +775,18 @@ impl<'program> Analyzer<'program> {
                     self.visit_optional(name, RequestedAccess::Default);
                 }
                 let outer_scope = self.current_scope();
+                let mut effect = self.visit_list(decorators, RequestedAccess::Read);
+                let saved_strict = self.strict;
+                self.strict = true;
                 self.push_scope(TypedScopeKind::Class, node);
                 self.set_node_scope(node, outer_scope);
                 if context == ClassContext::Expression {
                     self.visit_optional(name, RequestedAccess::Default);
                 }
-                let mut effect = self.visit_optional(super_class, RequestedAccess::Read);
-                effect.combine(self.visit_list(decorators, RequestedAccess::Read));
+                effect.combine(self.visit_optional(super_class, RequestedAccess::Read));
                 effect.combine(self.visit_list(members, RequestedAccess::Default));
                 self.pop_scope();
+                self.strict = saved_strict;
                 effect
             }
             IrNodeData::Block { body } => {
@@ -761,6 +809,24 @@ impl<'program> Analyzer<'program> {
                 consequent,
                 alternate,
             } => {
+                if !self.strict
+                    && [Some(consequent), alternate]
+                        .into_iter()
+                        .flatten()
+                        .any(|arm| {
+                            matches!(
+                                self.program.node(arm).unwrap().data(),
+                                IrNodeData::Function {
+                                    context: FunctionContext::Declaration,
+                                    is_async: false,
+                                    is_generator: false,
+                                    ..
+                                }
+                            )
+                        })
+                {
+                    self.legacy_block_functions = true;
+                }
                 let mut effect = self.visit(test, RequestedAccess::Read);
                 effect.combine(self.visit(consequent, RequestedAccess::Default));
                 effect.combine(self.visit_optional(alternate, RequestedAccess::Default));
@@ -1240,7 +1306,7 @@ impl<'program> Analyzer<'program> {
                 effect
             }
             IrNodeData::StaticBlock { body } => {
-                let block_scope = self.push_scope(TypedScopeKind::Block, node);
+                let block_scope = self.push_scope(TypedScopeKind::StaticBlock, node);
                 self.set_node_scope(node, block_scope);
                 let effect = self.visit_list(body, RequestedAccess::Default);
                 self.pop_scope();
@@ -1457,13 +1523,19 @@ impl<'program> Analyzer<'program> {
             | NameRole::MetaKeyword
             | NameRole::MetaProperty => NameAccess::NonBinding,
         };
-        let scope = if access == NameAccess::Declaration {
+        let scope = if name.role() == NameRole::FunctionName
+            && self.scopes[self.current_scope().index()].kind == TypedScopeKind::FunctionName
+        {
+            self.current_scope()
+        } else if access == NameAccess::Declaration {
             name.symbol()
                 .and_then(|symbol| self.program.symbol(symbol))
                 .map_or_else(
                     || self.current_scope(),
                     |symbol| match symbol.decl_kind() {
-                        DeclKind::Var | DeclKind::Function => self.nearest_function_scope(),
+                        DeclKind::Var | DeclKind::Function | DeclKind::Arguments => {
+                            self.nearest_function_scope()
+                        }
                         DeclKind::Let
                         | DeclKind::Const
                         | DeclKind::Class
@@ -1516,7 +1588,7 @@ impl<'program> Analyzer<'program> {
             .find(|scope| {
                 matches!(
                     self.scopes[scope.index()].kind,
-                    TypedScopeKind::Module | TypedScopeKind::Function
+                    TypedScopeKind::Module | TypedScopeKind::Function | TypedScopeKind::StaticBlock
                 )
             })
             .expect("module scope exists")
@@ -1805,6 +1877,15 @@ impl<'program> Analyzer<'program> {
     }
 
     fn finish_symbol_facts(&mut self) {
+        if self.legacy_block_functions {
+            for scope in &mut self.scopes {
+                scope.frozen = true;
+            }
+            for symbol in &mut self.symbols {
+                symbol.frozen = true;
+                symbol.escape.dynamically_observed = true;
+            }
+        }
         for facts in &mut self.symbols {
             let Some(declaration_scope) = facts.declaration_scope else {
                 continue;
@@ -1828,6 +1909,42 @@ impl<'program> Analyzer<'program> {
         for scope in &mut self.scopes {
             scope.symbols.sort_unstable();
             scope.symbols.dedup();
+        }
+        // The language instantiates arguments by this spelling, including a body var which
+        // inherits its initial value from the parameter environment. Rebuild this constraint
+        // from live symbol names, never from parser spans or an old semantic snapshot.
+        for (id, symbol) in self.program.symbols().iter().enumerate() {
+            if symbol.original_name() == "arguments" {
+                self.symbols[id].frozen = true;
+                self.symbols[id].escape.dynamically_observed = true;
+            }
+        }
+        // Implicit parameter copies are name-sensitive even though the parameter and body var
+        // have distinct semantic identities. Keep both declarations and spellings intact.
+        for scope in &self.scopes {
+            if scope.kind != TypedScopeKind::Function {
+                continue;
+            }
+            let parameters = scope
+                .symbols
+                .iter()
+                .filter_map(|&id| {
+                    let symbol = self.program.symbol(id)?;
+                    (symbol.decl_kind() == DeclKind::Param).then_some((symbol.original_name(), id))
+                })
+                .collect::<BTreeMap<_, _>>();
+            for &id in &scope.symbols {
+                let Some(symbol) = self.program.symbol(id) else {
+                    continue;
+                };
+                if symbol.decl_kind() == DeclKind::Var
+                    && let Some(&parameter) = parameters.get(symbol.original_name())
+                    && parameter != id
+                {
+                    self.symbols[parameter as usize].frozen = true;
+                    self.symbols[id as usize].frozen = true;
+                }
+            }
         }
     }
 }
@@ -2730,7 +2847,7 @@ mod tests {
             parsed.diagnostics
         );
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }
@@ -2771,6 +2888,69 @@ mod tests {
                 .is_some_and(|name| name.symbol() == Some(symbol))
         }));
         reads
+    }
+
+    #[test]
+    fn legacy_copy_guard_is_rebuilt_from_live_syntax_and_inherits_strict_contexts() {
+        let mut program = lower_source(
+            "if(false){function item(){}} consume(1);",
+            SourceType::Script,
+        );
+        assert!(
+            TypedAnalysis::rebuild(&program)
+                .unwrap()
+                .has_legacy_block_functions()
+        );
+        let body = root_body(&program);
+        program.splice_list(body, 0..1, &[]).unwrap();
+        assert!(
+            !TypedAnalysis::rebuild(&program)
+                .unwrap()
+                .has_legacy_block_functions()
+        );
+        for (source, kind, expected) in [
+            ("{function item(){}}", SourceType::Module, false),
+            (
+                "'use strict';{function item(){}}",
+                SourceType::Script,
+                false,
+            ),
+            (
+                "function strict(){'use strict';{function item(){}}}",
+                SourceType::Script,
+                false,
+            ),
+            (
+                "const strict=()=>{'use strict';{function item(){}}}",
+                SourceType::Script,
+                false,
+            ),
+            (
+                "class C {method(){{function item(){}}} static {{function item(){}}}}",
+                SourceType::Script,
+                false,
+            ),
+            (
+                "{async function item(){}} {function* generator(){}}",
+                SourceType::Script,
+                false,
+            ),
+            ("if(flag) function item(){}", SourceType::Script, true),
+            (
+                "const obj={method(){{function item(){}}}}",
+                SourceType::Script,
+                true,
+            ),
+        ] {
+            let program = lower_source(source, kind);
+            assert_eq!(
+                TypedAnalysis::rebuild(&program)
+                    .unwrap()
+                    .has_legacy_block_functions(),
+                expected,
+                "{source}"
+            );
+        }
     }
 
     #[test]

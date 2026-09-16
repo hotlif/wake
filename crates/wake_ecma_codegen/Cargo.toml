@@ -16,4 +16,5 @@ wake_ecma_minify.workspace = true
 
 [dev-dependencies]
 wake_ecma_parser.workspace = true
+wake_ecma_transform.workspace = true
 insta.workspace = true

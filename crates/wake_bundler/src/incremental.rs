@@ -5869,7 +5869,7 @@ fn exclude_locally_bound_require(
 ) {
     use wake_ecma_ast::{Expression, Visit, walk_expression};
     let require = interner.intern("require");
-    let semantic = wake_ecma_semantic::analyze(program);
+    let semantic = wake_ecma_semantic::analyze(program, interner);
     let mut bindings: FxHashMap<Span, bool> = FxHashMap::default();
     for reference in &semantic.references {
         if reference.name == require && !reference.span.is_dummy() {

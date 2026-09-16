@@ -559,12 +559,14 @@ pub fn lower_object_spread<'a>(
                             interner.with_resolved(ident.name, |name| name == "__proto__")
                         }
                         PropertyKey::String(string) => {
-                            interner.with_resolved(string.value, |name| name == "__proto__")
+                            interner.resolve_js(string.value) == "__proto__"
                         }
                         _ => false,
                     } {
                     let (span, value) = match property.key {
-                        PropertyKey::Ident(ident) => (ident.span, ident.name),
+                        PropertyKey::Ident(ident) => {
+                            (ident.span, interner.intern_js_from_atom(ident.name))
+                        }
                         PropertyKey::String(string) => (string.span, string.value),
                         _ => unreachable!("ordinary __proto__ key was matched above"),
                     };
@@ -1387,7 +1389,7 @@ fn lower_object_pattern<'a>(
                 MemberProperty::Ident(ident),
                 Expression::StringLiteral(arena.alloc(StringLiteral {
                     span: ident.span,
-                    value: ident.name,
+                    value: interner.intern_js_from_atom(ident.name),
                 })),
             ),
             PropertyKey::Computed(expression) => {
@@ -1419,7 +1421,7 @@ fn lower_object_pattern<'a>(
                 MemberProperty::Private(ident),
                 Expression::StringLiteral(arena.alloc(StringLiteral {
                     span: ident.span,
-                    value: ident.name,
+                    value: interner.intern_js_from_atom(ident.name),
                 })),
             ),
         };
@@ -2460,7 +2462,7 @@ fn lower_object_assignment_pattern<'a>(
                         if has_rest {
                             excluded.push(Expression::StringLiteral(arena.alloc(StringLiteral {
                                 span: ident.span,
-                                value: ident.name,
+                                value: interner.intern_js_from_atom(ident.name),
                             })));
                         }
                         MemberProperty::Ident(ident)
@@ -2512,7 +2514,7 @@ fn lower_object_assignment_pattern<'a>(
                         if has_rest {
                             excluded.push(Expression::StringLiteral(arena.alloc(StringLiteral {
                                 span: ident.span,
-                                value: ident.name,
+                                value: interner.intern_js_from_atom(ident.name),
                             })));
                         }
                         MemberProperty::Private(ident)
@@ -2656,7 +2658,7 @@ fn to_property_key<'a>(
     }));
     let symbol = Expression::StringLiteral(arena.alloc(StringLiteral {
         span,
-        value: interner.intern("symbol"),
+        value: interner.intern_js("symbol"),
     }));
     let test = Expression::Binary(arena.alloc(BinaryExpression {
         span,
@@ -2951,7 +2953,9 @@ pub fn lower_template<'a>(
         return Expression::TemplateLiteral(template);
     }
     let first = template.quasis.first().expect("template has one quasi");
-    let first_value = first.cooked.unwrap_or(first.raw);
+    let first_value = first
+        .cooked
+        .unwrap_or_else(|| interner.intern_js_from_atom(first.raw));
     let base = Expression::StringLiteral(arena.alloc(StringLiteral {
         span: first.span,
         value: first_value,
@@ -2969,8 +2973,10 @@ pub fn lower_template<'a>(
     for (index, expression) in template.expressions.iter().copied().enumerate() {
         arguments.push(expression);
         let quasi = template.quasis[index + 1];
-        let value = quasi.cooked.unwrap_or(quasi.raw);
-        if interner.with_resolved(value, |text| !text.is_empty()) {
+        let value = quasi
+            .cooked
+            .unwrap_or_else(|| interner.intern_js_from_atom(quasi.raw));
+        if !interner.resolve_js(value).is_empty() {
             arguments.push(Expression::StringLiteral(arena.alloc(StringLiteral {
                 span: quasi.span,
                 value,
@@ -4949,7 +4955,7 @@ mod tests {
         let jsx_dev = interner.intern("_jsxDEV");
         let source = Expression::StringLiteral(arena.alloc(StringLiteral {
             span,
-            value: interner.intern("source"),
+            value: interner.intern_js("source"),
         }));
         let (development, development_binding) = lower_automatic_jsx_call(
             &arena,

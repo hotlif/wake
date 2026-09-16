@@ -11,6 +11,7 @@
 //! （整体作字符串类型，同 tsc）、属性（字符串/`{表达式}`/布尔简写/`{...spread}`）、连字符属性名
 //! （`data-*`/`aria-*`）、`key`（提到第 3 参）、子节点（文本/`{表达式}`/嵌套元素）、自闭合、
 //! HTML 实体解码。
+//! 开闭标签必须精确匹配（含成员名、命名空间和片段）；不匹配生成 parser 错误，不能视为有效源码。
 //!
 //! **runtime 口径**由 [`crate::ParseOptions`] 决定：
 //! - `jsx_import_source`（默认 `"react"`）→ 导入 `<source>/jsx-runtime`；
@@ -18,8 +19,9 @@
 //!   {fileName,lineNumber,columnNumber}, this)`（对齐 tsc `--jsx react-jsxdev`），
 //!   供 React DevTools 显示组件栈。
 //!
+//! JSX 属性字符串使用独立的原生词法模式：允许原始换行，反斜杠不转义引号；实体仍由 JSX 解码。
 //! 未覆盖：classic runtime / `@jsx` pragma——**不在 legacy tool 对齐范围**（legacy tool 显式配置
-//! `@babel/preset-react` 的 `runtime: "automatic"`）；多行属性字符串中的 JS 转义。
+//! `@babel/preset-react` 的 `runtime: "automatic"`）。
 
 use wake_common::{Atom, Span};
 use wake_ecma_ast::{
@@ -28,13 +30,13 @@ use wake_ecma_ast::{
     ObjectMember, ObjectProperty, PropertyKey, PropertyKind, SpreadElement, Statement,
     StringLiteral,
 };
-use wake_ecma_lexer::{Lexer, TokenKind};
+use wake_ecma_lexer::{Lexer, Token, TokenKind};
 use wake_ecma_transform::{
     AutomaticJsxBinding, AutomaticJsxCall, AutomaticJsxCallKind, AutomaticJsxRuntime,
     lower_automatic_jsx_call,
 };
 
-use crate::Parser;
+use crate::{Parser, SourceNodeKind, SourceTokenContext};
 
 impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 驻留任意字符串为 Atom。
@@ -44,6 +46,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 重新以「普通词法」从 `from` 取 token 到 `cur`（regex 关闭，用于 JSX 标签内部/恢复）。
     fn jsx_relex(&mut self, from: u32) {
+        self.source_token(self.cur, SourceTokenContext::JsxTag);
         self.cur = self.lexer.next_at(from, false);
         self.lookahead = None;
         self.prev_end = from;
@@ -51,7 +54,15 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 重新以「表达式起始」从 `from` 取 token 到 `cur`（regex 允许，用于 `{表达式}`）。
     fn jsx_relex_expr(&mut self, from: u32) {
+        self.source_token(self.cur, SourceTokenContext::JsxTag);
         self.cur = self.lexer.next_at(from, true);
+        self.lookahead = None;
+        self.prev_end = from;
+    }
+
+    fn jsx_relex_attribute(&mut self, from: u32) {
+        self.source_token(self.cur, SourceTokenContext::JsxTag);
+        self.cur = self.lexer.next_jsx_attribute_token(from);
         self.lookahead = None;
         self.prev_end = from;
     }
@@ -159,19 +170,30 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let after_lt = self.cur.span.hi;
         // 取 `<` 之后的标签 token（名字，或片段的 `>`）。
         self.jsx_relex(after_lt);
+        let source_kind = if self.at(TokenKind::Gt) {
+            SourceNodeKind::JsxFragment
+        } else {
+            SourceNodeKind::JsxElement
+        };
+        self.source_begin(source_kind, lo);
+        self.source_begin(SourceNodeKind::JsxOpeningElement, lo);
 
         // 片段 `<> ... </>`。
         if self.at(TokenKind::Gt) {
             self.jsx_runtime_usage.insert(AutomaticJsxBinding::Fragment);
+            self.source_token(self.cur, SourceTokenContext::JsxTag);
             self.prev_end = self.cur.span.hi;
+            self.source_end(self.prev_end);
             let children = self.parse_jsx_children();
-            self.parse_jsx_closing();
+            self.parse_jsx_closing("");
             let frag = self.ident_expr_atom(Span::new(lo, lo), self.jsx_atoms().fragment);
+            self.source_end(self.prev_end);
             return self.build_jsx_call(lo, frag, None, self.new_vec(), children);
         }
 
         // 元素名 → intrinsic 字符串 或 组件标识符/成员。
         let name = self.parse_jsx_element_name();
+        self.source_leaf(SourceNodeKind::JsxName, name.span());
         // TSX JSX 类型实参只参与类型检查，运行时直接擦除：`<Form<T> ... />`。
         if self.ts && self.at(TokenKind::Lt) {
             self.ts_type_arguments();
@@ -186,7 +208,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             if !self.at(TokenKind::Gt) {
                 self.error_expected(">");
             }
+            self.source_token(self.cur, SourceTokenContext::JsxTag);
             self.prev_end = self.cur.span.hi;
+            self.source_end(self.prev_end);
+            self.source_end(self.prev_end);
             return self.build_jsx_call(lo, name, key, members, self.new_vec());
         }
 
@@ -194,9 +219,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if !self.at(TokenKind::Gt) {
             self.error_expected(">");
         }
+        self.source_token(self.cur, SourceTokenContext::JsxTag);
         self.prev_end = self.cur.span.hi;
+        self.source_end(self.prev_end);
         let children = self.parse_jsx_children();
-        self.parse_jsx_closing();
+        self.parse_jsx_closing(self.slice(name.span()));
+        self.source_end(self.prev_end);
         self.build_jsx_call(lo, name, key, members, children)
     }
 
@@ -232,7 +260,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             let full = Span::new(first.lo, second.hi);
             return Expression::StringLiteral(self.alloc(StringLiteral {
                 span: full,
-                value: self.intern_slice(full),
+                value: self.interner.intern_js(self.slice(full)),
             }));
         }
 
@@ -240,15 +268,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if is_intrinsic_name(raw) {
             Expression::StringLiteral(self.alloc(StringLiteral {
                 span: first,
-                value: self.intern_slice(first),
+                value: self.interner.intern_js(self.slice(first)),
             }))
         } else {
             self.jsx_name_ident(first)
         }
     }
 
-    fn jsx_name_ident(&self, span: Span) -> Expression<'a> {
-        Expression::Identifier(self.alloc(Ident::new(span, self.intern_slice(span))))
+    fn jsx_name_ident(&mut self, span: Span) -> Expression<'a> {
+        let name = self.intern_slice(span);
+        self.source_identifier(
+            span,
+            name,
+            wake_ecma_ast::SourceIdentifierRole::ValueReference,
+        );
+        Expression::Identifier(self.alloc(Ident::new(span, name)))
     }
 
     /// 从 `cur`（名字段首 token）起，按 JSX 名字规则把连字符/后续名字符纳入同一 span，
@@ -265,6 +299,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        // Commit the complete grammar-owned JSX name, including hyphens.
+        self.cur.span.hi = end as u32;
         self.jsx_relex(end as u32);
         Span::new(lo, end as u32)
     }
@@ -283,16 +319,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 TokenKind::Gt | TokenKind::Slash | TokenKind::Eof => break,
                 TokenKind::LBrace => {
                     // 展开属性 `{...expr}`。
+                    self.source_begin(SourceNodeKind::JsxSpreadAttribute, self.cur.span.lo);
                     let after = self.cur.span.hi;
                     self.jsx_relex_expr(after);
                     if !self.at(TokenKind::DotDotDot) {
                         self.error_expected("...");
+                        self.source_end(self.prev_end);
                         break;
                     }
                     let after_dots = self.cur.span.hi;
                     self.jsx_relex_expr(after_dots);
                     let e = self.with_allow_in(true, |p| p.parse_assignment_expression());
                     self.jsx_expect_rbrace();
+                    self.source_jsx_value(Some(e), false);
+                    self.source_end(self.prev_end);
                     members.push(ObjectMember::Spread(self.alloc(SpreadElement {
                         span: e.span(),
                         argument: e,
@@ -301,39 +341,58 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 _ => {
                     // 属性名（可含连字符）。`slice` 返回 `&'src str`（绑源码而非 `&self`），
                     // 可跨后续 `&mut self` 调用存活，无需 `to_string`。
+                    let attr_lo = self.cur.span.lo;
+                    self.source_begin(SourceNodeKind::JsxAttribute, self.cur.span.lo);
                     let name_span = self.jsx_read_name_raw();
+                    self.source_leaf(SourceNodeKind::JsxName, name_span);
                     let name_raw = self.slice(name_span);
 
-                    let value = if self.at(TokenKind::Eq) {
+                    let shorthand = !self.at(TokenKind::Eq);
+                    let value = if !shorthand {
                         let after_eq = self.cur.span.hi;
-                        self.jsx_relex(after_eq);
-                        match self.cur.kind {
+                        self.jsx_relex_attribute(after_eq);
+                        self.source_begin(SourceNodeKind::JsxAttributeValue, self.cur.span.lo);
+                        let value = match self.cur.kind {
                             TokenKind::Str => {
                                 let s_span = self.cur.span;
                                 let val = self.jsx_decode_attr_string(s_span);
                                 self.jsx_relex(s_span.hi);
                                 Expression::StringLiteral(self.alloc(StringLiteral {
                                     span: s_span,
-                                    value: val,
+                                    value: self.interner.intern_js_from_atom(val),
                                 }))
                             }
                             TokenKind::LBrace => {
+                                self.source_begin(
+                                    SourceNodeKind::JsxExpressionContainer,
+                                    self.cur.span.lo,
+                                );
                                 let after_lb = self.cur.span.hi;
                                 self.jsx_relex_expr(after_lb);
                                 let e =
                                     self.with_allow_in(true, |p| p.parse_assignment_expression());
                                 self.jsx_expect_rbrace();
+                                self.source_end(self.prev_end);
                                 e
                             }
                             _ => {
                                 self.error_expected("属性值");
                                 self.jsx_true(name_span)
                             }
-                        }
+                        };
+                        self.source_end(self.prev_end);
+                        value
                     } else {
                         // 布尔简写：`<input disabled />` → `disabled: true`。
                         self.jsx_true(name_span)
                     };
+                    self.source_jsx_value(Some(value), shorthand);
+                    self.source_callback(
+                        wake_ecma_ast::SourceCallbackKind::JsxAttribute,
+                        self.span_to(attr_lo),
+                        value.span(),
+                    );
+                    self.source_end(self.prev_end);
 
                     if name_raw == "key" {
                         key = Some(value);
@@ -365,7 +424,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         } else {
             PropertyKey::String(self.alloc(StringLiteral {
                 span,
-                value: self.intern_str(raw),
+                value: self.interner.intern_js(raw),
             }))
         }
     }
@@ -401,17 +460,23 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             match self.cur.kind {
                 TokenKind::Eof => break,
                 TokenKind::JsxText => {
-                    if let Some(s) = clean_jsx_text(self.slice(self.cur.span)) {
+                    self.source_token(self.cur, SourceTokenContext::JsxText);
+                    self.source_begin(SourceNodeKind::JsxText, self.cur.span.lo);
+                    let text = clean_jsx_text(self.slice(self.cur.span));
+                    self.source_jsx_text(text.as_deref());
+                    self.source_end(self.cur.span.hi);
+                    if let Some(s) = text {
                         let atom = self.intern_str(&s);
                         children.push(Expression::StringLiteral(self.alloc(StringLiteral {
                             span: self.cur.span,
-                            value: atom,
+                            value: self.interner.intern_js_from_atom(atom),
                         })));
                     }
                     from = self.cur.span.hi;
                 }
                 TokenKind::LBrace => {
                     // `{表达式}` 子节点（`{}` / `{/*注释*/}` 跳过）。
+                    self.source_begin(SourceNodeKind::JsxExpressionContainer, self.cur.span.lo);
                     let after = self.cur.span.hi;
                     self.jsx_relex_expr(after);
                     if !self.at(TokenKind::RBrace) {
@@ -420,13 +485,19 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                             self.jsx_relex_expr(ad);
                         }
                         let e = self.with_allow_in(true, |p| p.parse_assignment_expression());
+                        self.source_jsx_value(Some(e), false);
                         children.push(e);
+                    } else {
+                        self.source_jsx_value(None, false);
                     }
                     if !self.at(TokenKind::RBrace) {
                         self.error_expected("}");
+                        self.source_end(self.prev_end);
                         break;
                     }
+                    self.source_token(self.cur, SourceTokenContext::JsxTag);
                     from = self.cur.span.hi;
+                    self.source_end(from);
                 }
                 TokenKind::Lt => {
                     // `</` → 闭合标签，交回调用方。
@@ -444,26 +515,52 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// 消费闭合标签 `</name>` 或 `</>`（`cur == <`，其后为 `/`）。
-    fn parse_jsx_closing(&mut self) {
+    fn parse_jsx_closing(&mut self, expected_name: &str) {
         if !self.at(TokenKind::Lt) {
             self.error_expected("</");
             return;
         }
+        self.source_begin(SourceNodeKind::JsxClosingElement, self.cur.span.lo);
         let slash_pos = self.cur.span.hi; // `/` 的位置
         self.jsx_relex(slash_pos + 1); // 跳过 `/`，取名字或 `>`
+        self.source_token(
+            Token::new(TokenKind::Slash, Span::new(slash_pos, slash_pos + 1), false),
+            SourceTokenContext::JsxTag,
+        );
+        let mut closing_name = "";
+        let name_lo = self.cur.span.lo;
         if !self.at(TokenKind::Gt) {
-            // 闭合名（可为成员链）——不校验是否匹配，直接消费。
+            // 闭合名（可为成员链）。
             let _ = self.jsx_read_name_raw();
+            if self.at(TokenKind::Colon) {
+                let after_colon = self.cur.span.hi;
+                self.jsx_relex(after_colon);
+                let _ = self.jsx_read_name_raw();
+            }
             while self.at(TokenKind::Dot) {
                 let ad = self.cur.span.hi;
                 self.jsx_relex(ad);
                 let _ = self.jsx_read_name_raw();
             }
+            self.source_leaf(SourceNodeKind::JsxName, Span::new(name_lo, self.prev_end));
+            closing_name = self.slice(Span::new(name_lo, self.prev_end));
+        }
+        if !closing_name
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .eq(expected_name.chars().filter(|ch| !ch.is_whitespace()))
+        {
+            self.error(
+                Span::new(name_lo, self.prev_end.max(name_lo)),
+                format!("JSX closing tag must match <{expected_name}>"),
+            );
         }
         if !self.at(TokenKind::Gt) {
             self.error_expected(">");
         }
+        self.source_token(self.cur, SourceTokenContext::JsxTag);
         self.prev_end = self.cur.span.hi;
+        self.source_end(self.prev_end);
     }
 
     /// 降级为 automatic runtime 调用：
@@ -577,7 +674,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             atoms.file_name,
             Expression::StringLiteral(self.alloc(StringLiteral {
                 span,
-                value: self.intern_str(self.options.file_name),
+                value: self.interner.intern_js(self.options.file_name),
             })),
         );
         push(atoms.line_number, self.num_lit(line as f64));

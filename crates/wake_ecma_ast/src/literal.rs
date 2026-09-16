@@ -1,6 +1,6 @@
 //! 字面量节点。
 
-use wake_common::{Atom, Span};
+use wake_common::{Atom, JsAtom, Span};
 
 use crate::AVec;
 use crate::expr::Expression;
@@ -14,8 +14,8 @@ pub struct NumberLiteral {
 #[derive(Clone, Copy, Debug)]
 pub struct StringLiteral {
     pub span: Span,
-    /// 已解码并驻留的值。
-    pub value: Atom,
+    /// 已解码并驻留的 UTF-16 码元值，与标识符的 UTF-8 Atom 分离。
+    pub value: JsAtom,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,7 +51,7 @@ pub struct TemplateLiteral<'a> {
 pub struct TemplateElement {
     pub span: Span,
     /// cooked 值（转义解码后）；非法转义时为 `None`（tagged 模板允许）。
-    pub cooked: Option<Atom>,
+    pub cooked: Option<JsAtom>,
     /// raw 文本。
     pub raw: Atom,
     /// 是否是最后一段（`}...\``）。

@@ -234,7 +234,7 @@ pub fn run_typed_pass(
 enum Primitive {
     Bool(bool),
     Number(f64),
-    String(String),
+    String(wake_common::JsString),
     Null,
     Undefined,
 }
@@ -385,7 +385,7 @@ fn fold_binary(
 
     let result = match (operator, &left, &right) {
         (BinaryOperator::Add, Primitive::String(left), Primitive::String(right)) => {
-            Primitive::String(format!("{left}{right}"))
+            Primitive::String(left.concat(right))
         }
         (
             BinaryOperator::Add
@@ -1095,10 +1095,13 @@ fn late_peephole(
                 else {
                     continue;
                 };
+                let Some(value) = value.as_str() else {
+                    continue;
+                };
                 if !is_ascii_identifier_name(value) {
                     continue;
                 }
-                let value = value.clone();
+                let value = value.to_owned();
                 let member_origin = rewrite_origin(record.origin());
                 let property_origin = program
                     .node(property)
@@ -1238,7 +1241,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, source_type);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }
@@ -1248,7 +1251,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             let Statement::Expression(statement) = &program.body[0] else {
                 panic!("owner fixture must contain one expression statement")
             };

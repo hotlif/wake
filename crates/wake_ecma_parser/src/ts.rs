@@ -4,7 +4,8 @@
 //! 仅推进 token），从而在所有位置都能精确定位类型的起止、正确处理 `>>` 拆分、函数类型 `=>`、
 //! 条件类型 `A extends B ? C : D`、`keyof`/`typeof`/`infer`、映射/对象/元组/模板字面量类型等。
 //!
-//! 括号包裹的构造（`(...)`/`[...]`/`{...}`）本身自平衡，用 [`Parser::ts_skip_balanced`] 消费即完整；
+//! 类型擦除与事实收集共用结构化类型文法，嵌套模板的早期错误不能被平衡 token 跳过；
+//! [`Parser::ts_skip_balanced`] 仅用于推测解析、错误恢复及不支持的声明属性恢复路径。
 //! `<...>`（类型参数/实参）用 [`Parser::consume_type_gt`] 精确处理 `>`/`>>`/`>>>` 收尾；
 //! 「扁平」文法（联合/交叉/条件/引用/前缀算子）按产生式递归消费。
 
@@ -12,7 +13,7 @@ use wake_common::Span;
 use wake_ecma_ast::Expression;
 use wake_ecma_lexer::{Keyword, TokenKind};
 
-use crate::{DeclarationRequestRole, Parser};
+use crate::{DeclarationRequestRole, Parser, SourceNodeKind};
 
 /// 类型参数列表在 TSX 表达式起始位置的消歧信息。
 ///
@@ -22,6 +23,8 @@ use crate::{DeclarationRequestRole, Parser};
 pub(crate) struct TsTypeParametersInfo {
     pub(crate) closed: bool,
     pub(crate) jsx_unambiguous: bool,
+    pub(crate) comma_disambiguates: bool,
+    pub(crate) source_list: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,11 +63,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if !self.ts || !self.at(TokenKind::Colon) {
             return None;
         }
+        self.source_begin(SourceNodeKind::TsTypeAnnotation, self.cur.span.lo);
         self.bump(); // :
         let lo = self.start();
         self.ts_type_or_predicate();
         let span = Span::new(lo, self.prev_end.max(lo));
         self.declaration_record_type_annotation(span);
+        self.source_end(self.prev_end);
         Some(span)
     }
 
@@ -104,6 +109,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if !self.ts || !self.at(TokenKind::Lt) {
             return info;
         }
+        let source_list = self.source_list_start(wake_ecma_ast::SourceListKind::TypeParameters);
+        let mut has_constraint_or_default = false;
+        self.source_begin(SourceNodeKind::TsTypeParameters, self.cur.span.lo);
+        let source_scope = self.source_type_scope_begin(
+            wake_ecma_ast::SourceTypeScopeKind::TypeParameters,
+            self.cur.span.lo,
+        );
         let strict = self.declaration_requires_strict_type_syntax();
         let reference_mark = self.declaration_type_reference_mark();
         let mut bindings = Vec::new();
@@ -125,7 +137,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.bump();
             }
             if self.at_ident_name() {
-                let binding = self.intern_slice(self.cur.span);
+                let binding = self.intern_ident(self.cur.span);
+                self.source_type_parameter(source_scope, self.cur.span, binding);
                 bindings.push(binding);
                 self.bump(); // 参数名
                 saw_parameter = true;
@@ -134,10 +147,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 reported_missing_parameter = true;
             }
             if self.eat_keyword(Keyword::Extends) {
+                has_constraint_or_default = true;
                 info.jsx_unambiguous = true;
                 self.ts_type();
             }
             if self.eat(TokenKind::Eq) {
+                has_constraint_or_default = true;
                 info.jsx_unambiguous = true;
                 self.ts_type();
             }
@@ -150,8 +165,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.error_expected("类型参数名");
         }
         info.closed = self.at_type_gt();
+        info.comma_disambiguates = bindings.len() == 1 && !has_constraint_or_default;
+        info.source_list = self.source_list_finish(source_list, true);
         self.consume_type_gt();
         self.declaration_activate_type_bindings_since(reference_mark, &bindings);
+        self.source_end(self.prev_end);
         info
     }
 
@@ -164,6 +182,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if !self.at(TokenKind::Lt) {
             return;
         }
+        self.source_begin(SourceNodeKind::TsTypeArguments, self.cur.span.lo);
         let strict = self.declaration_requires_strict_type_syntax();
         let mut saw_argument = false;
         let mut reported_missing_argument = false;
@@ -186,11 +205,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if strict && !saw_argument && !reported_missing_argument {
             self.error_expected("类型实参");
         }
-        if expression && !self.at(TokenKind::Gt) {
-            self.error_expected("类型实参闭合的 `>`");
+        if expression {
+            if !self.at(TokenKind::Gt) {
+                self.error_expected("类型实参闭合的 `>`");
+            } else {
+                // An instantiation is an expression value. Its following slash is division,
+                // unlike a comparison's RHS; do not lex it with the generic `>` heuristic.
+                self.source_token(self.cur, crate::SourceTokenContext::JavaScript);
+                self.prev_end = self.cur.span.hi;
+                self.cur = self.lexer.next_at(self.prev_end, false);
+                self.lookahead = None;
+            }
         } else {
             self.consume_type_gt();
         }
+        self.source_end(self.prev_end);
     }
 
     /// Speculatively erase call, constructor, tag, or standalone instantiation type arguments.
@@ -285,9 +314,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 完整类型：函数/构造类型，或联合类型 + 可选条件类型。
     pub(crate) fn ts_type(&mut self) {
+        self.source_begin(SourceNodeKind::TsType, self.cur.span.lo);
         self.declaration_begin_type();
         self.ts_type_inner();
         self.declaration_end_type();
+        self.source_end(self.prev_end);
     }
 
     fn ts_type_inner(&mut self) {
@@ -302,8 +333,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.bump(); // extends
             // extends 类型：不再吃条件，避免贪婪。
             self.ts_union();
+            let has_true = self.eat(TokenKind::Question);
             let infer_scope = self.declaration_activate_infer_scope();
-            if self.eat(TokenKind::Question) {
+            if has_true {
                 self.ts_type();
                 self.declaration_restore_type_scope(infer_scope);
                 self.expect(TokenKind::Colon);
@@ -337,6 +369,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     fn ts_type_operand(&mut self) {
         // typeof 类型查询：`typeof a.b.c` (+ 可选类型实参)。
         if self.at_keyword(Keyword::Typeof) {
+            let lo = self.start();
+            self.source_begin(SourceNodeKind::TsTypeOperator, lo);
             self.bump();
             if self.at_keyword(Keyword::Import) {
                 self.ts_import_type();
@@ -347,17 +381,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.ts_type_arguments();
             }
             // 类型查询同样可以继续索引：`typeof VALUE[keyof typeof VALUE]`。
-            while !self.newline_before() && self.at(TokenKind::LBracket) {
-                if self.declaration_is_collecting() {
-                    self.bump();
-                    if !self.at(TokenKind::RBracket) {
-                        self.ts_type();
-                    }
-                    self.expect(TokenKind::RBracket);
-                } else {
-                    self.ts_skip_balanced();
-                }
-            }
+            self.ts_postfix_suffixes(lo);
+            self.source_end(self.prev_end);
             return;
         }
         // infer T (extends U)?
@@ -365,7 +390,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.bump();
             let binding = if self.at_ident_name() {
                 let span = self.cur.span;
-                let binding = self.intern_slice(self.cur.span);
+                let binding = self.intern_ident(self.cur.span);
+                self.source_infer_binding(span, binding);
                 self.bump();
                 Some((binding, span))
             } else {
@@ -376,7 +402,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             };
             if self.at_keyword(Keyword::Extends) && !self.newline_before() {
                 self.bump();
+                let constraint_scope = self.declaration_type_scope_mark();
+                if let Some((name, span)) = binding {
+                    self.source_infer_constraint(span, name);
+                }
                 self.ts_type_operand();
+                self.declaration_restore_type_scope(constraint_scope);
             }
             if let Some((binding, span)) = binding
                 && !self.declaration_record_infer_binding(binding)
@@ -391,45 +422,54 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             || self.at_contextual("readonly")
             || self.at_contextual("unique")
         {
+            self.source_begin(SourceNodeKind::TsTypeOperator, self.start());
             self.bump();
             self.ts_type_operand();
+            self.source_end(self.prev_end);
             return;
         }
         self.ts_postfix();
     }
 
     fn ts_postfix(&mut self) {
+        let lo = self.start();
         self.ts_primary();
+        self.ts_postfix_suffixes(lo);
+    }
+
+    fn ts_postfix_suffixes(&mut self, lo: u32) {
         // 后缀数组/索引访问 `T[]` / `T[K]`（同行）。
         while !self.newline_before() && self.at(TokenKind::LBracket) {
-            if self.declaration_is_collecting() {
-                self.bump();
-                if !self.at(TokenKind::RBracket) {
-                    self.ts_type();
-                }
-                self.expect(TokenKind::RBracket);
-            } else {
-                self.ts_skip_balanced();
+            self.bump();
+            let array = self.at(TokenKind::RBracket);
+            if !array {
+                self.ts_type();
             }
+            self.expect(TokenKind::RBracket);
+            self.source_leaf(
+                if array {
+                    SourceNodeKind::TsArrayType
+                } else {
+                    SourceNodeKind::TsIndexedAccessType
+                },
+                self.span_to(lo),
+            );
         }
     }
 
     fn ts_primary(&mut self) {
         match self.cur.kind {
-            TokenKind::LParen if self.declaration_is_collecting() => {
+            TokenKind::LParen => {
                 self.bump();
                 self.ts_type();
                 self.expect(TokenKind::RParen);
             }
-            TokenKind::LBrace if self.declaration_is_collecting() => {
+            TokenKind::LBrace => {
                 self.ts_declaration_type_literal();
             }
-            TokenKind::LBracket if self.declaration_is_collecting() => {
+            TokenKind::LBracket => {
                 self.ts_declaration_tuple_type();
             }
-            // Ordinary transforms need only preserve token position. Strict declaration validation
-            // uses the structured branches above so balanced executable syntax cannot hide here.
-            TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => self.ts_skip_balanced(),
             // this / void / null / const 类型。
             // `const` 是 `as const` / `<const>` 断言的类型位置写法；它是保留字，
             // ts_entity_name 会拒收，故在此显式消费（否则整段解析在 `const` 处失步）。
@@ -460,6 +500,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             // 模板字面量类型 `` `a${T}b` ``。
             TokenKind::TemplateNoSub => {
+                self.template_value(self.cur.span, true, false);
                 self.bump();
             }
             TokenKind::TemplateHead => self.ts_template_literal_type(),
@@ -472,6 +513,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             // 类型引用：`A.B.C<Args>`（含 unique/keyof 之外的上下文关键字作名字）。
             TokenKind::Ident | TokenKind::Keyword(_) => {
+                self.source_begin(SourceNodeKind::TsTypeReference, self.start());
                 if self.at_contextual("any") {
                     self.declaration_record_any(self.cur.span);
                 }
@@ -479,6 +521,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 if self.at(TokenKind::Lt) {
                     self.ts_type_arguments();
                 }
+                self.source_end(self.prev_end);
             }
             _ => {
                 // Recovery still consumes one token, but an absent/invalid type must not be
@@ -491,33 +534,41 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// `import("mod")` 类型（`.entity` 尾巴由调用方按需接类型实参）。
     fn ts_import_type(&mut self) {
+        let lo = self.start();
         self.bump(); // import
         if !self.at(TokenKind::LParen) {
-            if self.declaration_is_collecting() {
-                self.error_expected("import 类型参数");
-            }
+            self.error_expected("import 类型参数");
             return;
         }
         self.bump(); // (
+        let mut source = None;
         if self.at(TokenKind::Str) {
+            if self.source_syntax.is_some() {
+                source = Some(wake_ecma_ast::SourceModuleSpecifier {
+                    value: self.lexer.string_value(self.cur.span),
+                    span: self.cur.span,
+                });
+            }
             self.declaration_record_request(
                 self.cur.span,
                 DeclarationRequestRole::ImportTypeExpression,
             );
             self.bump();
-        } else if self.declaration_requires_strict_type_syntax() {
+        } else if self.declaration_requires_strict_type_syntax() || self.source_syntax.is_some() {
             self.error_expected("import 类型的字符串模块名");
         }
 
-        if self.declaration_requires_strict_type_syntax() {
+        let mut attributes = Some(Vec::new());
+        if self.declaration_requires_strict_type_syntax() || self.source_syntax.is_some() {
             if self.eat(TokenKind::Comma) {
-                self.ts_declaration_import_type_options();
+                attributes = self.ts_declaration_import_type_options();
                 self.eat(TokenKind::Comma);
             }
             self.expect(TokenKind::RParen);
         } else {
             self.ts_skip_balanced_tail(1);
         }
+        self.source_type_import(Span::new(lo, self.prev_end), source, attributes);
         while self.at(TokenKind::Dot) {
             self.bump();
             if self.at_ident_name() {
@@ -528,21 +579,34 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    fn ts_declaration_import_type_options(&mut self) {
+    fn ts_declaration_import_type_options(
+        &mut self,
+    ) -> Option<Vec<wake_ecma_ast::SourceImportAttribute>> {
         if !self.at(TokenKind::LBrace) {
             self.error_expected("import 类型 attributes 对象");
             while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                 self.bump();
             }
-            return;
+            return None;
         }
         self.bump();
         let mut saw_attributes = false;
+        let mut known = true;
+        let mut attributes = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let name;
             if matches!(
                 self.cur.kind,
                 TokenKind::Ident | TokenKind::Keyword(_) | TokenKind::Str
             ) {
+                name = if self.at(TokenKind::Str) {
+                    self.lexer.string_value(self.cur.span)
+                } else {
+                    self.lexer
+                        .identifier_text(self.cur.span)
+                        .into_owned()
+                        .into()
+                };
                 self.bump();
             } else {
                 self.error_expected("import 类型 attributes 属性名");
@@ -550,7 +614,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
             self.expect(TokenKind::Colon);
-            self.ts_declaration_import_attributes_bag();
+            let entries = self.ts_declaration_import_attributes_bag();
+            if name == "with" {
+                if let Some(entries) = entries {
+                    attributes = entries;
+                } else {
+                    known = false;
+                }
+            } else {
+                known = false;
+            }
             saw_attributes = true;
             if !self.eat(TokenKind::Comma) {
                 break;
@@ -560,20 +633,34 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.error_expected("import 类型 attributes");
         }
         self.expect(TokenKind::RBrace);
+        known.then_some(attributes)
     }
 
-    fn ts_declaration_import_attributes_bag(&mut self) {
+    fn ts_declaration_import_attributes_bag(
+        &mut self,
+    ) -> Option<Vec<wake_ecma_ast::SourceImportAttribute>> {
         if !self.at(TokenKind::LBrace) {
             self.error_expected("import 类型 attribute 映射");
             self.ts_recover_declaration_import_attributes(TokenKind::RBrace);
-            return;
+            return None;
         }
         self.bump();
+        let mut attributes = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let lo = self.start();
+            let name;
             if matches!(
                 self.cur.kind,
                 TokenKind::Ident | TokenKind::Keyword(_) | TokenKind::Str
             ) {
+                name = if self.at(TokenKind::Str) {
+                    self.lexer.string_value(self.cur.span)
+                } else {
+                    self.lexer
+                        .identifier_text(self.cur.span)
+                        .into_owned()
+                        .into()
+                };
                 self.bump();
             } else {
                 self.error_expected("import 类型 attribute 名");
@@ -582,6 +669,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             self.expect(TokenKind::Colon);
             if self.at(TokenKind::Str) {
+                if self.source_syntax.is_some() {
+                    attributes.push(wake_ecma_ast::SourceImportAttribute {
+                        key: name,
+                        value: self.lexer.string_value(self.cur.span),
+                        span: Span::new(lo, self.cur.span.hi),
+                    });
+                }
                 self.bump();
             } else {
                 self.error_expected("import 类型 attribute 字符串值");
@@ -593,6 +687,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
         }
         self.expect(TokenKind::RBrace);
+        Some(attributes)
     }
 
     fn ts_recover_declaration_import_attributes(&mut self, boundary: TokenKind) {
@@ -609,14 +704,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     fn ts_template_literal_type(&mut self) {
+        self.template_value(self.cur.span, false, false);
         self.bump(); // TemplateHead `` `..${ ``
         loop {
             self.ts_type();
             match self.cur.kind {
                 TokenKind::TemplateMiddle => {
+                    self.template_value(self.cur.span, false, false);
                     self.bump();
                 }
                 TokenKind::TemplateTail => {
+                    self.template_value(self.cur.span, true, false);
                     self.bump();
                     break;
                 }
@@ -628,12 +726,24 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 实体名 `A.B.C`（用于类型引用/typeof）。
     fn ts_entity_name(&mut self, namespace: TsEntityReferenceNamespace) {
         if self.at_ident_name() {
-            let binding = self.intern_slice(self.cur.span);
+            let binding = self
+                .interner
+                .intern(&self.lexer.identifier_text(self.cur.span));
             match namespace {
                 TsEntityReferenceNamespace::Type => {
+                    self.source_identifier(
+                        self.cur.span,
+                        binding,
+                        wake_ecma_ast::SourceIdentifierRole::TypeReference,
+                    );
                     self.declaration_record_type_reference(binding);
                 }
                 TsEntityReferenceNamespace::Value => {
+                    self.source_identifier(
+                        self.cur.span,
+                        binding,
+                        wake_ecma_ast::SourceIdentifierRole::TypeQuery,
+                    );
                     self.declaration_record_value_reference(binding);
                 }
             }
@@ -684,6 +794,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// `value is T`, `asserts value is T`, and `this` predicates. Signature parameter bindings
     /// remain active while collecting references from the return type.
     fn ts_function_type(&mut self) {
+        self.source_begin(SourceNodeKind::TsSignature, self.cur.span.lo);
         let type_scope = self.declaration_type_scope_mark();
         let value_scope = self.declaration_value_scope_mark();
         if self.at_contextual("abstract") {
@@ -694,22 +805,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.ts_type_parameters(TsTypeParameterContext::FunctionLike);
         }
         if self.at(TokenKind::LParen) {
-            if self.declaration_is_collecting() {
-                self.ts_declaration_signature_parameters();
-            } else {
-                self.ts_skip_balanced();
-            }
+            self.ts_declaration_signature_parameters();
         }
         self.expect(TokenKind::Arrow);
         self.ts_type_or_predicate();
         self.declaration_restore_value_scope(value_scope);
         self.declaration_restore_type_scope(type_scope);
+        self.source_end(self.prev_end);
     }
 
-    /// Parse the type-member grammar used by interface and object type bodies during strict
-    /// declaration validation. Ordinary lowering intentionally keeps the faster balanced-token
-    /// path, while untrusted declaration bodies must prove that every balanced token is a type
-    /// member rather than an initializer or method implementation.
+    /// Parse type members for lowering, source facts and strict declaration validation alike.
+    /// Erasure must still validate template literals nested in member and signature types.
     pub(crate) fn ts_declaration_type_literal(&mut self) {
         self.ts_declaration_type_literal_with_mapped(true);
     }
@@ -719,6 +825,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     fn ts_declaration_type_literal_with_mapped(&mut self, allow_mapped: bool) {
+        self.source_begin(SourceNodeKind::TsObjectType, self.cur.span.lo);
         self.expect(TokenKind::LBrace);
         let mut member_count = 0usize;
         let mut saw_mapped = false;
@@ -757,14 +864,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
         }
         self.expect(TokenKind::RBrace);
+        self.source_end(self.prev_end);
     }
 
     /// `new` starts a construct signature only before a parameter or type-parameter list;
     /// otherwise it is an ordinary property name, including optional properties and methods.
     fn ts_declaration_type_member(&mut self) -> bool {
+        self.source_begin(SourceNodeKind::TsTypeMember, self.cur.span.lo);
         let type_scope = self.declaration_type_scope_mark();
         let mapped = self.ts_declaration_type_member_inner();
         self.declaration_restore_type_scope(type_scope);
+        self.source_end(self.prev_end);
         mapped
     }
 
@@ -886,6 +996,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     fn ts_declaration_member_signature(&mut self, requires_return_type: bool) {
+        self.source_begin(SourceNodeKind::TsSignature, self.cur.span.lo);
+        self.ts_declaration_member_signature_inner(requires_return_type);
+        self.source_end(self.prev_end);
+    }
+
+    fn ts_declaration_member_signature_inner(&mut self, requires_return_type: bool) {
         let type_scope = self.declaration_type_scope_mark();
         let value_scope = self.declaration_value_scope_mark();
         if self.at(TokenKind::Lt) {
@@ -930,13 +1046,19 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.bump(); // `:`
             self.ts_type();
         } else if mapped_signature {
-            let binding = self.intern_slice(self.cur.span);
+            let span = self.cur.span;
+            let binding = self.intern_ident(span);
             self.bump();
             self.bump(); // `in`
             self.ts_type();
             // A mapped key is not in scope in its own constraint, but it is in scope in the
             // optional remapping clause and the mapped value type parsed by the caller.
             self.declaration_record_type_binding(binding);
+            let source_scope = self.source_type_scope_begin(
+                wake_ecma_ast::SourceTypeScopeKind::MappedType,
+                self.cur.span.lo,
+            );
+            self.source_type_parameter(source_scope, span, binding);
             if self.eat_keyword(Keyword::As) || self.at_contextual("as") {
                 if self.at_contextual("as") {
                     self.bump();
@@ -972,12 +1094,18 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
+    pub(crate) fn ts_class_index_signature(&mut self) {
+        self.ts_declaration_bracket_member_name();
+    }
+
     fn ts_declaration_signature_parameters(&mut self) {
         let value_reference_mark = self.declaration_value_reference_mark();
+        let source_list = self.source_list_start(wake_ecma_ast::SourceListKind::Parameters);
+        let mut rest = false;
         let mut parameters = Vec::new();
         self.expect(TokenKind::LParen);
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-            self.eat(TokenKind::DotDotDot);
+            rest = self.eat(TokenKind::DotDotDot);
             while matches!(
                 self.cur.kind,
                 TokenKind::Keyword(Keyword::Public | Keyword::Private | Keyword::Protected)
@@ -1016,11 +1144,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(source_list, !rest);
         self.expect(TokenKind::RParen);
         self.declaration_activate_parameter_bindings(value_reference_mark, &parameters);
     }
 
     fn ts_declaration_tuple_type(&mut self) {
+        let source_list = self.source_list_start(wake_ecma_ast::SourceListKind::Tuple);
+        self.source_begin(SourceNodeKind::TsTupleType, self.cur.span.lo);
         self.expect(TokenKind::LBracket);
         while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
             self.eat(TokenKind::DotDotDot);
@@ -1039,7 +1170,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(source_list, true);
         self.expect(TokenKind::RBracket);
+        self.source_end(self.prev_end);
     }
 
     fn ts_tuple_label_ahead(&mut self) -> bool {
@@ -1197,6 +1330,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             | TokenKind::ShrEq
             | TokenKind::UshrEq => {
                 let lo = self.cur.span.lo;
+                self.source_token(
+                    wake_ecma_lexer::Token::new(
+                        TokenKind::Gt,
+                        Span::new(lo, lo + 1),
+                        self.cur.newline_before,
+                    ),
+                    crate::SourceTokenContext::JavaScript,
+                );
                 self.prev_end = lo + 1;
                 self.cur = self.lexer.next_at(lo + 1, false);
                 self.lookahead = None;
@@ -1259,36 +1400,6 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 "namespace" | "module" | "global" | "type" | "abstract"
             ),
             _ => false,
-        }
-    }
-
-    /// 消费一个「环境声明」（`declare` 之后）用于整体擦除：遇 depth-0 的 `{` 体则整体消费；
-    /// 否则到 depth-0 的 `;`/换行/`}`/EOF 结束。括号内容保持平衡消费。
-    pub(crate) fn ts_skip_ambient(&mut self) {
-        let mut started = false;
-        loop {
-            match self.cur.kind {
-                TokenKind::LBrace => {
-                    self.ts_skip_balanced();
-                    return;
-                }
-                TokenKind::Semicolon => {
-                    self.bump();
-                    return;
-                }
-                TokenKind::RBrace | TokenKind::Eof => return,
-                TokenKind::LParen | TokenKind::LBracket => {
-                    self.ts_skip_balanced();
-                    started = true;
-                    continue;
-                }
-                _ => {}
-            }
-            if started && self.newline_before() {
-                return;
-            }
-            self.bump();
-            started = true;
         }
     }
 

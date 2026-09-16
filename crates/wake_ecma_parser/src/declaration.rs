@@ -10,13 +10,21 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bumpalo::Bump;
-use wake_common::{Atom, Interner, Span};
+use wake_common::{Atom, Interner, JsString, Span};
 use wake_ecma_ast::{
     Class, ExportDefaultKind, Expression, Function, MemberProperty, MethodKind, ModuleExportName,
-    ObjectMember, Program, PropertyKey, PropertyKind, SourceType, Statement, VariableDeclarator,
+    ObjectMember, Pattern, Program, PropertyKey, PropertyKind, SourceType, Statement,
+    VariableDeclarator,
 };
 
 use super::{ParseOptions, Parser};
+
+/// The same grammar exit closes declaration-emission bookkeeping and neutral source regions.
+#[derive(Clone, Copy)]
+pub(crate) struct TypeScopeMark {
+    declaration: Option<usize>,
+    source: Option<usize>,
+}
 
 /// A declaration-producing construct accepted by the main parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,14 +63,14 @@ pub enum DeclarationImportUsage {
 /// A typed module request embedded in a rendered declaration item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclarationRequestFact {
-    specifier: Arc<str>,
+    specifier: JsString,
     source_span: Span,
     template_range: Range<usize>,
     role: DeclarationRequestRole,
 }
 
 impl DeclarationRequestFact {
-    pub fn specifier(&self) -> &str {
+    pub fn specifier(&self) -> &JsString {
         &self.specifier
     }
 
@@ -253,7 +261,7 @@ pub(crate) struct DeclarationCollectorMark {
 
 #[derive(Clone)]
 pub(crate) struct PendingRequest {
-    pub specifier: Arc<str>,
+    pub specifier: JsString,
     pub span: Span,
     pub role: DeclarationRequestRole,
 }
@@ -302,7 +310,7 @@ struct PendingClass {
     body_close: Span,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PendingClassMemberKind {
     Method {
         key: Option<Atom>,
@@ -310,6 +318,7 @@ enum PendingClassMemberKind {
         return_type: Option<Span>,
         body_span: Option<Span>,
         async_span: Option<Span>,
+        initializer_ranges: Arc<[Span]>,
     },
     Property {
         annotation: Option<Span>,
@@ -319,7 +328,7 @@ enum PendingClassMemberKind {
     StaticBlock,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingClassMember {
     span: Span,
     signature_lo: u32,
@@ -484,7 +493,7 @@ impl<'src> DeclarationCollector<'src> {
         });
     }
 
-    pub(crate) fn record_function_overload(&mut self, span: Span) {
+    pub(crate) fn record_function_overload(&mut self, span: Span, params: &[Pattern<'_>]) {
         let Some(function) = self
             .functions
             .iter()
@@ -499,7 +508,9 @@ impl<'src> DeclarationCollector<'src> {
         }
         let mut builder = TemplateBuilder::new(self.source, &self.requests, &self.any_spans);
         builder.push_str("declare ");
-        builder.push_span(Span::new(function.keyword_span.lo, span.hi));
+        let signature = Span::new(function.keyword_span.lo, span.hi);
+        let initializer_ranges = parameter_initializer_ranges(self.source, params);
+        builder.push_span_excluding(signature, &initializer_ranges);
         let (template, requests, contains_forbidden_any) = builder.finish();
         let (ambient_template, ambient_requests) =
             remove_known_template_range(&template, &requests, 0.."declare ".len());
@@ -583,6 +594,7 @@ impl<'src> DeclarationCollector<'src> {
         return_type: Option<Span>,
         body_span: Option<Span>,
         async_span: Option<Span>,
+        params: &[Pattern<'_>],
     ) {
         self.class_members.push(PendingClassMember {
             span,
@@ -593,6 +605,7 @@ impl<'src> DeclarationCollector<'src> {
                 return_type,
                 body_span,
                 async_span,
+                initializer_ranges: parameter_initializer_ranges(self.source, params).into(),
             },
         });
     }
@@ -632,7 +645,7 @@ impl<'src> DeclarationCollector<'src> {
 
     pub(crate) fn record_request(
         &mut self,
-        specifier: impl Into<Arc<str>>,
+        specifier: impl Into<JsString>,
         span: Span,
         role: DeclarationRequestRole,
     ) {
@@ -824,7 +837,7 @@ impl<'src> DeclarationCollector<'src> {
             .iter()
             .filter(|request| span.contains(request.span))
             .map(|request| DeclarationRequestFact {
-                specifier: Arc::clone(&request.specifier),
+                specifier: request.specifier.clone(),
                 source_span: request.span,
                 template_range: (request.span.lo - span.lo) as usize
                     ..(request.span.hi - span.lo) as usize,
@@ -1145,7 +1158,9 @@ impl<'src> DeclarationCollector<'src> {
         // `async` is a runtime modifier and is intentionally excluded. The main parser recorded
         // the accepted `function` keyword span, so no textual search is needed.
         let _ = event.is_async;
-        builder.push_span(self.trim_end_span(Span::new(event.keyword_span.lo, header_end)));
+        let signature = self.trim_end_span(Span::new(event.keyword_span.lo, header_end));
+        let initializer_ranges = parameter_initializer_ranges(self.source, &function.params);
+        builder.push_span_excluding(signature, &initializer_ranges);
         if event.return_type.is_none() && event.body_span.is_some() {
             builder.push_str(": import(\"react\").JSX.Element");
         }
@@ -1311,26 +1326,26 @@ impl<'src> DeclarationCollector<'src> {
         let mut members = self
             .class_members
             .iter()
-            .copied()
             .filter(|member| {
                 event.body_open.hi <= member.span.lo && member.span.hi <= event.body_close.lo
             })
+            .cloned()
             .collect::<Vec<_>>();
         members.sort_by_key(|member| member.span.lo);
         let overloads = members
             .iter()
-            .filter_map(|member| match member.kind {
+            .filter_map(|member| match &member.kind {
                 PendingClassMemberKind::Method {
                     key,
                     body_span: None,
                     ..
-                } => key,
+                } => *key,
                 _ => None,
             })
             .collect::<Vec<_>>();
 
         for member in &members {
-            match member.kind {
+            match &member.kind {
                 PendingClassMemberKind::Method {
                     method_kind,
                     return_type,
@@ -1343,7 +1358,7 @@ impl<'src> DeclarationCollector<'src> {
                             "declaration methods must not have implementations",
                         );
                     }
-                    if !matches!(method_kind, MethodKind::Constructor | MethodKind::Set)
+                    if !matches!(*method_kind, MethodKind::Constructor | MethodKind::Set)
                         && return_type.is_none()
                     {
                         self.error(
@@ -1437,7 +1452,7 @@ impl<'src> DeclarationCollector<'src> {
         builder.push_str(prefix);
         builder.push_span(Span::new(class.keyword_span.lo, class.body_open.hi));
         for member in members {
-            match member.kind {
+            match &member.kind {
                 PendingClassMemberKind::StaticBlock => continue,
                 PendingClassMemberKind::Method { key, body_span, .. }
                     if body_span.is_some() && key.is_some_and(|key| overloads.contains(&key)) =>
@@ -1447,21 +1462,28 @@ impl<'src> DeclarationCollector<'src> {
                 PendingClassMemberKind::Method {
                     body_span,
                     async_span,
+                    initializer_ranges,
                     ..
                 } => {
                     builder.push_str("\n  ");
                     let end = body_span.map_or(member.span.hi, |body| body.lo);
                     if let Some(async_span) = async_span {
-                        builder.push_span(trim_span_in(
-                            self.source,
-                            Span::new(member.signature_lo, async_span.lo),
-                        ));
-                        builder.push_span(trim_span_in(self.source, Span::new(async_span.hi, end)));
+                        builder.push_span_excluding(
+                            trim_span_in(
+                                self.source,
+                                Span::new(member.signature_lo, async_span.lo),
+                            ),
+                            initializer_ranges,
+                        );
+                        builder.push_span_excluding(
+                            trim_span_in(self.source, Span::new(async_span.hi, end)),
+                            initializer_ranges,
+                        );
                     } else {
-                        builder.push_span(trim_span_in(
-                            self.source,
-                            Span::new(member.signature_lo, end),
-                        ));
+                        builder.push_span_excluding(
+                            trim_span_in(self.source, Span::new(member.signature_lo, end)),
+                            initializer_ranges,
+                        );
                     }
                     if !builder.output.ends_with(';') {
                         builder.push_str(";");
@@ -1622,13 +1644,30 @@ impl<'a> TemplateBuilder<'a> {
                 .iter()
                 .filter(|request| span.contains(request.span))
                 .map(|request| DeclarationRequestFact {
-                    specifier: Arc::clone(&request.specifier),
+                    specifier: request.specifier.clone(),
                     source_span: request.span,
                     template_range: output_start + (request.span.lo - span.lo) as usize
                         ..output_start + (request.span.hi - span.lo) as usize,
                     role: request.role,
                 }),
         );
+    }
+
+    fn push_span_excluding(&mut self, span: Span, excluded: &[Span]) {
+        let mut cursor = span.lo;
+        for range in excluded {
+            if range.hi <= cursor || range.lo >= span.hi {
+                continue;
+            }
+            let lo = range.lo.max(cursor);
+            if lo > cursor {
+                self.push_span(Span::new(cursor, lo));
+            }
+            cursor = cursor.max(range.hi.min(span.hi));
+        }
+        if cursor < span.hi {
+            self.push_span(Span::new(cursor, span.hi));
+        }
     }
 
     fn finish(mut self) -> (Arc<str>, Arc<[DeclarationRequestFact]>, bool) {
@@ -1640,6 +1679,60 @@ impl<'a> TemplateBuilder<'a> {
             self.contains_forbidden_any,
         )
     }
+}
+
+fn parameter_initializer_ranges(source: &str, params: &[Pattern<'_>]) -> Vec<Span> {
+    fn collect(source: &str, pattern: Pattern<'_>, ranges: &mut Vec<Span>) {
+        match pattern {
+            Pattern::Ident(_) => {}
+            Pattern::Array(array) => {
+                for element in array.elements.iter().flatten() {
+                    collect(source, *element, ranges);
+                }
+            }
+            Pattern::Object(object) => {
+                for property in &object.properties {
+                    collect(source, property.value, ranges);
+                }
+                if let Some(rest) = object.rest {
+                    collect(source, Pattern::Rest(rest), ranges);
+                }
+            }
+            Pattern::Assignment(assignment) => {
+                collect(source, assignment.left, ranges);
+                let right_start = assignment.right.span().lo as usize;
+                let left_end = assignment.left.span().hi as usize;
+                let equals = source[left_end..right_start]
+                    .char_indices()
+                    .rev()
+                    .find_map(|(offset, character)| {
+                        if character != '=' {
+                            return None;
+                        }
+                        let next = source[left_end + offset + 1..]
+                            .chars()
+                            .find(|character| !character.is_whitespace());
+                        (next != Some('>')).then_some((left_end + offset) as u32)
+                    })
+                    .unwrap_or(right_start.saturating_sub(1) as u32);
+                let mut equals = equals;
+                while equals > left_end as u32
+                    && matches!(source.as_bytes()[(equals - 1) as usize], b' ' | b'\t')
+                {
+                    equals -= 1;
+                }
+                ranges.push(Span::new(equals, assignment.span.hi));
+            }
+            Pattern::Rest(rest) => collect(source, rest.argument, ranges),
+        }
+    }
+
+    let mut ranges = Vec::new();
+    for parameter in params {
+        collect(source, *parameter, &mut ranges);
+    }
+    ranges.sort_by_key(|range| (range.lo, range.hi));
+    ranges
 }
 
 fn append_inferred_type(
@@ -1667,7 +1760,8 @@ fn append_inferred_type(
                 signature.lo = (signature.lo + "async".len() as u32).min(signature.hi);
                 signature = trim_span_in(builder.source, signature);
             }
-            builder.push_span(signature);
+            let initializer_ranges = parameter_initializer_ranges(builder.source, &value.params);
+            builder.push_span_excluding(signature, &initializer_ranges);
             builder.push_str(" => ");
             if let Some(return_type) = arrow.return_type {
                 builder.push_span(trim_span_in(builder.source, return_type));
@@ -1900,10 +1994,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    pub(crate) fn declaration_type_scope_mark(&self) -> Option<usize> {
-        self.declaration
-            .as_ref()
-            .map(DeclarationCollector::type_scope_mark)
+    pub(crate) fn declaration_type_scope_mark(&self) -> TypeScopeMark {
+        TypeScopeMark {
+            declaration: self
+                .declaration
+                .as_ref()
+                .map(DeclarationCollector::type_scope_mark),
+            source: self
+                .source_syntax
+                .as_ref()
+                .map(|collector| collector.active_type_scopes.len()),
+        }
     }
 
     pub(crate) fn declaration_type_reference_mark(&self) -> Option<usize> {
@@ -1928,9 +2029,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    pub(crate) fn declaration_restore_type_scope(&mut self, mark: Option<usize>) {
-        if let (Some(collector), Some(mark)) = (&mut self.declaration, mark) {
+    pub(crate) fn declaration_restore_type_scope(&mut self, mark: TypeScopeMark) {
+        if let (Some(collector), Some(mark)) = (&mut self.declaration, mark.declaration) {
             collector.restore_type_scope(mark);
+        }
+        if let (Some(collector), Some(mark)) = (&mut self.source_syntax, mark.source) {
+            collector.restore_type_scopes(mark, self.prev_end);
         }
     }
 
@@ -1963,6 +2067,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     pub(crate) fn declaration_begin_infer_scope(&mut self) {
+        self.source_begin_infer();
         if let Some(collector) = &mut self.declaration {
             collector.begin_infer_scope();
         }
@@ -1974,16 +2079,18 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             .is_some_and(|collector| collector.record_infer_binding(binding))
     }
 
-    pub(crate) fn declaration_activate_infer_scope(&mut self) -> Option<usize> {
-        self.declaration
-            .as_mut()
-            .map(DeclarationCollector::activate_infer_scope)
+    pub(crate) fn declaration_activate_infer_scope(&mut self) -> TypeScopeMark {
+        let mark = self.declaration_type_scope_mark();
+        if let Some(collector) = &mut self.declaration {
+            collector.activate_infer_scope();
+        }
+        self.source_activate_infer();
+        mark
     }
 
     pub(crate) fn declaration_record_request(&mut self, span: Span, role: DeclarationRequestRole) {
-        let specifier: Arc<str> = Arc::from(self.lexer.string_value(span).as_ref());
         if let Some(collector) = &mut self.declaration {
-            collector.record_request(specifier, span, role);
+            collector.record_request(self.lexer.string_value(span), span, role);
         }
     }
 
@@ -2053,6 +2160,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     pub(crate) fn declaration_record_any(&mut self, span: Span) {
+        self.source_leaf(crate::SourceNodeKind::TsAny, span);
         if let Some(collector) = &mut self.declaration {
             collector.record_any(span);
         }
@@ -2093,9 +2201,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    pub(crate) fn declaration_record_function_overload(&mut self, span: Span) {
+    pub(crate) fn declaration_record_function_overload(
+        &mut self,
+        span: Span,
+        params: &[Pattern<'_>],
+    ) {
         if let Some(collector) = &mut self.declaration {
-            collector.record_function_overload(span);
+            collector.record_function_overload(span, params);
         }
     }
 
@@ -2151,6 +2263,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         return_type: Option<Span>,
         body_span: Option<Span>,
         async_span: Option<Span>,
+        params: &[Pattern<'_>],
     ) {
         if let Some(collector) = &mut self.declaration {
             collector.record_class_method(
@@ -2161,6 +2274,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 return_type,
                 body_span,
                 async_span,
+                params,
             );
         }
     }
@@ -2806,6 +2920,47 @@ mod tests {
             item.kind() == DeclarationItemKind::Function
                 && item.template() == "export function load(value: number): number;"
         }));
+    }
+
+    #[test]
+    fn implementation_parameter_initializers_are_removed_from_declaration_templates() {
+        let facts = parse_declaration_facts(
+            r#"
+                export function value(
+                    input: number = 1,
+                    { name = "default" }: { name?: string } = {},
+                ): number { return input; }
+                export function overloaded(input: number = 1): number;
+                export const callback = (input: number = 1): number => input;
+                export class Box {
+                    method(input: number = 1): number { return input; }
+                    constructor(input: number = 1) { this.value = input; }
+                    value: number;
+                }
+            "#,
+            SourceType::TypeScript,
+        )
+        .unwrap();
+        let templates = facts
+            .items()
+            .iter()
+            .map(DeclarationItemFact::template)
+            .collect::<Vec<_>>();
+        assert!(templates.contains(&"export function value(\n                    input: number,\n                    { name }: { name?: string },\n                ): number;"));
+        assert!(templates.contains(&"export declare const callback: (input: number) => number;"));
+        assert!(templates.contains(&"export declare function overloaded(input: number): number;"));
+        let class = templates
+            .iter()
+            .find(|template| template.starts_with("export class Box"))
+            .expect("class declaration template");
+        assert!(class.contains("method(input: number): number;"));
+        assert!(class.contains("constructor(input: number);"));
+        assert!(!templates.iter().any(|template| template.contains("= 1")));
+        assert!(
+            !templates
+                .iter()
+                .any(|template| template.contains("= \"default\""))
+        );
     }
 
     #[test]

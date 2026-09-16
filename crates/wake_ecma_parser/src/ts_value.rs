@@ -10,7 +10,7 @@
 //! 非导出成员保持局部。**点分名** `A.B.C` 展开为嵌套 IIFE；实参用 `X || (X = {})`，
 //! 即 TS 的**声明合并**——同名 enum/namespace 再次出现时复用已有对象。
 
-use wake_common::{Atom, Span};
+use wake_common::{Atom, JsAtom, Span};
 use wake_ecma_ast::*;
 use wake_ecma_lexer::TokenKind;
 
@@ -19,6 +19,7 @@ use crate::{DeclarationItemKind, Parser};
 impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 解析 `enum E { .. }`（`const` 已由调用方消费；当前 token 为 `enum`）。
     pub(crate) fn parse_enum(&mut self, lo: u32) -> Statement<'a> {
+        self.source_begin(SourceNodeKind::TsEnum, lo);
         self.bump(); // enum
         let name = if self.at_ident_name() {
             self.parse_binding_ident()
@@ -27,6 +28,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             Ident::new(self.cur.span, self.interner.intern("__enum__"))
         };
         let parameter = transformed_parameter(name);
+        self.source_type_declaration_name(name.span, name.name, false);
+        let source_list = self.source_list_start(SourceListKind::Enum);
         self.expect(TokenKind::LBrace);
 
         let mut stmts = self.new_vec::<Statement>();
@@ -41,7 +44,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 a
             } else {
                 let id = self.parse_ident_name();
-                id.name
+                self.source_identifier(
+                    id.span,
+                    id.name,
+                    wake_ecma_ast::SourceIdentifierRole::EnumMemberBinding,
+                );
+                self.interner.intern_js_from_atom(id.name)
             };
 
             // 初始值。
@@ -85,6 +93,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(source_list, true);
         self.expect(TokenKind::RBrace);
 
         // return E;
@@ -98,6 +107,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let init = self.or_assign_ident(name);
         let decl_span = self.span_to(lo);
         self.declaration_record_source_item(DeclarationItemKind::Enum, decl_span, Some(name.span));
+        self.source_end(self.prev_end);
         self.build_value_iife(decl_span, name, parameter, stmts, init)
     }
 
@@ -107,27 +117,43 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 点分名 `A.B.C` 展开为嵌套 IIFE（成员挂最内层段）；`||` 初始化式支持跨声明合并。
     /// 字符串模块名（ambient `module "x" {}`）→ 擦除。
     pub(crate) fn parse_namespace(&mut self, lo: u32) -> Statement<'a> {
+        let dependency_mark = self.dependencies.len();
+        let kind = if self.peek().kind == TokenKind::Str {
+            SourceNodeKind::TsAmbientModule
+        } else {
+            SourceNodeKind::TsNamespace
+        };
+        self.source_begin(kind, lo);
+        let source_namespace = self.source_namespace_begin();
+        let statement = self.parse_namespace_inner(lo, source_namespace);
+        self.source_namespace_end(source_namespace);
+        self.source_end(self.prev_end);
+        if kind == SourceNodeKind::TsAmbientModule && !self.declaration_is_collecting() {
+            self.dependencies.truncate(dependency_mark);
+        }
+        statement
+    }
+
+    fn parse_namespace_inner(&mut self, lo: u32, source_namespace: Option<usize>) -> Statement<'a> {
         self.bump(); // namespace / module
         let declaration_item_mark = self.declaration_item_mark();
 
         // ambient 模块 `module "x" { .. }` → 擦除。
         if self.at(TokenKind::Str) {
+            let module_span = self.cur.span;
             self.bump();
+            self.source_namespace_header(source_namespace, &[], Some(module_span));
             if self.at(TokenKind::LBrace) {
-                if self.declaration_is_collecting() {
-                    self.bump(); // {
-                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                        let before = self.cur.span.lo;
-                        let statement = self.parse_statement();
-                        self.declaration_record_declared_statement(statement);
-                        if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
-                            self.bump();
-                        }
+                self.bump(); // {
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let before = self.cur.span.lo;
+                    let statement = self.parse_statement();
+                    self.declaration_record_declared_statement(statement);
+                    if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
+                        self.bump();
                     }
-                    self.expect(TokenKind::RBrace);
-                } else {
-                    self.ts_skip_balanced();
                 }
+                self.expect(TokenKind::RBrace);
             }
             let span = self.span_to(lo);
             self.declaration_discard_items_since(declaration_item_mark);
@@ -151,6 +177,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_namespace_header(source_namespace, &segments, None);
         let parameters: Vec<Ident> = segments
             .iter()
             .copied()
@@ -386,8 +413,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     // —— 小构造器 ——
 
-    fn enum_string_atom(&self, span: Span) -> Atom {
-        self.interner.intern(&self.lexer.string_value(span))
+    fn enum_string_atom(&self, span: Span) -> JsAtom {
+        self.interner.intern_js(self.lexer.string_value(span))
     }
 
     fn ident_ref(&self, name: Atom) -> Expression<'a> {
@@ -398,7 +425,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         Expression::Identifier(self.alloc(ident))
     }
 
-    fn str_lit(&self, value: Atom) -> Expression<'a> {
+    fn str_lit(&self, value: JsAtom) -> Expression<'a> {
         Expression::StringLiteral(self.alloc(StringLiteral {
             span: Span::DUMMY,
             value,
@@ -417,7 +444,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// `E["member"]`（计算成员，键为字符串字面量）。
-    fn member_str(&self, obj: Ident, member: Atom) -> Expression<'a> {
+    fn member_str(&self, obj: Ident, member: JsAtom) -> Expression<'a> {
         let key = self.str_lit(member);
         self.member_expr_computed(obj, key)
     }

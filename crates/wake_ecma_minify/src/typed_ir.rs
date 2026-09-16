@@ -16,10 +16,10 @@ use std::ops::Range;
 use wake_common::{Interner, Span};
 use wake_ecma_ast::{
     ArrowBody, AssignmentOperator, AttributesKeyword, BinaryOperator, Class, ClassMember,
-    ExportDefaultKind, Expression, ForInit, ForLeft, Function, Ident, ImportAttributes,
-    ImportSpecifier, LogicalOperator, MemberProperty, MethodKind, ModuleExportName, ObjectMember,
-    Pattern, Program, PropertyKey, PropertyKind, SourceType, Statement, UnaryOperator,
-    UpdateOperator, VarKind,
+    ExportDefaultKind, Expression, ForInit, ForLeft, Function, Ident, ImportAttributeKey,
+    ImportAttributes, ImportSpecifier, LogicalOperator, MemberProperty, MethodKind,
+    ModuleExportName, ObjectMember, Pattern, Program, PropertyKey, PropertyKind, SourceType,
+    Statement, UnaryOperator, UpdateOperator, VarKind,
 };
 use wake_ecma_semantic::{DeclKind, SemanticModel, SymbolId};
 
@@ -556,7 +556,7 @@ pub enum IrNodeData {
         value: f64,
     },
     StringLiteral {
-        value: String,
+        value: wake_common::JsString,
     },
     BooleanLiteral {
         value: bool,
@@ -574,7 +574,7 @@ pub enum IrNodeData {
         expressions: ListId,
     },
     TemplateElement {
-        cooked: Option<String>,
+        cooked: Option<wake_common::JsString>,
         raw: String,
         tail: bool,
     },
@@ -737,6 +737,7 @@ pub enum IrNodeData {
         items: ListId,
     },
     ImportAttribute {
+        /// String keys use lossless StringLiteral nodes, not the UTF-8 module-name table.
         key: IrModuleName,
         value: NodeId,
     },
@@ -1121,7 +1122,7 @@ impl TypedProgram {
         program: &Program<'_>,
         interner: &Interner,
     ) -> Result<Self, TypedIrError> {
-        let semantic = wake_ecma_semantic::analyze(program);
+        let semantic = wake_ecma_semantic::analyze(program, interner);
         Self::lower(program, interner, Some(&semantic))
     }
 
@@ -2645,7 +2646,12 @@ impl TypedProgram {
                 !computed && self.name_node_has_syntax(key.value, NameSyntax::Identifier)
             }
             PropertyKeyKind::String => {
-                !computed && self.name_node_has_syntax(key.value, NameSyntax::String)
+                !computed
+                    && (self.name_node_has_syntax(key.value, NameSyntax::String)
+                        || matches!(
+                            self.nodes[key.value.index()].data,
+                            IrNodeData::StringLiteral { .. }
+                        ))
             }
             PropertyKeyKind::Number => {
                 !computed
@@ -4806,7 +4812,7 @@ impl Lowerer<'_> {
             Expression::StringLiteral(literal) => self.finish(
                 literal.span,
                 IrNodeData::StringLiteral {
-                    value: self.interner.resolve(literal.value),
+                    value: self.interner.resolve_js(literal.value),
                 },
             ),
             Expression::BooleanLiteral(literal) => self.finish(
@@ -5171,7 +5177,7 @@ impl Lowerer<'_> {
                 self.finish(
                     quasi.span,
                     IrNodeData::TemplateElement {
-                        cooked: quasi.cooked.map(|cooked| self.interner.resolve(cooked)),
+                        cooked: quasi.cooked.map(|cooked| self.interner.resolve_js(cooked)),
                         raw: self.interner.resolve(quasi.raw),
                         tail: quasi.tail,
                     },
@@ -5264,15 +5270,17 @@ impl Lowerer<'_> {
                 kind: PropertyKeyKind::Identifier,
                 value: self.ident(identifier, role),
             },
-            PropertyKey::String(literal) => IrPropertyKey {
-                kind: PropertyKeyKind::String,
-                value: self.name_text(
-                    self.interner.resolve(literal.value),
-                    literal.span,
-                    role,
-                    NameSyntax::String,
-                ),
-            },
+            PropertyKey::String(literal) => {
+                let value = self.interner.resolve_js(literal.value);
+                IrPropertyKey {
+                    kind: PropertyKeyKind::String,
+                    value: if let Some(text) = value.as_str() {
+                        self.name_text(text.to_owned(), literal.span, role, NameSyntax::String)
+                    } else {
+                        self.finish(literal.span, IrNodeData::StringLiteral { value })
+                    },
+                }
+            }
             PropertyKey::Number(literal) => IrPropertyKey {
                 kind: PropertyKeyKind::Number,
                 value: self.finish(
@@ -5365,11 +5373,25 @@ impl Lowerer<'_> {
             .items
             .iter()
             .map(|attribute| {
-                let key = self.module_name(attribute.key, attribute.span, NameRole::AttributeKey);
+                let key = match attribute.key {
+                    ImportAttributeKey::Ident(id) => IrModuleName {
+                        kind: ModuleNameKind::Identifier,
+                        value: self.ident(id, NameRole::AttributeKey),
+                    },
+                    ImportAttributeKey::String(value) => IrModuleName {
+                        kind: ModuleNameKind::String,
+                        value: self.finish_with_origin(
+                            IrOrigin::parser_derived(attribute.span),
+                            IrNodeData::StringLiteral {
+                                value: self.interner.resolve_js(value),
+                            },
+                        ),
+                    },
+                };
                 let value = self.finish_with_origin(
                     IrOrigin::parser_derived(attribute.span),
                     IrNodeData::StringLiteral {
-                        value: self.interner.resolve(attribute.value),
+                        value: self.interner.resolve_js(attribute.value),
                     },
                 );
                 self.finish(attribute.span, IrNodeData::ImportAttribute { key, value })
@@ -5403,7 +5425,7 @@ mod tests {
             parsed.diagnostics
         );
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }
@@ -5422,7 +5444,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             let explicit = TypedProgram::lower(program, &interner, Some(&semantic)).unwrap();
             let analyzed = TypedProgram::lower_analyzed(program, &interner).unwrap();
             assert_eq!(analyzed, explicit);
@@ -5732,7 +5754,7 @@ export { label as "public-owned-name" };
             let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Module);
             assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
             parsed.module.with_ast(|program| {
-                let semantic = wake_ecma_semantic::analyze(program);
+                let semantic = wake_ecma_semantic::analyze(program, &interner);
                 TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
             })
             // `parsed.module` and `interner` are released at block exit.
@@ -5879,7 +5901,7 @@ export { label as "public-owned-name" };
         );
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let ir = parsed.module.with_ast(|program| {
-            let mut semantic = wake_ecma_semantic::analyze(program);
+            let mut semantic = wake_ecma_semantic::analyze(program, &interner);
             assert_eq!(semantic.symbols.len(), 2);
             // Model a lowering which inherited the exact same occurrence span for two distinct
             // symbols. The resolver must treat the coordinate as ambiguous, never choose one.
@@ -5918,7 +5940,7 @@ export { label as "public-owned-name" };
             );
             assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
             parsed.module.with_ast(|program| {
-                let semantic = wake_ecma_semantic::analyze(program);
+                let semantic = wake_ecma_semantic::analyze(program, &interner);
                 let Statement::Expression(statement) = &program.body[0] else {
                     panic!("standalone expression parser envelope changed")
                 };
@@ -6043,7 +6065,7 @@ export { label as "public-owned-name" };
             let parsed = wake_ecma_parser::parse("(value=>value)", &interner, SourceType::Script);
             assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
             parsed.module.with_ast(|program| {
-                let semantic = wake_ecma_semantic::analyze(program);
+                let semantic = wake_ecma_semantic::analyze(program, &interner);
                 let Statement::Expression(statement) = &program.body[0] else {
                     panic!("expected standalone expression")
                 };

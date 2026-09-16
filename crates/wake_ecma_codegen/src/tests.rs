@@ -51,7 +51,7 @@ fn directive_helper_program(interner: &Interner) -> wake_ecma_ast::ModuleAst {
                 span: marker_span,
                 expression: Expression::StringLiteral(arena.alloc(StringLiteral {
                     span: marker_span,
-                    value: interner.intern("wake-prologue"),
+                    value: interner.intern_js("wake-prologue"),
                 })),
             })));
         program
@@ -60,7 +60,7 @@ fn directive_helper_program(interner: &Interner) -> wake_ecma_ast::ModuleAst {
                 span: strict_span,
                 expression: Expression::StringLiteral(arena.alloc(StringLiteral {
                     span: strict_span,
-                    value: interner.intern("use strict"),
+                    value: interner.intern_js("use strict"),
                 })),
             })));
         program
@@ -906,7 +906,7 @@ fn codegen_with_optimizer_defines_and_map(
                 quoted if quoted.starts_with('"') && quoted.ends_with('"') => {
                     wake_ecma_minify::ValidatedDefine::primitive(
                         *key,
-                        wake_ecma_minify::ConstVal::Str(quoted[1..quoted.len() - 1].to_string()),
+                        wake_ecma_minify::ConstVal::Str(quoted[1..quoted.len() - 1].into()),
                     )
                 }
                 numeric if numeric.parse::<f64>().is_ok() => {

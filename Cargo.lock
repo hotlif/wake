@@ -4424,6 +4424,7 @@ dependencies = [
  "wake_ecma_ast",
  "wake_ecma_minify",
  "wake_ecma_parser",
+ "wake_ecma_transform",
 ]
 
 [[package]]
@@ -4433,6 +4434,7 @@ dependencies = [
  "criterion",
  "insta",
  "memchr",
+ "unicode-id-start",
  "wake_common",
 ]
 
@@ -4468,6 +4470,7 @@ dependencies = [
  "wake_common",
  "wake_ecma_ast",
  "wake_ecma_parser",
+ "wake_ecma_transform",
 ]
 
 [[package]]

@@ -1852,7 +1852,9 @@ fn is_static_define_key(expression: Expression<'_>) -> bool {
 fn primitive_define_value(expression: Expression<'_>, interner: &Interner) -> Option<ConstVal> {
     match expression {
         Expression::NumberLiteral(literal) => Some(ConstVal::Num(literal.value)),
-        Expression::StringLiteral(literal) => Some(ConstVal::Str(interner.resolve(literal.value))),
+        Expression::StringLiteral(literal) => {
+            Some(ConstVal::Str(interner.resolve_js(literal.value)))
+        }
         Expression::BooleanLiteral(literal) => Some(ConstVal::Bool(literal.value)),
         Expression::NullLiteral(_) => Some(ConstVal::Null),
         Expression::Identifier(identifier) => match interner.resolve(identifier.name).as_str() {

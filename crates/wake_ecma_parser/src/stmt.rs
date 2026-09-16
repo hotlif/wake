@@ -48,7 +48,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.bump(); // async
                 self.parse_function_declaration_statement(lo, true)
             }
-            TokenKind::Keyword(Keyword::Class) => Statement::ClassDeclaration(self.parse_class(lo)),
+            TokenKind::Keyword(Keyword::Class) => {
+                Statement::ClassDeclaration(self.parse_class(lo, false))
+            }
             TokenKind::Keyword(Keyword::If) => self.parse_if(lo),
             TokenKind::Keyword(Keyword::For) => self.parse_for(lo, &[]),
             TokenKind::Keyword(Keyword::While) => self.parse_while(lo),
@@ -75,7 +77,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 let decs = self.parse_decorators();
                 if self.at_keyword(Keyword::Class) {
                     let clo = self.start();
-                    Statement::ClassDeclaration(self.parse_class_with_decorators(clo, decs))
+                    Statement::ClassDeclaration(self.parse_class_with_decorators(clo, decs, false))
                 } else if self.at_keyword(Keyword::Export) {
                     let export_lo = self.start();
                     self.parse_export_with_decorators(export_lo, Some(decs))
@@ -108,7 +110,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         && self.peek().kind == TokenKind::Keyword(Keyword::Class)
                     {
                         self.bump(); // abstract
-                        return Statement::ClassDeclaration(self.parse_class(self.start()));
+                        return Statement::ClassDeclaration(self.parse_class(self.start(), false));
                     }
                     // `namespace N { .. }` / `module N { .. }` → 值转换（IIFE）。
                     if (self.at_contextual("namespace") || self.at_contextual("module"))
@@ -145,7 +147,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             return self.parse_for(for_lo, &labels);
         }
 
-        let body = self.parse_statement();
+        let body = self.parse_statement_body(true, true);
         self.wrap_statement_labels(body, &labels, lo)
     }
 
@@ -228,6 +230,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_expression_statement(&mut self, lo: u32) -> Statement<'a> {
         let expression = self.parse_expression();
+        // The compiled expression can have erased assertions and parentheses. Type queries own
+        // the complete grammar range consumed here, including those original wrappers.
+        self.source_expression_statement(self.span_to(lo), self.span_to(lo));
         self.semicolon();
         Statement::Expression(self.alloc(ExpressionStatement {
             span: self.span_to(lo),
@@ -241,9 +246,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             && id.name == self.require_atom
             && call.arguments.len() == 1
             && let Expression::StringLiteral(s) = &call.arguments[0]
+            && let Some(specifier) = self.interner.resolve_js(s.value).as_str()
         {
             self.record_dependency(Dependency {
-                specifier: s.value,
+                specifier: self.interner.intern(specifier),
                 kind: DependencyKind::Require,
                 span: call.span,
             });
@@ -256,6 +262,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     pub(crate) fn parse_block(&mut self) -> &'a BlockStatement<'a> {
         let lo = self.start();
+        self.source_begin(SourceNodeKind::JsBlock, lo);
         self.expect(TokenKind::LBrace);
         let mut body = self.new_vec::<Statement>();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -267,6 +274,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
         }
         self.expect(TokenKind::RBrace);
+        self.source_end(self.prev_end);
         self.alloc(BlockStatement {
             span: self.span_to(lo),
             body,
@@ -287,14 +295,27 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         loop {
             let dlo = self.start();
             let id = self.parse_binding_pattern();
+            let source_kind = match kind {
+                VarKind::Var => wake_ecma_ast::SourceValueBindingKind::Var,
+                VarKind::Let => wake_ecma_ast::SourceValueBindingKind::Let,
+                VarKind::Const => wake_ecma_ast::SourceValueBindingKind::Const,
+                VarKind::Using | VarKind::AwaitUsing => {
+                    wake_ecma_ast::SourceValueBindingKind::Using
+                }
+            };
+            self.mark_source_pattern_bindings(id, source_kind);
             let annotation = if self.ts {
                 self.eat(TokenKind::Bang); // 明确赋值断言 `let x!: T`
                 self.ts_type_annotation() // `: T`
             } else {
                 None
             };
+            let mut init_span = None;
             let init = if self.eat(TokenKind::Eq) {
-                Some(self.parse_assignment_expression())
+                let init_lo = self.start();
+                let init = self.parse_assignment_expression();
+                init_span = Some(self.span_to(init_lo));
+                Some(init)
             } else {
                 None
             };
@@ -303,6 +324,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 id,
                 init,
             };
+            if init.is_some() {
+                self.source_assignment(
+                    wake_ecma_ast::SourceAssignmentKind::Variable,
+                    declarator.span,
+                    declarator.id.span(),
+                    init_span.expect("initializer span"),
+                );
+            }
             let (name_span, name) = match id {
                 Pattern::Ident(identifier) => (Some(identifier.span), Some(identifier.name)),
                 _ => (None, None),
@@ -353,6 +382,33 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         })
     }
 
+    fn mark_source_pattern_bindings(
+        &mut self,
+        pattern: Pattern<'a>,
+        kind: wake_ecma_ast::SourceValueBindingKind,
+    ) {
+        match pattern {
+            Pattern::Ident(identifier) => self.source_binding_kind(identifier.span, kind),
+            Pattern::Assignment(assignment) => {
+                self.mark_source_pattern_bindings(assignment.left, kind)
+            }
+            Pattern::Rest(rest) => self.mark_source_pattern_bindings(rest.argument, kind),
+            Pattern::Array(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.mark_source_pattern_bindings(*element, kind);
+                }
+            }
+            Pattern::Object(object) => {
+                for property in object.properties.iter() {
+                    self.mark_source_pattern_bindings(property.value, kind);
+                }
+                if let Some(rest) = object.rest {
+                    self.mark_source_pattern_bindings(rest.argument, kind);
+                }
+            }
+        }
+    }
+
     // ==================================================================
     // TypeScript 声明擦除（DESIGN §4.1）——仅 ts 模式。类型语法的结构化消费在 `ts.rs`。
     // 本节：interface / type 别名 / declare 的整体擦除（值语义的 enum/namespace 见 `parse_enum`/`parse_namespace`）。
@@ -360,9 +416,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// `interface X<..> extends A, B { .. }` → 整体擦除为空语句（语法结构化消费）。
     fn skip_interface(&mut self, lo: u32) -> Statement<'a> {
+        self.source_begin(SourceNodeKind::TsInterface, lo);
         self.bump(); // interface
         let name_span = if self.at_ident_name() {
             let span = self.cur.span;
+            self.source_type_declaration_name(span, self.intern_ident(span), false);
             self.bump(); // 名字
             Some(span)
         } else {
@@ -373,7 +431,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.ts_type_parameters(TsTypeParameterContext::TypeDeclaration); // <T ..>
         if self.eat_keyword(Keyword::Extends) {
             loop {
+                self.source_begin(SourceNodeKind::TsHeritageType, self.start());
                 self.ts_type();
+                self.source_end(self.prev_end);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -381,11 +441,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
         if self.at(TokenKind::LBrace) {
             self.declaration_begin_type();
-            if self.declaration_is_collecting() {
-                self.ts_declaration_interface_body();
-            } else {
-                self.ts_skip_balanced(); // 成员体（对象类型，自平衡）
-            }
+            self.ts_declaration_interface_body();
             self.declaration_end_type();
         } else {
             self.error_expected("接口成员体");
@@ -393,14 +449,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.declaration_restore_type_scope(type_scope);
         let span = self.span_to(lo);
         self.declaration_record_source_item(DeclarationItemKind::Interface, span, name_span);
+        self.source_end(span.hi);
         Statement::Empty(span)
     }
 
     /// `type X<..> = Type;` → 整体擦除为空语句（RHS 用完整类型文法消费）。
     fn skip_type_alias(&mut self, lo: u32) -> Statement<'a> {
+        self.source_begin(SourceNodeKind::TsTypeAlias, lo);
         self.bump(); // type
         let name_span = if self.at_ident_name() {
             let span = self.cur.span;
+            self.source_type_declaration_name(span, self.intern_ident(span), false);
             self.bump(); // 别名名
             Some(span)
         } else {
@@ -418,6 +477,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.semicolon();
         let span = self.span_to(lo);
         self.declaration_record_source_item(DeclarationItemKind::TypeAlias, span, name_span);
+        self.source_end(span.hi);
         Statement::Empty(span)
     }
 
@@ -436,23 +496,61 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // 控制流
     // ==================================================================
 
+    fn parse_statement_body(
+        &mut self,
+        function_allowed: bool,
+        labelled_function_allowed: bool,
+    ) -> Statement<'a> {
+        let function_start = self.at_keyword(Keyword::Function)
+            || (self.at_keyword(Keyword::Async)
+                && self.peek().kind == TokenKind::Keyword(Keyword::Function));
+        let statement = self.parse_statement();
+        let mut terminal = statement;
+        let mut labelled = false;
+        while let Statement::Labeled(label) = terminal {
+            labelled = true;
+            terminal = label.body;
+        }
+        let invalid = match terminal {
+            Statement::FunctionDeclaration(function) => {
+                self.ctx.strict
+                    || !function_allowed
+                    || function.is_async
+                    || function.is_generator
+                    || (labelled && !labelled_function_allowed)
+            }
+            Statement::Empty(_) if function_start => self.ctx.strict || !function_allowed,
+            _ => false,
+        };
+        if invalid {
+            self.error(statement.span(), "函数声明在此语句位置不合法；请使用显式块");
+        }
+        statement
+    }
+
     fn parse_if(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // if
         self.expect(TokenKind::LParen);
         let test = self.with_allow_in(true, |p| p.parse_expression());
         self.expect(TokenKind::RParen);
-        let consequent = self.parse_statement();
+        let consequent = self.parse_statement_body(true, false);
         let alternate = if self.eat_keyword(Keyword::Else) {
-            Some(self.parse_statement())
+            Some(self.parse_statement_body(true, false))
         } else {
             None
         };
-        Statement::If(self.alloc(IfStatement {
+        let statement = Statement::If(self.alloc(IfStatement {
             span: self.span_to(lo),
             test,
             consequent,
             alternate,
-        }))
+        }));
+        self.source_condition(
+            wake_ecma_ast::SourceConditionKind::If,
+            statement.span(),
+            test.span(),
+        );
+        statement
     }
 
     fn parse_while(&mut self, lo: u32) -> Statement<'a> {
@@ -460,27 +558,39 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.expect(TokenKind::LParen);
         let test = self.with_allow_in(true, |p| p.parse_expression());
         self.expect(TokenKind::RParen);
-        let body = self.parse_statement();
-        Statement::While(self.alloc(WhileStatement {
+        let body = self.parse_statement_body(false, false);
+        let statement = Statement::While(self.alloc(WhileStatement {
             span: self.span_to(lo),
             test,
             body,
-        }))
+        }));
+        self.source_condition(
+            wake_ecma_ast::SourceConditionKind::While,
+            statement.span(),
+            test.span(),
+        );
+        statement
     }
 
     fn parse_do_while(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // do
-        let body = self.parse_statement();
+        let body = self.parse_statement_body(false, false);
         self.expect(TokenKind::Keyword(Keyword::While));
         self.expect(TokenKind::LParen);
         let test = self.with_allow_in(true, |p| p.parse_expression());
         self.expect(TokenKind::RParen);
-        self.eat(TokenKind::Semicolon);
-        Statement::DoWhile(self.alloc(DoWhileStatement {
+        self.statement_terminator(true);
+        let statement = Statement::DoWhile(self.alloc(DoWhileStatement {
             span: self.span_to(lo),
             body,
             test,
-        }))
+        }));
+        self.source_condition(
+            wake_ecma_ast::SourceConditionKind::DoWhile,
+            statement.span(),
+            test.span(),
+        );
+        statement
     }
 
     fn parse_for(&mut self, lo: u32, labels: &[Ident]) -> Statement<'a> {
@@ -524,7 +634,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.with_allow_in(true, |p| p.parse_expression())
             };
             self.expect(TokenKind::RParen);
-            let body = self.parse_statement();
+            let body = self.parse_statement_body(false, false);
             let tdz_pattern = match left {
                 ForLeft::Variable(declaration)
                     if matches!(declaration.kind, VarKind::Let | VarKind::Const)
@@ -594,7 +704,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             Some(self.with_allow_in(true, |p| p.parse_expression()))
         };
         self.expect(TokenKind::RParen);
-        let body = self.parse_statement();
+        let body = self.parse_statement_body(false, false);
         let statement = Statement::For(self.alloc(ForStatement {
             span: self.span_to(lo),
             init,
@@ -602,6 +712,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             update,
             body,
         }));
+        if let Some(test) = test {
+            self.source_condition(
+                wake_ecma_ast::SourceConditionKind::For,
+                statement.span(),
+                test.span(),
+            );
+        }
         self.wrap_statement_labels(statement, labels, lo)
     }
 
@@ -808,12 +925,18 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.expect(TokenKind::LParen);
         let discriminant = self.with_allow_in(true, |p| p.parse_expression());
         self.expect(TokenKind::RParen);
+        self.source_begin(SourceNodeKind::JsSwitchBody, self.cur.span.lo);
         self.expect(TokenKind::LBrace);
         let mut cases = self.new_vec::<SwitchCase>();
+        let mut source_cases = Vec::new();
+        let mut source_case_spans = Vec::new();
+        let mut source_case_clause_spans = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let clo = self.start();
             let test = if self.eat_keyword(Keyword::Case) {
                 let t = self.with_allow_in(true, |p| p.parse_expression());
+                source_cases.push(crate::source::source_primitive(self.interner, t));
+                source_case_spans.push(t.span());
                 Some(t)
             } else {
                 self.expect(TokenKind::Keyword(Keyword::Default));
@@ -828,6 +951,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             {
                 consequent.push(self.parse_statement());
             }
+            if test.is_some() {
+                source_case_clause_spans.push(self.span_to(clo));
+            }
             cases.push(SwitchCase {
                 span: self.span_to(clo),
                 test,
@@ -835,11 +961,22 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             });
         }
         self.expect(TokenKind::RBrace);
-        Statement::Switch(self.alloc(SwitchStatement {
+        self.source_end(self.prev_end);
+        let has_default = cases.iter().any(|case| case.test.is_none());
+        let statement = Statement::Switch(self.alloc(SwitchStatement {
             span: self.span_to(lo),
             discriminant,
             cases,
-        }))
+        }));
+        self.source_switch(
+            statement.span(),
+            discriminant.span(),
+            has_default,
+            source_cases,
+            source_case_spans,
+            source_case_clause_spans,
+        );
+        statement
     }
 
     fn parse_return(&mut self, lo: u32) -> Statement<'a> {
@@ -850,6 +987,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             Some(self.with_allow_in(true, |p| p.parse_expression()))
         };
         self.semicolon();
+        if let Some(argument) = argument {
+            self.source_return(self.span_to(lo), argument.span());
+        }
         Statement::Return(self.alloc(ReturnStatement {
             span: self.span_to(lo),
             argument,
@@ -978,7 +1118,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.expect(TokenKind::LParen);
         let object = self.with_allow_in(true, |p| p.parse_expression());
         self.expect(TokenKind::RParen);
-        let body = self.parse_statement();
+        let body = self.parse_statement_body(false, false);
         Statement::With(self.alloc(WithStatement {
             span: self.span_to(lo),
             object,
@@ -1000,7 +1140,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if function.body.is_some() {
             Statement::FunctionDeclaration(function)
         } else {
-            self.declaration_record_function_overload(function.span);
+            self.declaration_record_function_overload(function.span, function.params.as_slice());
             Statement::Empty(function.span)
         }
     }
@@ -1057,6 +1197,18 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             is_async,
             is_generator,
         });
+        self.source_function(
+            function.span,
+            keyword_span.lo,
+            function.body.map(|body| body.span),
+            false,
+        );
+        if let Some(identifier) = function.id {
+            self.source_binding_kind(
+                identifier.span,
+                wake_ecma_ast::SourceValueBindingKind::Function,
+            );
+        }
         self.declaration_record_function(
             function.span,
             keyword_span,
@@ -1079,6 +1231,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         allow_parameter_properties: bool,
         requires_return_type: bool,
     ) -> (&'a Function<'a>, Option<Span>) {
+        let scope_lo = self.cur.span.lo;
         let type_scope = self.declaration_type_scope_mark();
         self.ts_type_parameters(TsTypeParameterContext::FunctionLike); // 方法泛型 `m<T>()`
         let saved = (self.ctx.in_async, self.ctx.in_generator, self.ctx.top_level);
@@ -1122,6 +1275,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         });
         self.declaration_restore_value_scope(value_scope);
         self.declaration_restore_type_scope(type_scope);
+        self.source_function(
+            function.span,
+            scope_lo,
+            function.body.map(|body| body.span),
+            false,
+        );
         (self.lower_parsed_function_parameters(function), return_type)
     }
 
@@ -1274,6 +1433,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         allow_parameter_properties: bool,
     ) -> (AVec<'a, Pattern<'a>>, Vec<(wake_common::Atom, Span)>) {
         let value_reference_mark = self.declaration_value_reference_mark();
+        let source_list = self.source_list_start(SourceListKind::Parameters);
         self.expect(TokenKind::LParen);
         let mut params = self.new_vec::<Pattern>();
         let mut param_props: Vec<(wake_common::Atom, Span)> = Vec::new();
@@ -1330,6 +1490,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(
+            source_list,
+            !matches!(params.last(), Some(Pattern::Rest(_))),
+        );
         self.expect(TokenKind::RParen);
         self.declaration_activate_parameter_bindings(value_reference_mark, params.as_slice());
         (params, param_props)
@@ -1362,33 +1526,45 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// `declare ...` 环境声明 → 整体擦除为空语句。
     fn parse_declare(&mut self, lo: u32) -> Statement<'a> {
-        self.bump(); // declare
-        if self.declaration_is_collecting() {
-            let item_mark = self.declaration_item_mark();
-            if self.at_contextual("global") {
-                self.bump(); // global
-                self.expect(TokenKind::LBrace);
-                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                    let before = self.cur.span.lo;
-                    let declaration = self.parse_statement();
-                    self.declaration_record_declared_statement(declaration);
-                    if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
-                        self.bump();
-                    }
-                }
-                self.expect(TokenKind::RBrace);
-                let span = self.span_to(lo);
-                self.declaration_discard_items_since(item_mark);
-                self.declaration_record_source_item(DeclarationItemKind::Ambient, span, None);
-                self.declaration_mark_declared_since(item_mark, lo);
-                return Statement::Empty(span);
-            }
-            let declaration = self.parse_statement();
-            self.declaration_record_declared_statement(declaration);
-            self.declaration_mark_declared_since(item_mark, lo);
-            return Statement::Empty(self.span_to(lo));
+        self.source_begin(SourceNodeKind::TsDeclare, lo);
+        let dependency_mark = self.dependencies.len();
+        let top_level_await = self.has_top_level_await;
+        let statement = self.parse_declare_inner(lo);
+        self.source_end(self.prev_end);
+        if !self.declaration_is_collecting() {
+            // Source collection must not turn an erased ambient import into a runtime edge.
+            self.dependencies.truncate(dependency_mark);
+            self.has_top_level_await = top_level_await;
         }
-        self.ts_skip_ambient();
+        statement
+    }
+
+    fn parse_declare_inner(&mut self, lo: u32) -> Statement<'a> {
+        self.bump(); // declare
+        let item_mark = self.declaration_item_mark();
+        if self.at_contextual("global") {
+            self.source_begin(SourceNodeKind::TsGlobalAugmentation, self.cur.span.lo);
+            self.bump(); // global
+            self.expect(TokenKind::LBrace);
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                let before = self.cur.span.lo;
+                let declaration = self.parse_statement();
+                self.declaration_record_declared_statement(declaration);
+                if self.cur.span.lo == before && !self.at(TokenKind::RBrace) {
+                    self.bump();
+                }
+            }
+            self.expect(TokenKind::RBrace);
+            self.source_end(self.prev_end);
+            let span = self.span_to(lo);
+            self.declaration_discard_items_since(item_mark);
+            self.declaration_record_source_item(DeclarationItemKind::Ambient, span, None);
+            self.declaration_mark_declared_since(item_mark, lo);
+            return Statement::Empty(span);
+        }
+        let declaration = self.parse_statement();
+        self.declaration_record_declared_statement(declaration);
+        self.declaration_mark_declared_since(item_mark, lo);
         Statement::Empty(self.span_to(lo))
     }
 
@@ -1401,6 +1577,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         enable_transform_temps: bool,
     ) -> &'a FunctionBody<'a> {
         let lo = self.start();
+        self.source_begin(SourceNodeKind::JsFunctionBody, lo);
         // Once a function/method/arrow body starts, an enclosing parenthesized cover no longer
         // makes expressions inside this independent scope ambiguous arrow parameters. Restore the
         // outer flag after the body so the containing cover can still finish conservatively.
@@ -1427,6 +1604,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let transform_temps = self.pop_transform_temp_scope();
         self.in_cover_paren = previous_cover;
         let statements = self.inject_transform_temp_declaration(statements, &transform_temps);
+        self.source_end(self.prev_end);
         self.alloc(FunctionBody {
             span: self.span_to(lo),
             statements,
@@ -1434,9 +1612,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         })
     }
 
-    pub(crate) fn parse_class(&mut self, lo: u32) -> &'a Class<'a> {
+    pub(crate) fn parse_class(&mut self, lo: u32, is_expression: bool) -> &'a Class<'a> {
         let decorators = self.new_vec::<Expression>();
-        self.parse_class_with_decorators(lo, decorators)
+        self.parse_class_with_decorators(lo, decorators, is_expression)
     }
 
     /// 同上，但带已解析的**类装饰器**（`@dec class C {}`）。
@@ -1444,8 +1622,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         &mut self,
         lo: u32,
         class_decorators: wake_ecma_ast::AVec<'a, Expression<'a>>,
+        is_expression: bool,
     ) -> &'a Class<'a> {
         let keyword_span = self.cur.span;
+        self.source_begin(SourceNodeKind::JsClass, keyword_span.lo);
         self.expect(TokenKind::Keyword(Keyword::Class));
         let id = if self.at_ident_name() && !self.at_keyword(Keyword::Extends) {
             Some(self.parse_binding_ident())
@@ -1453,6 +1633,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             None
         };
         let type_scope = self.declaration_type_scope_mark();
+        if let Some(id) = id {
+            self.source_type_declaration_name(id.span, id.name, is_expression);
+        }
         self.ts_type_parameters(TsTypeParameterContext::Class); // class C<T>
         let super_class = if self.eat_keyword(Keyword::Extends) {
             let sc = self.parse_lhs_expression();
@@ -1468,7 +1651,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if self.ts && self.at_keyword(Keyword::Implements) {
             self.bump();
             loop {
+                self.source_begin(SourceNodeKind::TsHeritageType, self.start());
                 self.ts_type();
+                self.source_end(self.prev_end);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -1512,6 +1697,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             body_close,
         );
         self.declaration_restore_type_scope(type_scope);
+        self.source_end(self.prev_end);
         class
     }
 
@@ -1573,6 +1759,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // static 块。
         if is_static && self.at(TokenKind::LBrace) {
+            // Keep the source container aligned with the StaticBlock AST span. The semantic
+            // resolver enters the class static-block scope with that full span; starting at the
+            // opening brace would make erased declarations inside it unreachable to source facts.
+            self.source_begin(SourceNodeKind::JsBlock, lo);
             self.bump(); // {
             // static 块不是 async 上下文，也不再是模块顶层（规范禁止其中出现 `await`）。
             let saved = (self.ctx.in_async, self.ctx.top_level);
@@ -1589,6 +1779,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.ctx.in_async = saved.0;
             self.ctx.top_level = saved.1;
             self.expect(TokenKind::RBrace);
+            self.source_end(self.prev_end);
             let block = self.alloc(StaticBlock {
                 span: self.span_to(lo),
                 body,
@@ -1599,7 +1790,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // TS 索引签名 `[k: T]: U;` → 擦除。
         if self.ts && self.at(TokenKind::LBracket) && self.is_index_signature() {
-            self.ts_skip_balanced(); // [ ... ]
+            self.ts_class_index_signature(); // [ ... ]
             self.ts_type_annotation(); // : U
             self.semicolon();
             self.declaration_record_class_index(self.span_to(lo), signature_lo);
@@ -1666,11 +1857,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.declaration_record_class_method(
                 value.span,
                 lo,
-                property_key_atom(&key),
+                property_key_atom(self.interner, &key),
                 mkind,
                 return_type,
                 value.body.map(|body| body.span),
                 async_span,
+                value.params.as_slice(),
             );
             // 无函数体（重载签名 / abstract / declare 方法）→ 擦除。
             value.body?;
@@ -1694,6 +1886,23 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             None
         };
         self.semicolon();
+        // A bare contextual field name can become a modifier/accessor prefix for the next
+        // member after deletion, even across a newline. Preserve that grammar boundary.
+        if self.source_syntax.is_some()
+            && value.is_none()
+            && annotation.is_none()
+            && !computed
+            && !matches!(self.cur.kind, TokenKind::RBrace | TokenKind::Eof)
+            && matches!(key, PropertyKey::Ident(id) if self.interner.with_resolved(id.name, |name| matches!(name,
+                "static" | "get" | "set" | "async" | "accessor" | "public" | "private"
+                | "protected" | "readonly" | "override" | "abstract" | "declare")))
+            && let Some(terminator) = self
+                .source_syntax
+                .as_mut()
+                .and_then(|source| source.terminators.last_mut())
+        {
+            terminator.can_omit = false;
+        }
         self.declaration_record_class_property(
             self.span_to(lo),
             signature_lo,
@@ -1753,6 +1962,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let span = self.cur.span;
         if self.at_ident_name() {
             let name = self.intern_ident(span);
+            self.source_identifier(span, name, SourceIdentifierRole::ValueBinding);
             self.bump();
             Ident::new(span, name)
         } else {
@@ -1809,6 +2019,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_array_pattern(&mut self) -> Pattern<'a> {
         let lo = self.start();
+        let source_list = self.source_list_start(SourceListKind::ArrayPattern);
         self.bump(); // [
         let mut elements = self.new_vec::<Option<Pattern>>();
         while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
@@ -1832,6 +2043,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(
+            source_list,
+            !matches!(elements.last(), Some(Some(Pattern::Rest(_))) | Some(None)),
+        );
         self.expect(TokenKind::RBracket);
         Pattern::Array(self.alloc(ArrayPattern {
             span: self.span_to(lo),
@@ -1841,6 +2056,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_object_pattern(&mut self) -> Pattern<'a> {
         let lo = self.start();
+        let source_list = self.source_list_start(SourceListKind::ObjectPattern);
         self.bump(); // {
         let mut properties = self.new_vec::<ObjectPatternProperty>();
         let mut rest = None;
@@ -1869,6 +2085,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         Ident::new(self.span_to(plo), self.interner.intern("__error__"))
                     }
                 };
+                self.source_identifier(id.span, id.name, SourceIdentifierRole::ValueBinding);
                 if self.eat(TokenKind::Eq) {
                     let right = self.parse_assignment_expression();
                     Pattern::Assignment(self.alloc(AssignmentPattern {
@@ -1891,6 +2108,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(source_list, rest.is_none());
         self.expect(TokenKind::RBrace);
         Pattern::Object(self.alloc(ObjectPattern {
             span: self.span_to(lo),
@@ -1904,6 +2122,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
 
     fn parse_import_declaration(&mut self, lo: u32) -> Statement<'a> {
+        self.source_import_begin(lo);
+        let statement = self.parse_import_declaration_body(lo);
+        self.source_import_end(self.span_to(lo).hi);
+        statement
+    }
+
+    fn parse_import_declaration_body(&mut self, lo: u32) -> Statement<'a> {
         self.bump(); // import
 
         // TS：`import type ...`（类型-only 导入）→ 整体擦除，不产生运行时依赖。
@@ -1917,16 +2142,24 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 _ => false,
             };
             if type_only {
+                self.source_import_type_only();
                 self.bump(); // type
                 // `import type A = require('m')` / `import type A = N.B`：右侧按表达式消费
                 // （其中的 `require('m')` 会被 `maybe_record_require` 记为依赖，故解析后
                 // 截断依赖列表——类型-only 导入不产生任何运行时依赖）。
                 if self.at_ident_name() && self.peek().kind == TokenKind::Eq {
-                    let binding = self.intern_slice(self.cur.span);
-                    self.bump(); // A
+                    let binding = self.parse_binding_ident();
+                    self.source_import_specifier(
+                        SourceImportBindingKind::Equals,
+                        binding.span.lo,
+                        binding,
+                        None,
+                        true,
+                    );
                     self.bump(); // =
                     let dep_mark = self.dependencies.len();
                     let init = self.with_allow_in(true, |p| p.parse_assignment_expression());
+                    self.source_import_equals_target(init);
                     self.declaration_record_import_equals_request(
                         init,
                         DeclarationRequestRole::ImportType,
@@ -1934,7 +2167,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     self.dependencies.truncate(dep_mark);
                     self.semicolon();
                     let span = self.span_to(lo);
-                    self.declaration_record_import(span, [binding], false, true);
+                    self.declaration_record_import(span, [binding.name], false, true);
                     self.declaration_record_source_item(DeclarationItemKind::Import, span, None);
                     return Statement::Empty(span);
                 }
@@ -1942,16 +2175,36 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 let mut bindings = Vec::new();
                 // `import type X from 'm'`.
                 if self.at_ident_name() {
-                    bindings.push(self.parse_binding_ident().name);
+                    let local = self.parse_binding_ident();
+                    self.source_import_specifier(
+                        SourceImportBindingKind::Default,
+                        local.span.lo,
+                        local,
+                        None,
+                        true,
+                    );
+                    bindings.push(local.name);
                     self.eat(TokenKind::Comma);
                 }
                 // `import type { A, B as C } from 'm'` / `import type * as N from 'm'`.
                 if self.at(TokenKind::Star) {
+                    let slo = self.start();
                     self.bump();
                     self.expect(TokenKind::Keyword(Keyword::As));
-                    bindings.push(self.parse_binding_ident().name);
-                } else if self.eat(TokenKind::LBrace) {
+                    let local = self.parse_binding_ident();
+                    self.source_import_specifier(
+                        SourceImportBindingKind::Namespace,
+                        slo,
+                        local,
+                        None,
+                        true,
+                    );
+                    bindings.push(local.name);
+                } else if self.at(TokenKind::LBrace) {
+                    let source_list = self.source_list_start(SourceListKind::Imports);
+                    self.bump();
                     while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        let slo = self.start();
                         let imported = self.parse_module_export_name();
                         let local = if self.eat_keyword(Keyword::As) {
                             self.parse_binding_ident()
@@ -1964,23 +2217,37 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                                 }
                             }
                         };
+                        self.source_import_specifier(
+                            SourceImportBindingKind::Named,
+                            slo,
+                            local,
+                            Some(imported),
+                            true,
+                        );
                         bindings.push(local.name);
                         if !self.eat(TokenKind::Comma) {
                             break;
                         }
                     }
+                    self.source_list_finish(source_list, true);
                     self.expect(TokenKind::RBrace);
                 }
                 self.expect(TokenKind::Keyword(Keyword::From));
-                if self.at(TokenKind::Str) {
+                let request = if self.at(TokenKind::Str) {
                     let request_span = self.cur.span;
                     self.declaration_record_request(
                         request_span,
                         DeclarationRequestRole::ImportType,
                     );
                     self.bump();
+                    Some(request_span)
+                } else {
+                    None
+                };
+                let attributes = self.parse_import_attributes();
+                if let Some(request_span) = request {
+                    self.source_import_module(request_span, attributes);
                 }
-                let _ = self.parse_import_attributes();
                 self.semicolon();
                 let span = self.span_to(lo);
                 self.declaration_record_import(span, bindings, false, true);
@@ -2006,6 +2273,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.declaration_record_request(sp, DeclarationRequestRole::ImportValue);
             self.bump();
             let attributes = self.parse_import_attributes();
+            self.source_import_module(sp, attributes);
             self.semicolon();
             self.record_dependency(Dependency {
                 specifier: source,
@@ -2027,6 +2295,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if self.at_ident_name() {
             let slo = self.start();
             let local = self.parse_binding_ident();
+            self.source_import_specifier(SourceImportBindingKind::Default, slo, local, None, false);
             specifiers.push(ImportSpecifier::Default {
                 span: self.span_to(slo),
                 local,
@@ -2040,11 +2309,19 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.bump();
             self.expect(TokenKind::Keyword(Keyword::As));
             let local = self.parse_binding_ident();
+            self.source_import_specifier(
+                SourceImportBindingKind::Namespace,
+                slo,
+                local,
+                None,
+                false,
+            );
             specifiers.push(ImportSpecifier::Namespace {
                 span: self.span_to(slo),
                 local,
             });
         } else if self.at(TokenKind::LBrace) {
+            let source_list = self.source_list_start(SourceListKind::Imports);
             self.bump();
             while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
                 let slo = self.start();
@@ -2064,6 +2341,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                             }
                         }
                     };
+                    self.source_import_specifier(
+                        SourceImportBindingKind::Named,
+                        slo,
+                        local,
+                        Some(imported),
+                        true,
+                    );
                     inline_type_bindings.push(local.name);
                     if !self.eat(TokenKind::Comma) {
                         break;
@@ -2082,6 +2366,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         }
                     }
                 };
+                self.source_import_specifier(
+                    SourceImportBindingKind::Named,
+                    slo,
+                    local,
+                    Some(imported),
+                    false,
+                );
                 specifiers.push(ImportSpecifier::Named {
                     span: self.span_to(slo),
                     imported,
@@ -2091,6 +2382,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     break;
                 }
             }
+            self.source_list_finish(source_list, true);
             self.expect(TokenKind::RBrace);
         }
 
@@ -2107,6 +2399,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.declaration_record_request(request_span, role);
         }
         let attributes = self.parse_import_attributes();
+        if let Some(request_span) = request_span {
+            self.source_import_module(request_span, attributes);
+        }
         self.semicolon();
         if saw_inline_type_specifier && specifiers.is_empty() {
             let span = self.span_to(lo);
@@ -2151,8 +2446,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// `var` 的提升语义可避免 TDZ。
     fn parse_import_equals(&mut self, lo: u32) -> Statement<'a> {
         let name = self.parse_binding_ident();
+        self.source_import_specifier(
+            SourceImportBindingKind::Equals,
+            name.span.lo,
+            name,
+            None,
+            false,
+        );
         self.expect(TokenKind::Eq);
         let init = self.with_allow_in(true, |p| p.parse_assignment_expression());
+        self.source_import_equals_target(init);
         self.declaration_record_import_equals_request(init, DeclarationRequestRole::ImportValue);
         self.semicolon();
         let span = self.span_to(lo);
@@ -2215,20 +2518,40 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         };
         let lo = self.start();
         self.bump(); // with / assert
+        let source_list = self.source_list_start(SourceListKind::ImportAttributes);
         self.expect(TokenKind::LBrace);
         let mut items = self.new_vec::<ImportAttribute>();
+        let mut keys = wake_common::FxHashSet::default();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let ilo = self.start();
-            let key = self.parse_module_export_name();
+            let key_span = self.cur.span;
+            let key = if self.at(TokenKind::Str) {
+                let value = self
+                    .interner
+                    .intern_js(self.lexer.string_value(self.cur.span));
+                self.bump();
+                ImportAttributeKey::String(value)
+            } else {
+                ImportAttributeKey::Ident(self.parse_ident_name())
+            };
+            let key_value = match key {
+                ImportAttributeKey::Ident(id) => self.interner.intern_js_from_atom(id.name),
+                ImportAttributeKey::String(value) => value,
+            };
+            if !keys.insert(key_value) {
+                self.error(key_span, "重复的引入属性键");
+            }
             self.expect(TokenKind::Colon);
             // 属性值只能是字符串字面量（规范限定）。
             let value = if self.at(TokenKind::Str) {
-                let a = self.string_atom(self.cur.span);
+                let a = self
+                    .interner
+                    .intern_js(self.lexer.string_value(self.cur.span));
                 self.bump();
                 a
             } else {
                 self.error_expected("引入属性值（字符串字面量）");
-                self.interner.intern("")
+                self.interner.intern_js("")
             };
             items.push(ImportAttribute {
                 span: self.span_to(ilo),
@@ -2239,6 +2562,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(source_list, true);
         self.expect(TokenKind::RBrace);
         Some(self.alloc(ImportAttributes {
             span: self.span_to(lo),
@@ -2252,6 +2576,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     fn parse_export_with_decorators(
+        &mut self,
+        lo: u32,
+        class_decorators: Option<wake_ecma_ast::AVec<'a, Expression<'a>>>,
+    ) -> Statement<'a> {
+        self.source_export_begin(lo);
+        let declaration = self.parse_export_body(lo, class_decorators);
+        self.source_export_end(self.span_to(lo).hi);
+        declaration
+    }
+
+    fn parse_export_body(
         &mut self,
         lo: u32,
         mut class_decorators: Option<wake_ecma_ast::AVec<'a, Expression<'a>>>,
@@ -2281,6 +2616,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if self.ts && self.at(TokenKind::Eq) {
             self.bump(); // =
             let value = self.with_allow_in(true, |p| p.parse_assignment_expression());
+            self.source_export_form(SourceExportKind::Assignment, false, Some(value.span()));
             self.semicolon();
             let span = self.span_to(lo);
             self.declaration_record_export_assignment(span, value);
@@ -2289,10 +2625,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // TS：`export as namespace X;`（UMD 全局声明）→ 纯类型，擦除。
         if self.ts && self.at_keyword(Keyword::As) && self.peek_contextual("namespace") {
+            self.source_export_form(SourceExportKind::Namespace, false, None);
             self.bump(); // as
             self.bump(); // namespace
             if self.at_ident_name() {
-                self.bump(); // X
+                let name = self.parse_ident_name();
+                self.source_export_name(ModuleExportName::Ident(name), name.span);
             }
             self.semicolon();
             let span = self.span_to(lo);
@@ -2306,36 +2644,61 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             && matches!(self.peek().kind, TokenKind::LBrace | TokenKind::Star)
         {
             self.bump(); // type
+            self.source_export_form(SourceExportKind::Named, true, None);
             let mut local_bindings = Vec::new();
             let mut requires_source = false;
             if self.at(TokenKind::LBrace) {
+                let source_list = self.source_list_start(SourceListKind::Exports);
                 self.bump();
                 while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let slo = self.start();
+                    let local_span = self.cur.span;
                     let local = self.parse_module_export_name();
                     if let ModuleExportName::Ident(identifier) = local {
                         local_bindings.push(identifier.name);
                     }
-                    if self.eat_keyword(Keyword::As) {
-                        let _ = self.parse_module_export_name();
-                    }
+                    let (exported, exported_span) = if self.eat_keyword(Keyword::As) {
+                        let span = self.cur.span;
+                        (self.parse_module_export_name(), span)
+                    } else {
+                        (local, local_span)
+                    };
+                    self.source_export_specifier(
+                        slo,
+                        local,
+                        local_span,
+                        exported,
+                        exported_span,
+                        true,
+                    );
                     if !self.eat(TokenKind::Comma) {
                         break;
                     }
                 }
+                self.source_list_finish(source_list, true);
                 self.expect(TokenKind::RBrace);
             } else if self.eat(TokenKind::Star) {
+                self.source_export_form(SourceExportKind::All, true, None);
                 requires_source = true;
                 if self.eat_keyword(Keyword::As) {
-                    let _ = self.parse_module_export_name();
+                    let span = self.cur.span;
+                    let name = self.parse_module_export_name();
+                    self.source_export_name(name, span);
                 }
             }
             let has_source = self.eat_keyword(Keyword::From);
+            let mut source = None;
             if has_source && self.at(TokenKind::Str) {
                 let request_span = self.cur.span;
+                source = Some(request_span);
                 self.declaration_record_request(request_span, DeclarationRequestRole::ExportType);
                 self.bump(); // 类型-only：不记录运行时依赖
-            } else if requires_source {
+            } else if requires_source || has_source {
                 self.error_expected("`from` 类型导出来源");
+            }
+            if let Some(span) = source {
+                let attributes = self.parse_import_attributes();
+                self.source_export_module(span, attributes);
             }
             if !has_source {
                 for binding in local_bindings {
@@ -2350,6 +2713,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // export default ...
         if self.eat_keyword(Keyword::Default) {
+            let target_lo = self.start();
             let declaration = if self.at_keyword(Keyword::Function) {
                 ExportDefaultKind::Function(self.parse_function(self.start(), false))
             } else if self.at_keyword(Keyword::Async)
@@ -2360,9 +2724,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             } else if self.at_keyword(Keyword::Class) {
                 let class_lo = self.start();
                 let class = if let Some(decorators) = class_decorators.take() {
-                    self.parse_class_with_decorators(class_lo, decorators)
+                    self.parse_class_with_decorators(class_lo, decorators, false)
                 } else {
-                    self.parse_class(class_lo)
+                    self.parse_class(class_lo, false)
                 };
                 ExportDefaultKind::Class(class)
             } else {
@@ -2370,6 +2734,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.semicolon();
                 ExportDefaultKind::Expression(e)
             };
+            let target = match declaration {
+                ExportDefaultKind::Expression(expression) => expression.span(),
+                _ => self.span_to(target_lo),
+            };
+            self.source_export_form(SourceExportKind::Default, false, Some(target));
             return Statement::ExportDefault(self.alloc(ExportDefaultDeclaration {
                 span: self.span_to(lo),
                 declaration,
@@ -2378,9 +2747,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // export * (as ns)? from '...'
         if self.at(TokenKind::Star) {
+            self.source_export_form(SourceExportKind::All, false, None);
             self.bump();
             let exported = if self.eat_keyword(Keyword::As) {
-                Some(self.parse_module_export_name())
+                let span = self.cur.span;
+                let name = self.parse_module_export_name();
+                self.source_export_name(name, span);
+                Some(name)
             } else {
                 None
             };
@@ -2391,6 +2764,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.declaration_record_request(request_span, DeclarationRequestRole::ExportValue);
             }
             let attributes = self.parse_import_attributes();
+            if let Some(request_span) = request_span {
+                self.source_export_module(request_span, attributes);
+            }
             self.semicolon();
             self.record_dependency(Dependency {
                 specifier: source,
@@ -2408,6 +2784,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // export { a, b as c } (from '...')?
         if self.at(TokenKind::LBrace) {
+            let source_list = self.source_list_start(SourceListKind::Exports);
             self.bump();
             let mut specifiers = self.new_vec::<ExportSpecifier>();
             let mut saw_inline_type_specifier = false;
@@ -2417,24 +2794,46 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 if self.ts && self.at_contextual("type") && self.ts_inline_type_specifier_ahead() {
                     saw_inline_type_specifier = true;
                     self.bump(); // type
+                    let local_span = self.cur.span;
                     let local = self.parse_module_export_name();
                     if let ModuleExportName::Ident(identifier) = local {
                         self.declaration_record_type_reference(identifier.name);
                     }
-                    if self.eat_keyword(Keyword::As) {
-                        let _ = self.parse_module_export_name();
-                    }
+                    let (exported, exported_span) = if self.eat_keyword(Keyword::As) {
+                        let span = self.cur.span;
+                        (self.parse_module_export_name(), span)
+                    } else {
+                        (local, local_span)
+                    };
+                    self.source_export_specifier(
+                        slo,
+                        local,
+                        local_span,
+                        exported,
+                        exported_span,
+                        true,
+                    );
                     if !self.eat(TokenKind::Comma) {
                         break;
                     }
                     continue;
                 }
+                let local_span = self.cur.span;
                 let local = self.parse_module_export_name();
-                let exported = if self.eat_keyword(Keyword::As) {
-                    self.parse_module_export_name()
+                let (exported, exported_span) = if self.eat_keyword(Keyword::As) {
+                    let span = self.cur.span;
+                    (self.parse_module_export_name(), span)
                 } else {
-                    local
+                    (local, local_span)
                 };
+                self.source_export_specifier(
+                    slo,
+                    local,
+                    local_span,
+                    exported,
+                    exported_span,
+                    false,
+                );
                 specifiers.push(ExportSpecifier {
                     span: self.span_to(slo),
                     local,
@@ -2444,6 +2843,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     break;
                 }
             }
+            self.source_list_finish(source_list, true);
             self.expect(TokenKind::RBrace);
             let mut attributes = None;
             let source = if self.eat_keyword(Keyword::From) {
@@ -2458,6 +2858,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     self.declaration_record_request(request_span, role);
                 }
                 attributes = self.parse_import_attributes();
+                if let Some(request_span) = request_span {
+                    self.source_export_module(request_span, attributes);
+                }
                 Some(s)
             } else {
                 None
@@ -2486,6 +2889,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
 
         // export <declaration>
+        let target_lo = self.start();
         let declaration = if let Some(decorators) = class_decorators.take() {
             if self.ts
                 && self.at_contextual("abstract")
@@ -2494,10 +2898,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.bump(); // abstract
             }
             let class_lo = self.start();
-            Statement::ClassDeclaration(self.parse_class_with_decorators(class_lo, decorators))
+            Statement::ClassDeclaration(
+                self.parse_class_with_decorators(class_lo, decorators, false),
+            )
         } else {
             self.parse_statement()
         };
+        self.source_export_form(
+            SourceExportKind::Declaration,
+            false,
+            Some(self.span_to(target_lo)),
+        );
         if self.ts && matches!(declaration, Statement::Empty(_)) {
             self.declaration_wrap_last_item(self.span_to(lo));
             return declaration;
@@ -2533,8 +2944,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    fn string_atom(&self, span: Span) -> wake_common::Atom {
-        self.interner.intern(&self.lexer.string_value(span))
+    fn string_atom(&mut self, span: Span) -> wake_common::Atom {
+        let value = self.utf8_string_value(span);
+        self.interner.intern(&value)
     }
 
     // ==================================================================
@@ -2543,13 +2955,58 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// 消费语句结尾分号（ASI：换行 / `}` / EOF 处可省略）。
     fn semicolon(&mut self) {
-        if self.eat(TokenKind::Semicolon) {
+        self.statement_terminator(false);
+    }
+
+    fn statement_terminator(&mut self, do_while: bool) {
+        let explicit = self.at(TokenKind::Semicolon);
+        let span = if explicit {
+            let span = self.cur.span;
+            self.bump();
+            span
+        } else {
+            Span::new(self.prev_end, self.prev_end)
+        };
+        let asi_boundary = do_while
+            || self.newline_before()
+            || self.at(TokenKind::RBrace)
+            || self.at(TokenKind::Eof);
+        if !explicit && !asi_boundary {
+            self.error_expected("`;`");
             return;
         }
-        if self.newline_before() || self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+        if self.source_syntax.is_none() {
             return;
         }
-        self.error_expected("`;`");
+        // A whitelist avoids promising omission in ambiguous expression/class-field grammar.
+        // Calls, computed keys, templates, regex/division and operators may join the previous
+        // expression even across a line break. Do-while has an independent optional terminator.
+        let cannot_continue = match self.cur.kind {
+            TokenKind::Eof
+            | TokenKind::RBrace
+            | TokenKind::LBrace
+            | TokenKind::PrivateIdent
+            | TokenKind::Str
+            | TokenKind::Number
+            | TokenKind::BigInt
+            | TokenKind::Tilde
+            | TokenKind::PlusPlus
+            | TokenKind::MinusMinus => true,
+            TokenKind::Ident => !self.at_contextual("satisfies"),
+            TokenKind::Keyword(keyword) => {
+                !matches!(keyword, Keyword::In | Keyword::Instanceof | Keyword::As)
+            }
+            _ => false,
+        };
+        self.source_syntax
+            .as_mut()
+            .unwrap()
+            .terminators
+            .push(wake_ecma_ast::SourceTerminator {
+                span,
+                explicit,
+                can_omit: !explicit || do_while || (asi_boundary && cannot_continue),
+            });
     }
 
     fn at_statement_end(&self) -> bool {
@@ -2591,10 +3048,16 @@ fn collect_pattern_bindings(pattern: &Pattern<'_>, bindings: &mut Vec<wake_commo
     }
 }
 
-fn property_key_atom(key: &PropertyKey<'_>) -> Option<wake_common::Atom> {
+fn property_key_atom(
+    interner: &wake_common::Interner,
+    key: &PropertyKey<'_>,
+) -> Option<wake_common::Atom> {
     match key {
         PropertyKey::Ident(identifier) | PropertyKey::Private(identifier) => Some(identifier.name),
-        PropertyKey::String(value) => Some(value.value),
+        PropertyKey::String(value) => interner
+            .resolve_js(value.value)
+            .as_str()
+            .map(|name| interner.intern(name)),
         PropertyKey::Number(_) | PropertyKey::Computed(_) => None,
     }
 }

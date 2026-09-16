@@ -5,6 +5,38 @@ use wake_ecma_ast::*;
 
 use crate::{ParseOptions, parse, parse_with};
 
+#[test]
+fn expression_statement_facts_keep_original_assertions_and_parentheses() {
+    let source = "value as string; (value satisfies string); value!; (<string>value); ((value));";
+    let interner = Interner::new();
+    let result = crate::parse_source(
+        source,
+        &interner,
+        SourceType::TypeScript,
+        ParseOptions::default(),
+    );
+    assert!(
+        result.parsed.diagnostics.is_empty(),
+        "{:?}",
+        result.parsed.diagnostics
+    );
+    let spans: Vec<_> = result
+        .expression_statements
+        .iter()
+        .map(|site| site.expression.slice(source))
+        .collect();
+    assert_eq!(
+        spans,
+        [
+            "value as string",
+            "(value satisfies string)",
+            "value!",
+            "(<string>value)",
+            "((value))"
+        ]
+    );
+}
+
 /// 无诊断地解析并对根 AST 运行断言。
 fn with_program(src: &str, f: impl FnOnce(&Program<'_>)) {
     let interner = Interner::new();
@@ -534,6 +566,73 @@ fn templates() {
 }
 
 #[test]
+fn template_elements_keep_raw_source_and_decode_cooked_escapes() {
+    let interner = Interner::new();
+    let source = r#"const value = `line\n${expression}\tend`;"#;
+    let output = parse(source, &interner, SourceType::Module);
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    output.module.with_ast(|program| {
+        let Statement::VariableDeclaration(declaration) = program.body[0] else {
+            panic!("expected template declaration")
+        };
+        let Expression::TemplateLiteral(template) = declaration.declarations[0]
+            .init
+            .expect("template initializer")
+        else {
+            panic!("expected template expression")
+        };
+        assert_eq!(template.quasis.len(), 2);
+        let first = template.quasis[0];
+        let second = template.quasis[1];
+        assert_eq!(interner.resolve(first.raw), r#"line\n"#);
+        assert_eq!(
+            interner.resolve_js(first.cooked.expect("cooked first")),
+            "line\n"
+        );
+        assert_eq!(interner.resolve(second.raw), r#"\tend"#);
+        assert_eq!(
+            interner.resolve_js(second.cooked.expect("cooked second")),
+            "\tend"
+        );
+    });
+}
+
+#[test]
+fn template_cooked_values_normalize_source_line_terminators() {
+    for (raw, cooked) in [
+        ("a\r\nb\rc\nd", "a\nb\nc\nd"),
+        ("a\\\r\nb\\\rc\\\nd", "abcd"),
+        ("a\\\u{2028}b\\\u{2029}c", "abc"),
+        ("a\u{2028}b\u{2029}c", "a\u{2028}b\u{2029}c"),
+        ("a\\r\\nb\r\nc\\r", "a\r\nb\nc\r"),
+    ] {
+        let interner = Interner::new();
+        for source in [
+            format!("`{raw}`;"),
+            format!("`{raw}${{value}}{raw}${{value}}{raw}`;"),
+        ] {
+            let output = parse(&source, &interner, SourceType::Module);
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            output.module.with_ast(|program| {
+                let Statement::Expression(statement) = program.body[0] else {
+                    panic!("expected expression statement")
+                };
+                let Expression::TemplateLiteral(template) = statement.expression else {
+                    panic!("expected template literal")
+                };
+                for quasi in &template.quasis {
+                    assert_eq!(interner.resolve(quasi.raw), raw);
+                    assert_eq!(
+                        interner.resolve_js(quasi.cooked.expect("valid cooked text")),
+                        cooked
+                    );
+                }
+            });
+        }
+    }
+}
+
+#[test]
 fn dependency_extraction() {
     let interner = Interner::new();
     let src = "import a from 'mod-a';
@@ -981,7 +1080,7 @@ fn automatic_jsx_development_runtime_preserves_unicode_source_location() {
         else {
             panic!("fileName must be a string")
         };
-        assert_eq!(interner.resolve(file_name.value), "src/界面.tsx");
+        assert_eq!(interner.resolve_js(file_name.value), "src/界面.tsx");
         let Expression::NumberLiteral(line) =
             object_property(source_object, &interner, "lineNumber")
         else {

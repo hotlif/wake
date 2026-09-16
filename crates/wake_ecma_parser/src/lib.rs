@@ -6,14 +6,21 @@
 //! 名为 `async` 的普通调用仅在完整 cover 后出现 `=>` 时解释为异步箭头。
 //!
 //! 入口：[`parse`]。产出 [`ParseOutput`]（自引用 [`ModuleAst`] + 依赖 + 诊断）。
+//! [`parse_with_comments`] additionally retains real source comments in the same parser pass.
+//! The module owns the exact source snapshot; comment ranges refer to that snapshot, including
+//! malformed input. This is not a raw TypeScript/JSX AST: the existing compilation AST still
+//! performs erasure/lowering. Ordinary parsing does not collect comments.
+//! [`parse_source`] also collects original JSX and erased TS ranges and nesting before lowering.
+//! These are parser-owned source facts, not a stable plugin AST or a full JS/TS source tree.
 
 /// Stable parser implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v5";
+pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v41";
 
 mod declaration;
 mod expr;
 mod jsx;
 mod private_names;
+mod source;
 mod stmt;
 mod ts;
 mod ts_value;
@@ -23,7 +30,12 @@ pub use declaration::{
     DeclarationItemKind, DeclarationRequestFact, DeclarationRequestRole, parse_declaration_facts,
     validate_declaration_module, validate_declaration_module_allow_any,
 };
+pub use source::{
+    SourceNode, SourceNodeKind, SourceParseOutput, SourceToken, SourceTokenContext, parse_source,
+};
 pub use wake_ecma_ast::SourceType;
+pub use wake_ecma_lexer::TokenKind as SourceTokenKind;
+pub use wake_ecma_lexer::{Comment, CommentKind};
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -50,6 +62,33 @@ pub struct ParseOutput {
     /// 模块**顶层**（不在任何函数/方法/箭头/`static {}` 内）出现过 `await` 或 `for await`。
     /// 打包器据此把该模块包成 `async function` 并让其导入方 `await`（DESIGN §6.1.1）。
     pub has_top_level_await: bool,
+}
+
+/// Compilation results plus source comments from the same parser pass. Ranges refer to the
+/// owned snapshot in `parsed.module.source()`, not to a subsequently modified disk file.
+pub struct CommentedParseOutput {
+    pub parsed: ParseOutput,
+    pub comments: Vec<Comment>,
+}
+
+/// Parse with opt-in comment retention. TypeScript erasure and JSX lowering remain identical
+/// to [`parse_with`]; this does not expose a raw source AST or perform a second lexical pass.
+pub fn parse_with_comments(
+    source: &str,
+    interner: &Interner,
+    source_type: SourceType,
+    options: ParseOptions<'_>,
+) -> CommentedParseOutput {
+    let mut capture = source::SourceCapture::new(false);
+    let parsed = if options.transform_features.is_empty() {
+        parse_with_mode::<false>(source, interner, source_type, options, Some(&mut capture))
+    } else {
+        parse_with_mode::<true>(source, interner, source_type, options, Some(&mut capture))
+    };
+    CommentedParseOutput {
+        parsed,
+        comments: capture.comments,
+    }
 }
 
 impl ParseOutput {
@@ -98,9 +137,9 @@ pub fn parse_with(
     options: ParseOptions<'_>,
 ) -> ParseOutput {
     if options.transform_features.is_empty() {
-        parse_with_mode::<false>(source, interner, source_type, options)
+        parse_with_mode::<false>(source, interner, source_type, options, None)
     } else {
-        parse_with_mode::<true>(source, interner, source_type, options)
+        parse_with_mode::<true>(source, interner, source_type, options, None)
     }
 }
 
@@ -110,6 +149,7 @@ fn parse_with_mode<const LOWER: bool>(
     interner: &Interner,
     source_type: SourceType,
     options: ParseOptions<'_>,
+    capture: Option<&mut source::SourceCapture>,
 ) -> ParseOutput {
     let deps = RefCell::new(Vec::new());
     let diags = RefCell::new(Vec::new());
@@ -124,14 +164,56 @@ fn parse_with_mode<const LOWER: bool>(
         interner.identity(),
         source_hash,
         |arena| {
-            let mut parser = Parser::<LOWER>::new(
+            let lexer = if capture.is_some() {
+                Lexer::new_with_comments(parser_source.as_ref())
+            } else {
+                Lexer::new(parser_source.as_ref())
+            };
+            let mut parser = Parser::<LOWER>::new_with_lexer(
                 parser_source.as_ref(),
                 interner,
                 arena,
                 source_type,
                 options,
+                lexer,
             );
+            if capture
+                .as_ref()
+                .is_some_and(|capture| capture.collect_syntax)
+            {
+                parser.source_syntax = Some(source::SourceCollector::default());
+            }
             let program = parser.parse_program();
+            if let Some(capture) = capture {
+                capture.comments = parser.lexer.comments();
+                if let Some(collector) = parser.source_syntax.take() {
+                    capture.syntax = collector.nodes;
+                    capture.tokens = collector.tokens;
+                    capture.identifiers = collector.identifiers;
+                    capture.imports = collector.imports;
+                    capture.type_imports = collector.type_imports;
+                    capture.exports = collector.exports;
+                    capture.jsx_values = collector.jsx_values;
+                    capture.arrays = collector.arrays;
+                    capture.functions = collector.functions;
+                    capture.type_scopes = collector.type_scopes;
+                    capture.type_declarations = collector.type_declarations;
+                    capture.namespaces = collector.namespaces;
+                    capture.terminators = collector.terminators;
+                    capture.lists = collector.lists;
+                    capture.assertions = collector.assertions;
+                    capture.calls = collector.calls;
+                    capture.awaits = collector.awaits;
+                    capture.expression_statements = collector.expression_statements;
+                    capture.assignments = collector.assignments;
+                    capture.callbacks = collector.callbacks;
+                    capture.returns = collector.returns;
+                    capture.conditions = collector.conditions;
+                    capture.switches = collector.switches;
+                    capture.templates = collector.templates;
+                    capture.members = collector.members;
+                }
+            }
             *deps.borrow_mut() = std::mem::take(&mut parser.dependencies);
             *diags.borrow_mut() = std::mem::take(&mut parser.diagnostics);
             tla.set(parser.has_top_level_await);
@@ -206,6 +288,7 @@ struct ParserCheckpoint {
     diag_len: usize,
     /// Optional declaration fact sink state. Speculative grammar must not leak facts on rewind.
     declaration_mark: Option<declaration::DeclarationCollectorMark>,
+    source_mark: Option<source::SourceMark>,
 }
 
 /// JSX 降级要反复驻留的编译期常量名的预驻留 Atom（见 [`Parser::jsx_atoms`]）。
@@ -257,6 +340,7 @@ pub(crate) struct Parser<'a, 'src, const LOWER: bool> {
     /// Installed only by `parse_declaration_facts`/`validate_declaration_module`; ordinary builds
     /// pay no declaration collection or secondary parse cost.
     declaration: Option<declaration::DeclarationCollector<'src>>,
+    source_syntax: Option<source::SourceCollector>,
 
     /// 标识符驻留缓存：源码切片 → Atom。真实代码里标识符高频重复，命中即跳过全局
     /// interner 的锁 + 二次哈希，大幅提升单核解析吞吐。`RefCell` 保持 `&self` 接口。
@@ -301,7 +385,24 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         source_type: SourceType,
         options: ParseOptions<'src>,
     ) -> Parser<'a, 'src, LOWER> {
-        let mut lexer = Lexer::new(source);
+        Self::new_with_lexer(
+            source,
+            interner,
+            arena,
+            source_type,
+            options,
+            Lexer::new(source),
+        )
+    }
+
+    fn new_with_lexer(
+        source: &'src str,
+        interner: &'src Interner,
+        arena: &'a Bump,
+        source_type: SourceType,
+        options: ParseOptions<'src>,
+        mut lexer: Lexer<'src>,
+    ) -> Parser<'a, 'src, LOWER> {
         // 表达式起始位置：首 token 允许正则。
         let cur = lexer.next(true);
         // 模块顶层即 async 上下文：`await` 是运算符（ES2022 顶层 await）。Script 保持旧语义。
@@ -330,6 +431,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             diagnostics: Vec::new(),
             dependencies: Vec::new(),
             declaration: None,
+            source_syntax: None,
             ident_cache: RefCell::new(FxHashMap::default()),
             require_atom: interner.intern("require"),
             jsx_atoms: Cell::new(None),
@@ -499,6 +601,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 前进一个 token，返回被消费的（旧 cur）。regex/div 上下文用启发式（见 lexer）。
     fn bump(&mut self) -> Token {
         let prev = self.cur;
+        self.source_token(prev, SourceTokenContext::JavaScript);
         self.prev_end = prev.span.hi;
         self.cur = match self.lookahead.take() {
             Some(t) => t,
@@ -525,6 +628,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             lex: self.lexer.checkpoint(),
             diag_len: self.diagnostics.len(),
             declaration_mark: self.declaration.as_ref().map(|collector| collector.mark()),
+            source_mark: self
+                .source_syntax
+                .as_ref()
+                .map(|collector| collector.mark()),
         }
     }
 
@@ -536,6 +643,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.lexer.rewind(cp.lex);
         self.diagnostics.truncate(cp.diag_len);
         if let (Some(collector), Some(mark)) = (&mut self.declaration, cp.declaration_mark) {
+            collector.rewind(mark);
+        }
+        if let (Some(collector), Some(mark)) = (&mut self.source_syntax, cp.source_mark) {
             collector.rewind(mark);
         }
     }
@@ -628,6 +738,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 .with_code("WAKE0200")
                 .with_primary(span, "此处"),
         );
+    }
+
+    fn utf8_string_value(&mut self, span: Span) -> String {
+        match self.lexer.string_value(span).as_str() {
+            Some(value) => value.to_owned(),
+            None => {
+                self.error(span, "模块名称或说明符必须能表示为 Unicode 标量文本");
+                String::new()
+            }
+        }
     }
 
     fn error_expected(&mut self, what: &str) {

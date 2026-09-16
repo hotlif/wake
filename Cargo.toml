@@ -97,6 +97,7 @@ tungstenite = { version = "=0.28.0", default-features = false, features = ["hand
 ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 open = "=5.4.0"
 unicode-segmentation = "=1.12.0"
+unicode-id-start = "=1.4.0"
 unicode-width = "=0.2.1"
 
 # —— 内部 crate（路径依赖）——

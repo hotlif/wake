@@ -24,7 +24,7 @@ impl From<wake_ecma_ast::DependencyKind> for ModuleRequestKind {
 }
 
 /// Bump whenever pass semantics, ordering, or fingerprint inputs change.
-pub const PIPELINE_VERSION: &str = "wake-closure-minifier-v16";
+pub const PIPELINE_VERSION: &str = "wake-closure-minifier-v22";
 pub const MAX_FIXED_POINT_ITERATIONS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -317,7 +317,7 @@ impl TrustedExpression {
                     TrustedExpressionValidation::WrongSyntaxCategory,
                 );
             };
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, interner);
             match crate::typed_ir::lower_expression_owner(
                 &statement.expression,
                 interner,
@@ -951,7 +951,10 @@ fn stable_fingerprint(
             }
             ValidatedDefineValue::Primitive(ConstVal::Str(value)) => {
                 hash.write_u64(1);
-                hash.write_str(&value);
+                hash.write_u64(value.len_utf16() as u64);
+                for unit in value.code_units() {
+                    hash.write_u64(u64::from(unit));
+                }
             }
             ValidatedDefineValue::Primitive(ConstVal::Num(value)) => {
                 hash.write_u64(2);

@@ -3166,7 +3166,7 @@ fn rewrite_mdx_esm(root: &Path, page: &Path, ast: &Node) -> Result<RewrittenEsm,
                     ),
                 ));
             };
-            if lexer.string_value(token.span).as_ref() != specifier {
+            if lexer.string_value(token.span).as_str() != Some(specifier.as_str()) {
                 return Err(DocsError::Mdx(
                     page.to_path_buf(),
                     format!(

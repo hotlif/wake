@@ -904,8 +904,13 @@ impl DecoratedKind {
 
 #[derive(Clone)]
 enum RuntimeKey {
-    Known { name: String, private: bool },
-    Computed { temporary: Binding },
+    Known {
+        name: wake_common::JsString,
+        private: bool,
+    },
+    Computed {
+        temporary: Binding,
+    },
 }
 
 impl RuntimeKey {
@@ -1043,7 +1048,7 @@ fn lower_one_class(
         }
         let runtime_key = runtime_key(program, key, names)?;
         let key_label = match &runtime_key {
-            RuntimeKey::Known { name, .. } => sanitize(name),
+            RuntimeKey::Known { name, .. } => sanitize(name.as_str().unwrap_or("string")),
             RuntimeKey::Computed { temporary } => sanitize(&temporary.name),
         };
         let side = if is_static { "static" } else { "instance" };
@@ -1471,6 +1476,14 @@ fn runtime_key(
             temporary: names.binding(program, "_computedKey", DeclKind::Let)?,
         }),
         PropertyKeyKind::Identifier | PropertyKeyKind::String | PropertyKeyKind::Private => {
+            if let Some(IrNodeData::StringLiteral { value }) =
+                program.node(key.value).map(|node| node.data())
+            {
+                return Ok(RuntimeKey::Known {
+                    name: value.clone(),
+                    private: false,
+                });
+            }
             let IrNodeData::Name { name } = program
                 .node(key.value)
                 .ok_or_else(|| typed_error(Some(key.value), "property key is missing"))?
@@ -1485,7 +1498,7 @@ fn runtime_key(
                 .name(*name)
                 .ok_or_else(|| typed_error(Some(key.value), "property name is missing"))?;
             Ok(RuntimeKey::Known {
-                name: record.original().to_owned(),
+                name: record.original().into(),
                 private: key.kind == PropertyKeyKind::Private,
             })
         }
@@ -1501,7 +1514,7 @@ fn runtime_key(
                 ));
             };
             Ok(RuntimeKey::Known {
-                name: value.to_string(),
+                name: value.to_string().into(),
                 private: false,
             })
         }
@@ -1705,12 +1718,12 @@ fn template_string(
     // Template interpolation performs the same string-hinted ToPrimitive + ToString sequence as
     // ToPropertyKey's non-Symbol branch without depending on a shadowable `String` global.
     let head = factory.leaf(IrNodeData::TemplateElement {
-        cooked: Some(String::new()),
+        cooked: Some(wake_common::JsString::default()),
         raw: String::new(),
         tail: false,
     })?;
     let tail = factory.leaf(IrNodeData::TemplateElement {
-        cooked: Some(String::new()),
+        cooked: Some(wake_common::JsString::default()),
         raw: String::new(),
         tail: true,
     })?;
@@ -2039,6 +2052,9 @@ fn build_private_function_names(
             "private descriptor lacks a statically known private name",
         ));
     };
+    let name = name
+        .as_str()
+        .expect("private names are Unicode identifiers");
     let properties = match item.kind {
         DecoratedKind::Method => vec![("value", format!("#{name}"))],
         DecoratedKind::Getter => vec![("get", format!("get #{name}"))],
@@ -2139,7 +2155,11 @@ fn runtime_key_expression(
         RuntimeKey::Known {
             name,
             private: true,
-        } => factory.string(&format!("#{name}")),
+        } => factory.string(format!(
+            "#{}",
+            name.as_str()
+                .expect("private names are Unicode identifiers")
+        )),
         RuntimeKey::Known {
             name,
             private: false,
@@ -2253,7 +2273,12 @@ fn private_member(
     else {
         return Err(typed_error(None, "private access requested for public key"));
     };
-    factory.member_private(object, name, None)
+    factory.member_private(
+        object,
+        name.as_str()
+            .expect("private names are Unicode identifiers"),
+        None,
+    )
 }
 
 fn member_key(
@@ -3590,7 +3615,7 @@ mod tests {
             parsed.diagnostics
         );
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic))
                 .expect("decorator fixture should lower to typed IR")
         })

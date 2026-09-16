@@ -281,7 +281,11 @@ impl EvalCtx<'_> {
 /// 递归求值一个表达式；无法在构建期确定时返回 `None`。
 pub fn eval(expr: &Expression, ctx: &EvalCtx) -> Option<StaticValue> {
     match expr {
-        Expression::StringLiteral(s) => Some(StaticValue::Str(ctx.interner.resolve(s.value))),
+        Expression::StringLiteral(s) => ctx
+            .interner
+            .resolve_js(s.value)
+            .as_str()
+            .map(|text| StaticValue::Str(text.to_owned())),
         Expression::NumberLiteral(n) => finite_number(n.value),
         Expression::BooleanLiteral(b) => Some(StaticValue::Bool(b.value)),
         Expression::NullLiteral(_) => Some(StaticValue::Null),
@@ -351,7 +355,9 @@ pub fn eval(expr: &Expression, ctx: &EvalCtx) -> Option<StaticValue> {
                         }
                         let key = match &p.key {
                             PropertyKey::Ident(id) => ctx.interner.resolve(id.name),
-                            PropertyKey::String(s) => ctx.interner.resolve(s.value),
+                            PropertyKey::String(s) => {
+                                ctx.interner.resolve_js(s.value).as_str()?.to_owned()
+                            }
                             PropertyKey::Number(n) => format_number(n.value),
                             _ => return None,
                         };
@@ -439,7 +445,8 @@ pub fn eval_template(t: &TemplateLiteral, ctx: &EvalCtx) -> Option<String> {
 
 /// 取模板片段的 cooked 文本（非法转义时为 `None`）。
 pub fn cooked_text(q: &TemplateElement, interner: &Interner) -> Option<String> {
-    q.cooked.map(|a| interner.resolve(a))
+    q.cooked
+        .and_then(|a| interner.resolve_js(a).as_str().map(str::to_owned))
 }
 
 /// 收集模块顶层 immutable `const` 的可静态求值绑定（按声明序逐条累积，后者可引用前者）。

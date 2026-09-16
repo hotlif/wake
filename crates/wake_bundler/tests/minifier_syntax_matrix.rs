@@ -18,7 +18,7 @@ use wake_ecma_ast::expr::{
     UpdateOperator,
 };
 use wake_ecma_ast::module::{
-    AttributesKeyword, ExportDefaultKind, ImportSpecifier, ModuleExportName,
+    AttributesKeyword, ExportDefaultKind, ImportAttributeKey, ImportSpecifier, ModuleExportName,
 };
 use wake_ecma_ast::pattern::Pattern;
 use wake_ecma_ast::stmt::{ForInit, ForLeft, Statement, VarKind};
@@ -304,6 +304,13 @@ impl AstCoverage {
         });
     }
 
+    fn record_attribute_key(&mut self, key: ImportAttributeKey) {
+        self.module_export_names.insert(match key {
+            ImportAttributeKey::Ident(_) => "identifier",
+            ImportAttributeKey::String(_) => "string",
+        });
+    }
+
     fn record_attribute_keyword(&mut self, keyword: AttributesKeyword) {
         self.attribute_keywords.insert(match keyword {
             AttributesKeyword::With => "with",
@@ -400,7 +407,7 @@ impl<'a> Visit<'a> for AstCoverage {
                 if let Some(attributes) = declaration.attributes {
                     self.record_attribute_keyword(attributes.keyword);
                     for attribute in attributes.items {
-                        self.record_module_name(attribute.key);
+                        self.record_attribute_key(attribute.key);
                     }
                 }
                 "import"
@@ -413,7 +420,7 @@ impl<'a> Visit<'a> for AstCoverage {
                 if let Some(attributes) = declaration.attributes {
                     self.record_attribute_keyword(attributes.keyword);
                     for attribute in attributes.items {
-                        self.record_module_name(attribute.key);
+                        self.record_attribute_key(attribute.key);
                     }
                 }
                 "export-named"
@@ -434,7 +441,7 @@ impl<'a> Visit<'a> for AstCoverage {
                 if let Some(attributes) = declaration.attributes {
                     self.record_attribute_keyword(attributes.keyword);
                     for attribute in attributes.items {
-                        self.record_module_name(attribute.key);
+                        self.record_attribute_key(attribute.key);
                     }
                 }
                 "export-all"
@@ -1187,6 +1194,44 @@ const FIXTURES: &[Fixture] = &[
         ),
     },
 ];
+
+#[test]
+fn commonjs_legacy_block_function_copies_survive_module_planning_and_minification() {
+    let fixture = Fixture {
+        name: "commonjs-legacy-block-function-copies",
+        entry: "src/index.cjs",
+        files: &[
+            (
+                "src/index.cjs",
+                "const run=require('./legacy.cjs'); module.exports=run();",
+            ),
+            (
+                "src/legacy.cjs",
+                r#"
+module.exports=function run(){
+  function dead(){if(false){function missing(){}}return missing}
+  function live(){const before=typeof fn;{function fn(){return 7}}return [before,fn()]}
+  function shadow(fn){{function fn(){return 9}}return fn}
+  return [dead(),live(),shadow(3)];
+};
+"#,
+            ),
+        ],
+        runtime: RuntimeCoverage::Differential,
+    };
+    let readable = build(fixture, false, false);
+    let optimized = build(fixture, true, false);
+    let mapped = build(fixture, true, true);
+    assert_reparses(fixture, "optimized", &optimized);
+    assert_mapped_and_unmapped_match(fixture, &optimized, &mapped);
+    assert_runtime_differential(fixture, &readable, &optimized);
+    if node_available() {
+        assert_eq!(
+            String::from_utf8(execute(&optimized.bundle).stdout).unwrap(),
+            "__WAKE_MATRIX__[null,[\"undefined\",7],3]"
+        );
+    }
+}
 
 #[test]
 fn complete_owned_syntax_matrix_builds_reparses_maps_and_is_deterministic() {

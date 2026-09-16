@@ -649,7 +649,8 @@ fn source_type(path: &Path) -> Result<SourceType, String> {
         "ts" | "mts" | "cts" => Ok(SourceType::TypeScript),
         "tsx" => Ok(SourceType::Tsx),
         "jsx" => Ok(SourceType::Jsx),
-        "js" | "mjs" | "cjs" => Ok(SourceType::Module),
+        "cjs" => Ok(SourceType::Script),
+        "js" | "mjs" => Ok(SourceType::Module),
         extension => Err(format!(
             "unsupported library module extension `{extension}`: {}",
             path.display()
@@ -726,6 +727,38 @@ mod tests {
     fn write_output(root: &Path, output: &LibraryJavaScriptOutput) {
         for module in &output.modules {
             write(&root.join(&module.file_name), &module.code);
+        }
+    }
+
+    #[test]
+    fn commonjs_source_keeps_script_binding_semantics_in_preserved_output() {
+        let project = tempdir().unwrap();
+        write(
+            &project.path().join("package.json"),
+            r#"{"name":"example"}"#,
+        );
+        write(
+            &project.path().join("src/index.cjs"),
+            "function dead(){if(false) function missing(){} return missing;} function live(){if(true) function fn(){return 7} return fn();} module.exports=[dead(),live()];",
+        );
+        let graph =
+            LibraryGraph::scan(LibraryGraphOptions::new(project.path(), "src/index.cjs")).unwrap();
+        let output = graph.emit(PreserveModuleFormat::CommonJs).unwrap();
+        let destination = project.path().join("out");
+        write_output(&destination, &output);
+        if node_available() {
+            let result = Command::new("node")
+                .arg("-e")
+                .arg("process.stdout.write(JSON.stringify(require(process.argv[1])))")
+                .arg(destination.join(&output.entry))
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, b"[null,7]");
         }
     }
 

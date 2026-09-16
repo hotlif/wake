@@ -732,7 +732,10 @@ fn specialization_body_is_observable(
             | IrNodeData::ArrowFunction { .. } => true,
             IrNodeData::Name { name } => program.name(*name).is_some_and(|name| {
                 name.original() == "arguments"
-                    && name.symbol().is_none()
+                    && name
+                        .symbol()
+                        .and_then(|symbol| program.symbol(symbol))
+                        .is_none_or(|symbol| symbol.decl_kind() == DeclKind::Arguments)
                     && matches!(
                         name.role(),
                         NameRole::Reference | NameRole::AssignmentTarget
@@ -1972,7 +1975,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, source_type);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }

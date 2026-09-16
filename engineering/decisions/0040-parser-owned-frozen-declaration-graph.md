@@ -34,6 +34,11 @@ sufficient executable-syntax boundary.
    only its local name rather than its public alias.
    Standalone and already-ambient templates retain independent request ranges. Speculative parses
    roll these facts back with the parser checkpoint that produced them.
+   Implementation-only parameter initializers are also parser-owned facts: ordinary functions,
+   arrows, methods and constructors preserve their type annotations and parameter patterns while
+   removing each default-value range (including nested destructuring defaults) from emitted
+   declaration templates. Strict declaration input rejects those initializers; implementation
+   input never copies executable defaults into `.d.ts` output.
 2. `wake_tsdoc` owns the frozen declaration graph. It reads and resolves the graph once, retains
    parser facts beside owned source/declaration text, and exposes typed operations for declaration
    rendering, module-request rebinding, parser-proven ambient-body rendering, and strict
@@ -111,7 +116,9 @@ first-class frozen-graph projection，而不是 placeholder JSON rewrite。
   parameter-property modifiers, multiline requests, `import = require`, structured `import()`
   types, type/value namespace separation, exact generic-list/`infer`/mapped-key/signature scope,
   type-import and type-export alias selection, speculative rollback, explicit and implicit public
-  `any`, and strict executable-syntax handling.
+  `any`, strict executable-syntax handling, and removal of implementation-only defaults from
+  ordinary functions, overloads, arrows, methods, constructors, and nested destructuring
+  parameters.
 - Declaration-renderer tests prove that only request spans are rewritten and user strings/comments
   containing reserved namespace text remain byte-identical. Counting filesystem tests prove that
   shared multi-entry sources are read once, runtime asset imports are not read, valid declaration

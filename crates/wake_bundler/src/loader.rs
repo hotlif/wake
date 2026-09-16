@@ -378,12 +378,13 @@ fn split_css_imports(imports: &[wake_css::CssImport], code: &str) -> (String, St
     (js, css)
 }
 
-/// 按扩展名选择源类型：`.tsx` → TS+JSX，`.jsx` → JS+JSX，`.ts`/`.mts`/`.cts` → TS，其余 → ESM 模块。
+/// 按扩展名选择源类型：`.cjs` → Script，TS/JSX 保留对应语法，其余 → ESM 模块。
 pub(crate) fn source_type_for(path: &Path) -> SourceType {
     match path.extension().and_then(|e| e.to_str()) {
         Some("tsx") => SourceType::Tsx,
         Some("jsx") => SourceType::Jsx,
         Some("ts" | "mts" | "cts") => SourceType::TypeScript,
+        Some("cjs") => SourceType::Script,
         _ => SourceType::Module,
     }
 }

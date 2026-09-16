@@ -319,7 +319,10 @@ fn run_typed_pipeline_impl(
             &mut stats,
         )?;
     }
-    let final_analysis = if options.minify && !trivial_effect_module {
+    let preserve_legacy = analysis.has_legacy_block_functions();
+    let final_analysis = if preserve_legacy {
+        Some(analysis)
+    } else if options.minify && !trivial_effect_module {
         Some(run_minifying_fixed_point(
             &mut program,
             options,
@@ -347,7 +350,7 @@ fn run_typed_pipeline_impl(
             .any(|scope| scope.is_frozen() || scope.contains_direct_eval() || scope.contains_with())
     });
 
-    let mangling = if options.minify && !trivial_effect_module {
+    let mangling = if options.minify && !trivial_effect_module && !preserve_legacy {
         let final_analysis = final_analysis
             .as_ref()
             .expect("non-trivial minify always retains a current semantic model");
@@ -887,7 +890,7 @@ mod tests {
         let parsed = parse(source, &interner, source_type);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }

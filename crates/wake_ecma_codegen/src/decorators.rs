@@ -63,17 +63,19 @@ impl DecoratedKind {
 }
 
 /// 规整标识符片段，用于生成 `_<name>_decorators` 这类内部变量名。
-pub(crate) fn sanitize(name: &str) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+pub(crate) fn sanitize(name: &wake_common::JsString) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for unit in name.code_units() {
+        if unit <= 0x7f && ((unit as u8).is_ascii_alphanumeric() || unit == u16::from(b'$')) {
+            out.push(char::from(unit as u8));
+        } else if unit == u16::from(b'_') {
+            out.push_str("__");
+        } else {
+            // Escape underscore separately so source names cannot collide with encoded units.
+            let _ = write!(out, "_u{unit:04x}_");
+        }
+    }
     if out.is_empty() {
         out.push('_');
     }

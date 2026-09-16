@@ -1,6 +1,6 @@
 //! 模块语法（import / export）与依赖记录（DESIGN §4.4 依赖同步提取）。
 
-use wake_common::{Atom, Span};
+use wake_common::{Atom, JsAtom, Span};
 
 use crate::AVec;
 use crate::Ident;
@@ -35,12 +35,20 @@ impl AttributesKeyword {
 }
 
 /// 一条引入属性：`type: "json"` / `"content-type": "text/css"`。值恒为字符串字面量。
+/// Attribute string keys admit arbitrary UTF-16 code units, unlike ModuleExportName.
+#[derive(Clone, Copy, Debug)]
+pub enum ImportAttributeKey {
+    Ident(Ident),
+    String(JsAtom),
+}
+
+/// A static import attribute; the key is a name, never a value reference.
 #[derive(Clone, Copy, Debug)]
 pub struct ImportAttribute {
     pub span: Span,
-    pub key: ModuleExportName,
+    pub key: ImportAttributeKey,
     /// 属性值（已驻留的字符串字面量内容）。
-    pub value: Atom,
+    pub value: JsAtom,
 }
 
 /// `with { .. }` / `assert { .. }` 子句。用 `&'a [_]` 而非 `AVec` 承载条目，

@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 
 use memchr::{memchr, memchr2, memchr3};
-use wake_common::{Diagnostic, Span};
+use wake_common::{Diagnostic, JsString, Span};
 
 use crate::token::{Keyword, Token, TokenKind};
 use crate::unicode::{
@@ -99,6 +99,29 @@ pub struct LexerCheckpoint {
     pos: usize,
     brace_stack: Vec<Brace>,
     diag_len: usize,
+    comment_event_len: usize,
+}
+
+/// A comment recognized in the active lexical context, including its delimiters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Comment {
+    pub kind: CommentKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentKind {
+    Line,
+    Block,
+    Hashbang,
+}
+
+/// An append-only journal lets checkpoints restore comments even when JSX relex replaced an
+/// earlier observation. Truncating the materialized list alone would lose those observations.
+#[derive(Clone, Copy)]
+enum CommentEvent {
+    Comment(Comment),
+    Relex(u32),
 }
 
 /// 词法分析器。持有源码、游标与诊断。**不** 持有 interner——标识符驻留惰性交给 parser（DESIGN §4.3）。
@@ -108,10 +131,21 @@ pub struct Lexer<'a> {
     pos: usize,
     diagnostics: Vec<Diagnostic>,
     brace_stack: Vec<Brace>,
+    comment_events: Option<Vec<CommentEvent>>,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Lexer<'a> {
+        Self::new_impl(src, false)
+    }
+
+    /// Retain comments recognized by the caller-driven lexical context. Read the final list
+    /// with [`Self::comments`] after parsing; strings, regexes and JSX text are not comments.
+    pub fn new_with_comments(src: &'a str) -> Lexer<'a> {
+        Self::new_impl(src, true)
+    }
+
+    fn new_impl(src: &'a str, collect_comments: bool) -> Lexer<'a> {
         // 跳过 UTF-8 BOM（U+FEFF）。
         let start = if src.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) {
             3
@@ -124,9 +158,41 @@ impl<'a> Lexer<'a> {
             pos: start,
             diagnostics: Vec::new(),
             brace_stack: Vec::new(),
+            comment_events: collect_comments.then(Vec::new),
         };
         lexer.skip_hashbang();
         lexer
+    }
+
+    /// Materialize comments for the current lexical state in source order. Ordinary lexers
+    /// return an empty list. This does not consume the journal or invalidate checkpoints.
+    pub fn comments(&self) -> Vec<Comment> {
+        let mut comments: Vec<Comment> = Vec::new();
+        if let Some(events) = &self.comment_events {
+            for event in events {
+                match *event {
+                    CommentEvent::Comment(comment) => comments.push(comment),
+                    CommentEvent::Relex(from) => {
+                        let keep = comments.partition_point(|comment| comment.span.hi <= from);
+                        comments.truncate(keep);
+                    }
+                }
+            }
+        }
+        comments
+    }
+
+    fn record_comment(&mut self, kind: CommentKind, lo: usize) {
+        let span = self.span_from(lo);
+        if let Some(events) = &mut self.comment_events {
+            events.push(CommentEvent::Comment(Comment { kind, span }));
+        }
+    }
+
+    fn record_relex(&mut self, from: u32) {
+        if let Some(events) = &mut self.comment_events {
+            events.push(CommentEvent::Relex(from));
+        }
     }
 
     /// 至今累积的诊断（错误恢复模式下可能多条）。
@@ -145,6 +211,7 @@ impl<'a> Lexer<'a> {
             pos: self.pos,
             brace_stack: self.brace_stack.clone(),
             diag_len: self.diagnostics.len(),
+            comment_event_len: self.comment_events.as_ref().map_or(0, Vec::len),
         }
     }
 
@@ -153,6 +220,9 @@ impl<'a> Lexer<'a> {
         self.pos = cp.pos;
         self.brace_stack = cp.brace_stack;
         self.diagnostics.truncate(cp.diag_len);
+        if let Some(events) = &mut self.comment_events {
+            events.truncate(cp.comment_event_len);
+        }
     }
 
     // ==================================================================
@@ -197,12 +267,9 @@ impl<'a> Lexer<'a> {
 
     fn skip_hashbang(&mut self) {
         if self.pos == 0 && self.peek() == Some(b'#') && self.peek_at(1) == Some(b'!') {
-            while let Some(b) = self.peek() {
-                if b == b'\n' || b == b'\r' {
-                    break;
-                }
-                self.bump();
-            }
+            let lo = self.pos;
+            self.skip_single_line_content();
+            self.record_comment(CommentKind::Hashbang, lo);
         }
     }
 
@@ -243,13 +310,40 @@ impl<'a> Lexer<'a> {
 
     /// 重定位到 `from` 再取一个普通 token（供 JSX 解析结束后恢复正常词法）。
     pub fn next_at(&mut self, from: u32, regex_allowed: bool) -> Token {
+        self.record_relex(from);
         self.pos = from as usize;
         self.next(regex_allowed)
+    }
+
+    /// Parser-selected JSX attribute value context. Quoted text may contain raw line breaks
+    /// and backslashes; only the matching quote closes it. Entity decoding belongs to JSX.
+    /// Other tokens retain normal lexer state, including an expression container's braces.
+    pub fn next_jsx_attribute_token(&mut self, from: u32) -> Token {
+        self.record_relex(from);
+        self.pos = from as usize;
+        let newline_before = self.skip_trivia();
+        let lo = self.pos;
+        if let Some(quote @ (b'\'' | b'"')) = self.peek() {
+            self.bump();
+            let kind = if let Some(offset) = memchr(quote, &self.bytes[self.pos..]) {
+                self.pos += offset + 1;
+                TokenKind::Str
+            } else {
+                self.pos = self.bytes.len();
+                self.error(self.span_from(lo), "未闭合的 JSX 属性字符串");
+                TokenKind::Error
+            };
+            return Token::new(kind, self.span_from(lo), newline_before);
+        }
+        let mut token = self.next(false);
+        token.newline_before |= newline_before;
+        token
     }
 
     /// 从 `from` 处取一个 JSX 子节点 token（DESIGN §4.3）：
     /// `<`/`{` 返回对应标点，否则扫描到下一个 `<`/`{`/EOF 之间的原始文本，返回 [`TokenKind::JsxText`]。
     pub fn next_jsx_child_token(&mut self, from: u32) -> Token {
+        self.record_relex(from);
         self.pos = from as usize;
         let lo = self.pos;
         match self.peek() {
@@ -312,7 +406,11 @@ impl<'a> Lexer<'a> {
                 }
                 b'/' => match self.peek_at(1) {
                     Some(b'/') => self.skip_line_comment(),
-                    Some(b'*') => newline |= self.skip_block_comment(),
+                    Some(b'*') => {
+                        let lo = self.pos;
+                        newline |= self.skip_block_comment();
+                        self.record_comment(CommentKind::Block, lo);
+                    }
                     _ => break, // 真正的 `/` token，交给分派
                 },
                 0xEF | 0xE2 | 0xC2 => {
@@ -330,11 +428,30 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_line_comment(&mut self) {
+        let lo = self.pos;
         self.pos += 2; // //
-        // memchr 批量扫到行终止符（U+2028/2029 属罕见边角，交由下一轮 trivia 处理）。
-        match memchr2(b'\n', b'\r', &self.bytes[self.pos..]) {
-            Some(off) => self.pos += off,
-            None => self.pos = self.bytes.len(),
+        self.skip_single_line_content();
+        self.record_comment(CommentKind::Line, lo);
+    }
+
+    fn skip_single_line_content(&mut self) {
+        loop {
+            match memchr3(b'\n', b'\r', 0xE2, &self.bytes[self.pos..]) {
+                None => {
+                    self.pos = self.bytes.len();
+                    return;
+                }
+                Some(off) => {
+                    self.pos += off;
+                    if self.bytes[self.pos] != 0xE2
+                        || (self.peek_at(1) == Some(0x80)
+                            && matches!(self.peek_at(2), Some(0xA8 | 0xA9)))
+                    {
+                        return;
+                    }
+                    self.pos += 1;
+                }
+            }
         }
     }
 
@@ -499,7 +616,9 @@ impl<'a> Lexer<'a> {
         }
 
         if !any {
-            self.bump();
+            if let Some((_, len)) = self.current_char() {
+                self.pos += len;
+            }
             self.error(self.span_from(lo), "无效标识符");
             return TokenKind::Error;
         }
@@ -581,7 +700,9 @@ impl<'a> Lexer<'a> {
         }
         // 数字后紧跟标识符起始字符是错误（如 `3in`），报错但恢复。
         if let Some(b) = self.peek()
-            && (b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x80)
+            && (b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'$' | b'\\')
+                || (b >= 0x80 && self.current_char().is_some_and(|(ch, _)| is_id_start(ch))))
         {
             self.error(self.span_from(lo), "数字后紧邻标识符字符");
         }
@@ -695,7 +816,7 @@ impl<'a> Lexer<'a> {
                     return;
                 }
                 self.bump();
-                self.scan_unicode_escape_value(lo);
+                self.scan_unicode_escape_code_point(lo);
             }
             // 其它单字符转义（含 \0 \n \t \\ \' \" 等）与非法但可恢复的转义。
             Some(_) => {
@@ -711,6 +832,14 @@ impl<'a> Lexer<'a> {
 
     /// 扫描 `\u` 之后的部分（`{...}` 或四位十六进制），返回解码码点。失败报错并返回 None。
     fn scan_unicode_escape_value(&mut self, lo: usize) -> Option<char> {
+        let value = self.scan_unicode_escape_code_point(lo)?;
+        char::from_u32(value).or_else(|| {
+            self.error(self.span_from(lo), "标识符不能包含 UTF-16 代理项");
+            None
+        })
+    }
+
+    fn scan_unicode_escape_code_point(&mut self, lo: usize) -> Option<u32> {
         if self.peek() == Some(b'{') {
             self.bump();
             let mut value: u32 = 0;
@@ -722,12 +851,12 @@ impl<'a> Lexer<'a> {
                         self.error(self.span_from(lo), "`\\u{}` 为空");
                         return None;
                     }
-                    return char::from_u32(value).or_else(|| {
-                        self.error(self.span_from(lo), "码点超出 Unicode 范围");
-                        None
-                    });
+                    return Some(value);
                 }
-                let d = hex_val(b)?;
+                let Some(d) = hex_val(b) else {
+                    self.error(self.span_from(lo), "`\\u{...}` 需要十六进制码点");
+                    return None;
+                };
                 value = value.saturating_mul(16).saturating_add(d as u32);
                 any = true;
                 self.bump();
@@ -752,10 +881,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
             }
-            char::from_u32(value).or_else(|| {
-                self.error(self.span_from(lo), "非法的 UTF-16 码元（孤立代理项）");
-                None
-            })
+            Some(value)
         }
     }
 
@@ -807,7 +933,11 @@ impl<'a> Lexer<'a> {
                 _ => {
                     // 反斜杠
                     self.bump();
-                    self.consume_escape_for_validation(lo);
+                    // Templates lex NotEscapeSequence too. Only the parser knows whether
+                    // the template is tagged; do not issue string escape errors here.
+                    if let Some((_, length)) = self.current_char() {
+                        self.pos += length;
+                    }
                 }
             }
         }
@@ -1045,10 +1175,9 @@ impl<'a> Lexer<'a> {
             }
             b'#' => {
                 // 私有字段 `#x`。
-                if self
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c >= 0x80)
-                {
+                if self.peek().is_some_and(|c| {
+                    c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'\\' || c >= 0x80
+                }) {
                     return Token::new(
                         self.scan_private_ident(),
                         self.span_from(lo),
@@ -1083,19 +1212,17 @@ impl<'a> Lexer<'a> {
 
     /// `#name` 私有字段。`#` 已消费；把后续名字扫完即可（文本惰性由 identifier_text 取）。
     fn scan_private_ident(&mut self) -> TokenKind {
-        while let Some(b) = self.peek() {
-            if b.is_ascii_alphanumeric() || b == b'$' || b == b'_' {
-                self.bump();
-            } else if b >= 0x80 {
-                let (c, len) = self.current_char().unwrap();
-                if is_non_ascii_id_continue(c) {
-                    self.pos += len;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
+        let name_start = self.pos;
+        let kind = if self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+        {
+            self.scan_ident_ascii(name_start)
+        } else {
+            self.scan_ident_slow(name_start)
+        };
+        if kind == TokenKind::Error {
+            return TokenKind::Error;
         }
         TokenKind::PrivateIdent
     }
@@ -1120,17 +1247,10 @@ impl<'a> Lexer<'a> {
         parse_number(span.slice(self.src))
     }
 
-    /// 字符串 token 的解码值（去引号、处理转义）。无转义时零拷贝借源码切片（常见情形，
-    /// 含每个 import/export 说明符），含转义时才解码为拥有串——与 [`Self::identifier_text`] 同构。
-    pub fn string_value(&self, span: Span) -> Cow<'a, str> {
+    /// Lossless runtime value of a quoted JavaScript string token.
+    pub fn string_value(&self, span: Span) -> JsString {
         let raw = span.slice(self.src);
-        // 去掉首尾引号。
-        let inner = &raw[1..raw.len().saturating_sub(1)];
-        if !inner.contains('\\') {
-            Cow::Borrowed(inner)
-        } else {
-            Cow::Owned(decode_escapes(inner))
-        }
+        decode_escaped_value(&raw[1..raw.len().saturating_sub(1)])
     }
 
     /// 标识符/私有字段的文本（惰性；parser 需要驻留时调用）。无转义时零拷贝借源码切片，
@@ -1283,12 +1403,112 @@ fn surrogate_pair_escape(bytes: &[u8]) -> Option<(char, usize)> {
         .map(|ch| (ch, high_len + 2 + low_len))
 }
 
-/// 解码字符串内部（不含引号）的转义序列。非法转义尽力保留原字符（错误已在扫描期报出）。
-fn decode_escapes(inner: &str) -> String {
+/// Decode a string/template segment into a lossless ECMAScript value.
+///
+/// Input excludes delimiters; template CR/CRLF normalization belongs to the caller.
+/// This value decoder does not validate syntax. String scanning validates escapes;
+/// templates must use decode_template_value so invalid cooked values remain absent.
+/// Isolated surrogates are retained as code units rather than coerced to Unicode scalars.
+pub fn decode_escaped_value(inner: &str) -> JsString {
     if !inner.contains('\\') {
-        return inner.to_owned();
+        return JsString::from(inner);
     }
-    let mut out = String::with_capacity(inner.len());
+    let decoded = decode_escapes_into(
+        inner,
+        StringValueBuilder {
+            text: String::with_capacity(inner.len()),
+            units: None,
+        },
+    );
+    match decoded.units {
+        Some(units) => JsString::from_utf16(&units),
+        None => JsString::from(decoded.text),
+    }
+}
+
+/// Decode a template segment's TV, excluding its delimiters.
+///
+/// A NotEscapeSequence makes the whole segment undefined (None). Valid segments normalize
+/// source CR/CRLF before escape decoding, retaining isolated UTF-16 code units.
+/// The parser owns the early error for undefined TV in an untagged template.
+pub fn decode_template_value(inner: &str) -> Option<JsString> {
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            continue;
+        }
+        match chars.next()? {
+            '0' if chars.clone().next().is_some_and(|ch| ch.is_ascii_digit()) => return None,
+            '1'..='9' => return None,
+            'u' if chars.clone().next() == Some('{') => {
+                chars.next();
+                let mut value = 0u32;
+                let mut any = false;
+                loop {
+                    let ch = chars.next()?;
+                    if ch == '}' {
+                        if !any {
+                            return None;
+                        }
+                        break;
+                    }
+                    value = value.checked_mul(16)?.checked_add(ch.to_digit(16)?)?;
+                    if value > 0x10_ffff {
+                        return None;
+                    }
+                    any = true;
+                }
+            }
+            escape @ ('x' | 'u') => {
+                for _ in 0..if escape == 'x' { 2 } else { 4 } {
+                    chars.next()?.to_digit(16)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Normalize source line terminators before decoding so \r escapes keep their value.
+    if inner.contains('\r') {
+        Some(decode_escaped_value(
+            &inner.replace("\r\n", "\n").replace('\r', "\n"),
+        ))
+    } else {
+        Some(decode_escaped_value(inner))
+    }
+}
+
+trait EscapeOutput {
+    fn push(&mut self, ch: char);
+    fn push_code_point(&mut self, value: u32);
+}
+
+struct StringValueBuilder {
+    text: String,
+    units: Option<Vec<u16>>,
+}
+
+impl EscapeOutput for StringValueBuilder {
+    fn push(&mut self, ch: char) {
+        if let Some(units) = &mut self.units {
+            units.extend_from_slice(ch.encode_utf16(&mut [0; 2]));
+        } else {
+            self.text.push(ch);
+        }
+    }
+
+    fn push_code_point(&mut self, value: u32) {
+        if (0xd800..=0xdfff).contains(&value) {
+            let units = self
+                .units
+                .get_or_insert_with(|| self.text.encode_utf16().collect());
+            units.push(value as u16);
+        } else if let Some(ch) = char::from_u32(value) {
+            self.push(ch);
+        }
+    }
+}
+
+fn decode_escapes_into<T: EscapeOutput>(inner: &str, mut out: T) -> T {
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c != '\\' {
@@ -1306,7 +1526,7 @@ fn decode_escapes(inner: &str) -> String {
             Some('0') if !chars.clone().next().is_some_and(|c| c.is_ascii_digit()) => {
                 out.push('\0')
             }
-            Some('\n') => {}
+            Some('\n' | '\u{2028}' | '\u{2029}') => {}
             Some('\r') if chars.clone().next() == Some('\n') => {
                 chars.next();
             }
@@ -1337,9 +1557,7 @@ fn decode_escapes(inner: &str) -> String {
                             v = v.saturating_mul(16).saturating_add(d);
                         }
                     }
-                    if let Some(ch) = char::from_u32(v) {
-                        out.push(ch);
-                    }
+                    out.push_code_point(v);
                 } else {
                     let mut v = 0u32;
                     for _ in 0..4 {
@@ -1347,9 +1565,7 @@ fn decode_escapes(inner: &str) -> String {
                             v = v * 16 + d;
                         }
                     }
-                    if let Some(ch) = char::from_u32(v) {
-                        out.push(ch);
-                    }
+                    out.push_code_point(v);
                 }
             }
             Some(other) => out.push(other),

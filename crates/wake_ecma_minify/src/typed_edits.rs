@@ -839,7 +839,7 @@ fn static_unresolved_chain(program: &TypedProgram, node: NodeId) -> Option<Strin
                     program.name(*name)?.original().to_owned()
                 }
                 PropertyKeyKind::String => match program.node(*property)?.data() {
-                    IrNodeData::StringLiteral { value } => value.clone(),
+                    IrNodeData::StringLiteral { value } => value.as_str()?.to_owned(),
                     _ => return None,
                 },
                 PropertyKeyKind::Number | PropertyKeyKind::Computed | PropertyKeyKind::Private => {
@@ -1206,7 +1206,7 @@ fn property_key_text(program: &TypedProgram, key: IrPropertyKey) -> Option<Strin
             Some(program.name(*name)?.original().to_owned())
         }
         PropertyKeyKind::String => match program.node(key.value)?.data() {
-            IrNodeData::StringLiteral { value } => Some(value.clone()),
+            IrNodeData::StringLiteral { value } => value.as_str().map(str::to_owned),
             IrNodeData::Name { name } => Some(program.name(*name)?.original().to_owned()),
             _ => None,
         },
@@ -1729,7 +1729,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }
@@ -1739,7 +1739,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             let Statement::Expression(statement) = &program.body[0] else {
                 panic!("owner fixture must contain one expression statement")
             };

@@ -6,7 +6,7 @@ use std::mem::Discriminant;
 use wake_common::Hash64;
 
 use crate::expr::Expression;
-use crate::module::{ImportAttributes, ModuleExportName};
+use crate::module::{ImportAttributeKey, ImportAttributes};
 use crate::stmt::Statement;
 use crate::visit::{Visit, walk_expression, walk_statement};
 use crate::{Ident, ObjectMember, Program, PropertyKey};
@@ -89,9 +89,10 @@ impl HashFold {
         let Some(a) = attrs else { return };
         self.mix_disc(std::mem::discriminant(&a.keyword));
         for item in a.items {
+            self.mix_disc(std::mem::discriminant(&item.key));
             match item.key {
-                ModuleExportName::Ident(id) => self.mix_u64(id.name.as_u32() as u64),
-                ModuleExportName::String(s) => self.mix_u64(s.as_u32() as u64),
+                ImportAttributeKey::Ident(id) => self.mix_u64(id.name.as_u32() as u64),
+                ImportAttributeKey::String(s) => self.mix_u64(s.as_u32() as u64),
             }
             self.mix_u64(item.value.as_u32() as u64);
         }

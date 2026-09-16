@@ -33,6 +33,8 @@
 # M4 — 转换与 Source Map
 
 - TypeScript 类型擦除与 React automatic runtime 为默认能力；
+- `.cjs` 文件按非严格 Script 起始上下文解析，显式 `"use strict"` 仍生效；`.js`/`.mjs`
+  使用 Module。构建加载器与保留模块的库入口采用相同扩展名语义，避免改变 CommonJS 的块级函数行为。
 - 浏览器目标从显式配置、Browserslist 文件、package.json 或固定现代基线解析；
 - `transforms.include/exclude` 只覆盖已登记转换，不执行任意插件。
 
@@ -46,7 +48,7 @@ origin 提供源位置，改名 occurrence 通过 V3 `names` 保留原标识符�
 
 ## M4e — 压缩语义边界
 
-`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v16`），不要求第二个
+`minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v22`），不要求第二个
 名字优化开关，也不因模块源码长度改变行为。这里的“Closure 风格”只表示 Wake 对 pass 排序、变更跟踪和收敛模型的架构选择；
 不兼容 Closure `ADVANCED`、Closure modules、externs、类型优化、全局属性 flattening 或逐字输出。
 普通 ESM/CommonJS、公开成员和宿主协议按 Wake 的局部可证明安全边界保留。实现只使用 workspace

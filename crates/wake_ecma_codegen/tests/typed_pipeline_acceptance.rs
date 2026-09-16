@@ -31,6 +31,106 @@ struct AcceptanceCase {
 fn acceptance_cases() -> Vec<AcceptanceCase> {
     vec![
         AcceptanceCase {
+            name: "sloppy-block-function-binding-copies",
+            source_type: SourceType::Script,
+            source: r#"
+function live(){const before=typeof fn;{const local=fn;function fn(){return 2}if(local!==fn)throw 1}return [before,fn()]}
+function dead(){if(false){function never(){return 9}}return never}
+function parameter(fn){{function fn(){return 3}}return fn}
+function lexical(){let fn=4;{function fn(){return 5}}return fn}
+function siblings(){const values=[];{function fn(){return 6}values.push(fn())}{function fn(){return 7}values.push(fn())}return [values,fn()]}
+function immutableBlock(){let read;{function fn(){return 8}read=()=>fn;fn=9}return [read(),fn()]}
+function strict(){'use strict';{function local(){}}return typeof local}
+function asynchronous(){{async function local(){}}return typeof local}
+function generator(){{function* local(){}}return typeof local}
+function direct(flag){if(flag)function fn(){return 1}else function fn(){return 2}return fn()}
+function duplicates(){{function fn(){return 1}function fn(){return 2}}return fn()}
+function ancestor(){{function fn(){return 1}{function fn(){return 2}}}return fn()}
+function caught(){try{throw 1}catch(fn){{function fn(){return 3}}}return fn()}
+function caughtPattern(){try{throw {fn:1}}catch({fn}){{function fn(){}}}return typeof fn}
+function argumentsCopy(p=1){const before=arguments;const read=()=>arguments;{function arguments(){}}return [typeof before,typeof read(),typeof arguments]}
+globalThis.__wake_result=[live(),dead(),parameter(3),lexical(),siblings(),immutableBlock(),strict(),asynchronous(),generator(),direct(true),direct(false),duplicates(),ancestor(),caught(),caughtPattern(),argumentsCopy()];
+"#,
+            node_expectation: NodeExpectation::Return,
+        },
+        AcceptanceCase {
+            name: "implicit-arguments-and-mapped-parameters",
+            source_type: SourceType::Script,
+            source: r#"
+var arguments=99;
+function implicit(){return [arguments[0],(()=>arguments[1])()]}
+function same(){var arguments;return arguments[0]}
+function copied(value=1){var arguments;return arguments[0]}
+function mapped(value){arguments[0]=4;const first=value;value=5;return [first,arguments[0]]}
+function assigned(value){value=2;arguments[0]=3;return value}
+function aliased(value){const args=arguments;value=2;args[0]=3;return value}
+function captured(value){value=2;(()=>arguments[0]=3)();return value}
+function length(flag){if(flag)return arguments.length;return 0}
+function unmapped(value){'use strict';arguments[0]=4;return value}
+function separate(value=1){arguments[0]=4;return value}
+function parameter(arguments){return arguments}
+globalThis.__wake_result=[implicit(2,3),same(6),copied(7),mapped(2),unmapped(2),separate(2),parameter(8),arguments,assigned(1),aliased(1),captured(1),length(true)];
+"#,
+            node_expectation: NodeExpectation::Return,
+        },
+        AcceptanceCase {
+            name: "named-function-expression-environments",
+            source_type: SourceType::Script,
+            source: r#"
+const bodyVar=function self(){var self;return typeof self};
+const parameter=function self(self){return self};
+const lexical=function self(){let self=2;return self};
+const defaults=function self(read=()=>self){var self=3;return [typeof read(),self]};
+const immutable=function self(){self=3;return typeof self};
+const strictImmutable=function self(){'use strict';try{self=3;return 'miss'}catch(error){return error.name}};
+globalThis.__wake_result=[bodyVar(),parameter(4),lexical(),defaults(),immutable(),strictImmutable(),typeof self];
+"#,
+            node_expectation: NodeExpectation::Return,
+        },
+        AcceptanceCase {
+            name: "parameter-and-body-var-bindings",
+            source_type: SourceType::Script,
+            source: r#"
+function same(value){var value;return value}
+function destructured({value}){var value;return value}
+function separate(value,read=()=>value){var value=3;return [read(),value]}
+function replaced(value){function value(){return 7}return value()}
+function copied(value=5){var value;return value}
+const key='item';
+function computed({[key]:value}){var value;return value}
+function rest(...values){var values;return values}
+const copiedArrow=(value=6)=>{var value;return value};
+globalThis.__wake_result=[same(2),destructured({value:4}),separate(1),replaced(0),copied(),computed({item:8}),rest(1,2),copiedArrow()];
+"#,
+            node_expectation: NodeExpectation::Return,
+        },
+        AcceptanceCase {
+            name: "strict-block-function-bindings",
+            source_type: SourceType::Script,
+            source: r#"
+"use strict";
+const values=[];
+{values.push(local());function local(){return "left"}}
+{function local(){return "right"}values.push(local())}
+function enclosing(){"use strict";{function hidden(){return 3}values.push(hidden())}return typeof hidden}
+globalThis.__wake_result=[values,typeof local,enclosing()];
+"#,
+            node_expectation: NodeExpectation::Return,
+        },
+        AcceptanceCase {
+            name: "class-static-block-var-environments",
+            source_type: SourceType::Script,
+            source: r#"
+const values=[];
+class C {
+    static { values.push(typeof value, helper()); { var value=3; } function helper(){return "first"} values.push(value); }
+    static { values.push(typeof value); var value=4; values.push(value,typeof helper); }
+}
+globalThis.__wake_result=[values,typeof value,typeof helper];
+"#,
+            node_expectation: NodeExpectation::Return,
+        },
+        AcceptanceCase {
             name: "control-flow-labels-switch-loops-try-finally",
             source_type: SourceType::Script,
             source: r#"
@@ -188,9 +288,98 @@ struct TypedBuild {
     fingerprint: u64,
 }
 
-fn build_typed(source: &str, source_type: SourceType) -> TypedBuild {
+#[test]
+fn utf16_import_attributes_reach_native_module_linker_unchanged() {
+    use wake_ecma_codegen::{
+        ModuleSpecifierRewriter, PreserveModuleFormat, codegen_preserved_optimized,
+        codegen_preserved_optimized_with_map,
+    };
+    struct Unchanged;
+    impl ModuleSpecifierRewriter for Unchanged {
+        fn rewrite(&self, _specifier: &str) -> Option<String> {
+            None
+        }
+    }
+    fn observe(source: &str) -> String {
+        let script = r#"
+const vm = require('node:vm');
+(async () => {
+  const seen = [];
+  const root = new vm.SourceTextModule(process.argv[1]);
+  await root.link((specifier, referring, extra) => {
+    const units = text => Array.from({length:text.length}, (_,i) => text.charCodeAt(i));
+    seen.push([specifier, Object.keys(extra.attributes).sort().map(key => [units(key), units(extra.attributes[key])])]);
+    return new vm.SyntheticModule(['value','default'], function() { this.setExport('value', 1); this.setExport('default', 1); });
+  });
+  await root.evaluate();
+  console.log(JSON.stringify(seen));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"#;
+        let output = Command::new("node")
+            .args(["--experimental-vm-modules", "-e", script, source])
+            .output()
+            .expect("Node required");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    let source = r#"
+import value from 'first' with {"\ud800":"\udfff",type:"\ufffd", "👍":"\0"};
+export {value} from 'second' with {"\ud801":"\udffe"};
+export * from 'third' with {"\ud802":"\udffd"};
+"#;
+    let expected = observe(source);
+    assert!(expected.contains("55296"));
     let interner = Interner::new();
-    let parsed = parse(source, &interner, source_type);
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let readable = parsed
+        .module
+        .with_ast(|program| wake_ecma_codegen::codegen(program, &interner));
+    assert_eq!(observe(&readable), expected);
+    for minify in [false, true] {
+        let mut input = OptimizeInput::new(source);
+        input.minify = minify;
+        let optimized = optimize(parsed.module.clone(), &interner, &input).unwrap();
+        let generated = codegen_preserved_optimized(
+            &optimized,
+            &interner,
+            PreserveModuleFormat::EsModule,
+            &Unchanged,
+        );
+        let (mapped, _) = codegen_preserved_optimized_with_map(
+            &optimized,
+            &interner,
+            PreserveModuleFormat::EsModule,
+            &Unchanged,
+        );
+        assert_eq!(generated, mapped);
+        assert_eq!(
+            observe(&generated),
+            expected,
+            "minify={minify}\n{generated}"
+        );
+    }
+}
+
+fn build_typed(source: &str, source_type: SourceType) -> TypedBuild {
+    build_typed_with_options(
+        source,
+        source_type,
+        wake_ecma_parser::ParseOptions::default(),
+    )
+}
+
+fn build_typed_with_options(
+    source: &str,
+    source_type: SourceType,
+    options: wake_ecma_parser::ParseOptions<'_>,
+) -> TypedBuild {
+    let interner = Interner::new();
+    let parsed = wake_ecma_parser::parse_with(source, &interner, source_type, options);
     assert!(
         !parsed.has_errors(),
         "acceptance fixture failed to parse as {source_type:?}:\n{source}\n{:?}",
@@ -345,6 +534,175 @@ globalThis.__wake_result=render(7,2);
                 "template raw text or substitution token semantics changed:\n{generated}"
             );
         }
+    }
+}
+
+#[test]
+fn typed_pipeline_template_line_terminators_match_source_with_downlevel() {
+    assert!(
+        node_available(),
+        "Node is required for template runtime regressions"
+    );
+    let raw = "a\r\nb\rc\n\\r\\n\\\r\n\\\u{2028}\\\u{2029}d\u{2028}e\u{2029}f";
+    let source = format!(
+        "function inspect(strings,...values){{return [strings.raw,[...strings],values]}}\n\
+         const value=7;\n\
+         globalThis.__wake_result=[`{raw}`,`{raw}${{value}}{raw}${{value}}{raw}`,\
+         inspect`{raw}${{value}}{raw}`,\"a\\\u{2028}b\\\u{2029}c\"];"
+    );
+    let expected = execute_in_node(&source);
+    assert!(expected.contains("\"kind\":\"return\""));
+    for downlevel in [false, true] {
+        let mut options = wake_ecma_parser::ParseOptions::default();
+        if downlevel {
+            options
+                .transform_features
+                .insert(wake_ecma_transform::EcmaFeature::TemplateLiteral);
+        }
+        let build = build_typed_with_options(&source, SourceType::Script, options);
+        assert_eq!(build.optimized, build.mapped);
+        for generated in [&build.readable, &build.optimized] {
+            assert_reparses("template-line-terminators", generated);
+            assert_eq!(
+                execute_in_node(generated),
+                expected,
+                "downlevel={downlevel}\n{generated}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_pipeline_tagged_invalid_escapes_preserve_raw_and_undefined_cooked() {
+    assert!(
+        node_available(),
+        "Node is required for template runtime regressions"
+    );
+    let source = r#"
+function inspect(strings,...values){return [strings.raw,[...strings],values,Object.isFrozen(strings),Object.isFrozen(strings.raw)]}
+const value=7;
+globalThis.__wake_result=[
+  inspect`\1`,inspect`\8`,inspect`\00`,inspect`\09`,inspect`\x`,inspect`\x0`,
+  inspect`\u`,inspect`\u000`,inspect`\u{`,inspect`\u{}`,inspect`\u{z}`,
+  inspect`\u{123z}`,inspect`\u{110000}`,inspect`\u{ffffffffffffffffffffffffffffffff}`,
+  inspect`\x${value}valid\n`,inspect`valid\n${value}\8${value}valid\n`,
+  inspect`valid\n${value}\u`,inspect`\u${inspect`\9`}ok`,
+  inspect`\\x|\\u{}|\`|\${literal}|\0|\x41|\u0042|\u{00000043}|\u{d800}|\q|\👍`,
+  inspect`\\\u{z}`,inspect`\x\`${value}\u\${literal}`
+];
+"#;
+    let expected = execute_in_node(source);
+    assert!(expected.contains("\"kind\":\"return\""), "{expected}");
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Script);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let legacy = parsed
+        .module
+        .with_ast(|program| wake_ecma_codegen::codegen(program, &interner));
+    assert_eq!(execute_in_node(&legacy), expected);
+    for downlevel in [false, true] {
+        let mut options = wake_ecma_parser::ParseOptions::default();
+        if downlevel {
+            options
+                .transform_features
+                .insert(wake_ecma_transform::EcmaFeature::TemplateLiteral);
+        }
+        let build = build_typed_with_options(source, SourceType::Script, options);
+        assert_eq!(build.optimized, build.mapped);
+        for generated in [&build.readable, &build.optimized] {
+            assert_reparses("tagged-invalid-escapes", generated);
+            assert_eq!(
+                execute_in_node(generated),
+                expected,
+                "downlevel={downlevel}\n{generated}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_pipeline_utf16_strings_match_source_with_downlevel() {
+    assert!(
+        node_available(),
+        "Node is required for UTF-16 runtime regressions"
+    );
+    let source = r#"
+function inspect(strings,...values){return [strings.raw,[...strings],values]}
+const high="\ud800",low="\udfff";
+const object={"\ud800":1,"\udfff"(){return 2},get "\u{d800}x"(){return 3}};
+class Keys {"\ud800"(){return 4}}
+const {"\ud800":picked,...rest}=object;
+globalThis.__wake_result=[
+  high,low,"\u{d800}","a\ud800b\udfffc",high.length,high.charCodeAt(0),
+  "\ud83d"+"\udc4d", "\ud800"+"x", "\ud800"==="\ufffd",!!"\ud800",
+  "\udc00\ud800", "\ud800\ud800\udc00", "\ud800\u0000\ufffd",
+  object[high],object[low](),object["\ud800x"],picked,rest[low](),new Keys()[high](),
+  `\ud800`, `x\ud800${low}z\udfff`,inspect`\ud800${high}\u{dfff}`,
+  "\ud800"<"\ud801", "\u{10000}"<"\ue000"
+];
+"#;
+    let expected = execute_in_node(source);
+    assert!(expected.contains("\"kind\":\"return\""));
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Script);
+    let legacy = parsed
+        .module
+        .with_ast(|program| wake_ecma_codegen::codegen(program, &interner));
+    assert_eq!(execute_in_node(&legacy), expected);
+    for downlevel in [false, true] {
+        let mut options = wake_ecma_parser::ParseOptions::default();
+        if downlevel {
+            options
+                .transform_features
+                .insert(wake_ecma_transform::EcmaFeature::TemplateLiteral);
+        }
+        let build = build_typed_with_options(source, SourceType::Script, options);
+        assert_eq!(build.optimized, build.mapped);
+        for generated in [&build.readable, &build.optimized] {
+            assert_reparses("utf16-strings", generated);
+            assert_eq!(
+                execute_in_node(generated),
+                expected,
+                "downlevel={downlevel}\n{generated}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_and_readable_decorators_preserve_utf16_property_names() {
+    let source = r#"
+const names=[];
+function record(value,context){names.push(context.name);return value}
+class Example { @record "\ud800"(){return 1} @record "\udfff"(){return 2} }
+const value=new Example();
+globalThis.__wake_result=[names,value["\ud800"](),value["\udfff"]()];
+"#;
+    let expected = r#"{"kind":"return","value":[["\ud800","\udfff"],1,2],"logs":[]}"#;
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::TypeScript);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let readable = parsed
+        .module
+        .with_ast(|program| wake_ecma_codegen::codegen(program, &interner));
+    assert_eq!(execute_in_node(&readable).trim(), expected);
+    let build = build_typed(source, SourceType::TypeScript);
+    for generated in [&build.readable, &build.optimized] {
+        assert_eq!(execute_in_node(generated).trim(), expected, "{generated}");
+    }
+}
+
+#[test]
+fn typed_pipeline_utf16_enum_members_and_jsx_values_remain_distinct() {
+    let source = r#"
+enum Values { "\ud800"=1, "\udfff"="\ud800" }
+const view=<div title={"\ud800"}>{"\udfff"}</div>;
+globalThis.__wake_result=[Values["\ud800"],Values[1],Values["\udfff"],view.props.title,view.props.children];
+"#;
+    let expected = r#"{"kind":"return","value":[1,"\ud800","\ud800","\ud800","\udfff"],"logs":[]}"#;
+    let build = build_typed(source, SourceType::Tsx);
+    for generated in [&build.readable, &build.optimized] {
+        assert_eq!(execute_in_node(generated).trim(), expected, "{generated}");
     }
 }
 

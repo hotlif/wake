@@ -16,6 +16,7 @@ pub struct SourceFile {
     name: String,
     src: String,
     line_starts: Vec<u32>,
+    ecmascript_lines: bool,
 }
 
 impl SourceFile {
@@ -27,6 +28,31 @@ impl SourceFile {
             name,
             src,
             line_starts,
+            ecmascript_lines: false,
+        }
+    }
+
+    /// Source snapshot for ECMAScript diagnostics. Recognizes LF, CRLF, CR, U+2028 and U+2029.
+    /// Ordinary `new` retains its existing LF line model for other languages and protocols.
+    pub fn new_ecmascript(name: impl Into<String>, src: impl Into<String>) -> SourceFile {
+        let src = src.into();
+        let mut line_starts = vec![0];
+        let mut chars = src.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            let end = match ch {
+                '\r' if chars.peek().is_some_and(|(_, ch)| *ch == '\n') => {
+                    chars.next().unwrap().0 + 1
+                }
+                '\r' | '\n' | '\u{2028}' | '\u{2029}' => index + ch.len_utf8(),
+                _ => continue,
+            };
+            line_starts.push(end as u32);
+        }
+        SourceFile {
+            name: name.into(),
+            src,
+            line_starts,
+            ecmascript_lines: true,
         }
     }
 
@@ -128,7 +154,11 @@ impl SourceFile {
         } else {
             self.src.len()
         };
-        self.src[start..end].trim_end_matches(['\n', '\r'])
+        if self.ecmascript_lines {
+            self.src[start..end].trim_end_matches(['\n', '\r', '\u{2028}', '\u{2029}'])
+        } else {
+            self.src[start..end].trim_end_matches(['\n', '\r'])
+        }
     }
 
     /// 某一行（0 基）行首的字节偏移。

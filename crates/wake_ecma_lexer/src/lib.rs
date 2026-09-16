@@ -3,19 +3,48 @@
 //! DESIGN §4.3。全量 ES2022 token；parser 驱动 `/` 二义（正则 vs 除号）；ASI 换行标志；错误恢复。
 //! 字符串中相邻的 UTF-16 高低代理项转义必须合并为对应 Unicode 字符，
 //! 与直接字符及 `\u{...}` 写法得到相同值；标识符仍按 Unicode 标量校验。
+//! 标识符使用固定 Unicode 17.0.0 ID_Start / ID_Continue，而非 XID 或 std 字母/数字近似。
+//! 孤立代理项在字符串/模板中保留为 UTF-16 码元，不替换或丢弃；标识符仍拒绝它们。
+//! 模板 token 接受非法转义，由 decode_template_value 返回空 cooked 值，再由 parser
+//! 按 tagged 上下文决定是否诊断；独立 tokenize 不代替该语法早期错误检查。
+//! ECMAScript 另允许 $、_ 起始，以及 ZWNJ/ZWJ 延续；直接字符与转义形式使用相同分类。
+//! 私有标识符在 # 后使用相同的起始、延续与转义规则。
 //!
 //! 两种用法：
 //! - **parser 驱动**（P2）：逐 token 调 [`Lexer::next`]，由语法上下文传入 `regex_allowed`。
 //! - **独立**（`wake tokenize` / 测试）：[`tokenize`] 用启发式自行判定 `regex_allowed`，一次出全部 token。
+//!
+//! [`Lexer::new_with_comments`] opts into source comment collection. Comment spans include
+//! delimiters, exclude a line comment's terminating line separator, and use UTF-8 byte offsets.
+//! All ECMAScript line separators terminate line comments. Checkpoint rewind and contextual
+//! relex discard speculative comments; ordinary `Lexer::new` does not collect them.
 
 mod lexer;
 mod token;
 mod unicode;
 
-pub use lexer::{Lexer, LexerCheckpoint};
+pub use lexer::{
+    Comment, CommentKind, Lexer, LexerCheckpoint, decode_escaped_value, decode_template_value,
+};
 pub use token::{Keyword, Token, TokenKind};
 
 use wake_common::Diagnostic;
+
+#[cfg(test)]
+mod comment_line_endings {
+    use super::*;
+
+    #[test]
+    fn unicode_separator_preserves_code_after_line_comment() {
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let source = format!("// comment{separator}value");
+            let mut lexer = Lexer::new(&source);
+            let token = lexer.next(false);
+            assert_eq!(token.kind, TokenKind::Ident);
+            assert!(token.newline_before);
+        }
+    }
+}
 
 /// 独立词法分析：一次扫出全部 token（含结尾 `Eof`）与诊断。**不驻留标识符**（惰性，DESIGN §4.3）。
 ///
@@ -102,6 +131,22 @@ mod tests {
             assert!(lexer.take_diagnostics().is_empty(), "{source}");
             assert_eq!(lexer.string_value(token.span), "👍", "{source}");
         }
+    }
+
+    #[test]
+    fn string_line_continuations_remove_all_ecmascript_line_terminators() {
+        for separator in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+            let source = format!("\"a\\{separator}b\"");
+            let mut lexer = Lexer::new(&source);
+            let token = lexer.next(true);
+            assert!(lexer.take_diagnostics().is_empty(), "{source:?}");
+            assert_eq!(lexer.string_value(token.span), "ab", "{source:?}");
+        }
+        let source = "\"a\u{2028}b\u{2029}c\"";
+        let mut lexer = Lexer::new(source);
+        let token = lexer.next(true);
+        assert!(lexer.take_diagnostics().is_empty());
+        assert_eq!(lexer.string_value(token.span), "a\u{2028}b\u{2029}c");
     }
 
     fn kinds(src: &str) -> Vec<TokenKind> {

@@ -1,8 +1,8 @@
 //! 表达式解析（Pratt 优先级爬升）+ 主表达式 + cover grammar 箭头 + 模式转换。DESIGN §4.4
 
-use wake_common::{Atom, Span};
+use wake_common::{Atom, JsString, Span};
 use wake_ecma_ast::*;
-use wake_ecma_lexer::{Keyword, TokenKind};
+use wake_ecma_lexer::{Keyword, TokenKind, decode_template_value};
 use wake_ecma_transform::AutomaticJsxUsage;
 
 use crate::{Context, Parser, ParserCheckpoint, ts::TsTypeParameterContext};
@@ -12,6 +12,7 @@ struct CoverParen<'a> {
     items: AVec<'a, Expression<'a>>,
     rest: Option<&'a RestElement<'a>>,
     value_reference_mark: Option<usize>,
+    source_list: Option<usize>,
 }
 
 /// 泛型箭头完整试探的输出状态快照。
@@ -53,18 +54,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     pub(crate) fn parse_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
         let first = self.parse_assignment_expression();
-        if !self.at(TokenKind::Comma) {
-            return first;
-        }
-        let mut exprs = self.new_vec::<Expression>();
-        exprs.push(first);
-        while self.eat(TokenKind::Comma) {
-            exprs.push(self.parse_assignment_expression());
-        }
-        Expression::Sequence(self.alloc(SequenceExpression {
-            span: self.span_to(lo),
-            expressions: exprs,
-        }))
+        let expression = if !self.at(TokenKind::Comma) {
+            first
+        } else {
+            let mut exprs = self.new_vec::<Expression>();
+            exprs.push(first);
+            while self.eat(TokenKind::Comma) {
+                exprs.push(self.parse_assignment_expression());
+            }
+            Expression::Sequence(self.alloc(SequenceExpression {
+                span: self.span_to(lo),
+                expressions: exprs,
+            }))
+        };
+        self.source_condition_expression(expression);
+        expression
     }
 
     /// 赋值表达式（含箭头、yield、赋值运算符）。
@@ -135,6 +139,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.in_cover_paren = previous_cover;
             let features = self.options.transform_features;
             let span = self.span_to(lo);
+            self.source_assignment(
+                wake_ecma_ast::SourceAssignmentKind::Expression,
+                span,
+                left.span(),
+                right.span(),
+            );
             if !LOWER {
                 return Expression::Assignment(self.alloc(AssignmentExpression {
                     span,
@@ -199,12 +209,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let consequent = self.with_allow_in(true, |p| p.parse_assignment_expression());
         self.expect(TokenKind::Colon);
         let alternate = self.parse_assignment_expression();
-        Expression::Conditional(self.alloc(ConditionalExpression {
+        let expression = Expression::Conditional(self.alloc(ConditionalExpression {
             span: self.span_to(lo),
             test,
             consequent,
             alternate,
-        }))
+        }));
+        self.source_condition_expression(expression);
+        expression
     }
 
     // ==================================================================
@@ -223,12 +235,29 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         loop {
             // TS：`expr as Type` / `expr satisfies Type`（同行）→ 擦除类型，保留表达式。
             if self.ts
+                && min_prec <= 8
                 && !self.cur.newline_before
                 && (self.at_keyword(Keyword::As) || self.at_contextual("satisfies"))
             {
+                let kind = if self.at_keyword(Keyword::As) {
+                    SourceAssertionKind::As
+                } else {
+                    SourceAssertionKind::Satisfies
+                };
+                let operand = self.span_to(lo);
                 self.bump(); // as / satisfies
+                let type_lo = self.start();
+                let const_span = self.at_keyword(Keyword::Const).then_some(self.cur.span);
                 // `as const` 也是类型位置；`const` 是保留字，由 ts_primary 显式消费。
                 self.ts_type();
+                let type_span = self.span_to(type_lo);
+                self.source_assertion(
+                    kind,
+                    self.span_to(lo),
+                    operand,
+                    Some(type_span),
+                    kind == SourceAssertionKind::As && const_span == Some(type_span),
+                );
                 continue;
             }
             let Some((op, prec, logical)) = self.peek_binary_op() else {
@@ -252,12 +281,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         right,
                     })),
                     BinOp::Logical(operator) => {
-                        Expression::Logical(self.alloc(LogicalExpression {
+                        let expression = Expression::Logical(self.alloc(LogicalExpression {
                             span,
                             operator,
                             left,
                             right,
-                        }))
+                        }));
+                        self.source_condition_expression(expression);
+                        expression
                     }
                 };
                 continue;
@@ -273,6 +304,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     right,
                 ),
                 BinOp::Logical(l) => {
+                    // Source facts must describe the original condition even when this parser
+                    // lowers the logical expression for an older target. Keep the original node
+                    // ranges before handing the operands to the lowering transform.
+                    let original = Expression::Logical(self.alloc(LogicalExpression {
+                        span,
+                        operator: l,
+                        left,
+                        right,
+                    }));
+                    self.source_condition_expression(original);
                     let temp = if l == LogicalOperator::Coalesce
                         && features.contains(wake_ecma_transform::EcmaFeature::NullishCoalescing)
                         && !wake_ecma_transform::is_repeatable(left)
@@ -359,9 +400,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         // TS 类型断言 `<Type>expr`（仅 .ts；.tsx 用 `as`，且 `<` 在 .tsx 是 JSX）。
         if self.ts && !self.jsx && self.at(TokenKind::Lt) {
             self.bump(); // <
+            let type_lo = self.start();
+            let const_span = self.at_keyword(Keyword::Const).then_some(self.cur.span);
             self.ts_type();
+            let type_span = self.span_to(type_lo);
             self.consume_type_gt(); // >
-            return self.parse_unary_expression();
+            let operand_lo = self.start();
+            let expression = self.parse_unary_expression();
+            self.source_assertion(
+                SourceAssertionKind::Angle,
+                self.span_to(lo),
+                self.span_to(operand_lo),
+                Some(type_span),
+                const_span == Some(type_span),
+            );
+            return expression;
         }
 
         // 前缀更新 ++ --。
@@ -436,6 +489,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             self.bump();
             let argument = self.parse_unary_expression();
+            self.source_await(self.span_to(lo), argument.span());
             return Expression::Await(self.alloc(AwaitExpression {
                 span: self.span_to(lo),
                 argument,
@@ -531,6 +585,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }));
         }
         // callee：member 表达式（不含调用）。
+        let callee_lo = self.start();
         let mut callee_base = if self.at_keyword(Keyword::New) {
             self.parse_new_expression()
         } else {
@@ -548,14 +603,21 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             callee_base = self.parenthesized_expression(callee_base);
         }
-        let callee = self.parse_member_tail_no_call(lo, callee_base);
+        let callee = self.parse_member_tail_no_call(lo, callee_lo, callee_base);
         // Constructors can omit their argument list: `new C<T>` still owns the type arguments.
         if self.ts && self.at(TokenKind::Lt) {
             self.try_ts_constructor_type_arguments();
         }
         let arguments = if self.at(TokenKind::LParen) {
-            self.parse_arguments()
+            self.parse_arguments(lo, callee_lo, SourceCallKind::Construct, false)
         } else {
+            self.source_call(
+                SourceCallKind::Construct,
+                self.span_to(lo),
+                self.span_to(callee_lo),
+                false,
+                Vec::new(),
+            );
             self.new_vec()
         };
         let new = self.alloc(NewExpression {
@@ -584,7 +646,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     /// Parse a constructor member expression, including tags and erased TS non-null assertions,
     /// without consuming an ordinary argument list (which belongs to the surrounding `new`).
-    fn parse_member_tail_no_call(&mut self, lo: u32, mut expr: Expression<'a>) -> Expression<'a> {
+    fn parse_member_tail_no_call(
+        &mut self,
+        lo: u32,
+        source_lo: u32,
+        mut expr: Expression<'a>,
+    ) -> Expression<'a> {
         loop {
             match self.cur.kind {
                 TokenKind::Lt if self.ts => {
@@ -603,12 +670,24 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     break;
                 }
                 TokenKind::Bang if self.ts && !self.cur.newline_before => {
+                    let operand = self.span_to(source_lo);
+                    self.source_leaf(crate::SourceNodeKind::TsNonNullAssertion, self.cur.span);
                     self.bump();
+                    self.source_assertion(
+                        SourceAssertionKind::NonNull,
+                        self.span_to(source_lo),
+                        operand,
+                        None,
+                        false,
+                    );
                 }
                 TokenKind::TemplateNoSub | TokenKind::TemplateHead => {
-                    let Expression::TemplateLiteral(quasi) = self.parse_template_literal() else {
+                    let head = self.span_to(source_lo);
+                    let Expression::TemplateLiteral(quasi) = self.parse_template_literal(true)
+                    else {
                         unreachable!("template parser always produces a template literal")
                     };
+                    self.source_tagged_call(self.span_to(source_lo), head, quasi.span);
                     expr = Expression::TaggedTemplate(self.alloc(TaggedTemplateExpression {
                         span: self.span_to(lo),
                         tag: expr,
@@ -616,8 +695,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     }));
                 }
                 TokenKind::Dot => {
+                    let object = self.span_to(source_lo);
                     self.bump();
-                    let property = self.parse_member_property();
+                    let property = self.parse_source_member_property(source_lo, object, false);
                     expr = Expression::Member(self.alloc(MemberExpression {
                         span: self.span_to(lo),
                         object: expr,
@@ -626,13 +706,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     }));
                 }
                 TokenKind::LBracket => {
-                    self.bump();
-                    let idx = self.with_allow_in(true, |p| p.parse_expression());
-                    self.expect(TokenKind::RBracket);
+                    let object = self.span_to(source_lo);
+                    let property = self.parse_source_member_property(source_lo, object, false);
                     expr = Expression::Member(self.alloc(MemberExpression {
                         span: self.span_to(lo),
                         object: expr,
-                        property: MemberProperty::Computed(idx),
+                        property,
                         optional: false,
                     }));
                 }
@@ -688,8 +767,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         loop {
             match self.cur.kind {
                 TokenKind::Dot => {
+                    let object = self.span_to(lo);
                     self.bump();
-                    let property = self.parse_member_property();
+                    let property = self.parse_source_member_property(lo, object, false);
                     expr = Expression::Member(self.alloc(MemberExpression {
                         span: self.span_to(lo),
                         object: expr,
@@ -698,13 +778,15 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     }));
                 }
                 TokenKind::QuestionDot => {
+                    let object = self.span_to(lo);
                     self.bump();
                     // TS type arguments after `?.` unambiguously belong to an optional call;
                     // erasing them must preserve receiver binding and argument short-circuiting.
                     match self.cur.kind {
                         TokenKind::Lt if self.ts => {
                             self.ts_type_arguments();
-                            let arguments = self.parse_arguments();
+                            let arguments =
+                                self.parse_arguments(lo, lo, SourceCallKind::Call, true);
                             expr = Expression::Call(self.alloc(CallExpression {
                                 span: self.span_to(lo),
                                 callee: expr,
@@ -713,7 +795,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                             }));
                         }
                         TokenKind::LParen => {
-                            let arguments = self.parse_arguments();
+                            let arguments =
+                                self.parse_arguments(lo, lo, SourceCallKind::Call, true);
                             expr = Expression::Call(self.alloc(CallExpression {
                                 span: self.span_to(lo),
                                 callee: expr,
@@ -722,18 +805,16 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                             }));
                         }
                         TokenKind::LBracket => {
-                            self.bump();
-                            let idx = self.with_allow_in(true, |p| p.parse_expression());
-                            self.expect(TokenKind::RBracket);
+                            let property = self.parse_source_member_property(lo, object, true);
                             expr = Expression::Member(self.alloc(MemberExpression {
                                 span: self.span_to(lo),
                                 object: expr,
-                                property: MemberProperty::Computed(idx),
+                                property,
                                 optional: true,
                             }));
                         }
                         _ => {
-                            let property = self.parse_member_property();
+                            let property = self.parse_source_member_property(lo, object, true);
                             expr = Expression::Member(self.alloc(MemberExpression {
                                 span: self.span_to(lo),
                                 object: expr,
@@ -744,19 +825,27 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     }
                 }
                 TokenKind::LBracket if allow_computed_tail => {
-                    self.bump();
-                    let idx = self.with_allow_in(true, |p| p.parse_expression());
-                    self.expect(TokenKind::RBracket);
+                    let object = self.span_to(lo);
+                    let property = self.parse_source_member_property(lo, object, false);
                     expr = Expression::Member(self.alloc(MemberExpression {
                         span: self.span_to(lo),
                         object: expr,
-                        property: MemberProperty::Computed(idx),
+                        property,
                         optional: false,
                     }));
                 }
                 // TS：非空断言 `expr!`（同行）→ 擦除，继续 member 链（`a!.b`）。
                 TokenKind::Bang if self.ts && !self.cur.newline_before => {
+                    let operand = self.span_to(lo);
+                    self.source_leaf(crate::SourceNodeKind::TsNonNullAssertion, self.cur.span);
                     self.bump();
+                    self.source_assertion(
+                        SourceAssertionKind::NonNull,
+                        self.span_to(lo),
+                        operand,
+                        None,
+                        false,
+                    );
                 }
                 // TS type arguments may form a call/tag or a standalone instantiation.
                 // Failed or comparison-shaped probes rewind before Pratt consumes `<`.
@@ -773,7 +862,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                             self.prepare_parenthesized_optional_callee(expr);
                         preserve_optional_chain = false;
                     }
-                    let arguments = self.parse_arguments();
+                    let arguments = self.parse_arguments(lo, lo, SourceCallKind::Call, false);
                     let call = self.alloc(CallExpression {
                         span: self.span_to(lo),
                         callee: expr,
@@ -836,8 +925,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                         expr = prepared;
                         preserve_optional_chain = false;
                     }
-                    let quasi = self.parse_template_literal();
+                    let head = self.span_to(lo);
+                    let quasi = self.parse_template_literal(true);
                     if let Expression::TemplateLiteral(q) = quasi {
+                        self.source_tagged_call(self.span_to(lo), head, q.span);
                         expr = Expression::TaggedTemplate(self.alloc(TaggedTemplateExpression {
                             span: self.span_to(lo),
                             tag: expr,
@@ -1014,6 +1105,41 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
+    fn parse_source_member_property(
+        &mut self,
+        lo: u32,
+        object: Span,
+        optional: bool,
+    ) -> MemberProperty<'a> {
+        let (property, span, kind) = if self.eat(TokenKind::LBracket) {
+            let property_lo = self.start();
+            let expression = self.with_allow_in(true, |p| p.parse_expression());
+            let span = self.span_to(property_lo);
+            self.expect(TokenKind::RBracket);
+            (
+                MemberProperty::Computed(expression),
+                span,
+                SourceMemberKind::Computed,
+            )
+        } else {
+            let property = self.parse_member_property();
+            let (span, kind) = match property {
+                MemberProperty::Ident(ident) => (ident.span, SourceMemberKind::Named),
+                MemberProperty::Private(ident) => (ident.span, SourceMemberKind::Private),
+                MemberProperty::Computed(_) => unreachable!("named property parser"),
+            };
+            (property, span, kind)
+        };
+        self.source_member(SourceMember {
+            span: self.span_to(lo),
+            object,
+            property: span,
+            kind,
+            optional,
+        });
+        property
+    }
+
     fn parse_member_property(&mut self) -> MemberProperty<'a> {
         if self.at(TokenKind::PrivateIdent) {
             let span = self.cur.span;
@@ -1028,10 +1154,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     }
 
     /// 解析调用实参 `( ... )`（含 `...spread`）。
-    fn parse_arguments(&mut self) -> AVec<'a, Expression<'a>> {
+    fn parse_arguments(
+        &mut self,
+        call_lo: u32,
+        head_lo: u32,
+        kind: SourceCallKind,
+        optional: bool,
+    ) -> AVec<'a, Expression<'a>> {
+        let head = self.span_to(head_lo);
+        let mut source_arguments = Vec::new();
+        let source_list = self.source_list_start(SourceListKind::Arguments);
         self.expect(TokenKind::LParen);
         let mut args = self.new_vec::<Expression>();
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            let argument_lo = self.start();
             if self.at(TokenKind::DotDotDot) {
                 let lo = self.start();
                 self.bump();
@@ -1043,11 +1179,25 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             } else {
                 args.push(self.with_allow_in(true, |p| p.parse_assignment_expression()));
             }
+            if self.source_syntax.is_some() {
+                source_arguments.push(self.span_to(argument_lo));
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
         }
+        self.source_list_finish(
+            source_list,
+            !matches!(args.last(), Some(Expression::Spread(_))),
+        );
         self.expect(TokenKind::RParen);
+        self.source_call(
+            kind,
+            self.span_to(call_lo),
+            head,
+            optional,
+            source_arguments,
+        );
         args
     }
 
@@ -1056,6 +1206,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // ==================================================================
 
     fn parse_primary_expression(&mut self) -> Expression<'a> {
+        // The grammar knows this is an operand, even after a control-head `)` which the
+        // lexer's local heuristic treats like a value. No slash token was consumed yet.
+        if matches!(self.cur.kind, TokenKind::Slash | TokenKind::SlashEq) {
+            let newline_before = self.cur.newline_before;
+            self.cur = self.lexer.next_at(self.cur.span.lo, true);
+            self.cur.newline_before = newline_before;
+            self.lookahead = None;
+        }
         let lo = self.start();
         let span = self.cur.span;
         if self.at_keyword(Keyword::Async)
@@ -1093,7 +1251,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 }))
             }
             TokenKind::TemplateNoSub | TokenKind::TemplateHead => {
-                let template = self.parse_template_literal();
+                let template = self.parse_template_literal(false);
                 if let Expression::TemplateLiteral(template) = template {
                     if !LOWER {
                         return Expression::TemplateLiteral(template);
@@ -1130,7 +1288,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
             TokenKind::Keyword(Keyword::Function) => self.parse_function_expression(lo, false),
             TokenKind::Keyword(Keyword::Class) => {
-                let class = self.parse_class(lo);
+                let class = self.parse_class(lo, true);
                 Expression::Class(class)
             }
             TokenKind::Keyword(Keyword::Import) => self.parse_import_expression(lo),
@@ -1147,12 +1305,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             TokenKind::Ident => {
                 self.bump();
                 let name = self.intern_ident(span);
+                self.source_identifier(span, name, SourceIdentifierRole::ValueReference);
                 Expression::Identifier(self.alloc(Ident::new(span, name)))
             }
             TokenKind::Keyword(kw) if !kw.is_reserved() => {
                 // 上下文关键字作标识符（async/of/let/...）。
                 self.bump();
                 let name = self.intern_ident(span);
+                self.source_identifier(span, name, SourceIdentifierRole::ValueReference);
                 Expression::Identifier(self.alloc(Ident::new(span, name)))
             }
             _ => {
@@ -1179,18 +1339,39 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }));
         }
         // 动态 import(specifier)
+        let head = self.span_to(lo);
+        let mut source_arguments = Vec::new();
         self.expect(TokenKind::LParen);
+        let source_lo = self.start();
         let source = self.with_allow_in(true, |p| p.parse_assignment_expression());
+        if self.source_syntax.is_some() {
+            source_arguments.push(self.span_to(source_lo));
+        }
         let options = if self.eat(TokenKind::Comma) && !self.at(TokenKind::RParen) {
-            Some(self.parse_assignment_expression())
+            let option_lo = self.start();
+            let options = self.with_allow_in(true, |parser| parser.parse_assignment_expression());
+            if self.source_syntax.is_some() {
+                source_arguments.push(self.span_to(option_lo));
+            }
+            self.eat(TokenKind::Comma);
+            Some(options)
         } else {
             None
         };
         self.expect(TokenKind::RParen);
+        self.source_call(
+            SourceCallKind::DynamicImport,
+            self.span_to(lo),
+            head,
+            false,
+            source_arguments,
+        );
         // 依赖提取：字符串字面量的动态 import。
-        if let Expression::StringLiteral(s) = source {
+        if let Expression::StringLiteral(s) = source
+            && let Some(specifier) = self.interner.resolve_js(s.value).as_str()
+        {
             self.record_dependency(Dependency {
-                specifier: s.value,
+                specifier: self.interner.intern(specifier),
                 kind: DependencyKind::DynamicImport,
                 span: self.span_to(lo),
             });
@@ -1204,6 +1385,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_array_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
+        let source_list = self.source_list_start(SourceListKind::Array);
         // Raw assignment/for targets such as `[{a, ...rest}] = rhs` and
         // `for ([a, ...rest] of values)` have no surrounding cover parens. Scan only for this
         // array's matching `]` before parsing, so nested rest is not prematurely lowered as
@@ -1239,12 +1421,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(
+            source_list,
+            !matches!(
+                elements.last(),
+                Some(Some(Expression::Spread(_))) | Some(None)
+            ),
+        );
         self.expect(TokenKind::RBracket);
         self.in_cover_paren = previous_cover;
         let array = self.alloc(ArrayExpression {
             span: self.span_to(lo),
             elements,
         });
+        self.source_array(array);
         // A spread-shaped element before `=` / a for-head `in` / `of` is rest, not array spread.
         let destructuring_cover = self.at(TokenKind::Eq)
             || (self.in_for_head_init
@@ -1301,6 +1491,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_object_expression(&mut self) -> Expression<'a> {
         let lo = self.start();
+        let source_list = self.source_list_start(SourceListKind::Object);
         let previous_cover = self.in_cover_paren;
         if !previous_cover
             && self.delimited_expression_needs_cover(TokenKind::LBrace, TokenKind::RBrace)
@@ -1326,6 +1517,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        self.source_list_finish(
+            source_list,
+            !matches!(properties.last(), Some(ObjectMember::Spread(_))),
+        );
         self.expect(TokenKind::RBrace);
         self.in_cover_paren = previous_cover;
         let object = self.alloc(ObjectExpression {
@@ -1335,6 +1530,17 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         let destructuring_cover = self.at(TokenKind::Eq)
             || (self.in_for_head_init
                 && (self.at_keyword(Keyword::In) || self.at_keyword(Keyword::Of)));
+        if !destructuring_cover {
+            for member in object.properties.iter() {
+                if let ObjectMember::Property(property) = member {
+                    self.source_callback(
+                        wake_ecma_ast::SourceCallbackKind::ObjectProperty,
+                        property.span,
+                        property.value.span(),
+                    );
+                }
+            }
+        }
         if self.lowers(wake_ecma_transform::EcmaFeature::ObjectRestSpread)
             && !self.in_cover_paren
             && !destructuring_cover
@@ -1425,9 +1631,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     PropertyKey::Ident(ident) => self
                         .interner
                         .with_resolved(ident.name, |name| name == "__proto__"),
-                    PropertyKey::String(string) => self
-                        .interner
-                        .with_resolved(string.value, |name| name == "__proto__"),
+                    PropertyKey::String(string) => {
+                        self.interner.resolve_js(string.value) == "__proto__"
+                    }
                     _ => false,
                 };
             return self.alloc(ObjectProperty {
@@ -1444,7 +1650,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // 简写 `{ x }` 或 `{ x = default }`（后者仅解构合法，这里宽松接受）。
         let ident = match key {
-            PropertyKey::Ident(id) => Expression::Identifier(self.alloc(id)),
+            PropertyKey::Ident(id) => {
+                self.source_identifier(id.span, id.name, SourceIdentifierRole::ValueReference);
+                Expression::Identifier(self.alloc(id))
+            }
             _ => {
                 self.error(self.span_to(lo), "对象属性缺少值");
                 Expression::NullLiteral(self.span_to(lo))
@@ -1515,31 +1724,36 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     // 模板
     // ==================================================================
 
-    fn parse_template_literal(&mut self) -> Expression<'a> {
+    fn parse_template_literal(&mut self, tagged: bool) -> Expression<'a> {
         let lo = self.start();
         let mut quasis = self.new_vec::<TemplateElement>();
         let mut expressions = self.new_vec::<Expression>();
+        let mut source_expressions = Vec::new();
 
         if self.at(TokenKind::TemplateNoSub) {
             let span = self.cur.span;
-            quasis.push(self.template_element(span, TemplatePart::NoSub, true));
+            quasis.push(self.template_element(span, true, tagged));
             self.bump();
         } else {
             // Head
             let span = self.cur.span;
-            quasis.push(self.template_element(span, TemplatePart::Head, false));
+            quasis.push(self.template_element(span, false, tagged));
             self.bump();
             loop {
+                let expression_lo = self.start();
                 expressions.push(self.with_allow_in(true, |p| p.parse_expression()));
+                if self.source_syntax.is_some() {
+                    source_expressions.push(self.span_to(expression_lo));
+                }
                 match self.cur.kind {
                     TokenKind::TemplateMiddle => {
                         let s = self.cur.span;
-                        quasis.push(self.template_element(s, TemplatePart::Middle, false));
+                        quasis.push(self.template_element(s, false, tagged));
                         self.bump();
                     }
                     TokenKind::TemplateTail => {
                         let s = self.cur.span;
-                        quasis.push(self.template_element(s, TemplatePart::Tail, true));
+                        quasis.push(self.template_element(s, true, tagged));
                         self.bump();
                         break;
                     }
@@ -1551,6 +1765,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             }
         }
 
+        self.source_template(self.span_to(lo), tagged, source_expressions);
         Expression::TemplateLiteral(self.alloc(TemplateLiteral {
             span: self.span_to(lo),
             quasis,
@@ -1558,23 +1773,37 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }))
     }
 
-    fn template_element(&self, span: Span, part: TemplatePart, tail: bool) -> TemplateElement {
-        let raw_slice = self.slice(span);
-        // 去掉定界符得到 raw 文本。
-        let inner = match part {
-            TemplatePart::NoSub => &raw_slice[1..raw_slice.len().saturating_sub(1)], // `...`
-            TemplatePart::Head => &raw_slice[1..raw_slice.len().saturating_sub(2)],  // `...${
-            TemplatePart::Middle => &raw_slice[1..raw_slice.len().saturating_sub(2)], // }...${
-            TemplatePart::Tail => &raw_slice[1..raw_slice.len().saturating_sub(1)],  // }...`
-        };
-        let raw = self.interner.intern(inner);
-        // cooked 的完整转义解码是后续精修项；此处以 raw 近似。
+    fn template_element(&mut self, span: Span, tail: bool, tagged: bool) -> TemplateElement {
+        // raw remains source spelling for emission, not the runtime tagged-template TRV.
+        let raw = self.interner.intern(self.template_raw(span, tail));
+        let cooked = self
+            .template_value(span, tail, tagged)
+            .map(|value| self.interner.intern_js(value));
         TemplateElement {
             span,
-            cooked: Some(raw),
+            cooked,
             raw,
             tail,
         }
+    }
+
+    fn template_raw(&self, span: Span, tail: bool) -> &'src str {
+        let raw = self.slice(span);
+        // NoSub/Tail end in a backtick; Head/Middle end in an interpolation opener.
+        &raw[1..raw.len() - if tail { 1 } else { 2 }]
+    }
+
+    pub(super) fn template_value(
+        &mut self,
+        span: Span,
+        tail: bool,
+        tagged: bool,
+    ) -> Option<JsString> {
+        let value = decode_template_value(self.template_raw(span, tail));
+        if value.is_none() && !tagged {
+            self.error(span, "无标签的模板字符串不能包含非法转义");
+        }
+        value
     }
 
     // ==================================================================
@@ -1609,11 +1838,14 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         if is_async {
             self.bump(); // async
         }
-        self.ts_type_parameters(TsTypeParameterContext::FunctionLike);
+        let type_parameters = self.ts_type_parameters(TsTypeParameterContext::FunctionLike);
         let cover = self.parse_cover_paren();
         let return_type = self.skip_arrow_return_type_if_arrow();
         if self.at(TokenKind::Arrow) && !self.newline_before() {
             let arrow = self.finish_arrow(lo, cover, is_async, return_type);
+            if self.jsx && type_parameters.comma_disambiguates {
+                self.source_list_require_comma(type_parameters.source_list);
+            }
             self.declaration_restore_type_scope(type_scope);
             return Some(arrow);
         }
@@ -1661,6 +1893,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
     fn parse_cover_paren(&mut self) -> CoverParen<'a> {
         let value_reference_mark = self.declaration_value_reference_mark();
+        let source_list = self.source_list_start(SourceListKind::Parenthesized);
         self.expect(TokenKind::LParen);
         let previous_cover = self.in_cover_paren;
         self.in_cover_paren = true;
@@ -1719,6 +1952,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 break;
             }
         }
+        let source_list = self.source_list_finish(source_list, rest.is_none());
         self.expect(TokenKind::RParen);
         let _ = self.pop_transform_temp_scope();
         self.in_cover_paren = previous_cover;
@@ -1726,6 +1960,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             items,
             rest,
             value_reference_mark,
+            source_list,
         }
     }
 
@@ -1752,8 +1987,10 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
         let cp = self.checkpoint();
         let lo = self.start();
+        self.source_begin(crate::SourceNodeKind::TsTypeAnnotation, lo);
         self.bump(); // :
         self.ts_type_or_predicate();
+        self.source_end(self.prev_end);
         // 只有确实是箭头（`=>` 紧随）才提交；否则回退，`:` 交回给条件表达式等。
         if !self.at(TokenKind::Arrow) || self.newline_before() {
             self.rewind(cp);
@@ -1917,6 +2154,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         return_type: Option<Span>,
     ) -> Expression<'a> {
         let value_scope = self.declaration_value_scope_mark();
+        self.source_list_parameters(cover.source_list);
         let arrow_span = self.cur.span;
         self.expect(TokenKind::Arrow);
         let mut params = self.new_vec::<Pattern>();
@@ -1963,6 +2201,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         params: AVec<'a, Pattern<'a>>,
         is_async: bool,
     ) -> Expression<'a> {
+        let body_lo = self.cur.span.lo;
         let saved_async = self.ctx.in_async;
         let saved_gen = self.ctx.in_generator;
         let saved_top = self.ctx.top_level;
@@ -2013,6 +2252,12 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             body,
             is_async,
         });
+        self.source_function(
+            arrow.span,
+            lo,
+            Some(Span::new(body_lo, self.prev_end)),
+            true,
+        );
         let features = self.options.transform_features;
         if !LOWER {
             return Expression::Arrow(arrow);
@@ -2164,8 +2409,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         self.lexer.number_value(span)
     }
 
-    fn intern_string(&self, span: Span) -> wake_common::Atom {
-        self.interner.intern(&self.lexer.string_value(span))
+    fn intern_string(&self, span: Span) -> wake_common::JsAtom {
+        self.interner.intern_js(self.lexer.string_value(span))
     }
 
     fn split_regex(&self, span: Span) -> (wake_common::Atom, wake_common::Atom) {
@@ -2208,13 +2453,6 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                     | TokenKind::Eq
             )
     }
-}
-
-enum TemplatePart {
-    NoSub,
-    Head,
-    Middle,
-    Tail,
 }
 
 #[derive(Clone, Copy)]

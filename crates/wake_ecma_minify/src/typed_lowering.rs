@@ -297,9 +297,12 @@ impl<'a> SyntheticFactory<'a> {
         self.leaf(IrNodeData::NumberLiteral { value })
     }
 
-    pub(crate) fn string(&self, value: &str) -> Result<NodeId, TypedIrError> {
+    pub(crate) fn string(
+        &self,
+        value: impl Into<wake_common::JsString>,
+    ) -> Result<NodeId, TypedIrError> {
         self.leaf(IrNodeData::StringLiteral {
-            value: value.to_owned(),
+            value: value.into(),
         })
     }
 
@@ -1698,7 +1701,7 @@ mod tests {
         let parsed = parse(source, &interner, SourceType::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).expect("typed lowering")
         })
     }

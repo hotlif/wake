@@ -701,7 +701,7 @@ mod tests {
     fn cloned_program_owns_import_attribute_slices_and_preserves_metadata() {
         let interner = Interner::new();
         let type_name = interner.intern("type");
-        let json = interner.intern("json");
+        let json = interner.intern_js("json");
         let source_name = interner.intern("./data.json");
         let local_name = interner.intern("data");
         let spread_helper = interner.intern("__spread");
@@ -713,7 +713,7 @@ mod tests {
         let source = ModuleAst::from_builder(move |arena| {
             let items = arena.alloc_slice_copy(&[ImportAttribute {
                 span: attribute_span,
-                key: ModuleExportName::Ident(Ident::new(attribute_span, type_name)),
+                key: ImportAttributeKey::Ident(Ident::new(attribute_span, type_name)),
                 value: json,
             }]);
             let attributes = arena.alloc(ImportAttributes {
@@ -782,7 +782,7 @@ mod tests {
             assert_eq!(attributes.items.len(), 1);
             assert_eq!(attributes.items[0].span, attribute_span);
             assert_eq!(attributes.items[0].value, json);
-            let ModuleExportName::Ident(key) = attributes.items[0].key else {
+            let ImportAttributeKey::Ident(key) = attributes.items[0].key else {
                 panic!("attribute key kind changed during clone");
             };
             assert_eq!(key.name, type_name);

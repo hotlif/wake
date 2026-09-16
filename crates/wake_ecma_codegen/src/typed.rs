@@ -446,18 +446,18 @@ impl<'program> TypedEmitter<'program> {
         (name.emitted(), name.original(), name.syntax())
     }
 
-    fn emit_string_value(&mut self, id: NodeId, value: &str) {
+    fn emit_string_value(&mut self, id: NodeId, value: &wake_common::JsString) {
         let encoded = quote_string(value, self.minify);
         self.source_token(id, &encoded);
     }
 
     fn emit_string_node(&mut self, id: NodeId) {
         let value = match self.node(id).data() {
-            IrNodeData::StringLiteral { value } => value.as_str(),
-            IrNodeData::Name { .. } => self.name_text(id).0,
+            IrNodeData::StringLiteral { value } => value.clone(),
+            IrNodeData::Name { .. } => self.name_text(id).0.into(),
             other => panic!("typed codegen expected string-bearing node, found {other:?}"),
         };
-        self.emit_string_value(id, value);
+        self.emit_string_value(id, &value);
     }
 
     fn emit_list(
@@ -2311,7 +2311,7 @@ fn number_token_starts_with_minus(value: f64) -> bool {
     value.is_finite() && value.is_sign_negative()
 }
 
-fn quote_string(value: &str, minify: bool) -> String {
+pub(super) fn quote_string(value: &wake_common::JsString, minify: bool) -> String {
     let double = escaped_string(value, '"');
     if !minify {
         return double;
@@ -2324,10 +2324,17 @@ fn quote_string(value: &str, minify: bool) -> String {
     }
 }
 
-fn escaped_string(value: &str, quote: char) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
+fn escaped_string(value: &wake_common::JsString, quote: char) -> String {
+    let mut output = String::with_capacity(value.len_utf16() + 2);
     output.push(quote);
-    for character in value.chars() {
+    for character in char::decode_utf16(value.code_units()) {
+        let character = match character {
+            Ok(character) => character,
+            Err(surrogate) => {
+                let _ = write!(output, "\\u{:04x}", surrogate.unpaired_surrogate());
+                continue;
+            }
+        };
         match character {
             character if character == quote => {
                 output.push('\\');

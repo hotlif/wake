@@ -17,6 +17,7 @@ pub mod holder;
 pub mod literal;
 pub mod module;
 pub mod pattern;
+pub mod source;
 pub mod stmt;
 pub mod visit;
 
@@ -28,6 +29,18 @@ pub use holder::ModuleAst;
 pub use literal::*;
 pub use module::*;
 pub use pattern::*;
+pub use source::{
+    SourceArray, SourceArrayElement, SourceAssertionKind, SourceAssignment, SourceAssignmentKind,
+    SourceAwait, SourceCall, SourceCallKind, SourceCallback, SourceCallbackKind, SourceCondition,
+    SourceConditionKind, SourceExport, SourceExportKind, SourceExportName, SourceExportSpecifier,
+    SourceExpressionStatement, SourceFunction, SourceIdentifier, SourceIdentifierRole,
+    SourceImport, SourceImportAttribute, SourceImportAttributes, SourceImportBinding,
+    SourceImportBindingKind, SourceJsxValue, SourceList, SourceListKind, SourceMember,
+    SourceMemberKind, SourceModuleSpecifier, SourceNamespace, SourceNode, SourceNodeKind,
+    SourcePrimitiveValue, SourceReturn, SourceSwitch, SourceTemplate, SourceTerminator,
+    SourceTypeAssertion, SourceTypeDeclaration, SourceTypeImport, SourceTypeScope,
+    SourceTypeScopeKind, SourceValueBindingKind,
+};
 pub use stmt::*;
 pub use visit::{
     Visit, walk_class, walk_expression, walk_function, walk_pattern, walk_program, walk_statement,

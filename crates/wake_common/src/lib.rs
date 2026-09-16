@@ -5,6 +5,7 @@
 //!
 //! - [`Span`] / [`SourceFile`]：字节偏移位置 + 行列还原。
 //! - [`Atom`] / [`Interner`]：分片锁字符串驻留，比较退化为 `u32`。
+//! - [`JsString`] / [`JsAtom`]：无损 UTF-16 码元值及独立的进程内驻留身份。
 //! - [`Diagnostic`] + [`render`]：统一诊断结构 + rustc 风格彩色报错。
 //! - [`FileSystem`] / [`MemoryFileSystem`] / [`OsFileSystem`]：可测试的文件系统抽象。
 //!
@@ -13,18 +14,20 @@
 pub mod atom;
 pub mod diagnostic;
 pub mod fs;
+pub mod js_string;
 pub mod render;
 pub mod source;
 pub mod span;
 pub mod zip;
 
-pub use atom::{Atom, Interner};
+pub use atom::{Atom, Interner, JsAtom};
 pub use diagnostic::{Diagnostic, Label, Severity};
 pub use fs::{
     FileSystem, FileSystemProjection, MemoryFileSystem, OsFileSystem, OwnedFileTree,
     OwnedFileTreeBuilder, OwnedFileTreeError, OwnedOverlayFileSystem, ProjectedFileSystem,
     ProjectedRelativePath,
 };
+pub use js_string::JsString;
 pub use render::{RenderStyle, render};
 pub use source::{LineCol, SourceFile};
 pub use span::Span;

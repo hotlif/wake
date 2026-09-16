@@ -1492,7 +1492,7 @@ fn program_body(program: &TypedProgram) -> Result<ListId, TypedModuleError> {
 
 fn string_value(program: &TypedProgram, node: NodeId) -> Option<&str> {
     match program.node(node)?.data() {
-        IrNodeData::StringLiteral { value } => Some(value),
+        IrNodeData::StringLiteral { value } => value.as_str(),
         IrNodeData::Name { name } => {
             let name = program.name(*name)?;
             (name.syntax() == NameSyntax::String).then(|| name.original())
@@ -4366,7 +4366,7 @@ fn rewrite_native_specifiers(
             IrNodeData::StringLiteral { .. } => program.replace_node_data(
                 node,
                 IrNodeData::StringLiteral {
-                    value: rewrite.to_owned(),
+                    value: rewrite.into(),
                 },
             )?,
             IrNodeData::Name { name } => program.set_emitted_name(*name, rewrite.to_owned())?,
@@ -4729,7 +4729,7 @@ mod tests {
         let parsed = wake_ecma_parser::parse(source, &interner, source_type);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = wake_ecma_semantic::analyze(program);
+            let semantic = wake_ecma_semantic::analyze(program, &interner);
             TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
         })
     }
@@ -4777,7 +4777,7 @@ mod tests {
 
     fn emitted_string(program: &TypedProgram, node: NodeId) -> Option<&str> {
         match program.node(node)?.data() {
-            IrNodeData::StringLiteral { value } => Some(value),
+            IrNodeData::StringLiteral { value } => value.as_str(),
             IrNodeData::Name { name } => {
                 let name = program.name(*name)?;
                 (name.syntax() == NameSyntax::String).then(|| name.emitted())

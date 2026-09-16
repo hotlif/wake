@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 wake_common.workspace = true
 memchr.workspace = true
+unicode-id-start.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

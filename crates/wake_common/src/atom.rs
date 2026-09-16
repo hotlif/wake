@@ -1,15 +1,17 @@
-//! 字符串驻留（Atom）：标识符 / 字符串字面量 / 模块路径统一驻留为 `u32`。
+//! 字符串驻留：UTF-8 文本使用 [`Atom`]，ECMAScript 码元值使用独立的 [`JsAtom`]。
 //!
 //! 比较退化为 `u32 == u32`，跨线程无拷贝——parser 与 bundler 同构设计的第一块基石
 //! （DESIGN §4.1）。分片锁 + `FxHashMap` 降低 Scan 阶段全线程高频写的竞争。
 //!
-//! **正确性纪律（DESIGN §10.3）**：`Atom` 是进程内句柄，**禁止落盘**——
-//! 持久化前必须还原为字符串。因此这里刻意 **不** 为 `Atom` 实现 `Serialize`/`rkyv`。
+//! **正确性纪律（DESIGN §10.3）**：两类句柄都仅在进程内有效，**禁止落盘**——
+//! 持久化前必须还原为无损值。因此这里刻意不为句柄实现 `Serialize`/`rkyv`。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use rustc_hash::FxHashMap;
+
+use crate::JsString;
 
 /// 分片数（2 的幂）。Atom 高 [`SHARD_BITS`] 位编码分片号，低位编码片内序号。
 const SHARD_COUNT: usize = 16;
@@ -23,6 +25,20 @@ static NEXT_INTERNER_ID: AtomicU64 = AtomicU64::new(1);
 /// 仅在同一个 [`Interner`] 内有意义；跨 interner / 跨进程无效。
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Atom(u32);
+
+/// Interned ECMAScript code-unit value, deliberately distinct from a UTF-8 [`Atom`].
+///
+/// Valid only within its owning [`Interner`]. Like `Atom`, it must never be persisted or
+/// passed to another process; resolve it to its owned value first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JsAtom(Atom);
+
+impl JsAtom {
+    /// Process-local identity for structural hashes, never a persistent content identity.
+    pub fn as_u32(self) -> u32 {
+        self.0.as_u32()
+    }
+}
 
 impl Atom {
     #[inline]
@@ -62,12 +78,20 @@ struct Shard {
     store: Vec<Arc<str>>,
 }
 
+#[derive(Default)]
+struct JsShard {
+    map: FxHashMap<JsString, u32>,
+    store: Vec<JsString>,
+}
+
 /// 字符串驻留表。分片锁，`intern` 无需全局锁；`resolve` 只锁对应分片。
 ///
 /// 通常整个进程共享一个 `Interner`（放进编译上下文里以 `&` 传递）。
 pub struct Interner {
     identity: u64,
     shards: Box<[RwLock<Shard>]>,
+    // Existing UTF-8-only users do not allocate a second table.
+    js_shards: OnceLock<Box<[RwLock<JsShard>]>>,
 }
 
 impl Default for Interner {
@@ -84,7 +108,11 @@ impl Interner {
             .map(|_| RwLock::new(Shard::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Interner { identity, shards }
+        Interner {
+            identity,
+            shards,
+            js_shards: OnceLock::new(),
+        }
     }
 
     /// Process-local identity used to prevent `Atom` values from being resolved by another table.
@@ -135,6 +163,53 @@ impl Interner {
     pub fn with_resolved<R>(&self, atom: Atom, f: impl FnOnce(&str) -> R) -> R {
         let shard = self.shards[atom.shard()].read().unwrap();
         f(shard.store[atom.index() as usize].as_ref())
+    }
+
+    /// Intern an exact ECMAScript value, including isolated UTF-16 surrogates.
+    /// UTF-8 `Atom` identities are kept in a separate table and cannot be mixed with these IDs.
+    pub fn intern_js(&self, value: impl Into<JsString>) -> JsAtom {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let value = value.into();
+        let hash = BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(&value);
+        let shard_idx = (hash as usize) & (SHARD_COUNT - 1);
+        let shards = self.js_shards.get_or_init(|| {
+            (0..SHARD_COUNT)
+                .map(|_| RwLock::new(JsShard::default()))
+                .collect()
+        });
+        {
+            let shard = shards[shard_idx].read().unwrap();
+            if let Some(&index) = shard.map.get(&value) {
+                return JsAtom(Atom::encode(shard_idx, index));
+            }
+        }
+        let mut shard = shards[shard_idx].write().unwrap();
+        if let Some(&index) = shard.map.get(&value) {
+            return JsAtom(Atom::encode(shard_idx, index));
+        }
+        assert!(
+            shard.store.len() <= INDEX_MASK as usize,
+            "JavaScript string shard exhausted"
+        );
+        let index = shard.store.len() as u32;
+        shard.store.push(value.clone());
+        shard.map.insert(value.clone(), index);
+        JsAtom(Atom::encode(shard_idx, index))
+    }
+
+    /// Resolve a string value by sharing immutable storage; no code units are copied or lost.
+    pub fn resolve_js(&self, atom: JsAtom) -> JsString {
+        let shards = self
+            .js_shards
+            .get()
+            .expect("JsAtom belongs to another interner");
+        let shard = shards[atom.0.shard()].read().unwrap();
+        shard.store[atom.0.index() as usize].clone()
+    }
+
+    /// Convert an identifier/source-text atom into an equal runtime string value.
+    pub fn intern_js_from_atom(&self, atom: Atom) -> JsAtom {
+        self.with_resolved(atom, |text| self.intern_js(text))
     }
 }
 

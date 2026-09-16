@@ -486,7 +486,7 @@ pub(crate) fn optimize_owned_program(
     let (owned, export_bindings) = if let Some(owned) = semantic_free {
         (owned, Vec::new())
     } else {
-        let semantic = analyze(program);
+        let semantic = analyze(program, interner);
         let export_bindings = collect_export_symbol_bindings(program, interner, &semantic);
         let lowering_plan = pre_lower_export_function_elision(
             program,
@@ -822,7 +822,7 @@ mod tests {
         let mut input = OptimizeInput::new(source);
         configure(&mut input);
         parsed.module.with_ast(|program| {
-            let semantic = analyze(program);
+            let semantic = analyze(program, &interner);
             let bindings = collect_export_symbol_bindings(program, &interner, &semantic);
             let plan =
                 pre_lower_export_function_elision(program, &interner, &semantic, &bindings, &input);
@@ -1187,7 +1187,7 @@ mod tests {
         let parsed = parse(source, &interner, SourceType::Module);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         parsed.module.with_ast(|program| {
-            let semantic = analyze(program);
+            let semantic = analyze(program, &interner);
             let bindings = collect_export_symbol_bindings(program, &interner, &semantic);
             let mut input = OptimizeInput::new(source);
             input.set_bundled_commonjs(true);
@@ -1260,7 +1260,7 @@ mod tests {
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
 
         parsed.module.with_ast(|program| {
-            let semantic = analyze(program);
+            let semantic = analyze(program, &interner);
             let bindings = collect_export_symbol_bindings(program, &interner, &semantic);
             let answer = bindings
                 .iter()

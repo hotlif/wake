@@ -105,7 +105,9 @@ pub struct DeclarationRenderRequest<'a> {
     pub owner: &'a str,
     pub module_source: &'a Path,
     pub output_file: &'a Path,
-    pub specifier: &'a str,
+    /// Parser-owned request, including its lossless value and original quoted source range.
+    /// Returning no replacement preserves the original quoted spelling.
+    pub source_request: &'a DeclarationRequestFact,
     pub role: DeclarationRequestRole,
     pub resolved_source: Option<&'a Path>,
     pub resolved_output: Option<&'a Path>,
@@ -312,7 +314,7 @@ impl FrozenDeclarationGraph {
                             owner: &entry.entry.owner,
                             module_source: source,
                             output_file,
-                            specifier: request.specifier(),
+                            source_request: request,
                             role: request.role(),
                             resolved_source: frozen.resolved_source.as_deref(),
                             resolved_output: resolved_output.map(PathBuf::as_path),
@@ -497,12 +499,18 @@ pub fn prepare_library_declarations_with_file_system(
                     let mut item_requests = Vec::with_capacity(item.requests().len());
                     let mut include_item = true;
                     for request in item.requests() {
-                        let resolved_source = if request.specifier().starts_with('.') {
+                        let resolved_source = if request.specifier().code_units().next()
+                            == Some(u16::from(b'.'))
+                        {
+                            let specifier = request.specifier().as_str().ok_or_else(|| ApiError::InvalidSource(
+                                path.clone(),
+                                "local declaration module specifier contains isolated UTF-16 surrogates unsupported by the UTF-8 filesystem".into(),
+                            ))?;
                             let target = if runtime_side_effect {
                                 match resolve_optional_local_declaration_import(
                                     file_system,
                                     &path,
-                                    request.specifier(),
+                                    specifier,
                                 )? {
                                     Some(target) => target,
                                     None => {
@@ -514,7 +522,7 @@ pub fn prepare_library_declarations_with_file_system(
                                 resolve_required_local_declaration_import(
                                     file_system,
                                     &path,
-                                    request.specifier(),
+                                    specifier,
                                 )?
                             };
                             if !target.starts_with(&root) {
@@ -522,7 +530,7 @@ pub fn prepare_library_declarations_with_file_system(
                                     path.clone(),
                                     format!(
                                         "local declaration dependency `{}` escapes the project root",
-                                        request.specifier()
+                                        specifier
                                     ),
                                 ));
                             }
@@ -2812,6 +2820,55 @@ mod tests {
                 .code
                 .contains("import('@scope/雪\\'\\\\module').Value")
         );
+    }
+
+    #[test]
+    fn surrogate_external_type_requests_keep_original_templates_and_can_be_rewritten() {
+        let root = fixture(&[(
+            "src/index.ts",
+            r#"export type T = import('pkg\ud800').T; export type U = import('pkg\ud801').U;"#,
+        )]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let graph = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("utf16", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap();
+        let calls = file_system.calls();
+        let rendered = graph.render_entry("utf16").unwrap();
+        assert!(rendered.files[0].code.contains(r"pkg\ud800"));
+        assert!(rendered.files[0].code.contains(r"pkg\ud801"));
+        let mut count = 0;
+        let rewritten = graph
+            .render_entry_with("utf16", |request| {
+                assert!(request.resolved_source.is_none());
+                assert_eq!(
+                    request.source_request.specifier().code_units().last(),
+                    Some(0xd800 + count)
+                );
+                count += 1;
+                Some(format!("rewritten:{count}"))
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(rewritten.files[0].code.contains("rewritten:1"));
+        assert!(rewritten.files[0].code.contains("rewritten:2"));
+        assert_eq!(file_system.calls(), calls);
+    }
+
+    #[test]
+    fn surrogate_relative_type_request_fails_before_filesystem_path_probes() {
+        let root = fixture(&[("src/index.ts", r#"export type T = import('./\ud800').T;"#)]);
+        let file_system = CountingDeclarationFileSystem::default();
+        let error = prepare_library_declarations_with_file_system(
+            &root,
+            [DeclarationEntry::new("utf16", "src/index.ts")],
+            &file_system,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("UTF-16"), "{error}");
+        assert!(file_system.calls().is_file.is_empty());
     }
 
     #[test]
