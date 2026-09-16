@@ -8,10 +8,12 @@ import {
   buildDocs,
   bundle,
   createTestContext,
+  createLintContext,
   generateFederationLock,
   generateCssToken,
   generateDocgen,
   initializeFederation,
+  lint,
   runTests,
   startDevServer,
   startDocsDevServer,
@@ -28,6 +30,7 @@ import {
   formatBanner,
   formatBuildResult,
   formatError,
+  formatDiagnostic,
   formatFinalSummary,
   formatGeneratorResult,
   formatServerReady,
@@ -55,6 +58,9 @@ Usage:
   wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
   wake parse <file> [--format auto|human|json]
   wake tokenize <file> [--format auto|human|json]
+  wake lint [paths...] [--root DIR] [--format auto|human|json] [--watch]
+    [--print-config FILE] [--rule ID=LEVEL|JSON ...] [--global NAME=readonly|writable|off ...] [--env browser|node ...] [--list-rules] [--cache]
+            [--stdin --stdin-filename FILE] [--max-warnings COUNT] [--fix | --fix-dry-run]
   wake test [patterns...] [--root DIR] [--name-pattern TEXT] [--project NAME]
             [--environment auto|dom|browser] [--watch] [--changed] [--related PATH...]
             [--coverage] [--update-snapshots] [--serial] [--workers COUNT]
@@ -66,7 +72,7 @@ Usage:
 Options:
   --ui MODE   Terminal UI mode for long-running commands (default: auto)
   --no-color  Disable terminal colors; also honors NO_COLOR
-  --format    Human or JSON output for parse/tokenize (default: auto)
+  --format    Human or JSON output for parse/tokenize/lint (default: auto)
 `
 
 function takeOption(args, name, usage = false) {
@@ -441,6 +447,48 @@ async function runServer(factory, options, command, root, ui, uiMode) {
   }
 }
 
+function printLintHuman(result, preview = false) {
+  const plain = createUi(false)
+  for (const file of result.files) {
+    for (const diagnostic of file.diagnostics) printLines(formatDiagnostic(plain, diagnostic), console.log)
+    if (preview && file.output !== undefined) console.log(`=== ${file.path} (fixed preview) ===\n${file.output}`)
+    else if (file.written) console.log(`Fixed ${file.path}`)
+  }
+  for (const warning of result.cache?.warnings ?? []) console.log(`Cache: ${warning}`)
+  if (result.baseline) {
+    const b = result.baseline
+    console.log(`Baseline ${b.path}: ${b.suppressed} suppressed, ${b.stale} stale, ${b.ambiguous} ambiguous, ${b.entries} entries${b.written ? ', written' : ''}`)
+  }
+  console.log(`${result.errorCount} errors, ${result.warningCount} warnings`)
+}
+
+async function runLintWatch(options, format) {
+  let context, finish
+  const stopped = new Promise((resolve) => { finish = resolve })
+  const onSigint = () => finish(130)
+  const onSigterm = () => finish(143)
+  process.once('SIGINT', onSigint)
+  process.once('SIGTERM', onSigterm)
+  const report = (event) => {
+    if (format === 'json') console.log(JSON.stringify({ schema: 'wake.lint.watch.v1', event }))
+    else if (event.type === 'checked') printLintHuman(event.snapshot.result)
+    else if (event.type === 'diagnostic') console.error(`wake: ${event.error.code}: ${event.error.message}`)
+    else console.log('Checking...')
+  }
+  try {
+    context = await createLintContext(options)
+    context.on('checkStart', (event) => report({ type: 'checkStart', ...event }))
+    context.on('checked', (snapshot) => report({ type: 'checked', snapshot }))
+    context.on('diagnostic', (event) => report({ type: 'diagnostic', ...event }))
+    context.on('closed', () => finish(0))
+    return await stopped
+  } finally {
+    process.off('SIGINT', onSigint)
+    process.off('SIGTERM', onSigterm)
+    await context?.close()
+  }
+}
+
 async function runTestCommand(args) {
   try {
     const root = takeOption(args, '--root', true)
@@ -684,6 +732,77 @@ export async function runCli(argv = process.argv.slice(2)) {
   }
 
   const command = args.shift()
+  if (command === 'lint') {
+    try {
+      ensureStaticMode(uiMode)
+      const root = takeOption(args, '--root', true)
+      const format = resolveFormat(takeOption(args, '--format', true))
+      const stdin = takeFlag(args, '--stdin')
+      const filename = takeOption(args, '--stdin-filename', true)
+      const limit = takeOption(args, '--max-warnings', true)
+      const writeFix = takeFlag(args, '--fix')
+      const dryRun = takeFlag(args, '--fix-dry-run')
+      const printConfig = takeOption(args, '--print-config', true)
+      const listRules = takeFlag(args, '--list-rules')
+      const cache = takeFlag(args, '--cache')
+      const watch = takeFlag(args, '--watch')
+      const baselineModes = [
+        ['check', takeOption(args, '--baseline', true)],
+        ['generate', takeOption(args, '--generate-baseline', true)],
+        ['prune', takeOption(args, '--prune-baseline', true)],
+      ].filter(([, path]) => path !== undefined)
+      if (baselineModes.length > 1) throw usageError('baseline modes are mutually exclusive')
+      const baseline = baselineModes.length ? { mode: baselineModes[0][0], path: baselineModes[0][1] } : undefined
+      const rules = Object.fromEntries(takeOptions(args, '--rule', true).map((value) => {
+        const separator = value.indexOf('=')
+        if (separator <= 0) throw usageError('--rule requires id=level or id=JSON')
+        const id = value.slice(0, separator)
+        const setting = value.slice(separator + 1)
+        return [id, ['off', 'warn', 'error'].includes(setting) ? setting : JSON.parse(setting)]
+      }))
+      const globals = Object.fromEntries(takeOptions(args, '--global', true).map((value) => {
+        const separator = value.indexOf('=')
+        if (separator <= 0) throw usageError('--global requires name=readonly|writable|off')
+        return [value.slice(0, separator), value.slice(separator + 1)]
+      }))
+      const environments = takeOptions(args, '--env', true)
+      if (writeFix && (dryRun || stdin)) throw usageError('--fix cannot be combined with --fix-dry-run or --stdin')
+      const fix = writeFix ? 'write' : dryRun ? 'dry-run' : 'off'
+      const maxWarnings = limit === undefined ? undefined : Number(limit)
+      if (limit !== undefined && (!/^[0-9]+$/.test(limit) || !Number.isSafeInteger(maxWarnings))) {
+        throw usageError('--max-warnings requires a non-negative integer')
+      }
+      if (args.some((arg) => arg.startsWith('-'))) {
+        throw usageError(`unknown lint arguments: ${args.join(' ')}`)
+      }
+      if (stdin !== (filename !== undefined) || (stdin && args.length > 0)) {
+        throw usageError('--stdin requires --stdin-filename and cannot be combined with paths')
+      }
+      if (printConfig !== undefined && (cache || stdin || args.length > 0 || writeFix || dryRun || limit !== undefined)) {
+        throw usageError('--print-config cannot be combined with paths, stdin, fix modes, max-warnings or cache')
+      }
+      if (listRules && (cache || stdin || args.length > 0 || printConfig !== undefined || Object.keys(rules).length > 0 || Object.keys(globals).length > 0 || environments.length > 0 || limit !== undefined || writeFix || dryRun)) {
+        throw usageError('--list-rules cannot be combined with analysis, configuration overrides, or fix modes')
+      }
+      if (baseline && (printConfig !== undefined || listRules)) throw usageError('baseline cannot be combined with --print-config or --list-rules')
+      if (baseline && baseline.mode !== 'check' && (stdin || writeFix || dryRun || limit !== undefined)) throw usageError('baseline generation/pruning cannot be combined with stdin, fixes or max-warnings')
+      if (baseline?.mode === 'prune' && args.length) throw usageError('baseline pruning requires the complete project')
+      if (watch) {
+        if (stdin || writeFix || dryRun || printConfig !== undefined || listRules || (baseline && baseline.mode !== 'check')) throw usageError('--watch only supports read-only project checks')
+        return await runLintWatch({ root, paths: args, maxWarnings, cache, baseline, rules, globals, environments, watch: true }, format)
+      }
+      const result = await lint({ root, paths: args, maxWarnings, fix, printConfig, listRules, cache, baseline, rules, globals, environments,
+        stdin: stdin ? { filename, text: readFileSync(0, 'utf8') } : undefined })
+      if (printConfig !== undefined || listRules || format === 'json') console.log(JSON.stringify(result, null, 2))
+      else printLintHuman(result, dryRun)
+      return result.exitCode
+    } catch (error) {
+      const wrapped = error instanceof WakeError && error.code !== 'WAKE_CONFIG'
+        ? error : new WakeError('WAKE_LINT_CONFIG', error.message)
+      wrapped.exitCode = 2
+      throw wrapped
+    }
+  }
   if (command === 'test') {
     if (takeFlag(args, '--help') || takeFlag(args, '-h')) {
       console.log(HELP)

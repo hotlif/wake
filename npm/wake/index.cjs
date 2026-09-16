@@ -243,6 +243,45 @@ async function generateDocgen(options) {
   return invoke(native.generateDocgen(JSON.stringify(value), signal))
 }
 
+function validateLintSignal(signal) {
+  if (signal !== undefined && (typeof signal?.addEventListener !== 'function' || typeof signal?.removeEventListener !== 'function' || typeof signal?.aborted !== 'boolean')) {
+    throw new WakeError('WAKE_LINT_CONFIG', 'signal must be an AbortSignal')
+  }
+}
+
+async function lint(options) {
+  let value, signal
+  try {
+    ;[value, signal] = splitOptions(options)
+  } catch (error) {
+    if (error instanceof WakeError && error.code === 'WAKE_CONFIG') {
+      throw new WakeError('WAKE_LINT_CONFIG', error.message, { cause: error })
+    }
+    throw error
+  }
+  validateLintSignal(signal)
+  let task
+  try { task = native.lint(JSON.stringify(value)) } catch (error) { throw fromNativeError(error) }
+  const cancel = () => task.cancel()
+  signal?.addEventListener('abort', cancel, { once: true })
+  try {
+    for (;;) {
+      let response
+      try { response = task.poll() } catch (error) { throw fromNativeError(error) }
+      if (response !== undefined && response !== null) {
+        const result = await invoke(response)
+        if (signal?.aborted) throw new WakeError('WAKE_CANCELLED', 'Wake operation was cancelled')
+        return result
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  } finally {
+    signal?.removeEventListener('abort', cancel)
+    task.cancel()
+    while (!task.pollClosed()) await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 async function initializeFederation(options) {
   const [value, signal] = splitOptions(options)
   return invoke(native.initializeFederation(JSON.stringify(value), signal))
@@ -251,6 +290,123 @@ async function initializeFederation(options) {
 async function generateFederationLock(options) {
   const [value, signal] = splitOptions(options)
   return invoke(native.generateFederationLock(JSON.stringify(value), signal))
+}
+
+class LintContext extends EventEmitter {
+  #native
+  #closePromise
+  #watchTimer
+  #stopWatchPromise
+
+  constructor(handle, token) {
+    super()
+    assertInternalContextConstructor(token, 'LintContext', 'createLintContext')
+    this.#native = handle
+    if (handle.watching) this.#startWatchPoll()
+  }
+
+  get closed() { return Boolean(this.#closePromise) || this.#native.closed }
+  get generation() { return this.#native.generation }
+  get watching() { return !this.closed && this.#native.watching }
+
+  startWatch() {
+    if (this.#stopWatchPromise) throw new WakeError('WAKE_LINT_WATCH', 'Previous lint watcher is still stopping')
+    try { this.#native.startWatch() } catch (error) { throw fromNativeError(error) }
+    this.#startWatchPoll()
+    return this
+  }
+
+  stopWatch() {
+    if (this.#stopWatchPromise) return this.#stopWatchPromise
+    this.#stopWatchPoll()
+    this.#native.stopWatch()
+    this.#stopWatchPromise = (async () => {
+      try {
+        await Promise.resolve()
+        while (!this.#native.pollWatchStopped()) await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      finally { this.#stopWatchPromise = undefined }
+    })()
+    return this.#stopWatchPromise
+  }
+
+  #startWatchPoll() {
+    if (this.#watchTimer) return
+    this.#watchTimer = setInterval(() => {
+      const events = JSON.parse(this.#native.pollWatch())
+      for (const event of events) {
+        const generation = event.type === 'checked' ? event.snapshot.generation : event.generation
+        if (this.closed || generation !== this.generation) continue
+        if (event.type === 'checked') this.emit('checked', event.snapshot)
+        else if (event.type === 'checkStart') this.emit('checkStart', { generation })
+        else this.emit('diagnostic', { generation, error: event.error })
+      }
+    }, 30)
+  }
+
+  #stopWatchPoll() { if (this.#watchTimer) { clearInterval(this.#watchTimer); this.#watchTimer = undefined } }
+  unref() { this.#watchTimer?.unref?.(); return this }
+
+  updateDocument(document) {
+    try { this.#native.updateDocument(JSON.stringify(document)) } catch (error) { throw fromNativeError(error) }
+  }
+
+  closeDocument(filename, version) {
+    try { this.#native.closeDocument(JSON.stringify({ filename, version })) } catch (error) { throw fromNativeError(error) }
+  }
+
+  invalidate() {
+    try { return this.#native.invalidate() } catch (error) { throw fromNativeError(error) }
+  }
+
+  async check(options) {
+    if (this.closed) throw new WakeError('WAKE_INTERNAL', 'LintContext has already been closed')
+    const [value, signal] = splitOptions(options)
+    if (Object.keys(value).length) throw new WakeError('WAKE_LINT_CONFIG', 'LintContext.check only accepts signal')
+    validateLintSignal(signal)
+    let generation
+    try { generation = this.#native.startCheck() } catch (error) { throw fromNativeError(error) }
+    const cancel = () => { this.#native.cancelCheck(generation) }
+    signal?.addEventListener('abort', cancel, { once: true })
+    try {
+      for (;;) {
+        let response
+        try { response = this.#native.pollCheck(generation) } catch (error) { throw fromNativeError(error) }
+        if (response !== undefined && response !== null) {
+          let snapshot
+          try { snapshot = await invoke(response) } catch (error) {
+            if (this.closed || generation !== this.generation) throw new WakeError('WAKE_CANCELLED', 'Lint snapshot was superseded')
+            throw error
+          }
+          if (this.closed || snapshot.generation !== this.generation) throw new WakeError('WAKE_CANCELLED', 'Lint snapshot was superseded')
+          return snapshot
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+    } finally { signal?.removeEventListener('abort', cancel) }
+  }
+
+  close() {
+    if (!this.#closePromise) {
+      this.#stopWatchPoll()
+      this.#native.close()
+      this.#closePromise = (async () => {
+        await Promise.resolve()
+        while (!this.#native.pollClosed()) await new Promise((resolve) => setTimeout(resolve, 10))
+        this.emit('closed')
+      })()
+    }
+    return this.#closePromise
+  }
+
+  async [Symbol.asyncDispose]() { await this.close() }
+}
+
+async function createLintContext(options) {
+  const [value, signal] = splitOptions(options)
+  if (signal !== undefined) throw new WakeError('WAKE_LINT_CONFIG', 'Pass cancellation to LintContext.check')
+  try { return new LintContext(native.createLintContext(JSON.stringify(value)), INTERNAL_CONTEXT_CONSTRUCTOR) }
+  catch (error) { throw fromNativeError(error) }
 }
 
 class BuildContext {
@@ -436,6 +592,7 @@ function startDocsDevServer(options) {
 
 module.exports = {
   BuildContext,
+  LintContext,
   DevServer,
   TestContext,
   WakeError,
@@ -443,12 +600,14 @@ module.exports = {
   buildLibrary,
   buildDocs,
   bundle,
+  lint,
   runTests,
   generateCssToken,
   generateDocgen,
   initializeFederation,
   generateFederationLock,
   createBuildContext,
+  createLintContext,
   createTestContext,
   startDevServer,
   startDocsDevServer,

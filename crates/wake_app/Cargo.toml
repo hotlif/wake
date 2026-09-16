@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 wake_common.workspace = true
+wake_lint_core.workspace = true
+wake_cache.workspace = true
+wake_turbo.workspace = true
 wake_config.workspace = true
 wake_scan.workspace = true
 wake_html.workspace = true
@@ -31,10 +34,11 @@ regex.workspace = true
 getrandom.workspace = true
 base64.workspace = true
 ring.workspace = true
+notify.workspace = true
 ureq.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

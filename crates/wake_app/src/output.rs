@@ -12,6 +12,422 @@ use wake_common::FileSystem;
 
 use super::WakeError;
 
+/// Source input captured before analysis. Unlike generated outputs this explicitly owns an
+/// expected old value; it must never be replaced by an empty protected-input set.
+pub(super) struct LintSourceSnapshot {
+    path: PathBuf,
+    physical: PathBuf,
+    identity: same_file::Handle,
+    permissions: std::fs::Permissions,
+    limit: usize,
+    pub(super) text: String,
+}
+
+fn lint_io(path: &Path, error: std::io::Error) -> WakeError {
+    WakeError::new("WAKE_LINT_IO", error.to_string()).at(path)
+}
+
+impl LintSourceSnapshot {
+    pub(super) fn read(path: &Path) -> Result<Self, WakeError> {
+        Self::read_bounded(path, usize::MAX - 1)
+    }
+
+    pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Self, WakeError> {
+        use std::io::Read;
+        let physical = path.canonicalize().map_err(|e| lint_io(path, e))?;
+        if is_output_commit_lock_path(path)
+            || !std::fs::symlink_metadata(path)
+                .map_err(|e| lint_io(path, e))?
+                .file_type()
+                .is_file()
+        {
+            return Err(WakeError::new(
+                "WAKE_LINT_WRITE",
+                "Lint source must be an ordinary non-symlink file",
+            )
+            .at(path));
+        }
+        let mut file = std::fs::File::open(path).map_err(|e| lint_io(path, e))?;
+        let permissions = file.metadata().map_err(|e| lint_io(path, e))?.permissions();
+        let mut text = String::new();
+        std::io::Read::by_ref(&mut file)
+            .take(limit.saturating_add(1) as u64)
+            .read_to_string(&mut text)
+            .map_err(|e| lint_io(path, e))?;
+        if text.len() > limit {
+            return Err(WakeError::new("WAKE_LINT_IO", "Lint input exceeds size limit").at(path));
+        }
+        let identity = same_file::Handle::from_file(file).map_err(|e| lint_io(path, e))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            physical,
+            identity,
+            permissions,
+            limit,
+            text,
+        })
+    }
+
+    fn validate(&self) -> Result<(), WakeError> {
+        let current = Self::read_bounded(&self.path, self.limit).map_err(|_| {
+            WakeError::new(
+                "WAKE_LINT_CONFLICT",
+                "Lint source is no longer the inspected file",
+            )
+            .at(&self.path)
+        })?;
+        if current.permissions.readonly()
+            || lint_link_count(current.identity.as_file()).map_err(|e| lint_io(&self.path, e))? != 1
+        {
+            return Err(WakeError::new(
+                "WAKE_LINT_WRITE",
+                "Refusing to replace a read-only or multiply linked lint source",
+            )
+            .at(&self.path));
+        }
+        if self.physical != current.physical
+            || self.identity != current.identity
+            || self.text != current.text
+            || self.permissions != current.permissions
+        {
+            return Err(WakeError::new(
+                "WAKE_LINT_CONFLICT",
+                "Lint source content, identity or permissions changed after inspection",
+            )
+            .at(&self.path));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn lint_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.nlink())
+}
+
+#[cfg(windows)]
+fn lint_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the live file owns this handle; Windows initializes the complete output on success.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle returned success above.
+    Ok(unsafe { information.assume_init() }.nNumberOfLinks as u64)
+}
+
+pub(super) fn replace_lint_source(
+    snapshot: LintSourceSnapshot,
+    text: &str,
+) -> Result<(), WakeError> {
+    replace_lint_source_with(snapshot, text, || {})
+}
+
+fn replace_lint_source_with(
+    snapshot: LintSourceSnapshot,
+    text: &str,
+    before_commit: impl FnOnce(),
+) -> Result<(), WakeError> {
+    let lock = acquire_output_commit_lock("lint source")?;
+    snapshot.validate()?;
+    for path in lock.lock_paths() {
+        if same_file::is_same_file(path, &snapshot.path).unwrap_or(false) {
+            return Err(WakeError::new(
+                "WAKE_LINT_WRITE",
+                "Lint cannot replace a live Wake publication lock",
+            )
+            .at(&snapshot.path));
+        }
+    }
+    let parent = snapshot.path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".wake-lint-stage-")
+        .tempfile_in(parent)
+        .map_err(|e| lint_io(&snapshot.path, e))?;
+    temporary
+        .write_all(text.as_bytes())
+        .and_then(|()| temporary.flush())
+        .map_err(|e| lint_io(&snapshot.path, e))?;
+    temporary
+        .as_file()
+        .set_permissions(snapshot.permissions.clone())
+        .map_err(|e| {
+            WakeError::new(
+                "WAKE_LINT_IO",
+                format!("Could not preserve source permissions: {e}"),
+            )
+            .at(&snapshot.path)
+        })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|e| lint_io(&snapshot.path, e))?;
+    before_commit();
+    snapshot.validate()?;
+    // Keep the inspected identity alive through the final comparison, then close it before
+    // rename: Windows can reject replacement of an open destination. The OS commit lock remains
+    // held, but external editors do not participate in this optimistic validation protocol.
+    drop(snapshot.identity);
+    temporary.persist(&snapshot.path).map_err(|e| {
+        WakeError::new(
+            "WAKE_LINT_IO",
+            format!("Could not atomically replace lint source: {}", e.error),
+        )
+        .at(&snapshot.path)
+    })?;
+    Ok(())
+}
+
+/// Expected absence plus the inspected parent identity. Publication never clobbers a new occupant.
+pub(super) struct LintNewFileSnapshot {
+    path: PathBuf,
+    parent: PathBuf,
+    physical_parent: PathBuf,
+    identity: same_file::Handle,
+}
+
+impl LintNewFileSnapshot {
+    pub(super) fn read(path: &Path) -> Result<Self, WakeError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| WakeError::new("WAKE_LINT_WRITE", "Missing lint output parent"))?;
+        let snapshot = Self {
+            path: path.into(),
+            parent: parent.into(),
+            physical_parent: parent.canonicalize().map_err(|e| lint_io(path, e))?,
+            identity: same_file::Handle::from_path(parent).map_err(|e| lint_io(path, e))?,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn validate(&self) -> Result<(), WakeError> {
+        let valid_parent = self
+            .parent
+            .canonicalize()
+            .is_ok_and(|path| path == self.physical_parent)
+            && same_file::Handle::from_path(&self.parent)
+                .is_ok_and(|handle| handle == self.identity)
+            && std::fs::symlink_metadata(&self.parent).is_ok_and(|m| m.file_type().is_dir());
+        if !valid_parent || is_output_commit_lock_path(&self.path) {
+            return Err(WakeError::new(
+                "WAKE_LINT_CONFLICT",
+                "Lint output parent changed or is not an ordinary directory",
+            )
+            .at(&self.path));
+        }
+        match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(WakeError::new(
+                "WAKE_LINT_CONFLICT",
+                "Lint output was created concurrently or already exists",
+            )
+            .at(&self.path)),
+        }
+    }
+}
+
+pub(super) fn create_lint_file(snapshot: LintNewFileSnapshot, text: &str) -> Result<(), WakeError> {
+    create_lint_file_with(snapshot, text, || {})
+}
+
+fn create_lint_file_with(
+    snapshot: LintNewFileSnapshot,
+    text: &str,
+    before_commit: impl FnOnce(),
+) -> Result<(), WakeError> {
+    let _lock = acquire_output_commit_lock("lint baseline")?;
+    snapshot.validate()?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".wake-lint-stage-")
+        .tempfile_in(&snapshot.parent)
+        .map_err(|e| lint_io(&snapshot.path, e))?;
+    temporary
+        .write_all(text.as_bytes())
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| lint_io(&snapshot.path, e))?;
+    before_commit();
+    snapshot.validate()?;
+    temporary
+        .persist_noclobber(&snapshot.path)
+        .map_err(|error| {
+            WakeError::new(
+                "WAKE_LINT_CONFLICT",
+                format!(
+                    "Could not create lint output without replacing another file: {}",
+                    error.error
+                ),
+            )
+            .at(&snapshot.path)
+        })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod lint_source_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn new_lint_artifacts_never_overwrite_concurrent_files_and_clean_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("baseline.json");
+        let snapshot = LintNewFileSnapshot::read(&path).unwrap();
+        let error = create_lint_file_with(snapshot, "candidate", || {
+            fs::write(&path, "concurrent").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "WAKE_LINT_CONFLICT");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(LintNewFileSnapshot::read(&path).is_err());
+        let path = root.path().join("new.json");
+        create_lint_file(LintNewFileSnapshot::read(&path).unwrap(), "new").unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[test]
+    fn bounded_lint_snapshot_rejects_oversized_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("baseline.json");
+        fs::write(&path, "12345").unwrap();
+        assert!(LintSourceSnapshot::read_bounded(&path, 4).is_err());
+        assert_eq!(
+            LintSourceSnapshot::read_bounded(&path, 5).unwrap().text,
+            "12345"
+        );
+    }
+
+    #[test]
+    fn lint_source_replacement_waits_for_the_shared_publication_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.js");
+        fs::write(&path, "original").unwrap();
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        let lock = acquire_output_commit_lock("lint lock test").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(replace_lint_source(snapshot, "new")).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        drop(lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lint_replacement_preserves_unix_mode_and_rejects_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.js");
+        fs::write(&path, "original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+        replace_lint_source(LintSourceSnapshot::read(&path).unwrap(), "new").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        let alias = root.path().join("alias.js");
+        symlink(&path, &alias).unwrap();
+        assert!(LintSourceSnapshot::read(&alias).is_err());
+    }
+
+    #[test]
+    fn lint_replacement_checks_content_identity_and_permission_before_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.jsx");
+        fs::write(&path, "<C></C>").unwrap();
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        fs::write(&path, "// editor changed").unwrap();
+        assert_eq!(
+            replace_lint_source(snapshot, "<C/>").unwrap_err().code,
+            "WAKE_LINT_CONFLICT"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "// editor changed");
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        fs::rename(&path, root.path().join("previous.jsx")).unwrap();
+        fs::write(&path, "// editor changed").unwrap();
+        assert_eq!(
+            replace_lint_source(snapshot, "new").unwrap_err().code,
+            "WAKE_LINT_CONFLICT"
+        );
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        assert_eq!(
+            replace_lint_source(snapshot, "new").unwrap_err().code,
+            "WAKE_LINT_WRITE"
+        );
+        fs::set_permissions(&path, original).unwrap();
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        replace_lint_source(snapshot, "<C/>\r\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "<C/>\r\n");
+    }
+
+    #[test]
+    fn lint_replacement_rechecks_after_staging_and_rejects_hardlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.js");
+        fs::write(&path, "original").unwrap();
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        let error = replace_lint_source_with(snapshot, "candidate", || {
+            fs::write(&path, "editor").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "WAKE_LINT_CONFLICT");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "editor");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        fs::hard_link(&path, root.path().join("alias.js")).unwrap();
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        assert_eq!(
+            replace_lint_source(snapshot, "candidate").unwrap_err().code,
+            "WAKE_LINT_WRITE"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("alias.js")).unwrap(),
+            "editor"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn lint_locked_destination_keeps_original_and_cleans_staging() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.js");
+        fs::write(&path, "original").unwrap();
+        let snapshot = LintSourceSnapshot::read(&path).unwrap();
+        let _locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(replace_lint_source(snapshot, "candidate").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+}
+
 /// One exact-file publication.
 pub(super) struct ExactOutput<'a> {
     path: &'a Path,

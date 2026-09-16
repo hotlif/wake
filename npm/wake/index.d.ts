@@ -23,6 +23,13 @@ export type WakeErrorCode =
   | 'WAKE_LIBRARY_BUILD'
   | 'WAKE_LIBRARY_TYPE'
   | 'WAKE_LIBRARY_OUTPUT'
+  | 'WAKE_LINT_CONFIG'
+  | 'WAKE_LINT_ANALYSIS'
+  | 'WAKE_LINT_IO'
+  | 'WAKE_LINT_FIX'
+  | 'WAKE_LINT_CONFLICT'
+  | 'WAKE_LINT_WRITE'
+  | 'WAKE_LINT_WATCH'
   | 'WAKE_TEST_CONFIG'
   | 'WAKE_TEST_DISCOVERY'
   | 'WAKE_TEST_RUNTIME'
@@ -681,6 +688,125 @@ export class DevServer extends EventEmitter {
 }
 
 export function version(): string
+export interface LintOptions {
+  /** Explain this virtual filename without reading its source. Conflicts with analysis/fix selection. */
+  printConfig?: string
+  /** List native rule metadata without reading source files or project configuration. */
+  listRules?: boolean
+  /** Cache read-only disk-file diagnostics; stdin and fix modes bypass persistence. */
+  cache?: boolean
+  baseline?: { path: string; mode?: 'check' | 'generate' | 'prune' }
+  rules?: Record<string, LintRuleSetting>
+  globals?: Record<string, LintGlobalMode>
+  /** Enable versioned built-in browser and/or Node global sets. */
+  environments?: Array<'browser' | 'node'>
+  fix?: 'off' | 'dry-run' | 'write'
+  root?: string
+  paths?: string[]
+  stdin?: { filename: string; text: string }
+  maxWarnings?: number
+  signal?: AbortSignal
+}
+
+export interface LintResult {
+  baseline?: { path: string; suppressed: number; stale: number; ambiguous: number; entries: number; written: boolean }
+  config?: LintEffectiveConfig
+  catalog?: LintRuleCatalog
+  cache?: { hits: number; misses: number; writes: number; bypassed: number; warnings: string[] }
+  files: Array<{
+    path: string
+    diagnostics: LintDiagnostic[]
+    changed: boolean
+    written: boolean
+    fixPasses: number
+    output?: string
+  }>
+  errorCount: number
+  warningCount: number
+  exitCode: 0 | 1
+}
+
+export type LintRuleLevel = 'off' | 'warn' | 'error'
+export type LintGlobalMode = 'readonly' | 'writable' | 'off'
+export interface LintRuleCatalog {
+  schema: 'wake.lint.rules.v1'
+  pipelineVersion: string
+  rules: LintRuleInfo[]
+}
+export interface LintRuleInfo {
+  id: string
+  description: string
+  category: 'problem' | 'suggestion' | 'layout'
+  languages: Array<'js' | 'jsx' | 'ts' | 'tsx'>
+  defaultLevel: LintRuleLevel
+  analysis: 'syntax' | 'scope' | 'control-flow' | 'scope-control-flow' | 'module-graph' | 'type-information'
+  optionsSchema: { type: 'object'; additionalProperties: false; properties: Record<string,
+    { type: 'boolean'; default: boolean } | { type: 'string'; default: string; enum: string[] } |
+    { type: 'integer'; default: number; minimum: number; maximum: number } |
+    { type: 'string'; default: string; format: 'rust-regex'; maxLength: number } |
+    { type: 'array'; default: string[]; maxItems: number; minItems?: number; uniqueItems?: boolean;
+      items: { type: 'string'; enum: string[] } | { type: 'string'; format: 'rust-regex'; maxLength: number } } |
+    { type: 'array'; default: LintPathZone[]; maxItems: number; items: {
+      type: 'object'; additionalProperties: false; required: Array<'from' | 'to'>; properties: {
+        from: { type: 'string'; format: 'rust-regex'; maxLength: number };
+        to: { type: 'string'; format: 'rust-regex'; maxLength: number };
+        except: { type: 'array'; maxItems: number; items: { type: 'string'; format: 'rust-regex'; maxLength: number } };
+        message: { type: 'string'; maxLength: number }
+      }
+    } }> }
+  messageIds: string[]
+  documentation: string
+  fixable: boolean
+}
+export interface LintPathZone { from: string; to: string; except?: string[]; message?: string }
+export type LintRuleSetting = LintRuleLevel | { level: LintRuleLevel; options?: Record<string, unknown> }
+export interface LintEffectiveConfig {
+  schema: 'wake.lint.config.v1'
+  pipelineVersion: string
+  path: string
+  language: 'module' | 'script' | 'typescript' | 'jsx' | 'tsx'
+  processor?: 'markdown'
+  ignored: boolean
+  reportUnusedDisable: LintRuleLevel
+  rules: Record<string, { level: LintRuleLevel; options: Record<string, unknown>; source: string }>
+  globals: Record<string, { mode: LintGlobalMode; source: string }>
+  environments: Array<'browser' | 'node'>
+  types?: { compiler: string; projects: string[] }
+}
+
+export interface LintDiagnostic extends Diagnostic {
+  messageId?: string
+  fix?: { edits: Array<{ start: number; end: number; text: string }> }
+}
+
+export function lint(options?: LintOptions): Promise<LintResult>
+export type LintContextOptions = Pick<LintOptions, 'root' | 'paths' | 'rules' | 'globals' | 'environments' | 'maxWarnings' | 'cache'> & {
+  baseline?: { path: string; mode?: 'check' }
+  watch?: boolean
+}
+export interface LintDocument { filename: string; version: number; text: string }
+export interface LintSnapshot { generation: number; documents: Record<string, number>; result: LintResult }
+export interface LintWatchDiagnostic { generation: number; error: Pick<WakeError, 'code' | 'message' | 'path' | 'diagnostics'> }
+export class LintContext extends EventEmitter {
+  private constructor()
+  readonly closed: boolean
+  readonly generation: number
+  readonly watching: boolean
+  startWatch(): this
+  stopWatch(): Promise<void>
+  unref(): this
+  on(event: 'checkStart', listener: (event: { generation: number }) => void): this
+  on(event: 'checked', listener: (snapshot: LintSnapshot) => void): this
+  on(event: 'diagnostic', listener: (event: LintWatchDiagnostic) => void): this
+  on(event: 'closed', listener: () => void): this
+  updateDocument(document: LintDocument): void
+  closeDocument(filename: string, version: number): void
+  invalidate(): number
+  check(options?: { signal?: AbortSignal }): Promise<LintSnapshot>
+  close(): Promise<void>
+  [Symbol.asyncDispose](): Promise<void>
+}
+export function createLintContext(options?: LintContextOptions): Promise<LintContext>
 export function bundle(options?: BundleOptions): Promise<BundleResult>
 export function build(options?: BuildOptions): Promise<BuildResult>
 export function buildLibrary(options?: LibraryBuildOptions): Promise<LibraryBuildResult>
@@ -697,6 +823,7 @@ export function startDocsDevServer(options?: DocsDevServerOptions): Promise<DevS
 
 declare const wake: {
   BuildContext: typeof BuildContext
+  LintContext: typeof LintContext
   DevServer: typeof DevServer
   TestContext: typeof TestContext
   WakeError: typeof WakeError
@@ -704,11 +831,13 @@ declare const wake: {
   buildLibrary: typeof buildLibrary
   buildDocs: typeof buildDocs
   bundle: typeof bundle
+  lint: typeof lint
   generateCssToken: typeof generateCssToken
   generateDocgen: typeof generateDocgen
   initializeFederation: typeof initializeFederation
   generateFederationLock: typeof generateFederationLock
   createBuildContext: typeof createBuildContext
+  createLintContext: typeof createLintContext
   runTests: typeof runTests
   createTestContext: typeof createTestContext
   startDevServer: typeof startDevServer

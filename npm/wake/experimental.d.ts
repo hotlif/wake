@@ -40,6 +40,7 @@ export interface SemanticScope {
 export interface SemanticSymbol {
   id: number
   name: string
+  /** Implicit `arguments` and Annex B `var` bindings have start/end 0 and no source declaration. */
   declarationKind: string
   scope: number
   start: number

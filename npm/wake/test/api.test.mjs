@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -45,6 +45,261 @@ const packageVersion = JSON.parse(
 ).version
 const contexts = []
 
+test('native lint module graphs share catalog source overlays cache bypass and failures', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-lint-modules-'))
+  let context
+  try {
+    await writeFile(join(root, 'a.ts'), "import './b';")
+    await writeFile(join(root, 'b.ts'), "import './a';")
+    const rules = { 'import/no-cycle': 'error', 'import/no-unresolved': 'error' }
+    const options = { root, paths: ['a.ts'], rules, cache: true }
+    const catalog = (await esmApi.lint({ listRules: true })).catalog.rules.filter(rule => rule.analysis === 'module-graph')
+    assert.equal(catalog.length, 6)
+    assert.ok(catalog.every(rule => rule.defaultLevel === 'off' && !rule.fixable))
+    assert.equal(catalog.find(rule => rule.id === 'import/order').optionsSchema.properties.groups.type, 'array')
+    const result = await esmApi.lint(options)
+    assert.equal(result.errorCount, 1)
+    assert.equal(result.files[0].diagnostics[0].messageId, 'cycle')
+    assert.deepEqual(result.cache, { hits: 0, misses: 0, writes: 0, bypassed: 1, warnings: [] })
+    assert.deepEqual(await commonjs.lint(options), result)
+    context = await esmApi.createLintContext(options)
+    await context.updateDocument({ filename: 'b.ts', version: 1, text: 'export {};' })
+    assert.equal((await context.check()).result.errorCount, 0)
+    assert.equal(await readFile(join(root, 'b.ts'), 'utf8'), "import './a';")
+    const stdin = await esmApi.lint({ root, rules, stdin: { filename: 'a.ts', text: 'export {};' } })
+    assert.equal(stdin.errorCount, 0)
+    await writeFile(join(root, '.pnp.cjs'), 'broken')
+    await assert.rejects(esmApi.lint(options), { code: 'WAKE_LINT_ANALYSIS' })
+    await assert.rejects(context.check(), { code: 'WAKE_LINT_ANALYSIS' })
+  } finally {
+    await context?.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('native lint type service shares config, final fixes and unsaved dependency facts', async () => {
+  const parent = join(dirname(fileURLToPath(import.meta.url)), '../../../.tmp/lint-validation')
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, 'typed-addon-'))
+  let context
+  try {
+    await writeFile(join(root, 'wake.config.toml'), '[lint]\nrecommended=false\n[lint.types]\ncompiler="@typescript/native"\nprojects=["tsconfig.json"]\n[lint.rules]\n"ts/no-unsafe-call"="error"\n"style/eol-last"="error"')
+    await writeFile(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, types: [], target: 'es2022', module: 'esnext', moduleResolution: 'bundler' }, files: ['a.ts', 'b.ts'] }))
+    await writeFile(join(root, 'a.ts'), "import {value} from './b'; value();")
+    await writeFile(join(root, 'b.ts'), 'export const value:any = 1;\n')
+    const options = { root, paths: ['a.ts'], cache: true }
+    const explained = await esmApi.lint({ root, printConfig: 'a.ts' })
+    assert.deepEqual(explained.config.types, { compiler: '@typescript/native', projects: ['tsconfig.json'] })
+    const cold = await commonjs.lint(options)
+    assert.equal(cold.errorCount, 2)
+    assert.equal(cold.cache.bypassed, 1)
+    const fixed = await esmApi.lint({ ...options, fix: 'dry-run' })
+    assert.equal(fixed.errorCount, 1)
+    assert.equal(fixed.files[0].output, "import {value} from './b'; value();\n")
+    context = await esmApi.createLintContext(options)
+    await context.updateDocument({ filename: 'b.ts', version: 1, text: 'export const value = () => 1;\n' })
+    const checked = await context.check()
+    assert.equal(checked.result.errorCount, 1)
+    assert.deepEqual(checked.result.files[0].diagnostics.map(d => d.code), ['style/eol-last'])
+    const catalog = (await esmApi.lint({ listRules: true })).catalog.rules.find(rule => rule.id === 'ts/no-unsafe-call')
+    assert.equal(catalog.analysis, 'type-information')
+    assert.equal(catalog.defaultLevel, 'off')
+    assert.equal(catalog.fixable, false)
+    await context.close()
+    context = undefined
+    await writeFile(join(root, 'a.ts'), "// 😀\nimport {value} from './b'; const text = `${value}`;\n")
+    const templates = await esmApi.lint({ ...options, rules: { 'ts/restrict-template-expressions': { level: 'error', options: { allow_any: false } } } })
+    assert.equal(templates.errorCount, 1)
+    assert.equal(templates.files[0].diagnostics[0].code, 'ts/restrict-template-expressions')
+    assert.equal(templates.files[0].diagnostics[0].location.line, 2)
+  } finally {
+    await context?.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('native lint globals share configuration, normalized cache and context validation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-lint-globals-'))
+  try {
+    await writeFile(join(root, 'a.js'), 'Promise; injected;')
+    await writeFile(join(root, 'wake.config.toml'), '[lint.globals]\ninjected="readonly"')
+    const options = { root, globals: { Promise: 'off', injected: 'writable' } }
+    const explained = await esmApi.lint({ ...options, printConfig: 'a.js' })
+    assert.deepEqual(explained.config.globals.Promise, { mode: 'off', source: 'request' })
+    assert.deepEqual(explained.config.globals.injected, { mode: 'writable', source: 'request' })
+    const cold = await commonjs.lint({ root, cache: true })
+    assert.equal(cold.cache.misses, 1)
+    assert.equal((await esmApi.lint({ root, cache: true, globals: { Promise: 'readonly', absent: 'off' } })).cache.hits, 1)
+    assert.equal((await esmApi.lint({ ...options, cache: true })).cache.misses, 1)
+    const context = await esmApi.createLintContext({ ...options, cache: true })
+    try { assert.equal((await context.check()).result.cache.hits, 1) } finally { await context.close() }
+    for (const globals of [{ bad: true }, { 'x.y': 'off' }, { bad: 'write' }]) {
+      await assert.rejects(esmApi.lint({ root, globals }), { code: 'WAKE_LINT_CONFIG' })
+      await assert.rejects(esmApi.createLintContext({ root, globals }), { code: 'WAKE_LINT_CONFIG' })
+    }
+    await assert.rejects(esmApi.lint({ listRules: true, globals: { injected: 'readonly' } }), { code: 'WAKE_LINT_CONFIG' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint environments provide versioned browser and Node globals', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-lint-environments-'))
+  try {
+    await writeFile(join(root, 'a.js'), 'window; process;')
+    const options = { root, environments: ['browser', 'node'], rules: { 'js/no-undef': 'error' } }
+    const result = await esmApi.lint(options)
+    assert.equal(result.errorCount, 0)
+    const explained = await commonjs.lint({ ...options, printConfig: 'a.js' })
+    assert.deepEqual(explained.config.environments, ['browser', 'node'])
+    assert.equal(explained.config.globals.window.source, 'request:environment:browser@1')
+    assert.equal(explained.config.globals.process.source, 'request:environment:node@1')
+    await assert.rejects(esmApi.lint({ root, environments: ['deno'] }), { code: 'WAKE_LINT_CONFIG' })
+    await assert.rejects(esmApi.createLintContext({ root, environments: ['deno'] }), { code: 'WAKE_LINT_CONFIG' })
+    await assert.rejects(esmApi.lint({ listRules: true, environments: ['browser'] }), { code: 'WAKE_LINT_CONFIG' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint undefined values and JSX roots use globals across disk and overlays', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-undefined-'))
+  const rules = { 'js/no-undef': 'error', 'react/jsx-no-undef': 'error' }
+  try {
+    await writeFile(join(root, 'a.tsx'), 'const node=<External value={injected}/>;')
+    const cold = await esmApi.lint({ root, rules, cache: true })
+    assert.deepEqual(cold.files[0].diagnostics.map(d => d.code), ['react/jsx-no-undef', 'js/no-undef'])
+    const globals = { External: 'readonly', injected: 'writable' }
+    const context = await esmApi.createLintContext({ root, rules, globals, cache: true })
+    try {
+      const clean = await context.check()
+      assert.equal(clean.result.errorCount, 0)
+      assert.equal(clean.result.cache.misses, 1)
+      assert.equal((await context.check()).result.cache.hits, 1)
+      context.updateDocument({ filename: 'a.tsx', version: 1, text: 'const node=<External/>; missing;' })
+      const overlay = await context.check()
+      assert.equal(overlay.result.cache.bypassed, 1)
+      assert.deepEqual(overlay.result.files[0].diagnostics.map(d => d.code), ['js/no-undef'])
+    } finally { await context.close() }
+    const stdin = await commonjs.lint({ root, rules, globals, stdin: { filename: 'virtual.ts', text: 'typeof optional; typeof object.member;' } })
+    assert.equal(stdin.errorCount, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint prefers const with safe publication and Unicode identifier identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-const-'))
+  try {
+    const source = 'let a\u0301 = 1; let changed = 1; changed++; a\\u0301;'
+    await writeFile(join(root, 'a.ts'), source)
+    const rules = { 'js/prefer-const': 'warn', 'js/no-undef': 'error' }
+    const preview = await esmApi.lint({ root, rules, fix: 'dry-run' })
+    assert.equal(preview.files[0].changed, true)
+    assert.equal(preview.files[0].written, false)
+    assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), source)
+    assert.equal(preview.files[0].output, source.replace('let a', 'const a'))
+    assert.equal(preview.errorCount, 0)
+    assert.equal(preview.warningCount, 0)
+    const published = await commonjs.lint({ root, rules, fix: 'write' })
+    assert.equal(published.files[0].written, true)
+    assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), preview.files[0].output)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint unused binding filters and JSX usage are shared by CJS ESM and contexts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-unused-'))
+  try {
+    await writeFile(join(root, 'a.tsx'), "import { Component, Other } from 'ui'; export const node=<Component/>; const _ignored=1;")
+    const rules = { 'js/no-unused-vars': { level: 'error', options: { vars_ignore_pattern: '^_' } } }
+    const cold = await esmApi.lint({ root, rules, cache: true })
+    assert.equal(cold.errorCount, 2)
+    const jsxRules = { ...rules, 'react/jsx-uses-vars': 'warn' }
+    const warm = await commonjs.lint({ root, rules: jsxRules, cache: true })
+    assert.equal(warm.errorCount, 1)
+    assert.equal(warm.cache.misses, 1)
+    assert.equal(warm.files[0].diagnostics[0].messageId, 'unused')
+    const context = await esmApi.createLintContext({ root, rules: jsxRules, cache: true })
+    try {
+      assert.equal((await context.check()).result.cache.hits, 1)
+      context.updateDocument({ filename: 'a.tsx', version: 1, text: 'export type Used=string; type Unused=number;' })
+      assert.equal((await context.check()).result.errorCount, 1)
+    } finally { await context.close() }
+    const catalog = await esmApi.lint({ listRules: true })
+    const rule = catalog.catalog.rules.find(rule => rule.id === 'js/no-unused-vars')
+    assert.equal(rule.optionsSchema.properties.vars_ignore_pattern.format, 'rust-regex')
+    await assert.rejects(esmApi.lint({ root, rules: { 'js/no-unused-vars': { level: 'off', options: { vars_ignore_pattern: '[' } } } }), { code: 'WAKE_LINT_CONFIG' })
+    await writeFile(join(root, 'wake.config.toml'), "[[lint.overrides]]\nfiles=['never/**']\nrules={'js/no-unused-vars'={level='off',options={args_ignore_pattern='['}}}")
+    await assert.rejects(esmApi.lint({ root }), { code: 'WAKE_LINT_CONFIG' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint semicolons preserve grammar across cache preview publication and overlays', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-semi-'))
+  const rules = { 'style/semi': 'warn' }
+  const source = 'const 名=1 // keep\nfunction f(){return 名}'
+  try {
+    await writeFile(join(root, 'a.ts'), source)
+    const cold = await esmApi.lint({ root, rules, cache: true })
+    assert.equal(cold.warningCount, 2)
+    assert.equal((await commonjs.lint({ root, rules, cache: true })).cache.hits, 1)
+    const preview = await esmApi.lint({ root, rules, fix: 'dry-run' })
+    assert.equal(preview.files[0].output, 'const 名=1; // keep\nfunction f(){return 名;}')
+    assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), source)
+    const published = await commonjs.lint({ root, rules, fix: 'write' })
+    assert.equal(published.files[0].written, true)
+    assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), preview.files[0].output)
+    const context = await esmApi.createLintContext({ root, rules: { 'style/semi': { level: 'warn', options: { mode: 'never' } } }, cache: true })
+    try {
+      context.updateDocument({ filename: 'a.ts', version: 1, text: 'value;\n(call)()' })
+      const checked = await context.check()
+      assert.equal(checked.result.warningCount, 0)
+      assert.equal(checked.result.cache.bypassed, 1)
+    } finally { await context.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint trailing commas preserve TSX holes and typed lists through publication', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-comma-'))
+  const rules = { 'style/comma-dangle': { level: 'warn', options: { mode: 'always' } } }
+  const source = 'const f=<T,>(x:T)=>x; const a=[1 /*keep*/]; const holes=[1,,];'
+  try {
+    await writeFile(join(root, 'a.tsx'), source)
+    const cold = await commonjs.lint({ root, rules, cache: true })
+    assert.equal(cold.warningCount, 2)
+    assert.equal((await esmApi.lint({ root, rules, cache: true })).cache.hits, 1)
+    const preview = await esmApi.lint({ root, rules, fix: 'dry-run' })
+    assert.equal(preview.files[0].output, 'const f=<T,>(x:T,)=>x; const a=[1, /*keep*/]; const holes=[1,,];')
+    assert.equal(await readFile(join(root, 'a.tsx'), 'utf8'), source)
+    assert.equal((await commonjs.lint({ root, rules, fix: 'write' })).files[0].written, true)
+    const never = { 'style/comma-dangle': 'warn' }
+    const reversed = await esmApi.lint({ root, rules: never, fix: 'write' })
+    assert.equal(reversed.files[0].output, source)
+    assert.equal(await readFile(join(root, 'a.tsx'), 'utf8'), source)
+    const catalog = await esmApi.lint({ listRules: true })
+    assert.deepEqual(catalog.catalog.rules.find(rule => rule.id === 'style/comma-dangle').optionsSchema.properties.mode.enum, ['never', 'always', 'always-multiline', 'only-multiline'])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint indentation validates integer options and preserves raw JSX attributes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-indent-'))
+  const source = 'function f(){\nconst view=<div title="first\n raw"/>;\n}'
+  const rules = { 'style/indent': { level: 'warn', options: { width: 4 } } }
+  try {
+    await writeFile(join(root, 'a.tsx'), source)
+    const cold = await commonjs.lint({ root, rules, cache: true })
+    assert.equal(cold.warningCount, 1)
+    assert.equal((await esmApi.lint({ root, rules, cache: true })).cache.hits, 1)
+    const preview = await esmApi.lint({ root, rules, fix: 'dry-run' })
+    assert.equal(preview.files[0].output, source.replace('\nconst', '\n    const'))
+    assert.equal(await readFile(join(root, 'a.tsx'), 'utf8'), source)
+    assert.equal((await commonjs.lint({ root, rules, fix: 'write' })).files[0].written, true)
+    const context = await esmApi.createLintContext({ root, rules })
+    try {
+      context.updateDocument({ filename: 'a.tsx', version: 1, text: 'function f(){\ncall();\n}' })
+      assert.equal((await context.check()).result.warningCount, 1)
+    } finally { await context.close() }
+    const catalog = await esmApi.lint({ listRules: true })
+    assert.deepEqual(catalog.catalog.rules.find(rule => rule.id === 'style/indent').optionsSchema.properties.width, { type: 'integer', default: 2, minimum: 1, maximum: 8 })
+    await writeFile(join(root, 'wake.config.toml'), "[[lint.overrides]]\nfiles=['never/**']\nrules={'style/indent'={level='off',options={style='tabs',width=0}}}")
+    await assert.rejects(esmApi.lint({ root }), { code: 'WAKE_LINT_CONFIG' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 async function assertSameExistingPath(actual, expected) {
   const [actualStats, expectedStats] = await Promise.all([
     stat(actual, { bigint: true }),
@@ -82,9 +337,409 @@ after(async () => {
   await Promise.all(contexts.map((context) => context.close()))
 })
 
+test('native lint explains virtual configuration and applies request parameters', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-config-'))
+  try {
+    await writeFile(join(root, 'wake.config.toml'), '[lint]\npresets=["react@1"]')
+    const explained = await esmApi.lint({ root, printConfig: 'src/virtual.tsx',
+      rules: { 'js/eqeqeq': { level: 'error', options: { allow_null: true } } } })
+    assert.equal(explained.config.schema, 'wake.lint.config.v1')
+    assert.equal(explained.config.rules['js/eqeqeq'].source, 'request')
+    assert.equal(explained.config.rules['js/eqeqeq'].options.allow_null, true)
+    assert.equal(explained.config.rules['react/no-danger'].source, 'preset:react@1')
+    assert.equal(explained.files.length, 0)
+    await assert.rejects(access(join(root, 'src')), { code: 'ENOENT' })
+    const result = await esmApi.lint({ root, stdin: { filename: 'x.js', text: 'x == null;' },
+      rules: { 'js/eqeqeq': { level: 'error', options: { allow_null: true } } } })
+    assert.equal(result.errorCount, 0)
+    assert.equal(result.warningCount, 0)
+    for (const options of [
+      { printConfig: true }, { rules: null }, { rules: [] },
+      { printConfig: 'x.js', fix: 'dry-run' },
+      { rules: { 'js/eqeqeq': { level: 'off', options: { allow_null: 'true' } } } },
+      { rules: { 'js/eqeqeq': { level: 'off', typo: true } } },
+    ]) await assert.rejects(esmApi.lint({ root, ...options }), { code: 'WAKE_LINT_CONFIG' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint exposes one project-independent rule catalog', async () => {
+  const result = await esmApi.lint({ listRules: true, root: join(tmpdir(), 'missing-wake-lint-catalog') })
+  assert.equal(result.catalog.schema, 'wake.lint.rules.v1')
+  assert.deepEqual(result.files, [])
+  const rule = result.catalog.rules.find((rule) => rule.id === 'style/quotes')
+  assert.equal(rule.defaultLevel, 'off')
+  assert.equal(rule.fixable, true)
+  assert.deepEqual(rule.optionsSchema.properties.quote.enum, ['single', 'double'])
+  const binary = result.catalog.rules.find((rule) => rule.id === 'js/no-constant-binary-expression')
+  assert.equal(binary.defaultLevel, 'off')
+  assert.equal(binary.analysis, 'syntax')
+  assert.equal(binary.fixable, false)
+  const array = result.catalog.rules.find((rule) => rule.id === 'ts/array-type')
+  assert.equal(array.defaultLevel, 'off')
+  assert.deepEqual(array.languages, ['ts', 'tsx'])
+  assert.deepEqual(array.optionsSchema.properties.syntax.enum, ['array', 'generic'])
+  const arrayResult = await esmApi.lint({ root: fileURLToPath(new URL('../../../', import.meta.url)), stdin: { filename: 'virtual.ts', text: 'type X=Array<string>;' }, rules: { 'ts/array-type': 'error' } })
+  assert.deepEqual(arrayResult.files[0].diagnostics.filter((diagnostic) => diagnostic.code === array.id).map((diagnostic) => diagnostic.messageId), ['array'])
+  const checked = await esmApi.lint({ root: fileURLToPath(new URL('../../../', import.meta.url)), stdin: { filename: 'virtual.ts', text: '(x < max) ?? 10; [] === value;' }, rules: { 'js/no-constant-binary-expression': 'error' } })
+  assert.deepEqual(checked.files[0].diagnostics.filter((diagnostic) => diagnostic.code === binary.id).map((diagnostic) => diagnostic.messageId), ['constant-nullish', 'constant-comparison'])
+  assert.deepEqual((await commonjs.lint({ listRules: true })).catalog, result.catalog)
+  for (const options of [{ listRules: 'true' }, { listRules: true, paths: ['x.js'] }, { listRules: true, printConfig: 'x.js' }]) {
+    await assert.rejects(esmApi.lint(options), { code: 'WAKE_LINT_CONFIG' })
+  }
+})
+
+test('native lint checks Hooks identities and propagates analysis limits', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-hooks-'))
+  const rules = { 'react-hooks/rules-of-hooks': 'error' }
+  try {
+    const catalog = (await esmApi.lint({ listRules: true })).catalog
+    assert.equal(catalog.rules.find((r) => r.id === 'react-hooks/rules-of-hooks').analysis, 'scope-control-flow')
+    const text = "import {useState as h} from 'react'; function App(x) { if(x) h(0); }"
+    const options = { root, stdin: { filename: 'app.tsx', text }, rules }
+    const result = await esmApi.lint(options)
+    assert.deepEqual(result.files[0].diagnostics.map((d) => d.messageId), ['conditional'])
+    assert.deepEqual(await commonjs.lint(options), result)
+    for (const fix of [undefined, 'dry-run']) {
+      await assert.rejects(esmApi.lint({ ...options, fix, stdin: { filename: 'app.tsx', text: `function App() { ${'ordinary();'.repeat(60000)} }` } }), { code: 'WAKE_LINT_ANALYSIS' })
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint checks original Hook dependencies and custom effect aliases', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-dependencies-'))
+  try {
+    const rules = { 'react-hooks/exhaustive-deps': { level: 'error', options: { additional_effect_hooks: '^useObserve$' } } }
+    const text = "import {useEffect, useState} from 'react'; import {useObserve as observe} from 'store'; function App(props) { const [value,set] = useState(0); useEffect(() => { set(1); consume(props.name); }, []); observe(() => consume(value), []); }"
+    const options = { root, rules, stdin: { filename: 'app.tsx', text } }
+    const result = await esmApi.lint(options)
+    assert.equal(result.errorCount, 2)
+    assert.deepEqual(result.files[0].diagnostics.map((d) => d.messageId), ['missing', 'missing'])
+    assert.deepEqual(await commonjs.lint(options), result)
+    const context = await esmApi.createLintContext({ root, rules })
+    try {
+      await context.updateDocument({ filename: 'app.tsx', version: 1, text })
+      assert.equal((await context.check()).result.errorCount, 2)
+      await context.updateDocument({ filename: 'app.tsx', version: 2, text: "import {useEffect} from 'react'; function App(p) { useEffect(() => consume(p), [p]); }" })
+      assert.equal((await context.check()).result.errorCount, 0)
+    } finally { await context.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint exposes the accessibility catalog and checks original JSX values', async () => {
+  const catalog = (await esmApi.lint({ listRules: true })).catalog.rules.filter((rule) => rule.id.startsWith('a11y/'))
+  assert.equal(catalog.length, 9)
+  for (const rule of catalog) {
+    assert.equal(rule.defaultLevel, 'off')
+    assert.equal(rule.fixable, false)
+    assert.deepEqual(rule.languages, ['jsx', 'tsx'])
+  }
+  const result = await esmApi.lint({
+    root: fileURLToPath(new URL('../../../', import.meta.url)),
+    stdin: { filename: 'virtual.tsx', text: 'const el=<><img/><a/><label/><div aria-labl="x" aria-hidden="bad" role="unknown"/><div role="button" onClick={run}/></>;' },
+    rules: Object.fromEntries(catalog.map((rule) => [rule.id, 'error'])),
+  })
+  assert.deepEqual([...new Set(result.files[0].diagnostics.map((diagnostic) => diagnostic.code))].sort(), catalog.map((rule) => rule.id).sort())
+  assert.equal(result.errorCount, 10)
+  assert.equal(result.exitCode, 1)
+})
+
+test('native lint checks JSX list keys and callback index bindings', async () => {
+  const catalog = (await esmApi.lint({ listRules: true })).catalog.rules
+  for (const id of ['react/jsx-key', 'react/no-array-index-key']) {
+    const rule = catalog.find((rule) => rule.id === id)
+    assert.equal(rule.defaultLevel, 'off')
+    assert.equal(rule.fixable, false)
+    assert.deepEqual(rule.languages, ['jsx', 'tsx'])
+  }
+  const result = await esmApi.lint({
+    root: fileURLToPath(new URL('../../../', import.meta.url)),
+    stdin: { filename: 'lists.tsx', text: 'const items=[<Row/>]; items.map((item,index)=><Row key={index}/>);' },
+    rules: { 'react/jsx-key': 'error', 'react/no-array-index-key': 'error' },
+  })
+  assert.deepEqual(result.files[0].diagnostics.map((diagnostic) => diagnostic.code), ['react/jsx-key', 'react/no-array-index-key'])
+  assert.equal(result.errorCount, 2)
+})
+
+test('native lint uses lexical block, static block and parameter environments', async () => {
+  const text = "{ function console() {} console.log('local'); } console.log('global'); class C { static { var Promise; new Promise(async () => {}); } } new Promise(async () => {}); function check(console = () => 0) { var console; console.log('local'); }"
+  const result = await esmApi.lint({
+    root: fileURLToPath(new URL('../../../', import.meta.url)),
+    stdin: { filename: 'scopes.mjs', text },
+    rules: { 'js/no-console': 'error', 'js/no-async-promise-executor': 'error' },
+  })
+  assert.deepEqual(result.files[0].diagnostics.filter((diagnostic) =>
+    diagnostic.code === 'js/no-console' || diagnostic.code === 'js/no-async-promise-executor'
+  ).map((diagnostic) => diagnostic.code), ['js/no-console', 'js/no-async-promise-executor'])
+})
+
+test('native lint distinguishes original type imports from ambient and generic bindings', async () => {
+  const id = 'ts/consistent-type-imports'
+  const rule = (await esmApi.lint({ listRules: true })).catalog.rules.find((rule) => rule.id === id)
+  assert.ok(rule)
+  assert.equal(rule.defaultLevel, 'off')
+  assert.equal(rule.analysis, 'scope')
+  assert.equal(rule.fixable, false)
+  const text = "import { Used, Shared, Generic, Runtime } from 'pkg'; let used: Used; type Local<Generic> = Generic; declare namespace N { interface Shared {} } declare namespace N { const value: Shared; } const value = Runtime;"
+  const result = await esmApi.lint({
+    root: fileURLToPath(new URL('../../../', import.meta.url)),
+    stdin: { filename: 'type-imports.ts', text }, rules: { [id]: 'error' },
+  })
+  assert.equal(result.errorCount, 1)
+  assert.deepEqual(result.files[0].diagnostics.map((diagnostic) => [diagnostic.code, diagnostic.messageId]), [[id, 'type']])
+  const exports = await esmApi.lint({
+    root: fileURLToPath(new URL('../../../', import.meta.url)),
+    stdin: { filename: 'type-exports.ts', text: 'interface Shape {} declare const Dual: number; type Dual = number; export { Shape, Dual };' },
+    rules: { 'ts/consistent-type-exports': 'error' },
+  })
+  assert.equal(exports.errorCount, 1)
+  assert.deepEqual(exports.files[0].diagnostics.map((diagnostic) => diagnostic.code), ['ts/consistent-type-exports'])
+})
+
+test('native lint checks declaration identity, ordering and shadow options', async () => {
+  const result = await esmApi.lint({
+    root: fileURLToPath(new URL('../../../', import.meta.url)),
+    stdin: { filename: 'binding-rules.mjs', text: 'var repeated; var repeated; let outer; {let outer;} later; let later;' },
+    rules: {
+      'js/no-redeclare': 'error',
+      'js/no-shadow': { level: 'error', options: { hoist: false } },
+      'js/no-use-before-define': { level: 'error', options: { functions: false } },
+    },
+  })
+  assert.equal(result.errorCount, 3)
+  assert.deepEqual(result.files[0].diagnostics.map((diagnostic) => diagnostic.code), ['js/no-redeclare', 'js/no-shadow', 'js/no-use-before-define'])
+})
+
+test('native lint context owns document versions, cancellation and disposal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-context-api-'))
+  let context
+  try {
+    await writeFile(join(root, 'a.js'), 'debugger;')
+    context = await esmApi.createLintContext({ root })
+    assert.ok(context instanceof commonjs.LintContext)
+    context.updateDocument({ filename: 'a.js', version: 1, text: 'run();' })
+    context.updateDocument({ filename: 'new.ts', version: 2, text: 'debugger;' })
+    const first = await context.check()
+    assert.deepEqual(first.documents, { 'a.js': 1, 'new.ts': 2 })
+    assert.equal(first.result.errorCount, 1)
+    assert.equal(first.generation, context.generation)
+    assert.throws(() => context.updateDocument({ filename: 'new.ts', version: 2, text: '' }), { code: 'WAKE_LINT_CONFIG' })
+    const stale = context.check()
+    const rejected = assert.rejects(stale, { code: 'WAKE_CANCELLED' })
+    context.updateDocument({ filename: 'new.ts', version: 3, text: 'run();' })
+    await rejected
+    assert.equal((await context.check()).result.errorCount, 0)
+    context.closeDocument('a.js', 2)
+    assert.equal((await context.check()).result.errorCount, 1)
+    const before = context.generation
+    assert.ok(context.invalidate() > before)
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(context.check({ signal: controller.signal }), { code: 'WAKE_CANCELLED' })
+    await assert.rejects(context.check({ typo: true }), { code: 'WAKE_LINT_CONFIG' })
+    await context[Symbol.asyncDispose]()
+    await context.close()
+    assert.equal(context.closed, true)
+    await assert.rejects(context.check())
+    assert.throws(() => context.updateDocument({ filename: 'a.js', version: 3, text: '' }))
+    for (const options of [{ fix: 'write' }, { stdin: { filename: 'a.js', text: '' } }, { listRules: true }, { baseline: { path: 'x.json', mode: 'generate' } }]) {
+      await assert.rejects(esmApi.createLintContext({ root, ...options }), { code: 'WAKE_LINT_CONFIG' })
+    }
+    assert.throws(() => new commonjs.LintContext(), /createLintContext/)
+  } finally { await context?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint cancellation stops active checks and rejects invalid signals before starting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-cancel-api-'))
+  const context = await esmApi.createLintContext({ root })
+  try {
+    context.updateDocument({ filename: 'a.js', version: 1, text: 'debugger;\n'.repeat(30000) })
+    const controller = new AbortController()
+    const pending = context.check({ signal: controller.signal })
+    const rejection = assert.rejects(pending, { code: 'WAKE_CANCELLED' })
+    controller.abort()
+    await rejection
+    context.updateDocument({ filename: 'a.js', version: 2, text: 'run();' })
+    assert.equal((await context.check()).result.errorCount, 0)
+    const once = new AbortController()
+    const checking = esmApi.lint({ root, stdin: { filename: 'large.js', text: 'debugger;\n'.repeat(30000) }, signal: once.signal })
+    const cancelled = assert.rejects(checking, { code: 'WAKE_CANCELLED' })
+    once.abort()
+    await cancelled
+    for (const signal of [{}, 1, { aborted: false }]) {
+      await assert.rejects(context.check({ signal }), { code: 'WAKE_LINT_CONFIG' })
+      await assert.rejects(esmApi.lint({ root, signal }), { code: 'WAKE_LINT_CONFIG' })
+    }
+  } finally { await context.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint context cleanup cancels work when its Worker is terminated', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-context-worker-'))
+  const worker = new Worker(`
+    const { parentPort, workerData } = require('node:worker_threads')
+    parentPort.on('message', () => {})
+    ;(async () => {
+      const wake = require(workerData.api)
+      globalThis.context = await wake.createLintContext({ root: workerData.root, watch: true })
+      context.updateDocument({ filename: 'open.js', version: 1, text: 'debugger;\\n'.repeat(30000) })
+      globalThis.pending = context.check().catch(() => {})
+      parentPort.postMessage('admitted')
+    })().catch((error) => { throw error })
+  `, { eval: true, workerData: { root, api: fileURLToPath(new URL('../index.cjs', import.meta.url)) } })
+  try {
+    assert.deepEqual(await once(worker, 'message'), ['admitted'])
+    assert.equal(await worker.terminate(), 1)
+    const context = await commonjs.createLintContext({ root })
+    assert.equal((await context.check()).result.files.length, 0)
+    await context.close()
+  } finally { await worker.terminate(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint one-shot cleanup survives Worker termination during analysis', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-operation-worker-'))
+  const worker = new Worker(`
+    const { parentPort, workerData } = require('node:worker_threads')
+    parentPort.on('message', () => {})
+    const wake = require(workerData.api)
+    globalThis.pending = wake.lint({ root: workerData.root, stdin: { filename: 'large.js', text: 'debugger;\\n'.repeat(30000) } }).catch(() => {})
+    parentPort.postMessage('admitted')
+  `, { eval: true, workerData: { root, api: fileURLToPath(new URL('../index.cjs', import.meta.url)) } })
+  try {
+    assert.deepEqual(await once(worker, 'message'), ['admitted'])
+    assert.equal(await worker.terminate(), 1)
+  } finally { await worker.terminate(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint watch recovers invalid configuration and preserves context after stopping', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-watch-api-'))
+  let context
+  try {
+    await writeFile(join(root, 'wake.config.toml'), '[lint\n')
+    context = await esmApi.createLintContext({ root, watch: true })
+    assert.equal(context.watching, true)
+    const event = (name, accepts = () => true) => new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => { context.off(name, listener); reject(new Error(`missing lint ${name}`)) }, 10000)
+      const listener = (value) => { if (accepts(value)) { clearTimeout(timeout); context.off(name, listener); resolve(value) } }
+      context.on(name, listener)
+    })
+    const invalid = await event('diagnostic')
+    assert.equal(invalid.error.code, 'WAKE_LINT_CONFIG')
+    const recovered = event('checked')
+    await writeFile(join(root, 'wake.config.toml'), '[lint]\n')
+    const first = await recovered
+    assert.equal(first.generation, context.generation)
+    const next = event('checked', (snapshot) => snapshot.result.errorCount === 1)
+    context.updateDocument({ filename: 'new.ts', version: 1, text: 'debugger;' })
+    assert.equal((await next).documents['new.ts'], 1)
+    await Promise.all([context.stopWatch(), context.stopWatch()])
+    assert.equal(context.watching, false)
+    assert.equal(context.closed, false)
+    assert.equal((await context.check()).result.errorCount, 1)
+    const resumed = event('checked')
+    assert.equal(context.startWatch(), context)
+    assert.equal(context.startWatch(), context)
+    await resumed
+    const closed = once(context, 'closed')
+    await context.close()
+    await closed
+    assert.equal(context.watching, false)
+  } finally { await context?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint context rejects root redirection through a replacement directory link', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'wake-lint-root-identity-'))
+  const root = join(parent, 'project')
+  const target = join(parent, 'different-project')
+  let context
+  try {
+    await mkdir(root)
+    await mkdir(target)
+    await writeFile(join(target, 'private.js'), 'debugger;')
+    context = await esmApi.createLintContext({ root })
+    await rm(root, { recursive: true })
+    await symlink(target, root, process.platform === 'win32' ? 'junction' : 'dir')
+    await assert.rejects(context.check(), { code: 'WAKE_LINT_IO' })
+    assert.throws(() => context.startWatch(), { code: 'WAKE_LINT_IO' })
+  } finally { await context?.close(); await rm(parent, { recursive: true, force: true }) }
+})
+
+test('native lint baseline generates, checks, prunes and validates its closed request', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-baseline-api-'))
+  try {
+    await writeFile(join(root, 'a.js'), 'debugger;\n')
+    const baseline = { path: 'lint-baseline.json', mode: 'generate' }
+    const generated = await esmApi.lint({ root, baseline })
+    assert.equal(generated.exitCode, 0)
+    assert.equal(generated.baseline.written, true)
+    assert.equal((await commonjs.lint({ root, baseline: { path: baseline.path } })).baseline.suppressed, 1)
+    await writeFile(join(root, 'a.js'), 'run();\n')
+    const pruned = await esmApi.lint({ root, baseline: { ...baseline, mode: 'prune' } })
+    assert.equal(pruned.baseline.stale, 1)
+    assert.equal(pruned.baseline.entries, 0)
+    for (const baseline of [{}, { path: 'x.json', mode: 'guess' }, { path: 'x.json', force: true }, 'x.json']) {
+      await assert.rejects(esmApi.lint({ root, baseline }), { code: 'WAKE_LINT_CONFIG' })
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint cache preserves diagnostics and bypasses fixes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-cache-api-'))
+  try {
+    await writeFile(join(root, 'a.js'), 'debugger;')
+    const cold = await esmApi.lint({ root, cache: true })
+    assert.equal(cold.cache.writes, 1)
+    const warm = await commonjs.lint({ root, cache: true })
+    assert.equal(warm.cache.hits, 1)
+    assert.deepEqual(cold.files, warm.files)
+    assert.equal((await esmApi.lint({ root, cache: true, fix: 'dry-run' })).cache.bypassed, 1)
+    for (const options of [{ cache: 'true' }, { cache: null }, { cache: true, printConfig: 'x.js' }, { cache: true, listRules: true }]) {
+      await assert.rejects(esmApi.lint({ root, ...options }), { code: 'WAKE_LINT_CONFIG' })
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('native lint checks unsaved snapshots and rejects malformed requests', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-api-'))
+  try {
+    assert.equal(typeof esmApi.lint, 'function')
+    const result = await esmApi.lint({ root, stdin: { filename: 'unsaved.ts', text: '// 😀\r\ndebugger;' } })
+    assert.equal(result.errorCount, 1)
+    assert.equal(result.exitCode, 1)
+    assert.equal(result.files[0].diagnostics[0].location.line, 2)
+    for (const options of [{ root, typo: true }, { root, maxWarnings: -1 }, { root, stdin: { filename: 'a.ts' } }, { root, stdin: null }]) {
+      await assert.rejects(esmApi.lint(options), { code: 'WAKE_LINT_CONFIG' })
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('native lint fix modes return final source and publish only when requested', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-lint-fix-api-'))
+  try {
+    await writeFile(join(root, 'wake.config.toml'), "[lint.rules]\n'style/eol-last'='error'")
+    await writeFile(join(root, 'a.js'), 'run();')
+    const checked = await esmApi.lint({ root })
+    assert.equal(checked.files[0].diagnostics[0].messageId, 'missing')
+    assert.deepEqual(checked.files[0].diagnostics[0].fix.edits, [{ start: 6, end: 6, text: '\n' }])
+    const preview = await esmApi.lint({ root, fix: 'dry-run' })
+    assert.equal(preview.exitCode, 0)
+    assert.equal(preview.files[0].output, 'run();\n')
+    assert.equal(preview.files[0].written, false)
+    assert.equal(await readFile(join(root, 'a.js'), 'utf8'), 'run();')
+    const result = await esmApi.lint({ root, fix: 'write' })
+    assert.equal(result.files[0].written, true)
+    assert.equal(await readFile(join(root, 'a.js'), 'utf8'), 'run();\n')
+    for (const fix of [true, 'yes', null]) await assert.rejects(esmApi.lint({ root, fix }), { code: 'WAKE_LINT_CONFIG' })
+    await assert.rejects(esmApi.lint({ root, fix: 'write', stdin: { filename: 'x.js', text: 'x;' } }), { code: 'WAKE_LINT_CONFIG' })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('loads the same API from ESM and CommonJS', () => {
   const expectedRuntimeExports = [
     'BuildContext',
+    'LintContext',
     'DevServer',
     'TestContext',
     'WakeError',
@@ -93,11 +748,13 @@ test('loads the same API from ESM and CommonJS', () => {
     'buildLibrary',
     'bundle',
     'createBuildContext',
+    'createLintContext',
     'createTestContext',
     'generateCssToken',
     'generateDocgen',
     'generateFederationLock',
     'initializeFederation',
+    'lint',
     'runTests',
     'startDevServer',
     'startDocsDevServer',
@@ -121,6 +778,8 @@ test('loads the same API from ESM and CommonJS', () => {
 test('loads the exact freshly built native addon ABI', () => {
   const expectedNativeExports = [
     'NativeBuildContext',
+    'NativeLintContext',
+    'NativeLintTask',
     'NativeDevServer',
     'NativeParsedModule',
     'NativeTestContext',
@@ -129,11 +788,13 @@ test('loads the exact freshly built native addon ABI', () => {
     'buildLibrary',
     'bundle',
     'createBuildContext',
+    'createLintContext',
     'createTestContext',
     'generateCssToken',
     'generateDocgen',
     'generateFederationLock',
     'initializeFederation',
+    'lint',
     'parse',
     'runTests',
     'startDevServer',
@@ -697,6 +1358,33 @@ test('exposes disposable experimental compiler handles', async () => {
   assert.equal(module.summary.statementCount, 1)
   assert.match(transform(module).code, /answer/)
   assert.equal(analyze(module).schemaVersion, 'wake.semantic.v1')
+  const scoped = parse('const f=function self(){var self;return [self,arguments,()=>arguments]};arguments;')
+  try {
+    const semantic = analyze(scoped)
+    const argumentsRefs = semantic.references.filter((reference) => reference.name === 'arguments')
+    assert.notEqual(argumentsRefs[0].resolved, null)
+    assert.equal(argumentsRefs[0].resolved, argumentsRefs[1].resolved)
+    assert.equal(argumentsRefs[2].resolved, null)
+    const implicit = semantic.symbols[argumentsRefs[0].resolved]
+    assert.equal(implicit.declarationKind, 'arguments')
+    assert.equal(implicit.start, 0)
+    assert.equal(implicit.end, 0)
+    const selfBindings = semantic.symbols.filter((symbol) => symbol.name === 'self')
+    assert.equal(selfBindings.length, 2)
+    assert.notEqual(selfBindings[0].scope, selfBindings[1].scope)
+  } finally { scoped.dispose() }
+  const legacy = parse('{ item; function item(){return item} } item;', { sourceType: 'script' })
+  try {
+    const semantic = analyze(legacy)
+    const refs = semantic.references.filter((reference) => reference.name === 'item')
+    assert.equal(refs[0].resolved, refs[1].resolved)
+    assert.notEqual(refs[1].resolved, refs[2].resolved)
+    const outer = semantic.symbols[refs[2].resolved]
+    assert.equal(outer.declarationKind, 'var')
+    assert.equal(outer.start, 0)
+    assert.equal(outer.end, 0)
+    assert.equal(outer.scope, 0)
+  } finally { legacy.dispose() }
   const worker = new Worker('setInterval(() => {}, 1_000)', { eval: true })
   assert.throws(
     () => worker.postMessage(module),

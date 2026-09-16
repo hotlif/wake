@@ -4192,6 +4192,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "libc",
+ "notify",
  "regex",
  "ring",
  "same-file",
@@ -4201,6 +4202,7 @@ dependencies = [
  "toml",
  "ureq",
  "wake_bundler",
+ "wake_cache",
  "wake_common",
  "wake_config",
  "wake_dev_server",
@@ -4208,10 +4210,12 @@ dependencies = [
  "wake_ecma_transform",
  "wake_federation_contract",
  "wake_html",
+ "wake_lint_core",
  "wake_resolver",
  "wake_scan",
  "wake_test_contract",
  "wake_tsdoc",
+ "wake_turbo",
  "windows-sys 0.61.2",
 ]
 
@@ -4266,6 +4270,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "signal-hook 0.4.4",
+ "tempfile",
  "unicode-segmentation",
  "unicode-width",
  "wake_app",
@@ -4527,6 +4532,21 @@ dependencies = [
  "wake_compiler_core",
  "wake_ecma_vm",
  "wake_resolver",
+]
+
+[[package]]
+name = "wake_lint_core"
+version = "0.1.39"
+dependencies = [
+ "criterion",
+ "regex",
+ "ring",
+ "serde",
+ "serde_json",
+ "wake_common",
+ "wake_ecma_ast",
+ "wake_ecma_parser",
+ "wake_ecma_semantic",
 ]
 
 [[package]]

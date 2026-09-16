@@ -20,7 +20,7 @@ mod environment;
 pub mod pnp;
 mod pnpfs;
 
-pub use environment::ResolutionEnvironment;
+pub use environment::{NodeModulesPath, NodeModulesView, ResolutionContext, ResolutionEnvironment};
 use environment::{PnpRegistry, PnpRoute};
 pub use pnp::{PnpError, PnpLoadError, PnpManifest};
 pub use pnpfs::PnpFileSystem;
@@ -473,6 +473,30 @@ impl Resolver {
             .or_default()
             .insert(key, resolved.clone());
         resolved.map_err(|kind| self.err(specifier, from_dir, kind))
+    }
+
+    /// Identify the original package name under the same PnP/alias routing as resolution.
+    ///
+    /// This does not require an installed target. It distinguishes `@scope/pkg/sub` from Wake
+    /// path aliases without letting an alias hide a managed or explicitly classic PnP route.
+    /// Relative/absolute paths and package `#imports` are not bare package requests. Builtin
+    /// host modules must be classified by the host before consulting installation identity.
+    pub fn package_request<'a>(
+        &self,
+        specifier: &'a str,
+        from_dir: &Path,
+    ) -> Result<Option<&'a str>, ResolveError> {
+        if !is_valid_bare_package_specifier(specifier) || Path::new(specifier).is_absolute() {
+            return Ok(None);
+        }
+        let from_dir = normalize(from_dir);
+        let route = self.pnp_route(&from_dir).map_err(|error| {
+            self.err(specifier, &from_dir, ResolveErrorKind::PnpManifest(error))
+        })?;
+        if matches!(route, PnpRoute::NoManifest) && self.apply_alias(specifier).is_some() {
+            return Ok(None);
+        }
+        Ok(Some(split_package_ref(specifier).0))
     }
 
     /// 同时返回物理路径和按 npm 包名、版本、子路径归一后的逻辑身份。

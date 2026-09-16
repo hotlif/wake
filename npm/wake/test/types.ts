@@ -7,11 +7,13 @@ import {
   buildDocs,
   bundle,
   createBuildContext,
+  createLintContext,
   createTestContext,
   generateCssToken,
   generateDocgen,
   generateFederationLock,
   initializeFederation,
+  lint,
   runTests,
   startDevServer,
   startDocsDevServer,
@@ -135,6 +137,113 @@ void [
 ]
 
 async function api() {
+  const cachedResult = await lint({ cache: true })
+  const cacheHits: number | undefined = cachedResult.cache?.hits
+  const cacheWarning: string | undefined = cachedResult.cache?.warnings[0]
+  void [cacheHits, cacheWarning]
+  // @ts-expect-error Caching must be selected with a boolean.
+  await lint({ cache: 'true' })
+  const catalogResult = await lint({ listRules: true })
+  const catalogSchema: 'wake.lint.rules.v1' | undefined = catalogResult.catalog?.schema
+  const ruleAnalysis: 'syntax' | 'scope' | 'control-flow' | 'scope-control-flow' | 'module-graph' | 'type-information' | undefined = catalogResult.catalog?.rules[0]?.analysis
+  void [catalogSchema, ruleAnalysis]
+  // @ts-expect-error Rule listing is a boolean option.
+  await lint({ listRules: 'yes' })
+  const explained = await lint({ printConfig: 'src/virtual.tsx', rules: {
+    'js/eqeqeq': { level: 'error', options: { allow_null: true } }, 'js/no-debugger': 'off',
+  } })
+  const ruleSource: string | undefined = explained.config?.rules['js/eqeqeq']?.source
+  const typeCompiler: string | undefined = explained.config?.types?.compiler
+  const typeProjects: string[] | undefined = explained.config?.types?.projects
+  void [typeCompiler, typeProjects]
+  const ruleLevel: 'off' | 'warn' | 'error' | undefined = explained.config?.rules['js/eqeqeq']?.level
+  void [ruleSource, ruleLevel]
+  // @ts-expect-error A configuration target is a filename, not a boolean.
+  await lint({ printConfig: true })
+  // @ts-expect-error Rule levels form a closed set.
+  await lint({ rules: { 'js/eqeqeq': 'fatal' } })
+  // @ts-expect-error Options must be an object.
+  await lint({ rules: { 'js/eqeqeq': { level: 'off', options: [] } } })
+  const lintResult = await lint({ root: '.', paths: ['src'], maxWarnings: 0 })
+  const baselineResult = await lint({ baseline: { path: 'lint-baseline.json', mode: 'generate' } })
+  const lintContext = await createLintContext({ root: '.', cache: true })
+  lintContext.updateDocument({ filename: 'a.ts', version: 1, text: 'debugger;' })
+  const snapshot = await lintContext.check({ signal: new AbortController().signal })
+  const documentVersion: number | undefined = snapshot.documents['a.ts']
+  lintContext.closeDocument('a.ts', 2)
+  lintContext.on('checked', (event) => { const errors: number = event.result.errorCount; void errors })
+  lintContext.on('diagnostic', (event) => { const code: WakeErrorCode = event.error.code; void code })
+  lintContext.startWatch().unref()
+  const watching: boolean = lintContext.watching
+  await lintContext.stopWatch()
+  void watching
+  lintContext.invalidate()
+  await lintContext[Symbol.asyncDispose]()
+  void documentVersion
+  // @ts-expect-error A lint context does not publish source fixes.
+  await createLintContext({ fix: 'write' })
+  // @ts-expect-error Unsaved documents require their source text and version.
+  lintContext.updateDocument({ filename: 'a.ts' })
+  const suppressed: number | undefined = baselineResult.baseline?.suppressed
+  void suppressed
+  // @ts-expect-error Baselines use an explicit path and closed operation mode.
+  await lint({ baseline: { path: 'lint-baseline.json', mode: 'guess' } })
+  const lintExitCode: 0 | 1 = lintResult.exitCode
+  const globalsResult = await lint({ globals: { Promise: 'off', console: 'readonly', injected: 'writable' }, printConfig: 'a.ts' })
+  const globalMode: 'readonly' | 'writable' | 'off' | undefined = globalsResult.config?.globals.console?.mode
+  await createLintContext({ globals: { injected: 'readonly' } })
+  // @ts-expect-error Global modes are strings, with no legacy boolean coercion.
+  await lint({ globals: { injected: true } })
+  void globalMode
+  const rulesCatalog = await lint({ listRules: true })
+  for (const rule of rulesCatalog.catalog?.rules ?? []) {
+    for (const schema of Object.values(rule.optionsSchema.properties)) {
+      if (schema.type === 'integer') {
+        const minimum: number = schema.minimum
+        const maximum: number = schema.maximum
+        const defaultWidth: number = schema.default
+        void [minimum, maximum, defaultWidth]
+      }
+      if (schema.type === 'string' && !('enum' in schema)) {
+        const format: 'rust-regex' = schema.format
+        const maxLength: number = schema.maxLength
+        void [format, maxLength]
+      }
+      if (schema.type === 'array') {
+        const maxItems: number = schema.maxItems
+        if (schema.items.type === 'object') {
+          const patternFormat: 'rust-regex' = schema.items.properties.from.format
+          const required: Array<'from' | 'to'> = schema.items.required
+          void [patternFormat, required]
+        }
+        void maxItems
+      }
+    }
+  }
+  const lintCode: string | undefined = lintResult.files[0]?.diagnostics[0]?.code
+  const lintFailureCode: WakeErrorCode = 'WAKE_LINT_CONFIG'
+  const lintAnalysisCode: WakeErrorCode = 'WAKE_LINT_ANALYSIS'
+  const lintCombinedAnalysis: import('../index.js').LintRuleInfo['analysis'] = 'scope-control-flow'
+  const lintModuleAnalysis: import('../index.js').LintRuleInfo['analysis'] = 'module-graph'
+  void lintModuleAnalysis
+  void lintAnalysisCode
+  void lintCombinedAnalysis
+  const lintIoCode: WakeErrorCode = 'WAKE_LINT_IO'
+  const preview = await lint({ fix: 'dry-run', stdin: { filename: 'input.ts', text: '' } })
+  const fixedSource: string | undefined = preview.files[0]?.output
+  const fixedText: string | undefined = preview.files[0]?.diagnostics[0]?.fix?.edits[0]?.text
+  const fixFailureCode: WakeErrorCode = 'WAKE_LINT_FIX'
+  const conflictCode: WakeErrorCode = 'WAKE_LINT_CONFLICT'
+  const writeFailureCode: WakeErrorCode = 'WAKE_LINT_WRITE'
+  // @ts-expect-error Fix modes are explicit; booleans do not select a publication policy.
+  await lint({ fix: true })
+  void [fixedSource, fixedText, fixFailureCode, conflictCode, writeFailureCode]
+  await lint({ stdin: { filename: 'unsaved.tsx', text: '<div />' }, signal: new AbortController().signal })
+  // @ts-expect-error A virtual lint document requires its source text.
+  await lint({ stdin: { filename: 'unsaved.ts' } })
+  // @ts-expect-error Lint requests do not expose compiler build options.
+  await lint({ entry: 'input.ts' })
+  void [lintExitCode, lintCode, lintFailureCode, lintIoCode]
   const federation: FederationOptions = {
     enabled: true,
     name: 'shell',

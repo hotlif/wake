@@ -1,4 +1,6 @@
 //! Resolver-owned Yarn PnP discovery, registry, filesystem and invalidation.
+mod node_modules;
+pub use node_modules::{NodeModulesPath, NodeModulesView};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,17 +16,26 @@ pub(crate) enum PnpRoute {
     Managed(Arc<PnpManifest>),
 }
 
+/// Resolver-owned authority retained when an installed package lives outside its PnP project.
+/// A new filesystem generation revalidates the referenced manifest; callers cannot forge roots.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ResolutionContext {
+    pnp_root: Option<PathBuf>,
+}
+
 /// 按 issuer 发现最近 PnP 根，并缓存成功及失败清单。
 pub(crate) struct PnpRegistry {
     fs: Arc<dyn FileSystem>,
+    context: ResolutionContext,
     roots: Mutex<FxHashMap<PathBuf, Option<PathBuf>>>,
     manifests: Mutex<FxHashMap<PathBuf, Result<Arc<PnpManifest>, PnpLoadError>>>,
 }
 
 impl PnpRegistry {
-    fn new(fs: Arc<dyn FileSystem>) -> Self {
+    fn new(fs: Arc<dyn FileSystem>, context: ResolutionContext) -> Self {
         Self {
             fs,
+            context,
             roots: Mutex::new(FxHashMap::default()),
             manifests: Mutex::new(FxHashMap::default()),
         }
@@ -53,8 +64,43 @@ impl PnpRegistry {
         manifest
     }
 
+    fn context_for_issuer(&self, issuer_dir: &Path) -> Result<ResolutionContext, PnpLoadError> {
+        self.context_for_issuer_with(issuer_dir, &self.context)
+    }
+
+    fn context_for_issuer_with(
+        &self,
+        issuer_dir: &Path,
+        inherited: &ResolutionContext,
+    ) -> Result<ResolutionContext, PnpLoadError> {
+        if let Some(root) = self.discover_root(issuer_dir) {
+            // Nearest physical authority is final, including ignored/unmanaged or invalid input.
+            self.manifest(&root)?;
+            return Ok(ResolutionContext {
+                pnp_root: Some(root),
+            });
+        }
+        if let Some(root) = &inherited.pnp_root
+            && self.manifest(root)?.owns_issuer(issuer_dir)
+        {
+            return Ok(inherited.clone());
+        }
+        Ok(ResolutionContext::default())
+    }
+
     pub(crate) fn route(&self, issuer_dir: &Path) -> Result<PnpRoute, PnpLoadError> {
-        let Some(root) = self.discover_root(issuer_dir) else {
+        self.route_with(issuer_dir, &self.context)
+    }
+
+    fn route_with(
+        &self,
+        issuer_dir: &Path,
+        inherited: &ResolutionContext,
+    ) -> Result<PnpRoute, PnpLoadError> {
+        let Some(root) = self
+            .context_for_issuer_with(issuer_dir, inherited)?
+            .pnp_root
+        else {
             return Ok(PnpRoute::NoManifest);
         };
         let manifest = self.manifest(&root)?;
@@ -88,8 +134,18 @@ impl ResolutionEnvironment {
     }
 
     pub fn with_options(base_fs: Arc<dyn FileSystem>, options: ResolveOptions) -> Self {
+        Self::with_context(base_fs, options, ResolutionContext::default())
+    }
+
+    /// Create an isolated resolver cache for a previously observed authority and new filesystem.
+    /// Actual ancestor PnP roots still win; inherited authority only owns declared package paths.
+    pub fn with_context(
+        base_fs: Arc<dyn FileSystem>,
+        options: ResolveOptions,
+        context: ResolutionContext,
+    ) -> Self {
         let pnp_fs = Arc::new(PnpFileSystem::new(Arc::clone(&base_fs)));
-        let registry = Arc::new(PnpRegistry::new(Arc::clone(&base_fs)));
+        let registry = Arc::new(PnpRegistry::new(Arc::clone(&base_fs), context));
         let fs: Arc<dyn FileSystem> = pnp_fs.clone();
         let resolver = Arc::new(Resolver::with_registry(fs, Arc::clone(&registry), options));
         Self {
@@ -102,6 +158,19 @@ impl ResolutionEnvironment {
 
     pub fn resolver(&self) -> Arc<Resolver> {
         Arc::clone(&self.resolver)
+    }
+
+    pub fn context_for_issuer(&self, issuer_dir: &Path) -> Result<ResolutionContext, PnpLoadError> {
+        self.registry.context_for_issuer(&normalize(issuer_dir))
+    }
+
+    /// Read-only node_modules lookup projection for tools that query an installation filesystem.
+    /// Package visibility and physical/logical target selection remain resolver-owned.
+    pub fn node_modules_view(&self, issuer: &Path) -> Result<NodeModulesView, PnpLoadError> {
+        Ok(NodeModulesView::new(
+            self.registry.clone(),
+            self.context_for_issuer(issuer)?,
+        ))
     }
 
     pub fn file_system(&self) -> Arc<dyn FileSystem> {
@@ -161,6 +230,134 @@ mod tests {
     use crate::{PnpError, ResolveErrorKind};
     use wake_common::MemoryFileSystem;
 
+    #[test]
+    fn node_modules_view_keeps_installed_package_directory_boundaries_literal() {
+        let root = normalize(&std::env::temp_dir().join("installed-type-view"));
+        let disk = Arc::new(MemoryFileSystem::new());
+        disk.insert(
+            root.join(".pnp.cjs"),
+            "module.exports = require('./.pnp.data.json');",
+        );
+        let location = "./.yarn/__virtual__/pkg-one/0/cache/pkg.zip/node_modules/pkg/";
+        disk.insert(root.join(".pnp.data.json"), serde_json::json!({"packageRegistryData":[
+            [null,[[null,{"packageLocation":"./","packageDependencies":[["alias",["pkg","virtual:one"]]]}]]],
+            ["pkg",[["virtual:one",{"packageLocation":location,"packageDependencies":[]}]]]
+        ]}).to_string());
+        let environment = ResolutionEnvironment::new(disk);
+        let view = environment.node_modules_view(&root).unwrap();
+        for suffix in ["", "index.d.ts"] {
+            let path = normalize(&root.join(location).join(suffix));
+            assert_eq!(view.resolve(&path).unwrap(), NodeModulesPath::Native(path));
+        }
+    }
+
+    #[test]
+    fn node_modules_view_uses_pnp_visibility_aliases_scopes_and_transitive_authority() {
+        let root = normalize(&std::env::temp_dir().join("type-view-project"));
+        let cache = root.parent().unwrap().join("type-view-cache");
+        let fs = Arc::new(MemoryFileSystem::new());
+        fs.insert(
+            root.join(".pnp.cjs"),
+            "module.exports = require('./.pnp.data.json');",
+        );
+        fs.insert(root.join(".pnp.data.json"), serde_json::json!({
+            "ignorePatternData":"(^|/)ignored/", "enableTopLevelFallback":true,
+            "fallbackPool":[["fallback","npm:1"]],
+            "packageRegistryData":[
+                [null,[[null,{"packageLocation":"./","packageDependencies":[["first",["pkg","npm:1"]],["@scope/tool","npm:1"],["missing",null]]}]]],
+                ["pkg",[["npm:1",{"packageLocation":"../type-view-cache/pkg/","packageDependencies":[["peer","npm:1"]]}]]],
+                ["peer",[["npm:1",{"packageLocation":"../type-view-cache/peer/","packageDependencies":[]}]]],
+                ["@scope/tool",[["npm:1",{"packageLocation":"../type-view-cache/tool/","packageDependencies":[]}]]],
+                ["fallback",[["npm:1",{"packageLocation":"../type-view-cache/fallback/","packageDependencies":[]}]]]
+            ]
+        }).to_string());
+        fs.insert(
+            root.join("node_modules/undeclared/index.d.ts"),
+            "physical shadow",
+        );
+        let environment = ResolutionEnvironment::new(fs.clone());
+        let view = environment.node_modules_view(&root).unwrap();
+        assert_eq!(
+            view.resolve(&root.join("node_modules")).unwrap(),
+            NodeModulesPath::Directory(vec!["@scope".into(), "fallback".into(), "first".into()])
+        );
+        assert_eq!(
+            view.resolve(&root.join("node_modules/@scope")).unwrap(),
+            NodeModulesPath::Directory(vec!["tool".into()])
+        );
+        for (request, expected) in [
+            (
+                "node_modules/first/index.d.ts",
+                cache.join("pkg/index.d.ts"),
+            ),
+            (
+                "src/node_modules/first/node_modules/peer/index.d.ts",
+                cache.join("peer/index.d.ts"),
+            ),
+            (
+                "node_modules/@scope/tool/index.d.ts",
+                cache.join("tool/index.d.ts"),
+            ),
+            (
+                "node_modules/fallback/index.d.ts",
+                cache.join("fallback/index.d.ts"),
+            ),
+        ] {
+            let NodeModulesPath::Projected { path, context } =
+                view.resolve(&root.join(request)).unwrap()
+            else {
+                panic!("{request}");
+            };
+            assert_eq!(path, expected);
+            assert_eq!(context, environment.context_for_issuer(&root).unwrap());
+        }
+        for request in [
+            "node_modules/undeclared/index.d.ts",
+            "node_modules/missing/index.d.ts",
+            "node_modules/@absent",
+            "node_modules/@scope/absent",
+        ] {
+            assert_eq!(
+                view.resolve(&root.join(request)).unwrap(),
+                NodeModulesPath::Missing
+            );
+        }
+        let ordinary = root.join("ignored/node_modules/undeclared/index.d.ts");
+        assert_eq!(
+            view.resolve(&ordinary).unwrap(),
+            NodeModulesPath::Native(ordinary)
+        );
+        let outside = root
+            .parent()
+            .unwrap()
+            .join("unmanaged/node_modules/pkg/file.ts");
+        assert_eq!(
+            view.resolve(&outside).unwrap(),
+            NodeModulesPath::Native(outside)
+        );
+        let context = view.context_for_issuer(&cache.join("pkg")).unwrap();
+        assert_eq!(context, environment.context_for_issuer(&root).unwrap());
+        let retained = view.in_context(context);
+        assert!(
+            matches!(retained.resolve(&cache.join("pkg/node_modules/peer/index.d.ts")).unwrap(),
+            NodeModulesPath::Projected { path, .. } if path == cache.join("peer/index.d.ts"))
+        );
+        for ancestor in [&cache, root.parent().unwrap()] {
+            assert_eq!(
+                retained
+                    .resolve(&ancestor.join("node_modules/undeclared/index.d.ts"))
+                    .unwrap(),
+                NodeModulesPath::Missing,
+                "ancestor node_modules cannot bypass a PnP rejection"
+            );
+        }
+        fs.insert(root.join("nested/.pnp.cjs"), "broken");
+        assert!(
+            view.resolve(&root.join("nested/node_modules/first/index.d.ts"))
+                .is_err()
+        );
+    }
+
     fn manifest(package_location: &str, ignore_pattern: Option<&str>) -> String {
         let mut value = serde_json::json!({
             "enableTopLevelFallback": false,
@@ -203,6 +400,132 @@ mod tests {
             .resolve("ghost", Path::new("project/src"))
             .unwrap_err();
         assert!(matches!(error.kind(), ResolveErrorKind::PnpManifest(_)));
+    }
+
+    #[test]
+    fn package_request_identity_reuses_alias_and_pnp_routing_without_requiring_installation() {
+        for mode in ["absent", "managed", "ignored", "malformed"] {
+            let fs = Arc::new(MemoryFileSystem::new());
+            if mode == "malformed" {
+                fs.insert("project/.pnp.cjs", "truncated");
+            } else if mode != "absent" {
+                external_loader(
+                    &fs,
+                    "project",
+                    manifest(
+                        "../cache/ghost/node_modules/ghost/",
+                        (mode == "ignored").then_some("^src(?:/|$)"),
+                    ),
+                );
+            }
+            let environment = ResolutionEnvironment::with_options(
+                fs,
+                ResolveOptions {
+                    alias: vec![
+                        ("ghost".into(), "project/local.js".into()),
+                        ("@".into(), "project/src".into()),
+                    ],
+                    ..Default::default()
+                },
+            );
+            let resolver = environment.resolver();
+            let issuer = Path::new("project/src");
+            assert_eq!(
+                resolver.package_request("./relative", issuer).unwrap(),
+                None
+            );
+            assert_eq!(resolver.package_request("#imports", issuer).unwrap(), None);
+            assert_eq!(resolver.package_request("@/alias", issuer).unwrap(), None);
+            assert_eq!(resolver.package_request("@bad", issuer).unwrap(), None);
+            if mode == "malformed" {
+                assert!(matches!(
+                    resolver
+                        .package_request("ghost/sub", issuer)
+                        .unwrap_err()
+                        .kind(),
+                    ResolveErrorKind::PnpManifest(_)
+                ));
+            } else {
+                assert_eq!(
+                    resolver.package_request("ghost/sub", issuer).unwrap(),
+                    (mode != "absent").then_some("ghost")
+                );
+                assert_eq!(
+                    resolver
+                        .package_request("@scope/missing/deep", issuer)
+                        .unwrap(),
+                    Some("@scope/missing")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_context_owns_external_cache_issuers_without_capturing_other_projects() {
+        let fs = Arc::new(MemoryFileSystem::new());
+        external_loader(
+            &fs,
+            "project",
+            manifest("../cache/ghost/node_modules/ghost/", None),
+        );
+        external_loader(
+            &fs,
+            "nested",
+            manifest("../cache/other/node_modules/ghost/", None),
+        );
+        fs.insert(
+            "cache/ghost/node_modules/ghost/index.js",
+            "export default 1;",
+        );
+        fs.insert(
+            "cache/other/node_modules/ghost/index.js",
+            "export default 2;",
+        );
+        let environment = ResolutionEnvironment::new(fs.clone());
+        let context = environment
+            .context_for_issuer(Path::new("project/src"))
+            .unwrap();
+        assert_ne!(context, ResolutionContext::default());
+        let retained =
+            ResolutionEnvironment::with_context(fs, ResolveOptions::default(), context.clone());
+        assert_eq!(
+            retained
+                .context_for_issuer(Path::new("cache/ghost/node_modules/ghost"))
+                .unwrap(),
+            context
+        );
+        assert_eq!(
+            retained
+                .resolver()
+                .resolve("ghost", Path::new("cache/ghost/node_modules/ghost"))
+                .unwrap(),
+            PathBuf::from("cache/ghost/node_modules/ghost/index.js")
+        );
+        assert_eq!(
+            retained
+                .context_for_issuer(Path::new("unrelated/src"))
+                .unwrap(),
+            ResolutionContext::default()
+        );
+        assert_ne!(
+            retained
+                .context_for_issuer(Path::new("nested/src"))
+                .unwrap(),
+            context
+        );
+        assert_eq!(
+            retained
+                .resolver()
+                .resolve("ghost", Path::new("nested/src"))
+                .unwrap(),
+            PathBuf::from("cache/other/node_modules/ghost/index.js")
+        );
+        assert_eq!(
+            environment
+                .context_for_issuer(Path::new("cache/ghost/node_modules/ghost"))
+                .unwrap(),
+            ResolutionContext::default()
+        );
     }
 
     #[test]

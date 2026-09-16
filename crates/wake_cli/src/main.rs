@@ -4,7 +4,7 @@
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::ffi::OsString;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{
@@ -40,6 +40,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check source files with Wake's native lint rules.
+    Lint {
+        paths: Vec<String>,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
+        format: OutputFormat,
+        #[arg(long, requires = "stdin_filename", conflicts_with = "paths")]
+        stdin: bool,
+        #[arg(long, requires = "stdin")]
+        stdin_filename: Option<String>,
+        #[arg(long)]
+        max_warnings: Option<usize>,
+        #[arg(long, conflicts_with_all = ["fix_dry_run", "stdin"])]
+        fix: bool,
+        #[arg(long)]
+        fix_dry_run: bool,
+        #[arg(long, conflicts_with_all = ["paths", "stdin", "fix", "fix_dry_run", "max_warnings"])]
+        print_config: Option<String>,
+        /// List native rule metadata as JSON without loading a project.
+        #[arg(long, conflicts_with_all = ["paths", "stdin", "print_config", "rules", "globals", "environments", "fix", "fix_dry_run", "max_warnings"])]
+        list_rules: bool,
+        /// Cache read-only file diagnostics by source content and effective rules.
+        #[arg(long, conflicts_with_all = ["print_config", "list_rules"])]
+        cache: bool,
+        /// Override a rule: id=off|warn|error or id={"level":"error","options":{...}}.
+        #[arg(long = "rule")]
+        rules: Vec<String>,
+        /// Override a global: name=readonly|writable|off. May be repeated.
+        #[arg(long = "global")]
+        globals: Vec<String>,
+        /// Enable a built-in host global set: browser or node. May be repeated.
+        #[arg(long = "env")]
+        environments: Vec<String>,
+        #[arg(long, conflicts_with_all = ["generate_baseline", "prune_baseline", "print_config", "list_rules"])]
+        baseline: Option<String>,
+        #[arg(long, conflicts_with_all = ["prune_baseline", "print_config", "list_rules", "stdin", "fix", "fix_dry_run", "max_warnings"])]
+        generate_baseline: Option<String>,
+        #[arg(long, conflicts_with_all = ["paths", "print_config", "list_rules", "stdin", "fix", "fix_dry_run", "max_warnings"])]
+        prune_baseline: Option<String>,
+        #[arg(long, conflicts_with_all = ["stdin", "fix", "fix_dry_run", "print_config", "list_rules", "generate_baseline", "prune_baseline"])]
+        watch: bool,
+    },
     /// Build an application.
     Build {
         /// Optional entry file. Configuration is used when omitted.
@@ -426,6 +469,107 @@ fn main() -> ExitCode {
     };
 
     let result = match cli.command {
+        Command::Lint {
+            paths,
+            root,
+            format,
+            stdin,
+            stdin_filename,
+            max_warnings,
+            fix,
+            fix_dry_run,
+            print_config,
+            list_rules,
+            cache,
+            rules,
+            globals,
+            environments,
+            baseline,
+            generate_baseline,
+            prune_baseline,
+            watch,
+        } => ensure_static_mode(cli.ui).and_then(|()| {
+            let stdin = if stdin {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .map_err(|error| {
+                        eprintln!("wake: could not read stdin: {error}");
+                        ExitCode::from(2)
+                    })?;
+                Some(wake_app::LintStdin {
+                    filename: stdin_filename.expect("clap requires stdin filename"),
+                    text,
+                })
+            } else {
+                None
+            };
+            let options = wake_app::LintProjectOptions {
+                root,
+                paths,
+                stdin,
+                max_warnings,
+                print_config,
+                list_rules,
+                cache,
+                baseline: baseline
+                    .map(|path| wake_app::LintBaselineOptions {
+                        path,
+                        mode: wake_app::LintBaselineMode::Check,
+                    })
+                    .or_else(|| {
+                        generate_baseline.map(|path| wake_app::LintBaselineOptions {
+                            path,
+                            mode: wake_app::LintBaselineMode::Generate,
+                        })
+                    })
+                    .or_else(|| {
+                        prune_baseline.map(|path| wake_app::LintBaselineOptions {
+                            path,
+                            mode: wake_app::LintBaselineMode::Prune,
+                        })
+                    }),
+                rules: rules
+                    .into_iter()
+                    .map(|input| {
+                        wake_app::parse_lint_rule_argument(&input).map_err(|error| {
+                            eprintln!("wake: {error}");
+                            ExitCode::from(2)
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                globals: globals
+                    .into_iter()
+                    .map(|input| {
+                        wake_app::parse_lint_global_argument(&input).map_err(|error| {
+                            eprintln!("wake: {error}");
+                            ExitCode::from(2)
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                environments: environments
+                    .into_iter()
+                    .map(|input| {
+                        wake_app::parse_lint_environment_argument(&input).map_err(|error| {
+                            eprintln!("wake: {error}");
+                            ExitCode::from(2)
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                fix: if fix {
+                    wake_app::LintFixMode::Write
+                } else if fix_dry_run {
+                    wake_app::LintFixMode::DryRun
+                } else {
+                    wake_app::LintFixMode::Off
+                },
+            };
+            if watch {
+                cmd_lint_watch(options, format)
+            } else {
+                cmd_lint(options, format)
+            }
+        }),
         Command::Build {
             entry,
             outdir,
@@ -2669,6 +2813,124 @@ fn cmd_docs_build(
     Ok(())
 }
 
+fn cmd_lint(options: wake_app::LintProjectOptions, format: OutputFormat) -> Result<(), ExitCode> {
+    let preview = options.fix == wake_app::LintFixMode::DryRun;
+    let result = wake_app::lint_project(options, &wake_app::CancellationToken::default()).map_err(
+        |error| {
+            eprintln!("wake: {error}");
+            ExitCode::from(2)
+        },
+    )?;
+    render_lint_result(&result, preview, format)?;
+    if result.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(ExitCode::from(result.exit_code))
+    }
+}
+
+fn render_lint_result(
+    result: &wake_app::LintProjectResult,
+    preview: bool,
+    format: OutputFormat,
+) -> Result<(), ExitCode> {
+    if result.config.is_some() || result.catalog.is_some() || format.resolve() == OutputFormat::Json
+    {
+        let json = serde_json::to_string_pretty(&result).map_err(|error| {
+            eprintln!("wake: could not serialize lint result: {error}");
+            ExitCode::from(2)
+        })?;
+        println!("{json}");
+    } else {
+        for file in &result.files {
+            for diagnostic in &file.diagnostics {
+                println!("{}", format_diagnostic_plain(&diagnostic.diagnostic));
+            }
+            if preview && let Some(output) = &file.output {
+                println!("=== {} (fixed preview) ===\n{output}", file.path);
+            } else if file.written {
+                println!("Fixed {}", file.path);
+            }
+        }
+        if let Some(cache) = &result.cache {
+            for warning in &cache.warnings {
+                println!("Cache: {warning}");
+            }
+        }
+        if let Some(baseline) = &result.baseline {
+            println!(
+                "Baseline {}: {} suppressed, {} stale, {} ambiguous, {} entries{}",
+                baseline.path,
+                baseline.suppressed,
+                baseline.stale,
+                baseline.ambiguous,
+                baseline.entries,
+                if baseline.written { ", written" } else { "" }
+            );
+        }
+        println!(
+            "{} files, {} errors, {} warnings",
+            result.files.len(),
+            result.error_count,
+            result.warning_count
+        );
+    }
+    Ok(())
+}
+
+fn cmd_lint_watch(
+    options: wake_app::LintProjectOptions,
+    format: OutputFormat,
+) -> Result<(), ExitCode> {
+    let fail = |error: wake_app::WakeError| {
+        eprintln!("wake: {error}");
+        ExitCode::from(2)
+    };
+    let context = wake_app::LintContext::create_for_watch(options).map_err(fail)?;
+    let watcher = wake_app::LintWatcher::start(context.clone()).map_err(fail)?;
+    let signals = shutdown_signals().map_err(|error| {
+        eprintln!("wake: could not install lint interrupt handler: {error}");
+        ExitCode::from(2)
+    })?;
+    loop {
+        for event in watcher.drain_events() {
+            if format.resolve() == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema":"wake.lint.watch.v1", "event":event})
+                );
+            } else {
+                match event {
+                    wake_app::LintWatchEvent::CheckStart { .. } => println!("Checking..."),
+                    wake_app::LintWatchEvent::Checked { snapshot } => {
+                        render_lint_result(&snapshot.result, false, OutputFormat::Human)?
+                    }
+                    wake_app::LintWatchEvent::Diagnostic { error, .. } => {
+                        eprintln!("wake: {error}")
+                    }
+                }
+            }
+        }
+        match signals.recv_timeout(Duration::from_millis(30)) {
+            Ok(code) => {
+                watcher.stop();
+                context.close();
+                return Err(ExitCode::from(code));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                watcher.stop();
+                context.close();
+                return Err(ExitCode::from(2));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if !watcher.is_watching() {
+            context.close();
+            return Err(ExitCode::from(2));
+        }
+    }
+}
+
 fn cmd_parse(
     file: &Path,
     ast: bool,
@@ -2732,7 +2994,9 @@ fn cmd_parse(
                 interner.resolve(dependency.specifier)
             );
         }
-        let model = output.module.with_ast(wake_ecma_semantic::analyze);
+        let model = output
+            .module
+            .with_ast(|program| wake_ecma_semantic::analyze(program, &interner));
         println!(
             "  Scopes {:<12} Symbols {:<10} Unresolved {}",
             model.scopes.len(),

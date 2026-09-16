@@ -33,3 +33,6 @@ open.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 mimalloc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

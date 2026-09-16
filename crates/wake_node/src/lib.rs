@@ -22,6 +22,9 @@ struct ContextResource {
     context: wake_app::BuildContext,
 }
 
+mod lint_context;
+use lint_context::{LintContextResource, LintTaskResource};
+
 struct ServerResource {
     server: wake_app::DevServer,
 }
@@ -269,6 +272,8 @@ impl Drop for TestContextResource {
 #[derive(Default)]
 struct EnvResources {
     contexts: Mutex<Vec<Weak<ContextResource>>>,
+    lint_contexts: Mutex<Vec<Weak<LintContextResource>>>,
+    lint_tasks: Mutex<Vec<Weak<LintTaskResource>>>,
     servers: Mutex<Vec<Weak<ServerResource>>>,
     test_contexts: Mutex<Vec<Weak<TestContextResource>>>,
 }
@@ -276,6 +281,29 @@ struct EnvResources {
 impl EnvResources {
     #[cfg_attr(test, allow(dead_code))]
     fn close_all(&self) {
+        let lint_contexts = {
+            let mut contexts = self
+                .lint_contexts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *contexts)
+        };
+        for context in lint_contexts
+            .into_iter()
+            .filter_map(|context| context.upgrade())
+        {
+            context.close();
+        }
+        let lint_tasks = {
+            let mut tasks = self
+                .lint_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *tasks)
+        };
+        for task in lint_tasks.into_iter().filter_map(|task| task.upgrade()) {
+            task.close();
+        }
         let contexts = {
             let mut contexts = self
                 .contexts
@@ -1111,6 +1139,110 @@ struct RawBundleOptions {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct RawLintOptions {
+    root: Option<String>,
+    paths: Vec<String>,
+    stdin: Option<RawLintStdin>,
+    max_warnings: Option<usize>,
+    fix: RawLintFixMode,
+    print_config: Option<String>,
+    list_rules: bool,
+    cache: bool,
+    baseline: Option<wake_app::LintBaselineOptions>,
+    rules: std::collections::BTreeMap<String, serde_json::Value>,
+    globals: std::collections::BTreeMap<String, serde_json::Value>,
+    environments: Vec<String>,
+}
+
+impl RawLintOptions {
+    fn into_app(self) -> wake_app::LintProjectOptions {
+        wake_app::LintProjectOptions {
+            root: self
+                .root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            paths: self.paths,
+            stdin: self.stdin.map(|input| wake_app::LintStdin {
+                filename: input.filename,
+                text: input.text,
+            }),
+            max_warnings: self.max_warnings,
+            print_config: self.print_config,
+            list_rules: self.list_rules,
+            cache: self.cache,
+            baseline: self.baseline,
+            rules: self.rules,
+            globals: self.globals,
+            environments: self.environments,
+            fix: match self.fix {
+                RawLintFixMode::Off => wake_app::LintFixMode::Off,
+                RawLintFixMode::DryRun => wake_app::LintFixMode::DryRun,
+                RawLintFixMode::Write => wake_app::LintFixMode::Write,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawLintFixMode {
+    #[default]
+    Off,
+    DryRun,
+    Write,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawLintStdin {
+    filename: String,
+    text: String,
+}
+
+#[napi(js_name = "lint")]
+pub fn native_lint(options_json: Option<String>) -> napi::Result<NativeLintTask> {
+    let raw = parse_optional_node_request::<RawLintOptions>(options_json, "WAKE_LINT_CONFIG")
+        .map_err(napi_wake_error)?;
+    let resource = Arc::new(LintTaskResource::new(raw.into_app()).map_err(napi_wake_error)?);
+    let resources = current_env_resources();
+    let mut tasks = resources
+        .lint_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tasks.retain(|task| task.strong_count() > 0);
+    tasks.push(Arc::downgrade(&resource));
+    Ok(NativeLintTask { resource })
+}
+
+#[napi]
+pub struct NativeLintTask {
+    resource: Arc<LintTaskResource>,
+}
+
+#[napi]
+impl NativeLintTask {
+    #[napi]
+    pub fn poll(&self) -> napi::Result<Option<String>> {
+        self.resource.poll().map_err(napi_wake_error)
+    }
+    #[napi]
+    pub fn cancel(&self) {
+        self.resource.cancel();
+    }
+    #[napi]
+    pub fn poll_closed(&self) -> bool {
+        self.resource.poll_closed()
+    }
+}
+
+impl Drop for NativeLintTask {
+    fn drop(&mut self) {
+        self.resource.cancel();
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawGenerateCssTokenOptions {
     cwd: Option<String>,
     config_path: Option<String>,
@@ -1121,6 +1253,168 @@ struct RawGenerateCssTokenOptions {
 struct RawGenerateDocgenOptions {
     cwd: Option<String>,
     entry: Option<String>,
+}
+
+#[napi]
+pub struct NativeLintContext {
+    resource: Arc<LintContextResource>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct RawLintContextOptions {
+    root: Option<String>,
+    paths: Vec<String>,
+    max_warnings: Option<usize>,
+    cache: bool,
+    rules: BTreeMap<String, serde_json::Value>,
+    globals: BTreeMap<String, serde_json::Value>,
+    environments: Vec<String>,
+    baseline: Option<wake_app::LintBaselineOptions>,
+    watch: bool,
+}
+
+#[napi]
+impl NativeLintContext {
+    #[napi]
+    pub fn start_watch(&self) -> napi::Result<()> {
+        self.resource.start_watch().map_err(napi_wake_error)
+    }
+    #[napi]
+    pub fn stop_watch(&self) {
+        self.resource.stop_watch();
+    }
+    #[napi]
+    pub fn poll_watch_stopped(&self) -> bool {
+        self.resource.poll_watch_stopped()
+    }
+    #[napi(getter)]
+    pub fn watching(&self) -> bool {
+        self.resource.is_watching()
+    }
+    #[napi]
+    pub fn poll_watch(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.resource.drain_watch())
+            .map_err(|e| napi_wake_error(WakeError::new("WAKE_INTERNAL", e.to_string())))
+    }
+    #[napi]
+    pub fn start_check(&self) -> napi::Result<f64> {
+        self.resource
+            .start()
+            .map(|id| id as f64)
+            .map_err(napi_wake_error)
+    }
+
+    #[napi]
+    pub fn poll_check(&self, generation: f64) -> napi::Result<Option<String>> {
+        self.resource.poll(generation).map_err(napi_wake_error)
+    }
+    #[napi]
+    pub fn cancel_check(&self, generation: f64) -> napi::Result<()> {
+        self.resource.cancel(generation).map_err(napi_wake_error)
+    }
+
+    #[napi]
+    pub fn update_document(&self, json: String) -> napi::Result<()> {
+        let document = deserialize_node_request::<wake_app::LintDocument>(&json)
+            .map_err(|e| napi_wake_error(WakeError::new("WAKE_LINT_CONFIG", e)))?;
+        self.resource
+            .context
+            .update_document(document)
+            .map_err(napi_wake_error)
+    }
+
+    #[napi]
+    pub fn close_document(&self, json: String) -> napi::Result<()> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            filename: String,
+            version: i64,
+        }
+        let request = deserialize_node_request::<Request>(&json)
+            .map_err(|e| napi_wake_error(WakeError::new("WAKE_LINT_CONFIG", e)))?;
+        self.resource
+            .context
+            .close_document(&request.filename, request.version)
+            .map_err(napi_wake_error)
+    }
+
+    #[napi]
+    pub fn invalidate(&self) -> napi::Result<f64> {
+        self.resource
+            .context
+            .invalidate()
+            .map(|generation| generation as f64)
+            .map_err(napi_wake_error)
+    }
+    #[napi(getter)]
+    pub fn generation(&self) -> f64 {
+        self.resource.context.generation() as f64
+    }
+    #[napi(getter)]
+    pub fn closed(&self) -> bool {
+        self.resource.context.is_closed()
+    }
+    #[napi]
+    pub fn close(&self) {
+        self.resource.request_close();
+    }
+    #[napi]
+    pub fn poll_closed(&self) -> bool {
+        self.resource.poll_closed()
+    }
+}
+
+impl Drop for NativeLintContext {
+    fn drop(&mut self) {
+        self.resource.request_close();
+    }
+}
+
+#[napi(js_name = "createLintContext")]
+pub fn create_lint_context(options_json: Option<String>) -> napi::Result<NativeLintContext> {
+    let (context, watch) = catch_unwind(AssertUnwindSafe(|| {
+        let raw =
+            parse_optional_node_request::<RawLintContextOptions>(options_json, "WAKE_LINT_CONFIG")?;
+        let options = wake_app::LintProjectOptions {
+            root: raw
+                .root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            paths: raw.paths,
+            max_warnings: raw.max_warnings,
+            cache: raw.cache,
+            rules: raw.rules,
+            globals: raw.globals,
+            environments: raw.environments,
+            baseline: raw.baseline,
+            ..Default::default()
+        };
+        let context = if raw.watch {
+            wake_app::LintContext::create_for_watch(options)
+        } else {
+            wake_app::LintContext::create(options)
+        }?;
+        Ok::<_, WakeError>((context, raw.watch))
+    }))
+    .map_err(|_| {
+        napi_wake_error(WakeError::new(
+            "WAKE_INTERNAL",
+            "Lint context creation panicked",
+        ))
+    })?
+    .map_err(napi_wake_error)?;
+    let resource = Arc::new(LintContextResource::new(context).map_err(napi_wake_error)?);
+    if watch {
+        resource.start_watch().map_err(napi_wake_error)?;
+    }
+    current_env_resources()
+        .lint_contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::downgrade(&resource));
+    Ok(NativeLintContext { resource })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1973,7 +2267,7 @@ impl NativeParsedModule {
             let semantic = parsed
                 .output
                 .module
-                .with_ast(wake_ecma_semantic::analyze);
+                .with_ast(|program| wake_ecma_semantic::analyze(program, &parsed.interner));
             let scopes = semantic
                 .scopes
                 .iter()
@@ -2646,6 +2940,20 @@ mod tests {
 
     #[test]
     fn one_shot_option_dtos_are_closed_and_type_checked() {
+        assert_closed_options::<RawLintOptions>(
+            r#"{"root":".","paths":[],"stdin":{"filename":"input.tsx","text":"<div />"},"maxWarnings":0,"fix":"dry-run","printConfig":"virtual.ts","rules":{"js/no-debugger":"off"}}"#,
+            &[
+                r#"{"printConfig":true}"#,
+                r#"{"rules":[]}"#,
+                r#"{"fix":true}"#,
+                r#"{"fix":"dry_run"}"#,
+                r#"{"entry":"input.tsx"}"#,
+                r#"{"maxWarnings":-1}"#,
+                r#"{"maxWarnings":"0"}"#,
+                r#"{"stdin":{"filename":"input.ts"}}"#,
+                r#"{"stdin":{"filename":"input.ts","text":"","extra":true}}"#,
+            ],
+        );
         assert_closed_options::<RawBuildOptions>(
             r#"{"cwd":".","configPath":"wake.config.toml","entry":"src/index.ts","outdir":"dist","cache":true,"sourceMap":true,"federation":{"enabled":false}}"#,
             &[

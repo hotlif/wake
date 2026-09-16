@@ -116,7 +116,7 @@ pages = ["reference/configuration/project", "reference/configuration/dev-server"
 [[group.section]]
 id = "cli"
 title = "命令行"
-pages = ["reference/cli/build", "reference/cli/dev", "reference/cli/bundle", "reference/cli/library", "reference/cli/test", "reference/cli/docs", "reference/cli/federation"]
+pages = ["reference/cli/build", "reference/cli/dev", "reference/cli/bundle", "reference/cli/library", "reference/cli/test", "reference/cli/lint", "reference/cli/docs", "reference/cli/federation"]
 
 [[group.section]]
 id = "node-api"

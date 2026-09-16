@@ -57,6 +57,15 @@ mod federation_type_sync;
 mod federation_type_watch;
 mod federation_types;
 mod library;
+mod lint;
+pub use lint::{
+    LintBaselineMode, LintBaselineOptions, LintBaselineStats, LintCacheStats, LintCheck,
+    LintContext, LintDiagnosticInfo, LintDocument, LintEffectiveConfig, LintEffectiveRule,
+    LintFileResult, LintFixInfo, LintFixMode, LintProjectOptions, LintProjectResult,
+    LintRuleCatalog, LintSnapshot, LintStdin, LintTextEdit, LintWatchEvent, LintWatcher,
+    lint_project, parse_lint_environment_argument, parse_lint_global_argument,
+    parse_lint_rule_argument,
+};
 mod output;
 pub use federation_init::{
     FederationInitFileStatus, FederationInitResult, initialize_federation_types,

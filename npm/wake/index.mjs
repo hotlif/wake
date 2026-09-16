@@ -2,6 +2,7 @@ import api from './index.cjs'
 
 export const {
   BuildContext,
+  LintContext,
   DevServer,
   TestContext,
   WakeError,
@@ -9,12 +10,14 @@ export const {
   buildLibrary,
   buildDocs,
   bundle,
+  lint,
   runTests,
   generateCssToken,
   generateDocgen,
   initializeFederation,
   generateFederationLock,
   createBuildContext,
+  createLintContext,
   createTestContext,
   startDevServer,
   startDocsDevServer,

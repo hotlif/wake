@@ -107,6 +107,7 @@ wake_compiler = { path = "crates/wake_compiler" }
 wake_config = { path = "crates/wake_config" }
 wake_scan = { path = "crates/wake_scan" }
 wake_html = { path = "crates/wake_html" }
+wake_lint_core = { path = "crates/wake_lint_core" }
 wake_turbo = { path = "crates/wake_turbo" }
 wake_turbo_macros = { path = "crates/wake_turbo_macros" }
 wake_ecma_ast = { path = "crates/wake_ecma_ast" }

@@ -367,6 +367,50 @@ impl PnpManifest {
         self.dependency_tree_roots.iter()
     }
 
+    pub(crate) fn issuer_location(&self, issuer: &Path) -> Option<&Path> {
+        let locator = self.find_package_locator(issuer)?;
+        self.packages
+            .get(locator)
+            .map(|package| package.location.as_path())
+    }
+
+    pub(crate) fn has_package_below(&self, directory: &Path) -> bool {
+        self.locations
+            .iter()
+            .any(|(location, _)| path_has_prefix(location, directory))
+    }
+
+    /// Enumerate only names that the existing dependency/fallback algorithm can actually resolve.
+    pub(crate) fn visible_dependencies(&self, issuer: &Path) -> Vec<String> {
+        let Some(locator) = self.find_package_locator(issuer) else {
+            return Vec::new();
+        };
+        let mut names = FxHashSet::default();
+        if let Some(package) = self.packages.get(locator) {
+            names.extend(package.dependencies.keys());
+        }
+        if self.enable_top_level_fallback && !self.fallback_exclusion.contains(locator) {
+            if let Some(top) = self.packages.get(&Locator {
+                ident: None,
+                reference: None,
+            }) {
+                names.extend(top.dependencies.keys());
+            }
+            names.extend(self.fallback_pool.keys());
+        }
+        let mut names: Vec<_> = names
+            .into_iter()
+            .filter(|name| {
+                crate::is_valid_bare_package_specifier(name)
+                    && crate::split_package_ref(name).1.is_empty()
+                    && self.resolve_bare(name, issuer).is_ok()
+            })
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// 解析裸说明符到「未限定」路径（相对 cwd；可能虚拟 / 指向 zip）。
     ///
     /// 返回的路径需再经 [`crate::Resolver`] 的文件/目录解析补 main/index/扩展名。

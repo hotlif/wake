@@ -72,8 +72,122 @@ pub struct Config {
     pub docs: Docs,
     /// Wake-owned React test runner configuration.
     pub test: Test,
+    /// Native lint discovery and ordered rule overrides. Rule identity validation is owned by
+    /// the lint core through the application layer, including overrides that match no file.
+    pub lint: Lint,
     /// 手动强制启用/禁用特定 Babel 风格 transform 名。
     pub transforms: TransformControl,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Lint {
+    pub recommended: bool,
+    pub presets: Vec<String>,
+    pub report_unused_disable: LintRuleLevel,
+    pub files: Vec<String>,
+    pub ignore: Vec<String>,
+    pub rules: BTreeMap<String, LintRuleSetting>,
+    /// Data only; names and modes are validated by the lint core before matching.
+    pub globals: BTreeMap<String, serde_json::Value>,
+    /// Versioned built-in host global sets (`browser` and `node`).
+    pub environments: Vec<String>,
+    pub overrides: Vec<LintOverride>,
+    pub types: Option<LintTypes>,
+    /// Closed mapping from file globs to built-in source processors.
+    pub processors: BTreeMap<String, String>,
+}
+
+impl Default for Lint {
+    fn default() -> Self {
+        Self {
+            recommended: true,
+            presets: Vec::new(),
+            report_unused_disable: LintRuleLevel::Warn,
+            files: ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"]
+                .into_iter()
+                .map(|ext| format!("**/*.{ext}"))
+                .collect(),
+            ignore: Vec::new(),
+            rules: BTreeMap::new(),
+            globals: BTreeMap::new(),
+            environments: Vec::new(),
+            overrides: Vec::new(),
+            types: None,
+            processors: BTreeMap::new(),
+        }
+    }
+}
+
+/// Data-only native type service selection. The app validates paths and resolves the compiler.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LintTypes {
+    pub compiler: String,
+    pub projects: Vec<String>,
+}
+impl Default for LintTypes {
+    fn default() -> Self {
+        Self {
+            compiler: "typescript".into(),
+            projects: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LintOverride {
+    pub files: Vec<String>,
+    pub rules: BTreeMap<String, LintRuleSetting>,
+    pub globals: BTreeMap<String, serde_json::Value>,
+    pub environments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum LintRuleSetting {
+    Level(LintRuleLevel),
+    Options(LintRuleOptions),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintRuleOptions {
+    pub level: LintRuleLevel,
+    #[serde(default)]
+    pub options: BTreeMap<String, serde_json::Value>,
+}
+
+impl LintRuleSetting {
+    pub fn level(&self) -> LintRuleLevel {
+        match self {
+            Self::Level(level) => *level,
+            Self::Options(setting) => setting.level,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.level().as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintRuleLevel {
+    Off,
+    Warn,
+    Error,
+}
+
+impl LintRuleLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
 }
 
 fn deserialize_federation_config<'de, D>(deserializer: D) -> Result<FederationConfig, D::Error>

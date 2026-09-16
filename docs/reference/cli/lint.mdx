@@ -1,0 +1,439 @@
++++
+title = "lint 命令"
+description = "检查 JavaScript、TypeScript 和 JSX 源码中的基础问题。"
+kind = "reference"
+status = "experimental"
++++
+
+# wake lint
+
+实验性原生 lint 入口。提供 JS、TS 语法、JSX、Hooks、无障碍、模块、风格和原生类型规则。
+支持规则参数、预设、文件覆盖、注释抑制、版本化上下文、文件监听、有界文件并行、原生类型服务、LSP
+quick-fix 和声明式 Markdown 处理器；任意动态插件仍不在兼容范围内。
+
+## 类型规则
+
+类型规则使用项目中声明的 TypeScript 7.0.2 原生编译器。例如 npm alias
+`@typescript/native` 指向 `typescript@7.0.2` 时，可配置：
+
+```toml
+[lint.types]
+compiler = "@typescript/native"
+projects = ["tsconfig.json"]
+
+[lint.rules]
+"ts/no-unsafe-call" = "error"
+```
+
+`compiler` 默认 `typescript`；`projects` 必须列出 1–64 个相对 lint 根目录的 tsconfig 文件，
+不展开 glob。只有所选文件启用了类型规则才启动服务。缺少配置、编译器版本不符、文件不属于
+配置的 program、项目归属歧义或类型查询不完整均返回分析错误，退出码 2。`--print-config`
+展示类型设置而不启动编译器。类型解析遵循 tsconfig；模块规则遵循 Wake 模块解析配置。
+类型规则使用修复后的最终源码和未保存文档，绕过单文件持久化缓存。
+
+字符串字面量类型按 UTF-16 码元比较，保留孤立代理项，不与替换字符混同。当前原生编译器
+对部分枚举字符串值和结构属性名称无法提供可验证的无损值；遇到这类歧义时返回
+`WAKE_LINT_ANALYSIS`（退出码 2），而不继续判断 switch 穷尽性或类型断言是否冗余。
+
+`ts/no-unsafe-call` 检查普通/可选调用、构造器及模板标签中的 `any`、未解析类型和缺少可用
+签名的标准 `Function` 类型；默认关闭且不自动修复。用户定义的同名类型不会仅凭名称被
+识别为标准 `Function`。类型诊断同样支持禁用注释、基线、stdin、上下文和监听。
+
+`ts/restrict-template-expressions` 检查无标签模板的插值，拒绝没有明确许可的隐式字符串转换。
+字符串及字符串品牌类型始终允许；联合类型必须每个成员均允许，泛型按其约束检查。
+`allow_any`、`allow_number`（含 bigint）、`allow_boolean`、`allow_nullish` 默认 true；
+`allow_regexp`、`allow_never` 默认 false。对象、数组、symbol、unknown、void 和无约束泛型
+默认不允许；RegExp 例外须证明标准库身份。标签模板由标签函数解释参数，不受此规则限制。
+本规则默认关闭且不自动修复。
+
+## 模块依赖规则
+
+六条 `import/` 规则默认关闭，使用项目中的实际依赖图，不自动移动或改写导入。
+导入属性的字符串键和值按 UTF-16 码元比较，支持孤立代理项；改变属性顺序或等价转义不改变
+重复导入判断。静态属性子句不允许重复键，动态 import options 的对象属性按后写值覆盖。
+类型导入和动态 import/require 字面量保留完整模块字符串。含孤立代理项的说明符不能进入
+当前 UTF-8 模块解析器，会由 `import/no-unresolved` 报告；它们不属于动态未知请求。
+运行时静态 import/export 的同类说明符仍会产生解析错误，相关支持正在迁移。
+
+```toml
+[lint.rules]
+"import/no-unresolved" = "error"
+"import/no-cycle" = "error"
+"import/no-duplicates" = "warn"
+"import/no-extraneous-dependencies" = "error"
+```
+
+| 规则 | 参数与行为 |
+| --- | --- |
+| `import/no-unresolved` | 检查缺失和动态未知请求；`commonjs`、`dynamic_imports`、`include_types`、`report_unknown` 默认 true；`ignore` 为 Rust regex 列表。 |
+| `import/no-cycle` | 检查静态运行时导入与重导出的循环；`commonjs`、`dynamic_imports`、`include_types`、`ignore_external` 默认 false。无法完整分析的依赖报告 `incomplete`。 |
+| `import/no-duplicates` | 按解析身份、声明容器和导入属性检查重复静态导入；`separate_type_imports=true` 允许独立纯类型导入。 |
+| `import/no-restricted-paths` | `zones` 默认空；每项 `to`、`from` 是匹配 importer/目标路径的 Rust regex；可选目标例外 `except` regex 列表和 `message`。路径相对项目根，使用 `/`。 |
+| `import/no-extraneous-dependencies` | 按导入方最近 `package.json` 声明判断；production 与 self-reference 允许，`dev_dependencies=false`、`optional_dependencies=true`、`peer_dependencies=true`、`include_types=true`。 |
+| `import/order` | `groups` 为 builtin/external/internal/parent/sibling/index/type/unknown 的完整排列；`alphabetize=ignore/asc/desc`、`case_insensitive=true`、`newlines=ignore/always/never`。默认忽略字母及空行顺序。 |
+
+规则使用 Wake alias、条件 exports、经典 npm 或 PnP 的解析身份，包括虚拟 peer 和 ZIP。
+纯类型请求使用声明入口及 types 条件；这一步提供模块解析事实，类型规则由后续类型服务提供。
+内建模块名称以 Node 24.0.0 为基线精确匹配；未知 `node:` 名称仍报告问题。
+损坏 PnP 清单导致分析失败，不回退到另一个安装布局。
+
+未选择或默认忽略的文件仍可能作为依赖参加分析，只有所选文件输出诊断。模块规则启用的文件
+绕过单文件缓存，统计记入 `bypassed`；混合项目的其他文件继续使用缓存。stdin、未保存文档、
+修复预览和修复写入均以该轮最终源码建立图，再统一处理注释抑制与基线。
+图最多 20,000 个文件、200,000 个请求和 128 MiB 源码；超限返回 `WAKE_LINT_ANALYSIS`，不发布部分修复。
+regex 最多 4096 字符，列表及 zones 最多 64 项；完整参数 schema 可通过 `--list-rules` 查看。
+
+## 批量抑制基线
+
+用 `wake lint --generate-baseline lint-baseline.json` 接纳当前唯一可识别的规则诊断，随后用
+`wake lint --baseline lint-baseline.json` 只检查剩余问题。`--prune-baseline lint-baseline.json`
+完整检查项目并清理过期条目，不添加新抑制。生成时可提供路径筛选，合并而不删除既有条目。
+
+文件使用 `wake.lint.baseline.v1` JSON schema，条目包含规范相对路径、规则、消息身份和源码上下文
+SHA-256 指纹。插入无关行不使匹配漂移；修改问题所在行会使旧条目过期。同文件重复相同上下文时
+全部报告，不自动分配旧抑制。语法和注释指令诊断不能加入基线。行上下文忽略首尾空白。
+
+三个基线选项互斥，不能与配置解释或规则目录组合。生成/清理不能与 stdin、修复或 max-warnings
+组合；清理不能筛选路径。检查可结合修复：每轮只修复基线外的诊断。缓存身份包含所用基线条目。
+生成的退出码反映合并后仍可见的问题；解析失败仍退出 1。清理保留解析失败或被忽略的现存文件条目。
+
+基线文件名须以 `.json` 结尾、位于项目根目录内，父目录已存在，至多 4 MiB/20,000 条。现有文件必须是有效基线，
+不会覆盖其他 JSON；符号链接、只读或多硬链接输出被拒绝。写入会复核先前内容和身份，原子提交。
+JSON/API 结果的 `baseline` 提供 `suppressed`、`stale`、`ambiguous`、`entries`、`written` 和 `path`。
+未选择或被忽略的文件不计过期；删除的文件只在完整检查时计过期。过期统计不增加 warningCount。
+Node 调用为 `lint({ baseline: { path: 'lint-baseline.json', mode: 'check' } })`，mode 可选
+`check`（默认）、`generate` 或 `prune`。其余限制与 CLI 相同。
+
+```bash
+wake lint . --root . --format human
+wake lint src --format json --max-warnings 0
+wake lint --stdin --stdin-filename src/example.ts
+```
+
+`--root` 默认为当前目录，只读取该目录的 `wake.config.toml`，不向上或向子包隐式合并配置。
+路径和 glob 相对 root；支持 `*`、`?`、`**`。递归发现不跟随符号链接。显式路径不存在、被忽略或
+模式无匹配时失败。省略路径时检查 root 中匹配的源码。默认只读取源码。
+
+```toml
+[lint]
+recommended = true
+report_unused_disable = "warn"
+files = ["**/*.js", "**/*.ts", "**/*.tsx"]
+ignore = ["**/generated/**"]
+
+[lint.rules]
+"js/no-debugger" = "error"
+"js/eqeqeq" = "warn"
+
+[[lint.overrides]]
+files = ["**/*.test.ts"]
+rules = { "js/no-debugger" = "off" }
+```
+
+处理器通过 `[lint.processors]` 将文件 glob 映射到内建处理器。当前唯一可用值是 `markdown`：它只提取带
+`js`、`javascript`、`mjs` 或 `cjs` 标签的 fenced 代码块，代码块外内容使用等长空白遮蔽，诊断仍引用宿主
+Markdown 的 UTF-8 字节范围。
+
+```toml
+[lint]
+files = ["docs/**/*.md"]
+[lint.processors]
+"docs/**/*.md" = "markdown"
+[lint.rules]
+"js/no-debugger" = "error"
+```
+
+处理器源码会绕过单文件持久化缓存。由于当前 Markdown 映射只保证诊断范围，`--fix` 和 `--fix-dry-run`
+会返回 `WAKE_LINT_CONFIG`，不会把虚拟代码块编辑写回宿主文档。
+处理器文件只支持单文件规则；启用模块图或类型规则时会返回分析错误，避免把宿主 Markdown 路径
+冒充 JavaScript/TypeScript 项目身份。
+
+独立扩展可安装 `@crab-dev/wake-lint-sdk` 使用 `wake.lint.extension.v1` 协议。SDK 冻结源码事实、
+校验 UTF-8 字节范围和编辑重叠，并将规则异常隔离为 `WAKE_LINT_EXTENSION`；它不会自动把第三方规则
+加入 `wake lint`，也不暴露 Wake 内部 AST 或 TypeScript 句柄。
+
+ESLint 配置迁移使用 `node scripts/lint-migration-report.mjs <eslintrc.json>` 生成
+`wake.lint.migration.v1` 报告。报告会映射规则注册表中的全部 Wake 原生规则，也识别未命名空间的
+ESLint 规则和 `@typescript-eslint/*` 别名；无法安全映射的插件规则、parser、processor、overrides
+和其他配置会保留在 `unsupported`/`unsupportedConfig`，不会被静默执行。迁移后的参数和语义仍需
+人工复核并写入 `wake.config.toml`。
+
+规则等级为 `off`、`warn`、`error`；参数使用 `{ level = "warn", options = { allow_null = true } }`。
+未知字段、规则、预设和参数类型均报错，包含 off 规则及未匹配的 override。
+`recommended = false` 从全部关闭开始。默认推荐启用：
+
+| 规则 | 默认等级 |
+| --- | --- |
+| `js/no-debugger` | error |
+| `js/no-empty` | error |
+| `js/no-duplicate-case` | error |
+| `js/no-dupe-keys` | error |
+| `js/eqeqeq` | warn |
+| `js/no-constant-condition` | warn |
+
+`no-empty` 允许含真实注释的空块，不检查函数体。重复 case 只比较已知字面量，不推断动态表达式。
+重复对象键允许 getter/setter 配对。常量条件只检查可证明恒定的表达式；这些规则不提供类型分析。
+
+以下 JSX 规则默认关闭，可在 `[lint.rules]` 显式启用，适用于 JSX/TSX 的原始标签：
+
+| 规则 | 检查范围 |
+| --- | --- |
+| `react/jsx-no-duplicate-props` | 同一开标签内重复的显式属性，区分大小写，含 `key`；不推断 spread 内容 |
+| `react/no-danger` | 显式 `dangerouslySetInnerHTML` 属性，包含自定义组件 |
+| `react/no-children-prop` | 显式 `children` 属性，包含自定义组件 |
+| `react/self-closing-comp` | 开闭标签间完全没有源码内容的元素；保留空白、注释或表达式的元素不报告 |
+
+这些规则不扫描普通对象或字符串。`react/self-closing-comp` 支持安全修复；改写范围含真实注释时
+只报告诊断，保留注释。其余三条只报告诊断。
+
+`style/eol-last` 默认关闭，要求非空源码以 ECMAScript 换行符结束；安全修复只在缺少换行时追加指定换行。
+
+`react-hooks/rules-of-hooks` 默认关闭，无参数和自动修复，支持 JS/TS/JSX/TSX。
+它按原始符号识别 `react` 具名导入别名、default/namespace 成员及 use + 大写字母/数字的
+自定义 Hook；普通对象同名成员不作为 React 调用。组件/Hook 函数、匿名默认导出和真实
+React `memo`/`forwardRef` 回调可以使用 Hooks；普通回调、类、参数默认值、async/generator
+不能使用。普通 Hook 必须在正常返回的路径中保持调用顺序，不能进入条件、循环或
+try/catch/finally。React `use` 允许条件和循环，其他位置限制仍有效。不可达调用不报告。
+未解析、不完整的绑定和通过普通赋值传递的 React 别名不推测其身份。
+
+需要控制流图的规则遇到单文件分析资源上限时，返回 `WAKE_LINT_ANALYSIS`，CLI 退出 2；
+Node Promise 拒绝且上下文保留结构化错误。失败不会成为空诊断、缓存条目或源码修复结果。
+
+`react-hooks/exhaustive-deps` 默认关闭，无自动修复。检查 React effect、memo、callback 以及
+imperative-handle 回调使用的响应值；导入别名、静态属性路径及嵌套回调保留原始符号身份。
+`additional_effect_hooks = "^useObserve$"` 可登记采用“回调、依赖数组”参数顺序的自定义 Hook，
+使用 Rust 正则，默认空且最多 4096 字符。普通对象同名方法不参与检查。
+
+effect 可省略数组；memo/callback 需要数组。缺失、重复、动态、外部依赖和 memo 的未使用
+依赖分别诊断；effect 允许额外响应依赖。真实 useRef 对象和 useState/useReducer/useTransition
+第二个返回绑定、const 字面量及不捕获响应值的局部函数可稳定。`ref.current` 不作为有效的
+React 更新触发条件。原始作用域不完整、未知或重赋值回调会明确报告；异步 effect 和陈旧
+赋值也会诊断。数组内包含局部回调本身时，其身份覆盖内部捕获；修复须由使用者决定。
+
+## 参数、预设与配置解释
+
+全局名称使用 `[lint.globals]`，例如 `console = "readonly"`。每项模式为 `readonly`、`writable`
+或 `off`；后者移除绑定。标准 ES2024 集合 `es2024@1` 默认启用，不自动添加浏览器、Node 或
+CommonJS 名称。标准集合的 readonly 是 lint 策略，不表示运行时属性描述符。`[lint]` 的
+`environments = ["browser", "node"]` 可显式加入版本化宿主集合；两者可同时启用，名称会先规范化排序，未知环境报配置错误。
+覆盖顺序为标准集合 → 排序后的 environments → 根 globals → 匹配 override 的 globals → 请求 globals，逐名替换。
+所有层都验证名称和模式，包含 off 和未匹配 override。名称须为 parser 接受的单一未转义标识符。
+CLI 使用可重复的 `--global console=readonly` 和 `--env browser|node`，Node 使用
+`globals: { console: 'readonly' }` 或 `environments: ['browser', 'node']`，
+一次检查和持久上下文相同。`--print-config` 的 `globals` 返回每项 mode/source，包括 off；
+`environments` 返回最终合并后的环境名称。缓存只使用有效绑定和模式，不使用来源。
+`--list-rules` 与 globals/environment 覆盖互斥。
+
+`wake lint --list-rules`（Node：`lint({ listRules: true })`）输出 JSON 规则目录，无需读取项目配置或
+源码。`catalog.schema` 为 `wake.lint.rules.v1`，规则按 ID 排序，包含说明、类别、支持语言、默认
+等级、分析依赖、参数 JSON Schema、消息 ID、文档路径与是否提供安全修复。目录来自原生注册表；
+它与 paths、stdin、printConfig、rules 覆盖、max-warnings 和修复互斥。
+
+| 规则 | 参数与默认值 | 行为 |
+| --- | --- | --- |
+| `js/eqeqeq` | `allow_null = false` | true 允许一侧为 null 的 `==` / `!=` |
+| `js/no-empty` | `allow_catch = false` | true 允许无注释的空 catch 块 |
+| `js/no-constant-condition` | `check_loops = true` | false 跳过 while、do、for 条件；仍检查 if 和条件表达式 |
+| `style/eol-last` | `linebreak = "lf"` | 可选 `"crlf"`；不改写已有换行 |
+
+`ts/switch-exhaustiveness-check` 对项目类型服务证明的字符串、数字、布尔、`null` 和 `undefined`
+字面量联合，会按源码 `case` 值证明无 `default` 的 `switch` 是否覆盖全部成员。`case Enum.Member`
+会使用同一项目的原生成员类型查询按运行时值匹配；动态 case 和缺少字面量事实不会被猜测。该
+规则默认关闭且不提供修复。
+
+`style/quotes` 另接受 `quote = "single"`（默认）或 `"double"`。
+`style/semi` 接受 `mode = "always"`（默认）或 `"never"`。检查语法定义的语句结束位置，
+包含 TS 类型别名、类字段与 do-while；不检查 for 头部、空语句和类型成员分隔符。
+never 保留同一行必须的分隔与可能连接相邻表达式的分号；两种模式均提供安全修复。
+`style/comma-dangle` 接受 `mode = "never"`（默认）、`"always"`、`"always-multiline"`
+或 `"only-multiline"`。多行按最后元素与闭合符之间的换行判断；涵盖 JS 列表以及 TS 类型参数、
+元组和枚举。保留数组空位及 TSX 泛型消歧逗号，不向空列表、rest/spread 后添加逗号。
+`style/indent` 接受 `style = "spaces"`（默认）或 `"tabs"`、`width = 2`（1–8 的整数）。
+语法分组和控制流正文每层增加一级，续行至少一级，闭合符对齐外层；tabs 每级一个 tab。
+仅修复非空代码行开头的空格/tab，保留字符串、模板、JSX 文本正文及多行注释内部的内容。
+`js/no-unused-vars` 接受 `vars = "all"` 或 `"local"`，`args = "after-used"`、`"all"` 或
+`"none"`，`caught_errors = "all"` 或 `"none"`；各自第一个值为默认值。另有
+`ignore_rest_siblings = false`、`report_used_ignore_pattern = false`。忽略模式
+`vars_ignore_pattern`、`args_ignore_pattern`、`caught_errors_ignore_pattern` 默认为空；
+非空模式使用 Rust regex 语法，最多 4096 个字符，包含 off/未匹配配置也校验。
+启用 `report_used_ignore_pattern` 会报告匹配忽略模式却实际被使用的绑定。ambient、
+不完整值名称、隐式 arguments 和合成声明不报告；类型使用按独立类型身份处理。
+含 with 或未遮蔽的直接 eval 的文件保守跳过未使用检查。
+`js/no-duplicate-imports` 接受 `allow_separate_type_imports = false`（默认）；设为 true 时允许纯类型与
+值导入各保留一次。其他规则的参数见下表及 `--list-rules` 返回的 schema；未登记参数会报错。
+覆盖顺序为：默认关闭 → 默认 recommended（如启用） →
+`[lint].presets` 声明顺序 → `[lint.rules]` → 匹配的 overrides 声明顺序 → 请求 `rules`。
+每次整体替换该规则的等级与参数；使用等级简写会恢复该规则的默认参数。
+
+`presets = ["react@1", "style@1"]` 可启用版本化预设：recommended@1 是上述六条默认规则；
+react@1 启用四条 JSX 规则（no-danger、self-closing-comp 为 warn，其余为 error）；
+style@1 启用 eol-last/warn；all@1 是三者并集。无 `@1` 的别名指向当前版本。
+新规则不会静默加入旧版本预设。
+
+以下规则默认关闭，须显式配置；它们不改变已有 `@1` 预设：
+
+| 规则 | 行为与修复 |
+| --- | --- |
+| `react/jsx-key` | 原始数组元素及 map/flatMap 内联回调返回的最外层 JSX 需要 key；排除生成的 children 数组及调用包装器；无修复 |
+| `react/no-array-index-key` | 以符号身份识别 map/flatMap 第二参数，检查 key 表达式对索引的读取及属性覆盖顺序；无修复 |
+| `js/no-sparse-arrays` | 报告数组表达式空槽，允许数组解构空位；无修复 |
+| `js/valid-typeof` | 检查 typeof 与静态字符串的等/不等比较；无修复 |
+| `js/no-cond-assign` | 检查条件内的直接或嵌套赋值，括号不豁免，跳过函数/类内部；无修复 |
+| `js/no-var` | 检查 var 声明，包含 for 头部；无修复 |
+| `js/no-unused-vars` | 检查未读取、未导出的原始值绑定与类型声明；写入不算使用。参数见下文；不提供删除修复 |
+| `react/jsx-uses-vars` | 将开标签组件根的已解析符号标记为使用，供 no-unused-vars 消费；无独立诊断或修复 |
+| `js/prefer-const` | 检查初始化后无写入的 let，以及同一作用域内作为独立语句的一次延后赋值；包含 for-in/of 的逐次绑定。`destructuring = "any"`（默认）或 `"all"`，`ignore_read_before_assign = false`。仅当整条声明均可转换且已有初始化器/迭代绑定时安全替换 let；混合声明和延后赋值只报告。动态 with/直接全局 eval 的文件保守跳过 |
+| `js/no-console` | 检查全局 console 成员访问，排除同名局部绑定；无修复 |
+| `js/no-undef` | 检查原始值读取和写入的未定义名称；标准与显式 globals 有效。默认允许直接 `typeof missing`，`typeof = true` 参数启用该检查；成员访问基对象仍检查。类型引用、类型查询和 JSX 标签由各自规则处理；无修复 |
+| `react/jsx-no-undef` | 检查开标签组件根名称（含 `UI.Panel` 的 UI）；不检查属性名、成员尾部、原生标签或闭标签；使用同一作用域和 globals；无修复 |
+| `js/no-async-promise-executor` | 检查全局 Promise 构造器的 async 执行器；无修复 |
+| `js/no-promise-executor-return` | 检查 Promise 执行器的带值 return/隐式返回，允许 void；不检查嵌套函数；无修复 |
+| `js/no-self-assign` | 检查标识符及对应数组/对象字面量解构自赋值；不推断动态 spread 或成员 getter；无修复 |
+| `js/no-self-compare` | 检查相同比较操作数（标识符/原始字面量），不推断重复成员访问或调用；无修复 |
+| `js/no-duplicate-imports` | 检查同作用域、模块字符串及属性内容的重复静态导入；包含原始类型导入，跳过动态 import 与 import-equals；无修复 |
+| `js/no-constant-binary-expression` | 检查恒定左侧短路、恒定空值性 `??`、字面量比较、严格类型不相交及新建引用的恒不相等比较；无修复 |
+| `js/use-isnan` | 检查与全局 NaN/Number.NaN 的比较和 switch/case，排除同名局部绑定；无修复 |
+| `js/no-unreachable` | 检查必然离开后的语句，允许提升函数、无初始化器 var 和空语句；无修复 |
+| `js/consistent-return` | 检查带值返回与无值返回/自然结束并存；独立分析原始函数，排除合成 namespace 函数；无修复 |
+| `js/no-fallthrough` | 检查非空 case 可进入下一 case 的路径，允许真实注释 `fallthrough` / `fall through` / `falls through`；无修复 |
+| `js/no-unsafe-finally` | 检查逃逸 finally 的 return/throw/break/continue；排除内部循环、标签或 catch 消费的跳转；无修复 |
+| `ts/no-explicit-any` | 检查原始类型中的 any，包括对象、元组、签名等嵌套类型；排除属性和变量名；无修复 |
+| `ts/no-non-null-assertion` | 检查表达式后缀非空断言，排除逻辑非与声明 definite-assignment；无修复 |
+| `ts/no-namespace` | 检查具名 namespace/module，包含 declare，允许字符串 ambient module；无修复 |
+| `ts/no-empty-interface` | 检查没有成员的接口，包含有 extends 的接口；无修复 |
+| `ts/consistent-type-imports` | 要求仅有类型使用的普通导入绑定显式标记 type；按作用域身份排除值使用/导出，跳过未使用、equals、attributes 和不完整查询；无参数、无修复 |
+| `ts/consistent-type-exports` | 本地接口、别名和显式 type import 的具名导出要求 type；排除同名值、普通 import、外部重导出和不完整值环境；无参数、无修复 |
+| `js/no-redeclare` | 检查同一值作用域内的显式重复声明；允许 TS namespace/class/function/enum 合并，不把 helper 或隐式绑定算成源码声明；无参数、无修复 |
+| `js/no-use-before-define` | 按文本顺序检查值引用早于声明，包含闭包；`functions`、`classes`、`variables` 均默认 true；不报告类型使用或具名 live-binding 导出，无修复 |
+| `js/no-shadow` | 检查显式值声明遮蔽外层源码绑定；`hoist` 与 `ignore_named_expressions` 默认 true；跳过隐式复制及不完整值名称，无修复 |
+| `ts/array-type` | `syntax = "array"`（默认）检查单参数 Array/ReadonlyArray 类型，`"generic"` 检查数组后缀；排除索引访问、元组、限定名称和 heritage 基类型；无修复 |
+| `ts/ban-ts-comment` | 拒绝真实注释行开头的 @ts-ignore/@ts-nocheck；@ts-expect-error 需至少三个字符的说明；允许 @ts-check；无修复 |
+| `a11y/alt-text` | 检查 img/area/input[type=image] 的替代文本及 object 的名称/回退内容；装饰 img 允许空 alt |
+| `a11y/anchor-has-content` | 检查 a 的可访问内容，排除隐藏内容、空注释与 false/null |
+| `a11y/anchor-is-valid` | 检查缺失、空、#、javascript: 和非字符串 href |
+| `a11y/label-has-associated-control` | label 需要文字及 htmlFor/内部控件关联；空 htmlFor 不回退为内部关联 |
+| `a11y/aria-props` | 检查显式 aria-* 属性的规范小写拼写 |
+| `a11y/aria-proptypes` | 检查最终静态属性的字符串、ID 引用、数字、整数和枚举类型；不验证远处 ID |
+| `a11y/aria-role` | 检查 role 是否含具体 ARIA 角色；支持后备列表、DPUB 和 Graphics 角色 |
+| `a11y/click-events-have-key-events` | 可见、未禁用且没有原生键盘交互的点击标签需要键盘处理器 |
+| `a11y/interactive-supports-focus` | 带点击/键盘处理器的交互角色需要原生焦点能力或整数 tabIndex，允许 -1 |
+| `style/quotes` | 检查 JS/TS 字符串，安全修复引号与必要转义；保留 JSX 属性、模板、注释 |
+| `style/semi` | 按 always/never 检查语句分号；保留自动分号插入屏障与注释 |
+| `style/comma-dangle` | 检查列表尾逗号；安全修复保留注释、数组长度和 TSX 消歧 |
+| `style/indent` | 按语法层级检查缩进，支持空格与 tab；安全修复行首空白 |
+| `style/no-trailing-spaces` | 检查行尾/EOF 的空格和 tab；字符串、模板或 JSX 文本内部只报告，其他位置可修复 |
+
+无障碍规则只检查内建 JSX/TSX 标签，不自动修复。动态值与 spread 保留不确定性；显式后续属性
+可以覆盖之前的值。词汇固定为 WAI-ARIA 1.3 的 2026-06-04 草案、DPUB-ARIA 1.1 与 Graphics 1.0；
+静态检查不代替运行时可访问性测试。
+
+```bash
+wake lint --print-config src/example.tsx
+wake lint src --rule 'js/eqeqeq={"level":"error","options":{"allow_null":true}}'
+```
+
+`--rule` 可重复，同一 ID 最后一次生效。`--print-config` 总是输出 JSON，`config` 字段含
+`wake.lint.config.v1` schema、文件语言、ignored、未使用抑制等级，以及所有规则的有效等级、参数和
+最后来源。来源为 `default`、`preset:<版本化 ID>`、`config:rules`、`override:<从零开始的序号>` 或
+`request`。它只解释虚拟文件名，文件无需存在；被忽略的路径仍可解释。它与 paths、stdin、修复和
+max-warnings 互斥，不分析源码。
+
+## 诊断缓存
+
+`wake lint --cache`（Node：`lint({ cache: true })`）可缓存只读文件检查的诊断，默认关闭。
+每次仍读取真实文件，以源码内容、规范路径、语言、有效规则参数/抑制等级和分析版本共同确定键；
+修改内容或配置会失效，即使文件大小和 mtime 没变。缓存目录为项目 `.wake/lint/v1`。
+单项最多 4 MiB，保留最多 20,000 项/256 MiB。损坏、不兼容或不可用缓存会重新分析。
+结果的 `cache` 字段包含 `hits`、`misses`、`writes`、`bypassed` 和最多一条聚合 `warnings`；
+缓存提示不计入规则 warningCount，也不影响退出码。
+
+stdin、`--fix` 和 `--fix-dry-run` 绕过缓存；这些模式不会因 `--cache` 创建缓存目录。
+parser 诊断不缓存。`--cache` 与 `--list-rules` / `--print-config` 互斥。
+
+## 自动修复
+
+```bash
+wake lint src --fix-dry-run --format json
+wake lint src --fix
+```
+
+`--fix` 和 `--fix-dry-run` 互斥。当前修复规则为 `react/self-closing-comp`、`style/eol-last`、
+`style/quotes`、`style/no-trailing-spaces`、`style/semi`、`style/comma-dangle`、`style/indent` 和 `js/prefer-const`，
+均须先在配置启用。其他规则不会猜测性改写。诊断可携带 `messageId` 和 `fix.edits`，编辑的
+`start`/`end` 是 UTF-8 字节半开范围，`text` 是替换文本。
+
+修复最多进行十轮，每轮重新解析；抑制的诊断不修复。冲突编辑以稳定诊断顺序选取完整 fix，
+剩余项下一轮重算。语法错误保持原文；新语法错误、循环或不收敛返回 `WAKE_LINT_FIX`。
+JSON 每个文件包含 `changed`、`written`、`fixPasses`，有变化时 `output` 提供最终源码。
+诊断位置、计数和退出码均按最终文本计算。human dry-run 输出变更文件的最终源码。
+
+`--fix-dry-run` 从不写磁盘，允许 stdin；`--fix` 拒绝 stdin。写回先完成全部文件分析，再逐文件
+持有 Wake 发布锁并复核原始内容与身份。已发现内容漂移报 `WAKE_LINT_CONFLICT`；只读或多硬链接
+文件报 `WAKE_LINT_WRITE`；IO 失败报 `WAKE_LINT_IO`。单文件原子替换，跨文件不保证整批原子性。
+保留标准文件权限位，不承诺复制扩展属性、ACL 或备用数据流。未参与 Wake 锁的外部程序仍可能在
+最后复核与替换之间修改路径；此机制不提供跨进程通用 compare-and-swap。
+
+默认包含 `.js/.mjs/.cjs/.jsx/.ts/.mts/.cts/.tsx`，忽略声明文件、`node_modules`、`.git`、`.yarn`、
+`.wake`、`dist`、`docs-dist` 和 PnP 生成的 `.pnp.cjs/.pnp.mjs/.pnp.loader.mjs`。配置 `files`
+替换默认包含集合，`ignore` 增补默认忽略集合；显式选择默认忽略的路径会返回可区分的执行错误。
+此预览版默认忽略集合不能取消；不读取 `.gitignore`。解析 `.cjs` 使用 Script，其他 JS 使用 Module。
+
+```js
+// wake-lint-disable-next-line js/no-debugger -- 调试示例
+debugger;
+```
+
+还支持 `wake-lint-disable`、`wake-lint-enable`、`wake-lint-disable-line`。规则名以逗号分隔，
+不写规则名则作用于全部规则。字符串、正则和 JSX 文本内的文字不会成为指令。语法错误不可抑制。
+`disable-next-line` 作用于注释结束后的下一行；`disable-line` 注释必须在单行内。
+默认以 `wake/unused-disable` 警告报告未用的抑制，可用 `[lint].report_unused_disable` 设置为
+`off`、`warn` 或 `error`。按每个规则名分别报告；空列表视为一项。重复 disable 幂等，最先生效的
+区间抑制获得使用记录；区间内多余的行抑制仍报告未使用。无效指令和未使用抑制诊断自身不可抑制。
+
+`--stdin` 必须配合 `--stdin-filename`，仍按虚拟路径应用配置，不读取或写入该文件。
+JSON 输出包含每个文件的诊断、源码位置、错误/警告计数与 `exitCode`；代码位置来自实际检查的文本。
+JSON 和纯文本检查结果写入 stdout，配置或执行错误写入 stderr。纯文本结果不包含 ANSI 控制序列。
+行号识别 ECMAScript 的 LF、CRLF、CR、U+2028、U+2029 换行；列号从 1 开始，按 Unicode 字符计数。
+退出码：`0` 通过，`1` 存在 error 或超过警告上限，`2` 配置、路径、读取或分析失败。默认不限制警告数量。
+
+## Node API
+
+`wake lint --watch` 持续检查项目。注册文件监听后先完整检查，源码/目录、根配置、基线或未保存
+文档变化会取消旧代次并合并检查。删除、重命名和根目录重建均重新发现文件；损坏配置不会结束
+监听，修复后自动恢复。watch 不能与 stdin、修复、基线生成/清理、配置解释或规则目录组合。
+启用模块规则时也监听实际依赖、缺失路径和 PnP 物理 ZIP，包括根外文件及默认忽略目录中的
+依赖。新增依赖覆盖后重新检查，坏 PnP 清单修复可自动恢复；不再使用的依赖退出监听。
+`--format json` 每行输出 `{ "schema": "wake.lint.watch.v1", "event": ... }`，事件类型为
+`checkStart`、`checked`（含 snapshot）或 `diagnostic`（含 generation/error）。Ctrl+C 停止监听。
+
+Node 使用 `createLintContext({ root, watch: true })` 自动监听，也可对已有上下文调用
+`startWatch()`。通过 `checkStart`、`checked`、`diagnostic` 事件读取带代次的结果；快速变化可合并
+中间快照。`await stopWatch()` 停止并回收监听，上下文仍可手动检查；`close()` 同时关闭监听。
+`watching` 表示当前监听状态，`unref()` 允许监听计时器不阻止 Node 进程自然退出。
+
+`createLintContext(options)` 创建固定根目录的只读项目上下文。`updateDocument({ filename, version,
+text })` 登记未保存文本（包括新文件），`closeDocument(filename, version)` 恢复磁盘文件。
+同路径版本必须严格递增，关闭后保留最后版本；版本须为 JavaScript 安全整数。
+
+`await context.check({ signal })` 返回 `{ generation, documents, result }`；documents 是本次内存
+文档的路径与版本映射，result 与 `lint()` 的结果一致。更新、关闭文档、`invalidate()` 或新检查会
+取消旧检查。调用方展示结果时须验证代次和文档版本，不能无条件应用迟到的 Promise 结果。
+项目配置每次重读，内存文档覆盖磁盘内容，忽略与路径筛选继续生效。
+
+上下文拒绝 stdin、修复、生成/清理基线、配置解释及规则目录选项。`await context.close()` 和
+`Symbol.asyncDispose` 幂等关闭并等待活动分析退出，关闭后操作失败。省略 `watch` 时只进行手动检查。
+
+```ts
+import { lint } from "@crab-dev/wake";
+const result = await lint({ root: ".", paths: ["src"], maxWarnings: 0 });
+process.exitCode = result.exitCode;
+```
+
+`lint({ root, paths, stdin: { filename, text }, maxWarnings, fix, rules, signal })` 使用同一项目入口；
+`fix` 为 `"off"`（默认）、`"dry-run"` 或 `"write"`。
+`stdin` 与非空 `paths` 互斥。所有字段可省略，`stdin` 一旦提供则其两个字段必填。
+未知字段和显式 `null` 被拒绝。规则失败正常返回结果；配置/路径/读取错误拒绝 Promise。
+取消在开始、发现文件和逐文件边界检查，当前不能中断正在执行的单文件解析。
+
+`lint({ root, printConfig: "src/example.tsx", rules })` 返回相同配置解释；`rules` 为 ID 到等级或
+`{ level, options }` 的对象。参数名保持 TOML 的 snake_case，例如 `allow_null`，不会隐式转换。

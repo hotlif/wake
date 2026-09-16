@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use xxhash_rust::xxh3::Xxh3;
 
+mod blobs;
+pub use blobs::{BlobCache, BlobLoadOutcome, BlobStoreReport};
+
 /// 缓存文件魔数。
 const MAGIC: &[u8; 4] = b"WKC1";
 /// schema 版本：**wake 的 parse/codegen 输出语义变更时必须 +1**，否则可能取到陈旧产物。
