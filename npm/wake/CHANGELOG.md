@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.45
+
+- Preserve lexical and imported bindings in compiled `cx()` calls, fixing runtime `ReferenceError`
+  failures and incorrect results after variable mangling, tree shaking or parameter shadowing.
+- Fold only safe literal calls to strings; retain the small `cx` runtime for binding-bearing and
+  nested expressions, preserving evaluation order, side effects and temporal dead zones.
+- Add executed bundle regressions across readable/minified output and tree-shaking modes.
+
 ## 0.1.44
 
 - Support local and nested `@starting-style` without rejecting the rule or dropping its selector.
