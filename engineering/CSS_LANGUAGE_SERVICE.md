@@ -24,6 +24,15 @@ Every open document is identified by URI and monotonically increasing editor ver
 snapshot contains discovered templates, virtual CSS text, source segments and one shared CSS CST.
 The snapshot and tree are reused by all requests for that version.
 
+The shared CST recognizes declaration bodies in `@position-try`, the sixteen page-margin rules
+inside `@page`, and the six named feature-value blocks inside `@font-feature-values`. Property
+hover, semantic tokens, value completion and unknown-property diagnostics use these declarations.
+Font feature-value names are author-defined descriptors, not CSS properties: they receive descriptor
+hover and declaration highlighting without unknown-property warnings or ordinary property/value
+suggestions. Their enclosing rule determines their context, including when names collide with CSS
+properties. Unknown at-rule bodies remain opaque. `@starting-style` completion and compiler
+diagnostics agree that the rule is permitted in a local `css` template.
+
 Virtual contexts are deterministic:
 
 - `css` is analyzed as a declaration and nesting block;

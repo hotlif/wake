@@ -5,7 +5,8 @@ mod virtual_document;
 
 use wake_common::{Diagnostic, Interner, Severity, SourceFile, Span};
 use wake_css::syntax::{
-    CssBlockKind, CssSyntaxContext, CssSyntaxKind, CssSyntaxNode, CssSyntaxTree,
+    CssBlockKind, CssSyntaxContext, CssSyntaxItem, CssSyntaxItemKind, CssSyntaxKind, CssSyntaxNode,
+    CssSyntaxTree,
 };
 use wake_css_in_js::value::{Scope, StaticExports, collect_imports};
 use wake_css_in_js::{
@@ -256,6 +257,10 @@ impl LanguageDocument {
                         .is_some_and(|trailing| trailing.chars().all(char::is_whitespace))
             })
         });
+        if font_feature_rule_at(&tree.items, Span::new(virtual_offset, virtual_offset)).is_some() {
+            // Feature names are user-defined; their numeric values are not CSS property values.
+            return Some(Vec::new());
+        }
         if let Some(declaration) = declaration
             && virtual_offset >= declaration.colon_span.hi
             && let Some(property) = facts::property(&declaration.name)
@@ -331,6 +336,17 @@ impl LanguageDocument {
         let tree = &self.syntax_trees[index];
         let node = tree.node_at(virtual_offset)?;
         let host_span = document.virtual_to_host_span(node.head_span)?;
+        if let Some(declaration) = tree.declaration_with_name_span(node.span)
+            && let Some(rule) = font_feature_rule_at(&tree.items, declaration.name_span)
+        {
+            return Some(Hover {
+                span: host_span,
+                markdown: format!(
+                    "**{}**\n\nNamed font feature value in `@{rule}`.",
+                    declaration.name
+                ),
+            });
+        }
         if let Some(declaration) = tree.declaration_with_name_span(node.span)
             && let Some(property) = facts::property(&declaration.name)
         {
@@ -478,7 +494,9 @@ fn css_diagnostics(document: &VirtualCssDocument, tree: &CssSyntaxTree) -> Vec<L
         })
     }));
     for declaration in &tree.declarations {
-        if declaration.name.starts_with("--") {
+        if declaration.name.starts_with("--")
+            || font_feature_rule_at(&tree.items, declaration.name_span).is_some()
+        {
             continue;
         }
         let Some(span) = document.virtual_to_host_span(declaration.name_span) else {
@@ -503,6 +521,29 @@ fn css_diagnostics(document: &VirtualCssDocument, tree: &CssSyntaxTree) -> Vec<L
         });
     }
     diagnostics
+}
+
+fn font_feature_rule_at(items: &[CssSyntaxItem], span: Span) -> Option<&str> {
+    for item in items {
+        if !item.span.contains(span) {
+            continue;
+        }
+        if matches!(&item.kind, CssSyntaxItemKind::AtRule { name } if name.eq_ignore_ascii_case("font-feature-values"))
+        {
+            for child in &item.children {
+                if child.span.contains(span)
+                    && child.block_index.is_some()
+                    && let CssSyntaxItemKind::AtRule { name } = &child.kind
+                {
+                    return Some(name);
+                }
+            }
+        }
+        if let Some(name) = font_feature_rule_at(&item.children, span) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn completion(label: &str, detail: &str, documentation: &str, kind: CompletionKind) -> Completion {

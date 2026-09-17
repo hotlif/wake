@@ -153,7 +153,7 @@ impl CssSyntaxTree {
         let mut parser = Parser::new(&mut input);
         let nodes = parse_nodes(&mut parser, source, body.lo);
         let mut declarations = Vec::new();
-        let items = collect_items(&nodes, context, &mut declarations);
+        let items = collect_items(&nodes, context, None, &mut declarations);
         let mut tree = Self {
             context,
             nodes,
@@ -341,6 +341,7 @@ fn span(base: u32, start: usize, end: usize) -> Span {
 fn collect_items(
     nodes: &[CssSyntaxNode],
     context: CssSyntaxContext,
+    parent_at_rule: Option<&str>,
     declarations: &mut Vec<CssDeclaration>,
 ) -> Vec<CssSyntaxItem> {
     if context == CssSyntaxContext::ComponentValues {
@@ -373,11 +374,11 @@ fn collect_items(
                 Some((index, boundary))
                     if matches!(boundary.kind, CssSyntaxKind::Block(CssBlockKind::Curly)) =>
                 {
-                    let body_context = at_rule_body_context(name, context);
+                    let body_context = at_rule_body_context(name, context, parent_at_rule);
                     (
                         index + 1,
                         Some(index),
-                        collect_items(&boundary.children, body_context, declarations),
+                        collect_items(&boundary.children, body_context, Some(name), declarations),
                     )
                 }
                 Some((index, _)) => (index + 1, None, Vec::new()),
@@ -459,7 +460,7 @@ fn collect_items(
                 span: item_span(nodes, cursor, end),
                 node_range: cursor..block_index,
                 block_index: Some(block_index),
-                children: collect_items(&block.children, child_context, declarations),
+                children: collect_items(&block.children, child_context, None, declarations),
             });
             cursor = end;
             continue;
@@ -501,7 +502,11 @@ fn declaration_colon(nodes: &[CssSyntaxNode], first: usize) -> Option<usize> {
     Some(colon_index)
 }
 
-fn at_rule_body_context(name: &str, parent: CssSyntaxContext) -> CssSyntaxContext {
+fn at_rule_body_context(
+    name: &str,
+    parent: CssSyntaxContext,
+    parent_at_rule: Option<&str>,
+) -> CssSyntaxContext {
     let name = name.to_ascii_lowercase();
     if name.ends_with("keyframes") {
         return CssSyntaxContext::Keyframes;
@@ -514,7 +519,42 @@ fn at_rule_body_context(name: &str, parent: CssSyntaxContext) -> CssSyntaxContex
             | "counter-style"
             | "font-palette-values"
             | "view-transition"
+            | "position-try"
     ) {
+        return CssSyntaxContext::StyleBlock;
+    }
+    if parent_at_rule.is_some_and(|name| name.eq_ignore_ascii_case("page"))
+        && matches!(
+            name.as_str(),
+            "top-left-corner"
+                | "top-left"
+                | "top-center"
+                | "top-right"
+                | "top-right-corner"
+                | "bottom-left-corner"
+                | "bottom-left"
+                | "bottom-center"
+                | "bottom-right"
+                | "bottom-right-corner"
+                | "left-top"
+                | "left-middle"
+                | "left-bottom"
+                | "right-top"
+                | "right-middle"
+                | "right-bottom"
+        )
+    {
+        return CssSyntaxContext::StyleBlock;
+    }
+    if name == "font-feature-values" {
+        return CssSyntaxContext::Stylesheet;
+    }
+    if parent_at_rule.is_some_and(|name| name.eq_ignore_ascii_case("font-feature-values"))
+        && matches!(
+            name.as_str(),
+            "styleset" | "stylistic" | "character-variant" | "swash" | "ornaments" | "annotation"
+        )
+    {
         return CssSyntaxContext::StyleBlock;
     }
     if matches!(
@@ -635,4 +675,29 @@ fn curly_depth(nodes: &[CssSyntaxNode], offset: u32) -> usize {
         }
     }
     depth
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modern_descriptor_bodies_are_declarations_and_unknown_rules_stay_opaque() {
+        let source = "@position-try --below { top: anchor(bottom); } @page { @top-center { content: 'Title'; } @left-middle { color: red; } } @font-feature-values Demo { @styleset { nice: 1; } @character-variant { special: 2 3; } } @unknown { imaginary: 1; }";
+        let tree = CssSyntaxTree::parse(source, Span::new(0, source.len() as u32));
+        assert_eq!(
+            tree.declarations
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["top", "content", "color", "nice", "special"]
+        );
+        // Named subrules only have descriptor semantics inside their owning rule.
+        let source = "@styleset { nice: 1; } @top-center { content: 'Title'; }";
+        assert!(
+            CssSyntaxTree::parse(source, Span::new(0, source.len() as u32))
+                .declarations
+                .is_empty()
+        );
+    }
 }

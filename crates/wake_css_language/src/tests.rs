@@ -8,6 +8,112 @@ fn analyze(source: &str) -> LanguageDocument {
 }
 
 #[test]
+fn starting_style_completion_and_compiler_diagnostics_agree() {
+    let source =
+        "import { css } from '@crab-dev/css'; const box = css`@starting-style { opacity: 0; }`;";
+    let document = analyze(source);
+    assert!(
+        document
+            .compiler_diagnostics("src/component.tsx", &Scope::default())
+            .is_empty()
+    );
+    let offset = source.find("@starting-style").unwrap() as u32 + 9;
+    assert!(
+        document
+            .completions(offset)
+            .unwrap()
+            .iter()
+            .any(|c| c.label == "@starting-style")
+    );
+    assert!(
+        document
+            .semantic_tokens()
+            .iter()
+            .any(|t| t.kind == SemanticKind::Property && t.span.slice(source) == "opacity")
+    );
+}
+
+#[test]
+fn position_try_and_page_margins_have_property_intelligence() {
+    for body in [
+        "@position-try --below { top: au; topp: 0; }",
+        "@page { @top-center { top: au; topp: 0; } }",
+    ] {
+        let source = format!("import {{ globalStyle }} from '@crab-dev/css'; globalStyle`{body}`;");
+        let document = analyze(&source);
+        let top = source.find("top:").unwrap() as u32;
+        assert!(document.hover(top).is_some(), "{source}");
+        assert!(
+            document
+                .semantic_tokens()
+                .iter()
+                .any(|t| t.span.lo == top && t.kind == SemanticKind::Property)
+        );
+        let values = document.completions(top + "top: au".len() as u32).unwrap();
+        assert_eq!(
+            values.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            ["auto"]
+        );
+        assert!(
+            document
+                .diagnostics()
+                .iter()
+                .any(|d| d.code == "CSS_UNKNOWN_PROPERTY" && d.message.contains("topp")),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn font_feature_names_are_custom_descriptors_even_when_named_like_properties() {
+    for kind in [
+        "styleset",
+        "stylistic",
+        "character-variant",
+        "swash",
+        "ornaments",
+        "annotation",
+    ] {
+        let source = format!(
+            "import {{ globalStyle }} from '@crab-dev/css'; globalStyle`@font-feature-values Demo {{ @{kind} {{ Nice: 1; color: 2; }} }} .box {{ Nice: 1; }}`;"
+        );
+        let document = analyze(&source);
+        let nice = source.find("Nice:").unwrap() as u32;
+        let color = source.find("color:").unwrap() as u32;
+        for offset in [nice, color] {
+            let hover = document.hover(offset).expect("named descriptor hover");
+            assert!(
+                hover.markdown.contains(&format!("@{kind}")),
+                "{}",
+                hover.markdown
+            );
+            assert!(
+                document
+                    .semantic_tokens()
+                    .iter()
+                    .any(|t| t.span.lo == offset && t.kind == SemanticKind::Property)
+            );
+        }
+        assert!(
+            document
+                .completions(nice + "Nice: ".len() as u32)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            document
+                .diagnostics()
+                .iter()
+                .filter(|d| d.code == "CSS_UNKNOWN_PROPERTY")
+                .count(),
+            1,
+            "{:?}",
+            document.diagnostics()
+        );
+    }
+}
+
+#[test]
 fn discovers_aliases_and_ignores_shadowing() {
     let source = "import { css as c } from '@crab-dev/css';\n\
         function ignored(c: unknown) { return c`color: red;`; }\n\
