@@ -103,21 +103,67 @@ fn supports_import_alias() {
 }
 
 #[test]
-fn lowers_safe_cx_calls_and_removes_fully_consumed_import() {
-    let src = "import { css, cx as merge } from '@crab-dev/css';\n\
-               const base = css`color:red;`;\n\
-               const active = css`font-weight:bold;`;\n\
-               const value = merge(base, enabled && active);";
+fn folds_literal_cx_calls_and_removes_fully_consumed_import() {
+    let src = "import { cx as merge } from '@crab-dev/css';\n\
+               const value = merge('base', false, '', null, 'active');";
     let r = run(src);
-    assert_eq!(r.replacements.len(), 3);
+    assert_eq!(r.replacements.len(), 1);
     assert_eq!(r.removable_import_spans.len(), 1);
-    assert!(
-        r.replacements
-            .values()
-            .any(|text| text.contains(".filter(Boolean).join(\" \")")),
-        "{:?}",
-        r.replacements
-    );
+    assert_eq!(r.replacements.values().next().unwrap(), "\"base active\"");
+}
+
+#[test]
+fn cx_keeps_argument_bindings_and_nested_edits_in_the_original_ast() {
+    for source in [
+        "const value = 'outer'; function render(value) { return cx(value); }",
+        "function render(enabled) { return cx(enabled && 'active'); }",
+        "import { value } from './value.js'; export const result = cx(value);",
+        "const result = cx(['one', 'two']);",
+        "const result = cx({ one: true });",
+        "const result = cx(...['one', 'two']);",
+        "const result = cx(effect(), 'two');",
+        "const result = cx?.('one');",
+    ] {
+        let result = run(&format!("import {{ cx }} from '@crab-dev/css'; {source}"));
+        assert!(
+            result.replacements.is_empty(),
+            "{source}: {:?}",
+            result.replacements
+        );
+        assert!(result.removable_import_spans.is_empty(), "{source}");
+    }
+    let result = run("import { css, cx } from '@crab-dev/css'; const value = cx(css`color:red;`);");
+    assert_eq!(result.replacements.len(), 1);
+    assert_eq!(result.removable_import_binding_spans.len(), 1);
+    assert!(result.removable_import_spans.is_empty());
+}
+
+#[test]
+fn cx_literal_folding_keeps_escaping_and_runtime_whitespace_semantics() {
+    for (arguments, expected) in [
+        ("", "\"\""),
+        ("false, null, ''", "\"\""),
+        (r#"'quote"', 'back\\slash'"#, r#""quote\" back\\slash""#),
+    ] {
+        let result = run(&format!(
+            "import {{ cx }} from '@crab-dev/css'; const value = cx({arguments});"
+        ));
+        assert_eq!(
+            result.replacements.values().next().map(String::as_str),
+            Some(expected)
+        );
+    }
+    for arguments in ["' two '", "'one two'", "'\\uFEFFtwo'", "undefined"] {
+        let result = run(&format!(
+            "import {{ cx }} from '@crab-dev/css'; const value = cx({arguments});"
+        ));
+        assert!(
+            result.replacements.is_empty(),
+            "{arguments}: {:?}",
+            result.replacements
+        );
+        assert!(result.removable_import_spans.is_empty());
+    }
 }
 
 #[test]

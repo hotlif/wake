@@ -8906,17 +8906,111 @@ fn minified_css_in_js_replacement_maps_to_the_original_tag_without_changing_js()
 }
 
 #[test]
-fn crab_css_lowers_safe_cx_and_eliminates_runtime_module() {
+fn crab_css_cx_preserves_bindings_in_executed_bundles() {
+    for minify in [false, true] {
+        for tree_shaking in [false, true] {
+            let fs = MemoryFileSystem::from_files([
+                ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
+                (
+                    "node_modules/@crab-dev/css/index.js",
+                    include_str!("../../../npm/css/index.mjs"),
+                ),
+                ("src/imported.js", "export const imported = 'imported';"),
+                (
+                    "src/index.tsx",
+                    r#"import { css, cx as merge } from '@crab-dev/css';
+import { imported } from './imported.js';
+export const base = css`color:red;`;
+const local = css`background:blue;`;
+const outer = 'outer';
+function render(enabled) { return merge(base, enabled && imported); }
+function renderLocal(enabled) { return merge(local, enabled && 'active'); }
+function shadow(outer) { return merge(outer); }
+function own(merge) { return merge('own'); }
+function booleanShadow(Boolean) { return merge('literal', false, null); }
+function nested() { return merge(css`padding:8px;`); }
+const events = [];
+function effect(value) { events.push(value); return value; }
+export const values = [
+  render(true), render(false), shadow(['first', { second: true }]),
+  booleanShadow(() => false), merge(effect('one'), effect('two')),
+  merge('head', merge('tail')), nested(), outer, renderLocal(true), own(value => 'own:' + value)
+];
+export const order = events.join(',');
+export let tdz = false;
+try { merge(late); } catch (error) { tdz = error instanceof ReferenceError; }
+const late = 'late';
+"#,
+                ),
+            ]);
+            let mut bundler = IncrementalBundler::new(Arc::new(fs));
+            bundler.enable_css_in_js();
+            bundler.enable_css_extraction();
+            bundler.enable_dead_module_elimination();
+            if minify {
+                bundler.enable_minify();
+            }
+            if tree_shaking {
+                bundler.enable_tree_shaking();
+            }
+            let output = bundler.build(Path::new("src/index.tsx"));
+            assert!(!output.has_errors(), "{:?}", output.diagnostics);
+            let retained = bundler.build(Path::new("src/index.tsx"));
+            assert_eq!(output.bundle, retained.bundle);
+            let directory = tempfile::tempdir().unwrap();
+            let bundle_path = directory.path().join("bundle.cjs");
+            std::fs::write(&bundle_path, &output.bundle).unwrap();
+            let script = format!(
+                r#"const assert = require('node:assert/strict');
+const result = require({:?});
+assert.deepEqual(result.values.slice(0, 6), [result.base + ' imported', result.base,
+  'first second', 'literal', 'one two', 'head tail']);
+assert.match(result.values[6], /^[a-zA-Z_]+_[a-zA-Z0-9]+$/);
+assert.equal(result.values[7], 'outer');
+assert.match(result.values[8], /^local_[a-zA-Z0-9]+ active$/);
+assert.equal(result.values[9], 'own:own');
+assert.equal(result.order, 'one,two');
+assert.equal(result.tdz, true);
+process.stdout.write('OK');"#,
+                bundle_path.to_string_lossy()
+            );
+            let executed = std::process::Command::new("node")
+                .args(["-e", &script])
+                .output()
+                .expect("Node is required to execute the cx binding regression");
+            assert!(
+                executed.status.success() && executed.stdout == b"OK",
+                "minify={minify} tree_shaking={tree_shaking}: {}\n{}",
+                String::from_utf8_lossy(&executed.stderr),
+                output.bundle
+            );
+            let css = output
+                .assets
+                .iter()
+                .filter(|asset| asset.is_css)
+                .map(|asset| String::from_utf8_lossy(&asset.bytes).into_owned())
+                .collect::<String>();
+            assert!(
+                css.contains("color:red")
+                    && css.contains("padding:8px")
+                    && css.contains("background:blue"),
+                "{css}"
+            );
+        }
+    }
+}
+
+#[test]
+fn crab_css_folds_literal_cx_and_eliminates_runtime_module() {
     let fs = MemoryFileSystem::from_files([
         ("node_modules/@crab-dev/css/package.json", CRAB_CSS_PKG_JSON),
         ("node_modules/@crab-dev/css/index.js", CRAB_CSS_INDEX),
         (
             "src/index.tsx",
             "import { css, cx as merge } from '@crab-dev/css';\n\
-             const base = css`color:red;`;\n\
-             const active = css`font-weight:bold;`;\n\
-             const enabled = false;\n\
-             export const className = merge(base, enabled && active);",
+             export const base = css`color:red;`;\n\
+             export const active = css`font-weight:bold;`;\n\
+             export const className = merge('ready', false, 'active');",
         ),
     ]);
     let mut b = IncrementalBundler::new(Arc::new(fs));
@@ -8932,7 +9026,8 @@ fn crab_css_lowers_safe_cx_and_eliminates_runtime_module() {
         out.bundle
     );
     assert!(!out.bundle.contains("@crab-dev/css"), "{}", out.bundle);
-    assert!(out.bundle.contains("filter(Boolean).join(\" \")"));
+    assert!(out.bundle.contains("ready active"), "{}", out.bundle);
+    assert!(!out.bundle.contains("filter(Boolean)"));
     assert_eq!(out.module_count, 1, "Crab CSS 运行时模块应被 DME 删除");
 }
 
@@ -9059,7 +9154,7 @@ fn crab_css_extracts_extended_api_and_eliminates_static_runtime() {
          const spin = keyframes`from { opacity: 0; } to { opacity: 1; }`;\n\
          globalStyle`:root { color-scheme: light dark; }`;\n\
          const box = css`color: ${accent}; animation: ${spin} 1s;`;\n\
-         export default cx(box);",
+         export default [box, cx('ready')];",
     )));
     bundler.enable_css_in_js();
     bundler.enable_css_extraction();

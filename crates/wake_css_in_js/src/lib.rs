@@ -686,7 +686,7 @@ pub fn transform(
 pub fn transform_with_class_prefix(
     program: &Program,
     interner: &Interner,
-    source: &str,
+    _source: &str,
     seed: &str,
     imported: &value::Scope,
     class_prefix: Option<&str>,
@@ -759,12 +759,12 @@ pub fn transform_with_class_prefix(
         collector.visit_program(program);
     }
 
-    // 4) `cx` 的 atomic-class 冲突语义不能盲目降级成 join。只有能证明每个可能出现的
-    // class 都是单个非 atomic token 时才替换；未知调用保留原包依赖。
+    // 4) Only closed literal calls can become an independently parsed replacement. Keep every
+    // binding-bearing argument in its original AST so imports, mangling, liveness and TDZ retain
+    // their original symbol identities. A constant result also needs no generated Boolean lookup.
     let mut usage = CssInJsUsage {
-        source,
         bindings: &bindings,
-        ctx: &ctx,
+        interner,
         out: &mut out,
         safe: bindings
             .bindings
@@ -858,9 +858,8 @@ fn define_token_diagnostics(
 }
 
 struct CssInJsUsage<'a, 'b> {
-    source: &'a str,
     bindings: &'a BindingRegistry,
-    ctx: &'a value::EvalCtx<'a>,
+    interner: &'a Interner,
     out: &'b mut TransformResult,
     safe: FxHashMap<SymbolId, bool>,
     consumed_create_var_calls: &'a [Span],
@@ -907,14 +906,7 @@ impl<'ast> Visit<'ast> for CssInJsUsage<'_, '_> {
             && let Some(binding) = self.bindings.binding_for_expression(&call.callee)
             && binding.kind == BindingKind::Cx
         {
-            if call.optional
-                || !call
-                    .arguments
-                    .iter()
-                    .all(|arg| known_non_atomic_class(arg, self.ctx))
-            {
-                self.safe.insert(binding.symbol, false);
-            } else if let Some(replacement) = cx_replacement(call, self.source) {
+            if let Some(replacement) = cx_replacement(call, self.interner) {
                 self.out.replacements.insert(call.span, replacement);
             } else {
                 self.safe.insert(binding.symbol, false);
@@ -944,38 +936,38 @@ impl<'ast> Visit<'ast> for CssInJsUsage<'_, '_> {
     }
 }
 
-fn known_non_atomic_class(expr: &Expression, ctx: &value::EvalCtx) -> bool {
-    match value::eval(expr, ctx) {
-        Some(StaticValue::Str(value)) => {
-            value.is_empty()
-                || (!value.chars().any(char::is_whitespace) && !value.starts_with("atm_"))
-        }
-        Some(StaticValue::Null | StaticValue::Undefined | StaticValue::Bool(false)) => true,
-        _ => match expr {
-            // `condition && knownClass`: truthy 时一定得到右侧 class，falsy 时会被 filter 删除。
-            Expression::Logical(logical) if logical.operator == LogicalOperator::And => {
-                known_non_atomic_class(&logical.right, ctx)
-            }
-            Expression::Conditional(conditional) => {
-                known_non_atomic_class(&conditional.consequent, ctx)
-                    && known_non_atomic_class(&conditional.alternate, ctx)
-            }
-            _ => false,
-        },
+fn cx_replacement(call: &CallExpression, interner: &Interner) -> Option<String> {
+    if call.optional {
+        return None;
     }
-}
-
-fn cx_replacement(call: &CallExpression, source: &str) -> Option<String> {
-    let mut out = String::from("[");
-    for (index, argument) in call.arguments.iter().enumerate() {
-        if index != 0 {
-            out.push(',');
+    let mut classes = String::new();
+    for argument in call.arguments.iter() {
+        match argument {
+            Expression::StringLiteral(literal) => {
+                let value = interner.resolve_js(literal.value);
+                let value = value.as_str()?;
+                // Retain runtime normalization for whitespace (including JS's BOM whitespace),
+                // and the existing conservative policy for atomic-looking class tokens.
+                if value.starts_with("atm_")
+                    || value
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || ch == '\u{feff}')
+                {
+                    return None;
+                }
+                if !value.is_empty() {
+                    if !classes.is_empty() {
+                        classes.push(' ');
+                    }
+                    classes.push_str(value);
+                }
+            }
+            Expression::BooleanLiteral(literal) if !literal.value => {}
+            Expression::NullLiteral(_) => {}
+            _ => return None,
         }
-        let span = argument.span();
-        out.push_str(source.get(span.lo as usize..span.hi as usize)?);
     }
-    out.push_str("].filter(Boolean).join(\" \")");
-    Some(out)
+    Some(js_string_literal(&classes))
 }
 
 /// 名称身份由「schema + 规范化模块 id + API 种类 + binding 名 + 同名 ordinal」组成，刻意
