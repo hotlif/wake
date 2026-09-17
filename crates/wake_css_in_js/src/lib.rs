@@ -1439,7 +1439,14 @@ fn unsupported_scoped_at_rule(nodes: &[CssSyntaxNode], items: &[CssSyntaxItem]) 
             // Unknown rules fail closed because many are global statements or descriptors.
             if !matches!(
                 normalized.as_str(),
-                "media" | "supports" | "container" | "scope" | "document" | "keyframes" | "layer"
+                "media"
+                    | "supports"
+                    | "container"
+                    | "scope"
+                    | "document"
+                    | "keyframes"
+                    | "layer"
+                    | "starting-style"
             ) {
                 return Some(normalized);
             }

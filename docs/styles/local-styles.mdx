@@ -55,6 +55,19 @@ export function Card() {
 
 ## 验证方式
 
+`@starting-style` 可以嵌套在局部模板里，为元素首次显示时的过渡提供起始值：
+
+```ts
+const notice = css`
+  opacity: 1;
+  transition: opacity 200ms;
+  @starting-style { opacity: 0; }
+`;
+```
+
+`@scope` 也可嵌套使用，输出保留浏览器原生作用域语义。嵌套选择器中的 `&` 指向整个父选择器
+集合，特异性与原生 CSS Nesting 一致；这些 CSS 功能需要目标浏览器支持。
+
 在 hover 和窄屏状态下检查边框与间距；CSS 中只应出现生成类名，不应包含运行时模板。
 
 ## 常见错误

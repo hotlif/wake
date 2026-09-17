@@ -105,7 +105,26 @@ fn flatten_items(
                 };
                 let prelude_nodes = item.nodes(nodes);
                 let prelude_span = nodes_span(prelude_nodes, item.span);
-                if is_conditional_at_rule(name) {
+                if name.eq_ignore_ascii_case("scope") {
+                    // Scope start/end selectors and the body have different nesting roots.
+                    // Preserve their native context instead of hoisting the group like @media.
+                    if !parents.is_empty() {
+                        out.push_str(&parents.join(","));
+                        out.push('{');
+                    }
+                    let mut edits = Vec::new();
+                    collect_native_animation_edits(
+                        source,
+                        nodes,
+                        std::slice::from_ref(item),
+                        ctx,
+                        &mut edits,
+                    );
+                    out.push_str(apply_edits(source, item.span, &edits).trim());
+                    if !parents.is_empty() {
+                        out.push('}');
+                    }
+                } else if is_conditional_at_rule(name) {
                     let mut inner = String::new();
                     flatten_items(
                         parents,
@@ -193,8 +212,38 @@ fn nodes_span(nodes: &[CssSyntaxNode], fallback: Span) -> Span {
 fn is_conditional_at_rule(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "media" | "supports" | "container" | "layer" | "scope" | "document"
+        "media" | "supports" | "container" | "layer" | "starting-style" | "document"
     )
+}
+
+fn collect_native_animation_edits(
+    source: &str,
+    nodes: &[CssSyntaxNode],
+    items: &[CssSyntaxItem],
+    ctx: &KeyframeCtx<'_>,
+    edits: &mut Vec<(Span, String)>,
+) {
+    for item in items {
+        let item_nodes = item.nodes(nodes);
+        let span = nodes_span(item_nodes, item.span);
+        let replacement = match &item.kind {
+            CssSyntaxItemKind::Declaration(_) => {
+                Some(scope_animation_declaration(source, item_nodes, span, ctx))
+            }
+            CssSyntaxItemKind::AtRule { name } if name.eq_ignore_ascii_case("keyframes") => {
+                Some(scope_keyframes_prelude(source, item_nodes, span, ctx))
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement
+            && replacement != slice(source, span).trim()
+        {
+            edits.push((span, replacement));
+        }
+        if let Some(block) = item.block(nodes) {
+            collect_native_animation_edits(source, &block.children, &item.children, ctx, edits);
+        }
+    }
 }
 
 fn keyframe_name(source: &str, nodes: &[CssSyntaxNode]) -> Option<(String, bool, Span)> {
@@ -347,27 +396,48 @@ fn expand_selectors(
 
         let ampersands = delimiter_spans(part_nodes, '&');
         if parents.is_empty() {
-            let edits = ampersands
-                .into_iter()
-                .map(|span| (span, String::new()))
-                .collect::<Vec<_>>();
-            expanded.push(apply_edits(source, part_span, &edits).trim().to_string());
+            // A top-level & has native :scope semantics; it is not an empty selector.
+            expanded.push(child.to_string());
         } else {
-            for parent in parents {
-                if ampersands.is_empty() {
-                    expanded.push(format!("{} {}", parent.trim(), child));
-                } else {
-                    let edits = ampersands
-                        .iter()
-                        .copied()
-                        .map(|span| (span, parent.trim().to_string()))
-                        .collect::<Vec<_>>();
-                    expanded.push(apply_edits(source, part_span, &edits).trim().to_string());
-                }
+            let parent = nesting_selector(parents);
+            if ampersands.is_empty() {
+                expanded.push(format!("{parent} {child}"));
+            } else {
+                let edits = ampersands
+                    .iter()
+                    .copied()
+                    .map(|span| (span, parent.clone()))
+                    .collect::<Vec<_>>();
+                expanded.push(apply_edits(source, part_span, &edits).trim().to_string());
             }
         }
     }
     expanded
+}
+
+fn nesting_selector(parents: &[String]) -> String {
+    if let [parent] = parents {
+        let parent = parent.trim();
+        let tree = CssSyntaxTree::parse_with_context(
+            parent,
+            Span::new(0, parent.len() as u32),
+            CssSyntaxContext::ComponentValues,
+        );
+        // Keep compact output for a single class/id. Compound selectors, type selectors,
+        // pseudo-elements and lists require :is() to preserve matching and specificity for every &.
+        let nodes = tree
+            .nodes
+            .iter()
+            .filter(|node| !matches!(node.kind, CssSyntaxKind::Comment))
+            .collect::<Vec<_>>();
+        if matches!(nodes.as_slice(), [dot, ident]
+            if matches!(dot.kind, CssSyntaxKind::Delim('.')) && matches!(ident.kind, CssSyntaxKind::Ident(_)))
+            || matches!(nodes.as_slice(), [id] if matches!(id.kind, CssSyntaxKind::IdHash(_)))
+        {
+            return parent.to_string();
+        }
+    }
+    format!(":is({})", parents.join(","))
 }
 
 fn selector_parts_from_nodes(nodes: &[CssSyntaxNode], span: Span) -> Vec<(Span, &[CssSyntaxNode])> {
@@ -550,25 +620,106 @@ mod tests {
     }
 
     #[test]
-    fn nested_selector_lists_expand_as_a_cartesian_product() {
+    fn nested_selector_lists_keep_native_specificity() {
         assert_eq!(
             flatten(
                 ".box",
                 "& .a, & .b { &:hover { color: red; } .child { color: blue; } }"
             ),
-            ".box .a:hover,.box .b:hover{color: red;}\
-.box .a .child,.box .b .child{color: blue;}"
+            ":is(.box .a,.box .b):hover{color: red;}\
+:is(.box .a,.box .b) .child{color: blue;}"
         );
 
-        // Functional-pseudo commas remain inside one selector while top-level child selectors
-        // still combine with every parent branch.
+        // Functional-pseudo commas remain inside one selector; each child uses the whole parent set.
         assert_eq!(
             flatten(
                 ".box",
                 "& .a, & .b { &:is(:hover, :focus), &[aria-current] { color: red; } }"
             ),
-            ".box .a:is(:hover, :focus),.box .b:is(:hover, :focus),\
-.box .a[aria-current],.box .b[aria-current]{color: red;}"
+            ":is(.box .a,.box .b):is(:hover, :focus),\
+:is(.box .a,.box .b)[aria-current]{color: red;}"
+        );
+    }
+
+    #[test]
+    fn starting_style_keeps_parent_and_nested_conditions() {
+        assert_eq!(
+            flatten(
+                ".box",
+                "@StArTiNg-StYlE { opacity: 0; @media screen { &:hover { opacity: .5; } } }"
+            ),
+            "@StArTiNg-StYlE{.box{opacity: 0;}@media screen{.box:hover{opacity: .5;}}}"
+        );
+        assert_eq!(
+            flatten("", "@starting-style { .box { opacity: 0; } }"),
+            "@starting-style{.box{opacity: 0;}}"
+        );
+    }
+
+    #[test]
+    fn scope_preserves_native_root_limit_and_nested_context() {
+        let scope = "@scope (& > .scope) to (& .limit) { & .content { color: red; } }";
+        assert_eq!(flatten(".parent", scope), format!(".parent{{{scope}}}"));
+        let top = "@scope (.root) { & .child { color: red; } @scope { :scope { color: blue; } } }";
+        assert_eq!(flatten("", top), top);
+        assert_eq!(
+            flatten(
+                ".parent",
+                "color: red; @scope { color: blue; } color: green;"
+            ),
+            ".parent{color: red;}.parent{@scope { color: blue; }}.parent{color: green;}"
+        );
+        assert_eq!(
+            flatten(".parent", "@media screen { @scope { color: blue; } }"),
+            "@media screen{.parent{@scope { color: blue; }}}"
+        );
+    }
+
+    #[test]
+    fn scope_keeps_local_animation_names_consistent() {
+        let css = flatten(
+            ".box",
+            "animation: spin 1s; @scope (&) { & { animation: spin 2s; } @keyframes spin { to { opacity: 0; } } }",
+        );
+        assert!(css.contains("animation: spin-box 1s;"), "{css}");
+        assert!(css.contains("animation: spin-box 2s;"), "{css}");
+        assert!(css.contains("@keyframes spin-box"), "{css}");
+        assert!(css.contains(".box{@scope (&)"), "{css}");
+    }
+
+    #[test]
+    fn nesting_uses_parent_set_for_every_ampersand() {
+        assert_eq!(
+            flatten("", ".foo, #bar { & .child { color: red; } }"),
+            ":is(.foo,#bar) .child{color: red;}"
+        );
+        assert_eq!(
+            flatten("", ".a, .b { & + & { color: red; } }"),
+            ":is(.a,.b) + :is(.a,.b){color: red;}"
+        );
+        assert_eq!(
+            flatten("", ".a .b { & + & { color: red; } }"),
+            ":is(.a .b) + :is(.a .b){color: red;}"
+        );
+        assert_eq!(
+            flatten("", "article { div& { color: red; } }"),
+            "div:is(article){color: red;}"
+        );
+        assert_eq!(
+            flatten("", ".box::before { & { color: red; } }"),
+            ":is(.box::before){color: red;}"
+        );
+        assert_eq!(
+            flatten("", "& .child { color: red; }"),
+            "& .child{color: red;}"
+        );
+    }
+
+    #[test]
+    fn nesting_selector_excludes_legacy_pseudo_elements() {
+        assert_eq!(
+            flatten("", ".box:before { & { color: red; } }"),
+            ":is(.box:before){color: red;}"
         );
     }
 
@@ -681,7 +832,7 @@ mod tests {
     #[test]
     fn deep_nesting() {
         let css = flatten(".box", "& .a { & .b { color: red; } }");
-        assert_eq!(css, ".box .a .b{color: red;}");
+        assert_eq!(css, ":is(.box .a) .b{color: red;}");
     }
 
     #[test]

@@ -25,6 +25,27 @@ fn run_with(src: &str, imported: &Scope) -> TransformResult {
 const IMPORT: &str = "import { css } from '@crab-dev/css';\n";
 
 #[test]
+fn starting_style_is_local_and_global_nesting_keeps_its_selector() {
+    let local = run(&format!(
+        "{IMPORT}const box = css`opacity: 1; @starting-style {{ opacity: 0; }} opacity: .9;`;"
+    ));
+    assert!(local.diagnostics.is_empty(), "{:?}", local.diagnostics);
+    let class = local.replacements.values().next().unwrap();
+    let class = class.trim_matches('"');
+    assert_eq!(
+        local.css,
+        format!(
+            ".{class}{{opacity: 1;}}@starting-style{{.{class}{{opacity: 0;}}}}.{class}{{opacity: .9;}}"
+        )
+    );
+    let global = run(
+        "import { globalStyle } from '@crab-dev/css'; globalStyle`.box { @starting-style { opacity: 0; } }`;",
+    );
+    assert!(global.diagnostics.is_empty());
+    assert_eq!(global.css, "@starting-style{.box{opacity: 0;}}");
+}
+
+#[test]
 fn crab_css_is_the_only_compiler_source() {
     assert_eq!(CSS_IN_JS_SOURCES, ["@crab-dev/css"]);
 }

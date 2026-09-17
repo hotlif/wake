@@ -426,6 +426,7 @@ pub struct CssModulesResult {
 ///   同文件同名稳定、跨文件不撞）；构建 `局部名 → 作用域名` 映射供 JS `import styles` 使用。
 /// - 正确区分**选择器上下文**（顶层 / `@media`·`@supports`·`@container`·`@layer` 体）与
 ///   **声明块**（`.foo { }` 体内、`@keyframes`/`@font-face` 体），只在前者改写 `.`。
+/// - `@scope` 起点与终点中的选择器使用同一类名映射，并支持 `:global()` / `:local()`。
 /// - `@import` 与 `url()` 依赖提取同 [`analyze`]，URL span 映射到所有作用域编辑之后。
 ///
 /// 未覆盖（后续）：`#id` 作用域、`composes`、keyframes 名作用域。
@@ -487,6 +488,15 @@ fn collect_module_rules(
     for item in items {
         if matches!(item.kind, CssSyntaxItemKind::QualifiedRule) {
             collect_selector_classes(item.nodes(nodes), true, seed, exports, edits);
+        }
+        if matches!(&item.kind, CssSyntaxItemKind::AtRule { name } if name.eq_ignore_ascii_case("scope"))
+        {
+            // Only the parenthesized start/end selectors are selector contexts in the prelude.
+            for node in item.nodes(nodes) {
+                if matches!(node.kind, CssSyntaxKind::Block(CssBlockKind::Parenthesis)) {
+                    collect_selector_classes(&node.children, true, seed, exports, edits);
+                }
+            }
         }
         if let Some(block) = item.block(nodes) {
             collect_module_rules(&block.children, &item.children, seed, exports, edits);
@@ -777,6 +787,56 @@ mod tests {
     }
 
     // —— CSS Modules ——
+
+    #[test]
+    fn modules_rewrite_scope_boundaries_with_the_same_class_mapping() {
+        let module = transform_modules(
+            r#"@scope (:local(.r\6f ot)) to (:global(.outside) .limit) { .child { color: red; } } .root {} .limit {}"#,
+            "s",
+        );
+        let map: std::collections::HashMap<_, _> = module.exports.iter().cloned().collect();
+        assert_eq!(map.len(), 3, "{:?}", map);
+        assert!(
+            module.code.contains(&format!(
+                "@scope (.{}) to (.outside .{})",
+                map["root"], map["limit"]
+            )),
+            "{}",
+            module.code
+        );
+        assert!(
+            module
+                .code
+                .contains(&format!(".{} {{ color: red; }}", map["child"]))
+        );
+        assert!(!module.code.contains(":local("));
+        assert!(!module.code.contains(":global("));
+        let nested = transform_modules(
+            ".host { @scope (& > .root) to (.limit) { .child {} } }",
+            "s",
+        );
+        for name in ["host", "root", "limit", "child"] {
+            assert!(
+                nested.exports.iter().any(|(local, _)| local == name),
+                "{}",
+                nested.code
+            );
+        }
+    }
+
+    #[test]
+    fn starting_style_survives_plain_css_minification_and_modules() {
+        let source =
+            ".box { @starting-style { opacity: 0; } } @starting-style { .box { opacity: .5; } }";
+        assert_eq!(analyze(source).code, source);
+        assert!(minify(source).contains("@starting-style{opacity: 0}"));
+        let module = transform_modules(source, "s");
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(
+            module.code,
+            source.replace(".box", &format!(".{}", module.exports[0].1))
+        );
+    }
 
     #[test]
     fn modules_scopes_class_selectors() {
