@@ -3,7 +3,7 @@
   "private": true,
   "displayName": "Crab CSS",
   "description": "CSS language intelligence for @crab-dev/css tagged templates.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "packageManager": "yarn@4.16.0",
   "publisher": "crab-dev",
   "license": "MIT OR Apache-2.0",

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Accept `@starting-style` in local Crab CSS templates during compiler validation.
+- Restore declaration highlighting, hover, value completion and unknown-property diagnostics in
+  `@position-try` and page-margin rules.
+- Recognize font feature-value declarations and treat their names as custom descriptors,
+  including names that overlap ordinary CSS properties.
+
 ## 0.1.3
 
 - Made Yarn PnP VSIX packaging expose VSCE's dynamic Secretlint rules to their actual resolver

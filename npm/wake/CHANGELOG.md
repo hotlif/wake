@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.44
+
+- Support local and nested `@starting-style` without rejecting the rule or dropping its selector.
+- Preserve native `@scope` nesting semantics and rewrite CSS Modules class names in scope boundaries.
+- Preserve CSS Nesting specificity and matching for selector lists, multiple `&` references,
+  complex parents and pseudo-elements.
+- Recognize declarations in `@position-try`, page-margin rules and font feature-value blocks;
+  provide accurate property intelligence and distinguish custom font feature names.
+- Distribute the editor fixes separately as Crab CSS VS Code 0.1.4 GitHub Release assets.
+
 ## 0.1.43
 
 Versions 0.1.40–0.1.42 were stopped during release validation and were not published.
