@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.1.4
+## 0.1.5
+
+Version 0.1.4 was stopped by release validation and was not published.
+
+- Verify the manifest version against the current changelog instead of an obsolete release number.
 
 - Accept `@starting-style` in local Crab CSS templates during compiler validation.
 - Restore declaration highlighting, hover, value completion and unknown-property diagnostics in

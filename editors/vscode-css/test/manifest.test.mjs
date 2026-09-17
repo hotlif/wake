@@ -10,7 +10,9 @@ test('manifest exposes the stable Crab CSS contract', async () => {
   assert.equal(manifest.name, 'crab-css')
   assert.equal(manifest.private, true)
   assert.equal(manifest.publisher, 'crab-dev')
-  assert.equal(manifest.version, '0.1.3')
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
+  const changelog = await readFile(new URL('CHANGELOG.md', root), 'utf8')
+  assert.equal(changelog.split('\n').find(line => line.startsWith('## '))?.trim(), `## ${manifest.version}`)
   assert.equal(manifest.engines.vscode, '^1.96.0')
   assert.deepEqual(manifest.extensionKind, ['workspace'])
   assert.deepEqual(manifest.contributes.semanticTokenTypes, [

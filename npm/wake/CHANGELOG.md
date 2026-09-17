@@ -8,7 +8,8 @@
   complex parents and pseudo-elements.
 - Recognize declarations in `@position-try`, page-margin rules and font feature-value blocks;
   provide accurate property intelligence and distinguish custom font feature names.
-- Distribute the editor fixes separately as Crab CSS VS Code 0.1.4 GitHub Release assets.
+- Distribute the editor fixes separately as Crab CSS VS Code 0.1.5 GitHub Release assets
+  (the planned 0.1.4 extension release was stopped during validation).
 
 ## 0.1.43
 
