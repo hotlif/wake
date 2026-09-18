@@ -3903,13 +3903,20 @@ fn validate_output_ownership(target: &Path, product: OutputProduct) -> Result<()
 
     let marker = target.join(OUTPUT_OWNERSHIP_FILE);
     let marker_metadata = std::fs::symlink_metadata(&marker).map_err(|error| {
-        WakeError::new(
-            "WAKE_CONFIG",
+        let message = if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "refusing to replace non-empty output: missing {OUTPUT_OWNERSHIP_FILE} ownership marker. \
+                 This directory may contain output from an older Wake version. \
+                 Choose a new output directory with --outdir, or confirm this directory contains \
+                 only build artifacts, move it to a backup location, and rebuild. \
+                 Wake will create the marker automatically."
+            )
+        } else {
             format!(
                 "refusing to replace non-empty output without a valid {OUTPUT_OWNERSHIP_FILE}: {error}"
-            ),
-        )
-        .at(target)
+            )
+        };
+        WakeError::new("WAKE_CONFIG", message).at(target)
     })?;
     if metadata_is_link_or_reparse_point(&marker_metadata) || !marker_metadata.is_file() {
         return Err(WakeError::new(
@@ -10273,6 +10280,30 @@ entry = "packages/Button.tsx"
             std::fs::read_to_string(fixture.0.join("custom-output/sentinel.txt")).unwrap(),
             "keep-unowned"
         );
+    }
+
+    #[test]
+    fn unowned_output_reports_recovery_without_changing_files() {
+        for product in [OutputProduct::Application, OutputProduct::Documentation] {
+            let fixture = Fixture::new("unowned-output-recovery");
+            fixture.write("old-output/index.html", "previous build");
+            let output = fixture.0.join("old-output");
+            let before = output_snapshot(&output);
+
+            let error = validate_output_ownership(&output, product).unwrap_err();
+
+            assert_eq!(error.code, "WAKE_CONFIG");
+            assert!(
+                error.message.contains("missing .wake-output.json"),
+                "{error}"
+            );
+            assert!(error.message.contains("older Wake version"), "{error}");
+            assert!(error.message.contains("--outdir"), "{error}");
+            assert!(error.message.contains("only build artifacts"), "{error}");
+            assert!(error.message.contains("backup"), "{error}");
+            assert!(error.message.contains("rebuild"), "{error}");
+            assert_eq!(output_snapshot(&output), before);
+        }
     }
 
     fn output_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
