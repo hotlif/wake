@@ -29,6 +29,10 @@ status = "stable"
 
 Wake 不自动接管非空、未标记目录，也不覆盖源码或项目根。使用新的输出目录验证；确需清理旧产物时先人工确认归属。不要伪造 `.wake-output.json` 以绕过保护。[构建参考](/reference/cli/build)列出准确规则。
 
+升级前生成的 `dist` 或 `docs-dist` 可能没有 `.wake-output.json`。此时诊断会明确指出缺少输出所有权标记，
+并提示选择新的输出目录，或确认旧目录仅包含构建产物后将它移到备份位置，再重新构建。
+新构建会自动写入标记，后续构建即可正常替换该目录；拒绝构建时原目录保持不变。
+
 ## 测试未发现或无法运行
 
 检查 `--root`、include/exclude、路径与名称筛选；`--project` 是项目名而不是目录。浏览器测试找不到浏览器时安装或指定系统浏览器路径。React 测试的 react/react-dom 版本必须匹配。Mock 没生效时检查注册是否晚于静态导入。详见[测试配置](/testing/configuration)与[环境](/testing/environments)。
