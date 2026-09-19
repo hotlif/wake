@@ -157,10 +157,16 @@ impl Executor {
             return Vec::new();
         }
         let (tx, rx) = mpsc::channel::<(usize, T)>();
+        let context = wake_common::progress::ProgressContext::capture();
         for (i, job) in jobs.into_iter().enumerate() {
             let tx = tx.clone();
+            let context = context.clone();
             self.shared.injector.push(Box::new(move || {
-                let result = job();
+                let result = {
+                    let _progress_context = context.enter();
+                    job()
+                };
+                drop(context);
                 // 接收端存活期间发送必成功；失败仅当提交方已放弃（进程退出），忽略。
                 let _ = tx.send((i, result));
             }));

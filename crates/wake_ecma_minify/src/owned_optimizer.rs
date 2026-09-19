@@ -482,11 +482,15 @@ pub(crate) fn optimize_owned_program(
     interner: &Interner,
     input: &OptimizeInput<'_>,
 ) -> Result<OwnedOptimizationResult, MinifyDiagnostic> {
+    let lowering_progress = wake_common::progress::step("ir-lower", String::new);
     let semantic_free = lower_exact_trivial_without_semantic(program, interner, input);
     let (owned, export_bindings) = if let Some(owned) = semantic_free {
         (owned, Vec::new())
     } else {
-        let semantic = analyze(program, interner);
+        let semantic = {
+            let _progress = wake_common::progress::step("parser-semantic", String::new);
+            analyze(program, interner)
+        };
         let export_bindings = collect_export_symbol_bindings(program, interner, &semantic);
         let lowering_plan = pre_lower_export_function_elision(
             program,
@@ -508,6 +512,7 @@ pub(crate) fn optimize_owned_program(
                 })?;
         (owned, export_bindings)
     };
+    drop(lowering_progress);
     let edits = typed_edit_input(input)?;
     let mut reserved_names = input.reserved_names.clone();
     reserved_names.extend(

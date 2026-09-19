@@ -168,6 +168,7 @@ fn run_typed_pipeline_impl(
     // preserves the typed-IR invariants or returns an error without exposing this owned value.
     debug_assert!(program.validate().is_ok());
 
+    let edits_progress = wake_common::progress::step("trusted-edits", String::new);
     let edit_report = apply_typed_edits(&mut program, edits).map_err(|error| {
         edit_error(
             OptimizationPass::ApplyTrustedEdits,
@@ -176,6 +177,8 @@ fn run_typed_pipeline_impl(
             error,
         )
     })?;
+    drop(edits_progress);
+    let helpers_progress = wake_common::progress::step("runtime-helpers", String::new);
     let runtime_helpers = materialize_runtime_helpers(&mut program).map_err(|error| {
         ir_error(
             OptimizationPass::ApplyTrustedEdits,
@@ -184,6 +187,8 @@ fn run_typed_pipeline_impl(
             error,
         )
     })?;
+    drop(helpers_progress);
+    let decorators_progress = wake_common::progress::step("decorators", String::new);
     let decorators = materialize_decorators(&mut program).map_err(|error| {
         decorator_error(
             OptimizationPass::ApplyTrustedEdits,
@@ -193,6 +198,7 @@ fn run_typed_pipeline_impl(
         )
     })?;
 
+    drop(decorators_progress);
     let mut stats = OptimizeStats::default();
     let helper_changes = usize::from(runtime_helpers.spread_name.is_some())
         + usize::from(runtime_helpers.object_spread_name.is_some())
@@ -218,6 +224,7 @@ fn run_typed_pipeline_impl(
         && helper_changes == 0
         && let Some(module_options) = module_options
     {
+        let planning_progress = wake_common::progress::step("module-plan-trivial", String::new);
         let (planned, plan) = try_plan_owned_trivial_bundled_module(program, module_options)
             .map_err(|error| {
                 module_error(
@@ -227,6 +234,7 @@ fn run_typed_pipeline_impl(
                     error,
                 )
             })?;
+        drop(planning_progress);
         program = planned;
         if let Some(mut plan) = plan {
             run_trivial_minifying_compaction(&mut program, &mut stats)?;
@@ -263,6 +271,8 @@ fn run_typed_pipeline_impl(
         }
     }
 
+    let semantic_progress =
+        wake_common::progress::step("semantic-rebuild", || "iteration=0".into());
     let mut analysis = TypedAnalysis::rebuild_validated(&program).map_err(|error| {
         ir_error(
             OptimizationPass::BuildSemanticModel,
@@ -271,9 +281,11 @@ fn run_typed_pipeline_impl(
             error,
         )
     })?;
+    drop(semantic_progress);
     stats.record(OptimizationPass::BuildSemanticModel, 0);
     let mut module_plan_changed = false;
     let mut module_plan = if let Some(module_options) = module_options {
+        let _progress = wake_common::progress::step("module-plan", String::new);
         let pre_plan_revision = program.revision();
         let (planned, plan) = plan_owned_typed_modules(program, &analysis, module_options)
             .map_err(|error| {
@@ -351,6 +363,9 @@ fn run_typed_pipeline_impl(
     });
 
     let mangling = if options.minify && !trivial_effect_module && !preserve_legacy {
+        let _progress = wake_common::progress::step("mangle-properties-slots-identifiers", || {
+            format!("iteration={}", stats.iterations)
+        });
         let final_analysis = final_analysis
             .as_ref()
             .expect("non-trivial minify always retains a current semantic model");
@@ -438,6 +453,8 @@ fn run_trivial_minifying_compaction(
     program: &mut TypedProgram,
     stats: &mut OptimizeStats,
 ) -> Result<(), TypedPipelineError> {
+    let _progress =
+        wake_common::progress::step(TypedPassKind::LatePeephole.name(), || "iteration=0".into());
     let changes = run_typed_pass(
         program,
         TypedPassOptions::default(),
@@ -543,6 +560,8 @@ fn run_minifying_fixed_point(
     let mut last_changed = OptimizationPass::LatePeephole;
     let mut analysis_current = true;
     for iteration in 1..=MAX_TYPED_PIPELINE_ITERATIONS {
+        let _iteration_progress =
+            wake_common::progress::step("optimize-iteration", || format!("iteration={iteration}"));
         let mut round_changes = 0usize;
         let primitive_changes = run_structural(
             program,
@@ -577,6 +596,9 @@ fn run_minifying_fixed_point(
             )?;
             analysis_current = true;
         }
+        let inline_progress = wake_common::progress::step("inline-closed-functions", || {
+            format!("iteration={iteration}")
+        });
         let function_stats = inline_closed_functions(program, &analysis).map_err(|error| {
             inline_error(
                 OptimizationPass::InlineClosedFunctions,
@@ -585,6 +607,7 @@ fn run_minifying_fixed_point(
                 error,
             )
         })?;
+        drop(inline_progress);
         let function_changes = function_stats.function_changes();
         stats.record(OptimizationPass::InlineClosedFunctions, function_changes);
         if function_changes != 0 {
@@ -602,6 +625,9 @@ fn run_minifying_fixed_point(
             )?;
             analysis_current = true;
         }
+        let inline_progress = wake_common::progress::step("inline-single-use-and-dce", || {
+            format!("iteration={iteration}")
+        });
         let local_stats = inline_single_use_and_dce(program, &analysis).map_err(|error| {
             inline_error(
                 OptimizationPass::InlineSingleUseVariables,
@@ -610,6 +636,7 @@ fn run_minifying_fixed_point(
                 error,
             )
         })?;
+        drop(inline_progress);
         let inline_changes = local_stats.inline_changes();
         let dce_changes = local_stats.dce_changes();
         stats.record(OptimizationPass::InlineSingleUseVariables, inline_changes);
@@ -685,6 +712,8 @@ fn run_readable_fixed_point(
     let mut last_changed = OptimizationPass::SimplifyControlFlow;
     let mut analysis_current = true;
     for iteration in 1..=MAX_TYPED_PIPELINE_ITERATIONS {
+        let _iteration_progress =
+            wake_common::progress::step("optimize-iteration", || format!("iteration={iteration}"));
         let mut round_changes = 0usize;
         let mut structural_passes = Vec::with_capacity(4);
         if simplify_defines {
@@ -736,6 +765,9 @@ fn run_readable_fixed_point(
                 )?;
                 analysis_current = true;
             }
+            let dce_progress = wake_common::progress::step("eliminate-dead-code", || {
+                format!("iteration={iteration}")
+            });
             let dce = eliminate_dead_code(program, &analysis).map_err(|error| {
                 inline_error(
                     OptimizationPass::EliminateDeadCode,
@@ -744,6 +776,7 @@ fn run_readable_fixed_point(
                     error,
                 )
             })?;
+            drop(dce_progress);
             let changes = dce.dce_changes();
             stats.record(OptimizationPass::EliminateDeadCode, changes);
             if changes != 0 {
@@ -782,6 +815,13 @@ fn run_structural(
     stats: &mut OptimizeStats,
     last_changed: &mut OptimizationPass,
 ) -> Result<usize, TypedPipelineError> {
+    let _progress = wake_common::progress::step(typed.name(), || format!("iteration={iteration}"));
+    #[cfg(test)]
+    PASS_BLOCKER.with(|blocker| {
+        if let Some(blocker) = blocker.borrow_mut().take() {
+            blocker();
+        }
+    });
     let changes = run_typed_pass(program, options, typed).map_err(|error| {
         ir_error(
             public,
@@ -803,6 +843,8 @@ fn rebuild_for(
     iteration: usize,
     stats: &mut OptimizeStats,
 ) -> Result<TypedAnalysis, TypedPipelineError> {
+    let _progress =
+        wake_common::progress::step("semantic-rebuild", || format!("iteration={iteration}"));
     let analysis = TypedAnalysis::rebuild_validated(program).map_err(|error| {
         ir_error(
             pass,
@@ -870,6 +912,11 @@ fn module_error(
 }
 
 #[cfg(test)]
+thread_local! {
+    static PASS_BLOCKER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use wake_common::{Interner, Span};
     use wake_ecma_ast::SourceType;
@@ -880,6 +927,94 @@ mod tests {
     use crate::typed_edits::{TypedEditDependency, TypedValidatedDefine};
     use crate::typed_ir::{IrOrigin, PropertyKeyKind};
     use crate::typed_modules::{TypedModuleMode, TypedModuleOptions, TypedModuleRequestKind};
+
+    #[test]
+    fn progress_blocked_pass_child() {
+        if std::env::var_os("WAKE_PROGRESS_PASS_CHILD").is_none() {
+            return;
+        }
+        use std::io::Read;
+        PASS_BLOCKER.with(|blocker| {
+            *blocker.borrow_mut() = Some(Box::new(|| {
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+            }))
+        });
+        let _module = wake_common::progress::task("optimize", || "blocked.js".into());
+        let mut program =
+            lower("function folded(){const longValue=1+2;return longValue}consume(folded());");
+        run_typed_pipeline(
+            &mut program,
+            &TypedEditInput::default(),
+            &TypedPipelineOptions {
+                minify: true,
+                ..TypedPipelineOptions::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn progress_observes_pass_before_it_returns() {
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "typed_pipeline::tests::progress_blocked_pass_child",
+                "--nocapture",
+            ])
+            .env("WAKE_PROGRESS", "1")
+            .env("WAKE_PROGRESS_PASS_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for row in std::io::BufReader::new(stderr).lines() {
+                let _ = tx.send(row.unwrap());
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut log = String::new();
+        let mut observed = false;
+        while let Ok(row) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            observed |= row.contains("active")
+                && row.contains(TypedPassKind::PrimitiveFolding.name())
+                && row.contains("iteration=1")
+                && row.contains("blocked.js");
+            log.push_str(&row);
+            log.push('\n');
+            if observed {
+                break;
+            }
+        }
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        reader.join().unwrap();
+        log.extend(rx.try_iter().map(|row| format!("{row}\n")));
+        assert!(status.is_some_and(|status| status.success()), "{log}");
+        assert!(observed, "pass was invisible before return: {log}");
+        assert!(log.contains("inline-single-use-and-dce count="), "{log}");
+        assert!(
+            log.contains("mangle-properties-slots-identifiers count="),
+            "{log}"
+        );
+    }
 
     fn lower(source: &str) -> TypedProgram {
         lower_as(source, SourceType::Script)

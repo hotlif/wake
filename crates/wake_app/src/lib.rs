@@ -1838,9 +1838,19 @@ fn execute_build(
     cancellation: &CancellationToken,
     project_defaults: bool,
 ) -> Result<BuildResult, WakeError> {
+    let _progress = wake_common::progress::build("build", || {
+        options
+            .entry
+            .as_deref()
+            .or(options.project.cwd.as_deref())
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    });
     cancellation.check()?;
     let started = Instant::now();
     let mut prepared = prepare_build(&options)?;
+    _progress.set_target(|| prepared.entry.display().to_string());
     cancellation.check()?;
     let bundler_options = create_bundler_options(&prepared, &options, project_defaults)?;
     let federation_inputs = federation::render_production_inputs(&prepared, &options)?;
@@ -1871,6 +1881,15 @@ fn execute_bundle(
     options: BundleOptions,
     cancellation: &CancellationToken,
 ) -> Result<BundleResult, WakeError> {
+    let _progress = wake_common::progress::build("bundle-request", || {
+        options
+            .entry
+            .as_deref()
+            .or(options.project.cwd.as_deref())
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    });
     let timing = std::env::var_os("WAKE_TIMING").is_some();
     let started = Instant::now();
     let phase_started = Instant::now();
@@ -1884,6 +1903,7 @@ fn execute_bundle(
         write: false,
         ..BuildOptions::default()
     })?;
+    _progress.set_target(|| prepared.entry.display().to_string());
     let prepare_elapsed = phase_started.elapsed();
     if let Some(outfile) = options.outfile.as_deref() {
         validate_not_reserved(
@@ -2034,6 +2054,7 @@ fn prepare_build_with_generation(
     options: &BuildOptions,
     candidate_generation: bool,
 ) -> Result<PreparedBuild, WakeError> {
+    let _progress = wake_common::progress::phase("prepare", String::new);
     materialize_build_probe(probe_build_candidate(options)?, candidate_generation)
 }
 
@@ -3393,6 +3414,8 @@ fn finish_output(
     generation: &mut BuildGeneration,
     cancellation: &CancellationToken,
 ) -> Result<BuildResult, WakeError> {
+    let _progress =
+        wake_common::progress::phase("finalize", || prepared.root.display().to_string());
     cancellation.check()?;
     let federation = federation::build_artifacts(
         prepared,
@@ -3435,6 +3458,8 @@ fn finish_bundle(
     protected_inputs: &[PathBuf],
     cancellation: &CancellationToken,
 ) -> Result<BundleResult, WakeError> {
+    let _progress =
+        wake_common::progress::phase("finalize", || prepared.root.display().to_string());
     let diagnostics = diagnostic_infos(&output.diagnostics, &prepared.root, diagnostic_file_system);
     if output.has_errors() {
         return Err(
@@ -3993,6 +4018,7 @@ fn publish_staged_output<T>(
     cancellation: &CancellationToken,
     materialize: impl FnOnce(&Path) -> Result<T, WakeError>,
 ) -> Result<(T, PathBuf), WakeError> {
+    let _progress = wake_common::progress::phase("publish", || requested.display().to_string());
     let target = resolve_safe_output_directory(project_root, protected_inputs, requested, product)?;
     // Application and Docs staging belongs to the project domain, never the target's parent. A
     // valid output target cannot equal or contain `project_root`, so an ancestor output commit
@@ -4864,6 +4890,9 @@ fn run_build_context(
                 cancellation,
                 response,
             } => {
+                let progress = wake_common::progress::build("rebuild", || {
+                    refresh_state.accepted.entry.display().to_string()
+                });
                 let result = cancellation.check().and_then(|()| {
                     if covered_revision.is_some_and(|covered| {
                         covered
@@ -5146,6 +5175,7 @@ fn run_build_context(
                     ));
                     invalidated.sort();
                     invalidated.dedup();
+                    progress.set_target(|| candidate.entry.display().to_string());
                     let result = execute_context_session_build(
                         &candidate,
                         &options,
@@ -5180,6 +5210,7 @@ fn run_build_context(
                     }
                     result
                 });
+                drop(progress);
                 let _ = response.send(result);
             }
             ContextCommand::Close { response } => {
@@ -5198,6 +5229,8 @@ fn execute_context_session_build(
     invalidate: bool,
     cancellation: &CancellationToken,
 ) -> Result<BuildResult, WakeError> {
+    let _progress =
+        wake_common::progress::phase("compile-publish", || prepared.entry.display().to_string());
     let started = Instant::now();
     session.generation.advance_generation();
     let federation_generation = federation::bind_production_generation(
@@ -5432,6 +5465,15 @@ fn forward_dev_server_event(
 
 #[allow(clippy::result_large_err)]
 pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeError> {
+    let _progress = wake_common::progress::build("dev-start", || {
+        options
+            .entry
+            .as_deref()
+            .or(options.project.cwd.as_deref())
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    });
     let dev_options = options.clone();
     let build_options = BuildOptions {
         project: options.project.clone(),
@@ -6108,6 +6150,15 @@ pub fn build_docs_with_mode(
     docs_mode: DocsMode,
     cancellation: &CancellationToken,
 ) -> Result<DocsBuildResult, WakeError> {
+    let _progress = wake_common::progress::build("docs-build", || {
+        options
+            .project
+            .cwd
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    });
     if docs_mode == DocsMode::Site {
         let workspaces = discover_docs_workspaces(&options)?;
         if !workspaces.is_empty() {
@@ -6122,6 +6173,7 @@ fn build_docs_leaf(
     docs_mode: DocsMode,
     cancellation: &CancellationToken,
 ) -> Result<DocsBuildResult, WakeError> {
+    let _progress = wake_common::progress::phase("docs-build", String::new);
     cancellation.check()?;
     let prepared_docs = prepare_docs(&options, wake_docs::BuildMode::Production, docs_mode)?;
     let requested = absolute_from(
@@ -7104,6 +7156,15 @@ fn start_docs_dev_server_leaf(
     options: DevServerOptions,
     docs_mode: DocsMode,
 ) -> Result<DevServer, WakeError> {
+    let _progress = wake_common::progress::build("docs-dev-start", || {
+        options
+            .project
+            .cwd
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    });
     let dev_options = options.clone();
     let docs_options = DocsBuildOptions {
         project: options.project.clone(),
@@ -8121,6 +8182,7 @@ fn prepare_docs(
     mode: wake_docs::BuildMode,
     docs_mode: DocsMode,
 ) -> Result<PreparedDocs, WakeError> {
+    let _progress = wake_common::progress::phase("docs-prepare", String::new);
     materialize_docs_probe(probe_docs_candidate(options, docs_mode)?, mode, docs_mode)
 }
 
@@ -8128,6 +8190,7 @@ fn probe_docs_candidate(
     options: &DocsBuildOptions,
     docs_mode: DocsMode,
 ) -> Result<PreparedDocsProbe, WakeError> {
+    let _progress = wake_common::progress::phase("docs-scan", String::new);
     let mut last_snapshot_error = None;
     for _ in 0..3 {
         match probe_docs_candidate_once(options, docs_mode) {
@@ -8203,6 +8266,8 @@ fn materialize_docs_probe(
     mode: wake_docs::BuildMode,
     docs_mode: DocsMode,
 ) -> Result<PreparedDocs, WakeError> {
+    let _progress =
+        wake_common::progress::phase("docs-render", || probe.prepared.root.display().to_string());
     let timing = std::env::var_os("WAKE_TIMING")
         .is_some()
         .then(std::time::Instant::now);
@@ -10403,6 +10468,87 @@ entry = "packages/Button.tsx"
             cancellation.commit(|| Ok(())).unwrap_err().code,
             "WAKE_CANCELLED"
         );
+    }
+
+    #[test]
+    fn progress_cancelled_build_child() {
+        if std::env::var_os("WAKE_PROGRESS_CANCEL_CHILD").is_none() {
+            return;
+        }
+        let fixture = Fixture::new("progress-cancel");
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let options = BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        };
+        assert_eq!(
+            build(options.clone(), &cancelled).unwrap_err().code,
+            "WAKE_CANCELLED"
+        );
+        assert!(
+            build(options, &CancellationToken::default())
+                .unwrap()
+                .success
+        );
+        let context = BuildContext::create(BuildOptions {
+            project: fixture.project(),
+            write: false,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        assert_eq!(
+            context.rebuild(Vec::new(), cancelled).unwrap_err().code,
+            "WAKE_CANCELLED"
+        );
+        for _ in 0..2 {
+            assert!(
+                context
+                    .rebuild(Vec::new(), CancellationToken::default())
+                    .unwrap()
+                    .success
+            );
+        }
+        context.close();
+    }
+
+    #[test]
+    fn progress_cancelled_build_does_not_leak_into_next_request() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::progress_cancelled_build_child",
+                "--nocapture",
+            ])
+            .env("WAKE_PROGRESS", "1")
+            .env("WAKE_PROGRESS_CANCEL_CHILD", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let summaries = stderr
+            .lines()
+            .filter(|row| row.contains("summary build "))
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 2, "{stderr}");
+        assert_ne!(
+            summaries[0].split(']').next(),
+            summaries[1].split(']').next(),
+            "{stderr}"
+        );
+        assert!(summaries[0].contains("operations=1"), "{stderr}");
+        let rebuilds = stderr
+            .lines()
+            .filter(|row| row.contains("summary rebuild "))
+            .collect::<Vec<_>>();
+        assert_eq!(rebuilds.len(), 3, "{stderr}");
+        let ids = rebuilds
+            .iter()
+            .map(|row| row.split(']').next().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 3, "{stderr}");
+        assert!(rebuilds[0].contains("operations=1"), "{stderr}");
     }
 
     #[test]

@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = UiMode::Auto)]
     ui: UiMode,
 
+    /// Report native build phases, active modules and slow operations on stderr.
+    #[arg(long, global = true)]
+    progress: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -431,7 +435,7 @@ fn selects_test_command(arguments: &[OsString]) -> bool {
     let mut index = 0;
     while let Some(argument) = arguments.get(index).and_then(|value| value.to_str()) {
         match argument {
-            "--no-color" => index += 1,
+            "--no-color" | "--progress" => index += 1,
             "--ui" => index += 2,
             value if value.starts_with("--ui=") => index += 1,
             value if value.starts_with('-') => return false,
@@ -443,7 +447,7 @@ fn selects_test_command(arguments: &[OsString]) -> bool {
 
 fn main() -> ExitCode {
     let raw_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -461,6 +465,12 @@ fn main() -> ExitCode {
             error.exit()
         }
     };
+    if cli.progress {
+        wake_common::progress::enable();
+    }
+    if wake_common::progress::enabled() {
+        cli.ui = UiMode::Plain;
+    }
     let ui = Ui::detect(cli.no_color);
     let style = if ui.color {
         RenderStyle::colored()

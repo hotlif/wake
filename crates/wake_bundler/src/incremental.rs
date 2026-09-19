@@ -1416,6 +1416,7 @@ impl IncrementalBundler {
         modules: &FxHashMap<u32, ModuleRec>,
         ordered: &[u32],
     ) -> FxHashMap<u32, Arc<wake_css_in_js::value::Scope>> {
+        let _progress = wake_common::progress::step("css-scopes", String::new);
         use wake_css_in_js::value::{Scope, collect_imports, collect_static_reexports};
 
         // 依赖后序：保证每个模块被处理时，其依赖（若非环）已处理完。
@@ -1456,6 +1457,8 @@ impl IncrementalBundler {
             };
             // 未 parse 的模块（缓存摘要命中）没有 AST 可求值，跳过。
             let Some(parsed) = &rec.parsed else { continue };
+            let _progress =
+                wake_common::progress::task("css-module-scope", || rec.path.display().to_string());
 
             // ① 用**已算好的依赖导出**装配本模块的 import 作用域。
             let imports = parsed.ast.with_ast(|p| collect_imports(p, &self.interner));
@@ -1615,6 +1618,7 @@ impl IncrementalBundler {
     /// 启用持久化构建缓存（PLAN §7.1）：从 `path` 载入既有缓存；构建结束 `store` 回盘。
     /// 让全新进程的冷构建跳过未变模块的 parse + codegen（「冷启动首跑毫秒级」）。opt-in。
     pub fn enable_persistent_cache(&mut self, path: PathBuf) -> &mut Self {
+        let _progress = wake_common::progress::phase("cache-load", || path.display().to_string());
         let (cache, warning) = match BuildCache::load(&path) {
             CacheLoadOutcome::Loaded(cache) => (*cache, None),
             CacheLoadOutcome::Missing | CacheLoadOutcome::Incompatible { .. } => {
@@ -1869,7 +1873,13 @@ impl IncrementalBundler {
                 let jsx = self.jsx.clone();
                 let target = self.target.clone();
                 let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&item.path)));
-                move || parse_request(cell, compiler, st, jsx, target, file_name)
+                let progress_path =
+                    wake_common::progress::enabled().then(|| path_to_slash(&item.path));
+                move || {
+                    let _progress =
+                        wake_common::progress::task("parse", || progress_path.unwrap_or_default());
+                    parse_request(cell, compiler, st, jsx, target, file_name)
+                }
             })
             .collect();
         let engine = Arc::clone(&self.engine);
@@ -1952,6 +1962,8 @@ impl IncrementalBundler {
 
     /// 从 `entry` 增量 + 并行打包。
     pub fn build(&mut self, entry: &Path) -> BuildOutput {
+        let _progress = wake_common::progress::phase("bundle", || entry.display().to_string());
+        let scan_progress = wake_common::progress::phase("scan", || entry.display().to_string());
         assert!(
             !self.one_shot || !self.one_shot_built,
             "one-shot IncrementalBundler may only build once"
@@ -2262,7 +2274,12 @@ impl IncrementalBundler {
                     let file_name = jsx
                         .dev
                         .then(|| Arc::<str>::from(path_to_slash(&layer[i].path)));
+                    let progress_path =
+                        wake_common::progress::enabled().then(|| path_to_slash(&layer[i].path));
                     move || {
+                        let _progress = wake_common::progress::task("parse", || {
+                            progress_path.unwrap_or_default()
+                        });
                         let (parse_vc, parsed) =
                             parse_request(cell, compiler, st, jsx, target, file_name);
                         // 三项只读分析共享一次 AST holder 访问，并留在 parse worker 上并行执行。
@@ -2917,6 +2934,9 @@ impl IncrementalBundler {
         }
 
         let t_scan = t0.elapsed();
+        drop(scan_progress);
+        let link_progress =
+            wake_common::progress::phase("link", || format!("{} modules", modules.len()));
         let t_link_start = timing.then(std::time::Instant::now);
 
         let link_fingerprint = self.link_plan_fingerprint(&modules, entry_id, next_id);
@@ -2940,6 +2960,9 @@ impl IncrementalBundler {
             (keep, export_stars)
         };
         let link_time = t_link_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        drop(link_progress);
+        let codegen_progress =
+            wake_common::progress::phase("codegen", || format!("{} modules", modules.len()));
         let t_codegen_start = timing.then(std::time::Instant::now);
         let mut optimize_time = std::time::Duration::ZERO;
         let mut body_time = std::time::Duration::ZERO;
@@ -3057,7 +3080,14 @@ impl IncrementalBundler {
                     let target = self.target.clone();
                     // dev runtime 的 `fileName`：统一正斜杠，避免 Windows 反斜杠进入产物。
                     let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&rec.path)));
-                    move || parse_request(cell, compiler, st, jsx, target, file_name)
+                    let progress_path =
+                        wake_common::progress::enabled().then(|| path_to_slash(&rec.path));
+                    move || {
+                        let _progress = wake_common::progress::task("parse", || {
+                            progress_path.unwrap_or_default()
+                        });
+                        parse_request(cell, compiler, st, jsx, target, file_name)
+                    }
                 })
                 .collect();
             let engine = Arc::clone(&self.engine);
@@ -3368,7 +3398,14 @@ impl IncrementalBundler {
                     let jsx = self.jsx.clone();
                     let target = self.target.clone();
                     let file_name = jsx.dev.then(|| Arc::<str>::from(path_to_slash(&rec.path)));
-                    move || parse_request(cell, compiler, st, jsx, target, file_name)
+                    let progress_path =
+                        wake_common::progress::enabled().then(|| path_to_slash(&rec.path));
+                    move || {
+                        let _progress = wake_common::progress::task("parse", || {
+                            progress_path.unwrap_or_default()
+                        });
+                        parse_request(cell, compiler, st, jsx, target, file_name)
+                    }
                 })
                 .collect();
             let engine = Arc::clone(&self.engine);
@@ -3459,7 +3496,11 @@ impl IncrementalBundler {
             let compiler = self.compiler.clone();
             let codegen_exec_counts = self.codegen_exec_counts.clone();
             let codegen_counter_shard = plans[i].id as usize & (CODEGEN_COUNTER_SHARDS - 1);
+            let progress_path =
+                wake_common::progress::enabled().then(|| path_to_slash(&plans[i].path));
             body_requests.push(move || {
+                let _progress =
+                    wake_common::progress::task("codegen", || progress_path.unwrap_or_default());
                 if let Some((artifact, data)) = direct {
                     (
                         None,
@@ -3563,7 +3604,14 @@ impl IncrementalBundler {
             let mut map_requests = Vec::with_capacity(body_miss.len());
             for &i in &body_miss {
                 let body_vc = plans[i].body_vc.expect("new body task value");
-                map_requests.push(move || source_map_facts_request(body_vc));
+                let progress_path =
+                    wake_common::progress::enabled().then(|| plans[i].path.display().to_string());
+                map_requests.push(move || {
+                    let _progress = wake_common::progress::task("sourcemap-facts", || {
+                        progress_path.unwrap_or_default()
+                    });
+                    source_map_facts_request(body_vc)
+                });
             }
             let engine = Arc::clone(&self.engine);
             let maps = par_request_batched(&engine, &self.exec, map_requests);
@@ -3597,6 +3645,8 @@ impl IncrementalBundler {
             (Vec::new(), BTreeMap::new())
         };
         let codegen_time = t_codegen_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        drop(codegen_progress);
+        let emit_progress = wake_common::progress::phase("emit", || entry.display().to_string());
         let t_emit_start = timing.then(std::time::Instant::now);
 
         // —— Emit：双路（无 async chunk → 旧单包，逐字节不变；有 → 多 chunk 全局 registry）——
@@ -3818,6 +3868,7 @@ impl IncrementalBundler {
         drop(namespace_identity_ids);
         drop(style_files);
 
+        drop(emit_progress);
         // 持久化缓存落盘（opt-in）：仅在无错误 **且本次新增过条目**（dirty）时写。
         // 全命中（未变）时缓存内容没变，跳过落盘——缓存文件常和 bundle 一样大，
         // 每次白写会让 `--cache` 的 I/O 反超它省下的 parse（实测小项目会更慢）。
@@ -3825,6 +3876,8 @@ impl IncrementalBundler {
             && let (Some(cache), Some(path)) = (&mut self.cache, &self.cache_path)
             && cache.is_dirty()
         {
+            let _progress =
+                wake_common::progress::phase("cache-store", || path.display().to_string());
             match cache.store(path) {
                 Ok(report) => {
                     if report.repaired_corrupt_latest {
@@ -3878,6 +3931,7 @@ impl IncrementalBundler {
             );
         }
 
+        let _cleanup_progress = wake_common::progress::phase("cleanup", String::new);
         if self.one_shot {
             let release_started = std::time::Instant::now();
             // These maps only describe a possible later generation. A one-shot bundler rejects a
@@ -5267,6 +5321,7 @@ fn optimize_request(
         let parsed = parse_vc.read();
         let css_input = css_input_vc.read();
         let options = options_input_vc.read();
+        let _progress = wake_common::progress::task("optimize", || options.module_name.clone());
         let prepared_defines = match &options.prepared_defines {
             Ok(prepared) => prepared,
             Err(message) => {
@@ -5287,6 +5342,7 @@ fn optimize_request(
         let cij = parsed.ast.with_ast(|program| {
             let imported: wake_css_in_js::value::Scope = css_input.scope.iter().cloned().collect();
             css_input.seed.as_deref().map(|seed| {
+                let _progress = wake_common::progress::step("css-in-js-transform", String::new);
                 wake_css_in_js::transform(program, interner, &parsed.source, seed, &imported)
             })
         });
@@ -5625,6 +5681,7 @@ fn compiler_finalize_facts(
 }
 
 fn compiler_mappings_to_codegen(mappings: CompilerMappings) -> ModuleMappings {
+    let _progress = wake_common::progress::step("sourcemap-extract", String::new);
     ModuleMappings {
         mappings: mappings
             .mappings
@@ -6419,6 +6476,7 @@ fn build_style_artifacts(
     if collected_css.is_empty() {
         return (Vec::new(), BTreeMap::new());
     }
+    let _progress = wake_common::progress::step("css-artifacts", String::new);
     let order = css_emission_order(final_edges, entry_id);
     let fallback = u32::MAX;
     collected_css.sort_by_key(|(id, _)| (*order.get(id).unwrap_or(&fallback), *id));
@@ -7355,6 +7413,9 @@ pub(crate) fn map_source_name(path: &Path, cwd: Option<&Path>) -> String {
 /// 按源文件批量计算坐标，避免压成一行的依赖被每条映射从行首重新扫描。
 /// 缺源文本时保持已有的 (0, 0) 回退。
 fn serialize_map(sm: &SourceMap, sources: &FxHashMap<u32, (String, Option<String>)>) -> String {
+    let _progress = wake_common::progress::step("sourcemap-serialize", || {
+        sm.file.clone().unwrap_or_default()
+    });
     let by_name: FxHashMap<&str, &str> = sources
         .values()
         .filter_map(|(n, c)| c.as_deref().map(|c| (n.as_str(), c)))
@@ -7816,6 +7877,8 @@ fn merge_bundle_map(
     sources: &FxHashMap<u32, (String, Option<String>)>,
     file: Option<String>,
 ) -> SourceMap {
+    let _progress =
+        wake_common::progress::step("sourcemap-merge", || file.clone().unwrap_or_default());
     let mut sm = SourceMap {
         file,
         ..SourceMap::new()

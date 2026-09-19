@@ -62,6 +62,8 @@
 - [ADR 0037: Typed development watches and isolated candidate generations](0037-typed-development-watch-and-candidate-generations.md) — `accepted`
 - [ADR 0039: Owned immutable generated-input overlay](0039-owned-immutable-filesystem-overlay.md) — `accepted`
 - [ADR 0045: Isolated incremental candidate sessions](0045-isolated-incremental-candidate-sessions.md) — `accepted`
+- [ADR 0069: 原生构建活动与卡顿诊断](0069-live-build-progress-diagnostics.md) — `accepted`
+- [ADR 0070: 构建归属、诊断上下文与步骤统计](0070-build-scoped-progress-context.md) — `accepted`
 
 ### css-editor
 

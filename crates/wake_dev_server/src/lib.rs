@@ -2057,6 +2057,7 @@ fn watch_and_rebuild(
             continue;
         }
         let spec = workers[index].spec.clone();
+        let _progress = mount_progress("dev-build", &spec);
         let session = create_mount_session(&spec);
         let outcome = rebuild_mount(
             session,
@@ -2337,6 +2338,7 @@ fn watch_and_rebuild(
                 workers[index].spec.name.clone(),
                 event_handler.as_ref(),
             );
+            let _progress = mount_progress("dev-demand", &workers[index].spec);
             let refresh = match workers[index].pending_candidate.take() {
                 Some(candidate) => Ok(DevMountRefresh::Candidate(candidate)),
                 None => refresh_mount(&workers[index].spec, &WatchInvalidation::Rescan),
@@ -2576,6 +2578,7 @@ fn watch_and_rebuild(
                     continue;
                 }
             }
+            _progress.set_target(|| mount_progress_target(&candidate_spec));
             let candidate_session = create_mount_session(&candidate_spec);
             let committed_spec = candidate_spec.clone();
             let committed_interests = mount_watch_interests(&candidate_spec);
@@ -2899,6 +2902,7 @@ fn watch_and_rebuild(
                     }
                     continue;
                 }
+                let _progress = mount_progress("dev-refresh", &workers[index].spec);
                 match refresh_mount(&workers[index].spec, &invalidation) {
                     Ok(DevMountRefresh::Invalidate { .. }) => {
                         let previous = workers[index].pending_candidate.take();
@@ -3140,6 +3144,7 @@ fn watch_and_rebuild(
                 }
                 continue;
             }
+            let _progress = mount_progress("dev-rebuild", &workers[index].spec);
             if initializing_eager {
                 workers[index].session = Some(create_mount_session(&workers[index].spec));
             }
@@ -3415,6 +3420,7 @@ fn watch_and_rebuild(
                     invalidated.extend(generated_paths);
                     invalidated.sort();
                     invalidated.dedup();
+                    _progress.set_target(|| mount_progress_target(&candidate_spec));
                     let candidate_session = create_candidate_mount_session(
                         &candidate_spec,
                         workers[index].session.as_mut(),
@@ -3657,6 +3663,21 @@ fn watch_and_rebuild(
 }
 
 pub const DEV_RESTART_REQUIRED_CODE: &str = "WAKE_DEV_RESTART_REQUIRED";
+
+fn mount_progress(name: &'static str, spec: &MountSpec) -> wake_common::progress::Span {
+    wake_common::progress::build(name, || mount_progress_target(spec))
+}
+
+fn mount_progress_target(spec: &MountSpec) -> String {
+    format!(
+        "{} {}",
+        spec.plan
+            .as_ref()
+            .map_or(spec.root.as_path(), |plan| plan.entry.as_path())
+            .display(),
+        spec.base_path
+    )
+}
 
 #[allow(clippy::result_large_err)]
 fn refresh_mount(

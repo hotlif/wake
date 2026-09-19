@@ -2970,7 +2970,7 @@ test('Docs page metadata is rendered from one finalized typed plan', () => {
   )
   assert.match(
     production,
-    /apply_navigation\(&source_dir,\s*&mut pages\)\?[\s\S]{0,1800}for \(_, page\) in &pages \{[\s\S]{0,240}page\.render_module\(\)/,
+    /apply_navigation\(&source_dir,\s*&mut pages\)\?[\s\S]{0,1800}for \((?:_|path), page\) in &pages \{[\s\S]{0,240}page\.render_module\(\)/,
     'page code and maps must render only after navigation has finalized route metadata',
   )
   assert.doesNotMatch(production, /\bfn\s+sync_page_metadata\b/)

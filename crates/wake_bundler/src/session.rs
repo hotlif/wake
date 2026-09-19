@@ -179,6 +179,7 @@ struct CommittedBuild {
 
 impl BuildSession {
     pub fn new(fs: Arc<dyn FileSystem>, options: BuildOptions) -> Self {
+        let _progress = wake_common::progress::phase("session-prepare", String::new);
         let mut bundler = IncrementalBundler::new(fs);
         apply_options(&mut bundler, options.clone());
         bundler.enable_load_cache();
@@ -197,6 +198,7 @@ impl BuildSession {
     /// Unlike retained sessions, this path does not retain loader snapshots or commit an output
     /// for future generations. Call [`BuildSession::build_once`] to consume it.
     pub fn new_one_shot(fs: Arc<dyn FileSystem>, options: BuildOptions) -> Self {
+        let _progress = wake_common::progress::phase("session-prepare", String::new);
         let mut bundler = IncrementalBundler::new_one_shot(fs);
         apply_options(&mut bundler, options.clone());
         Self {
@@ -259,6 +261,8 @@ impl BuildSession {
     }
 
     fn rebuild_and_commit(&mut self, request: BuildRequest) -> &BuildOutput {
+        let _progress =
+            wake_common::progress::phase("rebuild", || request.entry.display().to_string());
         let _guard = self
             .build_gate
             .lock()

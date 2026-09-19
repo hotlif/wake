@@ -16,6 +16,25 @@ function run(args) {
   })
 }
 
+test('progress reports native phases on stderr and preserves bundle output', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-cli-progress-'))
+  try {
+    const entry = join(root, 'entry.js')
+    await writeFile(entry, 'console.log(40 + 2);')
+    const plain = run(['bundle', entry, '--outfile', join(root, 'plain.js')])
+    assert.equal(plain.status, 0, plain.stderr)
+    const observed = run(['bundle', entry, '--outfile', join(root, 'progress.js'), '--progress', '--ui', 'tui'])
+    assert.equal(observed.status, 0, observed.stderr)
+    assert.match(observed.stderr, /\[wake-progress/)
+    for (const stage of ['prepare', 'scan', 'link', 'codegen', 'emit', 'publish', 'slowest', 'summary', 'count=', 'avg=', 'max=']) {
+      assert.ok(observed.stderr.includes(stage), observed.stderr)
+    }
+    assert.ok(!observed.stdout.includes('[wake-progress'))
+    assert.ok(!observed.stderr.includes('\x1b'))
+    assert.equal(await readFile(join(root, 'plain.js'), 'utf8'), await readFile(join(root, 'progress.js'), 'utf8'))
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('lint globals override configuration by name and reject invalid assignments', async () => {
   const root = await mkdtemp(join(tmpdir(), 'wake-cli-globals-'))
   try {

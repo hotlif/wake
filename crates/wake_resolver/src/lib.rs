@@ -433,6 +433,9 @@ impl Resolver {
         from_dir: &Path,
         profile: &ResolutionProfile,
     ) -> Result<PathBuf, ResolveError> {
+        let _progress = wake_common::progress::task("resolve", || {
+            format!("{} -> {specifier}", from_dir.display())
+        });
         let key = ResolutionKey {
             specifier: specifier.to_string(),
             conditions: profile.conditions.clone(),
@@ -547,6 +550,9 @@ impl Resolver {
         issuer_dir: &Path,
         profile: &ResolutionProfile,
     ) -> Result<ResolvedModule, ResolveError> {
+        let _progress = wake_common::progress::task("resolve", || {
+            format!("{} -> {package}", issuer_dir.display())
+        });
         let package_root = self.resolve_package_root(package, issuer_dir)?;
         let path = self
             .resolve_package(&package_root, "", profile)

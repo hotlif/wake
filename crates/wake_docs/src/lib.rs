@@ -723,6 +723,8 @@ fn render_prepared(
 
     let mut pages = Vec::new();
     for path in &mdx_files {
+        let _progress =
+            wake_common::progress::task("docs-page-compile", || path.display().to_string());
         let page = compile_page(&root, &source_dir, path)?;
         pages.push((path.clone(), page));
     }
@@ -736,7 +738,9 @@ fn render_prepared(
 
     let demos = compile_demos(&root, &source_dir, &demo_files, docs_mode)?;
     let mut generation = RenderedFileTreeBuilder::new();
-    for (_, page) in &pages {
+    for (path, page) in &pages {
+        let _progress =
+            wake_common::progress::task("docs-page-render", || path.display().to_string());
         let rendered = page.render_module();
         insert_generation_file(
             &mut generation,
@@ -5078,6 +5082,79 @@ mod tests {
             .iter()
             .map(|(relative, content)| (slash_path(relative.as_path()), content.to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn progress_pages_child() {
+        if std::env::var_os("WAKE_PROGRESS_DOCS_CHILD").is_none() {
+            return;
+        }
+        let root = fixture();
+        fs::write(root.join("docs/index.mdx"), "# Home\n").unwrap();
+        write_fixture_navigation(&root);
+        let first = render_with_mode(
+            &root,
+            &DocsOptions::default(),
+            BuildMode::Development,
+            DocsMode::Site,
+        )
+        .unwrap();
+        let baseline = rendered_file_snapshot(&first);
+        wake_common::progress::enable();
+        {
+            let _progress = wake_common::progress::build("docs-demand", || "index.mdx".into());
+            let observed = render_with_mode(
+                &root,
+                &DocsOptions::default(),
+                BuildMode::Development,
+                DocsMode::Site,
+            )
+            .unwrap();
+            assert_eq!(baseline, rendered_file_snapshot(&observed));
+        }
+        {
+            let _progress = wake_common::progress::build("docs-invalid", || "broken.mdx".into());
+            fs::write(
+                root.join("docs/broken.mdx"),
+                "---\n: [broken\n---\n# Broken",
+            )
+            .unwrap();
+            assert!(
+                render_with_mode(
+                    &root,
+                    &DocsOptions::default(),
+                    BuildMode::Development,
+                    DocsMode::Site
+                )
+                .is_err()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_reports_page_paths_and_cleans_failed_render() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::progress_pages_child", "--nocapture"])
+            .env_remove("WAKE_PROGRESS")
+            .env("WAKE_PROGRESS_DOCS_CHILD", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        for step in ["docs-page-compile", "docs-page-render"] {
+            assert!(
+                stderr.lines().any(|row| row.contains("slowest")
+                    && row.contains(step)
+                    && row.contains("index.mdx")),
+                "{stderr}"
+            );
+        }
+        assert!(
+            stderr.contains("summary docs-invalid target=broken.mdx"),
+            "{stderr}"
+        );
+        assert_eq!(stderr.matches("build ended").count(), 2, "{stderr}");
     }
 
     #[test]

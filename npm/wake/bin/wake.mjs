@@ -72,6 +72,7 @@ Usage:
 Options:
   --ui MODE   Terminal UI mode for long-running commands (default: auto)
   --no-color  Disable terminal colors; also honors NO_COLOR
+  --progress  Report native build phases and slow operations on stderr (uses plain UI)
   --format    Human or JSON output for parse/tokenize/lint (default: auto)
 `
 
@@ -719,7 +720,9 @@ async function runTestCommand(args) {
 export async function runCli(argv = process.argv.slice(2)) {
   const args = [...argv]
   const noColor = takeFlag(args, '--no-color')
-  const uiMode = validateChoice(takeOption(args, '--ui') || 'auto', '--ui', ['auto', 'tui', 'plain'])
+  let uiMode = validateChoice(takeOption(args, '--ui') || 'auto', '--ui', ['auto', 'tui', 'plain'])
+  if (takeFlag(args, '--progress')) process.env.WAKE_PROGRESS = '1'
+  if (process.env.WAKE_PROGRESS === '1') uiMode = 'plain'
   const ui = createUi(!noColor && supportsColor())
 
   if (takeFlag(args, '--version') || takeFlag(args, '-V')) {

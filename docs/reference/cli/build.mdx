@@ -12,7 +12,7 @@ status = "stable"
 ## 用法
 
 ```text
-wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap]
+wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap] [--progress]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -22,6 +22,7 @@ wake build [ENTRY] [--outdir DIR] [--cache] [--watch] [--sourcemap]
 | `--cache` | 关闭 | 启用持久构建缓存 |
 | `--watch` | 关闭 | 构建后持续监听 |
 | `--sourcemap` | 关闭 | 输出与生产压缩、代码分割兼容的 source map |
+| `--progress` | 关闭 | 在 stderr 报告活动阶段、模块和耗时，自动使用 plain 界面 |
 
 `--cache` 只缓存可重建的派生结果。Wake 每个新进程仍读取并哈希真实源码；缓存缺失或 schema
 不兼容会静默重建，损坏、I/O 或并发提交问题会在一次构建中合并为最多一条非致命
@@ -43,6 +44,42 @@ Wake 只会替换新目录、空目录，或带有匹配 `.wake-output.json` 所
 
 编译诊断会显示稳定错误码、`path:line:column`、带行号的源码行和 `^` 范围。`build --watch`
 和 `dev` 重建使用同一格式；配置、I/O 等没有源码 span 的错误只显示消息与路径，不伪造行号。
+
+## 定位构建卡顿
+
+Rust CLI 与 npm CLI 都可以用 `wake build --progress`、`wake bundle ... --progress`、
+`wake dev --progress` 或 `wake docs dev --progress` 开启原生构建诊断。诊断模式自动使用
+plain 界面，记录写入 stderr，可以用 `2> wake-progress.log` 保存；stdout 保持原有格式。
+也可以在启动进程前设置 `WAKE_PROGRESS=1`，适用于 Node API 和其他构建入口。
+
+```powershell
+wake build --progress
+# 已通过脚本启动的 dev / docs 命令也可以这样诊断：
+$env:WAKE_PROGRESS = '1'
+yarn docs:dev
+Remove-Item Env:WAKE_PROGRESS
+```
+
+每次构建有独立编号和目标入口或页面；watch/dev 的后续构建使用新编号。阶段进入时立即记录
+`begin`，退出时记录 `end` 与耗时，子步骤带父操作编号。每秒心跳先显示构建目标与当前阶段，
+再列出最多八个尚未结束的操作，包括模块路径与已耗时间；并行构建分别显示，不混合统计。
+
+细分步骤覆盖优化器的 IR 转换、语义重建、实际优化 pass 和迭代轮次、变量名压缩，CSS
+作用域计算、转换与产物生成，以及 Source Map 信息提取、合并和序列化。Docs 页面渲染显示
+源文件路径。联合执行的优化使用联合名称，不人为拆分耗时。
+
+构建退出时输出 `summary`：墙钟总时长，以及按累计耗时降序排列的各步骤执行次数 `count`、
+累计 `total`、平均 `avg` 和最大 `max` 耗时；同时保留该构建最慢的十个模块操作 `slowest`。
+大量短任务的累计开销也会计入汇总。扫描、链接、生成、缓存写入、清理、项目准备、Docs 准备和
+产物发布均有阶段记录；空闲监听期间不会持续输出。汇总仍是终端文本，没有新增报告文件。
+
+`end` 只表示离开该步骤，可能伴随错误或取消；最终结果仍以正常诊断和退出码为准。
+步骤耗时包含子步骤；并行操作的累计耗时可能超过构建墙钟总时长，各行不能直接相加。
+模块总量在扫描中动态发现，因此不报告百分比，也不根据耗时推断死锁。日志是供人阅读的
+调试信息，不是稳定机器协议。
+
+默认关闭诊断，不创建采样线程。开启会增加计时、同步和日志成本，性能基准应关闭它。
+`WAKE_TIMING=1` 仍可额外输出现有的构建完成后阶段统计。
 
 ## 交互式控制台
 

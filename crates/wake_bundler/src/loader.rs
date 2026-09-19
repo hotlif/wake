@@ -71,6 +71,7 @@ pub(crate) fn load_source(
     path: &Path,
     opts: &LoadOptions,
 ) -> std::io::Result<Loaded> {
+    let _progress = wake_common::progress::task("read", || path.display().to_string());
     if is_asset_path(path) {
         let bytes = fs.read(path)?;
         if bytes.len() > opts.asset_inline_limit {
@@ -228,6 +229,7 @@ struct Prepared {
 /// `url()` 改写必须在这里、按**模块粒度**做：[`wake_css::CssUrl`] 的偏移是相对单个模块的
 /// `code` 的，一旦进了 `split_css_imports`（前置外部 `@import`）或跨模块聚合/压缩，偏移即失效。
 fn prepare_css(fs: &dyn FileSystem, path: &Path, text: &str, opts: &LoadOptions) -> Prepared {
+    let _progress = wake_common::progress::task("css-transform", || path.display().to_string());
     let (imports, analyzed, exports) = if is_css_module_path(path) {
         let seed = path_to_slash(path);
         let m = wake_css::transform_modules(text, &seed);

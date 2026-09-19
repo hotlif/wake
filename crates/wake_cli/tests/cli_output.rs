@@ -10,6 +10,118 @@ fn fixture_file() -> PathBuf {
 }
 
 #[test]
+fn progress_is_opt_in_and_preserves_bundle_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = root.path().join("entry.js");
+    std::fs::write(&entry, "console.log(40 + 2);").unwrap();
+    let run = |name: &str, flag: bool, env: bool| {
+        let outfile = root.path().join(name);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wake"));
+        command
+            .env_remove("WAKE_PROGRESS")
+            .env_remove("WAKE_TIMING")
+            .arg("bundle")
+            .arg(&entry)
+            .arg("--outfile")
+            .arg(&outfile);
+        if flag {
+            command.args(["--progress", "--ui", "tui"]);
+        }
+        if env {
+            command.env("WAKE_PROGRESS", "1");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("[wake-progress"));
+        (
+            std::fs::read(outfile).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let (plain, stderr) = run("plain.js", false, false);
+    assert!(!stderr.contains("[wake-progress"));
+    for (name, flag, env) in [("flag.js", true, false), ("env.js", false, true)] {
+        let (observed, stderr) = run(name, flag, env);
+        assert_eq!(plain, observed);
+        for stage in ["prepare", "scan", "link", "codegen", "emit", "publish"] {
+            assert!(stderr.contains(stage), "missing {stage}: {stderr}");
+        }
+        assert!(stderr.contains("slowest"), "{stderr}");
+        assert!(
+            stderr.contains("summary")
+                && stderr.contains("count=")
+                && stderr.contains("avg=")
+                && stderr.contains("max="),
+            "{stderr}"
+        );
+        assert!(!stderr.contains('\x1b'), "{stderr}");
+    }
+}
+
+#[test]
+fn progress_preserves_failure_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .arg("bundle")
+        .arg(root.path().join("missing.js"))
+        .arg("--outfile")
+        .arg(root.path().join("out.js"))
+        .arg("--progress")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[wake-progress"), "{stderr}");
+    assert!(stderr.contains("WAKE_"), "{stderr}");
+    assert!(!root.path().join("out.js").exists());
+}
+
+#[test]
+fn progress_reports_css_and_source_map_steps() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = root.path().join("entry.js");
+    let outfile = root.path().join("out.js");
+    std::fs::write(&entry, "import './style.css'; console.log(40 + 2);").unwrap();
+    std::fs::write(root.path().join("style.css"), "body { color: red; }").unwrap();
+    let mut prior = None;
+    for enabled in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wake"));
+        command
+            .env_remove("WAKE_PROGRESS")
+            .arg("bundle")
+            .arg(&entry)
+            .arg("--outfile")
+            .arg(&outfile)
+            .args(["--minify", "--sourcemap", "--cache"]);
+        if enabled {
+            command.arg("--progress");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&outfile).unwrap();
+        if let Some(prior) = &prior {
+            assert_eq!(prior, &bytes);
+        } else {
+            prior = Some(bytes);
+        }
+        if enabled {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for step in ["css-", "sourcemap-merge", "sourcemap-serialize", "summary"] {
+                assert!(stderr.contains(step), "missing {step}: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
 fn parse_json_keeps_stdout_machine_readable() {
     let output = Command::new(env!("CARGO_BIN_EXE_wake"))
         .args(["parse", fixture_file().to_str().unwrap()])
@@ -87,6 +199,17 @@ fn removed_test_flags_report_the_wake_test_config_category() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("WAKE_TEST_CONFIG"), "{stderr}");
     assert!(stderr.contains("--testNamePattern"), "{stderr}");
+}
+
+#[test]
+fn progress_keeps_test_usage_error_category() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wake"))
+        .args(["--progress", "test", "--testNamePattern", "renders"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WAKE_TEST_CONFIG"), "{stderr}");
 }
 
 #[test]

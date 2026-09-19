@@ -15,6 +15,7 @@ pub mod atom;
 pub mod diagnostic;
 pub mod fs;
 pub mod js_string;
+pub mod progress;
 pub mod render;
 pub mod source;
 pub mod span;

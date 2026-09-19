@@ -614,6 +614,7 @@ fn open_unix_output_commit_lock(path: &Path) -> std::io::Result<File> {
 }
 
 pub(super) fn acquire_output_commit_lock(product: &str) -> Result<OutputCommitLock, WakeError> {
+    let _progress = wake_common::progress::phase("publish-lock", || product.to_owned());
     let started = Instant::now();
     let process = loop {
         match OUTPUT_COMMIT.try_lock() {
@@ -790,6 +791,8 @@ pub(super) fn publish_exact_outputs(
     candidates: &[ExactOutput<'_>],
     protected_inputs: &[PathBuf],
 ) -> Result<(), WakeError> {
+    let _progress =
+        wake_common::progress::phase("publish", || format!("{} files", candidates.len()));
     publish_exact_outputs_inner(candidates, protected_inputs, None, || {})
 }
 
