@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.46
+
+- Add opt-in native build diagnostics with `--progress` or `WAKE_PROGRESS=1`, using plain stderr
+  output while preserving `WAKE_TIMING`.
+- Isolate build ownership across concurrent workers and rebuilds; expose optimizer passes and
+  iterations, CSS, source maps, and Docs source paths before work finishes.
+- Summarize per-build wall time, step counts, inclusive total/average/maximum durations, and the
+  ten slowest module operations without changing artifacts, cache identity, or cancellation.
+- Explain recovery from legacy output directories that lack the `.wake-output.json` ownership marker.
+
 ## 0.1.45
 
 - Preserve lexical and imported bindings in compiled `cx()` calls, fixing runtime `ReferenceError`

@@ -1,6 +1,6 @@
 {
   "name": "@crab-dev/wake-lint-sdk",
-  "version": "0.1.45",
+  "version": "0.1.46",
   "description": "Versioned, isolated SDK for Wake native lint extensions",
   "license": "MIT OR Apache-2.0",
   "repository": {
