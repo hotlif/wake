@@ -3,6 +3,11 @@
 //! This crate owns browser discovery, launch, CDP transport, BrowserContext isolation, real input,
 //! network interception, screenshots and precise V8 coverage. It intentionally knows nothing about
 //! test discovery, assertions, snapshots or reporters.
+//!
+//! CDP socket timeouts are polling intervals, not command deadlines. Temporary write backpressure
+//! must preserve the connection and flush the already buffered WebSocket frame without resending
+//! the command. Reads, caller deadlines and dispatcher shutdown remain serviceable while writes
+//! are blocked; terminal transport errors still fail the connection and all pending commands.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -695,7 +700,7 @@ impl CdpConnection {
         let worker_events = Arc::clone(&events);
         let worker = std::thread::Builder::new()
             .name("wake-test-cdp".to_string())
-            .spawn(move || cdp_worker(&mut socket, receiver, &worker_events))
+            .spawn(move || cdp_worker(&mut socket, receiver, &worker_events, set_socket_timeout))
             .map_err(|error| {
                 BrowserError::new(format!("could not start the CDP dispatcher: {error}"))
             })?;
@@ -789,12 +794,17 @@ impl Drop for CdpConnection {
     }
 }
 
-fn cdp_worker(
-    socket: &mut BrowserSocket,
+fn cdp_worker<S: Read + Write>(
+    socket: &mut WebSocket<S>,
     receiver: mpsc::Receiver<CdpOutbound>,
     events: &CdpEventQueue,
+    mut set_timeout: impl FnMut(&mut WebSocket<S>, Duration) -> Result<(), BrowserError>,
 ) {
     let mut pending = BTreeMap::<u64, PendingCommand>::new();
+    if let Err(error) = set_timeout(socket, CDP_EVENT_CANCEL_POLL) {
+        close_cdp_worker(events, &mut pending, error);
+        return;
+    }
     loop {
         let mut shutdown = false;
         loop {
@@ -814,7 +824,9 @@ fn cdp_worker(
                     if let Some(session_id) = session_id {
                         request["sessionId"] = Value::String(session_id);
                     }
-                    if let Err(error) = socket.send(Message::Text(request.to_string().into())) {
+                    if let Err(error) = socket.send(Message::Text(request.to_string().into()))
+                        && !is_socket_timeout(&error)
+                    {
                         let error = BrowserError::new(format!(
                             "could not send CDP command {method}: {error}"
                         ));
@@ -841,8 +853,17 @@ fn cdp_worker(
             return;
         }
 
-        if let Err(error) = set_socket_timeout(socket, CDP_EVENT_CANCEL_POLL) {
-            close_cdp_worker(events, &mut pending, error);
+        // A timed-out write has already queued the frame (possibly after a partial write).
+        // Flush its remaining bytes; resending the message would duplicate the CDP command.
+        // Poll reads and the outbound queue between attempts so deadlines and shutdown still work.
+        if let Err(error) = socket.flush()
+            && !is_socket_timeout(&error)
+        {
+            close_cdp_worker(
+                events,
+                &mut pending,
+                BrowserError::new(format!("could not flush CDP writes: {error}")),
+            );
             return;
         }
         let message = match socket.read() {
@@ -887,7 +908,9 @@ fn cdp_worker(
                 }
             }
             Message::Ping(payload) => {
-                if let Err(error) = socket.send(Message::Pong(payload)) {
+                if let Err(error) = socket.send(Message::Pong(payload))
+                    && !is_socket_timeout(&error)
+                {
                     close_cdp_worker(
                         events,
                         &mut pending,
@@ -2203,6 +2226,221 @@ mod tests {
                 .into(),
             ))
             .unwrap();
+    }
+
+    enum WriteFault {
+        Partial(usize),
+        Error(std::io::ErrorKind),
+    }
+
+    struct FaultyCdpStream {
+        stream: TcpStream,
+        faults: VecDeque<WriteFault>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl Read for FaultyCdpStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.stream.read(buffer)
+        }
+    }
+
+    impl Write for FaultyCdpStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.blocked.load(Ordering::Relaxed) {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            match self.faults.pop_front() {
+                Some(WriteFault::Partial(limit)) => {
+                    self.stream.write(&buffer[..buffer.len().min(limit)])
+                }
+                Some(WriteFault::Error(kind)) => Err(kind.into()),
+                None => self.stream.write(buffer),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    fn faulty_cdp_connection(
+        faults: Vec<WriteFault>,
+        blocked: Arc<AtomicBool>,
+        server: impl FnOnce(&mut WebSocket<TcpStream>) + Send + 'static,
+    ) -> (CdpConnection, JoinHandle<()>) {
+        use tungstenite::protocol::Role;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
+            server(&mut socket);
+        });
+        let mut socket = WebSocket::from_raw_socket(
+            FaultyCdpStream {
+                stream,
+                faults: faults.into(),
+                blocked,
+            },
+            Role::Client,
+            None,
+        );
+        let (outbound, receiver) = mpsc::channel();
+        let events = Arc::new(CdpEventQueue::default());
+        let worker_events = Arc::clone(&events);
+        let worker = std::thread::spawn(move || {
+            cdp_worker(&mut socket, receiver, &worker_events, |socket, timeout| {
+                let stream = &socket.get_mut().stream;
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .and_then(|()| stream.set_write_timeout(Some(timeout)))
+                    .map_err(|error| BrowserError::new(error.to_string()))
+            });
+        });
+        (
+            CdpConnection {
+                next_id: AtomicU64::new(1),
+                outbound,
+                events,
+                worker: Mutex::new(Some(worker)),
+                command_timeout: Duration::from_secs(1),
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn cdp_backpressure_flushes_partial_commands_and_pongs_exactly_once() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            for ping_first in [false, true] {
+                let (connection, server) = faulty_cdp_connection(
+                    vec![
+                        WriteFault::Partial(3),
+                        WriteFault::Error(kind),
+                        WriteFault::Error(kind),
+                    ],
+                    Arc::new(AtomicBool::new(false)),
+                    move |socket| {
+                        if ping_first {
+                            socket
+                                .send(Message::Ping(b"probe".to_vec().into()))
+                                .unwrap();
+                            socket
+                                .send(Message::Text(json!({"method": "ready"}).to_string().into()))
+                                .unwrap();
+                            assert_eq!(
+                                socket.read().unwrap(),
+                                Message::Pong(b"probe".to_vec().into())
+                            );
+                        }
+                        for id in 1..=2 {
+                            let Message::Text(text) = socket.read().unwrap() else {
+                                panic!("expected exactly one frame for each command");
+                            };
+                            let request: Value = serde_json::from_str(&text).unwrap();
+                            assert_eq!(request["id"], id);
+                            assert_eq!(request["method"], "Runtime.evaluate");
+                            assert_eq!(request["params"]["expression"], "1 + 1");
+                            answer_cdp_request(socket, &request);
+                        }
+                    },
+                );
+                if ping_first {
+                    assert!(matches!(
+                        connection
+                            .wait_for_event(
+                                None,
+                                "ready",
+                                Duration::from_secs(1),
+                                &BrowserCancellationToken::new()
+                            )
+                            .unwrap(),
+                        CdpEventWait::Event(_)
+                    ));
+                }
+                let first =
+                    connection.command(None, "Runtime.evaluate", json!({"expression": "1 + 1"}));
+                assert!(
+                    first.is_ok(),
+                    "{kind:?}, ping_first={ping_first}: {first:?}"
+                );
+                connection
+                    .command(None, "Runtime.evaluate", json!({"expression": "1 + 1"}))
+                    .unwrap();
+                drop(connection);
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cdp_backpressure_keeps_reads_deadlines_and_shutdown_serviceable() {
+        let (connection, server) =
+            faulty_cdp_connection(Vec::new(), Arc::new(AtomicBool::new(true)), |socket| {
+                socket
+                    .send(Message::Text(json!({"method": "ready"}).to_string().into()))
+                    .unwrap();
+                let _ = socket.read();
+            });
+        let started = Instant::now();
+        let error = connection
+            .command_with_timeout(
+                None,
+                "Runtime.evaluate",
+                json!({}),
+                Duration::from_millis(80),
+            )
+            .unwrap_err();
+        assert!(
+            error.message.contains("Runtime.evaluate timed out"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            connection
+                .wait_for_event(
+                    None,
+                    "ready",
+                    Duration::from_secs(1),
+                    &BrowserCancellationToken::new()
+                )
+                .unwrap(),
+            CdpEventWait::Event(_)
+        ));
+        let started = Instant::now();
+        drop(connection);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cdp_terminal_write_error_still_closes_the_connection() {
+        let (connection, server) = faulty_cdp_connection(
+            vec![WriteFault::Error(std::io::ErrorKind::BrokenPipe)],
+            Arc::new(AtomicBool::new(false)),
+            |socket| {
+                let _ = socket.read();
+            },
+        );
+        let first = connection
+            .command(None, "Runtime.evaluate", json!({}))
+            .unwrap_err();
+        assert!(
+            first
+                .message
+                .contains("could not send CDP command Runtime.evaluate")
+        );
+        let second = connection
+            .command(None, "Runtime.evaluate", json!({}))
+            .unwrap_err();
+        assert_eq!(first, second);
+        drop(connection);
+        server.join().unwrap();
     }
 
     fn test_page(connection: CdpConnection) -> BrowserPage {
