@@ -249,7 +249,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             && let Some(specifier) = self.interner.resolve_js(s.value).as_str()
         {
             self.record_dependency(Dependency {
-                specifier: self.interner.intern(specifier),
+                specifier: specifier.into(),
                 kind: DependencyKind::Require,
                 span: call.span,
             });
@@ -2268,7 +2268,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
 
         // import 'side-effect';
         if self.at(TokenKind::Str) {
-            let source = self.string_atom(self.cur.span);
+            let source = self.module_source_atom(self.cur.span);
             let sp = self.cur.span;
             self.declaration_record_request(sp, DeclarationRequestRole::ImportValue);
             self.bump();
@@ -2276,7 +2276,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.source_import_module(sp, attributes);
             self.semicolon();
             self.record_dependency(Dependency {
-                specifier: source,
+                specifier: self.interner.resolve_js(source),
                 kind: DependencyKind::Import,
                 span: sp,
             });
@@ -2409,11 +2409,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.declaration_record_source_item(DeclarationItemKind::Import, span, None);
             return Statement::Empty(span);
         }
-        self.record_dependency(Dependency {
-            specifier: source,
-            kind: DependencyKind::Import,
-            span: self.span_to(lo),
-        });
+        if request_span.is_some() {
+            self.record_dependency(Dependency {
+                specifier: self.interner.resolve_js(source),
+                kind: DependencyKind::Import,
+                span: self.span_to(lo),
+            });
+        }
         let span = self.span_to(lo);
         self.declaration_record_import(
             span,
@@ -2768,11 +2770,13 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.source_export_module(request_span, attributes);
             }
             self.semicolon();
-            self.record_dependency(Dependency {
-                specifier: source,
-                kind: DependencyKind::ExportFrom,
-                span: self.span_to(lo),
-            });
+            if request_span.is_some() {
+                self.record_dependency(Dependency {
+                    specifier: self.interner.resolve_js(source),
+                    kind: DependencyKind::ExportFrom,
+                    span: self.span_to(lo),
+                });
+            }
             self.declaration_record_export_item(DeclarationItemKind::ReExport, self.span_to(lo));
             return Statement::ExportAll(self.alloc(ExportAllDeclaration {
                 span: self.span_to(lo),
@@ -2846,8 +2850,9 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             self.source_list_finish(source_list, true);
             self.expect(TokenKind::RBrace);
             let mut attributes = None;
+            let mut request_span = None;
             let source = if self.eat_keyword(Keyword::From) {
-                let request_span = self.at(TokenKind::Str).then_some(self.cur.span);
+                request_span = self.at(TokenKind::Str).then_some(self.cur.span);
                 let s = self.expect_string_specifier();
                 if let Some(request_span) = request_span {
                     let role = if saw_inline_type_specifier && specifiers.is_empty() {
@@ -2871,9 +2876,11 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
                 self.declaration_record_export_item(DeclarationItemKind::ReExport, span);
                 return Statement::Empty(span);
             }
-            if let Some(source) = source {
+            if let Some(source) = source
+                && request_span.is_some()
+            {
                 self.record_dependency(Dependency {
-                    specifier: source,
+                    specifier: self.interner.resolve_js(source),
                     kind: DependencyKind::ExportFrom,
                     span: self.span_to(lo),
                 });
@@ -2932,16 +2939,20 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
         }
     }
 
-    /// 期望一个字符串说明符并返回其驻留 Atom（用于 from 子句）。
-    fn expect_string_specifier(&mut self) -> wake_common::Atom {
+    /// 期望一个字符串说明符并返回保留 UTF-16 码元的驻留值（用于 from 子句）。
+    fn expect_string_specifier(&mut self) -> wake_common::JsAtom {
         if self.at(TokenKind::Str) {
-            let atom = self.string_atom(self.cur.span);
+            let atom = self.module_source_atom(self.cur.span);
             self.bump();
             atom
         } else {
             self.error_expected("模块说明符字符串");
-            self.interner.intern("")
+            self.interner.intern_js("")
         }
+    }
+
+    fn module_source_atom(&self, span: Span) -> wake_common::JsAtom {
+        self.interner.intern_js(self.lexer.string_value(span))
     }
 
     fn string_atom(&mut self, span: Span) -> wake_common::Atom {

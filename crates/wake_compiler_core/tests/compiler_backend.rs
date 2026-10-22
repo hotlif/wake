@@ -186,6 +186,32 @@ fn bundled_emit_uses_owned_final_link_facts_and_reports_proven_ranges() {
 }
 
 #[test]
+fn non_utf8_static_requests_stop_before_owned_resolver_dependencies() {
+    let source = r#"import '\ud800'; export * from '\udfff'; import '\ufffd'; export * from '👍';"#;
+    let parsed = CompilerBackend::new()
+        .parse_module(ParseInput::new(source, SourceType::Module))
+        .expect("parse module");
+    let failures: Vec<_> = parsed
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error() && diagnostic.message().contains("UTF-8"))
+        .collect();
+    assert_eq!(failures.len(), 2, "{:?}", parsed.diagnostics());
+    assert!(failures.iter().all(|diagnostic| {
+        diagnostic
+            .labels()
+            .iter()
+            .any(|label| label.is_primary() && label.span().lo < label.span().hi)
+    }));
+    let requests: Vec<_> = parsed
+        .dependencies()
+        .iter()
+        .map(|dependency| dependency.specifier())
+        .collect();
+    assert_eq!(requests, ["\u{fffd}", "👍"]);
+}
+
+#[test]
 fn one_shot_changes_only_cross_generation_fingerprint_work() {
     let backend = CompilerBackend::new();
     let source = "export const answer = 40 + 2;";

@@ -709,7 +709,8 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
     /// 构造并返回按需注入的 `react/jsx-runtime` import（供 `parse_program` 在用到 JSX 时插入 body[0]）。
     pub(crate) fn build_jsx_runtime_import(&self) -> (Statement<'a>, Dependency) {
         let runtime = self.automatic_jsx_runtime();
-        let source = self.intern_str(&runtime.specifier(self.options.jsx_import_source));
+        let specifier = runtime.specifier(self.options.jsx_import_source);
+        let source = self.interner.intern_js(specifier.as_str());
         let atoms = self.jsx_atoms();
         let mut specs = self.new_vec::<ImportSpecifier>();
         for binding in runtime.used_imports(self.jsx_runtime_usage) {
@@ -735,7 +736,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             attributes: None,
         }));
         let dependency = Dependency {
-            specifier: source,
+            specifier: specifier.into(),
             kind: DependencyKind::Import,
             span: Span::DUMMY,
         };

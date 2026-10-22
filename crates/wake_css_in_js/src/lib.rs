@@ -180,8 +180,8 @@ impl BindingRegistry {
             let Statement::Import(import) = statement else {
                 continue;
             };
-            let source = interner.resolve(import.source);
-            if !is_css_in_js_source(&source) {
+            let source = interner.resolve_js(import.source);
+            if !source.as_str().is_some_and(is_css_in_js_source) {
                 continue;
             }
             for specifier in import.specifiers.iter() {
@@ -781,7 +781,12 @@ pub fn transform_with_class_prefix(
         let Statement::Import(imp) = stmt else {
             continue;
         };
-        if !is_css_in_js_source(&interner.resolve(imp.source)) || imp.specifiers.is_empty() {
+        if !interner
+            .resolve_js(imp.source)
+            .as_str()
+            .is_some_and(is_css_in_js_source)
+            || imp.specifiers.is_empty()
+        {
             continue;
         }
         let consumed: Vec<Span> = imp

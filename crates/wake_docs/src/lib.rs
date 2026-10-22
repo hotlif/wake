@@ -3156,7 +3156,12 @@ fn rewrite_mdx_esm(root: &Path, page: &Path, ast: &Node) -> Result<RewrittenEsm,
             ) {
                 continue;
             }
-            let specifier = interner.resolve(dependency.specifier);
+            let specifier = dependency.specifier.as_str().ok_or_else(|| {
+                DocsError::Mdx(
+                    page.to_path_buf(),
+                    "typed module specifier cannot be represented as a UTF-8 path".to_owned(),
+                )
+            })?;
             if !specifier.starts_with("./") && !specifier.starts_with("../") {
                 continue;
             }
@@ -3170,7 +3175,7 @@ fn rewrite_mdx_esm(root: &Path, page: &Path, ast: &Node) -> Result<RewrittenEsm,
                     ),
                 ));
             };
-            if lexer.string_value(token.span).as_str() != Some(specifier.as_str()) {
+            if lexer.string_value(token.span).as_str() != Some(specifier) {
                 return Err(DocsError::Mdx(
                     page.to_path_buf(),
                     format!(
@@ -3178,7 +3183,7 @@ fn rewrite_mdx_esm(root: &Path, page: &Path, ast: &Node) -> Result<RewrittenEsm,
                     ),
                 ));
             }
-            let resolved = normalize_path(&page.parent().unwrap_or(root).join(&specifier));
+            let resolved = normalize_path(&page.parent().unwrap_or(root).join(specifier));
             let Ok(relative) = resolved.strip_prefix(root) else {
                 continue;
             };

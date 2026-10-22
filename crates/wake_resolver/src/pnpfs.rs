@@ -158,7 +158,11 @@ fn split_zip(path: &Path) -> Option<(PathBuf, String)> {
 }
 
 fn is_zip_name(name: &str) -> bool {
-    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".zip")
+    // Archive suffix checks must not slice through a UTF-8 path component.
+    name.len() > 4
+        && name
+            .get(name.len() - 4..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".zip"))
 }
 
 impl FileSystem for PnpFileSystem {

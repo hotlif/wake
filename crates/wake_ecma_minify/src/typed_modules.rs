@@ -1238,13 +1238,17 @@ fn live_module_requests(
                 source: Some(source),
                 ..
             } => {
-                let specifier = string_value(program, *source).ok_or_else(|| {
-                    module_error(
-                        TypedModulePhase::Plan,
-                        Some(*source),
-                        "live native module source is not a string literal",
-                    )
-                })?;
+                let specifier = match native_module_source(program, *source) {
+                    Some(NativeModuleSource::Utf8(specifier)) => specifier,
+                    Some(NativeModuleSource::Unrepresentable) => continue,
+                    None => {
+                        return Err(module_error(
+                            TypedModulePhase::Plan,
+                            Some(*source),
+                            "live native module source is not a string literal",
+                        ));
+                    }
+                };
                 output.push(TypedModuleRequestEdge {
                     specifier: specifier.to_owned(),
                     kind: TypedModuleRequestKind::StaticImport,
@@ -1501,6 +1505,27 @@ fn string_value(program: &TypedProgram, node: NodeId) -> Option<&str> {
     }
 }
 
+/// Native ESM syntax can preserve a module source that has no UTF-8 representation. Such a
+/// source has no key in the UTF-8 linker/rewriter plan, but remains in the owned IR for emission.
+enum NativeModuleSource<'a> {
+    Utf8(&'a str),
+    Unrepresentable,
+}
+
+fn native_module_source(program: &TypedProgram, node: NodeId) -> Option<NativeModuleSource<'_>> {
+    match program.node(node)?.data() {
+        IrNodeData::StringLiteral { value } => Some(match value.as_str() {
+            Some(text) => NativeModuleSource::Utf8(text),
+            None => NativeModuleSource::Unrepresentable,
+        }),
+        IrNodeData::Name { name } => {
+            let name = program.name(*name)?;
+            (name.syntax() == NameSyntax::String).then(|| NativeModuleSource::Utf8(name.original()))
+        }
+        _ => None,
+    }
+}
+
 fn name_record(program: &TypedProgram, node: NodeId) -> Option<(NameId, &crate::typed_ir::IrName)> {
     let node = match program.node(node)?.data() {
         IrNodeData::Identifier { name } => *name,
@@ -1695,13 +1720,17 @@ fn collect_native_module_requests(
             _ => None,
         };
         let Some(source) = source else { continue };
-        let specifier = string_value(program, source).ok_or_else(|| {
-            module_error(
-                TypedModulePhase::Plan,
-                Some(source),
-                "module source is not a string literal",
-            )
-        })?;
+        let specifier = match native_module_source(program, source) {
+            Some(NativeModuleSource::Utf8(specifier)) => specifier,
+            Some(NativeModuleSource::Unrepresentable) => continue,
+            None => {
+                return Err(module_error(
+                    TypedModulePhase::Plan,
+                    Some(source),
+                    "module source is not a string literal",
+                ));
+            }
+        };
         plan.requests.push(TypedModuleRequestEdge {
             specifier: specifier.to_owned(),
             kind: TypedModuleRequestKind::StaticImport,
@@ -1887,7 +1916,7 @@ fn lower_import_declaration(
             module_error(
                 TypedModulePhase::Plan,
                 Some(source),
-                "import source is not a string literal",
+                "import source cannot be represented as UTF-8 for CommonJS lowering",
             )
         })?
         .to_owned();
@@ -2588,7 +2617,7 @@ fn lower_export_declaration(
                             module_error(
                                 TypedModulePhase::Plan,
                                 Some(source),
-                                "re-export source is not a string literal",
+                                "re-export source cannot be represented as UTF-8 for CommonJS lowering",
                             )
                         })
                 })
@@ -2724,7 +2753,7 @@ fn lower_export_declaration(
                     module_error(
                         TypedModulePhase::Plan,
                         Some(source),
-                        "export-all source is not a string literal",
+                        "export-all source cannot be represented as UTF-8 for CommonJS lowering",
                     )
                 })?
                 .to_owned();

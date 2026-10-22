@@ -1,6 +1,8 @@
 //! 模块语法（import / export）与依赖记录（DESIGN §4.4 依赖同步提取）。
+//! 静态模块说明符是 ECMAScript 字符串值：AST 使用进程内 JsAtom，解析依赖使用 owned
+//! JsString。文件系统解析只在下游显式检查 UTF-8 后进行，不能用替换文本或空串当身份。
 
-use wake_common::{Atom, JsAtom, Span};
+use wake_common::{Atom, JsAtom, JsString, Span};
 
 use crate::AVec;
 use crate::Ident;
@@ -67,7 +69,7 @@ pub struct ImportDeclaration<'a> {
     pub span: Span,
     pub specifiers: AVec<'a, ImportSpecifier>,
     /// 模块说明符字符串（已驻留）。
-    pub source: Atom,
+    pub source: JsAtom,
     /// `with { type: "json" }` 子句（无则 `None`）。
     pub attributes: Option<&'a ImportAttributes<'a>>,
 }
@@ -96,7 +98,7 @@ pub struct ExportNamedDeclaration<'a> {
     /// `export { a, b as c }`。
     pub specifiers: AVec<'a, ExportSpecifier>,
     /// `export { a } from '...'` 的来源（已驻留）。
-    pub source: Option<Atom>,
+    pub source: Option<JsAtom>,
     /// `export { a } from '...' with { .. }` 子句（无 `from` 时恒 `None`）。
     pub attributes: Option<&'a ImportAttributes<'a>>,
 }
@@ -126,7 +128,7 @@ pub struct ExportAllDeclaration<'a> {
     pub span: Span,
     /// `export * as ns from '...'` 的命名空间名。
     pub exported: Option<ModuleExportName>,
-    pub source: Atom,
+    pub source: JsAtom,
     /// `export * from '...' with { .. }` 子句。
     pub attributes: Option<&'a ImportAttributes<'a>>,
 }
@@ -136,9 +138,9 @@ pub struct ExportAllDeclaration<'a> {
 // ======================================================================
 
 /// 一条依赖：模块说明符 + 种类 + 位置。解析时收集，供 Scan 扇出（不进 arena）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dependency {
-    pub specifier: Atom,
+    pub specifier: JsString,
     pub kind: DependencyKind,
     pub span: Span,
 }

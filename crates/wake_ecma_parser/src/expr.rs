@@ -1371,7 +1371,7 @@ impl<'a, 'src, const LOWER: bool> Parser<'a, 'src, LOWER> {
             && let Some(specifier) = self.interner.resolve_js(s.value).as_str()
         {
             self.record_dependency(Dependency {
-                specifier: self.interner.intern(specifier),
+                specifier: specifier.into(),
                 kind: DependencyKind::DynamicImport,
                 span: self.span_to(lo),
             });

@@ -1,11 +1,13 @@
 //! Bounded translation of native semantic relations into source-bound Wake facts.
 use super::project::{ProjectId, TypeProject};
+use super::wire::{EnumMemberValues, PropertyPermissions};
 use crate::WakeError;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+use wake_common::JsString;
 use wake_lint_core::{
     CallArgumentType, CallType, MemberType, SourceAssertionKind, SourceAssignmentKind,
     SourceCallKind, SourceCallbackKind, SourceMemberKind, TypeId, TypeKind, TypeLiteral, TypeNode,
@@ -96,6 +98,18 @@ fn literal(value: &Value, kind: TypeKind) -> Result<Option<TypeLiteral>, WakeErr
     })
 }
 
+fn native_lossy_name(value: &JsString) -> String {
+    let mut text = String::new();
+    for scalar in char::decode_utf16(value.code_units()) {
+        match scalar {
+            Ok(scalar) => text.push(scalar),
+            // The pinned Go JSON path replaces each of the three WTF-8 bytes.
+            Err(_) => text.push_str("\u{fffd}\u{fffd}\u{fffd}"),
+        }
+    }
+    text
+}
+
 fn normalize_bigint(raw: &str) -> Result<String, &'static str> {
     let raw = raw.replace('_', "");
     let (negative, unsigned) = raw
@@ -178,7 +192,8 @@ struct Collector<'a> {
     next_unique_symbol_identity: u32,
     class_identities: BTreeMap<u64, u32>,
     next_class_identity: u32,
-    property_permissions: BTreeMap<PathBuf, BTreeMap<u32, (u32, bool)>>,
+    property_permissions: BTreeMap<PathBuf, PropertyPermissions>,
+    enum_values: BTreeMap<PathBuf, EnumMemberValues>,
     raw: Vec<Value>,
     nodes: Vec<TypeNode>,
     relations: usize,
@@ -200,6 +215,12 @@ impl Collector<'_> {
             && let Some(value) = raw["value"].as_str()
             && value.contains('\u{fffd}')
         {
+            if flags(&raw["flags"])? & 32_768 != 0 {
+                return self
+                    .enum_string_literal(raw)
+                    .map(TypeLiteral::String)
+                    .map(Some);
+            }
             // Go's JSON encoding replaces invalid UTF-8 (including each byte of a WTF-8
             // surrogate). Never compare those replacement strings as semantic identities.
             // The pinned printer escapes surrogate code units and NoTruncation preserves length.
@@ -217,6 +238,62 @@ impl Collector<'_> {
                 });
         }
         literal(raw, kind)
+    }
+    fn enum_string_literal(&mut self, raw: &Value) -> Result<JsString, WakeError> {
+        let type_id = handle(&raw["id"])?;
+        let symbol_id = handle(&raw["symbol"])?;
+        let native = raw["value"]
+            .as_str()
+            .ok_or_else(|| failure("enum string literal omitted value"))?;
+        let symbol = self.request("getSymbolOfType", json!({"objectId":type_id}))?;
+        if handle(&symbol["id"])? != symbol_id || flags(&symbol["flags"])? & 8 == 0 {
+            return Err(failure("enum member symbol differs from its type"));
+        }
+        let declarations = symbol["declarations"]
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| failure("enum member has no source declaration"))?;
+        self.count(declarations.len())?;
+        let mut recovered: Option<JsString> = None;
+        for declaration in declarations {
+            let declaration = declaration
+                .as_str()
+                .ok_or_else(|| failure("invalid enum declaration"))?;
+            let mut parts = declaration.splitn(3, '.');
+            let index = parts
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .filter(|index| *index != 0)
+                .ok_or_else(|| failure("invalid enum declaration index"))?;
+            let kind = parts
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .ok_or_else(|| failure("invalid enum declaration kind"))?;
+            if kind != 306 {
+                return Err(failure("enum symbol declaration is not an enum member"));
+            }
+            let path = parts
+                .next()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| failure("invalid enum declaration path"))?;
+            if !self.enum_values.contains_key(&path) {
+                let values = self.project.enum_member_values(self.owner, &path)?;
+                self.count(values.len())?;
+                self.enum_values.insert(path.clone(), values);
+            }
+            let value = self.enum_values[&path]
+                .get(&index)
+                .ok_or_else(|| failure("enum string initializer is not source-bound"))?;
+            if native_lossy_name(value) != native {
+                return Err(failure("enum value differs from its source initializer"));
+            }
+            if recovered.as_ref().is_some_and(|previous| previous != value) {
+                return Err(failure("enum declarations have different values"));
+            }
+            recovered = Some(value.clone());
+        }
+        recovered.ok_or_else(|| failure("cannot recover source-bound enum value"))
     }
     fn insert(&mut self, value: Value) -> Result<TypeId, WakeError> {
         let id = handle(&value["id"])?;
@@ -386,19 +463,79 @@ impl Collector<'_> {
                 self.count(permissions.len())?;
                 self.property_permissions.insert(path.clone(), permissions);
             }
-            let Some(&(actual_kind, readonly)) = self.property_permissions[&path].get(&index)
-            else {
+            let Some(declaration) = self.property_permissions[&path].get(&index) else {
                 return Err(failure("property declaration address missing from source"));
             };
-            if actual_kind != kind {
+            if declaration.kind != kind {
                 return Err(failure("property declaration kind differs from source"));
             }
-            if permission.is_some_and(|previous| previous != readonly) {
+            if permission.is_some_and(|previous| previous != declaration.readonly) {
                 return Ok(None);
             }
-            permission = Some(readonly);
+            permission = Some(declaration.readonly);
         }
         Ok(permission)
+    }
+
+    fn property_name(&mut self, property: &Value) -> Result<JsString, WakeError> {
+        let native = property["name"]
+            .as_str()
+            .ok_or_else(|| failure("property omitted name"))?;
+        if !native.contains('\u{fffd}') {
+            return Ok(native.into());
+        }
+        let symbol_flags = flags(&property["flags"])?;
+        let check_flags = flags(&property["checkFlags"])?;
+        if symbol_flags & (1 << 25) != 0 || check_flags != 0 {
+            return Err(failure(
+                "native property name may contain replaced UTF-16 code units",
+            ));
+        }
+        let declarations = property["declarations"]
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| failure("native property name has no source declaration"))?;
+        self.count(declarations.len())?;
+        let mut recovered: Option<JsString> = None;
+        for declaration in declarations {
+            let declaration = declaration
+                .as_str()
+                .ok_or_else(|| failure("invalid property declaration"))?;
+            let mut parts = declaration.splitn(3, '.');
+            let index = parts
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .filter(|index| *index != 0)
+                .ok_or_else(|| failure("invalid declaration index"))?;
+            let kind = parts
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .ok_or_else(|| failure("invalid declaration kind"))?;
+            let path = parts
+                .next()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| failure("invalid declaration path"))?;
+            if !self.property_permissions.contains_key(&path) {
+                let properties = self.project.property_permissions(self.owner, &path)?;
+                self.count(properties.len())?;
+                self.property_permissions.insert(path.clone(), properties);
+            }
+            let declaration = self.property_permissions[&path]
+                .get(&index)
+                .ok_or_else(|| failure("property declaration address missing from source"))?;
+            let Some(name) = declaration.name.as_ref() else {
+                return Err(failure("cannot recover source-bound property name"));
+            };
+            if declaration.kind != kind || native_lossy_name(name) != native {
+                return Err(failure("property name differs from its source declaration"));
+            }
+            if recovered.as_ref().is_some_and(|previous| previous != name) {
+                return Err(failure("property declarations have different names"));
+            }
+            recovered = Some(name.clone());
+        }
+        recovered.ok_or_else(|| failure("cannot recover source-bound property name"))
     }
     fn standard_symbol(&mut self, name: &str) -> Result<Option<u64>, WakeError> {
         // A global lookup has no source location, so file-local declarations cannot shadow it.
@@ -516,15 +653,7 @@ impl Collector<'_> {
                         self.count(properties.len())?;
                         for property in properties {
                             let symbol = handle(&property["id"])?;
-                            let name = property["name"]
-                                .as_str()
-                                .ok_or_else(|| failure("property omitted name"))?
-                                .to_owned();
-                            if name.contains('\u{fffd}') {
-                                return Err(failure(
-                                    "native property name may contain replaced UTF-16 code units",
-                                ));
-                            }
+                            let name = self.property_name(property)?;
                             let property_flags = flags(&property["flags"])?;
                             // SymbolFlags.Optional is 1 << 24 in the pinned TypeScript 7 wire.
                             // Convert that backend bit to a source-bound boolean before the fact
@@ -538,7 +667,7 @@ impl Collector<'_> {
                             // Computed symbol names may contain backend-local symbol handles.
                             // Their values still participate in unsafe proofs, but their opaque
                             // spellings cannot be an exported structural identity.
-                            if name.starts_with("__@") {
+                            if name.as_str().is_some_and(|name| name.starts_with("__@")) {
                                 node.structural_complete = false;
                             } else {
                                 if node.structural_complete {
@@ -834,6 +963,7 @@ impl TypeProject {
             class_identities: BTreeMap::new(),
             next_class_identity: 0,
             property_permissions: BTreeMap::new(),
+            enum_values: BTreeMap::new(),
             raw: Vec::new(),
             nodes: Vec::new(),
             relations: 0,
@@ -1238,7 +1368,25 @@ impl TypeProject {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_bigint, promise_identity_needed};
+    use super::{native_lossy_name, normalize_bigint, promise_identity_needed};
+    use wake_common::JsString;
+
+    #[test]
+    fn native_json_replacement_is_checked_against_exact_code_units() {
+        assert_eq!(
+            native_lossy_name(&JsString::from_utf16(&[0xd800])),
+            "\u{fffd}\u{fffd}\u{fffd}"
+        );
+        assert_eq!(
+            native_lossy_name(&JsString::from_utf16(&[0xdfff])),
+            "\u{fffd}\u{fffd}\u{fffd}"
+        );
+        assert_eq!(native_lossy_name(&JsString::from("\u{fffd}")), "\u{fffd}");
+        assert_eq!(
+            native_lossy_name(&JsString::from_utf16(&[0xd83d, 0xdc4d])),
+            "👍"
+        );
+    }
 
     #[test]
     fn bigint_normalization_rejects_empty_and_invalid_digits() {

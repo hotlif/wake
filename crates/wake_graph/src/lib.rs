@@ -13,7 +13,7 @@
 //! 「移除」的**安全性**由 codegen 侧兜底：只移除「外部未用 + 模块内也未引用 + 无副作用」的
 //! 导出声明；否则仅移除 `exports.x = ...` 绑定行（永远安全）。模块的顶层副作用语句一律保留。
 
-use wake_common::{Atom, FxHashMap, FxHashSet, Interner};
+use wake_common::{Atom, FxHashMap, FxHashSet, Interner, JsAtom};
 use wake_ecma_ast::{
     ExportDefaultKind, Expression, ImportSpecifier, ModuleExportName, Pattern, Program, Statement,
     Visit, walk_expression,
@@ -28,6 +28,12 @@ pub enum ImportUse {
     All,
     /// `export * from 'm'` re-export 全量——仅当下游消费本模块导出时才传播至目标。
     ReexportAll,
+}
+
+// CompilerBackend diagnoses non-UTF-8 requests before the module graph is built. Direct AST
+// analysis can only omit such a source fact; it must never invent a scalar-string identity.
+fn utf8_module_source(interner: &Interner, source: JsAtom) -> Option<String> {
+    interner.resolve_js(source).as_str().map(str::to_owned)
 }
 
 /// 一个模块的已用导出集合。
@@ -82,7 +88,9 @@ pub fn collect_static_uses(program: &Program, interner: &Interner) -> Vec<(Strin
     for stmt in program.body.iter() {
         match stmt {
             Statement::Import(d) => {
-                let source = interner.resolve(d.source);
+                let Some(source) = utf8_module_source(interner, d.source) else {
+                    continue;
+                };
                 let mut names = Vec::new();
                 let mut all = false;
                 for spec in d.specifiers.iter() {
@@ -105,7 +113,9 @@ pub fn collect_static_uses(program: &Program, interner: &Interner) -> Vec<(Strin
             }
             Statement::ExportNamed(s) => {
                 if let Some(src) = s.source {
-                    let source = interner.resolve(src);
+                    let Some(source) = utf8_module_source(interner, src) else {
+                        continue;
+                    };
                     let names = s
                         .specifiers
                         .iter()
@@ -115,7 +125,9 @@ pub fn collect_static_uses(program: &Program, interner: &Interner) -> Vec<(Strin
                 }
             }
             Statement::ExportAll(s) => {
-                out.push((interner.resolve(s.source), ImportUse::ReexportAll));
+                if let Some(source) = utf8_module_source(interner, s.source) {
+                    out.push((source, ImportUse::ReexportAll));
+                }
             }
             _ => {}
         }
@@ -203,7 +215,9 @@ pub fn collect_module_liveness(program: &Program, interner: &Interner) -> Module
     for stmt in program.body.iter() {
         match stmt {
             Statement::Import(d) => {
-                let source = interner.resolve(d.source);
+                let Some(source) = utf8_module_source(interner, d.source) else {
+                    continue;
+                };
                 for spec in d.specifiers.iter() {
                     match spec {
                         ImportSpecifier::Named {
@@ -231,7 +245,9 @@ pub fn collect_module_liveness(program: &Program, interner: &Interner) -> Module
             Statement::ExportNamed(s) => {
                 if let Some(src) = s.source {
                     // `export { imp as exported } from 'm'`：名级再导出（exported 被消费 → 向源要 imp）。
-                    let source = interner.resolve(src);
+                    let Some(source) = utf8_module_source(interner, src) else {
+                        continue;
+                    };
                     for sp in s.specifiers.iter() {
                         ml.reexport_named.push((
                             export_name_atom(&sp.exported),
@@ -284,7 +300,9 @@ pub fn collect_module_liveness(program: &Program, interner: &Interner) -> Module
                 }
             },
             Statement::ExportAll(s) => {
-                let spec = interner.resolve(s.source);
+                let Some(spec) = utf8_module_source(interner, s.source) else {
+                    continue;
+                };
                 match s.exported {
                     // `export * from 'm'`：把 m 的具名导出全量透传（不含 default）。
                     None => ml.reexport_star.push(spec),

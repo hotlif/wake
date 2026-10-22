@@ -28,7 +28,8 @@ import attributes 的键与模块导出名分开建模：标识符拼写仍为 A
 声明渲染回调携带 parser-owned 请求事实以读取无损值，tsdoc 不直接依赖 common 或自行扫描。
 外部字面量未重写时保留原文，相对请求必须在文件系统边界通过
 显式 UTF-8 检查。lint 已知字面量无法进入解析环境时产生 unresolved，不伪造动态未知请求。
-运行时值链路已接通；静态模块元数据和原生类型服务字符串协议尚需逐项完成迁移/验收，
+运行时值链路已接通；静态模块来源已在 parser AST、owned 依赖与普通/压缩 ESM 输出保留码元，
+进入 resolver 前由 compiler facade 检查 UTF-8。原生类型服务的其他字符串协议仍须逐项迁移/验收，
 不能由基础类型或运行时局部证据推导完整字符串兼容。
 
 ## Invariants
@@ -52,13 +53,20 @@ raw/cooked、装饰器、enum/JSX 和普通/压缩/模板降级；
 `crates/wake_lint_core/tests/utf16.rs` 覆盖重复项、truthiness 和 ARIA 的码元边界。
 `crates/wake_lint_core/tests/typed_strings.rs` 验证源值与类型字面量之间的码元身份，
 原生类型服务测试覆盖 JSON 替换造成的不同代理项碰撞、实际替换字符、跨文件长字面量，
-并验证尚未恢复的枚举值/属性名称会在不正确等价证明前失败。
+并验证无法源绑定的属性名称会在不正确等价证明前失败；源绑定的字符串属性名称由原生进程
+回归验证高/低孤立代理项与真实替换字符的码元身份。原生 enum 成员直接字符串 initializer
+通过同快照声明地址和 wire 子节点范围恢复；注释、带引号成员名及高/低孤立代理项与真实
+替换字符的碰撞均有原生回归，错误挂接的 wire 节点仍失败关闭。
 `crates/wake_ecma_parser/tests/utf16_attributes.rs` 验证原始属性事实、同值键与导出名称约束；
 codegen 的 Node 模块链接对照覆盖普通/优化/映射 ESM 产物的实际属性码元，模块请求与项目
 回归覆盖动态属性、重复导入、缓存命中和属性值变化后的失效。
 `crates/wake_ecma_parser/tests/utf16_type_modules.rs` 覆盖 ambient/类型导入、声明事实及擦除等价；
 semantic 验证无损模块值控制类型和值声明合并。tsdoc 验证外部引用保留和重写不再读盘，
 相对无损值在无法表示为 UTF-8 路径时于探测前失败；lint 项目验证该限制产生 unresolved。
+`crates/wake_ecma_parser/tests/utf16_static_modules.rs` 验证四类运行时静态请求的 AST/owned
+依赖码元身份；codegen 的 ordinary/preserve/minify 回归验证输出值，compiler core 验证孤立代理项
+在 resolver 前带范围失败而普通 Unicode 不丢失。bundler 冷/热缓存回归覆盖正常 Unicode 路径、
+拒绝的孤立代理项与内容失效，parser pipeline 版本更新使旧摘要自然失效。
 
 ## Consequences
 
@@ -79,5 +87,6 @@ None.
 
 ## Removal plan
 
-UTF-8-only 字符串解码桥已移除；标识符保留独立 Unicode 标量验证。静态模块元数据的
-显式 UTF-8 转换由 parser 拥有，迁移完成后移除此限制，不宣称超出当前边界的完整支持。
+UTF-8-only 字符串解码桥已移除；标识符保留独立 Unicode 标量验证。静态模块来源在
+parser AST 与 owned 依赖事实中保留码元身份；compiler facade 在进入 resolver 和缓存前
+显式检查 UTF-8，不可表示时携带源码范围诊断并跳过该依赖。不宣称超出当前边界的完整支持。

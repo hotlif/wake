@@ -365,6 +365,68 @@ export * from 'third' with {"\ud802":"\udffd"};
     }
 }
 
+#[test]
+fn static_module_requests_survive_readable_and_minified_output() {
+    use wake_ecma_codegen::{
+        ModuleSpecifierRewriter, PreserveModuleFormat, codegen_preserved_optimized,
+    };
+    struct Unchanged;
+    impl ModuleSpecifierRewriter for Unchanged {
+        fn rewrite(&self, _specifier: &str) -> Option<String> {
+            None
+        }
+    }
+
+    let source = r#"
+import '\ud800';
+import { value } from '\ud801';
+console.log(value);
+export { named } from '\udffe';
+export * from '\udfff';
+"#;
+    let sources = ["\\ud800", "\\ud801", "\\udffe", "\\udfff"];
+    let interner = Interner::new();
+    let parsed = parse(source, &interner, SourceType::Module);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let ordinary = parsed
+        .module
+        .with_ast(|program| wake_ecma_codegen::codegen(program, &interner));
+    for source in sources {
+        assert!(ordinary.contains(source), "missing {source}: {ordinary}");
+    }
+    assert!(!ordinary.contains('\u{fffd}'), "{ordinary}");
+    for minify in [false, true] {
+        let mut input = OptimizeInput::new(source);
+        input.minify = minify;
+        let optimized = optimize(parsed.module.clone(), &interner, &input).unwrap();
+        let generated = codegen_preserved_optimized(
+            &optimized,
+            &interner,
+            PreserveModuleFormat::EsModule,
+            &Unchanged,
+        );
+        for source in sources {
+            assert!(
+                generated.contains(source),
+                "minify={minify}, missing {source}: {generated}"
+            );
+        }
+        assert!(
+            !generated.contains('\u{fffd}'),
+            "minify={minify}: {generated}"
+        );
+    }
+
+    let mut bundled = OptimizeInput::new(source);
+    bundled.set_bundled_commonjs(true);
+    let error = optimize(parsed.module, &interner, &bundled)
+        .expect_err("CommonJS requests require a UTF-8 module specifier");
+    assert!(
+        error.to_string().contains("cannot be represented as UTF-8"),
+        "{error}"
+    );
+}
+
 fn build_typed(source: &str, source_type: SourceType) -> TypedBuild {
     build_typed_with_options(
         source,

@@ -1438,8 +1438,8 @@ impl<'i> Codegen<'i> {
         }
     }
 
-    fn emit_module_specifier(&mut self, atom: Atom) {
-        self.emit_string_atom(atom);
+    fn emit_module_specifier(&mut self, atom: wake_common::JsAtom) {
+        self.emit_js_string_atom(atom);
     }
 
     // ==================================================================

@@ -183,7 +183,11 @@ fn sealed_module_plan_drives_retained_dependency_edges() {
         .dependencies
         .iter()
         .map(|dependency| OptimizeDependency {
-            specifier: interner.resolve(dependency.specifier),
+            specifier: dependency
+                .specifier
+                .as_str()
+                .expect("fixture dependency is UTF-8")
+                .to_owned(),
             kind: dependency.kind.into(),
             origin: NodeOrigin::Source(dependency.span),
         })

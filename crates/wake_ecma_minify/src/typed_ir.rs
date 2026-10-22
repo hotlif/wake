@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 
-use wake_common::{Interner, Span};
+use wake_common::{Interner, JsAtom, Span};
 use wake_ecma_ast::{
     ArrowBody, AssignmentOperator, AttributesKeyword, BinaryOperator, Class, ClassMember,
     ExportDefaultKind, Expression, ForInit, ForLeft, Function, Ident, ImportAttributeKey,
@@ -2393,8 +2393,8 @@ impl TypedProgram {
                 }
             }
             IrNodeData::ImportDeclaration { source, .. } => {
-                if !self.name_node_has_syntax(*source, NameSyntax::String) {
-                    return Err(invalid("import source must be a string-syntax name"));
+                if !self.module_source_node(*source) {
+                    return Err(invalid("import source must be a string value"));
                 }
             }
             IrNodeData::ImportSpecifier {
@@ -2432,10 +2432,8 @@ impl TypedProgram {
                 if source.is_none() && attributes.is_some() {
                     return Err(invalid("export attributes require a module source"));
                 }
-                if source
-                    .is_some_and(|source| !self.name_node_has_syntax(source, NameSyntax::String))
-                {
-                    return Err(invalid("export source must be a string-syntax name"));
+                if source.is_some_and(|source| !self.module_source_node(source)) {
+                    return Err(invalid("export source must be a string value"));
                 }
             }
             IrNodeData::ExportDefaultDeclaration { value, kind } => {
@@ -2466,8 +2464,8 @@ impl TypedProgram {
             IrNodeData::ExportAllDeclaration {
                 exported, source, ..
             } => {
-                if !self.name_node_has_syntax(*source, NameSyntax::String) {
-                    return Err(invalid("export-all source must be a string-syntax name"));
+                if !self.module_source_node(*source) {
+                    return Err(invalid("export-all source must be a string value"));
                 }
                 if let Some(exported) = exported {
                     self.validate_module_name(node, *exported)?;
@@ -2633,6 +2631,14 @@ impl TypedProgram {
             self.nodes.get(node.index()).map(IrNode::data),
             Some(IrNodeData::Name { name }) if self.names[name.index()].syntax == syntax
         )
+    }
+
+    fn module_source_node(&self, node: NodeId) -> bool {
+        self.name_node_has_syntax(node, NameSyntax::String)
+            || matches!(
+                self.nodes.get(node.index()).map(IrNode::data),
+                Some(IrNodeData::StringLiteral { .. })
+            )
     }
 
     fn validate_property_key(
@@ -4218,6 +4224,15 @@ impl Lowerer<'_> {
         self.name_text(self.interner.resolve(ident.name), ident.span, role, syntax)
     }
 
+    fn module_source(&mut self, source: JsAtom, span: Span) -> NodeId {
+        self.finish_with_origin(
+            IrOrigin::parser_derived(span),
+            IrNodeData::StringLiteral {
+                value: self.interner.resolve_js(source),
+            },
+        )
+    }
+
     fn lower_program(&mut self, program: &Program<'_>, plan: &TypedLoweringPlan) -> NodeId {
         let body = program
             .body
@@ -4504,13 +4519,7 @@ impl Lowerer<'_> {
                 let attributes = declaration
                     .attributes
                     .map(|attributes| self.import_attributes(attributes));
-                let source = self.name_text_with_origin(
-                    self.interner.resolve(declaration.source),
-                    declaration.span,
-                    NameRole::ModuleSpecifier,
-                    NameSyntax::String,
-                    IrOrigin::parser_derived(declaration.span),
-                );
+                let source = self.module_source(declaration.source, declaration.span);
                 let parent = self.next_node();
                 let specifiers = self.list_for(parent, ChildRole::ImportSpecifiers, specifiers);
                 self.finish(
@@ -4552,15 +4561,9 @@ impl Lowerer<'_> {
                 let attributes = declaration
                     .attributes
                     .map(|attributes| self.import_attributes(attributes));
-                let source = declaration.source.map(|source| {
-                    self.name_text_with_origin(
-                        self.interner.resolve(source),
-                        declaration.span,
-                        NameRole::ModuleSpecifier,
-                        NameSyntax::String,
-                        IrOrigin::parser_derived(declaration.span),
-                    )
-                });
+                let source = declaration
+                    .source
+                    .map(|source| self.module_source(source, declaration.span));
                 let parent = self.next_node();
                 let specifiers = self.list_for(parent, ChildRole::ExportSpecifiers, specifiers);
                 self.finish(
@@ -4600,13 +4603,7 @@ impl Lowerer<'_> {
                 let attributes = declaration
                     .attributes
                     .map(|attributes| self.import_attributes(attributes));
-                let source = self.name_text_with_origin(
-                    self.interner.resolve(declaration.source),
-                    declaration.span,
-                    NameRole::ModuleSpecifier,
-                    NameSyntax::String,
-                    IrOrigin::parser_derived(declaration.span),
-                );
+                let source = self.module_source(declaration.source, declaration.span);
                 self.finish(
                     declaration.span,
                     IrNodeData::ExportAllDeclaration {

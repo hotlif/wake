@@ -819,23 +819,31 @@ pub fn collect_static_reexports(program: &Program, interner: &Interner) -> Vec<S
                 let Some(source) = export.source else {
                     continue;
                 };
-                let specifier = interner.resolve(source);
+                let specifier = interner.resolve_js(source);
+                let Some(specifier) = specifier.as_str() else {
+                    continue;
+                };
                 for item in export.specifiers.iter() {
                     out.push(StaticReexport {
-                        specifier: specifier.clone(),
+                        specifier: specifier.to_owned(),
                         imported: Some(export_name(&item.local, interner)),
                         exported: Some(export_name(&item.exported, interner)),
                     });
                 }
             }
-            Statement::ExportAll(export) => out.push(StaticReexport {
-                specifier: interner.resolve(export.source),
-                imported: None,
-                exported: export
-                    .exported
-                    .as_ref()
-                    .map(|name| export_name(name, interner)),
-            }),
+            Statement::ExportAll(export) => {
+                let specifier = interner.resolve_js(export.source);
+                if let Some(specifier) = specifier.as_str() {
+                    out.push(StaticReexport {
+                        specifier: specifier.to_owned(),
+                        imported: None,
+                        exported: export
+                            .exported
+                            .as_ref()
+                            .map(|name| export_name(name, interner)),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -934,7 +942,10 @@ pub fn collect_imports(program: &Program, interner: &Interner) -> Vec<(String, S
             continue;
         };
         // 类型-only import 在 parse 期已擦除，这里见到的都是运行时 import。
-        let spec_text = interner.resolve(imp.source);
+        let spec_text = interner.resolve_js(imp.source);
+        let Some(spec_text) = spec_text.as_str() else {
+            continue;
+        };
         for s in imp.specifiers.iter() {
             let (local, imported) = match s {
                 ImportSpecifier::Default { local, .. } => (*local, "default".to_string()),
@@ -943,7 +954,7 @@ pub fn collect_imports(program: &Program, interner: &Interner) -> Vec<(String, S
                     local, imported, ..
                 } => (*local, export_name(imported, interner)),
             };
-            out.push((interner.resolve(local.name), spec_text.clone(), imported));
+            out.push((interner.resolve(local.name), spec_text.to_owned(), imported));
         }
     }
     out

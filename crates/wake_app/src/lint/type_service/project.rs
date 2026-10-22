@@ -2,7 +2,7 @@
 use super::{
     filesystem::TypeFileSystem,
     transport::{Limits, Session},
-    wire::WireSource,
+    wire::{EnumMemberValues, PropertyPermissions, WireSource},
 };
 use crate::{CancellationToken, WakeError};
 use base64::Engine as _;
@@ -294,7 +294,7 @@ impl TypeProject {
         &mut self,
         project: ProjectId,
         file: &Path,
-    ) -> Result<std::collections::BTreeMap<u32, (u32, bool)>, WakeError> {
+    ) -> Result<PropertyPermissions, WakeError> {
         // Node handles use canonical case; the program's original spelling owns sparse overlays.
         let file = self
             .selected(project)?
@@ -308,6 +308,24 @@ impl TypeProject {
             .ok_or_else(|| failure("property declaration source is unavailable").at(&file))?;
         // `source` validates membership and exact backend text before exposing any address facts.
         Ok(self.source(project, &file, text)?.property_permissions())
+    }
+
+    pub(super) fn enum_member_values(
+        &mut self,
+        project: ProjectId,
+        file: &Path,
+    ) -> Result<EnumMemberValues, WakeError> {
+        let file = self
+            .selected(project)?
+            .files
+            .get(&key(file, self.case_sensitive))
+            .cloned()
+            .ok_or_else(|| failure("enum declaration is outside the selected program").at(file))?;
+        let text = self.filesystem.callback("readFile", &json!(file))?;
+        let text = text["content"]
+            .as_str()
+            .ok_or_else(|| failure("enum declaration source is unavailable").at(&file))?;
+        Ok(self.source(project, &file, text)?.enum_member_values())
     }
 }
 
@@ -2890,49 +2908,218 @@ derived as "pre\ud800";
 
     #[test]
     #[ignore = "requires repository's installed native TypeScript 7.0.2 and platform package"]
-    fn native_lossy_enum_values_and_property_names_stop_before_equivalence_proofs() {
-        use wake_lint_core::{SourceType, TypeSource};
+    fn native_source_bound_property_names_preserve_utf16_identity() {
+        use wake_lint_core::{LintOptions, RuleLevel, SourceType, TypeSource};
         let root = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
-        let fixture = root.join(".tmp/virtual-type-utf16-unavailable");
+        let fixture = root.join(".tmp/virtual-type-utf16-properties");
         let config = fixture.join("tsconfig.json");
         let file = fixture.join("a.ts");
-        for source in [
-            r#"export {}; interface A { "\ud800":string } interface B { "\udfff":string } declare const value:A; value as B;"#,
-            r#"export {}; enum E { A="\ud800", B="\udfff" } declare const value:E; switch(value){case E.A:break;}"#,
-        ] {
-            let source: Arc<str> = Arc::from(source);
-            let overlays = BTreeMap::from([
-                (config.clone(), Arc::from(json!({"compilerOptions":{"strict":true,"lib":["es2022"],"types":[]},"files":["a.ts"]}).to_string())),
-                (file.clone(), source.clone()),
-            ]);
-            let fs = TypeFileSystem::new(
-                Arc::new(OsFileSystem),
-                overlays,
-                &root,
-                CancellationToken::default(),
-            )
-            .unwrap();
-            let mut project = TypeProject::start(
-                fs,
-                &root,
-                "@typescript/native",
-                std::slice::from_ref(&config),
-                CancellationToken::default(),
-            )
-            .unwrap();
-            let error = match project.type_source(
+        let source: Arc<str> = Arc::from(
+            r#"export {}; interface A { "\ud800": string } interface B { "\udfff": string } interface C { "\ufffd": string } declare const value: A; value as B; value as C; value as A;"#,
+        );
+        let overlays = BTreeMap::from([
+            (config.clone(), Arc::from(json!({"compilerOptions":{"strict":true,"lib":["es2022"],"types":[]},"files":["a.ts"]}).to_string())),
+            (file.clone(), source.clone()),
+        ]);
+        let fs = TypeFileSystem::new(
+            Arc::new(OsFileSystem),
+            overlays,
+            &root,
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let mut project = TypeProject::start(
+            fs,
+            &root,
+            "@typescript/native",
+            &[config],
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let typed = project
+            .type_source(
                 &file,
-                TypeSource::new("a.ts", source, SourceType::TypeScript).unwrap(),
-            ) {
-                Ok(_) => panic!("lossy semantic names/values must not reach equivalence proofs"),
-                Err(error) => error,
-            };
-            assert_eq!(error.code, "WAKE_LINT_ANALYSIS");
-            assert!(
-                error.message.contains("UTF-16") || error.message.contains("lossless"),
-                "{error}"
-            );
-        }
+                TypeSource::new("a.ts", source.clone(), SourceType::TypeScript).unwrap(),
+            )
+            .unwrap();
+        let result = typed
+            .lint(&LintOptions {
+                recommended: false,
+                rules: [(
+                    "ts/no-unnecessary-type-assertion".into(),
+                    RuleLevel::Error.into(),
+                )]
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let spans: Vec<_> = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &source[diagnostic.start as usize..diagnostic.end as usize])
+            .collect();
+        assert_eq!(spans, ["value as A"]);
+    }
+
+    #[test]
+    #[ignore = "requires repository's installed native TypeScript 7.0.2 and platform package"]
+    fn native_enum_string_values_preserve_utf16_identity() {
+        use wake_lint_core::{LintOptions, RuleLevel, SourceType, TypeSource};
+        let root = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+        let fixture = root.join(".tmp/virtual-type-utf16-enum-values");
+        let config = fixture.join("tsconfig.json");
+        let file = fixture.join("a.ts");
+        let source: Arc<str> = Arc::from(
+            r#"
+export {};
+enum E { High = /* source trivia */ "\ud800", Low = "\udfff", Replacement = "\ufffd" }
+declare const value: E;
+switch (value) { case E.High: break; case E.Replacement: break; }
+switch (value) { case E.Low: break; case E.Replacement: break; }
+switch (value) { case E.High: break; case E.Low: break; }
+switch (value) { case E.High: break; case E.Low: break; case E.Replacement: break; }
+"#,
+        );
+        let overlays = BTreeMap::from([
+            (config.clone(), Arc::from(json!({"compilerOptions":{"strict":true,"lib":["es2022"],"types":[]},"files":["a.ts"]}).to_string())),
+            (file.clone(), source.clone()),
+        ]);
+        let fs = TypeFileSystem::new(
+            Arc::new(OsFileSystem),
+            overlays,
+            &root,
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let mut project = TypeProject::start(
+            fs,
+            &root,
+            "@typescript/native",
+            std::slice::from_ref(&config),
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let typed = project
+            .type_source(
+                &file,
+                TypeSource::new("a.ts", source.clone(), SourceType::TypeScript).unwrap(),
+            )
+            .unwrap();
+        let result = typed
+            .lint(&LintOptions {
+                recommended: false,
+                rules: [(
+                    "ts/switch-exhaustiveness-check".into(),
+                    RuleLevel::Error.into(),
+                )]
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let spans: Vec<_> = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &source[diagnostic.start as usize..diagnostic.end as usize])
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                "switch (value) { case E.High: break; case E.Replacement: break; }",
+                "switch (value) { case E.Low: break; case E.Replacement: break; }",
+                "switch (value) { case E.High: break; case E.Low: break; }",
+            ]
+        );
+
+        let owner = project.project_for(&file).unwrap();
+        let altered = source.replace("\\ud800", "\\ud801");
+        let error = match project.source(owner, &file, &altered) {
+            Ok(_) => panic!("changed source must not match the frozen native AST wire"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "WAKE_LINT_ANALYSIS");
+        assert!(error.message.contains("backend source differs"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires repository's installed native TypeScript 7.0.2 and platform package"]
+    fn native_enum_alias_has_no_direct_source_value() {
+        let root = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+        let fixture = root.join(".tmp/virtual-type-utf16-enum-alias");
+        let config = fixture.join("tsconfig.json");
+        let file = fixture.join("a.ts");
+        let source: Arc<str> = Arc::from(
+            r#"export {}; enum E { Direct = "\ud800", Alias = Direct } declare const value: E.Alias; value as E.Alias;"#,
+        );
+        let overlays = BTreeMap::from([
+            (config.clone(), Arc::from(json!({"compilerOptions":{"strict":true,"lib":["es2022"],"types":[]},"files":["a.ts"]}).to_string())),
+            (file.clone(), source.clone()),
+        ]);
+        let fs = TypeFileSystem::new(
+            Arc::new(OsFileSystem),
+            overlays,
+            &root,
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let mut project = TypeProject::start(
+            fs,
+            &root,
+            "@typescript/native",
+            &[config],
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let owner = project.project_for(&file).unwrap();
+        let values = project
+            .source(owner, &file, &source)
+            .unwrap()
+            .enum_member_values();
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.values().next(),
+            Some(&wake_common::JsString::from_utf16(&[0xd800]))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires repository's installed native TypeScript 7.0.2 and platform package"]
+    fn native_quoted_enum_member_name_does_not_replace_its_value() {
+        let root = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+        let fixture = root.join(".tmp/virtual-type-utf16-quoted-enum");
+        let config = fixture.join("tsconfig.json");
+        let file = fixture.join("a.ts");
+        let source: Arc<str> = Arc::from(
+            r#"export {}; enum E { "High" = "\ud800" } declare const value: E.High; value as E.High;"#,
+        );
+        let overlays = BTreeMap::from([
+            (config.clone(), Arc::from(json!({"compilerOptions":{"strict":true,"lib":["es2022"],"types":[]},"files":["a.ts"]}).to_string())),
+            (file.clone(), source.clone()),
+        ]);
+        let fs = TypeFileSystem::new(
+            Arc::new(OsFileSystem),
+            overlays,
+            &root,
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let mut project = TypeProject::start(
+            fs,
+            &root,
+            "@typescript/native",
+            &[config],
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let owner = project.project_for(&file).unwrap();
+        let values = project
+            .source(owner, &file, &source)
+            .unwrap()
+            .enum_member_values();
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.values().next(),
+            Some(&wake_common::JsString::from_utf16(&[0xd800]))
+        );
     }
 
     #[test]

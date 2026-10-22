@@ -114,10 +114,10 @@ pub struct TypeNode {
     /// Named structural properties used by conservative object-equivalence proofs. Each tuple is
     /// `(name, optional, value_type)`; names and optionalness are source data, while compiler
     /// handles and declaration addresses never enter this contract.
-    pub structural_properties: Vec<(String, bool, TypeId)>,
+    pub structural_properties: Vec<(wake_common::JsString, bool, TypeId)>,
     /// Readonly names from `structural_properties`. An empty set proves writability only when
     /// `structural_complete` is true; unknown permissions must leave the shape incomplete.
-    pub readonly_properties: BTreeSet<String>,
+    pub readonly_properties: BTreeSet<wake_common::JsString>,
     /// True only after the entire object shape was collected, including an empty shape. Call or
     /// construct signatures without parameter facts, nominal classes, opaque keys and unknown
     /// property permissions leave this false. Partial member lists must not prove equivalence.

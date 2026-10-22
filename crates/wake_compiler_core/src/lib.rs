@@ -1255,13 +1255,35 @@ impl CompilerBackend {
                 transform_features: input.target.required_features(),
             },
         );
+        let mut diagnostics: Vec<_> = output
+            .diagnostics
+            .into_iter()
+            .map(convert_diagnostic)
+            .collect();
         let dependencies = output
             .dependencies
             .iter()
-            .map(|dependency| ParsedDependency {
-                specifier: self.interner.resolve(dependency.specifier),
-                kind: dependency.kind.into(),
-                span: dependency.span,
+            .filter_map(|dependency| {
+                let Some(specifier) = dependency.specifier.as_str() else {
+                    diagnostics.push(CompilerDiagnostic {
+                        severity: DiagnosticSeverity::Error,
+                        code: Some("WAKE0200".to_owned()),
+                        message: "模块说明符无法表示为 UTF-8 文件系统请求".to_owned(),
+                        path: None,
+                        labels: vec![CompilerDiagnosticLabel {
+                            span: dependency.span,
+                            message: None,
+                            primary: true,
+                        }],
+                        notes: Vec::new(),
+                    });
+                    return None;
+                };
+                Some(ParsedDependency {
+                    specifier: specifier.to_owned(),
+                    kind: dependency.kind.into(),
+                    span: dependency.span,
+                })
             })
             .collect();
         let syntax = output.module.with_ast(|program| {
@@ -1282,11 +1304,7 @@ impl CompilerBackend {
         Ok(ParsedModule {
             ast: output.module,
             dependencies,
-            diagnostics: output
-                .diagnostics
-                .into_iter()
-                .map(convert_diagnostic)
-                .collect(),
+            diagnostics,
             syntax,
         })
     }

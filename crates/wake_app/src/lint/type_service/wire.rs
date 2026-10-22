@@ -1,14 +1,40 @@
 //! Private TypeScript 7.0.2 AST wire v5 address adapter. No backend AST escapes this module.
 //! The wire layout is verified against the installed native API, not a public Wake AST contract.
 use crate::WakeError;
+use std::collections::BTreeMap;
 use std::path::Path;
+use wake_common::JsString;
 use wake_common::Span;
+use wake_lint_core::TypeLiteral;
 
 fn invalid(message: &str) -> WakeError {
     WakeError::new(
         "WAKE_LINT_ANALYSIS",
         format!("Type source adapter: {message}"),
     )
+}
+
+/// A native node's start is its fullStart, which may include comments before the token.
+/// Only trivia inside that node's validated source range may be skipped.
+fn skip_leading_trivia(source: &str) -> Option<&str> {
+    let bytes = source.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if bytes[start].is_ascii_whitespace() {
+            start += 1;
+        } else if bytes[start..].starts_with(b"//") {
+            let newline = bytes[start + 2..]
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))?;
+            start += 2 + newline;
+        } else if bytes[start..].starts_with(b"/*") {
+            let end = source[start + 2..].find("*/")?;
+            start += 2 + end + 2;
+        } else {
+            break;
+        }
+    }
+    source.get(start..)
 }
 
 struct Change {
@@ -71,6 +97,15 @@ struct NodeAddress {
     end: u32,
     parent: u32,
 }
+
+pub(super) struct PropertyDeclaration {
+    pub kind: u32,
+    pub readonly: bool,
+    pub name: Option<JsString>,
+}
+
+pub(super) type PropertyPermissions = BTreeMap<u32, PropertyDeclaration>;
+pub(super) type EnumMemberValues = BTreeMap<u32, JsString>;
 
 pub(super) struct WireSource<'source> {
     source: &'source str,
@@ -273,7 +308,7 @@ impl<'source> WireSource<'source> {
 
     /// Private declaration facts for readonly property proofs. Modifier tokens are children of
     /// their declaration; property names and nested type members cannot act as modifiers.
-    pub(super) fn property_permissions(&self) -> std::collections::BTreeMap<u32, (u32, bool)> {
+    pub(super) fn property_permissions(&self) -> PropertyPermissions {
         let readonly: std::collections::BTreeSet<_> = self
             .nodes
             .iter()
@@ -284,10 +319,85 @@ impl<'source> WireSource<'source> {
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
-                matches!(node.kind, 172 | 173 | 303 | 304).then_some((
-                    index as u32,
-                    (node.kind, readonly.contains(&(index as u32))),
-                ))
+                if matches!(node.kind, 172 | 173 | 303 | 304) {
+                    // TypeScript 7.0.2 wire kind 10 is a string literal. A quoted property
+                    // name is a direct declaration child; computed and synthetic names are not.
+                    let first = self
+                        .children
+                        .partition_point(|child| self.nodes[*child as usize].parent < index as u32);
+                    let mut names = self.children[first..]
+                        .iter()
+                        .map(|child| self.nodes[*child as usize])
+                        .take_while(|child| child.parent == index as u32)
+                        .filter(|child| child.kind == 10);
+                    let name = names
+                        .next()
+                        .and_then(|child| {
+                            names
+                                .next()
+                                .is_none()
+                                .then(|| self.source.get(child.start as usize..child.end as usize))
+                                .flatten()
+                        })
+                        .and_then(|source| {
+                            match TypeLiteral::from_string_source(source.trim_ascii_start()) {
+                                Ok(TypeLiteral::String(value)) => Some(value),
+                                _ => None,
+                            }
+                        });
+                    Some((
+                        index as u32,
+                        PropertyDeclaration {
+                            kind: node.kind,
+                            readonly: readonly.contains(&(index as u32)),
+                            name,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Recover a direct string-literal initializer whose distinct name and value nodes are
+    /// contained in the same native enum member source range.
+    pub(super) fn enum_member_values(&self) -> EnumMemberValues {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.kind == 306) // TypeScript 7.0.2 EnumMember.
+            .filter_map(|(index, member)| {
+                let first = self
+                    .children
+                    .partition_point(|child| self.nodes[*child as usize].parent < index as u32);
+                let children: Vec<_> = self.children[first..]
+                    .iter()
+                    .map(|child| self.nodes[*child as usize])
+                    .take_while(|child| child.parent == index as u32)
+                    .collect();
+                let [name, initializer] = children.as_slice() else {
+                    return None;
+                };
+                if !matches!(name.kind, 79 | 10)
+                    || initializer.kind != 10
+                    || name.start < member.start
+                    || name.start >= name.end
+                    || name.end > member.end
+                    || initializer.start < name.end
+                    || initializer.start >= initializer.end
+                    || initializer.end > member.end
+                {
+                    return None;
+                }
+                let source = self
+                    .source
+                    .get(initializer.start as usize..initializer.end as usize)?;
+                let value = match TypeLiteral::from_string_source(skip_leading_trivia(source)?) {
+                    Ok(TypeLiteral::String(value)) => value,
+                    _ => return None,
+                };
+                Some((index as u32, value))
             })
             .collect()
     }
@@ -619,6 +729,49 @@ mod tests {
         bytes[nodes + 5 * 28 + 16..nodes + 5 * 28 + 20].copy_from_slice(&2u32.to_le_bytes());
         let ambiguous = WireSource::parse(&bytes, "f(1)", &path, true).unwrap();
         assert!(ambiguous.head_address(214, call, Span::new(0, 1)).is_err());
+    }
+
+    #[test]
+    fn enum_value_rejects_a_string_child_misattached_from_another_member() {
+        let source = r#"enum E { High = "\ud800", Low = "\ud800" }"#;
+        let path = std::env::temp_dir().join("wire-enum-misattached.ts");
+        let member_start = source.find("High").unwrap();
+        let member_end = source.find(", Low").unwrap();
+        let misplaced = source.rfind("\"\\ud800\"").unwrap();
+        let mut bytes = fixture(
+            source,
+            path.to_str().unwrap(),
+            member_start as u32,
+            member_end as u32,
+        );
+        let nodes = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+        bytes[nodes + 56..nodes + 60].copy_from_slice(&306u32.to_le_bytes());
+        bytes.resize(bytes.len() + 2 * 28, 0);
+        for (index, kind, start, end) in [
+            (3, 79u32, member_start, member_start + 4),
+            (4, 10, misplaced, misplaced + "\"\\ud800\"".len()),
+        ] {
+            for (offset, value) in [(0, kind), (4, start as u32), (8, end as u32), (16, 2)] {
+                bytes[nodes + index * 28 + offset..nodes + index * 28 + offset + 4]
+                    .copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let wire = WireSource::parse(&bytes, source, &path, true).unwrap();
+        assert!(wire.enum_member_values().is_empty());
+
+        let misplaced_name = source.find("Low").unwrap() as u32;
+        let initializer = source.find("\"\\ud800\"").unwrap() as u32;
+        for (index, start, end) in [
+            (3, misplaced_name, misplaced_name + 3),
+            (4, initializer, initializer + "\"\\ud800\"".len() as u32),
+        ] {
+            bytes[nodes + index * 28 + 4..nodes + index * 28 + 8]
+                .copy_from_slice(&start.to_le_bytes());
+            bytes[nodes + index * 28 + 8..nodes + index * 28 + 12]
+                .copy_from_slice(&end.to_le_bytes());
+        }
+        let wire = WireSource::parse(&bytes, source, &path, true).unwrap();
+        assert!(wire.enum_member_values().is_empty());
     }
 
     #[test]

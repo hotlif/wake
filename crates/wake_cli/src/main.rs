@@ -2998,11 +2998,22 @@ fn cmd_parse(
             output.dependencies.len()
         );
         for dependency in &output.dependencies {
-            println!(
-                "  {:<18} {}",
-                format!("{:?}", dependency.kind),
-                interner.resolve(dependency.specifier)
-            );
+            let specifier = dependency
+                .specifier
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    let mut escaped = String::new();
+                    for scalar in char::decode_utf16(dependency.specifier.code_units()) {
+                        match scalar {
+                            Ok(scalar) => escaped.push(scalar),
+                            Err(surrogate) => escaped
+                                .push_str(&format!("\\u{:04x}", surrogate.unpaired_surrogate())),
+                        }
+                    }
+                    escaped
+                });
+            println!("  {:<18} {}", format!("{:?}", dependency.kind), specifier);
         }
         let model = output
             .module

@@ -14,7 +14,7 @@
 //! These are parser-owned source facts, not a stable plugin AST or a full JS/TS source tree.
 
 /// Stable parser implementation identity for caller-owned cache keys.
-pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v41";
+pub const PIPELINE_VERSION: &str = "wake-ecma-parser-v42";
 
 mod declaration;
 mod expr;

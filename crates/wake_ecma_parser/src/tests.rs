@@ -649,7 +649,7 @@ fn dependency_extraction() {
     let specifiers: Vec<String> = out
         .dependencies
         .iter()
-        .map(|d| interner.resolve(d.specifier))
+        .map(|d| d.specifier.as_str().unwrap().to_owned())
         .collect();
     assert!(specifiers.contains(&"mod-a".to_string()));
     assert!(specifiers.contains(&"mod-b".to_string()));
@@ -878,7 +878,7 @@ fn automatic_jsx_imports_only_the_helpers_used_by_lowered_calls() {
         assert_eq!(dependency.kind, DependencyKind::Import, "{source}");
         assert_eq!(dependency.span, Span::DUMMY, "{source}");
         assert_eq!(
-            interner.resolve(dependency.specifier),
+            dependency.specifier.as_str().unwrap(),
             if development {
                 "react/jsx-dev-runtime"
             } else {
@@ -979,13 +979,16 @@ fn automatic_jsx_production_children_key_and_spread_contract() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert_eq!(out.dependencies.len(), 1);
     assert_eq!(
-        interner.resolve(out.dependencies[0].specifier),
+        out.dependencies[0].specifier.as_str().unwrap(),
         "react/jsx-runtime"
     );
 
     out.module.with_ast(|program| {
         let import = automatic_runtime_import(program);
-        assert_eq!(interner.resolve(import.source), "react/jsx-runtime");
+        assert_eq!(
+            interner.resolve_js(import.source).as_str(),
+            Some("react/jsx-runtime")
+        );
         let jsx = automatic_runtime_alias(import, &interner, "jsx");
         let jsxs = automatic_runtime_alias(import, &interner, "jsxs");
         assert_eq!(interner.resolve(jsx), "_jsx");
@@ -1054,7 +1057,7 @@ fn automatic_jsx_development_runtime_preserves_unicode_source_location() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert_eq!(out.dependencies.len(), 1);
     assert_eq!(
-        interner.resolve(out.dependencies[0].specifier),
+        out.dependencies[0].specifier.as_str().unwrap(),
         "react/jsx-dev-runtime"
     );
 
@@ -1153,7 +1156,7 @@ fn automatic_jsx_custom_source_keeps_directives_and_dependency_in_sync() {
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     assert_eq!(out.dependencies.len(), 1);
     assert_eq!(
-        interner.resolve(out.dependencies[0].specifier),
+        out.dependencies[0].specifier.as_str().unwrap(),
         "preact/jsx-runtime"
     );
     out.module.with_ast(|program| {
@@ -1162,7 +1165,10 @@ fn automatic_jsx_custom_source_keeps_directives_and_dependency_in_sync() {
         let Statement::Import(import) = program.body[2] else {
             panic!("runtime import must follow the complete directive prologue")
         };
-        assert_eq!(interner.resolve(import.source), "preact/jsx-runtime");
+        assert_eq!(
+            interner.resolve_js(import.source).as_str(),
+            Some("preact/jsx-runtime")
+        );
     });
 }
 
@@ -1538,7 +1544,7 @@ fn typescript_7_compatibility_matrix_parses_without_false_dependencies() {
             output
                 .dependencies
                 .iter()
-                .map(|dependency| interner.resolve(dependency.specifier))
+                .map(|dependency| dependency.specifier.as_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
         );
     }
@@ -1580,7 +1586,7 @@ fn ts_import_equals_and_export_assign() {
         .dependencies
         .iter()
         .filter(|d| d.kind == DependencyKind::Require)
-        .map(|d| interner.resolve(d.specifier))
+        .map(|d| d.specifier.as_str().unwrap().to_owned())
         .collect();
     assert_eq!(requires, vec!["fs".to_string(), "pub".to_string()]);
 
@@ -1616,7 +1622,7 @@ fn ts_type_only_import_equals_erased() {
         "类型-only 声明不应产生运行时依赖：{:?}",
         out.dependencies
             .iter()
-            .map(|d| interner.resolve(d.specifier))
+            .map(|d| d.specifier.as_str().unwrap().to_owned())
             .collect::<Vec<_>>()
     );
 }
