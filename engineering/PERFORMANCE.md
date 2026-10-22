@@ -1,8 +1,13 @@
 # Wake 性能测量
 
-本文件记录可复现方法和现有测量面，不给出脱离机器、提交和工具链的目标数字。CI 对增量路径执行确定性的 work-count 门禁并编译 benchmark；尚未启用“回归超过固定百分比即失败”的历史耗时基线。
+本文件记录可复现方法和现有测量面，不给出脱离机器、提交和工具链的目标数字。主 CI 对增量路径执行确定性的 work-count 门禁并编译 benchmark；独立 Performance 工作流还对 PR 的关键 Criterion benchmark 执行同一 runner 上的 base/head 对比与条件性百分比门禁。跨运行的固定机器历史耗时基线尚未建立。
 
-# 1. 测量纪律
+测量入口：[环境记录](#1-测量纪律) · [Criterion](#2-criterion-基准) · [压力样例](#3-2k-modules-压力样例) ·
+[压缩器](#4-压缩器体积与工作量门禁) · [冷热口径](#6-冷-热与增量口径) · [性能对比与历史基线](#7-性能对比与历史基线)。
+第 8–13 节包含特定提交和环境下的优化记录；其中的耗时、工具版本和“尚未实现”描述均属于记录时点，
+不能直接作为当前能力或性能承诺。后续工作见 [ROADMAP.md](ROADMAP.md)，持续门禁见 [TESTING.md](TESTING.md#5-benchmark-门禁)。
+
+## 1. 测量纪律
 
 每份结果至少记录：
 
@@ -21,7 +26,7 @@ sample size / warmup:
 
 同一比较必须使用相同源码、依赖锁、工具链、fixture 和电源状态。不要把 Windows Debug 构建与 Linux Release 构建直接比较。
 
-# 2. Criterion 基准
+## 2. Criterion 基准
 
 工作区包含以下 benchmark：
 
@@ -62,7 +67,7 @@ cargo bench -p wake_bundler --bench bundle
 
 优化前后至少各运行两轮；首轮用于发现频率爬升、杀毒扫描或缓存预热造成的异常。Criterion 的统计目录是生成物，不提交仓库。
 
-# 3. 2k modules 压力样例
+## 3. 2k modules 压力样例
 
 `fixtures/2k-modules` 生成确定性的 Northstar 商务控制台项目。约 2000 个模块通过领域模型、规则、
 指标、组件、本地化和页面聚合形成自然可达的静态依赖图，用于观察完整磁盘 I/O、解析、链接、
@@ -93,7 +98,7 @@ PowerShell WorkingSet 采样，Linux 使用 `/usr/bin/time -v`，macOS 使用 `/
 Northstar 替换了旧的全量 side-effect 注册语料，其依赖图、运行时 oracle、源码规模与可压缩性均已变化；
 ADR 0023/0024 中记录的旧 `modules=2013` 数字只保留为历史证据，不能与 Northstar 结果作前后性能或体积比较。
 
-# 4. 压缩器体积与工作量门禁
+## 4. 压缩器体积与工作量门禁
 
 Closure 风格管线只使用 Wake 完全自有的源码语料和冻结旧数字，不复制或下载 Closure Compiler 或
 其他第三方压缩器的源码、测试、二进制和语料，也不增加 Cargo/Yarn 依赖。自动门禁由两层组成：
@@ -121,7 +126,7 @@ literal/operator token cost；封闭函数与 primitive specialization 计入声
 引用和改名交互反例。任何体积收益必须与语义、Source Map 和冷/热缓存证据一起报告；跨线程确定性结论
 必须来自实际 worker 矩阵，不能从稳定 ID 或 fingerprint 的存在推断。
 
-# 5. 启动与 npm 开销
+## 5. 启动与 npm 开销
 
 Node 包启动 smoke：
 
@@ -132,7 +137,7 @@ node scripts/check-startup.mjs
 
 该脚本用于发现加载器、平台包选择和 CLI 启动的大幅退化，不是稳定的毫秒级 SLA。安装验证使用 `npm run npm:pack:check` 和发布后的干净 registry smoke，关注是否触发源码编译或 postinstall。
 
-# 6. 冷、热与增量口径
+## 6. 冷、热与增量口径
 
 - 冷构建：新进程、无内存会话；是否保留 `.wake/cache.bin` 必须说明。
 - 持久化缓存构建：新进程但保留 cache，验证跳过 source read/parse/optimize/codegen 的程度。
@@ -154,7 +159,7 @@ Source Map 序列化也必须批量计算源坐标：按每个源文件的所需
 行列位置，避免为压成一行的依赖反复从行首扫描。该优化保持原有 CRLF、Unicode、越界夹取与映射
 JSON 字节语义；不通过关闭 Source Map 缩短开发构建。
 
-# 7. 建立回归门禁的前置条件
+## 7. 性能对比与历史基线
 
 Docs 开发候选的工作量门禁见 `wake_bundler/tests/performance_invariants.rs` 与
 `wake_app` 的 `docs_dev_candidates_reuse_compilation_and_retry_all_uncommitted_sources`。
@@ -169,17 +174,38 @@ Rescan 仍须重读真实输入；不能以生成文件差异为空替代权威�
 测量公开服务 API 的启动边界；追加项目内 MDX 路径可测量一次临时正文编辑。该入口恢复原始字节，
 若发现并发编辑则拒绝覆盖，完成后关闭服务。反馈时间含最多约 10 ms 的事件轮询误差，不表示浏览器绘制。
 
-接入自动阈值前需要：
+独立 [Performance 工作流](../.github/workflows/performance.yml) 在 PR 上运行关键 benchmark：
+同一作业先测目标分支提交，再测 PR 提交；基准源码和 Cargo bench profile 一致时，
+均值回退超过 5% 会提醒，达到 15% 且保守置信区间下界也超过 5% 的候选会复测。
+两次都满足该条件才阻断 PR。相同的 Bundler 探针源码另分别针对 base/head crate 编译并执行：
+固定的 2k 模块图比较完整 chunk/资源产物与成功诊断，缺失依赖样例比较失败产物和诊断的级别、
+错误码、路径、消息、标注与尾注。原始探针 JSON 与逐场景等价结果随性能 artifact 保存。
+任一探针不等价、缺失或无法在旧 API 上编译时，关键 PR 比较失败关闭并明确报告原因；
+不能将该次耗时差异解释为等价实现的回归或收益。基准源码或 profile 改变时只报告耗时，
+不按旧负载阻断；非 PR 的完整 benchmark 运行也只报告耗时。关键 benchmark 的 base/head 测量缺失或无效会阻断 PR，
+避免把未完成的比较视为通过。工作流固定使用 `ubuntu-24.04` OS 镜像标签；这是软件环境约束，
+不是固定物理机器。原始 Criterion 输出、机器信息和摘要随工作流 artifact 保存 90 天，必要时可下载并
+人工复跑。此门禁衡量的是**本次 base/head 相对变化**，不是跨运行的长期历史基线。
+主 CI 的 work-count、benchmark 编译及正确性测试仍独立执行，性能复测不能抵消正确性失败。
 
-1. 选择固定 runner 或可校准的专用机器；
-2. 连续保存足够历史样本；
-3. 为高噪声与低噪声 benchmark 分别设置阈值；
-4. 允许人工复跑并保存原始 Criterion 输出；
-5. 将性能红灯与正确性门禁分开，避免重试掩盖功能失败。
+完整趋势运行的跨运行记录以 `performance-full-<run id>` 原始 artifact 为审计来源；另外保存仅含
+`report.json` 的轻量快照，供后续 `canary` 运行汇总。历史汇总只取先前成功的完整运行，按相同的
+OS/镜像、CPU 型号和核心数、内存、Node/Rust 工具链分组，并要求 benchmark 源文件、bench profile
+及 `Cargo.lock` 合成的 SHA-256 一致。每个 benchmark 列出当前均值、最多 12 份历史快照的中位数、相对变化与中位绝对偏差；
+缺少身份、定义摘要或历史样本时显式报告，不能把它们当作零回退。该汇总始终只报告，不阻断 CI：
+托管 runner 的环境字段不能证明是同一物理机器，也没有经历史方差校准的逐 benchmark 阈值。
+历史快照和原始 Criterion 数据一样最多保留 90 天；过期后不得从汇总数字反推原始样本。
 
-在这些条件满足前，CI 保持 work-count + `--no-run` 门禁，性能 PR 在说明中附可复现耗时结果。
+建立长期历史基线仍需要：
 
-# 8. 2026-08-31 Northstar one-shot 优化记录
+1. 固定或校准 CPU、工具链、电源与后台负载策略；固定操作系统镜像并不等于固定物理机器；
+2. 连续保存足够历史原始样本，使跨运行比较有可审计的来源；
+3. 根据历史方差分别校准高噪声与低噪声 benchmark 的阈值；
+4. 让性能报告与输出、诊断等价证据对应，确保减少工作量并未改变行为。
+
+在这些条件满足前，不把当前 5%/15% 单次对比阈值解释为长期性能承诺。
+
+## 8. 2026-08-31 Northstar one-shot 优化记录
 
 本次测量基于提交 `e896cff` 加当前 one-shot/scan/emit/allocator 工作树切片；环境为
 Windows NT 10.0.26200 x64、Intel i9-10900K（20 logical cores）、16 GiB RAM、
@@ -212,7 +238,7 @@ Wake `258ms (250–263)` / `235.0MB`，Vite `431ms (420–449)`。两轮均先 w
 保留 one-shot `task_exec_count()` 可观察语义并隔离并行析构 panic 后，最终 release 复测为
 Wake `257ms (248–269)` / `235.5MB`，Vite `436ms (426–442)` / `209.0MB`，产物字节仍完全不变。
 
-# 9. 2026-09-03 React compiler 抽离后基线
+## 9. 2026-09-03 React compiler 抽离后基线
 
 该记录用于给 `wake_compiler_core`/`wake_compiler` 抽离及 React helper import 裁剪建立后续可比较的
 Criterion 基线，不是迁移前后 A/B 结论：开始本切片时工作树已包含大量未提交的 parser、optimizer 和
@@ -247,7 +273,7 @@ React helper import 裁剪另有可重复的输出体积证据：简单 producti
 153 B 降至 115 B（-38 B），development fixture 从 238 B 降至 215 B（-23 B）。差异只来自删除未使用的
 runtime helper import；production/development golden 和运行时行为测试共同锁定其余代码语义。
 
-# 10. 2026-09-08 Docs 候选与 Source Map 优化
+## 10. 2026-09-08 Docs 候选与 Source Map 优化
 
 基于 `c69a16a4f0c0fe714ccc592a02d0f38626b92e76` 的优化工作树，使用 release 公开服务 API 测量
 Crab 文档站：3705 模块、620 分块，保留页面内 Demo、React Compiler、Crab CSS 和 Source Map。
@@ -268,7 +294,7 @@ UTF-16 换算对长单行依赖反复扫描行首，是这部分的算法性重�
 同版本 A/B；计时开启/关闭的样本分列，文件系统缓存未清空，后台负载未完全控制，不能外推 P95。
 启动复查仍存在且仍重读权威输入；本次没有实现按访问路由编译或测量浏览器绘制时间。
 
-# 11. 大模块控制流分析的工作量约束
+## 11. 大模块控制流分析的工作量约束
 
 开发构建仍需维护变量初始化与 TDZ（暂时性死区）事实。优化这些内部分析时，应保持每个读取的
 `None`/未初始化/已初始化结果、异常和循环边以及函数间保守性不变，不通过关闭分析换取速度。
@@ -279,7 +305,7 @@ UTF-16 换算对长单行依赖反复扫描行首，是这部分的算法性重�
 `wake_ecma_minify::typed_analysis` 的测试以全模块状态求解器为对照，检查分支、循环、异常、捕获和
 不连通控制流的逐读取结果；合成多函数图另检查状态容量随局部工作量增长，不设不稳定的耗时断言。
 
-## 2026-09-08 启动 22.3 秒的继续排查
+### 2026-09-08 启动 22.3 秒的继续排查
 
 同一 Crab 工作负载的临时任务探针定位到 `elkjs/lib/elk.bundled.js` 与 `elk-worker.min.js`：
 单模块优化分别约 16.57 s 和 14.27 s，二者并行，不应将耗时相加。前者经
@@ -309,7 +335,7 @@ UTF-16 换算对长单行依赖反复扫描行首，是这部分的算法性重�
 `require('./elk-worker.min.js')` 也被当前语法依赖收集纳入候选；提前排除局部绑定的 `require`
 需要专项验证依赖、缓存摘要与诊断语义。本阶段尚未改变，后续已在第 12 节实现与验证。
 
-# 12. 局部加载器不产生外部 CommonJS 依赖
+## 12. 局部加载器不产生外部 CommonJS 依赖
 
 Bundler 将 parser 的语法依赖候选转成文件依赖时，应排除有明确局部绑定的 `require` 调用，包括
 函数参数、局部声明和预打包模块的内置加载器。它们的调用代码与运行时语义保持不变；真正未绑定的
@@ -324,7 +350,7 @@ tree-shaking 开关、局部与真实调用混合、增量绑定变化、持久�
 逃逸与 CFG 读取查询只消费同一函数边界的名称事实；在已建立节点作用域之后，可在不同函数边界处
 停止下降。函数名、参数默认值、类的计算属性及初始化表达式仍按原作用域事实决定，不靠源码形状猜测。
 
-## 2026-09-08 继续排查 13 秒启动
+### 2026-09-08 继续排查 13 秒启动
 
 局部 `require` 回归在修改前稳定报 `WAKE0301`（不存在的内置加载器目标被送入 resolver），修改后
 正确保留局部调用而不加载目标文件。真实 Crab 工作负载从 3705 模块降至 3702，仍为 620 分块；
@@ -352,7 +378,7 @@ tree-shaking 开关、局部与真实调用混合、增量绑定变化、持久�
 两次最终测量沿用前述环境与公开服务 API 边界，持久缓存关闭，没有修改 Crab 源文件；页面内 Demo、
 CSS、Source Map 和启动复查仍开启。没有清空文件系统缓存、测量浏览器绘制或建立 P95 分布。
 
-# 13. Docs 开发按访问编译依赖（2026-09-09）
+## 13. Docs 开发按访问编译依赖（2026-09-09）
 
 用户选择首页优先，允许页面依赖错误在访问时报告。独立 Site 开发服务器现在先编译外壳、导航与
 元数据；页面及演示的 JS/TS 依赖由首次请求触发。MDX 解析和内容契约仍在启动执行，生产构建仍检查

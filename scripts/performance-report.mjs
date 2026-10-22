@@ -76,11 +76,19 @@ export function evaluateReport(report) {
     failurePercent: report.failureThresholdPercent ?? 15,
   }
   const benchmarks = report.benchmarks.map((benchmark) => evaluateBenchmark(benchmark, thresholds))
+  const blockingDataError = report.enforce === true && benchmarks.some((benchmark) =>
+    benchmark.gate === true && ['new', 'missing', 'invalid'].includes(benchmark.status))
+  const blockingEquivalenceError = report.requireOutputEquivalence === true
+    && report.outputEquivalence?.status !== 'equivalent'
   return {
     ...report,
     ...thresholds,
     benchmarks,
-    failed: report.enforce === true && benchmarks.some(({ status }) => status === 'failure'),
+    blockingDataError,
+    blockingEquivalenceError,
+    failed: blockingEquivalenceError || (report.enforce === true && (
+      blockingDataError || benchmarks.some(({ status }) => status === 'failure')
+    )),
   }
 }
 
@@ -111,7 +119,7 @@ export function renderMarkdown(report) {
     '',
     `Mode: **${report.mode}** · Base: \`${report.baseSha.slice(0, 12)}\` · Head: \`${report.headSha.slice(0, 12)}\``,
     '',
-    `Thresholds: warning above ${report.warningPercent}% · confirmed failure above ${report.failurePercent}%`,
+    `Thresholds: warning above ${report.warningPercent}% · confirmed failure at or above ${report.failurePercent}%`,
     '',
   ]
   if (report.baselineCompatibility?.compatible === false) {
@@ -119,6 +127,19 @@ export function renderMarkdown(report) {
       `Baseline compatibility: **incompatible** (${report.baselineCompatibility.reasons.join('; ')}). Results are report-only.`,
       '',
     )
+  }
+  if (report.outputEquivalence) {
+    lines.push(
+      `Output and diagnostic equivalence: **${report.outputEquivalence.status}**${report.outputEquivalence.reason ? ` (${report.outputEquivalence.reason.replaceAll('|', '\\|').replaceAll(/[\r\n]/g, ' ')})` : ''}.`,
+      '',
+    )
+    if (report.outputEquivalence.cases?.length) {
+      lines.push('| Probe | Output | Diagnostics |', '| --- | --- | --- |')
+      for (const item of report.outputEquivalence.cases) {
+        lines.push(`| \`${item.id.replaceAll('|', '\\|')}\` | ${item.outputEqual ? 'same' : 'different'} | ${item.diagnosticsEqual ? 'same' : 'different'} |`)
+      }
+      lines.push('')
+    }
   }
   lines.push(
     '| Benchmark | Base | Head | Change (95% conservative range) | Result |',
@@ -135,9 +156,13 @@ export function renderMarkdown(report) {
       : ''
     lines.push(`| \`${benchmark.id}\` | ${formatDuration(benchmark.base.point)} | ${formatDuration(benchmark.head.point)} | ${range}${retest} | ${STATUS[benchmark.status]} |`)
   }
-  lines.push('', report.failed
-    ? 'Confirmed performance regression: this pull request is blocked.'
-    : 'No confirmed blocking performance regression.')
+  lines.push('', report.blockingEquivalenceError
+    ? 'Output and diagnostic equivalence is missing or different: this pull request is blocked.'
+    : report.blockingDataError
+      ? 'Required benchmark data is missing or invalid: this pull request is blocked.'
+    : report.failed
+      ? 'Confirmed performance regression: this pull request is blocked.'
+      : 'No confirmed blocking performance regression.')
   return `${lines.join('\n')}\n`
 }
 

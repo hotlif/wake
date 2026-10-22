@@ -36,7 +36,7 @@
     "pnp:conformance:check": "node scripts/check-pnp-conformance.mjs",
     "yarn:lock:check": "node scripts/check-yarn-lock.mjs",
     "pnp:components:check": "node scripts/check-components-pnp.mjs",
-    "performance:report:test": "node --test scripts/performance-report.test.mjs",
+    "performance:report:test": "node --test scripts/performance-report.test.mjs scripts/performance-history.test.mjs",
     "performance:lint": "node scripts/run-performance.mjs --mode key",
     "lint:migration:report": "node scripts/lint-migration-report.mjs",
     "lint:migration:test": "node --test scripts/lint-migration-report.test.mjs",

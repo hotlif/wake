@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: performance-${{ github.event.pull_request.number || github.ref }}
@@ -22,7 +23,7 @@ env:
 jobs:
   benchmark:
     name: ${{ github.event_name == 'pull_request' && 'key performance gate' || 'full performance trend' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,8 +60,8 @@ jobs:
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
-      - name: Test performance report policy
-        run: node --test scripts/performance-report.test.mjs
+      - name: Test performance report and history policy
+        run: node --test scripts/performance-report.test.mjs scripts/performance-history.test.mjs
       - name: Compare Criterion benchmarks
         id: performance
         run: >-
@@ -69,14 +70,34 @@ jobs:
           --base "${{ steps.comparison.outputs.base_sha }}"
           --head "${{ steps.comparison.outputs.head_sha }}"
           --output .wake-performance
+      - name: Summarize canary performance history
+        id: history
+        if: github.ref == 'refs/heads/canary' && steps.comparison.outputs.mode == 'full' && steps.performance.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/performance-history.mjs
+          --current .wake-performance/report.json
+          --output .wake-performance/history.json
+          --markdown .wake-performance/history.md
+          --repository "${{ github.repository }}"
       - name: Publish performance job summary
         if: always()
         shell: bash
+        env:
+          PERFORMANCE_MODE: ${{ steps.comparison.outputs.mode }}
+          HISTORY_OUTCOME: ${{ steps.history.outcome }}
         run: |
           if [[ -f .wake-performance/summary.md ]]; then
             node -e "require('node:fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, require('node:fs').readFileSync('.wake-performance/summary.md'))"
           else
             echo "Performance run did not produce a summary." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f .wake-performance/history.md ]]; then
+            node -e "require('node:fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, '\n' + require('node:fs').readFileSync('.wake-performance/history.md'))"
+          elif [[ "$PERFORMANCE_MODE" == "full" && "$HISTORY_OUTCOME" == "failure" ]]; then
+            echo "Historical trend collection failed; inspect the collector step. Criterion comparison remains separate." >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Upload Criterion report and raw data
         if: always()
@@ -85,5 +106,13 @@ jobs:
           name: performance-${{ steps.comparison.outputs.mode }}-${{ github.run_id }}
           path: .wake-performance
           include-hidden-files: true
-          retention-days: 30
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload full-run history snapshot
+        if: github.ref == 'refs/heads/canary' && steps.comparison.outputs.mode == 'full' && steps.performance.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-snapshot-full-${{ github.run_id }}
+          path: .wake-performance/report.json
+          retention-days: 90
           if-no-files-found: error

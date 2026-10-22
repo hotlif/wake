@@ -1,7 +1,7 @@
 name: CI
 
-# 工程基线：每 PR 跑 fmt + clippy(-D warnings) + test + miri；bench 先做编译冒烟，
-# 回归门禁（超 5% 红灯）待有基线历史后接入 critcmp。
+# 工程基线：每 PR 跑 fmt + clippy(-D warnings) + test + miri；主 CI 保留性能编译和 work-count 冒烟。
+# 独立 performance 工作流对 PR 的 5% 差异给出提醒，并对兼容基准中达到 15% 且置信区间确认的回退复测后阻断。
 
 on:
   push:
