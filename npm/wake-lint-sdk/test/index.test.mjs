@@ -7,6 +7,7 @@ import {
   defineRule,
   runRule,
   assertCompatible,
+  loadPlugin,
 } from '../index.mjs'
 
 test('extension rules receive frozen UTF-8 source facts and stable diagnostics', async () => {
@@ -66,4 +67,37 @@ test('plugin loading validates names and upgrade compatibility', () => {
   assert.equal(plugin.protocol, PROTOCOL_VERSION)
   assert.doesNotThrow(() => assertCompatible(plugin, { sdkMajor: 1 }))
   assert.throws(() => assertCompatible(plugin, { sdkMajor: 2 }), /SDK major/)
+})
+
+function pluginSpecifier(extraFields) {
+  const source = `export default {
+    name: '@demo/wake-lint-plugin',
+    version: '1.2.0',
+    rules: [{
+      id: 'demo/example',
+      meta: { description: 'example', category: 'layout', fixable: false },
+      create() {},
+    }],
+    ...${JSON.stringify(extraFields)},
+  }`
+  return `data:text/javascript,${encodeURIComponent(source)}`
+}
+
+test('loadPlugin rejects incompatible declared protocol and SDK major before normalization', async () => {
+  await assert.rejects(loadPlugin(pluginSpecifier({ protocol: 'wake.lint.extension.v2' })), /protocol version is incompatible/)
+  await assert.rejects(loadPlugin(pluginSpecifier({ sdkMajor: 2 })), /SDK major 2 is incompatible/)
+  const compatible = await loadPlugin(pluginSpecifier({ protocol: PROTOCOL_VERSION, sdkMajor: 1 }))
+  assert.equal(compatible.rules[0].id, 'demo/example')
+})
+
+test('v1 plugin manifest rejects unknown plugin, rule, and metadata fields', () => {
+  const rule = {
+    id: 'demo/example',
+    meta: { description: 'example', category: 'layout', fixable: false },
+    create() {},
+  }
+  const plugin = { name: '@demo/wake-lint-plugin', version: '1.2.0', rules: [rule] }
+  assert.throws(() => definePlugin({ ...plugin, execute: true }), /unknown plugin field: execute/)
+  assert.throws(() => definePlugin({ ...plugin, rules: [{ ...rule, execute: true }] }), /unknown rule field: execute/)
+  assert.throws(() => definePlugin({ ...plugin, rules: [{ ...rule, meta: { ...rule.meta, execute: true } }] }), /unknown rule meta field: execute/)
 })

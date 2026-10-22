@@ -45,6 +45,41 @@ const packageVersion = JSON.parse(
 ).version
 const contexts = []
 
+test('native lint extensions need per-call authorization and load import-only packages', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wake-native-lint-extension-'))
+  const packageRoot = join(root, 'node_modules', '@demo', 'wake-lint-plugin')
+  const marker = join(packageRoot, 'loaded')
+  try {
+    await mkdir(packageRoot, { recursive: true })
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'extension-project', private: true, dependencies: { '@demo/wake-lint-plugin': '1.0.0' } }))
+    await writeFile(join(root, 'wake.config.toml'), "[lint]\nrecommended=false\nextensions=['@demo/wake-lint-plugin']\n[lint.rules]\n'demo/no-debugger'='error'\n")
+    await writeFile(join(root, 'a.js'), '// 🙂\ndebugger;')
+    await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: '@demo/wake-lint-plugin', version: '1.0.0', type: 'module', exports: { import: './index.mjs' }, wakeLint: { manifest: './wake-lint.manifest.json', module: './index.mjs' } }))
+    await writeFile(join(packageRoot, 'wake-lint.manifest.json'), JSON.stringify({ schema: 'wake.lint.package.v1', name: '@demo/wake-lint-plugin', version: '1.0.0', protocol: 'wake.lint.extension.v1', sdkMajor: 1, rules: [{ id: 'demo/no-debugger', meta: { description: 'find debugger', category: 'problem', fixable: false }, messageIds: ['found'], optionsSchema: { type: 'object', additionalProperties: false, properties: {} } }] }))
+    await writeFile(join(packageRoot, 'index.mjs'), `import { writeFileSync } from 'node:fs'
+writeFileSync(new URL('./loaded', import.meta.url), 'loaded')
+export default { protocol: 'wake.lint.extension.v1', sdkMajor: 1, name: '@demo/wake-lint-plugin', version: '1.0.0', rules: [{
+  protocol: 'wake.lint.extension.v1', id: 'demo/no-debugger', meta: { description: 'find debugger', category: 'problem', fixable: false },
+  create(context) { const i = context.source.indexOf('debugger'); if (i >= 0) { const start = Buffer.byteLength(context.source.slice(0, i)); context.report({ message: 'debugger is not allowed', messageId: 'found', start, end: start + 8 }) } },
+}] }
+`)
+
+    await assert.rejects(esmApi.lint({ root, paths: ['a.js'] }), { code: 'WAKE_LINT_CONFIG' })
+    await assert.rejects(access(marker))
+    const explained = await esmApi.lint({ root, printConfig: 'a.js', allowExtensions: true })
+    assert.equal(explained.config.rules['demo/no-debugger'].level, 'error')
+    await assert.rejects(access(marker))
+    const checked = await commonjs.lint({ root, paths: ['a.js'], allowExtensions: true, cache: true })
+    assert.equal(checked.errorCount, 1)
+    assert.equal(checked.files[0].diagnostics[0].code, 'demo/no-debugger')
+    assert.equal(checked.files[0].diagnostics[0].start, Buffer.byteLength('// 🙂\n'))
+    assert.equal(checked.cache.bypassed, 1)
+    await access(marker)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('native lint module graphs share catalog source overlays cache bypass and failures', async () => {
   const root = await mkdtemp(join(tmpdir(), 'wake-native-lint-modules-'))
   let context

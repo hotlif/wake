@@ -137,6 +137,9 @@ void [
 ]
 
 async function api() {
+  await lint({ root: '.', paths: ['src'], allowExtensions: true })
+  // @ts-expect-error Extension execution requires an explicit boolean authorization.
+  await lint({ allowExtensions: 'yes' })
   const cachedResult = await lint({ cache: true })
   const cacheHits: number | undefined = cachedResult.cache?.hits
   const cacheWarning: string | undefined = cachedResult.cache?.warnings[0]

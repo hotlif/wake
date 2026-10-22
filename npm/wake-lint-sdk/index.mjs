@@ -34,8 +34,24 @@ function requireText(value, label, maxLength) {
   return value
 }
 
+function rejectUnknownFields(value, allowed, label) {
+  for (const field of Object.keys(value)) {
+    if (!allowed.includes(field)) throw extensionError(`unknown ${label} field: ${field}`)
+  }
+}
+
+function validateDeclaredVersion(value) {
+  if (Object.hasOwn(value, 'protocol') && value.protocol !== PROTOCOL_VERSION) {
+    throw extensionError('extension protocol version is incompatible')
+  }
+  if (Object.hasOwn(value, 'sdkMajor') && value.sdkMajor !== SDK_MAJOR) {
+    throw extensionError(`extension SDK major ${value.sdkMajor} is incompatible with SDK major ${SDK_MAJOR}`)
+  }
+}
+
 function validateMeta(meta) {
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) throw extensionError('rule meta must be an object')
+  rejectUnknownFields(meta, ['description', 'category', 'fixable'], 'rule meta')
   const description = requireString(meta.description, 'rule meta.description')
   if (!CATEGORIES.has(meta.category)) throw extensionError('rule meta.category is invalid')
   if (typeof meta.fixable !== 'boolean') throw extensionError('rule meta.fixable must be boolean')
@@ -43,7 +59,9 @@ function validateMeta(meta) {
 }
 
 export function defineRule(definition) {
-  if (!definition || typeof definition !== 'object') throw extensionError('rule definition must be an object')
+  if (!definition || typeof definition !== 'object' || Array.isArray(definition)) throw extensionError('rule definition must be an object')
+  rejectUnknownFields(definition, ['protocol', 'id', 'meta', 'create'], 'rule')
+  validateDeclaredVersion(definition)
   if (!RULE_ID.test(definition.id)) throw extensionError(`invalid rule id: ${definition.id}`)
   const meta = validateMeta(definition.meta)
   if (typeof definition.create !== 'function') throw extensionError(`${definition.id} create must be a function`)
@@ -56,7 +74,9 @@ export function defineRule(definition) {
 }
 
 export function definePlugin(definition) {
-  if (!definition || typeof definition !== 'object') throw extensionError('plugin definition must be an object')
+  if (!definition || typeof definition !== 'object' || Array.isArray(definition)) throw extensionError('plugin definition must be an object')
+  rejectUnknownFields(definition, ['protocol', 'sdkMajor', 'name', 'version', 'rules'], 'plugin')
+  validateDeclaredVersion(definition)
   if (!PLUGIN_NAME.test(definition.name)) throw extensionError(`invalid plugin name: ${definition.name}`)
   if (!VERSION.test(definition.version)) throw extensionError(`invalid plugin version: ${definition.version}`)
   if (!Array.isArray(definition.rules) || definition.rules.length === 0) throw extensionError('plugin rules must be a non-empty array')

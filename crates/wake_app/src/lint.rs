@@ -18,6 +18,7 @@ mod baseline;
 mod cache;
 mod context;
 mod execution;
+mod extensions;
 mod module_snapshot;
 mod modules;
 #[cfg(test)]
@@ -48,6 +49,8 @@ pub struct LintProjectOptions {
     pub print_config: Option<String>,
     /// Inspect native rules without reading the filesystem or project configuration.
     pub list_rules: bool,
+    /// Allow explicitly configured third-party packages to execute for one-shot checks.
+    pub allow_extensions: bool,
     pub cache: bool,
     pub baseline: Option<LintBaselineOptions>,
     /// Closed rule settings, validated by the native registry; applied after project overrides.
@@ -68,6 +71,7 @@ impl Default for LintProjectOptions {
             fix: LintFixMode::Off,
             print_config: None,
             list_rules: false,
+            allow_extensions: false,
             cache: false,
             baseline: None,
             rules: BTreeMap::new(),
@@ -271,6 +275,26 @@ struct ConfiguredLint {
     request: BTreeMap<String, wake_lint_core::RuleSetting>,
     request_globals: BTreeMap<String, wake_lint_core::GlobalMode>,
     request_environments: Vec<String>,
+    extensions: Option<Arc<extensions::Catalog>>,
+    extension_base: BTreeMap<String, LintRuleSetting>,
+    extension_overrides: Vec<(Vec<Regex>, BTreeMap<String, LintRuleSetting>)>,
+    extension_request: BTreeMap<String, LintRuleSetting>,
+}
+
+fn extract_extension_settings(
+    rules: &mut BTreeMap<String, LintRuleSetting>,
+    catalog: Option<&extensions::Catalog>,
+) -> Result<BTreeMap<String, LintRuleSetting>, WakeError> {
+    let mut extension = BTreeMap::new();
+    if let Some(catalog) = catalog {
+        for id in catalog.all_rules() {
+            if let Some(setting) = rules.remove(id) {
+                catalog.validate_setting(id, &setting)?;
+                extension.insert(id.clone(), setting);
+            }
+        }
+    }
+    Ok(extension)
 }
 
 fn global_options(
@@ -301,9 +325,12 @@ impl ConfiguredLint {
         request: BTreeMap<String, serde_json::Value>,
         globals: BTreeMap<String, serde_json::Value>,
         environments: Vec<String>,
+        extensions: Option<Arc<extensions::Catalog>>,
     ) -> Result<Self, WakeError> {
         let types = config.types.map(type_service::validate).transpose()?;
-        let mut base = rule_options(config.recommended, &config.rules);
+        let mut base_rules = config.rules;
+        let extension_base = extract_extension_settings(&mut base_rules, extensions.as_deref())?;
+        let mut base = rule_options(config.recommended, &base_rules);
         base.globals = global_options(config.globals)?;
         base.environments = environment_options(config.environments)?;
         base.presets = config.presets;
@@ -336,32 +363,55 @@ impl ConfiguredLint {
             })
             .collect::<Result<Vec<_>, WakeError>>()?;
         let mut overrides = Vec::new();
+        let mut extension_overrides = Vec::new();
         for entry in config.overrides {
             if entry.files.is_empty() {
                 return Err(failure("lint override requires at least one files pattern"));
             }
-            let mut options = rule_options(config.recommended, &entry.rules);
+            let mut rules = entry.rules;
+            let extension_rules = extract_extension_settings(&mut rules, extensions.as_deref())?;
+            let mut options = rule_options(config.recommended, &rules);
             options.globals = global_options(entry.globals)?;
             options.environments = environment_options(entry.environments)?;
             wake_lint_core::effective_rules(&options)
                 .map_err(|error| failure(error.to_string()))?;
-            let patterns = entry
+            let patterns: Vec<Regex> = entry
                 .files
                 .iter()
                 .map(|pattern| glob(pattern))
                 .collect::<Result<_, _>>()?;
+            extension_overrides.push((patterns.clone(), extension_rules));
             overrides.push((patterns, options));
         }
+        let mut extension_request = BTreeMap::new();
         let request = request
             .into_iter()
             .map(|(id, value)| {
+                if extensions
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.has_rule(&id))
+                {
+                    let setting =
+                        serde_json::from_value::<LintRuleSetting>(value).map_err(|error| {
+                            failure(format!("Invalid lint setting for {id}: {error}"))
+                        })?;
+                    extensions
+                        .as_ref()
+                        .expect("matched extension rule has a catalog")
+                        .validate_setting(&id, &setting)?;
+                    extension_request.insert(id, setting);
+                    return Ok(None);
+                }
                 let setting = serde_json::from_value::<wake_lint_core::RuleSetting>(value)
                     .map_err(|error| failure(format!("Invalid lint setting for {id}: {error}")))?;
                 wake_lint_core::resolve_setting(&id, &setting)
                     .map_err(|error| failure(error.to_string()))?;
-                Ok((id, setting))
+                Ok(Some((id, setting)))
             })
-            .collect::<Result<_, WakeError>>()?;
+            .collect::<Result<Vec<_>, WakeError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(Self {
             types,
             files,
@@ -372,6 +422,10 @@ impl ConfiguredLint {
             request,
             request_globals: global_options(globals)?,
             request_environments: environment_options(environments)?,
+            extensions,
+            extension_base,
+            extension_overrides,
+            extension_request,
         })
     }
 
@@ -404,6 +458,66 @@ impl ConfiguredLint {
         options.environments.sort();
         options.environments.dedup();
         options
+    }
+
+    fn extension_settings(&self, path: &str) -> BTreeMap<String, LintRuleSetting> {
+        let mut settings = self.extension_base.clone();
+        for (patterns, rules) in &self.extension_overrides {
+            if patterns.iter().any(|pattern| pattern.is_match(path)) {
+                settings.extend(rules.clone());
+            }
+        }
+        settings.extend(self.extension_request.clone());
+        settings
+    }
+
+    fn has_active_extensions(&self, path: &str) -> bool {
+        self.extension_settings(path)
+            .values()
+            .any(|setting| !matches!(setting.level(), LintRuleLevel::Off))
+    }
+
+    fn verify_extension_identity(&self, cancellation: &CancellationToken) -> Result<(), WakeError> {
+        if let Some(catalog) = &self.extensions {
+            catalog.verify_identity(cancellation)?;
+        }
+        Ok(())
+    }
+
+    fn run_extensions(
+        &self,
+        path: &str,
+        source: &str,
+        result: &mut LintFileResult,
+        cancellation: &CancellationToken,
+    ) -> Result<(), WakeError> {
+        let Some(catalog) = &self.extensions else {
+            return Ok(());
+        };
+        let settings = self.extension_settings(path);
+        if settings
+            .values()
+            .all(|setting| matches!(setting.level(), LintRuleLevel::Off))
+        {
+            return Ok(());
+        }
+        let language = match source_type(path)? {
+            SourceType::Module | SourceType::Script => "js",
+            SourceType::Jsx => "jsx",
+            SourceType::TypeScript => "ts",
+            SourceType::Tsx => "tsx",
+        };
+        let diagnostics = catalog.run(path, source, language, &settings, cancellation)?;
+        result.diagnostics.extend(diagnostics);
+        result.diagnostics.sort_by(|left, right| {
+            left.diagnostic
+                .start
+                .cmp(&right.diagnostic.start)
+                .then(left.diagnostic.end.cmp(&right.diagnostic.end))
+                .then(left.diagnostic.code.cmp(&right.diagnostic.code))
+                .then(left.diagnostic.message.cmp(&right.diagnostic.message))
+        });
+        Ok(())
     }
 
     fn explain(&self, path: String) -> Result<LintEffectiveConfig, WakeError> {
@@ -483,6 +597,53 @@ impl ConfiguredLint {
                 },
             );
         }
+        let mut extension_effective = BTreeMap::new();
+        if let Some(catalog) = &self.extensions {
+            for id in catalog.all_rules() {
+                extension_effective.insert(
+                    id.clone(),
+                    LintEffectiveRule {
+                        level: "off",
+                        options: BTreeMap::new(),
+                        source: "default".into(),
+                    },
+                );
+            }
+        }
+        for (id, setting) in &self.extension_base {
+            extension_effective.insert(
+                id.clone(),
+                LintEffectiveRule {
+                    level: setting.as_str(),
+                    options: BTreeMap::new(),
+                    source: "config:rules".into(),
+                },
+            );
+        }
+        for (index, (patterns, rules)) in self.extension_overrides.iter().enumerate() {
+            if patterns.iter().any(|pattern| pattern.is_match(&path)) {
+                for (id, setting) in rules {
+                    extension_effective.insert(
+                        id.clone(),
+                        LintEffectiveRule {
+                            level: setting.as_str(),
+                            options: BTreeMap::new(),
+                            source: format!("override:{index}"),
+                        },
+                    );
+                }
+            }
+        }
+        for (id, setting) in &self.extension_request {
+            extension_effective.insert(
+                id.clone(),
+                LintEffectiveRule {
+                    level: setting.as_str(),
+                    options: BTreeMap::new(),
+                    source: "request".into(),
+                },
+            );
+        }
         let request_environment_globals = wake_lint_core::effective_globals(&LintOptions {
             environments: self.request_environments.clone(),
             ..LintOptions::default()
@@ -535,6 +696,7 @@ impl ConfiguredLint {
                         },
                     )
                 })
+                .chain(extension_effective)
                 .collect(),
         })
     }
@@ -780,8 +942,16 @@ fn analyze(
     fix: LintFixMode,
     mut cache: Option<&mut cache::LintCacheSession>,
     mut baseline: Option<&mut baseline::FileBaseline>,
+    cancellation: &CancellationToken,
 ) -> Result<LintFileResult, WakeError> {
     let processor = config.processor_for(&path);
+    let active_extension = config.has_active_extensions(&path);
+    if active_extension && (processor.is_some() || fix != LintFixMode::Off || baseline.is_some()) {
+        return Err(WakeError::new(
+            "WAKE_LINT_EXTENSION",
+            "Active lint extensions require read-only ordinary source without a baseline or processor",
+        ));
+    }
     if processor.is_some() && fix != LintFixMode::Off {
         if let Some(cache) = cache.as_deref_mut() {
             cache.bypass();
@@ -805,9 +975,15 @@ fn analyze(
         .as_ref()
         .map(|session| session.entries())
         .unwrap_or_default();
+    if active_extension && let Some(cache) = cache.as_deref_mut() {
+        cache.bypass();
+    }
     let (mut result, final_text, fix_passes) = if fix == LintFixMode::Off {
         (
-            if let Some(cache) = cache {
+            if active_extension {
+                wake_lint_core::lint_text(&lint_text, language, &options)
+                    .map_err(|error| analysis_failure(error, &path, false))?
+            } else if let Some(cache) = cache {
                 cache.check(&path, &lint_text, language, &options, &entries)?
             } else {
                 wake_lint_core::lint_text(&lint_text, language, &options)
@@ -837,7 +1013,11 @@ fn analyze(
     {
         session.apply(&final_text, &mut result)?;
     }
-    Ok(present_result(path, &text, final_text, fix_passes, result))
+    let mut presented = present_result(path.clone(), &text, final_text, fix_passes, result);
+    if active_extension {
+        config.run_extensions(&path, &text, &mut presented, cancellation)?;
+    }
+    Ok(presented)
 }
 
 fn present_result(
@@ -911,6 +1091,7 @@ struct FileTask {
     cache: Option<cache::LintCacheSession>,
     baseline: Option<baseline::FileBaseline>,
     snapshot: Option<LintSourceSnapshot>,
+    cancellation: CancellationToken,
 }
 
 struct CompletedFile {
@@ -929,6 +1110,7 @@ impl FileTask {
             self.fix,
             self.cache.as_mut(),
             self.baseline.as_mut(),
+            &self.cancellation,
         )?;
         Ok(CompletedFile {
             result,
@@ -1049,15 +1231,31 @@ fn lint_project_observed(
         return Err(failure("lint root must be a directory"));
     }
     let config = wake_config::load(&root).map_err(|error| failure(error.to_string()))?;
+    if !config.lint.extensions.is_empty() && !options.allow_extensions {
+        return Err(failure(
+            "lint extensions require --allow-lint-extensions or allowExtensions: true",
+        ));
+    }
+    if !config.lint.extensions.is_empty()
+        && (options.fix != LintFixMode::Off || options.baseline.is_some())
+    {
+        return Err(WakeError::new(
+            "WAKE_LINT_EXTENSION",
+            "Lint extensions do not support fix or baseline modes in this phase",
+        ));
+    }
     let resolve = wake_resolver::ResolveOptions {
         alias: config.resolver_aliases(&root),
         ..Default::default()
     };
+    let extensions =
+        extensions::Catalog::load(&root, &config.lint.extensions, cancellation)?.map(Arc::new);
     let config = Arc::new(ConfiguredLint::new(
         config.lint,
         options.rules,
         options.globals,
         options.environments,
+        extensions,
     )?);
     if let Some(path) = options.print_config {
         if options.cache
@@ -1119,6 +1317,7 @@ fn lint_project_observed(
             config: config.clone(),
             fix: options.fix,
             snapshot: None,
+            cancellation: cancellation.clone(),
         };
         let results = if modules::needs_project(&config, &task.path) {
             let batch = scheduler.admit(cancellation)?;
@@ -1256,6 +1455,7 @@ fn lint_project_observed(
                 config: config.clone(),
                 fix: options.fix,
                 snapshot,
+                cancellation: cancellation.clone(),
             });
             if !module_analysis && tasks.len() == scheduler.batch_size() {
                 let jobs = std::mem::take(&mut tasks)
@@ -1308,6 +1508,7 @@ fn lint_project_observed(
         }
     }
     cancellation.check()?;
+    config.verify_extension_identity(cancellation)?;
     for (index, snapshot) in pending {
         cancellation.commit(|| {
             replace_lint_source(

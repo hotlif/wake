@@ -48,6 +48,7 @@
 - [ADR 0066: lint 宿主环境集合与版本身份](0066-lint-host-environments.md) — `accepted`
 - [ADR 0067: 顶层 ambient 值绑定投影](0067-top-level-ambient-value-projection.md) — `accepted`
 - [ADR 0068: 无损 ECMAScript 字符串值](0068-lossless-ecmascript-string-values.md) — `proposed`
+- [ADR 0072: 显式授权的 lint 第三方规则宿主](0072-lint-third-party-rule-host.md) — `proposed`
 
 ### build
 

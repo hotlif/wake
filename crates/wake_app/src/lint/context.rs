@@ -119,6 +119,7 @@ impl LintContext {
             || options.fix != LintFixMode::Off
             || options.print_config.is_some()
             || options.list_rules
+            || options.allow_extensions
             || options
                 .baseline
                 .as_ref()
@@ -152,13 +153,22 @@ impl LintContext {
                 .map_err(|e| failure(e.to_string()))?
                 .lint
         } else {
-            wake_config::Lint::default()
+            wake_config::load(&options.root)
+                .map(|config| config.lint)
+                .unwrap_or_default()
         };
+        if !lint.extensions.is_empty() {
+            return Err(super::WakeError::new(
+                "WAKE_LINT_EXTENSION",
+                "LintContext and watch do not support lint extensions in this phase",
+            ));
+        }
         super::ConfiguredLint::new(
             lint,
             options.rules.clone(),
             options.globals.clone(),
             options.environments.clone(),
+            None,
         )?;
         Ok(Self {
             inner: Arc::new(Inner {

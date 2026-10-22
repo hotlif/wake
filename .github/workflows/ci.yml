@@ -229,10 +229,17 @@ jobs:
       - run: cargo test -p wake_lint_core -p wake_app --test lint -p wake_lint_lsp --locked --offline
         env:
           CARGO_NET_OFFLINE: "true"
+      - run: cargo test -p wake_app --test lint_extensions --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - run: cargo test -p wake_cli --test lint --locked --offline
+        env:
+          CARGO_NET_OFFLINE: "true"
       - run: cargo test -p wake_app --lib lint::type_service --locked --offline -- --ignored
         env:
           CARGO_NET_OFFLINE: "true"
       - run: node scripts/lint-real-project-smoke.mjs
+      - run: node scripts/lint-extension-pnp-smoke.mjs
       - run: node scripts/lint-lsp-smoke.mjs
       - run: node --test scripts/lint-migration-report.test.mjs npm/wake-lint-sdk/test/index.test.mjs
 

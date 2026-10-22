@@ -2,6 +2,106 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+fn lint_extensions_require_cli_authorization_and_print_config_stays_static() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("node_modules/@demo/wake-lint-plugin");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        root.path().join("package.json"),
+        r#"{"private":true,"dependencies":{"@demo/wake-lint-plugin":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("wake.config.toml"),
+        "[lint]\nrecommended=false\nextensions=['@demo/wake-lint-plugin']\n[lint.rules]\n'demo/no-debugger'='error'\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("a.js"), "// 🙂\ndebugger;").unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"@demo/wake-lint-plugin","version":"1.0.0","type":"module","exports":{"import":"./index.mjs"},"wakeLint":{"manifest":"./wake-lint.manifest.json","module":"./index.mjs"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("wake-lint.manifest.json"),
+        r#"{"schema":"wake.lint.package.v1","name":"@demo/wake-lint-plugin","version":"1.0.0","protocol":"wake.lint.extension.v1","sdkMajor":1,"rules":[{"id":"demo/no-debugger","meta":{"description":"find debugger","category":"problem","fixable":false},"messageIds":["found"],"optionsSchema":{"type":"object","additionalProperties":false,"properties":{}}}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("index.mjs"),
+        r#"import { writeFileSync } from 'node:fs'
+writeFileSync(new URL('./loaded', import.meta.url), 'loaded')
+console.log('extension loaded')
+export default {
+  protocol: 'wake.lint.extension.v1', sdkMajor: 1,
+  name: '@demo/wake-lint-plugin', version: '1.0.0',
+  rules: [{
+    protocol: 'wake.lint.extension.v1', id: 'demo/no-debugger',
+    meta: { description: 'find debugger', category: 'problem', fixable: false },
+    create(context) {
+      const index = context.source.indexOf('debugger')
+      if (index >= 0) {
+        const start = Buffer.byteLength(context.source.slice(0, index))
+        context.report({ message: 'debugger is not allowed', messageId: 'found', start, end: start + 8 })
+      }
+    },
+  }],
+}
+"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wake"))
+            .args(["lint", "--root"])
+            .arg(root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let loaded = package.join("loaded");
+
+    let denied = run(&["a.js", "--format", "json"]);
+    assert_eq!(denied.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("allow"));
+    assert!(!loaded.exists());
+
+    let explained = run(&["--allow-lint-extensions", "--print-config", "a.js"]);
+    assert_eq!(
+        explained.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    let explained: serde_json::Value = serde_json::from_slice(&explained.stdout).unwrap();
+    assert_eq!(
+        explained["config"]["rules"]["demo/no-debugger"]["level"],
+        "error"
+    );
+    assert!(!loaded.exists());
+
+    let checked = run(&[
+        "--allow-lint-extensions",
+        "a.js",
+        "--cache",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let diagnostic = &checked["files"][0]["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "demo/no-debugger");
+    assert_eq!(diagnostic["messageId"], "found");
+    assert_eq!(diagnostic["start"], "// 🙂\n".len());
+    assert_eq!(checked["cache"]["bypassed"], 1);
+    assert!(loaded.exists());
+}
+
+#[test]
 #[ignore = "requires repository's installed native TypeScript 7.0.2 and platform package"]
 fn lint_types_preserve_cli_diagnostics_cache_and_analysis_exit_codes() {
     let parent =

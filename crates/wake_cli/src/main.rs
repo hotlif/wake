@@ -66,6 +66,9 @@ enum Command {
         /// List native rule metadata as JSON without loading a project.
         #[arg(long, conflicts_with_all = ["paths", "stdin", "print_config", "rules", "globals", "environments", "fix", "fix_dry_run", "max_warnings"])]
         list_rules: bool,
+        /// Explicitly allow configured third-party lint rule packages for this invocation.
+        #[arg(long, conflicts_with = "list_rules")]
+        allow_lint_extensions: bool,
         /// Cache read-only file diagnostics by source content and effective rules.
         #[arg(long, conflicts_with_all = ["print_config", "list_rules"])]
         cache: bool,
@@ -490,6 +493,7 @@ fn main() -> ExitCode {
             fix_dry_run,
             print_config,
             list_rules,
+            allow_lint_extensions,
             cache,
             rules,
             globals,
@@ -521,6 +525,7 @@ fn main() -> ExitCode {
                 max_warnings,
                 print_config,
                 list_rules,
+                allow_extensions: allow_lint_extensions,
                 cache,
                 baseline: baseline
                     .map(|path| wake_app::LintBaselineOptions {

@@ -41,6 +41,7 @@ struct Prepared {
     options: LintOptions,
     module: bool,
     typed: bool,
+    active_extension: bool,
     text: Arc<str>,
     passes: u8,
 }
@@ -49,13 +50,24 @@ impl Prepared {
     fn new(mut task: FileTask) -> Result<Self, WakeError> {
         let module = enabled(&task.config, &task.path);
         let typed = type_service::enabled(&task.config, &task.path);
+        let active_extension = task.config.has_active_extensions(&task.path);
+        if active_extension
+            && (task.config.processor_for(&task.path).is_some()
+                || task.fix != LintFixMode::Off
+                || task.baseline.is_some())
+        {
+            return Err(WakeError::new(
+                "WAKE_LINT_EXTENSION",
+                "Active lint extensions require read-only ordinary source without a baseline or processor",
+            ));
+        }
         if typed && task.config.types.is_none() {
             return Err(analysis(
                 "Enabled type rules require [lint.types] with explicit projects",
             ));
         }
         let options = task.config.options(&task.path);
-        if (module || typed || task.fix != LintFixMode::Off)
+        if (module || typed || active_extension || task.fix != LintFixMode::Off)
             && let Some(cache) = &mut task.cache
         {
             cache.bypass();
@@ -93,6 +105,7 @@ impl Prepared {
             options,
             module,
             typed,
+            active_extension,
             text: Arc::from(text),
             passes,
         })
@@ -124,6 +137,9 @@ impl Prepared {
             graph.lint(id, &self.options).map_err(|error| {
                 analysis_failure(error, &self.task.path, self.task.fix != LintFixMode::Off)
             })?
+        } else if self.active_extension {
+            wake_lint_core::lint_text(&self.text, language, &self.options)
+                .map_err(|error| analysis_failure(error, &self.task.path, false))?
         } else if self.task.fix == LintFixMode::Off
             && let Some(cache) = &mut self.task.cache
         {
@@ -142,13 +158,17 @@ impl Prepared {
         if let Some(baseline) = &mut self.task.baseline {
             baseline.apply(&self.text, &mut result)?;
         }
-        let result = present_result(
+        let mut result = present_result(
             self.task.path,
             &self.task.text,
             self.text.to_string(),
             self.passes,
             result,
         );
+        let path = result.path.clone();
+        self.task
+            .config
+            .run_extensions(&path, &self.text, &mut result, &self.task.cancellation)?;
         Ok(CompletedFile {
             result,
             cache: self.task.cache,

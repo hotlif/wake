@@ -87,6 +87,8 @@ pub struct Lint {
     pub report_unused_disable: LintRuleLevel,
     pub files: Vec<String>,
     pub ignore: Vec<String>,
+    /// Exact, explicitly selected third-party lint packages; the app validates identities.
+    pub extensions: Vec<String>,
     pub rules: BTreeMap<String, LintRuleSetting>,
     /// Data only; names and modes are validated by the lint core before matching.
     pub globals: BTreeMap<String, serde_json::Value>,
@@ -109,6 +111,7 @@ impl Default for Lint {
                 .map(|ext| format!("**/*.{ext}"))
                 .collect(),
             ignore: Vec::new(),
+            extensions: Vec::new(),
             rules: BTreeMap::new(),
             globals: BTreeMap::new(),
             environments: Vec::new(),

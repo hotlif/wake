@@ -148,9 +148,36 @@ files = ["docs/**/*.md"]
 处理器文件只支持单文件规则；启用模块图或类型规则时会返回分析错误，避免把宿主 Markdown 路径
 冒充 JavaScript/TypeScript 项目身份。
 
-独立扩展可安装 `@crab-dev/wake-lint-sdk` 使用 `wake.lint.extension.v1` 协议。SDK 冻结源码事实、
-校验 UTF-8 字节范围和编辑重叠，并将规则异常隔离为 `WAKE_LINT_EXTENSION`；它不会自动把第三方规则
-加入 `wake lint`，也不暴露 Wake 内部 AST 或 TypeScript 句柄。
+独立规则包可使用 `@crab-dev/wake-lint-sdk` 的 `wake.lint.extension.v1` 协议。一次性 CLI/Node
+检查需要在项目根的 `package.json` 中直接声明依赖、在 `[lint]` 列出精确包名，并在 `[lint.rules]`
+显式启用规则：
+
+```toml
+[lint]
+extensions = ["@demo/wake-lint-plugin"]
+
+[lint.rules]
+"demo/no-debugger" = "error"
+```
+
+运行时还需 `wake lint --allow-lint-extensions` 或 Node `lint({ allowExtensions: true })`。
+只要配置声明扩展包，未授权检查和 `--print-config` 都会失败，且不启动扩展宿主或 PnP loader。
+授权后的 `--print-config` 只读取包内静态规则 manifest，不导入规则模块；PnP 项目可能执行其
+loader 以解析包。安装、配置声明或授权单独存在时均不会启用任何扩展规则。
+
+第一阶段扩展只提供普通源码文件的只读诊断。静态 manifest 的规则参数仅支持空对象；非空参数
+即使设为 off 或位于未匹配 override 中也会报错。只要配置列出扩展包，修复/预览、baseline、
+LintContext 和 watch 就会拒绝该请求；LSP 也暂不接入扩展规则。活跃扩展规则遇到 Markdown
+处理器会拒绝。扩展检查绕过持久化诊断缓存。
+注释抑制目前只识别原生规则；将扩展规则 ID 写入抑制指令会报告无效指令，扩展诊断仍会显示。
+规则包在获授权的 Node 子进程中执行；该进程用于隔离宿主 worker 的崩溃和超时，不限制规则包
+主动访问用户文件、环境变量或网络。Wake 终止超时或取消的 worker，但不保证终止规则包或项目
+PnP loader 自行启动的后代进程；后代可能继承句柄并继续消耗资源。规则异常、协议不兼容及非法范围
+均以 `WAKE_LINT_EXTENSION` 失败，不发布部分扩展诊断或源码写入。宿主至多解析 2 MiB 输出，
+周期检查运行中的输出大小；这不限制获授权代码或其后代持续写入临时文件。输出的单帧校验只
+覆盖读取时已写入的内容。每轮核对扩展入口模块的路径与
+内容身份；扩展代码或其传递依赖主动变化
+时，首期不提供完整依赖图快照保证。SDK 不暴露 Wake 内部 AST 或 TypeScript 句柄。
 
 ESLint 配置迁移使用 `node scripts/lint-migration-report.mjs <eslintrc.json>` 生成
 `wake.lint.migration.v1` 报告。报告会映射规则注册表中的全部 Wake 原生规则，也识别未命名空间的

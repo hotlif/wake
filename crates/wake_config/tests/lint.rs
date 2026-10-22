@@ -95,3 +95,23 @@ fn lint_accepts_closed_processor_mappings() {
     );
     assert!(toml::from_str::<Config>("[lint.processors]\n\"**/*.md\" = 7").is_err());
 }
+
+#[test]
+fn lint_extensions_are_a_closed_list_of_package_names() {
+    let config: Config = toml::from_str(
+        r#"
+[lint]
+extensions = ["@demo/wake-lint-plugin"]
+[lint.rules]
+"demo/no-debugger" = "error"
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.lint.extensions, ["@demo/wake-lint-plugin"]);
+    for source in [
+        "[lint]\nextensions='@demo/wake-lint-plugin'",
+        "[lint]\nextensions=[7]",
+    ] {
+        assert!(toml::from_str::<Config>(source).is_err(), "{source}");
+    }
+}

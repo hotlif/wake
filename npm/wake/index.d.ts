@@ -693,6 +693,8 @@ export interface LintOptions {
   printConfig?: string
   /** List native rule metadata without reading source files or project configuration. */
   listRules?: boolean
+  /** Permit configured third-party lint packages to run for this one-shot request. */
+  allowExtensions?: boolean
   /** Cache read-only disk-file diagnostics; stdin and fix modes bypass persistence. */
   cache?: boolean
   baseline?: { path: string; mode?: 'check' | 'generate' | 'prune' }
