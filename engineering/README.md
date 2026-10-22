@@ -1,22 +1,31 @@
 # Wake 工程文档
 
-本目录记录 Wake 当前的实现边界、设计依据和工程门禁。内容以源码、Cargo/npm 清单、测试与 CI 配置为事实来源，不作为尚未实现功能的承诺。
+本目录面向 Wake 维护者，记录当前实现、目标契约、工程门禁和历史证据。实现状态以源码、Cargo/npm
+清单、测试与 CI 配置为事实来源；目标、路线图和历史记录不代表当前已经支持的能力。
 
-## 阅读顺序
+## 按任务查阅
 
-1. [ARCHITECTURE.md](ARCHITECTURE.md)：workspace crate 的分层、依赖方向和构建数据流。
-2. [DESIGN.md](DESIGN.md)：编译、解析、打包、文档与增量引擎的当前设计。
-3. [COMPATIBILITY.md](COMPATIBILITY.md)：Crustify 迁移决策和 M1–M8 兼容里程碑。
-4. [TESTING.md](TESTING.md)：本地、CI、Miri、Loom、Node 与发布门禁。
-5. [PERFORMANCE.md](PERFORMANCE.md)：现有 benchmark、压力样例和测量纪律。
-6. [AUDIT.md](AUDIT.md)：按时间点追加的实证结论与开放风险。
-7. [ROADMAP.md](ROADMAP.md)：后续工作及其验收条件。
-8. [PLAN.md](PLAN.md)：供源码历史引用使用的 Phase/Gate 索引；不承担未来排期。
-9. [CRAB_CSS.md](CRAB_CSS.md)：`@crab-dev/css` 的安全模型、编译管线和阶段门禁。
-10. [CRAB_UI_INTEGRATION.md](CRAB_UI_INTEGRATION.md)：UI 组件的文档站适配、迁移桥和 PnP 验证。
-11. [decisions/](decisions/)：架构决策历史、替代关系、证据和删除计划。
+以下是导航索引，不要求依次通读。先从任务涉及的源码、清单和测试定位，只查阅需要的主题；
+验证范围见 [TESTING.md](TESTING.md#验证范围与结果复用)，持续任务与证据复用约定见 [AGENTS.md](../AGENTS.md#控制重复工作)。
+
+| 要解决的问题 | 文档入口 | 内容边界 |
+| --- | --- | --- |
+| 功能归哪个 crate，依赖如何流动 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前分层、所有权和构建数据流 |
+| 编译、打包、增量与缓存如何实现 | [DESIGN.md](DESIGN.md) | 实现机制与局部设计；分层归属回链架构文档 |
+| 一项变更需要运行哪些检查 | [TESTING.md](TESTING.md) | 按影响范围选择本地、CI、Miri/Loom 与发布门禁 |
+| 如何测量性能、比较优化结果 | [PERFORMANCE.md](PERFORMANCE.md) | 测量方法、工作量门禁及注明环境的历史样本 |
+| Lint 做到哪一步、规则如何验收 | [LINT.md](LINT.md) | P0–P7 状态、规则契约与验证要求 |
+| Crab CSS 如何编译与集成 | [CRAB_CSS.md](CRAB_CSS.md)、[CRAB_UI_INTEGRATION.md](CRAB_UI_INTEGRATION.md) | CSS API、静态求值、样式产物、组件迁移桥与 PnP |
+| CSS 编辑器与语言服务如何工作 | [CSS_LANGUAGE_SERVICE.md](CSS_LANGUAGE_SERVICE.md) | 文档模型、协议、资源限制与分发 |
+| 为什么采用某项架构约束 | [decisions/README.md](decisions/README.md) | 按领域检索 ADR 的状态、证据与替代关系 |
+| 后续还有哪些工作、何时算完成 | [ROADMAP.md](ROADMAP.md) | 未完成事项、验收条件及已完成事项的持续门禁 |
+| 如何理解源码中的迁移或阶段引用 | [COMPATIBILITY.md](COMPATIBILITY.md)、[PLAN.md](PLAN.md) | M1–M8 兼容决策和历史 Phase/Gate 索引 |
+| 查找过去的审计、实施或发布结果 | [AUDIT.md](AUDIT.md)、[Lint 实施记录](history/LINT_IMPLEMENTATION.md)、[releases/](releases/) | 指定版本和代码状态下的证据，不作为当前能力清单 |
 
 可执行 crate 边界以 [architecture-boundaries.json](architecture-boundaries.json) 为唯一事实来源，通过 `corepack yarn architecture:check` 校验；叙述性文档只解释边界意图，不复制规则。
+
+其他机器输入按需查阅：[浏览器验证矩阵](system-browser-conformance.json)、[测试运行时来源](test-runtime-sources.json)、
+[Test262 选择与来源](test262-es2024.json)。用途和运行方式统一见 [TESTING.md](TESTING.md)，避免在导航页复写版本与平台清单。
 
 ## 文档边界
 
@@ -24,6 +33,8 @@
 - `engineering/` 面向维护者，不参与产品文档站构建。
 - crate 级 rustdoc 说明局部不变量；跨 crate 的约束在本目录维护。
 - `README.md` 与 npm README 只保留安装、入口和稳定导航，不复制完整参考内容。
+- `ROADMAP.md` 汇总待办与验收；专题文档维护详细契约，ADR 维护长期架构依据。`proposed` ADR 不作为当前边界。
+- `AUDIT.md`、`history/`、`releases/` 和性能历史章节保留时点证据；当前状态变化时更新对应主文档，不改写旧记录以冒充新验证。
 
 ## 更新规则
 
@@ -35,3 +46,4 @@
 - 修改机器边界时必须引用一份已进入 decisions 索引的 `accepted` ADR，并运行 `corepack yarn architecture:check`。
 - 性能结论必须包含命令、提交、工具链和环境；没有可复现数据时只描述方法。
 - `AUDIT.md` 只记录可由源码、测试或命令复现的事实，推断必须显式标注。
+- 新增专题文档时补齐本页入口；迁移内容时更新相对链接并保留仍被引用的章节锚点。纯文档检查见 [TESTING.md](TESTING.md#1-5-文档)。

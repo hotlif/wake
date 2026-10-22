@@ -1,5 +1,9 @@
 # Wake 当前架构
 
+按问题定位：[Crate 分层](#2-crate-分层) · [依赖方向](#3-依赖方向) · [应用构建](#4-应用构建数据流) ·
+[Docs 构建](#5-文档构建数据流) · [对外边界](#6-对外边界) · [构建所有权](#7-构建-generation-与会话所有权) · [发布](#8-发布边界)。
+实现机制见 [DESIGN.md](DESIGN.md)，验证入口见 [TESTING.md](TESTING.md)。
+
 ## 1. 系统定位
 
 Wake 是 Rust 原生的 Web 构建工具，同时提供 CLI、Node.js API、应用开发服务器、React 组件文档系统和实验性的 React 优先测试系统。工作区当前包含 36 个第一方 workspace crate；`deno_core`、`deno_v8` 等第三方 Rust 包来自 crates.io，JavaScript 包来自 npm registry。npm 主包通过五个平台包加载预编译 Node-API 模块和内部 test host，系统 Chromium 不进入这些平台包。
@@ -304,7 +308,7 @@ Source-mapped coverage 对函数指标采用更严格的所有权边界：只有
 源函数起点写入的 map anchor 才进入用户函数统计。Preserve-CJS export getter 等合成函数不拥有该锚点，
 不会因为 floor mapping 继承前一源位置而被计数。
 
-## 4.2 测试数据流
+### 4.2 测试数据流
 
 ```text
 wake test / runTests() / TestContext

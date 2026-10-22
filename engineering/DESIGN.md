@@ -2,23 +2,27 @@
 
 本文保留源码现有 `DESIGN §…` 引用所需的编号，但描述的是仓库当前已实现设计。未来意向统一写入 [ROADMAP.md](ROADMAP.md)。
 
-# 1. 目标与原则
+按问题定位：[构建抽象](#3-总体架构) · [编译器](#4-ecmascript-编译器) · [解析与模块图](#5-解析与模块图) ·
+[打包与产物](#6-打包与产物) · [开发服务](#7-dev-server-与-live-reload) · [增量与缓存](#10-增量与并发)。
+Crate 归属与依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)，架构决策依据见 [ADR 索引](decisions/README.md)。
+
+## 1. 目标与原则
 
 Wake 将 JavaScript/TypeScript 编译、生产打包、开发服务器和 React 组件文档放在同一套 Rust 工具链中。设计优先级依次是正确性、可诊断性、跨平台一致性、增量工作规避和吞吐。
 
 非目标包括执行任意 JavaScript 配置、公开稳定 Rust 插件 ABI，以及在 0.x 冻结实验编译器数据结构。
 
-# 2. 产品边界
+## 2. 产品边界
 
 CLI 与 Node API 是两种调用外壳；构建行为由 `wake_app` 统一。Wake Docs 是同一编译管线上的产品层，不是独立的第二套打包器。
 
-# 3. 总体架构
+## 3. 总体架构
 
-## 3.1 Workspace 与入口
+### 3.1 Workspace 与入口
 
 workspace crate 按基础、编译、解析/资源、执行/编排和产品边缘分层。完整列表和依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-## 3.2 构建阶段
+### 3.2 构建阶段
 
 应用构建采用 Scan → Link/Chunk → Optimize/Codegen → Emit：Scan 解析依赖并建立记录，Link 以公开
 export 名称计算稳定的模块/绑定活跃性；bundler 把 `(ModuleId, export names)` 交给 Optimize。Optimize
@@ -26,14 +30,14 @@ export 名称计算稳定的模块/绑定活跃性；bundler 把 `(ModuleId, exp
 仍保留的模块依赖；bundler 再据此保守收敛可达集合并组装 runtime、chunk、代码和资源。`SymbolId` 只在
 optimizer 内部属于当前 AST 生命周期，不是跨 crate 或持久缓存格式。
 
-## 3.3 核心抽象
+### 3.3 核心抽象
 
 ECMAScript 编译核心不读取文件，只消费调用方提供的源码并返回 owned 诊断/依赖/发射事实；parser
 创建的 `ModuleAst` 持有 arena 生命周期与精确 source，并记录创建其 `Atom` 的进程内 interner
 identity。文件系统、路径解析、任务和缓存由 bundler/runtime 等调用方拥有，它们跨阶段只传稳定记录和
 受控句柄。
 
-## 3.4 BuildSession 所有权与生命周期
+### 3.4 BuildSession 所有权与生命周期
 
 `BuildSession` 是所有产品构建进入 `wake_bundler` 的唯一公共 owner。调用方先把平台、解析、JSX、
 CSS/资源、优化、缓存、entry/chunk 命名和 bundler-facing Federation plan 完整归一化为 owned
@@ -51,7 +55,7 @@ integration tests 与 benchmark 只能使用 session API；兼容 façade 必须
 configurator closure。长期边界见
 [ADR 0027](decisions/0027-build-session-ownership-and-lifetime.md)。
 
-## 3.5 BuildGeneration 与候选一致性
+### 3.5 BuildGeneration 与候选一致性
 
 `BuildSession` 只拥有一次 typed compilation；application、Federation container、optional shared
 provider、types 和 manifest 组成的产品候选由更外层的 `BuildGeneration` 唯一拥有。一次性 build/Docs
@@ -81,29 +85,29 @@ dev event adapter 对未知事件产生诊断。ESM Federation 子路径使用�
 声明，tarball 外部 NodeNext 消费测试负责证明 export map 和声明解析。见
 [ADR 0029](decisions/0029-node-contract-and-federation-control-ownership.md)。
 
-# 4. ECMAScript 编译器
+## 4. ECMAScript 编译器
 
-## 4.1 基础设施
+### 4.1 基础设施
 
 热路径使用字节 Span，行列号在诊断或 Source Map 序列化时按需换算。`Atom` 是进程内句柄，禁止进入持久化缓存。
 
-## 4.2 AST
+### 4.2 AST
 
 AST 使用 arena 分配和紧凑枚举；`ModuleAst` 把源码、arena 与 Program 生命周期封装在不可克隆的自引用持有者中。手写 `unsafe` 由 Miri 常驻验证。
 
-## 4.3 Lexer 与 JSX
+### 4.3 Lexer 与 JSX
 
 Lexer 按字节扫描，token 只保存类型、Span 和 ASI 换行状态。parser 驱动正则/除号与 JSX 文本上下文；标识符只在 parser 需要时驻留。
 
-## 4.4 Parser 与依赖
+### 4.4 Parser 与依赖
 
 语句使用递归下降，表达式使用 Pratt 优先级解析。解析时同步提取静态/动态依赖和顶层 await 标志，并根据 SourceType 选择 JS、TS、JSX、TSX 或 CommonJS 语义。需要 cover grammar、词法作用域或临时变量所有权的浏览器 lowering 由 parser 编排，但规则与 AST 构造归 `wake_ecma_transform`；因此目标特性属于前端任务身份。
 
-## 4.5 Transform
+### 4.5 Transform
 
 TypeScript 擦除、JSX automatic runtime 和浏览器目标转换在明确上下文中运行。`wake_ecma_transform` 不依赖 parser，只提供稳定的 lowering 规则与 AST helper；React runtime plan 统一决定 `jsx-runtime`/`jsx-dev-runtime` 路径、固定 helper import 集合和 runtime call ABI。parser 在仍掌握 cover grammar、作用域、collision-free 本地名、import 插入位置和依赖记录时调用这些 helper。转换复用原 Span，避免丢失诊断与 Source Map 来源。
 
-### 4.5.1 Compiler core 与公开 façade
+#### 4.5.1 Compiler core 与公开 façade
 
 `wake_compiler_core::CompilerBackend` 在共享 `Interner` 上依次执行 `parse_module`、
 `optimize_module` 和 `emit_module`。它只拥有
@@ -118,7 +122,7 @@ V3 Source Map，并固定不压缩。它不暴露 AST、Atom、Interner 或 type
 需求、ADR 与前端接入，不在当前 API 中预留 trait、枚举或字段。见
 [ADR 0043](decisions/0043-react-module-compiler-boundary.md)。
 
-## 4.6 Closure 风格优化管线
+### 4.6 Closure 风格优化管线
 
 `wake_ecma_minify` 把 parser AST 与初始 semantic model 一次性降低为完整拥有所有权的 `TypedProgram`。
 它以稳定 `NodeId`、`ListId`、`NameId` 和当前程序内 `SymbolId` 表达结构与绑定，每个节点携带 `Source`、
@@ -163,7 +167,7 @@ tree 上的请求。最终链接/chunk 事实确定后，消费式 `finalize_own
 Preserve CJS 与 bundled CJS 共用这一结构化生命周期；
 外层不能注入另一套 namespace/live-read side-plan。Direct `eval`/`with` 的冻结范围由当前树分析决定。
 
-## 4.7 Codegen 与 Source Map
+### 4.7 Codegen 与 Source Map
 
 `wake_ecma_codegen::typed` 直接遍历 finalizer 验证后构造的 `FinalizedTypedProgram`，根据 typed node
 类别与优先级写 token 和必要括号；它没有 parser AST 或 legacy optimization-table 输入，也不运行 DCE、
@@ -176,9 +180,9 @@ Mapped 与 unmapped 入口执行同一个 token walk，mapping 只是可选 sink
 segment。折叠、内联、实参替换和模块 wrapper 的每类细粒度来源必须由独立测试证明，未验证的映射规则
 不作为兼容承诺。
 
-# 5. 解析与模块图
+## 5. 解析与模块图
 
-## 5.1 Resolver
+### 5.1 Resolver
 
 `ResolutionEnvironment` 是唯一解析所有者，统一持有基础/PnP/zip 文件系统、按 issuer 发现的最近 PnP
 根、经典 Node 后端、Resolver 与成功/失败缓存。`.pnp.cjs` 存在即启用 PnP；非内联 loader 读取匹配 data，损坏清单返回
@@ -193,11 +197,11 @@ Wake 路径 alias 保留。ignore pattern 或 unmanaged issuer 执行 Yarn 指�
 `packageExtensions` 声明。Wake 内部兼容目标通过 strict package-root resolution 跳过用户源码 alias，
 但不跳过 issuer 的 PnP 可见性；这类目标不能用来提供未声明依赖。
 
-## 5.2 Scan
+### 5.2 Scan
 
 增量路径按依赖层并行加载、解析和分析。共享模块通过内容身份与 single-flight 避免重复工作；诊断不因并行而丢失来源路径。
 
-## 5.3 Tree Shaking
+### 5.3 Tree Shaking
 
 Link 阶段从入口计算模块可达性，并分别保存稳定的声明绑定保留名、精确公开观察名和 plain
 `export *` 转发事实。模块 parse 后，bundler 把这些事实与 `ModuleId` 一起传给 `OptimizeInput`；优化器使用
@@ -206,13 +210,13 @@ lowering 共用的 parser semantic model 将声明保留名解析为顶层 `Symb
 Bundler 将保留依赖映射为排序去重的 `ModuleId`
 用于可达性收敛。缓存摘要保存恢复分析所需的稳定字符串和标志，不持久化 `Atom`/`SymbolId` 或 AST 指针。
 
-# 6. 打包与产物
+## 6. 打包与产物
 
 模块默认进入函数包装 runtime；满足条件的 ESM 可进入 concat/scope-hoist 块。Bare-block eligibility 的
 保守 AST 扫描由 `wake_bundler::concat` 私有拥有：存在 `var` 或任何 `this` 即退回 IIFE；codegen 不导出
 这项分析。循环、CJS `module.exports` 替换、导出冲突和不安全块语义会保守降级为独立 factory。
 
-## 6.1 CJS/ESM 互操作
+### 6.1 CJS/ESM 互操作
 
 runtime 为 ESM namespace、CommonJS exports、循环模块和异步模块维持单次执行与缓存身份。
 Library preserve-modules 的每个 CommonJS 文件是独立执行单元，由 codegen 按实际引用在文件内
@@ -225,11 +229,11 @@ Library preserve-modules 的每个 CommonJS 文件是独立执行单元，由 co
 的稳定名，与用户绑定或自由引用冲突时按确定顺序加数字后缀。Library/runtime 只选择 preserve-CJS 模式，
 codegen 从 `OptimizedProgram` 读取 namespace 与实时访问表达式，避免任何 bundler/codegen side-plan 分叉。
 
-## 6.1.1 顶层 await
+#### 6.1.1 顶层 await
 
 包含顶层 await 的模块及其同步导入方形成 async 子图。runtime 缓存执行 Promise，调用方等待同一生命周期，避免重复执行或捕获未完成导出。
 
-## 6.2 Emit
+### 6.2 Emit
 
 Emit 生成 JS chunk、CSS、静态资源、HTML、manifest 和可选 Source Map。启用映射不会关闭压缩或
 代码分割，也不会改变不含 `sourceMappingURL` trailer 的 JS payload。文件路径在跨平台输出前统一规范化。
@@ -242,11 +246,11 @@ token 生成结果和 Docgen 结果在发布前携带 reader/resolver 给出的�
 sync、备份、安装和反向回滚。Bundle 未启用 Source Map 时不推断相邻旧 map 的所有权，也不删除它。
 长期不变量见 [ADR 0036](decisions/0036-input-disjoint-exact-output-transactions.md)。
 
-## 6.3 Chunk 与动态导入
+### 6.3 Chunk 与动态导入
 
 生产构建为动态 import 创建 async chunk，并通过 `public_path` 生成加载 URL。抽取 CSS 归属到具体 chunk：入口样式由 HTML 激活，异步样式由 runtime 在对应 JavaScript 执行前加载；书面 manifest 保留同一 chunk/style 关系。相对 `./` 用于 file URL/Electron；文档站独立使用 `base_path`。
 
-## 6.4 Wake Federation v1
+### 6.4 Wake Federation v1
 
 `wake_federation_contract` 是 Federation 公共数据的唯一 Rust owner，固定
 `wake.federation.manifest.v1` schema 与 `wake.federation.v1` browser ABI。配置、bundler、dev server、
@@ -274,7 +278,7 @@ isolated 使用非 default scope、自己的 root 与 open ShadowRoot，并只�
 slots。长期所有权、失败语义和删除计划见
 [ADR 0025](decisions/0025-wake-native-federation-contract.md)。
 
-# 7. Dev Server 与 Live Reload
+## 7. Dev Server 与 Live Reload
 
 开发服务器采用增量打包模式：监听变化、失效会话并重建受影响模块；普通应用完整候选成功发布后，
 通过 `/__wake_live_reload` 发送 typed `reload` frame，浏览器调用 `location.reload()`。服务端的增量复用
@@ -299,9 +303,9 @@ remote，之后仅轮询 `dev_follow` Manifest 的 build/type revision。revisio
 同一 synchronizer 先校验全体，再原子切换稳定 index。刷新失败不修改 index 并产生可重试诊断；pinned
 remote 不轮询，启动同步必须满足生产 lock。monitor 与 `DevServer` 共享生命周期，关闭完成后不得继续写入。
 
-# 8. CSS 与静态资源
+## 8. CSS 与静态资源
 
-## 8.1 CSS
+### 8.1 CSS
 
 开发模式可注入样式，生产模式抽取 CSS；CSS Modules 生成局部类名。CSS-in-JS 位于独立 crate，保持编译核心依赖边界。Crab UI 包由 `package.json#name = @crab-dev/rc-*` 与受支持入口共同识别，存在 `css/index.css` 时由 loader 自动加入模块图；业务源码与 Components runtime 均不显式导入这些样式。该身份使 CSS 的新增、删除及跨进程热缓存保持冷构建等价。
 
@@ -312,15 +316,15 @@ specifier/kind 继续由 ModuleRec、缓存、诊断和 codegen request 拥有�
 成功或拒绝。长期边界与删除条件见
 [ADR 0035](decisions/0035-parser-owned-crab-runtime-resolution.md)。
 
-## 8.2 静态资源
+### 8.2 静态资源
 
 小资源内联为 data URL，大资源使用内容哈希独立输出。`.raw` 作为文本导出，JSON 作为默认导出模块，CSS `url()` 与 HTML/manifest 使用统一公共路径。
 
-# 9. 扩展边界
+## 9. 扩展边界
 
 当前没有承诺稳定的公开 Rust/JavaScript 插件系统。组件扫描、Preview、主题 CSS 和声明式 TOML 是受支持的扩展点；实验编译器 API 不等于插件 ABI。
 
-## 9.1 Wake Docs 身份与源码溯源
+### 9.1 Wake Docs 身份与源码溯源
 
 Docs 页面编译是 typed content pipeline，不是字符串预处理器。每个源文件先构造一次 `PageIdentity`，
 同时冻结 root-relative source/generated 路径和 decoded/canonical-encoded `RoutePath`；registry、静态 shell、
@@ -333,39 +337,39 @@ markdown AST 拥有 `MdxjsEsm` node/span，Wake ECMA parser/lexer 在 node 内�
 并用 generated-only 段终止同一行的映射。详细不变量及移除的旧路径见
 [ADR 0031](decisions/0031-docs-page-identity-and-source-provenance.md)。
 
-# 10. 增量与并发
+## 10. 增量与并发
 
-## 10.1 工作规避
+### 10.1 工作规避
 
 Wake 使用内容身份、resolver/load cache、任务依赖、持久化摘要和优化/生成体缓存减少重复解析与
 codegen。依赖形状和绑定活跃性不变时复用上一 generation 的 link/chunk 规划；旧的内存摘要在成功
 generation 后回收。新进程始终读取并哈希真实 loader 输出，持久层只复用由内容身份派生的摘要、优化
 事实和生成体。持久缓存成功原子落盘才恢复 clean，并按访问新近度限制为 512 MiB/20 万条。
 
-## 10.2 并发模型
+### 10.2 并发模型
 
 一次 revision 的变更写入是串行的，查询可并行；Web 构建依赖图仍由领域层组织，不把每个对象建模为 Actor。生产 bundler 共享进程级工作窃取执行器，使多 BuildContext 的总 worker 数受机器并行度约束；显式执行器仅用于测试和隔离实验。
 
-## 10.3 wake_turbo
+### 10.3 wake_turbo
 
 任务 ID 来自函数与参数指纹。slot 保存类型擦除值、输出指纹、依赖和 revision；浅校验、深校验、重算与早期截断组成红绿失效协议。per-task single-flight 锁保证同一任务只执行一次，线程本地上下文收集直接依赖。
 
-## 10.4 Arena AST 生命周期
+### 10.4 Arena AST 生命周期
 
 AST 持有者放入 `Arc` 管理的任务值，下游只在受控闭包中借用。Parser owner 同时保存 exact source 和
 interner identity；优化入口校验两者以阻止同长度错误 source 或另一张 interner 表与 AST 配对。不得把
 AST 引用、指针、`Atom`、`SymbolId` 或 interner identity 跨进程持久化。
 
-## 10.5 执行器
+### 10.5 执行器
 
 工作窃取执行器处理同层 parse、optimize 和 body 扇出；source-map facts 是只依赖 body 的下游任务。
 Loom 验证 single-flight 交错；循环依赖检测在同线程任务栈上拒绝递归环。
 
-## 10.6 性能预算
+### 10.6 性能预算
 
 预算以可复现 benchmark 而非设计目标数字为准。现有测量面包括 interner、lexer、parser、resolver、turbo 和 bundle；方法见 [PERFORMANCE.md](PERFORMANCE.md)。
 
-## 10.7 缓存身份
+### 10.7 缓存身份
 
 目标浏览器、JSX、源码内容、压缩器版本、defines/drop flags、图边界的声明保留名/公开观察名/star 事实、可信编辑和保留名
 进入相关输入。optimizer key 不含最终 chunk 编号，持久层单独保存 retained request specifier，再映射为
@@ -389,33 +393,33 @@ body 重建这些语义或通过 helper/metaUrl token 扫描决定 runtime 注�
 单列 separator 回退查询。禁止对每条 mapping 从 token 列表头重新扫描，否则大模块会退化为
 `O(mapping × token)`，并直接拖慢启用 Source Map 的代码分割与 lazy workspace 首次构建。
 
-## 10.8 单机实现纪律
+### 10.8 单机实现纪律
 
-### 10.8.3 哈希表
+#### 10.8.3 哈希表
 
 内部非安全边界使用 `FxHashMap`；来自不可信网络的输入不直接进入可控碰撞的热表。
 
-### 10.8.5 数据布局
+#### 10.8.5 数据布局
 
 热路径优先紧凑结构和稳定 ID，但不得为尺寸牺牲生命周期或错误恢复正确性。
 
-# 11. 测试与质量
+## 11. 测试与质量
 
 单元、snapshot、fixture、Miri、Loom、Node API、类型、打包审计和平台 smoke 共同构成门禁，详见 [TESTING.md](TESTING.md)。字符串断言只能覆盖代码形态，关键 bundler 回归还需执行生成产物。
 
-# 12. 发布
+## 12. 发布
 
 主包与五个平台包使用同一版本。发布先验证源码和许可证，再在目标平台构建、审计不可变 tarball，Windows 原生构建还用 Yarn 4.16 PnP fixture 验证 Components 样式；之后先发平台包、最后发主包，并执行注册表干净安装。版本与 tarball 名从清单和 tag 动态取得。
 
-# 13. 风险与降级
+## 13. 风险与降级
 
 关键降级包括：增量引擎可关闭跨 revision 复用、危险 concat 回退独立 factory、单个无法证明安全的
 压缩候选保持原形、终端非 TTY 回退 plain 日志。Source Map
 不再关闭压缩或分包；优化表示不变量、可信编辑冲突或固定点不收敛返回构建诊断，不能静默输出旧路径
 或未压缩代码。Typed emitter 只消费最终 `TypedProgram`；不存在用于降级的 parser-AST/span emitter。
 
-# 14. 附录
+## 14. 附录
 
-## 14.1 依赖纪律
+### 14.1 依赖纪律
 
 编译核心外部依赖白名单在 workspace `Cargo.toml` 维护；网络、序列化、配置、终端和 Node 依赖限制在边缘 crate。Closure 风格压缩重写只使用 workspace 现有依赖和 Wake 自有测试语料，不复制或下载第三方实现、测试、二进制或 fixture。新增依赖同时接受许可证检查。

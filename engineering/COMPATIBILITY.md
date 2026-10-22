@@ -2,35 +2,38 @@
 
 本文为源码中的 `WAKE-COMPATIBILITY` 与 M1–M8 引用提供当前解释，并记录从 Crustify 迁移时形成的历史产品决策。公共文档不再维护旧工具迁移教程。
 
-# 0. 决策基线
+本文按迁移里程碑保留兼容决策及历史引用。当前用户接口从 [用户文档索引](../docs/README.md) 查阅，
+验证方式见 [TESTING.md](TESTING.md)。
+
+## 0. 决策基线
 
 1. 配置使用声明式 `wake.config.toml`，不执行 TypeScript/JavaScript 配置代码。
 2. 应用使用静态 HTML 外壳，不提供旧工具的运行时 SSR 配置能力。
 3. CLI、Node API 和文档构建共享 `wake_app`，避免兼容行为分叉。
 4. 无法声明化的回调型 `mods` 不直接兼容；有限扩展通过 `[hooks]`、alias、component scan、Preview 和主题表达。
 
-# M1 — 配置与 alias
+## M1 — 配置与 alias
 
 - 从项目起点向上发现 `wake.config.toml` 或 `package.json`；
 - `root_dir` 改变项目根；
 - 内置 `@` 指向 `src`、`@@` 指向根，自定义 alias 叠加；
 - Browserslist、TypeScript、React 和 define 使用声明字段。
 
-# M2 — 扫描、入口与 HTML
+## M2 — 扫描、入口与 HTML
 
 - `[[component_scan]]` 用目录、正则和 namespace 生成 `@@@/<namespace>` 模块；
 - `[html].entry` 定义虚拟入口；
 - `[html].template`、`public/index.html`、内置外壳按顺序选择；
 - `[hooks].bootstrap_path` 只保留声明数据，当前不替代普通入口。
 
-# M3 — Dev/Prod 产物
+## M3 — Dev/Prod 产物
 
 - dev 注入 development define、样式和整页 Live Reload；
 - prod 开启 Tree Shaking、压缩、分包、CSS 抽取和内容哈希；
 - `[dev_server]` 提供 host、port、open 和 HTTP/WS 代理；
 - 小资源内联、大资源独立输出，HTML 与 manifest 使用统一路径。
 
-# M4 — 转换与 Source Map
+## M4 — 转换与 Source Map
 
 - TypeScript 类型擦除与 React automatic runtime 为默认能力；
 - `.cjs` 文件按非严格 Script 起始上下文解析，显式 `"use strict"` 仍生效；`.js`/`.mjs`
@@ -38,7 +41,7 @@
 - 浏览器目标从显式配置、Browserslist 文件、package.json 或固定现代基线解析；
 - `transforms.include/exclude` 只覆盖已登记转换，不执行任意插件。
 
-## M4d — 精确 Source Map
+### M4d — 精确 Source Map
 
 Source Map 与生产压缩、确定性名字优化和代码分割可以同时启用。优化后的 mapped/unmapped 发射由同一
 typed token walk 完成，map 只是可选 sink，因此 JavaScript body 必须逐字节相同。`Source`/`Derived`
@@ -46,7 +49,7 @@ origin 提供源位置，改名 occurrence 通过 V3 `names` 保留原标识符�
 保持 unmapped。折叠、函数体内联、实参替换、可信 CSS 编辑和模块 wrapper 的细粒度映射分别以测试为
 兼容证据，未覆盖的来源关系不能仅凭 origin anchor 推断。
 
-## M4e — 压缩语义边界
+### M4e — 压缩语义边界
 
 `minify` 进入唯一的 Closure 风格显式 pass/固定点管线（当前 `wake-closure-minifier-v22`），不要求第二个
 名字优化开关，也不因模块源码长度改变行为。这里的“Closure 风格”只表示 Wake 对 pass 排序、变更跟踪和收敛模型的架构选择；
@@ -89,11 +92,11 @@ IIFE。Codegen 不提供 concat policy，也不会因压缩重新解释 wrapper 
 原子切换不提供兼容 emitter、旧压缩器 feature flag 或静默未压缩 fallback。IR 不变量、可信编辑、非法
 linker liveness、模块 finalize 和不收敛错误都必须成为构建诊断。旧压缩器只允许以冻结体积数字存在。
 
-# M5 — 高级语法
+## M5 — 高级语法
 
 parser/transform 支持项目测试覆盖的现代 JavaScript、TypeScript、JSX/TSX、装饰器相关语法和顶层 await。支持范围以测试与实际诊断为准，不使用“完全兼容所有 Babel 插件”的表述。
 
-# M6 — 边界收口
+## M6 — 边界收口
 
 组件 namespace、JSX、define 和死分支进入统一构建链。无法安全转换的语法应产生带路径和 Span 的诊断，不静默改变语义。
 
@@ -102,15 +105,15 @@ parser/transform 支持项目测试覆盖的现代 JavaScript、TypeScript、JSX
 缓存和 codegen request 保留原 specifier/kind。动态 import、应用、第三方、内部/嵌套入口不迁移。
 内部目标不受 source alias 改写，PnP 则必须由组件或 `packageExtensions` 显式声明依赖。
 
-# M7 — 根与不支持项
+## M7 — 根与不支持项
 
 `root_dir`、alias、入口、扫描、`.wake` 和输出均使用明确路径基准。Sass/Less 等未实现预处理器不伪装支持；项目需先生成 CSS 或接入上游步骤。
 
-# M8 — 多 chunk 与静态资源
+## M8 — 多 chunk 与静态资源
 
 开发与生产路径都能服务构建输出和静态资源；生产动态 import 使用 async chunk。文档站的 `base_path` 与普通应用的 `public_path` 独立，避免部署语义串线。
 
-# 兼容纪律
+## 兼容纪律
 
 - 兼容结论必须由 fixture、测试或迁移示例支持。
 - 旧工具的配置字段不因为名称相似就自动视为兼容。

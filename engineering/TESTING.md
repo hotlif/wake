@@ -1,6 +1,13 @@
 # Wake 测试与质量门禁
 
-本文描述仓库当前实际执行的验证。命令应从仓库根运行；需要原生 Node 绑定或 JavaScript 测试 host 的测试必须先执行 `corepack yarn native:build`。
+本文区分本地按影响范围选择的验证与 CI、发布完整门禁。命令应从仓库根运行；选中的测试需要原生
+Node 绑定或 JavaScript 测试 host 时，先确认产物与当前相关源码、依赖和构建配置一致。缺失或过期时
+执行 `corepack yarn native:build`；输入未变且已验证的本地产物可以复用。发布产物仍遵循第 6 节要求。
+
+按变更选择：[验证范围与复用](#验证范围与结果复用) · [Rust](#1-2-rust) · [JavaScript 与包消费](#1-3-javascript-依赖与包消费) ·
+[Lint](#1-4-lint) · [文档](#1-5-文档) · [CSS 编辑器](#1-6-crab-css-编辑器)。
+需要扩大验证时再查 [CI 矩阵](#2-ci-矩阵)、[回归矩阵](#3-回归矩阵)、[Miri/Loom](#4-miri-与-loom-分工)、
+[Benchmark](#5-benchmark-门禁) 和 [发布门禁](#6-发布门禁)。
 
 ## 工作顺序
 
@@ -23,9 +30,41 @@
 清理前确认路径归属；不按整个 `.tmp` 递归删除其他任务的缓存或产物。`.gitignore` 只忽略根
 `/.tmp/`，不隐藏源码或 fixture 内同名路径；已跟踪文件仍接受架构来源检查。
 
-# 1. 本地最小门禁
+## 1. 本地最小门禁
 
-Rust 修改：
+### 验证范围与结果复用
+
+先从目标所属 crate/package 的清单、现有测试或有效 ADR 的 `Validation` 定位验证入口，再按影响
+范围选择本节对应项。下面的命令是按场景选择的入口，不是每个任务都要依次执行的清单。
+
+| 变更范围 | 本地验证要求 |
+| --- | --- |
+| crate/package 内局部行为或内部重构 | 聚焦测试、所属 crate/package 的测试与静态检查；通过后停止扩大范围 |
+| 公共或跨层契约、共享语义、缓存或持久化 | 增加受影响消费者、协议两端和兼容测试；按调用关系确定涉及的 crate/package |
+| workspace 依赖或构建配置、广泛影响的共享基础设施 | 运行全 workspace 门禁及对应专项检查 |
+| 纯文档、版本或元数据 | 运行对应检查；不因修改了 Markdown 就构建全部产品或运行 Rust 全量测试 |
+| 发布、CI 策略变更或用户明确要求全面验证 | 执行相关 CI/发布完整门禁，见第 2、6 节 |
+
+公共 API、动态注册、生成代码、历史格式等影响范围不能仅由静态搜索排除；证据不足或聚焦测试暴露
+跨模块问题时，应补查相关入口并扩大验证。领域专项要求仍适用于对应变更，不以节省执行次数省略。
+
+同一相关源码、依赖、配置和工具链下已通过的检查可以复用，记录命令、结果和对应的代码状态；
+后续改动只使受影响检查失效。不要仅因结束一轮对话或进入下一阶段再次运行完整门禁。全量检查失败
+时先用失败用例定位并修复；聚焦测试通过后，再完成本次要求的全量门禁。缺少依赖或产物时先解决
+前置条件，避免原样重试相同失败命令。交付说明实际运行范围、复用证据和剩余风险。
+
+### 1.2 Rust
+
+局部修改先复现或运行聚焦测试，再运行所属 crate 门禁；将 `<crate>` 替换为实际包名，影响多个包时
+使用多个 `-p`。例如只改 `wake_lint_core` 的内部规则时，选择该 crate 及相应规则测试：
+
+```bash
+cargo fmt --all --check
+cargo clippy -p <crate> --all-targets -- -D warnings
+cargo test -p <crate>
+```
+
+workspace 依赖或构建配置、广泛影响的共享基础设施变更，以及要求完整 Rust 验证的 CI/发布阶段，运行：
 
 ```bash
 cargo fmt --all --check
@@ -59,7 +98,20 @@ cargo +1.95.0 clippy -p wake_federation_contract --all-targets -- -D warnings
 带 canonical checksum，声明为 conformance source 的少数 npm 包还必须精确 pin。Cargo build 与 npm
 lifecycle 下载被禁止，依赖和 Rusty V8 归档只能在独立、校验 checksum 的准备步骤获取。
 
-JavaScript/Yarn PnP 修改：
+### 1.3 JavaScript、依赖与包消费
+
+局部 JavaScript 修改先执行对应测试文件及所属 package 的检查；是否需要原生构建取决于选中的测试。
+按下表选择额外验证，只有相关输入发生变化或缺少有效结果时才重跑：
+
+| 变更内容 | 额外验证入口 |
+| --- | --- |
+| 依赖声明、锁文件或 PnP 安装 | `install --immutable --check-cache`、`yarn:lock:check`；PnP 解析变化加 `pnp:conformance:check`、`pnp:components:check` |
+| 包版本或发布元数据 | `versions:check`、`release:check`；打包内容变化加 `npm:pack:check` |
+| Node 绑定或测试 host | `native:build` 与相应 npm 集成测试 |
+| 公开 JavaScript API 或类型声明 | 对应 `npm:test:*`、`npm:typecheck:*`；TypeScript 兼容变化加 `typescript:7:check` |
+| 跨包解析、打包或发布消费 | 对应 PnP、tarball 和下述独立 npm 消费门禁 |
+
+下列为跨包安装、解析和发布验证的完整命令集合；局部修改按上表选用，不默认整组运行：
 
 ```bash
 corepack yarn install --immutable --check-cache
@@ -77,7 +129,7 @@ corepack yarn pnp:components:check
 npm 经典解析或发布消费修改还必须运行聚焦 resolver/watch 测试，并用本轮主包、CSS 包和 matching
 平台包 tarball 调用 `scripts/check-npm-consumer.mjs`。该脚本强制在源码仓库外创建 npm workspace，
 先执行 `npm install --package-lock-only`，确认尚无安装树，再执行 `npm ci --ignore-scripts`，最后验证
-CLI、CommonJS/ESM Node API、build、workspace link、CSS 与 Wake Test；项目任一祖先存在 `.pnp.cjs`
+CLI、CommonJS/ESM Node API、lint 诊断、build、workspace link、CSS、Wake Test 与 Unix test-host 可执行位；项目任一祖先存在 `.pnp.cjs`
 都会失败，防止把 npm 门禁误测成 PnP。
 
 `release:check` 要求每个公共 npm 包声明与发布工作流一致的 Git 仓库 URL
@@ -94,8 +146,8 @@ Windows 发布前浏览器检查失败且日志缺少结果时，可手动运行
 
 JavaScript 测试统一显式导入 `@crab-dev/wake/test`，由 `wake test` 执行；不得新增
 `node:test`、Jest/Deno runner 或调用官方 Node/Deno 的产品回退路径。测试 API 采用熟悉的
-`describe`/`test`/`expect` 形态，但门禁验证 Wake 自有契约而不是 Jest 兼容性。测试运行时的
-分层最小门禁为：
+`describe`/`test`/`expect` 形态，但门禁验证 Wake 自有契约而不是 Jest 兼容性。测试运行时局部修改
+选择受影响层的单元、conformance 或集成测试；跨层执行链路变更的完整门禁为：
 
 ```bash
 cargo test -p wake_ecma_vm -p wake_js_runtime -p wake_test_browser -p wake_test -p wake_test_host
@@ -144,7 +196,21 @@ corepack yarn architecture:test
 corepack yarn architecture:check
 ```
 
-Lint 产品修改还必须运行核心规则、原生 TypeScript 项目查询、LSP 坐标和迁移报告门禁：
+### 1.4 Lint
+
+Lint 局部修改按生产者和消费者选择验证入口；只改一条内部规则不要求运行无关的 LSP、SDK 或原生
+类型服务门禁。影响共享语义、配置或跨层契约时，增加消费该能力的集成测试：
+
+| 变更内容 | 验证范围 |
+| --- | --- |
+| 核心规则、诊断或 fix | 对应规则测试与 `wake_lint_core`；影响应用配置、诊断传递或写回时增加 `wake_app` 对应 lint 测试 |
+| 原生 TypeScript 查询或 host 选择 | 对应类型服务测试（含 `--ignored`）、host 选择脚本测试与消费查询的规则测试 |
+| LSP 或编辑器 | `wake_lint_lsp`、`lint:lsp:smoke`、`vscode:lint:check` |
+| 扩展 SDK 或迁移报告 | 对应 `lint:extension:test` 或 `lint:migration:test`；契约变化补消费端测试 |
+| 文件发现、项目根、模块图或 PnP | 对应 `wake_app` lint 集成测试与 `lint:real-project:test` |
+| 性能敏感的规则执行路径 | 对应行为回归及 `wake_lint_core` benchmark 编译；性能结论按第 5 节测量 |
+
+下列为 Lint 跨层产品验收的完整入口集合，发布或变更覆盖整个产品链路时运行；局部修改按上表选用。
 
 在运行被 `--ignored` 标记的原生类型服务测试前，执行 `node scripts/find-native-typescript.mjs
 --github-env`，由仓库 PnP 安装选择当前 runner 的 `@typescript/typescript-*` 原生编译器并设置
@@ -166,13 +232,22 @@ cargo bench -p wake_lint_core --bench lint --no-run --locked --offline
 node scripts/lint-lsp-smoke.mjs
 ```
 
-测试必须同时覆盖 parser-owned `Import`、`ExportFrom`、`Require` 和不映射的 `DynamicImport`；
+涉及 Crab 组件解析或模块请求身份的修改，测试必须同时覆盖 parser-owned `Import`、`ExportFrom`、
+`Require` 和不映射的 `DynamicImport`；
 loader 输入字节及字符串、模板、注释、正则诱饵；应用、其他第三方、组件内部/嵌套入口和伪 manifest
 负例；classic/workspace/virtual/unplugged/zip manifest identity；source alias 隔离；PnP declared 与
 `PnpDependency::Undeclared`；以及 readable/minified Node 执行和 cold/retained/persistent-warm 逐字节
 等价。仅检查 bundle 中的包名字符串不能代替运行时与结构化 request identity 证据。
 
-文档修改：
+### 1.5 文档
+
+只修改 `AGENTS.md`、`engineering/`、README 或 Skill 说明时，运行 `corepack yarn docs:check`；
+修改 `.agents/skills` 时还运行 `corepack yarn skill:check` 并按该 Skill 的验证约定处理。纯文字与链接
+变更不要求 `docs:build` 或 `cargo test -p wake_docs`。
+
+修改产品站点 `docs/` 的 MDX、导航、Demo、主题或其他实际构建输入时，增加 `corepack yarn docs:build`。
+修改 `wake_docs` 编译器、路由或运行时时，增加对应聚焦测试和所属 crate/package 门禁；完整 Docs 链路
+变更或发布验收使用：
 
 ```bash
 corepack yarn docs:check
@@ -183,6 +258,16 @@ cargo test -p wake_docs
 `docs:check` 校验 Frontmatter、canonical encoded route、站内路由和仓库文档链接，并执行 runtime route
 codec/search 测试；checker 与浏览器必须直接共享 `runtime/routes.mjs`，不能复制 slug 规则。`docs:build`
 验证真实 MDX/React 打包，而不只检查 Markdown 文本。
+
+ADR 0071 的 Docs Demo 视觉回归在 CI `browser-conformance` 的 Linux x64 目标上运行：先确认受审系统
+Chrome 的 CDP 身份，再构建当前 `wake_test_host` 与 CLI，显式执行
+`cargo test -p wake_cli --test docs_test docs_demo_matrix_uses_real_css_preview_and_reviewed_baselines -- --ignored --exact --nocapture --test-threads=1`。
+该用例在临时项目中验证四组合的缺失基线、显式创建、重跑匹配、CSS 差异及渲染和网络失败；它不代替
+产品站点的已审核截图基线。用例失败时保留临时项目，CI 上传截图、差异页与各阶段 JSON/错误输出。
+产品站点应将其基线随 Demo 源码提交，日常 CI 使用不带
+`--update-snapshots` 的 `wake docs test` 比较。
+
+### 1.6 Crab CSS 编辑器
 
 Crab CSS 编辑器修改：
 
@@ -212,7 +297,7 @@ scope 回退一致，避免嵌入式 CSS 值重新继承宿主 TypeScript 的 `k
 在真实 Extension Host 中键入属性前缀、接受自动弹出的候选并断言编辑结果，同时验证模板外位置
 返回不适用；不能只覆盖等同于 `Ctrl+Space` 的显式请求。
 
-# 2. CI 矩阵
+## 2. CI 矩阵
 
 `.github/workflows/ci.yml` 当前包含：
 
@@ -246,9 +331,9 @@ architecture job 的 all-target Cargo tree 与所有随后执行 NAPI CLI build 
 lock graph，不能使用 target-scoped fetch；Rusty V8 archive 校验仍必须保持 target-specific。NAPI
 结束后以 `git diff --exit-code -- Cargo.lock` 证明 offline metadata/build 没有改写锁文件。
 
-# 3. 回归矩阵
+## 3. 回归矩阵
 
-## 3.1 编译器
+### 3.1 编译器
 
 - lexer snapshot：字面量、模板、正则、ASI、类私有名和 JSX 边界；
 - parser/semantic：JS、TS、JSX、TSX、scope、引用、依赖与顶层 await；
@@ -290,7 +375,7 @@ lock graph，不能使用 target-scoped fetch；Rusty V8 archive 校验仍必须
 上述矩阵只有在对应命令实际通过后才能写成已验证能力；单点字符串断言、origin 元数据存在或单个
 mapped fixture 都不能替代运行时差分、重解析和完整 source-map 坐标断言。
 
-## 3.2 增量与缓存
+### 3.2 增量与缓存
 
 - 同内容二次构建应命中；
 - 单文件变化只失效受影响记录；
@@ -307,7 +392,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
   的代码、分包 map 和 assets 对拍。更多调度配置以及优化器保留依赖/pass 统计的跨线程对拍仍需扩展；
 - `wake_turbo` 红绿参考、并发压力、循环检测和纯并行降级通过。
 
-### 3.2.1 BuildSession 所有权门禁
+#### 3.2.1 BuildSession 所有权门禁
 
 - typed `BuildOptions` 必须覆盖 JSX、entry/chunk 命名、单 chunk hash、persistent cache 和完整
   bundler-facing Federation plan；每个新增语义选项都要有从 session 到产物或缓存身份的回归；
@@ -321,7 +406,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
   `BuildSession::from_incremental`。长期契约见
   [ADR 0027](decisions/0027-build-session-ownership-and-lifetime.md)。
 
-### 3.2.2 BuildGeneration 候选一致性门禁
+#### 3.2.2 BuildGeneration 候选一致性门禁
 
 - generation filesystem 用可变/计数 fake filesystem 覆盖七个 method family、success/failure replay、
   精确路径拼写、跨 retained/one-shot view 共享、并发 first-query single-flight 和 advance 后重新观察；
@@ -343,7 +428,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
   明确允许直接构造。长期契约见
   [ADR 0028](decisions/0028-build-generation-ownership-and-observation-cache.md)。
 
-### 3.2.3 精确文件发布门禁
+#### 3.2.3 精确文件发布门禁
 
 - `wake_app::output` 的故障注入必须在第二个 install 前失败并证明已安装文件、全部旧目标及外部
   sentinel 字节恢复；Windows 另以拒绝 delete sharing 的锁定第二目标覆盖真实 OS 失败；
@@ -366,7 +451,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
   在失效后回填。virtual zip `read_dir` 的返回值必须保持逻辑路径身份。见
   [ADR 0022](decisions/0022-yarn-pnp-ownership.md)。
 
-## 3.3 Bundler fixture
+### 3.3 Bundler fixture
 
 `fixtures/` 覆盖：
 
@@ -379,6 +464,23 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 - `2k-modules`：确定性 Northstar 商务控制台，验证 2000 个应用模块全部可达、生成摘要和精确运行时 oracle，再对比 Wake、Vite 与 webpack 的无缓存生产构建。
 
 关键语义必须执行产物或在真实服务器中验证。仅检查 bundle 字符串适合局部形态断言，不能替代运行时回归。
+`browser-conformance` CI 的 Linux x64 目标在确认受审系统 Chrome 身份后，显式执行
+`cargo test --locked --offline -p wake_test --test app_browser_conformance -- --ignored --nocapture --test-threads=1`。
+该浏览器证据覆盖 React 应用的一次 Live Reload 与状态重置，以及根路径/子路径的资源、导航和 404；
+失败时上传 `target/browser-artifacts/app-conformance/` 下的截图、控制台/网络记录及页面状态。
+同一 Linux x64 浏览器目标还显式执行
+`cargo test --locked --offline -p wake_test --test components_browser_conformance -- --ignored --nocapture --test-threads=1`。
+它在独立 Components 工作台验证类型生成的 Controls、默认值、字符串编辑后 iframe/URL 同步、显式 unset、
+重置、hash 深链和刷新恢复、视口选择，以及 Demo 抛错诊断后通过 Controls 编辑恢复；失败时上传
+`target/browser-artifacts/components-conformance/` 中的截图、控制台/网络记录和页面状态，并保留 fixture。
+生产 Docs 静态路由由同一目标显式执行
+`cargo test --locked --offline -p wake_test --test static_docs_browser_conformance -- --ignored --nocapture --test-threads=1`：
+以 `fixtures/react-docs` 构建 `/handbook/` 站点，在目录 index 与生成的 404 shell 静态托管下检查首页、
+站内导航、深层页面直达和刷新、Demo iframe 与脚本/样式的 base 前缀、public SVG 和缺失资源的 404。
+同一测试入口还在该生产站点的独立 Demo 中点击按钮并确认 iframe 内容与父页面高度同步变化；切换移动视口、
+展开源码和明暗主题时检查文档 URL、Demo 内部状态及父子 frame 的主题状态。
+失败时上传 `target/browser-artifacts/static-docs-conformance/` 的截图、控制台/网络记录、页面状态及保留的 fixture。
+当前浏览器矩阵尚未覆盖更多 Docs 页面、搜索、窄屏导航及其他受审浏览器平台的目标 runner 结果。
 `wake_ecma_codegen/tests/typed_pipeline_acceptance.rs` 是 owned optimizer 的统一差分 harness：完全自有的
 JS/TS/JSX/TSX 案例逐例生成 readable/minified/mapped body，重新解析两份 JavaScript，并在 Node VM 中
 比较返回值、异常类型和日志顺序；mapped/unmapped body 必须逐字节相同。Bundler 的 runtime differential
@@ -394,7 +496,7 @@ Library CommonJS 回归必须由 Node 加载最终入口和内部 preserve-modul
 字节不变。成功路径必须覆盖新目录首次声明、重复构建删除 stale、构建失败保留 last-good，以及 Docs
 route shell/public 资源与返回 inventory 一致。危险祖先用例不得把共享系统临时目录作为删除候选。
 
-## 3.4 Wake Federation
+### 3.4 Wake Federation
 
 - Contract JSON 固定 schema/runtime ABI、camelCase 字段、Asset/Type/Shared shape 与稳定 `FED_*` 码；
   unknown field、错误 schema/ABI、类型 build drift、MIME/SHA-384 和 production HTTP lock 必须失败；
@@ -429,7 +531,7 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
 - editor 类型控制面覆盖未变化 Manifest 不下载 bundle、仅 `dev_follow` probe、失败保留旧 index 并重试、
   pinned remote 的 lock/build/Manifest/type 摘要一致性，以及关闭 monitor 后不再启动同步写入。
 
-## 3.5 Docs
+### 3.5 Docs
 
 可覆盖展示接口使用 `corepack yarn docs:ui:test` 验证注册、默认回退、Context、异常和导航操作；
 `npm:typecheck:wake` 验证公共 props。`fixtures/docs-ui` 的默认、局部和完整覆盖配置都须完成开发与
@@ -450,7 +552,7 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
 - `base_path`、404 外壳、public 资源和静态托管路径。
 - 聚合挂载冲突、lazy single-flight、按 mount 隔离的 Live Reload、事务回滚和根/子 manifest。
 
-## 3.6 Node API
+### 3.6 Node API
 
 - ESM/CommonJS 导出一致；
 - build、bundle、BuildContext、应用/文档服务器和事件，包括 CLI/Node 的 `minify + sourceMap` 组合；
@@ -458,7 +560,7 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
 - experimental 句柄 dispose、字符串便捷入口和 TypeScript 声明；
 - 主包与五个平台包的版本、文件清单和可选依赖一致。
 
-## 3.7 React 优先测试系统
+### 3.7 React 优先测试系统
 
 - `wake_ecma_vm` 的 V8 realm、Promise job、异常位置、终止和 handle 生命周期；除该 crate 外
   任意 workspace crate 直接依赖 `deno_core` 都必须被架构门禁拒绝；
@@ -492,7 +594,7 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
   但不计入 stable conformance；Linux ARM64 执行完整非 browser 合同并保存 `unavailable` 证据。
   浏览器二进制不得进入平台包，任何平台都不得在门禁内下载替代浏览器。
 
-# 4. Miri 与 Loom 分工
+## 4. Miri 与 Loom 分工
 
 Miri 用于 `ModuleAst` 自引用持有者等 Rust 自有 unsafe 内存模型。V8 是外部原生引擎，不能用
 Miri 结果替代 isolate/handle/termination 的真实进程测试；这些生命周期必须由普通测试、崩溃
@@ -503,7 +605,7 @@ Loom 使用 `RUSTFLAGS="--cfg loom"` 穷举 single-flight 与可建模的 test-h
 普通 workspace test 不能替代 Loom，Loom 也不覆盖 V8、Chromium、resolver、bundler 或服务器
 端到端行为。
 
-# 5. Benchmark 门禁
+## 5. Benchmark 门禁
 
 CI 当前执行：
 
@@ -515,6 +617,10 @@ cargo bench --workspace --no-run
 Lint 的专用基线为 `cargo bench -p wake_lint_core --bench lint`，覆盖 16 KiB 与 128 KiB
 源码的冷解析/规则执行吞吐；`scripts/run-performance.mjs --mode key` 会把该基线纳入
 跨 revision 的 Criterion 报告，并与 parser/compiler 等关键路径共同执行回归判定。
+  独立 Performance 工作流的完整 `canary` 运行另外从既有 artifact 汇总最多 12 份相同记录环境与
+  benchmark 定义的历史样本，报告中位数/MAD。该历史汇总只报告；它尚无可验证的固定物理
+  runner 和逐 benchmark 噪声阈值，因此不作为阻断门禁。原始 Criterion artifact 与轻量
+  `report.json` 快照保留 90 天，查询失败会在 Performance job summary 标出。
 
 第一条用稳定 work-count 检查 edit-one 的 loader、resolver、link/optimize/chunk 与 codegen 工作局部性；
 第二条保证 benchmark 可编译。`typed_pipeline_owned_payload_never_grows_and_shrinks_in_aggregate` 使用四个
@@ -526,13 +632,13 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
 旧实现只保留审阅过的 body 与数字基线，不保留可执行 fallback。任何性能数字仍须按
 [PERFORMANCE.md](PERFORMANCE.md) 保存环境信息。
 
-# 6. 发布门禁
+## 6. 发布门禁
 
 发布 workflow 在 tag 上：
 
 1. 运行 workspace test、clippy 和许可证检查；
 2. 在 Windows、macOS x64/arm64、manylinux glibc 2.28 x64/arm64 构建；
-3. 审计七个不可变 tarball 的版本、许可证、文件和体积；五个平台包必须包含唯一 Node binding、
+3. 审计八个不可变 tarball 的版本、许可证、文件和体积；五个平台包必须包含唯一 Node binding、
    `test-host/wake-test-host[.exe]`、可复算 checksum/build ID 的 native manifest、SPDX SBOM 与第三方
    许可证清单；独立准备步骤中的 Rusty V8 target 归档必须先匹配固定 SHA-256，再以本地 archive
    输入 locked/offline Cargo build；仓库和平台包不得包含第三方源码、浏览器、下载器、install
@@ -540,8 +646,10 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
 4. 在 Windows 原生发布 leg 中把主包和五个平台包打成本地 tarball，以 Yarn 4.16 PnP 构建 Components fixture，并检查 internal runtime、Lucide 运行时导出、hashed CSS link 和 18 个组件前缀；
 5. 发布前在五个目标平台和 Node 22.14/24/26 的 15 个组合中，以本次构建的主包、CSS 包和 matching
    platform package 本地 tarball 先生成 lock、再执行 `npm ci --ignore-scripts`；外部已发布依赖可以来自 registry，
-   但三个待发布包必须保持可验证的 `file:` 来源，消费项目必须位于源码 PnP 根之外。每个组合执行 `wake test`、`runTests()` 和长期
-   `TestContext` lifecycle。Node 24 在 Windows/Linux x64 上以系统 Chrome、Edge 或 Chromium，分别针对
+   但三个待发布包必须保持可验证的 `file:` 来源，消费项目必须位于源码 PnP 根之外。每个组合检查
+   `wake lint` 与 CommonJS/ESM Node `lint()` 对同一错误源码的诊断、退出状态，并执行 `wake test`、
+   `runTests()` 和长期 `TestContext` lifecycle；Unix 目标还需核实安装后的 `wake-test-host` 可执行位。
+   Node 24 在 Windows/Linux x64 上以系统 Chrome、Edge 或 Chromium，分别针对
    Windows x64 的 reviewed major 151 或 152、Linux x64 的 reviewed major 151 或 152 执行 blocking conformance；在 macOS x64 上以 reviewed major 150 或 151、macOS arm64
    上以 reviewed major 150 或 152 执行
    blocking React/browser/screenshot 功能 smoke；两者都从 `wake.test.v1` 结果校验 family/major 并
@@ -553,7 +661,7 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
    per-target browser evidence，并再次证明 stable readiness 仍为 blocked。平台包的硬上限为 64 MiB
    packed / 192 MiB unpacked，56 MiB packed 起发布 warning；运行期不得下载 host 或浏览器。
 
-部分发布失败不能覆盖已有 npm 版本；修复后统一提升七个包和 workspace 版本。
+部分发布失败不能覆盖已有 npm 版本；修复后统一提升八个包和 workspace 版本。
 
 Wake Test 仍是 experimental。除上述通用发布门禁外，转为 stable 前还必须同时满足：从 registry
 lock 记录固定并审计 Deno/V8 与私有 DOM adapter 的来源、checksum、许可证和 SBOM；在五个平台执行 fast DOM
