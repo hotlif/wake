@@ -1,0 +1,9 @@
+{
+  "name": "@wake/pnp-shared-tsconfig",
+  "version": "1.0.0",
+  "private": true,
+  "exports": {
+    "./strict.json": "./strict.json"
+  },
+  "files": ["strict.json"]
+}

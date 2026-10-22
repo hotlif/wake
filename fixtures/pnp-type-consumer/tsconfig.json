@@ -1,0 +1,7 @@
+{
+  "extends": "@wake/pnp-shared-tsconfig/strict.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["consumer.ts"]
+}
