@@ -107,6 +107,7 @@ jobs:
         with:
           name: npm-consumer-${{ matrix.platform }}
           path: artifacts
+      - run: node --test scripts/npm-consumer-lint-smoke.test.mjs
       - name: Clean npm ci consumer outside the PnP source tree
         run: node scripts/check-npm-consumer.mjs
         env:

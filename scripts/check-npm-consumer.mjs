@@ -12,6 +12,8 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 
+import { checkInstalledTestHost, runInstalledLintSmoke } from './npm-consumer-lint-smoke.mjs'
+
 const repositoryRoot = resolve(import.meta.dirname, '..')
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const childEnvironment = { ...process.env }
@@ -354,6 +356,8 @@ for (const [name, { archiveName }] of optionalPlatformArchives) {
   }
 }
 
+checkInstalledTestHost(project, platformPackage)
+
 const workspaceLink = realpathSync(join(project, 'node_modules/wake-npm-consumer-shared'))
 const workspaceSource = realpathSync(join(project, 'packages/shared'))
 const normalizeCase = (value) => process.platform === 'win32' ? value.toLowerCase() : value
@@ -364,6 +368,7 @@ if (normalizeCase(workspaceLink) !== normalizeCase(workspaceSource)) {
 const wakeCli = join(project, 'node_modules', '@crab-dev', 'wake', 'bin', 'wake.mjs')
 if (!existsSync(wakeCli)) throw new Error(`Missing installed Wake CLI ${wakeCli}`)
 run(process.execPath, [wakeCli, '--version'], project)
+runInstalledLintSmoke(project, wakeCli)
 run(process.execPath, ['-e', [
   "const wake=require('@crab-dev/wake')",
   "const css=require('@crab-dev/css')",
