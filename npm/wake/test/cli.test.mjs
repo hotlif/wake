@@ -9,6 +9,18 @@ import { test } from '@crab-dev/wake/test'
 const cli = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url))
 const fixture = fileURLToPath(new URL('../../../fixtures/hello-esm/src/index.js', import.meta.url))
 
+test('docs test validates matrix and reporter arguments', () => {
+  for (const args of [
+    ['--viewport', '0x720'], ['--viewport', '1x0'], ['--viewport', 'oops'],
+    ['--theme', 'system'], ['--theme', 'dark', '--theme', 'dark'],
+    ['--reporter', 'invalid'], ['--output', 'report.json'], ['--watch'],
+  ]) {
+    const output = run(['docs', 'test', ...args])
+    assert.equal(output.status, 2, output.stderr)
+  }
+  assert.match(run(['docs', 'test', '--help']).stdout, /--viewport/)
+})
+
 function run(args) {
   return spawnSync(process.execPath, [cli, ...args], {
     encoding: 'utf8',

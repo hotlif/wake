@@ -12,6 +12,7 @@ export const {
   bundle,
   lint,
   runTests,
+  testDocs,
   generateCssToken,
   generateDocgen,
   initializeFederation,

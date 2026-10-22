@@ -332,6 +332,25 @@ fn parse_test_shard(value: &str) -> Result<String, String> {
 
 #[derive(Subcommand)]
 enum DocsCommand {
+    /// Run browser screenshots for all documentation demos.
+    Test {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long = "theme", value_parser = ["light", "dark"])]
+        themes: Vec<String>,
+        #[arg(long = "viewport", value_parser = parse_docs_viewport)]
+        viewports: Vec<wake_app::DocsTestViewport>,
+        #[arg(long)]
+        update_snapshots: bool,
+        #[arg(long)]
+        browser_path: Option<PathBuf>,
+        #[arg(long)]
+        headful: bool,
+        #[arg(long, value_enum, default_value_t = TestReporterArg::Pretty)]
+        reporter: TestReporterArg,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Start the documentation development server.
     Dev {
         /// Project root.
@@ -364,6 +383,20 @@ enum DocsCommand {
 enum DocsModeArg {
     Site,
     Components,
+}
+
+fn parse_docs_viewport(value: &str) -> Result<wake_app::DocsTestViewport, String> {
+    let (width, height) = value
+        .split_once('x')
+        .ok_or("viewport must be WIDTHxHEIGHT")?;
+    let width = width.parse::<u32>().map_err(|_| "invalid viewport width")?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| "invalid viewport height")?;
+    if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
+        return Err("viewport dimensions must be from 1 to 8192".into());
+    }
+    Ok(wake_app::DocsTestViewport { width, height })
 }
 
 #[derive(Subcommand)]
@@ -647,6 +680,39 @@ fn main() -> ExitCode {
         },
         Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port, ui, cli.ui),
         Command::Docs { command } => match command {
+            DocsCommand::Test {
+                root,
+                themes,
+                viewports,
+                update_snapshots,
+                browser_path,
+                headful,
+                reporter,
+                output,
+            } => ensure_static_mode(cli.ui).and_then(|()| {
+                let defaults = wake_app::DocsTestOptions::default();
+                cmd_docs_test(
+                    wake_app::DocsTestOptions {
+                        root: Some(root),
+                        themes: if themes.is_empty() {
+                            defaults.themes
+                        } else {
+                            themes
+                        },
+                        viewports: if viewports.is_empty() {
+                            defaults.viewports
+                        } else {
+                            viewports
+                        },
+                        update_snapshots,
+                        browser_path,
+                        headful,
+                    },
+                    reporter,
+                    output.as_deref(),
+                    ui,
+                )
+            }),
             DocsCommand::Dev { root, port, mode } => cmd_docs_dev(&root, port, mode, ui, cli.ui),
             DocsCommand::Build {
                 root,
@@ -688,6 +754,7 @@ fn main() -> ExitCode {
             let selected_reporter = reporter.unwrap_or_default();
             cmd_test(
                 wake_app::TestOptions {
+                    docs_plan: None,
                     root: Some(root),
                     patterns,
                     name_pattern,
@@ -786,6 +853,35 @@ fn cmd_federation_lock(root: &Path, ui: Ui) -> Result<(), ExitCode> {
             Err(ExitCode::FAILURE)
         }
     }
+}
+
+fn cmd_docs_test(
+    options: wake_app::DocsTestOptions,
+    reporter: TestReporterArg,
+    output: Option<&Path>,
+    ui: Ui,
+) -> Result<(), ExitCode> {
+    if reporter == TestReporterArg::Pretty && output.is_some() {
+        eprintln!("wake: --output requires --reporter json or --reporter junit");
+        return Err(ExitCode::from(2));
+    }
+    let cancellation = wake_app::CancellationToken::default();
+    let signal = cancellation.clone();
+    ctrlc::set_handler(move || signal.cancel()).map_err(|error| {
+        eprintln!("wake: could not install test interrupt handler: {error}");
+        ExitCode::from(2)
+    })?;
+    let result = wake_app::test_docs(options, &cancellation)
+        .map_err(|error| test_command_error_exit(ui, &error, &cancellation))?;
+    match reporter {
+        TestReporterArg::Pretty => print_pretty_test_result(&result, ui),
+        TestReporterArg::Json => {
+            let report = serde_json::to_string(&result).map_err(|_| ExitCode::from(2))?;
+            write_test_report(&report, output)?;
+        }
+        TestReporterArg::Junit => write_test_report(&junit_test_report(&result), output)?,
+    }
+    test_result_exit(&result)
 }
 
 fn cmd_test(

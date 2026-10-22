@@ -12,6 +12,9 @@ pub mod protocol;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct TestOptions {
+    /// Product-prepared visual suites. Not accepted by the public runTests Node request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs_plan: Option<DocsTestPlan>,
     pub root: Option<PathBuf>,
     pub patterns: Vec<String>,
     pub name_pattern: Option<String>,
@@ -77,6 +80,32 @@ pub enum TestStatus {
     Failed,
     Skipped,
     Todo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DocsTestPlan {
+    pub schema_version: String,
+    pub output_dir: PathBuf,
+    pub base_path: String,
+    pub demos: Vec<DocsTestDemo>,
+    pub themes: Vec<String>,
+    pub viewports: Vec<DocsTestViewport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DocsTestDemo {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocsTestViewport {
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

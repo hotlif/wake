@@ -365,6 +365,73 @@ jobs:
         run: cargo test --locked --offline -p wake_test --test browser_coverage_conformance -- --ignored --nocapture
         env:
           CARGO_NET_OFFLINE: "true"
+      - name: Build Docs Demo test host and CLI
+        if: matrix.target == 'linux-x64-gnu'
+        run: cargo build --locked --offline -p wake_test_host -p wake_cli
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Docs Demo visual browser regression
+        id: docs_demo
+        if: matrix.target == 'linux-x64-gnu'
+        run: cargo test --locked --offline -p wake_cli --test docs_test docs_demo_matrix_uses_real_css_preview_and_reviewed_baselines -- --ignored --exact --nocapture --test-threads=1
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Upload Docs Demo visual diagnostics on failure
+        if: failure() && matrix.target == 'linux-x64-gnu' && steps.docs_demo.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-demo-visual-diagnostics-ci-linux-x64-gnu
+          path: |
+            target/docs-visual-*/**
+            ${{ runner.temp }}/wake-browser-evidence.json
+          if-no-files-found: warn
+      - name: App browser product flow conformance
+        id: app_browser
+        if: matrix.target == 'linux-x64-gnu'
+        run: cargo test --locked --offline -p wake_test --test app_browser_conformance -- --ignored --nocapture --test-threads=1
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Upload app browser diagnostics on failure
+        if: failure() && matrix.target == 'linux-x64-gnu' && steps.app_browser.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-browser-diagnostics-ci-linux-x64-gnu
+          path: |
+            target/browser-artifacts/app-conformance/**
+            ${{ runner.temp }}/wake-browser-evidence.json
+          if-no-files-found: warn
+      - name: Components Controls and URL browser conformance
+        id: components_browser
+        if: matrix.target == 'linux-x64-gnu'
+        run: cargo test --locked --offline -p wake_test --test components_browser_conformance -- --ignored --nocapture --test-threads=1
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Upload Components browser diagnostics on failure
+        if: failure() && matrix.target == 'linux-x64-gnu' && steps.components_browser.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: components-browser-diagnostics-ci-linux-x64-gnu
+          path: |
+            target/browser-artifacts/components-conformance/**
+            target/wake-components-browser-*/**
+            ${{ runner.temp }}/wake-browser-evidence.json
+          if-no-files-found: warn
+      - name: Production Docs routes and Demo interaction browser conformance
+        id: static_docs_browser
+        if: matrix.target == 'linux-x64-gnu'
+        run: cargo test --locked --offline -p wake_test --test static_docs_browser_conformance -- --ignored --nocapture --test-threads=1
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - name: Upload production Docs browser diagnostics on failure
+        if: failure() && matrix.target == 'linux-x64-gnu' && steps.static_docs_browser.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-docs-browser-diagnostics-ci-linux-x64-gnu
+          path: |
+            target/browser-artifacts/static-docs-conformance/**
+            target/wake-static-docs-browser-*/**
+            ${{ runner.temp }}/wake-browser-evidence.json
+          if-no-files-found: warn
       - name: Upload reviewed browser evidence
         uses: actions/upload-artifact@v4
         with:

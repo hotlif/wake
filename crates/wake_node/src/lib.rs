@@ -1088,6 +1088,7 @@ impl RawNodeTestWorkers {
 impl RawTestOptions {
     fn into_app(self) -> Result<wake_app::TestOptions, WakeError> {
         Ok(wake_app::TestOptions {
+            docs_plan: None,
             root: self.root,
             patterns: self.patterns,
             name_pattern: self.name_pattern,
@@ -1614,6 +1615,33 @@ pub fn native_run_tests(
             let host_path = host_path.map(PathBuf::from);
             let result =
                 wake_app::run_tests_with_host(options, host_path.as_deref(), &cancellation)?;
+            serde_json::to_value(result)
+                .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
+        }),
+        signal,
+    )
+}
+
+#[napi(js_name = "testDocs")]
+pub fn native_test_docs(
+    options_json: Option<String>,
+    signal: Option<AbortSignal>,
+    host_path: Option<String>,
+) -> AsyncTask<JsonTask> {
+    let cancellation = CancellationToken::default();
+    if let Some(signal) = &signal {
+        let cancellation = cancellation.clone();
+        signal.on_abort(move || cancellation.cancel());
+    }
+    async_json(
+        JsonTask::new(move || {
+            let options = parse_optional_node_request::<wake_app::DocsTestOptions>(
+                options_json,
+                "WAKE_TEST_CONFIG",
+            )?;
+            let host_path = host_path.map(PathBuf::from);
+            let result =
+                wake_app::test_docs_with_host(options, host_path.as_deref(), &cancellation)?;
             serde_json::to_value(result)
                 .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))
         }),

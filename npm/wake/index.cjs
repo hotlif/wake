@@ -243,6 +243,11 @@ async function generateDocgen(options) {
   return invoke(native.generateDocgen(JSON.stringify(value), signal))
 }
 
+async function testDocs(options) {
+  const [value, signal] = splitTestOptions(options)
+  return invoke(native.testDocs(JSON.stringify(value), signal, native.__wakeTestHostPath))
+}
+
 function validateLintSignal(signal) {
   if (signal !== undefined && (typeof signal?.addEventListener !== 'function' || typeof signal?.removeEventListener !== 'function' || typeof signal?.aborted !== 'boolean')) {
     throw new WakeError('WAKE_LINT_CONFIG', 'signal must be an AbortSignal')
@@ -602,6 +607,7 @@ module.exports = {
   bundle,
   lint,
   runTests,
+  testDocs,
   generateCssToken,
   generateDocgen,
   initializeFederation,

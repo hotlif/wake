@@ -15,6 +15,7 @@ import {
   initializeFederation,
   lint,
   runTests,
+  testDocs,
   startDevServer,
   startDocsDevServer,
   type DevServerFederationUpdatedEvent,
@@ -28,6 +29,18 @@ import {
   type WakeErrorOptions,
 } from '@crab-dev/wake'
 import * as wakeContract from '@crab-dev/wake'
+
+const docsVisualResult: Promise<TestRunResult> = testDocs({
+  themes: ['light', 'dark'], viewports: [{ width: 390, height: 844 }],
+  updateSnapshots: false, signal: new AbortController().signal,
+})
+void docsVisualResult
+// @ts-expect-error Docs themes must be deterministic.
+testDocs({ themes: ['system'] })
+// @ts-expect-error Docs visual tests do not support watching.
+testDocs({ watch: true })
+// @ts-expect-error Private product plans are not ordinary test options.
+runTests({ docsPlan: {} })
 import {
   ParsedModule,
   analyze,

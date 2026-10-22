@@ -5,6 +5,7 @@
 //! owned models in this module.
 
 mod coverage_threshold;
+mod docs;
 mod git_changed;
 mod selection;
 
@@ -594,6 +595,15 @@ fn run_tests_with_selection_cached(
     watch_request: Option<TestWatchRequest>,
     cache: &mut TestRunCache,
 ) -> Result<TestRunResult, TestError> {
+    if options.docs_plan.is_some() {
+        if watch_request.is_some() || options.watch {
+            return Err(TestError::new(
+                "WAKE_TEST_CONFIG",
+                "Docs visual tests do not support watch",
+            ));
+        }
+        return docs::run(&options, &cancellation);
+    }
     let started = Instant::now();
     let root = match options.root.clone() {
         Some(path) => path,

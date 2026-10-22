@@ -36,6 +36,33 @@ wake docs build [ROOT] [--outdir DIR] [--base PATH] [--mode site|components]
 站点和工作台，`lazy` 工作区直到第一次请求才打包。显式 `--mode components` 仍只运行当前
 项目的 standalone 工作台，不执行聚合发现。
 
+## Demo 视觉回归（experimental）
+
+```text
+wake docs test [ROOT] [--theme light|dark ...] [--viewport WIDTHxHEIGHT ...]
+               [--update-snapshots] [--browser-path FILE] [--headful]
+               [--reporter pretty|json|junit] [--output FILE]
+```
+
+自动发现当前单站文档目录中的 Demo，构建真实生产页面，再按主题与视口组合截图。默认矩阵为
+light/dark × 1280×720/390×844；重复 `--theme` 或 `--viewport` 可以覆盖对应轴。每个组合使用独立
+浏览器上下文，保留 Docs Preview、CSS、资源和 Demo 的初始 `meta.args`。
+
+首次运行缺失基线会失败；审核后显式加 `--update-snapshots` 创建或更新，再移除该参数运行 CI。
+基线沿用 Wake Test 的渲染 profile，保存在每个 Demo 旁的 `__screenshots__`；失败比较生成
+`__diffs__` 中的 received PNG 和 HTML 差异页面。报告中的 suite 路径与名称定位 Demo、主题和视口。
+不会把加载占位、渲染错误、资源失败或超时保存成成功基线。
+
+```bash
+npx wake docs test . --update-snapshots
+npx wake docs test . --reporter json --output reports/demos.json
+```
+
+首版只验证单站 Demo 的初始渲染；工作区聚合配置会明确拒绝，请分别指定子项目根目录。
+需要系统 Chrome、Edge 或 Chromium；外部网络不开放，Demo 应使用本地确定性资源。
+浏览器 locale、timezone、sandbox、设备比例和超时沿用 `[test]` 配置；主题与视口由本命令矩阵指定。
+退出码沿用测试命令：成功 0、测试失败 1、配置/构建/宿主错误 2、取消 130。
+
 ## 开发控制台
 
 交互式终端中的 `docs dev` 默认启用全屏控制台，也可以用 `--ui plain` 强制输出流式日志。控制台的

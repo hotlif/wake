@@ -34,3 +34,24 @@ const result = await buildDocs({
 
 `site` 模式自动读取 `[[docs.workspace]]`。聚合服务器会发送 `workspaceState`，工作区重建的
 `rebuildStart` 与 `rebuilt` 还包含 `workspace` 和 `basePath`。
+
+## `testDocs(options)`（experimental）
+
+```ts
+import { testDocs } from "@crab-dev/wake";
+
+const result = await testDocs({
+  root: process.cwd(),
+  themes: ["light", "dark"],
+  viewports: [{ width: 1280, height: 720 }, { width: 390, height: 844 }],
+  updateSnapshots: false,
+});
+if (!result.success) process.exitCode = 1;
+```
+
+构建当前单站并验证全部 Demo 的初始渲染，返回与 `runTests()` 相同的 `TestRunResult`。
+默认采用示例中的矩阵；主题必须为不重复的 light/dark，视口为 1–8 个不重复尺寸，每维 1–8192。
+支持 `browserPath`、`headful` 和 `signal: AbortSignal`。缺失基线默认失败；显式
+`updateSnapshots: true` 才创建或更新。报告中的 artifacts 包含基线、received 和 HTML 差异路径。
+配置、构建及宿主错误拒绝 Promise；截图不匹配和 Demo 运行错误返回 `success: false`。
+首版不支持工作区聚合、watch 或交互步骤，详情见 [CLI 参考](/reference/cli/docs)。

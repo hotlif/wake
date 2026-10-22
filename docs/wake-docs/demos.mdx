@@ -62,6 +62,11 @@ export default function CounterDemo() {
 
 ## 常见错误
 
+可以使用 `wake docs test .` 对全部 Demo 运行主题与视口截图矩阵。首次审核后用
+`wake docs test . --update-snapshots` 建立基线，后续 CI 直接比较。参见
+[Demo 视觉回归](/reference/cli/docs)。此功能仍为 experimental，
+首版检查初始渲染，交互行为继续使用显式 Wake Test 测试。
+
 - Demo 不应依赖外部网络、当前时间或页面外的可变全局状态。
 - `src` 和 `glob` 必须是静态字面量，构建器才能建立依赖。
 

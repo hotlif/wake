@@ -26,6 +26,7 @@ import {
   generateDocgen,
   initializeFederation,
   runTests,
+  testDocs,
   startDevServer,
   startDocsDevServer,
   version,
@@ -771,6 +772,54 @@ test('native lint fix modes return final source and publish only when requested'
   }
 })
 
+test('Docs visual API runs the matching host and returns screenshot artifacts', async () => {
+  const parent = fileURLToPath(new URL('../../../target/', import.meta.url))
+  const root = await mkdtemp(join(parent, 'wake-node-docs-visual-'))
+  try {
+    await mkdir(join(root, 'docs'))
+    await writeFile(join(root, 'package.json'), JSON.stringify({ dependencies: { react: '19.2.8', 'react-dom': '19.2.8' } }))
+    await writeFile(join(root, 'wake.config.toml'), '[test]\ntimeout_ms = 15000\n')
+    await writeFile(join(root, 'docs/navigation.toml'), "[[group]]\nid = 'start'\ntitle = 'Start'\npages = ['index']\n")
+    await writeFile(join(root, 'docs/index.mdx'), '# Demos\n<Demo src="./button.demo.tsx" />\n')
+    await writeFile(join(root, 'docs/button.demo.tsx'), 'export default function Demo() { return <button>Ready</button> }')
+    const options = { root, themes: ['light'], viewports: [{ width: 390, height: 844 }] }
+    const missing = await testDocs(options)
+    assert.equal(missing.success, false)
+    assert.equal(missing.snapshot.unmatched, 1)
+    assert.equal(missing.suites[0].path, 'docs/button.demo.tsx')
+    const updated = await testDocs({ ...options, updateSnapshots: true })
+    assert.equal(updated.success, true, JSON.stringify(updated))
+    assert.equal(updated.snapshot.added, 1)
+    const matched = await commonjs.testDocs(options)
+    assert.equal(matched.success, true, JSON.stringify(matched))
+    assert.equal(matched.snapshot.matched, 1)
+    assert.equal(matched.environment.kind, 'browser')
+    assert.ok(matched.artifacts.some(artifact => artifact.kind === 'screenshot-baseline'))
+    const cli = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url))
+    const result = spawnSync(process.execPath, [cli, 'docs', 'test', root, '--theme', 'light', '--viewport', '390x844', '--reporter', 'json'], { encoding: 'utf8', env: process.env, timeout: 30000 })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(JSON.parse(result.stdout).snapshot.matched, 1)
+    const invalid = spawnSync(process.execPath, [cli, 'docs', 'test', '--viewport', '0x720'], { encoding: 'utf8', env: process.env, timeout: 30000 })
+    assert.equal(invalid.status, 2)
+
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('Docs visual requests validate the matrix and reject unsupported options before building', async () => {
+  for (const options of [
+    { themes: [] }, { themes: ['system'] }, { themes: ['dark', 'dark'] },
+    { viewports: [] }, { viewports: [{ width: 0, height: 720 }] },
+    { viewports: [{ width: 390, height: 844 }, { width: 390, height: 844 }] },
+    { watch: true }, { docsPlan: {} }, { updateSnapshots: 'all' },
+  ]) {
+    await assert.rejects(testDocs(options), error => error instanceof WakeError && error.code === 'WAKE_TEST_CONFIG')
+  }
+  await assert.rejects(runTests({ docsPlan: {} }), error => error.code === 'WAKE_TEST_CONFIG')
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(testDocs({ signal: controller.signal }))
+})
+
 test('loads the same API from ESM and CommonJS', () => {
   const expectedRuntimeExports = [
     'BuildContext',
@@ -791,6 +840,7 @@ test('loads the same API from ESM and CommonJS', () => {
     'initializeFederation',
     'lint',
     'runTests',
+    'testDocs',
     'startDevServer',
     'startDocsDevServer',
     'version',
@@ -832,6 +882,7 @@ test('loads the exact freshly built native addon ABI', () => {
     'lint',
     'parse',
     'runTests',
+    'testDocs',
     'startDevServer',
     'startDocsDevServer',
     'tokenize',

@@ -491,6 +491,19 @@ export interface OutputFile {
   bytes: number
 }
 
+/** Experimental visual regression of every Demo in one Docs site. */
+export interface DocsTestOptions {
+  root?: string
+  /** Defaults to both light and dark. Values must be unique. */
+  themes?: Array<'light' | 'dark'>
+  /** Defaults to 1280x720 and 390x844; 1–8 unique sizes, dimensions 1–8192. */
+  viewports?: Array<{ width: number; height: number }>
+  /** Create/update reviewed baselines. Defaults to false, including missing baselines. */
+  updateSnapshots?: boolean
+  browserPath?: string
+  headful?: boolean
+}
+
 export interface BuildResult {
   success: true
   moduleCount: number
@@ -818,6 +831,7 @@ export function initializeFederation(options?: FederationControlOptions): Promis
 export function generateFederationLock(options?: FederationControlOptions): Promise<FederationLockResult>
 export function createBuildContext(options?: BuildOptions): Promise<BuildContext>
 export function runTests(options?: TestOptions & { signal?: AbortSignal }): Promise<TestRunResult>
+export function testDocs(options?: DocsTestOptions & { signal?: AbortSignal }): Promise<TestRunResult>
 export function createTestContext(options?: TestOptions): Promise<TestContext>
 export function startDevServer(options?: DevServerOptions): Promise<DevServer>
 export function buildDocs(options?: DocsBuildOptions): Promise<DocsBuildResult>
@@ -841,6 +855,7 @@ declare const wake: {
   createBuildContext: typeof createBuildContext
   createLintContext: typeof createLintContext
   runTests: typeof runTests
+  testDocs: typeof testDocs
   createTestContext: typeof createTestContext
   startDevServer: typeof startDevServer
   startDocsDevServer: typeof startDocsDevServer

@@ -15,6 +15,7 @@ import {
   initializeFederation,
   lint,
   runTests,
+  testDocs,
   startDevServer,
   startDocsDevServer,
   version,
@@ -56,6 +57,9 @@ Usage:
   wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open]
   wake docs build [root] [--mode site|components] [--outdir DIR] [--base PATH]
   wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
+  wake docs test [root] [--theme light|dark ...] [--viewport WIDTHxHEIGHT ...]
+                 [--update-snapshots] [--browser-path FILE] [--headful]
+                 [--reporter pretty|json|junit] [--output FILE]
   wake parse <file> [--format auto|human|json]
   wake tokenize <file> [--format auto|human|json]
   wake lint [paths...] [--root DIR] [--format auto|human|json] [--watch]
@@ -920,6 +924,43 @@ export async function runCli(argv = process.argv.slice(2)) {
 
   if (command === 'docs') {
     const action = args.shift()
+    if (action === 'test') {
+      ensureStaticMode(uiMode)
+      const themes = takeOptions(args, '--theme', true)
+      const sizes = takeOptions(args, '--viewport', true)
+      const viewports = sizes.map((size) => {
+        if (!/^\d+x\d+$/.test(size)) throw testUsageError('viewport must be WIDTHxHEIGHT')
+        const [width, height] = size.split('x').map(Number)
+        if (width < 1 || width > 8192 || height < 1 || height > 8192) throw testUsageError('viewport dimensions must be from 1 to 8192')
+        return { width, height }
+      })
+      const updateSnapshots = takeFlag(args, '--update-snapshots')
+      const browserPath = takeOption(args, '--browser-path', true)
+      const headful = takeFlag(args, '--headful')
+      const reporter = takeOption(args, '--reporter', true) || 'pretty'
+      const output = takeOption(args, '--output', true)
+      if (!['pretty', 'json', 'junit'].includes(reporter)) throw testUsageError('reporter must be pretty, json or junit')
+      if (output && reporter === 'pretty') throw testUsageError('--output requires --reporter json or junit')
+      const root = args[0] && !args[0].startsWith('-') ? args.shift() : undefined
+      if (args.length) throw testUsageError(`unknown docs test arguments: ${args.join(' ')}`)
+      const controller = new AbortController()
+      const cancel = () => controller.abort()
+      process.once('SIGINT', cancel)
+      process.once('SIGTERM', cancel)
+      try {
+        const result = await testDocs({ root, themes: themes.length ? themes : undefined,
+          viewports: viewports.length ? viewports : undefined, updateSnapshots, browserPath, headful,
+          signal: controller.signal })
+        printTestRun(result, reporter, output)
+        return testResultExitCode(result)
+      } catch (error) {
+        error.exitCode = controller.signal.aborted ? 130 : 2
+        throw error
+      } finally {
+        process.removeListener('SIGINT', cancel)
+        process.removeListener('SIGTERM', cancel)
+      }
+    }
     const options = commonOptions(args)
     options.outdir = takeOption(args, '--outdir')
     options.basePath = takeOption(args, '--base')
@@ -949,7 +990,7 @@ export async function runCli(argv = process.argv.slice(2)) {
       if (reason === 'SIGTERM') return 143
       return 0
     }
-    throw new Error('docs requires build or dev')
+    throw new Error('docs requires build, dev or test')
   }
 
   if (command === 'parse' || command === 'tokenize') {

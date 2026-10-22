@@ -50,6 +50,8 @@ pub use wake_test_contract::{
     WorkerOverride,
 };
 
+mod docs_test;
+pub use docs_test::{DocsTestOptions, DocsTestViewport, test_docs, test_docs_with_host};
 mod federation;
 mod federation_init;
 mod federation_lock;

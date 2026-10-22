@@ -414,6 +414,7 @@ class DemoErrorBoundary extends React.Component<DemoErrorBoundaryProps, { error:
 function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
   const demo = demos.find((item) => item.id === id);
   const [module, setModule] = useState<any>(null);
+  const [frameTheme, setFrameTheme] = useState<ResolvedTheme>(resolved);
   const [args, setArgs] = useState<Record<string, unknown>>({});
   const [argsRevision, setArgsRevision] = useState(0);
   const [error, setError] = useState("");
@@ -434,11 +435,41 @@ function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
   }, [demo]);
   useEffect(() => {
     const send = (message: any) => window.parent.postMessage(message, "*");
-    const resize = new ResizeObserver(() => send({ type: "wake:resize", height: Math.ceil(document.documentElement.scrollHeight) }));
-    resize.observe(document.documentElement);
+    let pendingFrame = 0;
+    const scheduleResize = () => {
+      if (pendingFrame) return;
+      pendingFrame = requestAnimationFrame(() => {
+        pendingFrame = 0;
+        send({ type: "wake:resize", height: Math.ceil(document.documentElement.scrollHeight) });
+      });
+    };
+    let observedWidth = window.innerWidth;
+    let observedHeight = window.innerHeight;
+    let observedContentHeight = document.body.getBoundingClientRect().height;
+    const resize = new ResizeObserver(() => {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const contentHeight = document.body.getBoundingClientRect().height;
+      const widthChanged = width !== observedWidth;
+      const viewportDelta = height - observedHeight;
+      const contentDelta = contentHeight - observedContentHeight;
+      observedWidth = width;
+      observedHeight = height;
+      observedContentHeight = contentHeight;
+      // The parent's response can grow a vh-sized Preview by the same amount.
+      // A larger content delta still needs reporting when both changes coalesce.
+      if (Math.abs(contentDelta) >= 1 && (
+        widthChanged || viewportDelta === 0 || Math.abs(contentDelta) > Math.abs(viewportDelta) + 1
+      )) scheduleResize();
+    });
+    resize.observe(document.body);
+    scheduleResize();
     const receive = (event: MessageEvent) => {
       if (event.source !== window.parent || !event.data) return;
-      if (event.data.type === "wake:theme") document.documentElement.dataset.theme = event.data.theme;
+      if (event.data.type === "wake:theme" && (event.data.theme === "light" || event.data.theme === "dark")) {
+        document.documentElement.dataset.theme = event.data.theme;
+        setFrameTheme(event.data.theme);
+      }
       if (event.data.type === "wake:args" && (!event.data.id || event.data.id === id)) {
         const nextArgs = event.data.args;
         if (nextArgs && typeof nextArgs === "object" && !Array.isArray(nextArgs)) {
@@ -454,12 +485,14 @@ function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
     window.addEventListener("unhandledrejection", onUnhandledRejection);
     document.documentElement.dataset.theme = resolved;
     return () => {
+      cancelAnimationFrame(pendingFrame);
       resize.disconnect();
       window.removeEventListener("message", receive);
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onUnhandledRejection);
     };
   }, [id, resolved]);
+  useEffect(() => setFrameTheme(resolved), [resolved]);
   useEffect(() => {
     if (module) window.parent.postMessage({ type: "wake:ready", id }, "*");
   }, [id, module]);
@@ -473,7 +506,7 @@ function DemoFrame({ id, resolved }: { id: string; resolved: ResolvedTheme }) {
   }, "*");
   return <DemoErrorBoundary resetKey={argsRevision} onError={reportError}>
     <div className="demo-frame-root" data-wake-default={siteConfig.customPreview ? undefined : 'Preview'}
-      data-wake-custom={siteConfig.customPreview ? 'Preview' : undefined} data-theme={resolved}
+      data-wake-custom={siteConfig.customPreview ? 'Preview' : undefined} data-theme={frameTheme}
       style={siteConfig.accentColor ? { '--wake-accent': siteConfig.accentColor } as React.CSSProperties : undefined}>
       <Preview>{siteConfig.customPreview ? <Component {...args} /> : <div data-wake-demo><Component {...args} /></div>}</Preview>
     </div>
