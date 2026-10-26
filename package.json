@@ -68,7 +68,7 @@
     "@crab-dev/rc-tag": "^0.0.2",
     "@crab-dev/rc-text-edit": "^0.0.1",
     "@crab-dev/rc-tooltip": "^0.0.2",
-    "@crab-dev/rc-tree": "^0.1.2",
+    "@crab-dev/rc-tree": "0.1.2",
     "lucide-react": "^1.23.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"

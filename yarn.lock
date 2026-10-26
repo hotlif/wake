@@ -413,7 +413,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@crab-dev/rc-tree@npm:^0.1.2":
+"@crab-dev/rc-tree@npm:0.1.2":
   version: 0.1.2
   resolution: "@crab-dev/rc-tree@npm:0.1.2"
   dependencies:
@@ -492,7 +492,7 @@ __metadata:
     "@crab-dev/rc-tag": "npm:^0.0.2"
     "@crab-dev/rc-text-edit": "npm:^0.0.1"
     "@crab-dev/rc-tooltip": "npm:^0.0.2"
-    "@crab-dev/rc-tree": "npm:^0.1.2"
+    "@crab-dev/rc-tree": "npm:0.1.2"
     "@crab-dev/wake-darwin-arm64": "npm:0.1.46"
     "@crab-dev/wake-darwin-x64": "npm:0.1.46"
     "@crab-dev/wake-linux-arm64-gnu": "npm:0.1.46"
@@ -6302,7 +6302,7 @@ __metadata:
     "@crab-dev/rc-tag": "npm:^0.0.2"
     "@crab-dev/rc-text-edit": "npm:^0.0.1"
     "@crab-dev/rc-tooltip": "npm:^0.0.2"
-    "@crab-dev/rc-tree": "npm:^0.1.2"
+    "@crab-dev/rc-tree": "npm:0.1.2"
     "@crab-dev/wake": "workspace:*"
     "@napi-rs/cli": "npm:3.7.4"
     "@testing-library/dom": "npm:10.4.1"
