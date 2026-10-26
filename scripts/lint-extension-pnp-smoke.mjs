@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve, sep } from 'node:path'
 
 const repository = resolve(import.meta.dirname, '..')
 const binary = resolve(repository, 'target', 'debug', process.platform === 'win32' ? 'wake.exe' : 'wake')
-const project = mkdtempSync(join(tmpdir(), 'wake-lint-extension-pnp-'))
+// Node loads .pnp.cjs from its real path, so Yarn's issuer must use that same identity.
+// In particular, macOS exposes its temporary directory through /var -> /private/var.
+const temporaryRoot = realpathSync(tmpdir())
+const project = mkdtempSync(join(temporaryRoot, 'wake-lint-extension-pnp-'))
 const packageName = '@smoke/wake-lint-plugin'
 const ruleId = 'smoke/no-debugger'
 const marker = join(project, 'plugin-loaded')
@@ -157,7 +160,7 @@ export default {
   assert.equal(readFileSync(join(project, 'a.js'), 'utf8'), source)
   console.log('wake lint PnP ZIP extension smoke ok')
 } finally {
-  assert.ok(resolve(project).startsWith(`${resolve(tmpdir())}${sep}`))
+  assert.ok(resolve(project).startsWith(`${temporaryRoot}${sep}`))
   assert.ok(basename(project).startsWith('wake-lint-extension-pnp-'))
   rmSync(project, { recursive: true, force: true })
 }
