@@ -702,7 +702,7 @@ mod tests {
         let interner = Interner::new();
         let type_name = interner.intern("type");
         let json = interner.intern_js("json");
-        let source_name = interner.intern("./data.json");
+        let source_name = interner.intern_js("./data.json");
         let local_name = interner.intern("data");
         let spread_helper = interner.intern("__spread");
         let object_spread_helper = interner.intern("__object_spread");
