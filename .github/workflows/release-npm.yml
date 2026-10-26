@@ -385,7 +385,7 @@ jobs:
           - platform: win32-x64-msvc
             runner: windows-latest
             browser_evidence: reviewed-major-conformance
-            browser_majors: '151,152,155'
+            browser_majors: '151,152,155,156'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
@@ -634,7 +634,7 @@ jobs:
           - platform: win32-x64-msvc
             runner: windows-latest
             browser_evidence: reviewed-major-conformance
-            browser_majors: '151,152,155'
+            browser_majors: '151,152,155,156'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04

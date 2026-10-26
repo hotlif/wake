@@ -103,6 +103,7 @@
 - [ADR 0020: 拥有以 React 为先的浏览器测试运行时](0020-react-browser-test-runtime.md) — `accepted`
 - [ADR 0048: Windows 发布浏览器采用已审查主版本清单](0048-windows-browser-reviewed-majors.md) — `accepted`
 - [ADR 0073: Windows 与 Linux 浏览器证据纳入已审查主版本 155](0073-reviewed-browser-major-155.md) — `accepted`
+- [ADR 0074: Windows 浏览器证据纳入已审查主版本 156](0074-reviewed-windows-browser-major-156.md) — `accepted`
 
 ### node-release
 

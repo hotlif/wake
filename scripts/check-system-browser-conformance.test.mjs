@@ -51,7 +51,10 @@ for (const [target, version] of [
   assert.equal(checked.browser.major, 155)
   assert.equal(checked.mode, 'reviewed-major-conformance')
   assert.equal(checked.stableConformance, false)
-  for (const major of [153, 154, 156]) {
+  const unreviewedMajors = target === 'win32-x64-msvc'
+    ? [153, 154, 157]
+    : [153, 154, 156, 157]
+  for (const major of unreviewedMajors) {
     assert.throws(() => validateExperimentalBrowserIdentity({
       manifest,
       target,
@@ -59,11 +62,19 @@ for (const [target, version] of [
     }), /permits reviewed Chromium-family majors/)
   }
 }
+const windows156 = validateExperimentalBrowserIdentity({
+  manifest,
+  target: 'win32-x64-msvc',
+  identity: { kind: 'chrome', version: 'Chrome/156.0.8078.48', headless: true },
+})
+assert.equal(windows156.browser.major, 156)
+assert.equal(windows156.mode, 'reviewed-major-conformance')
+assert.equal(windows156.stableConformance, false)
 assert.throws(() => validateExperimentalBrowserIdentity({
   manifest,
   target: 'win32-x64-msvc',
   identity: { kind: 'chrome', version: 'Chrome/153.0.0.1', headless: true },
-}), /permits reviewed Chromium-family majors 151, 152, 155/)
+}), /permits reviewed Chromium-family majors 151, 152, 155, 156/)
 
 const missingWindowsEvidence = structuredClone(manifest)
 missingWindowsEvidence.targets['win32-x64-msvc'].reviewedRunnerEvidence.pop()
