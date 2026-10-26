@@ -5744,17 +5744,21 @@ export default view;
         let ir = {
             let source = r#"
 import thing from "./owned-dependency.js";
+import "\uD800";
+export { remote as aliased } from "\uDC00";
+export * from "\uFFFD";
 const label = `owned-${thing}`;
 export { label as "public-owned-name" };
-"#;
+"#
+            .to_owned();
             let interner = Interner::new();
-            let parsed = wake_ecma_parser::parse(source, &interner, SourceType::Module);
+            let parsed = wake_ecma_parser::parse(&source, &interner, SourceType::Module);
             assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
             parsed.module.with_ast(|program| {
                 let semantic = wake_ecma_semantic::analyze(program, &interner);
                 TypedProgram::lower(program, &interner, Some(&semantic)).unwrap()
             })
-            // `parsed.module` and `interner` are released at block exit.
+            // The source buffer, `parsed.module` and `interner` are released at block exit.
         };
 
         let first_walk = ir.preorder().unwrap();
@@ -5762,10 +5766,28 @@ export { label as "public-owned-name" };
         let second_walk = ir.preorder().unwrap();
         assert_eq!(first_walk, second_walk);
         assert_eq!(first_fingerprint, ir.fingerprint());
-        assert!(
-            ir.names()
-                .iter()
-                .any(|name| name.original() == "./owned-dependency.js")
+        let module_sources: Vec<Vec<u16>> = ir
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.data() {
+                IrNodeData::ImportDeclaration { source, .. }
+                | IrNodeData::ExportAllDeclaration { source, .. } => Some(*source),
+                IrNodeData::ExportNamedDeclaration { source, .. } => *source,
+                _ => None,
+            })
+            .map(|source| match ir.node(source).unwrap().data() {
+                IrNodeData::StringLiteral { value } => value.code_units().collect(),
+                _ => panic!("module source must own a lossless string value"),
+            })
+            .collect();
+        assert_eq!(
+            module_sources,
+            vec![
+                "./owned-dependency.js".encode_utf16().collect(),
+                vec![0xd800],
+                vec![0xdc00],
+                vec![0xfffd],
+            ]
         );
         assert!(
             ir.names()
