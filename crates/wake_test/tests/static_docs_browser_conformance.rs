@@ -1,4 +1,5 @@
 //! Real-browser acceptance for a production Docs site hosted under a non-root path.
+//! Route headings do not establish readiness for lazily mounted Demo frames.
 //!
 //! Run explicitly with a system Chromium browser and the immutable Yarn cache:
 //! `cargo test -p wake_test --test static_docs_browser_conformance -- --ignored`
@@ -189,6 +190,7 @@ fn state(page: &BrowserPage) -> Result<Value, String> {
           links: [...document.querySelectorAll('a[href]')].map(link => link.href),
           assets: [...document.querySelectorAll('script[src],link[rel="stylesheet"]')]
             .map(asset => asset.src || asset.href),
+          pendingDemoVisibility: globalThis.__wakePendingDemoVisibility?.() ?? 0,
           demoFrames: [...document.querySelectorAll('iframe[src]')]
             .map(frame => ({url: frame.src, text: frame.contentDocument?.body?.innerText ?? ''})),
           body: document.body?.innerText.slice(0, 800) ?? ''
@@ -209,6 +211,66 @@ fn wait_for_state(page: &BrowserPage, ready: impl Fn(&Value) -> bool) -> Value {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("production Docs page did not reach the expected state: {last}");
+}
+
+fn button_page_ready(value: &Value, url: &str) -> bool {
+    value["href"] == url
+        && value["heading"] == "按钮"
+        && value["demoFrames"]
+            .as_array()
+            .is_some_and(|frames| !frames.is_empty())
+}
+
+fn delay_demo_visibility(page: &BrowserPage) {
+    // Retain native intersection measurements, but release their callbacks only after checking
+    // the heading-only state. Installing per document exercises both direct entry and reload.
+    page.command(
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({"source": r#"(() => {
+          if (window.top !== window) return;
+          const NativeObserver = globalThis.IntersectionObserver;
+          const pending = [];
+          let released = false;
+          globalThis.__wakePendingDemoVisibility = () => pending.length;
+          globalThis.__wakeReleaseDemoVisibility = () => {
+            released = true;
+            for (const deliver of pending.splice(0)) deliver();
+          };
+          globalThis.IntersectionObserver = class extends NativeObserver {
+            constructor(callback, options) {
+              super((entries, observer) => {
+                const deliver = () => callback(entries, observer);
+                if (released) deliver();
+                else pending.push(deliver);
+              }, options);
+            }
+          };
+        })()"#}),
+    )
+    .unwrap();
+}
+
+fn navigate_with_delayed_demo_visibility(
+    page: &BrowserPage,
+    url: &str,
+    navigate: impl FnOnce(),
+) -> Value {
+    navigate();
+    let before_visibility = wait_for_state(page, |value| {
+        value["href"] == url
+            && value["heading"] == "按钮"
+            && value["pendingDemoVisibility"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && value["demoFrames"].as_array().is_some_and(Vec::is_empty)
+    });
+    assert!(
+        !button_page_ready(&before_visibility, url),
+        "the route heading must not satisfy Demo readiness before visibility callbacks: {before_visibility}"
+    );
+    page.evaluate("globalThis.__wakeReleaseDemoVisibility()")
+        .unwrap();
+    wait_for_state(page, |value| button_page_ready(value, url))
 }
 
 fn save_failure(page: &BrowserPage, fixture: &Path, case: &str) {
@@ -345,9 +407,9 @@ fn chromium_serves_production_docs_routes_under_a_non_root_base() {
                 && value["heading"] == "按钮"
         });
 
-        page.navigate(&deep).unwrap();
-        let direct = wait_for_state(&page, |value| {
-            value["href"] == deep && value["heading"] == "按钮"
+        delay_demo_visibility(&page);
+        let direct = navigate_with_delayed_demo_visibility(&page, &deep, || {
+            page.navigate(&deep).unwrap();
         });
         assert!(direct["title"].as_str().unwrap().contains("按钮"));
         assert!(
@@ -360,10 +422,9 @@ fn chromium_serves_production_docs_routes_under_a_non_root_base() {
             }),
             "production Demo iframe must use the Docs base path: {direct}"
         );
-        page.command("Page.reload", json!({"ignoreCache": true}))
-            .unwrap();
-        wait_for_state(&page, |value| {
-            value["href"] == deep && value["heading"] == "按钮"
+        navigate_with_delayed_demo_visibility(&page, &deep, || {
+            page.command("Page.reload", json!({"ignoreCache": true}))
+                .unwrap();
         });
 
         let responses = page.evaluate(
