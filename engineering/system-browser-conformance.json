@@ -23,7 +23,7 @@
       "rustTarget": "x86_64-pc-windows-msvc",
       "experimental": {
         "mode": "reviewed-major-conformance",
-        "majors": [151, 152]
+        "majors": [151, 152, 155]
       },
       "reviewedRunnerEvidence": [
         {
@@ -41,6 +41,13 @@
             "chrome": "152.0.7977.83",
             "edge": "152.0.4191.66"
           }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/aee0669dd04510a11756664eb77f5630debabed3/images/windows/Windows2025-VS2026-Readme.md",
+          "imageVersion": "20261007.264.1",
+          "browserVersions": {
+            "chrome": "155.0.8059.40"
+          }
         }
       ]
     },
@@ -49,7 +56,7 @@
       "rustTarget": "x86_64-unknown-linux-gnu",
       "experimental": {
         "mode": "reviewed-major-conformance",
-        "majors": [151, 152]
+        "majors": [151, 152, 155]
       },
       "reviewedRunnerEvidence": [
         {
@@ -68,6 +75,15 @@
             "chrome": "152.0.7977.64",
             "chromium": "152.0.7977.0",
             "edge": "152.0.4191.53"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/7e7dc1bcc0ef464e5e315a2b4c33609590c6cffe/images/ubuntu/Ubuntu2404-Readme.md",
+          "imageVersion": "20261012.334.1",
+          "browserVersions": {
+            "chrome": "155.0.8059.39",
+            "chromium": "155.0.8059.0",
+            "edge": "155.0.4283.45"
           }
         }
       ]

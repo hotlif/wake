@@ -39,11 +39,31 @@ const windows152 = validateExperimentalBrowserIdentity({
 })
 assert.equal(windows152.browser.major, 152)
 assert.equal(windows152.stableConformance, false)
+for (const [target, version] of [
+  ['win32-x64-msvc', 'Chrome/155.0.8059.40'],
+  ['linux-x64-gnu', 'Chrome/155.0.8059.39'],
+]) {
+  const checked = validateExperimentalBrowserIdentity({
+    manifest,
+    target,
+    identity: { kind: 'chrome', version, headless: true },
+  })
+  assert.equal(checked.browser.major, 155)
+  assert.equal(checked.mode, 'reviewed-major-conformance')
+  assert.equal(checked.stableConformance, false)
+  for (const major of [153, 154, 156]) {
+    assert.throws(() => validateExperimentalBrowserIdentity({
+      manifest,
+      target,
+      identity: { kind: 'chrome', version: `Chrome/${major}.0.0.1`, headless: true },
+    }), /permits reviewed Chromium-family majors/)
+  }
+}
 assert.throws(() => validateExperimentalBrowserIdentity({
   manifest,
   target: 'win32-x64-msvc',
   identity: { kind: 'chrome', version: 'Chrome/153.0.0.1', headless: true },
-}), /permits reviewed Chromium-family majors 151, 152/)
+}), /permits reviewed Chromium-family majors 151, 152, 155/)
 
 const missingWindowsEvidence = structuredClone(manifest)
 missingWindowsEvidence.targets['win32-x64-msvc'].reviewedRunnerEvidence.pop()
@@ -55,7 +75,7 @@ wrongWindowsInventory.targets['win32-x64-msvc'].reviewedRunnerEvidence[0].source
 assert.throws(() => validateSystemBrowserConformanceManifest(wrongWindowsInventory),
   /immutable official runner-images inventory/)
 
-for (const major of [151, 152]) {
+for (const major of [151, 152, 155]) {
   const linuxChromeEvidence = validateExperimentalBrowserIdentity({
     manifest,
     target: 'linux-x64-gnu',
@@ -148,7 +168,7 @@ for (const [description, action, pattern] of [
       target: 'linux-x64-gnu',
       identity: { kind: 'chrome', version: 'Chrome/150.0.0.1', headless: true },
     }),
-    /permits reviewed Chromium-family majors 151, 152/,
+    /permits reviewed Chromium-family majors 151, 152, 155/,
   ],
   [
     'unknown browser kind',

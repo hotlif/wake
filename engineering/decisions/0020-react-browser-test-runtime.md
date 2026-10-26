@@ -5,6 +5,7 @@
 - Date: 2026-08-24
 - Amended by: [ADR 0022](0022-yarn-pnp-ownership.md)
 - Amended by: [ADR 0048](0048-windows-browser-reviewed-majors.md)
+- Amended by: [ADR 0073](0073-reviewed-browser-major-155.md)
 
 ## Context
 
