@@ -234,6 +234,7 @@ export interface TestOptions {
   projects?: string[]
   environment?: TestEnvironment
   changed?: boolean
+  changedSince?: string
   related?: string[]
   coverage?: boolean
   updateSnapshots?: SnapshotUpdateMode

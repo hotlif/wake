@@ -430,6 +430,7 @@ async function api() {
     projects: ['components'],
     environment: 'auto',
     changed: false,
+    changedSince: undefined,
     related: ['src/button.tsx'],
     coverage: true,
     updateSnapshots: 'new',

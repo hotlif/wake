@@ -628,10 +628,14 @@ fn run_tests_with_selection_cached(
         .clone()
         .unwrap_or_else(|| random_seed().to_string());
     let test_name_pattern = compile_optional_pattern(options.name_pattern.as_deref())?;
-    if options.changed && !options.related.is_empty() {
+    if usize::from(options.changed)
+        + usize::from(options.changed_since.is_some())
+        + usize::from(!options.related.is_empty())
+        > 1
+    {
         return Err(TestError::new(
             "WAKE_TEST_CONFIG",
-            "changed and related test selection cannot be combined",
+            "changed, changed_since and related test selection cannot be combined",
         ));
     }
     let config_source = fs::read_to_string(root.join("wake.config.toml")).unwrap_or_default();
@@ -773,7 +777,7 @@ fn run_tests_with_selection_cached(
             | TestWatchSelection::Suites(_),
         ) => true,
         Some(TestWatchSelection::Configured) | None => {
-            options.changed || !options.related.is_empty()
+            options.changed || options.changed_since.is_some() || !options.related.is_empty()
         }
     };
     let mut selection_diagnostics = Vec::new();
@@ -796,8 +800,15 @@ fn run_tests_with_selection_cached(
                 Some(TestWatchSelection::Related(paths)) => {
                     (paths.clone(), RelatedOrigin::Explicit)
                 }
-                Some(TestWatchSelection::Configured) | None if options.changed => {
-                    let paths = git_changed::changed_paths(&root).map_err(|error| {
+                Some(TestWatchSelection::Configured) | None
+                    if options.changed || options.changed_since.is_some() =>
+                {
+                    let paths = if options.changed_since.is_some() {
+                        git_changed::changed_paths_from(&root, options.changed_since.as_deref())
+                    } else {
+                        git_changed::changed_paths(&root)
+                    }
+                    .map_err(|error| {
                         TestError::new(
                             "WAKE_TEST_DISCOVERY",
                             format!(

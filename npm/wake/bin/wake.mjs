@@ -66,7 +66,7 @@ Usage:
     [--print-config FILE] [--rule ID=LEVEL|JSON ...] [--global NAME=readonly|writable|off ...] [--env browser|node ...] [--list-rules] [--cache]
             [--stdin --stdin-filename FILE] [--max-warnings COUNT] [--fix | --fix-dry-run]
   wake test [patterns...] [--root DIR] [--name-pattern TEXT] [--project NAME]
-            [--environment auto|dom|browser] [--watch] [--changed] [--related PATH...]
+            [--environment auto|dom|browser] [--watch] [--changed | --changed-since REF | --related PATH...]
             [--coverage] [--update-snapshots] [--serial] [--workers COUNT]
             [--bail [COUNT]] [--shard INDEX/TOTAL] [--seed SEED] [--shuffle]
             [--reporter pretty|json|junit] [--output FILE] [--allow-no-tests]
@@ -506,6 +506,7 @@ async function runTestCommand(args) {
     )
     const watch = takeFlag(args, '--watch')
     const changed = takeFlag(args, '--changed')
+    const changedSince = takeOption(args, '--changed-since', true)
     const related = takeVariadicOptions(args, '--related')
     const coverage = takeFlag(args, '--coverage')
     const updateSnapshots = takeFlag(args, '--update-snapshots') ? 'all' : undefined
@@ -525,8 +526,8 @@ async function runTestCommand(args) {
     const browserPath = takeOption(args, '--browser-path', true)
     const headful = takeFlag(args, '--headful')
 
-    if (changed && related.length > 0) {
-      throw testUsageError('--changed cannot be combined with --related')
+    if (Number(changed) + Number(changedSince !== undefined) + Number(related.length > 0) > 1) {
+      throw testUsageError('--changed, --changed-since and --related cannot be combined')
     }
     if (serial && workers !== undefined) {
       throw testUsageError('--serial cannot be combined with --workers')
@@ -548,6 +549,7 @@ async function runTestCommand(args) {
       projects,
       environment,
       changed,
+      changedSince,
       related,
       coverage,
       updateSnapshots,

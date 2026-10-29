@@ -59,10 +59,51 @@ impl std::error::Error for GitChangedError {}
 /// disabled so both the deleted and added names are returned. The result is deduplicated and
 /// sorted by `PathBuf`'s platform-native stable ordering.
 pub(crate) fn changed_paths(root: &Path) -> Result<Vec<PathBuf>, GitChangedError> {
+    changed_paths_from(root, None)
+}
+
+pub(crate) fn changed_paths_from(
+    root: &Path,
+    since: Option<&str>,
+) -> Result<Vec<PathBuf>, GitChangedError> {
     let root = canonical_root(root)?;
     ensure_work_tree(&root)?;
 
     let has_head = repository_has_head(&root)?;
+    let baseline = if let Some(revision) = since {
+        if revision.is_empty() || revision.starts_with('-') || !has_head {
+            return Err(GitChangedError::new(
+                GitChangedErrorKind::CommandFailed,
+                "changed_since requires a valid revision and an existing HEAD",
+            ));
+        }
+        let commit = checked_git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{revision}^{{commit}}"),
+            ],
+            "resolve changed_since revision",
+        )?;
+        let commit = String::from_utf8(commit).map_err(|error| {
+            GitChangedError::new(GitChangedErrorKind::InvalidOutput, error.to_string())
+        })?;
+        let base = checked_git(
+            &root,
+            &["merge-base", "HEAD", commit.trim()],
+            "find changed_since merge-base",
+        )?;
+        String::from_utf8(base)
+            .map_err(|error| {
+                GitChangedError::new(GitChangedErrorKind::InvalidOutput, error.to_string())
+            })?
+            .trim()
+            .to_string()
+    } else {
+        "HEAD".into()
+    };
     let tracked = if has_head {
         checked_git(
             &root,
@@ -72,7 +113,7 @@ pub(crate) fn changed_paths(root: &Path) -> Result<Vec<PathBuf>, GitChangedError
                 "--no-renames",
                 "--name-only",
                 "-z",
-                "HEAD",
+                &baseline,
                 "--",
                 ".",
             ],
@@ -416,6 +457,37 @@ mod tests {
         paths.sort();
         paths.dedup();
         paths
+    }
+
+    #[test]
+    fn changed_since_uses_merge_base_and_includes_work_tree_and_untracked_paths() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        init_repository(root);
+        fs::write(root.join("base.ts"), "base").unwrap();
+        commit_all(root);
+        git(root, &["branch", "baseline"]);
+        fs::write(root.join("committed.ts"), "commit").unwrap();
+        commit_all(root);
+        fs::write(root.join("base.ts"), "working").unwrap();
+        fs::write(root.join("new.ts"), "untracked").unwrap();
+        let paths = super::changed_paths_from(root, Some("baseline")).unwrap();
+        assert_eq!(
+            paths,
+            absolute_paths(root, &["base.ts", "committed.ts", "new.ts"])
+        );
+    }
+
+    #[test]
+    fn changed_since_rejects_invalid_revisions_and_unborn_head() {
+        let fixture = tempfile::tempdir().unwrap();
+        init_repository(fixture.path());
+        assert!(super::changed_paths_from(fixture.path(), Some("HEAD")).is_err());
+        fs::write(fixture.path().join("base"), "base").unwrap();
+        commit_all(fixture.path());
+        for revision in ["", "--help", "missing-revision"] {
+            assert!(super::changed_paths_from(fixture.path(), Some(revision)).is_err());
+        }
     }
 
     #[test]

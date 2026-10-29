@@ -7,6 +7,26 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+mod engineering_controls_tests {
+    #[test]
+    fn changed_since_is_an_additive_owned_wire_option() {
+        let request: super::TestOptions =
+            serde_json::from_value(serde_json::json!({"changedSince": "main"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["changedSince"],
+            "main"
+        );
+        let legacy: super::TestOptions = serde_json::from_str("{}").unwrap();
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("changedSince")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+}
+
 pub mod protocol;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -22,6 +42,8 @@ pub struct TestOptions {
     pub environment: Option<String>,
     pub watch: bool,
     pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_since: Option<String>,
     pub related: Vec<PathBuf>,
     pub coverage: bool,
     pub update_snapshots: Option<String>,

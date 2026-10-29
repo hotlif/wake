@@ -13,7 +13,7 @@ status = "experimental"
 
 ```text
 wake test [PATTERN...] [--root DIR] [--name-pattern TEXT] [--project NAME]
-          [--environment auto|dom|browser] [--watch] [--changed] [--related PATH...]
+          [--environment auto|dom|browser] [--watch] [--changed | --changed-since REF | --related PATH...]
           [--coverage] [--update-snapshots] [--serial] [--workers COUNT]
           [--bail [COUNT]] [--shard INDEX/TOTAL] [--seed SEED] [--shuffle]
           [--reporter pretty|json|junit] [--output FILE] [--allow-no-tests]
@@ -26,13 +26,17 @@ wake test [PATTERN...] [--root DIR] [--name-pattern TEXT] [--project NAME]
 
 `--project` 可重复。`--workers` 接受 `auto`、正整数或 `1%`–`100%`；`--serial` 与
 `--workers` 互斥。`--bail` 不带值时等于 `1`，`--shard` 使用从 1 开始的 `INDEX/TOTAL`。
-`--changed` 与 `--related` 互斥。`--update-snapshots` 只更新 Wake 外部文本 snapshot 与按渲染
+`--changed`、`--changed-since` 与 `--related` 两两互斥。`--update-snapshots` 只更新 Wake 外部文本 snapshot 与按渲染
 profile 隔离的 PNG baseline，不改写测试源码。
 
 `--changed` 固定比较 `HEAD` 的 staged/unstaged 文件并加入未被忽略的 untracked 文件；unborn
 `HEAD` 使用 index + untracked。它不会猜测 upstream/base branch。Git 不可用或 root 不在 work
 tree 时返回 `WAKE_TEST_DISCOVERY`。`--related` 使用 Wake 执行时编译图的反向依赖；动态加载、PnP、
 解析缺口或 package/lock/config 拓扑变化会保守全选并给出 diagnostic，绝不静默漏掉 suite。
+
+`--changed-since REF` 验证本地 branch/commit 并取它与 HEAD 的 merge-base；比较基线到当前工作树的
+所有变化并纳入未忽略的新文件，不要求干净工作树。无效 revision、缺少 HEAD 或共同祖先返回
+`WAKE_TEST_DISCOVERY`，不自动 fetch 或猜测 upstream。
 
 默认 reporter 为 `pretty`。`json` 输出稳定的 `wake.test.v1` 结果，`junit` 输出 XML；二者可用
 `--output` 写文件。`pretty` 只写终端，不能与 `--output` 组合。

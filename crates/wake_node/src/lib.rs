@@ -1000,6 +1000,7 @@ struct RawTestOptions {
     projects: Vec<String>,
     environment: Option<RawNodeTestEnvironment>,
     changed: bool,
+    changed_since: Option<String>,
     related: Vec<PathBuf>,
     coverage: bool,
     update_snapshots: Option<RawNodeSnapshotUpdateMode>,
@@ -1099,6 +1100,7 @@ impl RawTestOptions {
             // Watching is an operation on Node's persistent TestContext, never a request flag.
             watch: false,
             changed: self.changed,
+            changed_since: self.changed_since,
             related: self.related,
             coverage: self.coverage,
             update_snapshots: self.update_snapshots.map(|mode| mode.as_str().to_string()),
@@ -3075,6 +3077,8 @@ mod tests {
 
     #[test]
     fn node_test_request_maps_only_implemented_fields() {
+        let baseline = parse_test_options(Some(r#"{"changedSince":"main"}"#.into())).unwrap();
+        assert_eq!(baseline.changed_since.as_deref(), Some("main"));
         let options = parse_test_options(Some(
             r#"{"root":".","patterns":["src/**/*.test.ts"],"namePattern":"button","projects":["ui"],"environment":"dom","changed":true,"related":["src/button.ts"],"coverage":true,"updateSnapshots":"all","serial":true,"workers":2,"bail":1,"shard":"1/2","seed":"seed","shuffle":true,"allowNoTests":true,"browserPath":"browser","headful":true}"#.to_owned(),
         ))

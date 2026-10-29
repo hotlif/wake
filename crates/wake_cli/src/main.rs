@@ -205,8 +205,11 @@ enum Command {
         #[arg(long)]
         watch: bool,
         /// Run tests affected by source-control changes.
-        #[arg(long, conflicts_with = "related")]
+        #[arg(long, conflicts_with_all = ["related", "changed_since"])]
         changed: bool,
+        /// Select changes since the merge-base with this local branch or commit.
+        #[arg(long, value_name = "REF", conflicts_with_all = ["changed", "related"])]
+        changed_since: Option<String>,
         /// Run tests related to one or more source paths.
         #[arg(long, value_name = "PATH", num_args = 1.., conflicts_with = "changed")]
         related: Vec<PathBuf>,
@@ -736,6 +739,7 @@ fn main() -> ExitCode {
             environment,
             watch,
             changed,
+            changed_since,
             related,
             coverage,
             update_snapshots,
@@ -762,6 +766,7 @@ fn main() -> ExitCode {
                     environment: environment.map(|environment| environment.as_str().to_string()),
                     watch,
                     changed,
+                    changed_since,
                     related,
                     coverage,
                     update_snapshots: update_snapshots.then_some("all".to_string()),
@@ -3556,6 +3561,7 @@ mod tests {
             environment,
             watch,
             changed,
+            changed_since,
             related,
             coverage,
             update_snapshots,
@@ -3581,6 +3587,7 @@ mod tests {
         assert_eq!(environment, Some(TestEnvironmentArg::Dom));
         assert!(watch);
         assert!(!changed);
+        assert!(changed_since.is_none());
         assert_eq!(
             related,
             [
@@ -3601,6 +3608,28 @@ mod tests {
         assert!(allow_no_tests);
         assert_eq!(browser_path, Some(PathBuf::from("chromium")));
         assert!(headful);
+    }
+
+    #[test]
+    fn test_changed_since_uses_one_explicit_git_selection() {
+        let cli = Cli::try_parse_from(["wake", "test", "--changed-since", "main"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Test { changed_since: Some(value), .. } if value == "main")
+        );
+        assert!(
+            Cli::try_parse_from(["wake", "test", "--changed-since", "main", "--changed"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "wake",
+                "test",
+                "--changed-since",
+                "main",
+                "--related",
+                "src"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

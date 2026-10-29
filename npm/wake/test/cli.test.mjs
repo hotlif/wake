@@ -217,6 +217,7 @@ test('test command exposes only the Wake dashed option contract', () => {
   const help = run(['test', '--help'])
   assert.equal(help.status, 0, help.stderr)
   assert.match(help.stdout, /--name-pattern/)
+  assert.match(help.stdout, /--changed-since/)
   for (const value of ['--environment', 'auto', 'dom', 'browser']) {
     assert.match(help.stdout, new RegExp(value))
   }
@@ -239,6 +240,9 @@ test('test command exposes only the Wake dashed option contract', () => {
     ['test', '--workers', '0'],
     ['test', '--serial', '--workers', '2'],
     ['test', '--changed', '--related', 'src/button.tsx'],
+    ['test', '--changed-since'],
+    ['test', '--changed-since', 'main', '--changed'],
+    ['test', '--changed-since', 'main', '--related', 'src/button.tsx'],
   ]) {
     const result = run(args)
     assert.equal(result.status, 2, `${args.join(' ')}\n${result.stderr}`)
