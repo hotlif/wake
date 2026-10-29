@@ -2,7 +2,9 @@ export type Awaitable<T> = T | PromiseLike<T>
 export type TestCallback = () => Awaitable<void>
 
 export interface TestCaseOptions {
-  timeout: number
+  timeout?: number
+  /** Additional attempts after an ordinary callback failure; a non-negative 32-bit integer. */
+  retries?: number
 }
 
 export interface Each {
@@ -22,6 +24,7 @@ export interface TestApi {
   (name: string, callback: TestCallback, options?: TestCaseOptions): void
   readonly only: TestApi
   readonly skip: TestApi
+  readonly failing: TestApi
   todo(name: string): void
   readonly each: Each
 }
@@ -88,6 +91,7 @@ export interface Matchers<R = void> extends CustomMatchers {
   toHaveLastReturnedWith(expected: unknown): R
   toHaveNthReturnedWith(call: number, expected: unknown): R
   toMatchSnapshot(propertyMatchers?: object, hint?: string): R
+  toThrowErrorMatchingSnapshot(hint?: string): R
   /** Browser-only exact visual snapshot for the current viewport or received Element. */
   toMatchScreenshot(hint?: string): Promise<void>
   toBeInTheDocument(): R
@@ -136,6 +140,14 @@ export interface Expect {
   stringContaining(sample: string): AsymmetricMatcher
   stringMatching(sample: string | RegExp): AsymmetricMatcher
   closeTo(sample: number, digits?: number): AsymmetricMatcher
+  arrayOf(sample: unknown): AsymmetricMatcher
+  readonly not: {
+    arrayOf(sample: unknown): AsymmetricMatcher
+    arrayContaining(sample: readonly unknown[]): AsymmetricMatcher
+    objectContaining(sample: object): AsymmetricMatcher
+    stringContaining(sample: string): AsymmetricMatcher
+    stringMatching(sample: string | RegExp): AsymmetricMatcher
+  }
 }
 
 export type AnyFunction = (...args: any[]) => any

@@ -20,6 +20,7 @@ function testApi() {
   const entry = (...args) => unavailable(...args)
   entry.only = entry
   entry.skip = entry
+  entry.failing = entry
   entry.todo = unavailable
   entry.each = unavailable
   return Object.freeze(entry)
@@ -51,6 +52,14 @@ const expect = callable({
   stringContaining: unavailable,
   stringMatching: unavailable,
   closeTo: unavailable,
+  arrayOf: unavailable,
+  not: Object.freeze({
+    arrayOf: unavailable,
+    arrayContaining: unavailable,
+    objectContaining: unavailable,
+    stringContaining: unavailable,
+    stringMatching: unavailable,
+  }),
 })
 
 const mock = Object.freeze({

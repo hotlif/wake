@@ -308,8 +308,7 @@ function printTestRun(result, reporter = 'pretty', output, includeDiagnostics = 
   }
   console.error(`Test Suites: ${result.counts.suites.passed} passed, ${result.counts.suites.failed} failed, ${result.counts.suites.total} total`)
   console.error(`Tests:       ${result.counts.tests.passed} passed, ${result.counts.tests.failed} failed, ${result.counts.tests.skipped + result.counts.tests.todo} pending, ${result.counts.tests.total} total`)
-  const coverageText = result.artifacts.find((artifact) => artifact.kind === 'coverage-text')
-  if (coverageText) {
+  for (const coverageText of result.artifacts.filter((artifact) => artifact.kind === 'coverage-text')) {
     console.error(readFileSync(coverageText.path, 'utf8').trimEnd())
   }
   console.error(`Seed:        ${result.seed}`)

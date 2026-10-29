@@ -34,6 +34,8 @@ failure、计数、seed、snapshot、coverage、leaks、artifacts、diagnostics 
 CLI 与 Node API 通过 `wake_app` 和同一 test host 返回该模型，不存在第二个兼容结果格式。
 
 `changedSince?: string` 对应 CLI `--changed-since`，与 `changed`、非空 `related` 互斥。
+case.attempts 记录含重试的实际执行次数；整轮 setup/teardown 错误通过
+`success: false` 和 `WAKE_TEST_LIFECYCLE` diagnostic 表达。
 
 该入口依照 ADR 0020 保持 experimental。React 19.2.8 / 19.3.0、fast DOM 与 Chromium conformance、V8
 source-mapped coverage、snapshot/watch 冷热等价、host/browser 崩溃和五平台 clean-install 矩阵是

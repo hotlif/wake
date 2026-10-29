@@ -17,6 +17,7 @@
     activeTest: null,
     focused: false,
     defaultTimeout: 5000,
+    defaultRetries: 0,
     seed: 0,
     namePattern: null,
     mocks: new Set(),
@@ -90,45 +91,59 @@
   function timeoutOption(value) {
     if (value === undefined) return undefined
     if (typeof value === 'number') throw new TypeError('Wake test timeouts use { timeout: milliseconds }')
-    if (value && typeof value === 'object' && value.timeout === undefined && Reflect.ownKeys(value).length === 0) return undefined
+    if (value && typeof value === 'object' && value.timeout === undefined) return undefined
     if (!value || typeof value !== 'object' || !Number.isFinite(value.timeout) || value.timeout <= 0) {
       throw new TypeError('Wake test timeout must be a positive { timeout } option')
     }
     return Number(value.timeout)
   }
 
+  function retryOption(value) {
+    const retries = value && value.retries
+    if (retries === undefined) return state.defaultRetries
+    if (!Number.isInteger(retries) || retries < 0 || retries > 0xffffffff) throw new TypeError('Wake test retries must be a non-negative 32-bit integer')
+    return retries
+  }
+
+  const ordinaryTestFailure = error => !error || typeof error.code !== 'string' || !error.code.startsWith('WAKE_') || error.code === 'WAKE_TEST_ASSERTION'
+
   function captureRegistrationStack() {
     const error = new Error()
     return error.stack ? String(error.stack) : null
   }
 
-  function registerTest(name, fn, mode = 'run', options = {}) {
+  function registerTest(name, fn, mode = 'run', options = {}, failing = false) {
     if (mode === 'only') {
       if (state.forbidOnly) throw Object.assign(new Error('Focused tests are forbidden by test.forbid_only'), { code: 'WAKE_TEST_CONFIG' })
       state.focused = true
     }
     const record = {
       name: String(name), fn, mode, timeout: timeoutOption(options),
+      retries: retryOption(options), failing,
       registrationStack: captureRegistrationStack(),
     }
     state.current.entries.push({ type: 'test', value: record })
     return record
   }
 
-  function makeTest(mode = 'run', options = {}) {
-    const value = (name, fn, timeout) => registerTest(name, fn, mode, timeout || options)
+  function makeTest(mode = 'run', options = {}, failing = false) {
+    const value = (name, fn, timeout) => registerTest(name, fn, mode, timeout || options, failing)
     value.todo = name => registerTest(name, undefined, 'todo', options)
     value.each = table => {
       const rows = tableRows(table)
       return (name, fn, timeout) => rows.forEach((row, index) =>
-        registerTest(formatName(name, row, index), () => fn(...row), mode, timeout || options))
+        registerTest(formatName(name, row, index), () => fn(...row), mode, timeout || options, failing))
     }
     return value
   }
 
-  const test = makeTest()
-  test.only = makeTest('only')
-  test.skip = makeTest('skip')
+  const ordinaryTests = ['run', 'only', 'skip'].map(mode => makeTest(mode))
+  const failingTests = ['run', 'only', 'skip'].map(mode => makeTest(mode, {}, true))
+  for (let index = 0; index < ordinaryTests.length; index++) {
+    Object.assign(ordinaryTests[index], {only: ordinaryTests[1], skip: ordinaryTests[2], failing: failingTests[index]})
+    Object.assign(failingTests[index], {only: failingTests[1], skip: failingTests[2], failing: failingTests[index]})
+  }
+  const test = ordinaryTests[0]
   const it = test
 
   function registerDescribe(name, fn, mode = 'run') {
@@ -396,6 +411,14 @@
     return {pass: canAdd, message: () => `Snapshot ${key} does not exist`, code: canAdd ? undefined : 'WAKE_TEST_SNAPSHOT'}
   }
 
+  matchers.toThrowErrorMatchingSnapshot = (received, hint) => {
+    if (typeof received !== 'function') throw new TypeError('Exception snapshot requires a function')
+    let thrown = false, message
+    try { received() } catch (error) { thrown = true; message = error && error.message !== undefined ? String(error.message) : String(error) }
+    if (!thrown) return result(false, 'Expected function to throw')
+    return matchers.toMatchSnapshot(message, undefined, hint)
+  }
+
   function screenshotClip(received) {
     if (received === globalThis || received === document || received === document.documentElement || received === document.body) return null
     if (!(received instanceof Element)) throw browserInputError('toMatchScreenshot requires document, window, or an Element')
@@ -490,7 +513,7 @@
         }
         return Promise.resolve(received).then(
           value => { throw new Error(`Expected Promise to reject, but it resolved with ${pretty(value)}`) },
-          error => applyMatcher(name, name === 'toThrow' ? () => { throw error } : error, expected, isNot),
+          error => applyMatcher(name, ['toThrow', 'toThrowErrorMatchingSnapshot'].includes(name) ? () => { throw error } : error, expected, isNot),
         )
       }
     }
@@ -534,9 +557,11 @@
   expect.stringContaining = sample => asymmetric(value => typeof value === 'string' && value.includes(String(sample)), 'StringContaining', sample)
   expect.stringMatching = sample => asymmetric(value => typeof value === 'string' && (sample instanceof RegExp ? sample.test(value) : new RegExp(sample).test(value)), 'StringMatching', sample)
   expect.arrayContaining = sample => asymmetric(value => Array.isArray(value) && sample.every(item => value.some(candidate => equals(candidate, item))), 'ArrayContaining', sample)
+  expect.arrayOf = sample => asymmetric(value => Array.isArray(value) && value.every(item => equals(item, sample)), 'ArrayOf', sample)
   expect.objectContaining = sample => asymmetric(value => subset(value, sample), 'ObjectContaining', sample)
   expect.closeTo = (sample, digits = 2) => asymmetric(value => typeof value === 'number' && Math.abs(value - sample) < 0.5 * 10 ** -digits, 'CloseTo', sample)
   expect.not = {
+    arrayOf: sample => asymmetric(value => !(Array.isArray(value) && value.every(item => equals(item, sample))), 'NotArrayOf', sample),
     stringContaining: sample => asymmetric(value => !(typeof value === 'string' && value.includes(String(sample))), 'NotStringContaining', sample),
     stringMatching: sample => asymmetric(value => !(typeof value === 'string' && (sample instanceof RegExp ? sample.test(value) : new RegExp(sample).test(value))), 'NotStringMatching', sample),
     arrayContaining: sample => asymmetric(value => !(Array.isArray(value) && sample.every(item => value.some(candidate => equals(candidate, item)))), 'NotArrayContaining', sample),
@@ -2478,6 +2503,7 @@
       durationMs,
       failures,
       assertions,
+      attempts: plan.attempts || (status === 'skipped' || status === 'todo' ? 0 : 1),
       registrationStack: plan.registrationStack,
     }
   }
@@ -2492,7 +2518,7 @@
         active.failures.length ? 'failed' : 'passed',
         active.failures.slice(),
         active.expectation.assertionCalls,
-        Math.max(0, realDateNow() - active.started),
+        Math.max(0, realDateNow() - active.plan.started),
       ))
     }
     const failed = cases.some(value => value.status === 'failed') || scheduler.suiteFailures.length > 0
@@ -2583,6 +2609,8 @@
           status: schedulerCaseStatus(record, target, staticallySkipped),
           registrationStack: record.registrationStack,
           suitePath,
+          retries: record.retries, failing: record.failing, attempts: 0,
+          startIndex: scheduler.steps.length,
         }
         scheduler.cases.push(plan)
         scheduler.steps.push({ kind: 'caseStart', plan })
@@ -2697,12 +2725,19 @@
     collectRealTimerLeaks(plan.fullName)
     network.reset()
     restoreAllMocks()
+    if (active.retryable && !active.nonRetryable && active.failures.length && plan.attempts <= plan.retries && state.leaks.length === active.leaksStart) {
+      state.snapshots.length = active.snapshotsStart
+      scheduler.activeCase = null
+      state.activeTest = null
+      scheduler.index = plan.startIndex
+      return
+    }
     scheduler.results.push(schedulerCaseResult(
       plan,
       active.failures.length ? 'failed' : 'passed',
       active.failures.slice(),
       active.expectation.assertionCalls,
-      Math.max(0, realDateNow() - active.started),
+      Math.max(0, realDateNow() - plan.started),
     ))
     scheduler.activeCase = null
     state.activeTest = null
@@ -2751,7 +2786,9 @@
           scheduler.results.push(schedulerCaseResult(plan, 'skipped'))
         } else {
           const expectation = { fullName: plan.fullName, assertionCalls: 0, expectedAssertions: null, hasAssertions: false, snapshotIndex: 0 }
-          scheduler.activeCase = { plan, expectation, failures: [], primaryFailed: false, started: realDateNow() }
+          plan.attempts++
+          if (plan.attempts === 1) plan.started = realDateNow()
+          scheduler.activeCase = { plan, expectation, failures: [], primaryFailed: false, started: realDateNow(), retryable: false, nonRetryable: false, leaksStart: state.leaks.length, snapshotsStart: state.snapshots.length }
           state.activeTest = expectation
           clearAllMocks()
           network.reset()
@@ -2771,6 +2808,8 @@
         if (!active || active.plan.index !== step.caseIndex) continue
         if ((step.kind === 'beforeEach' || step.kind === 'test') && active.primaryFailed) continue
       }
+      step.completed = false
+      step.timedOut = false
       scheduler.currentStep = step
       const cursor = schedulerStepCursor(step)
       globalThis.__wakeSerializedSchedulerCursor = JSON.stringify(cursor)
@@ -2808,6 +2847,8 @@
       return
     }
     active.failures.push(failure)
+    if (step.kind === 'test' && ordinaryTestFailure(failure)) active.retryable = true
+    else active.nonRetryable = true
     if (step.kind === 'beforeEach' || step.kind === 'test') active.primaryFailed = true
   }
 
@@ -2842,8 +2883,14 @@
       const execution = Promise.resolve().then(async () => {
         if (typeof step.fn !== 'function') return
         if (step.fn.length > 0) throw Object.assign(new Error('Wake tests do not support done callbacks; return or await a Promise'), { code: 'WAKE_TEST_UNSUPPORTED' })
-        await step.fn()
+        let thrown = false
+        try { await step.fn() }
+        catch (error) {
+          if (step.kind !== 'test' || !scheduler.activeCase.plan.failing || !ordinaryTestFailure(error)) throw error
+          thrown = true
+        }
         if (step.kind === 'test') {
+          if (scheduler.activeCase.plan.failing && !thrown) throw Object.assign(new Error('Expected test callback to fail, but it passed'), {code: 'WAKE_TEST_EXPECTED_FAILURE'})
           const active = scheduler.activeCase.expectation
           if (active.expectedAssertions !== null && active.assertionCalls !== active.expectedAssertions) {
             throw new Error(`Expected ${active.expectedAssertions} assertions, but received ${active.assertionCalls}`)
@@ -3031,6 +3078,7 @@
     options = options || {}
     state.seed = String(options.seed || '')
     state.defaultTimeout = Number(options.timeoutMs || 5000)
+    state.defaultRetries = Number(options.retries || 0)
     state.forbidOnly = Boolean(options.forbidOnly)
     state.reactStrictMode = Boolean(options.reactStrictMode)
     state.reactCleanup = options.reactCleanup !== false
@@ -3046,6 +3094,31 @@
     state.updateSnapshots = String(options.updateSnapshots || 'new')
     installReactActWarningCapture()
     installNetworkFetch()
+  }
+  globalThis.__wakeRunLifecyclePhase = async (callback, timeout) => {
+    if (typeof callback !== 'function' || callback.length > 0) throw new TypeError('Global lifecycle module must default-export a function without done callbacks')
+    installRealTimerTracking()
+    resumeRealTimerTracking()
+    let timer
+    try {
+      await Promise.race([
+        Promise.resolve().then(callback),
+        new Promise((_resolve, reject) => {
+          timer = realSetTimeout(() => reject(new Error('Global lifecycle exceeded its timeout')), timeout)
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) realClearTimeout(timer)
+      pauseRealTimerTracking()
+    }
+  }
+  globalThis.__wakePauseLifecycle = pauseRealTimerTracking
+  globalThis.__wakeCloseLifecycle = () => {
+    pauseRealTimerTracking()
+    collectRealTimerLeaks(null, true)
+    restoreClock()
+    restoreAllMocks()
+    network.reset()
   }
   globalThis.__wakeStartTestRun = () => {
     installNetworkFetch()

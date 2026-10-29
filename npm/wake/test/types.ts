@@ -509,6 +509,11 @@ async function api() {
     afterEach(() => undefined)
     afterAll(() => undefined)
     test('supports assertions', () => expect({ answer: 42 }).toEqual({ answer: 42 }))
+    test('supports retry options', () => undefined, { retries: 2 })
+    test.failing.each([1, 2])('fails %s', value => { throw new Error(String(value)) })
+    expect([1, 2]).toEqual(expect.arrayOf(expect.any(Number)))
+    expect(['x']).toEqual(expect.not.arrayOf(expect.any(Number)))
+    expect(() => { throw new Error('snapshot') }).toThrowErrorMatchingSnapshot()
     it('supports async cases', async () => expect(Promise.resolve(42)).resolves.toBe(42))
     test.each([[1, 2, 3] as const])('adds values', (left, right, sum) => {
       expect(left + right).toBe(sum)

@@ -239,7 +239,10 @@ pub struct Test {
     pub browser_include: Vec<String>,
     pub exclude: Vec<String>,
     pub setup: Vec<String>,
+    pub global_setup: Vec<String>,
+    pub global_teardown: Vec<String>,
     pub timeout_ms: u64,
+    pub retries: u32,
     pub workers: WorkerCount,
     pub forbid_only: bool,
     pub leaks: TestLeakPolicy,
@@ -262,7 +265,10 @@ impl Default for Test {
             ],
             exclude: vec!["**/node_modules/**".to_string(), "**/dist/**".to_string()],
             setup: Vec::new(),
+            global_setup: Vec::new(),
+            global_teardown: Vec::new(),
             timeout_ms: 5_000,
+            retries: 0,
             workers: WorkerCount::Auto,
             forbid_only: false,
             leaks: TestLeakPolicy::Warn,
@@ -461,6 +467,7 @@ impl Default for TestSnapshot {
 #[serde(default, deny_unknown_fields)]
 pub struct TestCoverage {
     pub enabled: bool,
+    pub collect: Vec<String>,
     pub reporters: Vec<TestCoverageReporter>,
     pub threshold: TestCoverageThreshold,
     pub per_file: Vec<TestCoverageFileThreshold>,
@@ -470,6 +477,7 @@ impl Default for TestCoverage {
     fn default() -> Self {
         Self {
             enabled: false,
+            collect: Vec::new(),
             reporters: vec![TestCoverageReporter::Text],
             threshold: TestCoverageThreshold::default(),
             per_file: Vec::new(),
@@ -558,7 +566,14 @@ pub struct TestProject {
     #[serde(default = "default_test_project_root")]
     pub root: String,
     #[serde(default)]
-    pub environment: TestEnvironment,
+    pub environment: Option<TestEnvironment>,
+    pub include: Option<Vec<String>>,
+    pub browser_include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+    pub setup: Option<Vec<String>>,
+    pub timeout_ms: Option<u64>,
+    pub retries: Option<u32>,
+    pub coverage: Option<TestCoverage>,
 }
 
 fn deserialize_test_projects<'de, D>(deserializer: D) -> Result<Vec<TestProject>, D::Error>
@@ -1475,7 +1490,7 @@ strategy = "version-first"
         assert_eq!(test.projects.len(), 1);
         assert_eq!(test.projects[0].name, "client");
         assert_eq!(test.projects[0].root, "packages/client");
-        assert_eq!(test.projects[0].environment, TestEnvironment::Browser);
+        assert_eq!(test.projects[0].environment, Some(TestEnvironment::Browser));
     }
 
     #[test]

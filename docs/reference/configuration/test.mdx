@@ -20,7 +20,10 @@ include = ["**/*.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"]
 browser_include = ["**/*.browser.{test,spec}.{js,mjs,cjs,jsx,ts,mts,cts,tsx}"]
 exclude = ["**/node_modules/**", "**/dist/**"]
 setup = []
+global_setup = []
+global_teardown = []
 timeout_ms = 5000
+retries = 0
 workers = "auto"
 forbid_only = false
 leaks = "warn"
@@ -50,6 +53,7 @@ screenshot_directory = "__screenshots__"
 [test.coverage]
 enabled = false
 reporters = ["text"]
+collect = []
 
 [test.coverage.threshold]
 lines = 80
@@ -70,7 +74,21 @@ environment = "auto"
 
 `environment` 只接受 `auto`、`dom` 或 `browser`。`auto` 根据 `browser_include` 为 suite 选择
 fast DOM 或真实 Chromium；浏览器可执行文件由 CLI/Node option 显式指定或从系统发现，不写入
-配置插件路径。每个 project 只有 `name`、`root`、`environment` 三个覆盖字段。
+配置插件路径。project 除 `name`、`root`、`environment` 外，可覆盖 `include`、`browser_include`、
+`exclude`、`setup`、`timeout_ms`、`retries`、`coverage`。未设置的字段继承根配置；显式数组（包括空数组）
+替换继承值。project.coverage 整张表替换根 coverage 表，表内省略字段使用默认值。project 的路径、
+setup 和 coverage.collect glob 相对该 project 的 root。
+
+`global_setup` / `global_teardown` 是相对根目录的模块路径数组；每个模块必须 default 导出无参数
+函数，可返回 Promise。仅在本轮选中 suite 时执行，每轮 watch 重跑均重建独立 DOM realm，setup
+按声明顺序运行，teardown 逆序运行；两阶段共享该 realm，但与 suite 不共享全局变量。可以通过文件
+或外部服务协调资源。失败和取消后仍尝试执行全部 teardown，使用独立 timeout_ms 预算；生命周期
+失败属于测试失败并产生 WAKE_TEST_LIFECYCLE diagnostic，CLI/Node 不把它当作成功。它不提供完整 Node 环境。
+生命周期 realm 的计时器在 phase 之间暂停，teardown 时恢复并最终取消；它不提供在 suite 执行期间
+独立运行的后台事件循环，需要持续运行的服务应由外部服务提供。
+
+`retries` 为非负 32 位整数，默认 0。仅普通测试回调失败触发重试，每次重新执行 beforeEach、afterEach
+和清理，beforeAll/afterAll 不重复；hook、超时、泄漏、快照和框架错误不重试。结果 attempts 为实际尝试次数。
 
 `workers` 接受 `auto`、正整数或 `1%`–`100%`。`leaks` 接受 `off`、`warn`、`error`；
 `act_warnings` 也接受这三个值：Wake 捕获 React 的 `act(...)` 警告并归因到当前 phase；`off`
@@ -83,6 +101,12 @@ Wake glob 选择文件。`lines`、`functions`、`blocks` 都接受 `0`–`100` 
 `text` 会生成并由 pretty CLI 输出 `coverage/coverage.txt`；`json`、`lcov` 和 `html` 分别生成
 `wake-coverage.json`、带逐行/函数/分支记录的 `lcov.info`，以及包含原始源码逐行标记的
 `coverage/index.html`。这些文件都会作为 owned artifact 返回。
+`coverage.collect` 使用相对项目根的 Wake glob，显式纳入未被测试导入的 JS/TS/JSX/TSX 源码；
+这些源码只编译和解析统计，不执行，未加载文件计零命中。排除测试文件、setup、global 生命周期模块
+和 node_modules；可用 `!glob` 排除。多项目分别生成覆盖率报告并检查各自阈值，根结果合并源码命中。
+允许空测试集时，普通 run 仍检查显式收集的源码门禁；changed、changed-since、related 筛选没有选中 suite 时跳过覆盖率。
+project 报告位于各自 root 的 `coverage/<project身份>/`，artifact.metadata.project 记录项目名，
+避免相同 root 的项目互相覆盖；无 project 配置时保持 `coverage/` 路径。
 `leaks` 检测并在 teardown 取消 Wake 拥有的 timeout、interval、immediate、animation-frame、
 idle-callback 与 fake-clock handle，并保留创建 stack；它不声称扫描操作系统或第三方原生进程的
 任意句柄。浏览器 context、拦截请求和 Wake 网络 route 由各自 owner 独立关闭。

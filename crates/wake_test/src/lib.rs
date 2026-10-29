@@ -4,10 +4,15 @@
 //! The embedded JavaScript runtime is a private implementation resource; callers only exchange the
 //! owned models in this module.
 
+mod coverage_collect;
 mod coverage_threshold;
 mod docs;
 mod git_changed;
+mod lifecycle;
 mod selection;
+
+#[cfg(test)]
+mod engineering_controls_tests;
 
 pub use wake_test_contract::protocol;
 pub use wake_test_contract::{
@@ -248,8 +253,14 @@ struct RuntimeCaseResult {
     duration_ms: u64,
     failures: Vec<RuntimeFailure>,
     assertions: usize,
+    #[serde(default = "one_attempt")]
+    attempts: usize,
     #[serde(default)]
     registration_stack: Option<String>,
+}
+
+fn one_attempt() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,7 +625,6 @@ fn run_tests_with_selection_cached(
     let root = root.canonicalize().unwrap_or(root);
     let config = wake_config::load(&root)
         .map_err(|error| TestError::new("WAKE_TEST_CONFIG", error.to_string()).at(&root))?;
-    let coverage_enabled = options.coverage || config.test.coverage.enabled;
     if let Some(environment) = options.environment.as_deref()
         && !matches!(environment, "auto" | "dom" | "browser")
     {
@@ -865,6 +875,25 @@ fn run_tests_with_selection_cached(
             .collect();
     }
     let discovered_count = test_paths.len();
+    let coverage_projects = if selection_active && test_paths.is_empty() {
+        BTreeMap::new()
+    } else if config.test.projects.is_empty() {
+        BTreeMap::from([(None, (root.clone(), config.test.clone()))])
+    } else {
+        config
+            .test
+            .projects
+            .iter()
+            .filter(|project| {
+                options.projects.is_empty() || options.projects.contains(&project.name)
+            })
+            .map(|project| {
+                let (name, project_root, project_config) =
+                    project_config(&root, &config.test, project);
+                (name, (project_root, project_config))
+            })
+            .collect()
+    };
     let browser = (!cancellation.is_cancelled()
         && test_paths
             .iter()
@@ -888,7 +917,11 @@ fn run_tests_with_selection_cached(
     );
     result.diagnostics.append(&mut selection_diagnostics);
     let bail = options.bail.unwrap_or(0);
-    let suites = if !options.serial && bail == 0 && test_paths.len() > 1 {
+    let mut lifecycle = lifecycle::RunLifecycle::new(&root, &config.test, !test_paths.is_empty());
+    let setup_ok = lifecycle.setup(&cancellation, &mut result.diagnostics);
+    let suites = if !setup_ok {
+        Vec::new()
+    } else if !options.serial && bail == 0 && test_paths.len() > 1 {
         execute_suites_parallel(
             &root,
             &test_paths,
@@ -896,7 +929,6 @@ fn run_tests_with_selection_cached(
             test_name_pattern.as_ref(),
             &seed,
             browser.as_ref(),
-            coverage_enabled,
             &cancellation,
             worker_count(
                 options.workers.as_ref(),
@@ -917,7 +949,6 @@ fn run_tests_with_selection_cached(
                 test_name_pattern.as_ref(),
                 &seed,
                 browser.as_deref(),
-                coverage_enabled,
                 &cancellation,
             )?;
             let failed = suite.suite.status == TestSuiteStatus::Failed;
@@ -935,10 +966,22 @@ fn run_tests_with_selection_cached(
         }
         suites
     };
-    let mut coverage_files = Vec::new();
+    lifecycle.finish(&mut result.diagnostics);
+    for path in lifecycle.watch_paths() {
+        merge_watch_path(
+            &mut cache.watch_paths,
+            path,
+            false,
+            TestWatchPathRoles::COMPILER_INPUT,
+        );
+    }
+    let mut project_coverage = BTreeMap::<Option<String>, Vec<NormalizedCoverageFile>>::new();
     for executed in suites {
         let suite = executed.suite;
-        coverage_files.extend(executed.coverage);
+        project_coverage
+            .entry(suite.project.clone())
+            .or_default()
+            .extend(executed.coverage);
         result.leaks.extend(executed.leaks);
         result.diagnostics.extend(executed.diagnostics);
         result.artifacts.extend(executed.artifacts);
@@ -948,26 +991,59 @@ fn run_tests_with_selection_cached(
         result.suites.push(suite);
     }
     let mut coverage_failed = false;
-    if coverage_enabled && !cancellation.is_cancelled() {
-        let aggregated = aggregate_coverage(coverage_files);
-        let artifacts = write_coverage_reports(
-            &root,
-            &config.test.coverage.reporters,
-            &aggregated.result,
-            &aggregated.report_files,
-        )?;
-        let artifact_ids = artifacts
-            .iter()
-            .map(|artifact| artifact.id.clone())
-            .collect();
-        let mut coverage = aggregated.result;
-        coverage.report_artifact_ids = artifact_ids;
-        let threshold_diagnostics =
-            coverage_threshold::evaluate(&root, &config.test.coverage, &coverage)?;
-        coverage_failed = !threshold_diagnostics.is_empty();
-        result.diagnostics.extend(threshold_diagnostics);
-        result.artifacts.extend(artifacts);
-        result.coverage = Some(coverage);
+    if !cancellation.is_cancelled() {
+        let mut all_files = Vec::new();
+        let mut loaded_paths = BTreeSet::new();
+        let mut artifact_ids = Vec::new();
+        let mut requested = false;
+        for (project, (project_root, project_config)) in coverage_projects {
+            if !options.coverage && !project_config.coverage.enabled {
+                continue;
+            }
+            requested = true;
+            let mut files = project_coverage.remove(&project).unwrap_or_default();
+            let loaded_count = files.len();
+            coverage_collect::append_missing(&project_root, &project_config, &mut files)?;
+            let aggregated = aggregate_coverage(files.clone());
+            let artifacts = write_coverage_reports(
+                &project_root,
+                project.as_deref(),
+                &project_config.coverage.reporters,
+                &aggregated.result,
+                &aggregated.report_files,
+            )?;
+            artifact_ids.extend(artifacts.iter().map(|artifact| artifact.id.clone()));
+            let diagnostics = coverage_threshold::evaluate(
+                &project_root,
+                &project_config.coverage,
+                &aggregated.result,
+            )?;
+            coverage_failed |= !diagnostics.is_empty();
+            result.diagnostics.extend(diagnostics);
+            result.artifacts.extend(artifacts);
+            for (index, mut file) in files.into_iter().enumerate() {
+                let absolute = project_root.join(&file.path);
+                file.path = normalize_path(absolute.strip_prefix(&root).unwrap_or(&absolute));
+                let loaded = index < loaded_count;
+                if loaded {
+                    loaded_paths.insert(file.path.clone());
+                }
+                all_files.push((file, loaded));
+            }
+        }
+        if requested {
+            let mut coverage = aggregate_coverage(
+                all_files
+                    .into_iter()
+                    .filter_map(|(file, loaded)| {
+                        (loaded || !loaded_paths.contains(&file.path)).then_some(file)
+                    })
+                    .collect(),
+            )
+            .result;
+            coverage.report_artifact_ids = artifact_ids;
+            result.coverage = Some(coverage);
+        }
     }
     let mut react_versions = result.suites.iter().filter_map(|suite| {
         suite.environment.as_ref().and_then(|environment| {
@@ -999,6 +1075,10 @@ fn run_tests_with_selection_cached(
         }
     }
     result.success = result.counts.suites.failed == 0
+        && !result
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "WAKE_TEST_LIFECYCLE")
         && !coverage_failed
         && (!result.suites.is_empty() || options.allow_no_tests || selection_active);
     if bail > 0
@@ -1008,6 +1088,7 @@ fn run_tests_with_selection_cached(
         result.termination_reason = TestTerminationReason::Bail;
     }
     if result.suites.is_empty()
+        && discovered_count == 0
         && !options.allow_no_tests
         && !selection_active
         && !cancellation.is_cancelled()
@@ -1075,7 +1156,6 @@ fn execute_suites_parallel(
     test_name_pattern: Option<&Regex>,
     seed: &str,
     browser: Option<&Arc<BrowserDriver>>,
-    coverage_enabled: bool,
     cancellation: &TestCancellationToken,
     workers: usize,
 ) -> Result<Vec<ExecutedSuite>, TestError> {
@@ -1103,7 +1183,6 @@ fn execute_suites_parallel(
                         test_name_pattern,
                         seed,
                         browser.map(Arc::as_ref),
-                        coverage_enabled,
                         cancellation,
                     );
                     results.lock().expect("test result lock is not poisoned")[index] = Some(value);
@@ -1126,11 +1205,11 @@ fn execute_suite(
     test_name_pattern: Option<&Regex>,
     seed: &str,
     browser: Option<&BrowserDriver>,
-    coverage_enabled: bool,
     cancellation: &TestCancellationToken,
 ) -> Result<ExecutedSuite, TestError> {
     let path = &prepared.discovered.path;
     let config = &prepared.discovered.config;
+    let coverage_enabled = options.coverage || config.coverage.enabled;
     let project = prepared.discovered.project.as_deref();
     let path_label = path
         .strip_prefix(root)
@@ -1171,6 +1250,7 @@ fn execute_suite(
     let configuration = serde_json::json!({
         "seed": seed,
         "timeoutMs": config.timeout_ms,
+        "retries": config.retries,
         "forbidOnly": config.forbid_only,
         "reactStrictMode": config.react.strict_mode,
         "reactCleanup": config.react.cleanup,
@@ -1287,7 +1367,12 @@ fn execute_suite(
                     failures,
                     snapshot: Some(browser_operations.snapshot),
                 },
-                coverage: normalize_coverage(root, path, &compiled, raw_coverage.as_ref()),
+                coverage: normalize_coverage(
+                    &prepared.discovered.project_root,
+                    path,
+                    &compiled,
+                    raw_coverage.as_ref(),
+                ),
                 leaks: Vec::new(),
                 diagnostics: Vec::new(),
                 artifacts: browser_operations.artifacts,
@@ -1408,7 +1493,7 @@ fn execute_suite(
                 status: test.status,
                 duration_ms: test.duration_ms,
                 assertions: test.assertions,
-                attempts: 1,
+                attempts: test.attempts,
                 location,
                 failures,
             }
@@ -1446,7 +1531,12 @@ fn execute_suite(
             failures,
             snapshot: Some(snapshot),
         },
-        coverage: normalize_coverage(root, path, &compiled, raw_coverage.as_ref()),
+        coverage: normalize_coverage(
+            &prepared.discovered.project_root,
+            path,
+            &compiled,
+            raw_coverage.as_ref(),
+        ),
         leaks,
         diagnostics,
         artifacts: browser_operations.artifacts,
@@ -3631,6 +3721,7 @@ fn browser_timeout_result(
                 duration_ms: step.timeout_ms,
                 failures: vec![failure.clone()],
                 assertions: 0,
+                attempts: 1,
                 registration_stack: planned.registration_stack.clone(),
             });
         } else {
@@ -3654,6 +3745,7 @@ fn browser_timeout_result(
             duration_ms: 0,
             failures: Vec::new(),
             assertions: 0,
+            attempts: 0,
             registration_stack: planned.registration_stack.clone(),
         });
     }
@@ -4216,11 +4308,15 @@ fn aggregate_coverage(files: Vec<NormalizedCoverageFile>) -> AggregatedCoverage 
 
 fn write_coverage_reports(
     root: &Path,
+    project: Option<&str>,
     reporters: &[wake_config::TestCoverageReporter],
     coverage: &CoverageResult,
     report_files: &[CoverageReportFile],
 ) -> Result<Vec<TestArtifact>, TestError> {
-    let directory = root.join("coverage");
+    let mut directory = root.join("coverage");
+    if let Some(project) = project {
+        directory.push(stable_id("project", project));
+    }
     let mut artifacts = Vec::new();
     for reporter in reporters {
         let (kind, path, contents) = match reporter {
@@ -4253,7 +4349,11 @@ fn write_coverage_reports(
             path: normalize_path(&path),
             suite_id: None,
             test_id: None,
-            metadata: BTreeMap::new(),
+            metadata: project
+                .map(|name| {
+                    BTreeMap::from([("project".into(), serde_json::Value::String(name.into()))])
+                })
+                .unwrap_or_default(),
         });
     }
     Ok(artifacts)
@@ -4574,6 +4674,7 @@ fn discover_tests(
             test_config.environment = environment;
             discovered.push(DiscoveredTest {
                 path,
+                project_root: project_root.clone(),
                 config: test_config,
                 project: project_name.clone(),
                 environment,
@@ -4587,6 +4688,7 @@ fn discover_tests(
 #[derive(Clone)]
 struct DiscoveredTest {
     path: PathBuf,
+    project_root: PathBuf,
     config: wake_config::Test,
     project: Option<String>,
     environment: wake_config::TestEnvironment,
@@ -4655,7 +4757,12 @@ fn prepare_test_interruptible(
             };
         }
     };
-    let source = suite_wrapper_source(root, &path, &discovered.config, &original_source);
+    let source = suite_wrapper_source(
+        &discovered.project_root,
+        &path,
+        &discovered.config,
+        &original_source,
+    );
     let graph = match compile_commonjs_module_graph_interruptible(&entry_path, &source, &|| {
         cancellation.is_cancelled()
     }) {
@@ -4858,7 +4965,28 @@ fn project_config(
     };
     let mut config = parent.clone();
     config.projects.clear();
-    config.environment = project.environment;
+    config.environment = project.environment.unwrap_or(parent.environment);
+    if let Some(value) = &project.include {
+        config.include = value.clone();
+    }
+    if let Some(value) = &project.browser_include {
+        config.browser_include = value.clone();
+    }
+    if let Some(value) = &project.exclude {
+        config.exclude = value.clone();
+    }
+    if let Some(value) = &project.setup {
+        config.setup = value.clone();
+    }
+    if let Some(value) = project.timeout_ms {
+        config.timeout_ms = value;
+    }
+    if let Some(value) = project.retries {
+        config.retries = value;
+    }
+    if let Some(value) = &project.coverage {
+        config.coverage = value.clone();
+    }
     (Some(project.name.clone()), project_root, config)
 }
 
@@ -5871,6 +5999,7 @@ test('executes the authoritative PnP graph', async () => {
             &root,
             DiscoveredTest {
                 path: suite.clone(),
+                project_root: root.clone(),
                 config,
                 project: None,
                 environment: wake_config::TestEnvironment::Browser,
@@ -6932,7 +7061,7 @@ environment = "dom"
         fs::write(fixture.path().join("package.json"), "{}").unwrap();
         fs::write(
             fixture.path().join("math.test.ts"),
-            "import * as wake from '@crab-dev/wake/test'; import * as reactEntry from '@crab-dev/wake/test/react'; import {clock, expect, mock, network, test} from '@crab-dev/wake/test'; test('surface', () => { expect(Object.keys(wake).sort()).toEqual(['afterAll','afterEach','beforeAll','beforeEach','clock','describe','expect','it','mock','network','test']); expect(Object.keys(reactEntry).sort()).toEqual(['act','afterAll','afterEach','beforeAll','beforeEach','cleanup','clock','describe','expect','fireEvent','it','mock','network','prettyDOM','render','renderHook','screen','test','userEvent','waitFor','waitForElementToBeRemoved','within']); expect(Object.keys(wake.test).sort()).toEqual(['each','only','skip','todo']); expect(Object.keys(mock).sort()).toEqual(['actual','clearAll','fn','import','isolate','module','replaceProperty','resetAll','restoreAll','spyOn']); expect(Object.keys(clock).sort()).toEqual(['advanceBy','advanceTo','fake','flushMicrotasks','restore','runAll','runNext']); expect(Object.keys(network).sort()).toEqual(['allow','requests','reset','route']) })",
+            "import * as wake from '@crab-dev/wake/test'; import * as reactEntry from '@crab-dev/wake/test/react'; import {clock, expect, mock, network, test} from '@crab-dev/wake/test'; test('surface', () => { expect(Object.keys(wake).sort()).toEqual(['afterAll','afterEach','beforeAll','beforeEach','clock','describe','expect','it','mock','network','test']); expect(Object.keys(reactEntry).sort()).toEqual(['act','afterAll','afterEach','beforeAll','beforeEach','cleanup','clock','describe','expect','fireEvent','it','mock','network','prettyDOM','render','renderHook','screen','test','userEvent','waitFor','waitForElementToBeRemoved','within']); expect(Object.keys(wake.test).sort()).toEqual(['each','failing','only','skip','todo']); expect(Object.keys(mock).sort()).toEqual(['actual','clearAll','fn','import','isolate','module','replaceProperty','resetAll','restoreAll','spyOn']); expect(Object.keys(clock).sort()).toEqual(['advanceBy','advanceTo','fake','flushMicrotasks','restore','runAll','runNext']); expect(Object.keys(network).sort()).toEqual(['allow','requests','reset','route']) })",
         )
         .unwrap();
         let result = run_tests(options(fixture.path())).unwrap();

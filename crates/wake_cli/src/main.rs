@@ -1226,10 +1226,10 @@ fn print_pretty_test_result(result: &wake_app::TestRunResult, ui: Ui) {
         result.counts.tests.skipped + result.counts.tests.todo,
         result.counts.tests.total
     );
-    if let Some(artifact) = result
+    for artifact in result
         .artifacts
         .iter()
-        .find(|artifact| artifact.kind == "coverage-text")
+        .filter(|artifact| artifact.kind == "coverage-text")
     {
         match std::fs::read_to_string(&artifact.path) {
             Ok(report) => eprintln!("{}", report.trim_end()),

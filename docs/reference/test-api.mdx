@@ -25,6 +25,12 @@ import { describe, test, expect, beforeEach, afterEach, mock, clock, network } f
 
 测试参数为 `test(name, callback, { timeout: 10_000 })`。不支持 done 回调、test.concurrent、focused aliases 或默认导出。异步 matcher 必须等待；完整类型由安装包 `test.d.ts` 提供。
 
+`test(name, callback, { retries: 2 })` 覆盖项目重试次数，timeout 可省略。
+`test.failing(name, callback, options?)` 声明预期抛错的用例，支持 only、skip、each；普通回调异常使其通过，
+回调正常结束则失败。hook、超时、快照和框架错误不反转，仍失败。不要用它掩盖环境或清理问题。
+`expect.arrayOf(matcher)` 与 `expect.not.arrayOf(matcher)` 检查全部元素；
+`toThrowErrorMatchingSnapshot(hint?)` 保存异常 message 的外部快照，不改写源码。
+
 ## 模块 Mock
 
 | API | 行为 |

@@ -1213,6 +1213,10 @@ test('publishes strict Wake test and React entrypoints outside the test realm', 
 
   for (const invoke of [
     () => esmTest.test('outside', () => {}),
+    () => esmTest.test.failing('outside', () => {}),
+    () => commonjsTest.test.failing.each([1]),
+    () => esmTest.expect.arrayOf(1),
+    () => commonjsTest.expect.not.arrayOf(1),
     () => commonjsTest.expect(42),
     () => esmTest.mock.fn(),
     () => commonjsTest.clock.fake(),
