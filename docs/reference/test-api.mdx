@@ -42,6 +42,10 @@ import { describe, test, expect, beforeEach, afterEach, mock, clock, network } f
 
 ## 时钟与网络
 
+DOM 宿主的 `node:crypto.createHash` 支持 SHA-1、SHA-256、SHA-384、SHA-512，接受 UTF-8/hex
+字符串和字节视图，支持连续 update，以及 Buffer、hex、base64 digest。其他算法、编码和 browser
+宿主调用明确报 `WAKE_TEST_UNSUPPORTED`；digest 后不能再更新或重复取值。它不代表完整 Node crypto 兼容。
+
 `await clock.fake(options?)` 启用异步虚拟时钟，支持 now、timerLimit 和排除项。advanceBy、advanceTo、runNext、runAll、flushMicrotasks 均需要等待；restore 返回真实时间。React 更新会经过相应 act 检查点，不提供旧式 timer 模式。
 
 `network.route(matcher, handler)` 和 `network.allow(matcher)` 返回释放函数。matcher 可使用 URL、字符串、正则、方法/URL 对象或请求判断函数。handler 返回 Response 或含 status、headers、body、delayMs 的响应对象。

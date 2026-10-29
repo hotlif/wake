@@ -6753,6 +6753,36 @@ environment = "dom"
     }
 
     #[test]
+    fn host_hashes_use_standard_algorithms_and_reject_unsupported_semantics() {
+        let fixture = fixture(
+            r#"
+            import {expect, test} from '@crab-dev/wake/test'
+            import {createHash} from 'node:crypto'
+            test('standard digests', () => {
+                expect(createHash('sha256').update('a').update('bc').digest('hex')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+                expect(createHash('SHA-256').update('\ud800').digest('hex')).toBe('83d544ccc223c057d2bf80d3f2a32982c32c3c0db8e2674820da5064783fb097')
+                expect(createHash('sha1').update('616263', 'hex').digest('hex')).toBe('a9993e364706816aba3e25717850c26c9cd0d89d')
+                expect(createHash('sha256').update(new Uint8Array([97, 98, 99]).subarray(1)).digest('base64')).toBe('Hgu9bGhroFC46wP/7txk/cnYCUf86CGrvl1tyNJSxaw=')
+                expect(createHash('sha512').update('').digest().length).toBe(64)
+                expect(createHash('sha384').update('').digest().length).toBe(48)
+                const hash = createHash('sha256').update('abc')
+                hash.digest()
+                expect(() => hash.update('d')).toThrow()
+                expect(() => hash.digest()).toThrow()
+                for (const algorithm of ['unknown', 'md5', 's-h-a-256']) {
+                    try { createHash(algorithm); throw new Error('must reject unsupported algorithm') }
+                    catch (error) { expect(error.code).toBe('WAKE_TEST_UNSUPPORTED') }
+                }
+                expect(() => createHash('sha256').update('abc', 'unknown')).toThrow()
+                expect(() => createHash('sha256').digest('unknown')).toThrow()
+            })
+        "#,
+        );
+        let result = run_tests(options(fixture.path())).unwrap();
+        assert!(result.success, "{result:#?}");
+    }
+
+    #[test]
     fn fast_dom_uses_the_npm_locked_same_realm_window() {
         let fixture = fixture(
             r#"

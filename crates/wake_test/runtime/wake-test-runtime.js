@@ -2334,11 +2334,35 @@
       webcrypto,
       randomUUID,
       randomBytes(size) { return WakeBuffer.from(Array.from({ length: Number(size) }, randomByte)) },
-      createHash() {
-        let hash = 0x811c9dc5
+      createHash(algorithm) {
+        const unsupported = message => Object.assign(new Error(message), {code: 'WAKE_TEST_UNSUPPORTED'})
+        if (state.environment === 'browser') throw unsupported('node:crypto.createHash is only supported in the DOM host')
+        if (typeof algorithm !== 'string') throw new TypeError('Hash algorithm must be a string')
+        algorithm = algorithm.toLowerCase().replace(/^sha-(1|256|384|512)$/, 'sha$1')
+        if (!['sha1', 'sha256', 'sha384', 'sha512'].includes(algorithm)) throw unsupported(`Unsupported hash algorithm: ${algorithm}`)
+        const chunks = []
+        let finalized = false
+        const check = () => { if (finalized) throw new Error('Digest already called') }
         return {
-          update(value) { for (const byte of WakeBuffer.from(value)) { hash ^= byte; hash = Math.imul(hash, 0x01000193) >>> 0 } return this },
-          digest(encoding) { const bytes = WakeBuffer.from(hash.toString(16).padStart(8, '0'), 'hex'); return encoding ? bytes.toString(encoding) : bytes },
+          update(value, encoding = 'utf8') {
+            check()
+            if (typeof value === 'string') {
+              if (!['utf8', 'utf-8', 'hex'].includes(encoding)) throw unsupported(`Unsupported hash input encoding: ${encoding}`)
+              if (encoding === 'hex' && (!/^[\da-f]*$/i.test(value) || value.length % 2)) throw new TypeError('Hash hex input must contain complete bytes')
+              chunks.push(WakeBuffer.from(encoding === 'hex' ? value : value.toWellFormed(), encoding))
+            } else if (ArrayBuffer.isView(value)) {
+              chunks.push(WakeBuffer.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)))
+            } else throw new TypeError('Hash update requires a string or byte view')
+            return this
+          },
+          digest(encoding) {
+            check()
+            if (encoding !== undefined && !['hex', 'base64'].includes(encoding)) throw unsupported(`Unsupported hash output encoding: ${encoding}`)
+            finalized = true
+            const bytes = WakeBuffer.from(host('hash', {algorithm, bytes: [...WakeBuffer.concat(chunks)]}))
+            chunks.length = 0
+            return encoding === undefined ? bytes : bytes.toString(encoding)
+          },
         }
       },
     }

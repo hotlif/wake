@@ -1895,6 +1895,19 @@ fn host_call(request: &str) -> Result<String, String> {
         "env" => serde_json::to_value(std::env::vars().collect::<BTreeMap<_, _>>())
             .map_err(|error| error.to_string())?,
         "httpRequest" => host_http_request(&request)?,
+        "hash" => {
+            let algorithm = match request.get("algorithm").and_then(serde_json::Value::as_str) {
+                Some("sha1") => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                Some("sha256") => &ring::digest::SHA256,
+                Some("sha384") => &ring::digest::SHA384,
+                Some("sha512") => &ring::digest::SHA512,
+                _ => return Err("unsupported hash algorithm".to_string()),
+            };
+            let bytes: Vec<u8> =
+                serde_json::from_value(request.get("bytes").cloned().ok_or("hash requires bytes")?)
+                    .map_err(|error| format!("invalid hash bytes: {error}"))?;
+            serde_json::json!(ring::digest::digest(algorithm, &bytes).as_ref())
+        }
         "evalJson" => {
             let code = request
                 .get("code")

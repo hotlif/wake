@@ -4524,6 +4524,7 @@ version = "0.1.46"
 name = "wake_js_runtime"
 version = "0.1.46"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
