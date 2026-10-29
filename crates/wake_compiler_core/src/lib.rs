@@ -413,7 +413,72 @@ pub struct ParsedModule {
     syntax: ModuleSyntaxFacts,
 }
 
+/// Original-source executable spans for zero-hit coverage collection. This is syntax metadata,
+/// not an execution count; type-only declarations and generated helpers never contribute.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CoverageSyntax {
+    pub functions: Vec<Span>,
+    pub blocks: Vec<Span>,
+}
+
+#[cfg(test)]
+mod coverage_syntax_tests {
+    #[test]
+    fn coverage_metadata_preserves_original_tsx_functions_and_skips_type_only_declarations() {
+        let source = "interface OnlyType { value: number }; export const view = (n: number) => n ? <b>yes</b> : <i>no</i>; export function work() { return 1 }";
+        let parsed = super::CompilerBackend::new()
+            .parse_module(super::ParseInput::new(source, super::SourceType::Tsx))
+            .unwrap();
+        assert!(!parsed.has_errors());
+        let value = parsed.coverage_syntax();
+        assert_eq!(value.functions.len(), 2);
+        assert_eq!(
+            &source[value.functions[0].lo as usize..value.functions[0].hi as usize],
+            "(n: number) => n ? <b>yes</b> : <i>no</i>"
+        );
+    }
+}
+
 impl ParsedModule {
+    pub fn coverage_syntax(&self) -> CoverageSyntax {
+        #[derive(Default)]
+        struct Scanner(CoverageSyntax);
+        impl<'a> Visit<'a> for Scanner {
+            fn visit_function(&mut self, function: &wake_ecma_ast::Function<'a>) {
+                if function.body.is_some() {
+                    self.0.functions.push(function.span);
+                }
+                wake_ecma_ast::walk_function(self, function);
+            }
+            fn visit_expression(&mut self, expression: &Expression<'a>) {
+                match expression {
+                    Expression::Arrow(function) => self.0.functions.push(function.span),
+                    Expression::Conditional(value) => {
+                        self.0.blocks.push(value.consequent.span());
+                        self.0.blocks.push(value.alternate.span());
+                    }
+                    Expression::Logical(value) => self.0.blocks.push(value.right.span()),
+                    _ => {}
+                }
+                walk_expression(self, expression);
+            }
+            fn visit_statement(&mut self, statement: &Statement<'a>) {
+                if let Statement::If(value) = statement {
+                    self.0.blocks.push(value.consequent.span());
+                    if let Some(alternate) = value.alternate {
+                        self.0.blocks.push(alternate.span());
+                    }
+                }
+                walk_statement(self, statement);
+            }
+        }
+        self.ast.with_ast(|program| {
+            let mut scanner = Scanner::default();
+            scanner.visit_program(program);
+            scanner.0
+        })
+    }
+
     pub fn ast(&self) -> &Arc<ModuleAst> {
         &self.ast
     }

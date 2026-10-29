@@ -707,6 +707,41 @@ pub fn compile_commonjs_module_graph(
     })
 }
 
+/// Compile one source for zero-hit coverage without resolving or executing its imports.
+/// Original executable anchors and function/block spans come from the same compiler as test graphs.
+pub fn coverage_source_metadata(
+    path: &Path,
+    source: &str,
+) -> Result<(Vec<u32>, wake_compiler_core::CoverageSyntax), RuntimeError> {
+    let parsed = CompilerBackend::new()
+        .parse_module(ParseInput::new(source, source_type(path)))
+        .map_err(|error| RuntimeError::Parse {
+            path: path.to_path_buf(),
+            messages: vec![error.to_string()],
+        })?;
+    if parsed.has_errors() {
+        return Err(RuntimeError::Parse {
+            path: path.to_path_buf(),
+            messages: parsed
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error())
+                .map(|diagnostic| diagnostic.message().to_owned())
+                .collect(),
+        });
+    }
+    let syntax = parsed.coverage_syntax();
+    let emitted = transpile_module_with_mappings(path, source)?;
+    let offsets = emitted
+        .mappings
+        .mappings
+        .iter()
+        .filter(|mapping| !mapping.is_unmapped)
+        .map(|mapping| mapping.source_offset)
+        .collect();
+    Ok((offsets, syntax))
+}
+
 /// Compile a CommonJS graph while allowing an owner to stop between module compilation units.
 ///
 /// A cancelled compilation returns `Ok(None)`: cancellation is an orchestration outcome, not a
