@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.47
+## 0.1.48
+
+- Supersede the 0.1.47 candidate, stopped before npm publication. Admit reviewed Linux Chrome 156
+  and macOS arm64 Chrome 157 runner images while retaining browser checks and blocked stable readiness.
+- Preserve payload bytes when appending source-map comments, and compare resource and Worker root
+  boundaries by filesystem identity so Windows long paths and 8.3 aliases are accepted consistently.
 
 - Unify development and production HTML templates: explicitly select `html.template`, or use only
   the project-root `index.html`. Migrate implicit `public/index.html` templates to an explicit path.
@@ -16,6 +21,10 @@
   capabilities retain their documented experimental status.
 - Preserve UTF-16 module sources, CDP write backpressure and the compatible Tree dependency graph.
 
+## 0.1.47 (not published)
+
+- Candidate cancelled before publication after CI rejected newly upgraded hosted browser images.
+  Its changes are included in 0.1.48.
 
 ## 0.1.46
 
