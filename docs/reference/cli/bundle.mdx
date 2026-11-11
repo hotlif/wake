@@ -49,6 +49,7 @@ require、eval、import.meta 和顶层 await 会报告 `WAKE0305`，不会静默
 
 banner/footer 不经过编译，调用方负责其语法和语义。banner 的行数自动计入 source map；
 footer 与附加代码本身不映射到输入源码。选项变化复用模块编译缓存并重新组合最终 JS/map。
+开启 source map 只追加 `sourceMappingURL` 注释，不改变此前生成代码（包括 banner/footer）的字节。
 
 设置 `--sourcemap` 时，JavaScript 与 `<outfile>.map` 会先在各自目标目录完整写入并同步，再作为
 一个集合提交；任一目标被锁定或替换失败都会恢复上一组字节。Wake 会拒绝把任一候选写到本次

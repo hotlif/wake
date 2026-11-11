@@ -3631,8 +3631,8 @@ fn finish_bundle(
         code.push('\n');
     }
     code.push_str(&output.bundle);
-    // Affixes and the sourceMappingURL directive always start on their own line.
-    if (!options.footer.is_empty() || source_map_file.is_some()) && !code.ends_with('\n') {
+    // Separate the footer without changing the payload when only a map is requested.
+    if !options.footer.is_empty() && !code.ends_with('\n') {
         code.push('\n');
     }
     if !options.footer.is_empty() {
