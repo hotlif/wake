@@ -4148,14 +4148,8 @@ impl IncrementalBundler {
                 let result: Result<String, String> = (|| {
                     let file = crate::resource_refs::decode_path(file)?;
                     let path = normalize(&rec.path.parent().unwrap_or(Path::new("")).join(file));
-                    if let Some(root) = &self.project_root
-                        && !path.starts_with(normalize(root))
-                    {
-                        return Err(format!(
-                            "static resource must remain inside project root {}",
-                            root.display()
-                        ));
-                    }
+                    // Compare physical identities: Windows long and 8.3 paths can spell the
+                    // same covered directory differently. This also rejects links escaping it.
                     let path = normalize(
                         &self
                             .fs

@@ -306,6 +306,73 @@ fn resource_url_project_boundary_uses_filesystem_identity() {
 }
 
 #[test]
+fn resource_url_project_boundary_accepts_root_path_aliases() {
+    // A Windows long root and an entry under its 8.3 alias have different spellings but one
+    // filesystem identity. Model that identity without depending on volume 8.3-name settings.
+    struct RootAliasFs(MemoryFileSystem);
+    impl wake_common::FileSystem for RootAliasFs {
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            if path == Path::new("long-project-root") {
+                Ok(PathBuf::from("app"))
+            } else {
+                self.0.canonicalize(path)
+            }
+        }
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.0.read_to_string(path)
+        }
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.0.read(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.0.exists(path)
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.0.is_file(path)
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.0.is_dir(path)
+        }
+        fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>> {
+            self.0.read_dir(path)
+        }
+    }
+    let fs = RootAliasFs(MemoryFileSystem::from_files([
+        (
+            "app/index.js",
+            "new Worker(new URL('./worker.js',import.meta.url));new URL('./logo.svg',import.meta.url);",
+        ),
+        ("app/worker.js", "self.postMessage('alias-worker');"),
+        ("app/logo.svg", "alias-logo"),
+    ]));
+    let output = crate::BuildSession::new_one_shot(
+        Arc::new(fs),
+        crate::BuildOptions {
+            project_root: Some(PathBuf::from("long-project-root")),
+            ..crate::BuildOptions::default()
+        },
+    )
+    .build_once(crate::BuildRequest::new("app/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.assets.len(), 2);
+    for asset in &output.assets {
+        assert!(output.bundle.contains(&asset.file_name));
+    }
+    assert!(
+        output
+            .assets
+            .iter()
+            .any(|asset| asset.bytes == b"alias-logo")
+    );
+    assert!(
+        output
+            .assets
+            .iter()
+            .any(|asset| { String::from_utf8_lossy(&asset.bytes).contains("alias-worker") })
+    );
+}
+
+#[test]
 fn native_worker_shared_reference_preserves_all_owners() {
     let fs = MemoryFileSystem::from_files([
         ("src/index.js", "import './a.js'; import './b.js';"),
