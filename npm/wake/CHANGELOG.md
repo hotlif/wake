@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.47
+
+- Unify development and production HTML templates: explicitly select `html.template`, or use only
+  the project-root `index.html`. Migrate implicit `public/index.html` templates to an explicit path.
+- Publish public assets atomically with application output, including inventory, stale-file cleanup,
+  collision checks and rollback. Stream SSE and relay WebSocket frames and close reasons in dev proxies.
+- Build static Worker entries in independent sequential sessions, and emit static `new URL()` assets
+  with content hashes, URL encoding, cache invalidation and project-root watch coverage.
+- Add expression-string `define` overrides to build, bundle, build contexts and dev servers.
+- Add conservative synchronous ESM bundles with immutable entry exports, plus banner/footer output
+  with source-map offsets. Unsupported external and live-binding semantics fail explicitly.
+- Include explicitly authorized native lint extensions, Docs Demo visual tests, Git-based test
+  selection, test engineering controls and original-source coverage added since 0.1.46; testing
+  capabilities retain their documented experimental status.
+- Preserve UTF-16 module sources, CDP write backpressure and the compatible Tree dependency graph.
+
+
 ## 0.1.46
 
 - Add opt-in native build diagnostics with `--progress` or `WAKE_PROGRESS=1`, using plain stderr
