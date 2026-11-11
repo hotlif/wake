@@ -5631,6 +5631,7 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         .proxy
         .iter()
         .map(|proxy| wake_dev_server::ProxyRule {
+            ws: proxy.ws,
             context: proxy.context.clone(),
             target: proxy.target.clone(),
             path_rewrite: proxy
@@ -7323,6 +7324,7 @@ fn start_docs_dev_server_leaf(
             .proxy
             .iter()
             .map(|proxy| wake_dev_server::ProxyRule {
+                ws: proxy.ws,
                 context: proxy.context.clone(),
                 target: proxy.target.clone(),
                 path_rewrite: proxy
@@ -7541,6 +7543,7 @@ fn start_aggregated_docs_dev_server(
             .proxy
             .iter()
             .map(|proxy| wake_dev_server::ProxyRule {
+                ws: proxy.ws,
                 context: proxy.context.clone(),
                 target: proxy.target.clone(),
                 path_rewrite: proxy

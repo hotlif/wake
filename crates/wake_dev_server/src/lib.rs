@@ -1156,6 +1156,8 @@ impl Default for ServeOptions {
 /// 一条代理规则（保持既定行为 `Proxy`）。
 #[derive(Clone)]
 pub struct ProxyRule {
+    /// Forward WebSocket upgrades when enabled.
+    pub ws: bool,
     /// 匹配的路径前缀（如 `["/api"]`）。
     pub context: Vec<String>,
     /// 转发目标（如 `http://localhost:8080`）。
@@ -1611,6 +1613,7 @@ fn run_server(
 
 /// 已编译的代理规则（pathRewrite 正则预编译）。
 struct CompiledProxy {
+    ws: bool,
     context: Vec<String>,
     target: String,
     rewrites: Vec<(regex::Regex, String)>,
@@ -1629,6 +1632,7 @@ impl CompiledProxy {
             }
         }
         Some(CompiledProxy {
+            ws: p.ws,
             context: p.context,
             target: p.target,
             rewrites,
@@ -4579,11 +4583,23 @@ async fn serve_html(mount: &MountedAppState) -> HttpResponse {
 /// 现在带扩展名的路径未命中即 404（对齐 webpack-dev-server 的 `disableDotRule: false`）。
 async fn serve_default(
     req: HttpRequest,
-    body: web::Bytes,
+    body: web::Payload,
     data: web::Data<AppState>,
 ) -> HttpResponse {
     if let Some(i) = data.proxies.iter().position(|p| p.matches(req.path())) {
-        return forward(&req, body, &data.proxies[i]).await;
+        let proxy = &data.proxies[i];
+        if req.headers().contains_key("upgrade") {
+            if !proxy.ws {
+                return HttpResponse::Forbidden().body("wake proxy: WebSocket disabled");
+            }
+            return forward_websocket(&req, body, proxy, &data.stop).await;
+        }
+        use actix_web::FromRequest as _;
+        let body = match web::Bytes::from_request(&req, &mut body.into_inner()).await {
+            Ok(body) => body,
+            Err(error) => return error.error_response(),
+        };
+        return forward(&req, body, proxy).await;
     }
     if req.method() != actix_web::http::Method::GET && req.method() != actix_web::http::Method::HEAD
     {
@@ -4875,7 +4891,145 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-/// 把请求转发到代理 target（buffer 整个 body；dev 用，非流式）。
+/// Relay only after a successful upstream handshake; each direction is backpressured.
+async fn forward_websocket(
+    req: &HttpRequest,
+    body: web::Payload,
+    proxy: &CompiledProxy,
+    stop: &StopSignal,
+) -> HttpResponse {
+    use futures_util::SinkExt as _;
+    let mut url = format!(
+        "{}{}",
+        proxy.target.trim_end_matches('/'),
+        proxy.rewrite(req.path())
+    );
+    if !req.query_string().is_empty() {
+        url.push('?');
+        url.push_str(req.query_string());
+    }
+    let client = awc::Client::default();
+    const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+    let mut request = client.ws(url).max_frame_size(MAX_FRAME_SIZE);
+    for (name, value) in req.headers() {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "connection"
+                | "upgrade"
+                | "content-length"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-extensions"
+                | "sec-websocket-protocol"
+        ) {
+            continue;
+        }
+        request = request.set_header(name.clone(), value.clone());
+    }
+    if !proxy.change_origin
+        && let Some(host) = req.headers().get("host")
+    {
+        request = request.set_header("host", host.clone());
+    }
+    if let Some(protocols) = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+    {
+        request = request.protocols(protocols.split(',').map(str::trim));
+    }
+    let (upstream_response, upstream) = match request.connect().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            return HttpResponse::BadGateway()
+                .body(format!("wake proxy: WebSocket handshake failed: {error}"));
+        }
+    };
+    let protocols = upstream_response
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .into_iter()
+        .collect::<Vec<_>>();
+    let (response, mut session, incoming) =
+        match actix_ws::handle_with_protocols(req, body, &protocols) {
+            Ok(connection) => connection,
+            Err(error) => return error.error_response(),
+        };
+    let mut incoming = incoming.max_frame_size(MAX_FRAME_SIZE);
+    let mut stopped = stop.subscribe();
+    actix_web::rt::spawn(async move {
+        if *stopped.borrow() {
+            return;
+        }
+        let (mut sink, mut stream) = upstream.split();
+        let closing_session = session.clone();
+        let to_upstream = async move {
+            while let Some(Ok(message)) = incoming.next().await {
+                let closing = match &message {
+                    actix_ws::Message::Close(reason) => Some(reason.clone()),
+                    _ => None,
+                };
+                if sink.send(message).await.is_err() {
+                    return None;
+                }
+                if let Some(reason) = closing {
+                    return reason;
+                }
+            }
+            None
+        };
+        let to_downstream = async move {
+            while let Some(Ok(frame)) = stream.next().await {
+                let sent = match frame {
+                    awc::ws::Frame::Text(bytes) => match String::from_utf8(bytes.to_vec()) {
+                        Ok(text) => session.text(text).await,
+                        Err(_) => break,
+                    },
+                    awc::ws::Frame::Binary(bytes) => session.binary(bytes).await,
+                    awc::ws::Frame::Ping(bytes) => session.ping(&bytes).await,
+                    awc::ws::Frame::Pong(bytes) => session.pong(&bytes).await,
+                    awc::ws::Frame::Continuation(item) => session.continuation(item).await,
+                    awc::ws::Frame::Close(reason) => {
+                        let _ = session.close(reason).await;
+                        return;
+                    }
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+            let _ = session.close(None).await;
+        };
+        tokio::select! {
+            reason = to_upstream => { let _ = closing_session.close(reason).await; },
+            _ = to_downstream => {},
+            _ = stopped.changed() => {},
+        }
+    });
+    response
+}
+
+fn proxy_hop_header(name: &str, headers: &actix_web::http::header::HeaderMap) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || headers
+        .get_all("connection")
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(name))
+}
+
+/// Stream the upstream response with downstream backpressure (including unbounded SSE).
 async fn forward(req: &HttpRequest, body: web::Bytes, p: &CompiledProxy) -> HttpResponse {
     use actix_web::http::header;
 
@@ -4893,7 +5047,10 @@ async fn forward(req: &HttpRequest, body: web::Bytes, p: &CompiledProxy) -> Http
     let mut fwd = client.request(req.method().clone(), &url).no_decompress();
     for (name, value) in req.headers() {
         // 跳过 Host（按 change_origin 决定）、hop-by-hop 与由 body 重算的 Content-Length。
-        if name == header::HOST || name == header::CONNECTION || name == header::CONTENT_LENGTH {
+        if name == header::HOST
+            || name == header::CONTENT_LENGTH
+            || proxy_hop_header(name.as_str(), req.headers())
+        {
             continue;
         }
         fwd = fwd.insert_header((name.clone(), value.clone()));
@@ -4906,23 +5063,16 @@ async fn forward(req: &HttpRequest, body: web::Bytes, p: &CompiledProxy) -> Http
     }
 
     match fwd.send_body(body).await {
-        Ok(mut resp) => {
+        Ok(resp) => {
             let mut builder = HttpResponse::build(resp.status());
             for (name, value) in resp.headers() {
-                if name == header::CONNECTION
-                    || name == header::TRANSFER_ENCODING
-                    || name == header::CONTENT_LENGTH
+                if proxy_hop_header(name.as_str(), resp.headers()) || name == header::CONTENT_LENGTH
                 {
                     continue;
                 }
-                builder.insert_header((name.clone(), value.clone()));
+                builder.append_header((name.clone(), value.clone()));
             }
-            match resp.body().limit(64 * 1024 * 1024).await {
-                Ok(bytes) => builder.body(bytes),
-                Err(e) => {
-                    HttpResponse::BadGateway().body(format!("wake proxy: 读取上游响应失败：{e}"))
-                }
-            }
+            builder.streaming(resp)
         }
         Err(e) => {
             HttpResponse::BadGateway().body(format!("wake proxy: 转发到 {} 失败：{e}", p.target))
@@ -8367,6 +8517,7 @@ mod tests {
     #[test]
     fn proxy_matches_and_rewrites() {
         let p = CompiledProxy::compile(ProxyRule {
+            ws: false,
             context: vec!["/api".to_string()],
             target: "http://localhost:8080".to_string(),
             path_rewrite: vec![("^/api".to_string(), "".to_string())],
@@ -8382,8 +8533,109 @@ mod tests {
     }
 
     #[test]
+    fn proxy_streams_the_first_event_before_upstream_eof() {
+        actix_web::rt::System::new().block_on(async {
+        use actix_web::body::MessageBody as _;
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let backend = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192);
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close, x-private\r\nx-private: hidden\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nD\r\ndata: first\n\n\r\n").unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(3));
+            let _ = socket.write_all(b"C\r\ndata: last\n\n\r\n0\r\n\r\n");
+        });
+        let proxy = CompiledProxy::compile(ProxyRule {
+            ws: false,
+            context: vec!["/api".into()], target: format!("http://{address}"),
+            path_rewrite: vec![], change_origin: false,
+        }).unwrap();
+        let request = actix_web::test::TestRequest::get().uri("/api/stream").to_http_request();
+        let response = forward(&request, web::Bytes::new(), &proxy).await;
+        assert_eq!(response.headers().get_all("set-cookie").count(), 2);
+        assert!(!response.headers().contains_key("x-private"));
+        let mut body = std::pin::pin!(response.into_body());
+        let first = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"data: first\n\n");
+        release.send(()).unwrap();
+        backend.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn proxy_websocket_relays_frames_and_closes() {
+        use futures_util::SinkExt as _;
+        actix_web::rt::System::new().block_on(async {
+            async fn echo(req: HttpRequest, body: web::Payload) -> Result<HttpResponse, actix_web::Error> {
+                assert_eq!(req.path(), "/echo");
+                assert_eq!(req.query_string(), "token=test");
+                let (response, mut session, stream) = actix_ws::handle_with_protocols(&req, body, &["inspector"])?;
+                let mut stream = stream.max_frame_size(1024 * 1024);
+                actix_web::rt::spawn(async move {
+                    while let Some(Ok(message)) = stream.next().await {
+                        match message {
+                            actix_ws::Message::Text(value) => { if session.text(value).await.is_err() { break; } }
+                            actix_ws::Message::Binary(value) => { if session.binary(value).await.is_err() { break; } }
+                            actix_ws::Message::Ping(value) => { if session.pong(&value).await.is_err() { break; } }
+                            actix_ws::Message::Close(reason) => { let _ = session.close(reason).await; break; }
+                            _ => break,
+                        }
+                    }
+                });
+                Ok(response)
+            }
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let upstream = listener.local_addr().unwrap();
+            let backend = HttpServer::new(|| App::new().default_service(web::to(echo))).workers(1).listen(listener).unwrap().run();
+            let backend_handle = backend.handle();
+            actix_web::rt::spawn(backend);
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("index.js"), "export const ready = true;").unwrap();
+            let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port(); drop(reservation);
+            let server = start(root.path(), port, ServeOptions {
+                entry: root.path().join("index.js"), quiet: true,
+                proxy: vec![ProxyRule { context: vec!["/api".into()], target: format!("http://{upstream}"), ws: true, change_origin: true, path_rewrite: vec![("^/api".into(), "".into())] }, ProxyRule { context: vec!["/disabled".into()], target: format!("http://{upstream}"), ws: false, change_origin: true, path_rewrite: vec![] }],
+                ..ServeOptions::default()
+            }).unwrap();
+            let disabled = awc::Client::default().ws(format!("ws://127.0.0.1:{port}/disabled")).connect().await;
+            assert!(matches!(disabled, Err(awc::error::WsClientError::InvalidResponseStatus(status)) if status == actix_web::http::StatusCode::FORBIDDEN));
+            let (response, mut socket) = awc::Client::default().ws(format!("ws://127.0.0.1:{port}/api/echo?token=test")).protocols(["inspector"]).max_frame_size(1024 * 1024).connect().await.unwrap();
+            assert_eq!(response.headers().get("sec-websocket-protocol").unwrap(), "inspector");
+            socket.send(awc::ws::Message::Text("hello".into())).await.unwrap();
+            assert!(matches!(socket.next().await.unwrap().unwrap(), awc::ws::Frame::Text(value) if value == "hello"));
+            socket.send(awc::ws::Message::Binary(web::Bytes::from_static(b"binary"))).await.unwrap();
+            assert!(matches!(socket.next().await.unwrap().unwrap(), awc::ws::Frame::Binary(value) if value == "binary"));
+            let large = "x".repeat(256 * 1024);
+            socket.send(awc::ws::Message::Text(large.clone().into())).await.unwrap();
+            assert!(matches!(tokio::time::timeout(Duration::from_secs(2), socket.next()).await.unwrap().unwrap().unwrap(), awc::ws::Frame::Text(value) if value.as_ref() == large.as_bytes()));
+            socket.send(awc::ws::Message::Ping(web::Bytes::from_static(b"probe"))).await.unwrap();
+            assert!(matches!(socket.next().await.unwrap().unwrap(), awc::ws::Frame::Pong(value) if value == "probe"));
+            let reason = awc::ws::CloseReason { code: awc::ws::CloseCode::Normal, description: Some("finished".into()) };
+            socket.send(awc::ws::Message::Close(Some(reason.clone()))).await.unwrap();
+            assert!(matches!(tokio::time::timeout(Duration::from_secs(2), socket.next()).await.unwrap(), Some(Ok(awc::ws::Frame::Close(Some(received)))) if received == reason));
+            let (_, mut socket) = awc::Client::default().ws(format!("ws://127.0.0.1:{port}/api/echo?token=test")).protocols(["inspector"]).connect().await.unwrap();
+            let started = Instant::now();
+            std::thread::spawn(move || server.close()).join().unwrap().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(tokio::time::timeout(Duration::from_secs(2), socket.next()).await.is_ok());
+            let rebound = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap(); drop(rebound);
+            backend_handle.stop(false).await;
+        });
+    }
+
+    #[test]
     fn proxy_multi_context() {
         let p = CompiledProxy::compile(ProxyRule {
+            ws: false,
             context: vec!["/api".to_string(), "/auth".to_string()],
             target: "http://localhost:9000".to_string(),
             path_rewrite: vec![],
