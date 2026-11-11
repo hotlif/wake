@@ -170,9 +170,9 @@ React 版本升级保留根工作区的 19.2.8 基线，并通过 `fixtures/reac
 V8/handle、fast DOM、Chromium/CDP、协议并发与 React 差分 fixture 分别进入普通单元测试、
 固定版本 conformance、真实浏览器 smoke 和 Loom 模型。系统浏览器测试必须记录可执行文件与
 CDP 完整版本。`engineering/system-browser-conformance.json` schema v3 区分当前 experimental
-发布证据和 stable readiness：Windows x64 对 reviewed major 151、152、155 或 156，Linux x64 对 151、152 或 155 运行 blocking conformance；
+发布证据和 stable readiness：Windows x64 对 reviewed major 151、152、155 或 156，Linux x64 对 151、152、155 或 156 运行 blocking conformance；
 macOS x64 在托管 runner 滚动切换期间对具备不可变官方清单证据的 reviewed major 150 或 151、
-macOS arm64 对 reviewed major 150 或 152 运行 blocking 功能 smoke，
+macOS arm64 对 reviewed major 150、152 或 157 运行 blocking 功能 smoke，
 但证据明确不是 stable
 conformance；Linux ARM64 对官方 hosted-runner 无系统 Chromium-family 浏览器的事实生成
 machine-readable `unavailable` 证据。major 不匹配直接失败，不下载、不 vendor、也不选择 fallback
@@ -588,9 +588,9 @@ route shell/public 资源与返回 inventory 一致。危险祖先用例不得�
 - 无限循环、host/browser panic 或 crash、协议损坏、资源 origin 伪造、取消和关闭不泄漏调用
   进程、端口、profile、page 或 V8 handle；
 - CLI、Node `runTests()` 和 `TestContext` 经过唯一持久 host session，返回同一稳定结果与事件模型；
-- Windows x64 执行 reviewed major 151、152、155 或 156，Linux x64 执行 151、152 或 155 的显式 browser path、CDP lifecycle、React、
+- Windows x64 执行 reviewed major 151、152、155 或 156，Linux x64 执行 151、152、155 或 156 的显式 browser path、CDP lifecycle、React、
   screenshot 和 coverage conformance；macOS x64 在具备不可变 runner 清单证据的 reviewed major
-  150 或 151、macOS arm64 在 reviewed major 150 或 152 执行同类功能 smoke，
+  150 或 151、macOS arm64 在 reviewed major 150、152 或 157 执行同类功能 smoke，
   但不计入 stable conformance；Linux ARM64 执行完整非 browser 合同并保存 `unavailable` 证据。
   浏览器二进制不得进入平台包，任何平台都不得在门禁内下载替代浏览器。
 
@@ -650,8 +650,8 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
    `wake lint` 与 CommonJS/ESM Node `lint()` 对同一错误源码的诊断、退出状态，并执行 `wake test`、
    `runTests()` 和长期 `TestContext` lifecycle；Unix 目标还需核实安装后的 `wake-test-host` 可执行位。
    Node 24 在 Windows/Linux x64 上以系统 Chrome、Edge 或 Chromium，分别针对
-   Windows x64 的 reviewed major 151、152、155 或 156、Linux x64 的 151、152 或 155 执行 blocking conformance；在 macOS x64 上以 reviewed major 150 或 151、macOS arm64
-   上以 reviewed major 150 或 152 执行
+   Windows x64 的 reviewed major 151、152、155 或 156、Linux x64 的 151、152、155 或 156 执行 blocking conformance；在 macOS x64 上以 reviewed major 150 或 151、macOS arm64
+   上以 reviewed major 150、152 或 157 执行
    blocking React/browser/screenshot 功能 smoke；两者都从 `wake.test.v1` 结果校验 family/major 并
    上传证据。Linux ARM64 不伪造或 skip 浏览器测试，而是依据 immutable hosted-runner inventory
    生成 blocking、machine-readable `unavailable` 证据；其 clean install 与全部非 browser smoke

@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-26
+- Amended by: [ADR 0080](0080-reviewed-linux-156-macos-arm64-157.md)
 
 ## Context
 

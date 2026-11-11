@@ -64,7 +64,7 @@
       "rustTarget": "x86_64-unknown-linux-gnu",
       "experimental": {
         "mode": "reviewed-major-conformance",
-        "majors": [151, 152, 155]
+        "majors": [151, 152, 155, 156]
       },
       "reviewedRunnerEvidence": [
         {
@@ -92,6 +92,13 @@
             "chrome": "155.0.8059.39",
             "chromium": "155.0.8059.0",
             "edge": "155.0.4283.45"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/add4380b0d6685806e9192c33c37359ee0aa4023/images/ubuntu/Ubuntu2404-Readme.md",
+          "imageVersion": "20261101.360.1",
+          "browserVersions": {
+            "chrome": "156.0.8078.79"
           }
         }
       ]
@@ -142,7 +149,7 @@
       "rustTarget": "aarch64-apple-darwin",
       "experimental": {
         "mode": "reviewed-major-smoke",
-        "majors": [150, 152]
+        "majors": [150, 152, 157]
       },
       "reviewedRunnerEvidence": [
         {
@@ -159,6 +166,13 @@
           "browserVersions": {
             "chrome": "152.0.7977.65",
             "edge": "152.0.4191.53"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/4a3efbb98bd2d06646222d4cbab17be441c0863b/images/macos/macos-15-arm64-Readme.md",
+          "imageVersion": "20261104.0514.1",
+          "browserVersions": {
+            "chrome": "157.0.8103.39"
           }
         }
       ]

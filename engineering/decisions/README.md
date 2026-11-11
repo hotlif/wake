@@ -109,6 +109,7 @@
 - [ADR 0073: Windows 与 Linux 浏览器证据纳入已审查主版本 155](0073-reviewed-browser-major-155.md) — `accepted`
 - [ADR 0074: Windows 浏览器证据纳入已审查主版本 156](0074-reviewed-windows-browser-major-156.md) — `accepted`
 - [ADR 0075: Wake Test 工程控制与可信统计](0075-test-engineering-controls.md) — `accepted`
+- [ADR 0080: Linux 156 与 macOS arm64 157 浏览器镜像准入](0080-reviewed-linux-156-macos-arm64-157.md) — `accepted`
 
 ### node-release
 

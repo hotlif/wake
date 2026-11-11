@@ -6,6 +6,7 @@
 - Amended by: [ADR 0022](0022-yarn-pnp-ownership.md)
 - Amended by: [ADR 0048](0048-windows-browser-reviewed-majors.md)
 - Amended by: [ADR 0073](0073-reviewed-browser-major-155.md)
+- Amended by: [ADR 0080](0080-reviewed-linux-156-macos-arm64-157.md)
 
 ## Context
 
