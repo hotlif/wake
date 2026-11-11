@@ -805,7 +805,8 @@ pub struct Proxy {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Html {
-    /// HTML 外壳模板路径（相对根）。缺省 `public/index.html`，无则用内置外壳。
+    /// HTML 外壳模板路径（相对项目根）。开发与生产只读取选定路径；缺省为根目录
+    /// `index.html`，仅缺省文件不存在时使用内置外壳，显式路径读取失败时报错。
     pub template: Option<String>,
     /// 虚拟入口目标（相对根）。缺省 `src/entry.tsx`（生成 `import("@/entry.tsx")`）。
     pub entry: Option<String>,

@@ -856,6 +856,8 @@ fn nearest_existing_watch_ancestor(path: &Path) -> Option<PathBuf> {
 }
 
 pub struct MountedServeOptions {
+    /// Explicit HTML template, relative to the mount root. None selects root index.html.
+    pub html_template: Option<PathBuf>,
     pub name: String,
     pub root: PathBuf,
     pub base_path: String,
@@ -901,6 +903,8 @@ pub enum DeferredValidation {
 /// a restart when they change.
 #[derive(Clone)]
 pub struct DevMountPlan {
+    /// Explicit HTML template, relative to the mount root. None selects root index.html.
+    pub html_template: Option<PathBuf>,
     pub entry: PathBuf,
     pub resolve_options: ResolveOptions,
     pub define: Vec<(String, String)>,
@@ -1085,6 +1089,8 @@ pub type EventHandler = Arc<dyn Fn(ServerEvent) + Send + Sync + 'static>;
 
 /// Dev server 选项（由 CLI 读 `wake.config.toml` 装配）。WAKE-COMPATIBILITY §M3。
 pub struct ServeOptions {
+    /// Explicit HTML template, relative to the mount root. None selects root index.html.
+    pub html_template: Option<PathBuf>,
     /// 已由调用方解析完成的入口文件。
     pub entry: PathBuf,
     /// URL base path owned by the primary application.
@@ -1125,6 +1131,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
+            html_template: None,
             entry: PathBuf::from("src/index.tsx"),
             base_path: "/".to_string(),
             resolve_options: ResolveOptions::default(),
@@ -1219,6 +1226,7 @@ fn run_server(
     stop: Arc<StopSignal>,
 ) -> std::io::Result<()> {
     let ServeOptions {
+        html_template,
         entry,
         base_path,
         resolve_options,
@@ -1260,6 +1268,7 @@ fn run_server(
         base_path: base_path.clone(),
         loading: DevLoading::Eager,
         plan: Some(DevMountPlan {
+            html_template,
             entry,
             resolve_options,
             define,
@@ -1302,6 +1311,7 @@ fn run_server(
             base_path: mount_base,
             loading: mount.loading,
             plan: Some(DevMountPlan {
+                html_template: mount.html_template,
                 entry: mount_entry,
                 resolve_options: mount.resolve_options,
                 define: mount.define,
@@ -1398,8 +1408,7 @@ fn run_server(
                     name: spec.name.clone(),
                     base_path: spec.base_path.clone(),
                     published: Arc::new(RwLock::new(PublishedMountGeneration {
-                        html: load_html_template(
-                            &spec.root,
+                        html: default_html(
                             &spec.base_path,
                             spec.name.as_deref(),
                             spec.federation.enabled && spec.federation.bootstrap.is_some(),
@@ -3800,6 +3809,15 @@ fn mount_watch_interests(spec: &MountSpec) -> Vec<WatchInterest> {
     {
         interests.push(WatchInterest::exact_file(plan.entry.clone()));
     }
+    if let Some(plan) = &spec.plan {
+        interests.push(
+            WatchInterest::exact_file(wake_html::template_path(
+                &spec.root,
+                plan.html_template.as_deref(),
+            ))
+            .resolve_against(&spec.root),
+        );
+    }
     interests.extend(
         spec.watch_interests
             .iter()
@@ -4299,14 +4317,32 @@ fn rebuild_mount(
         .expect("a mount build requires a materialized plan")
         .entry;
     let (out, generation_fs) = session.build_current_generation(BuildRequest::new(entry));
+    let (html, template_error) = match load_html_template(
+        &spec.root,
+        spec.plan
+            .as_ref()
+            .expect("materialized plan")
+            .html_template
+            .as_deref(),
+        &spec.base_path,
+        spec.name.as_deref(),
+        spec.federation.enabled && spec.federation.bootstrap.is_some(),
+    ) {
+        Ok(html) => (Some(html), None),
+        Err(error) => (
+            None,
+            Some(Diagnostic::error(error.to_string()).with_code("WAKE_IO")),
+        ),
+    };
     let elapsed = t.elapsed();
     let dur = human_dur(elapsed);
     let sep = sty.dim("·");
-    if out.has_errors() {
-        let errs = out.diagnostics.iter().filter(|d| d.is_error()).count();
-        let err = format_diagnostics(&out.diagnostics);
-        let diagnostics = out
-            .diagnostics
+    if out.has_errors() || template_error.is_some() {
+        let mut failures = out.diagnostics.clone();
+        failures.extend(template_error);
+        let errs = failures.iter().filter(|d| d.is_error()).count();
+        let err = format_diagnostics(&failures);
+        let diagnostics = failures
             .iter()
             .filter(|diagnostic| diagnostic.is_error())
             .cloned()
@@ -4435,12 +4471,7 @@ fn rebuild_mount(
             duration_ms: elapsed.as_secs_f64() * 1000.0,
         };
         let bundle = bundle_state_from_output(out);
-        let html = load_html_template(
-            &spec.root,
-            &spec.base_path,
-            spec.name.as_deref(),
-            spec.federation.enabled && spec.federation.bootstrap.is_some(),
-        );
+        let html = html.expect("template errors follow the failed candidate path");
         let mut session = Some(session);
         // Assembly above owns every fallible Federation/type/manifest operation. Only a complete
         // candidate reaches this single write critical section, so HTTP readers can never pair a
@@ -4587,6 +4618,11 @@ async fn serve_default(
             .content_type("text/plain; charset=utf-8")
             .body("wake dev: unsafe request path");
     };
+
+    // Both homepage URLs belong to the published generation, never to public/ static assets.
+    if rel.is_empty() || rel == "index.html" {
+        return serve_html(&mount).await;
+    }
 
     {
         // All in-memory routes for this request are selected from one published generation. The
@@ -5181,60 +5217,66 @@ fn accepts_federation_update(message: &str, requested_remote: &str) -> bool {
 // 入口 / HTML / 消息
 // ======================================================================
 
-/// 加载 HTML 外壳：优先项目 `public/index.html` / `index.html`，注入 Live Reload client；
-/// 无则生成默认外壳。
+/// Read the same selected shell as production, then add development-only hooks.
 fn load_html_template(
     root: &Path,
+    template: Option<&Path>,
+    base_path: &str,
+    mount: Option<&str>,
+    federation_bootstrap: bool,
+) -> std::io::Result<String> {
+    let template = wake_html::load_template(root, template)?;
+    Ok(render_dev_html(
+        &template,
+        base_path,
+        mount,
+        federation_bootstrap,
+    ))
+}
+
+fn default_html(base_path: &str, mount: Option<&str>, federation_bootstrap: bool) -> String {
+    render_dev_html(
+        &wake_html::default_shell(),
+        base_path,
+        mount,
+        federation_bootstrap,
+    )
+}
+
+fn render_dev_html(
+    template: &str,
     base_path: &str,
     mount: Option<&str>,
     federation_bootstrap: bool,
 ) -> String {
-    let candidates = [root.join("public/index.html"), root.join("index.html")];
-    for c in candidates {
-        if let Ok(mut html) = std::fs::read_to_string(&c) {
-            let mount = format!("\"{}\"", json_escape(mount.unwrap_or("")));
-            let inject = format!(
-                "<script>window.__WAKE_MOUNT__={mount}</script><script src=\"/__wake/client.js\"></script>"
-            );
-            if let Some(pos) = html.find("</head>") {
-                html.insert_str(pos, &inject);
-            } else {
-                html.insert_str(0, &inject);
-            }
-            // 保证有 bundle 脚本引用。
-            if !html.contains("bundle.js")
-                && let Some(pos) = html.find("</body>")
-            {
-                html.insert_str(
-                    pos,
-                    &format!("<script src=\"{base_path}bundle.js\"></script>"),
-                );
-            }
-            if base_path != "/" {
-                html = html.replace(
-                    "src=\"/bundle.js\"",
-                    &format!("src=\"{base_path}bundle.js\""),
-                );
-            }
-            if federation_bootstrap {
-                inject_federation_bootstrap(&mut html, base_path);
-            }
-            return html;
-        }
-    }
-    default_html(base_path, mount, federation_bootstrap)
-}
-
-fn default_html(base_path: &str, mount: Option<&str>, federation_bootstrap: bool) -> String {
+    let mut template = template.to_owned();
     let mount = format!("\"{}\"", json_escape(mount.unwrap_or("")));
-    let mut html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"/>\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\
-         <title>wake dev</title>\
-         <script>window.__WAKE_MOUNT__={mount}</script>\
-         <script src=\"/__wake/client.js\"></script></head>\
-         <body><div id=\"root\"></div><script src=\"{base_path}bundle.js\"></script></body></html>"
+    wake_html::inject_head(
+        &mut template,
+        &format!(
+            "<script>window.__WAKE_MOUNT__={mount}</script><script src=\"/__wake/client.js\"></script>"
+        ),
     );
+    // Retain compatibility with shells that already reference the development entry.
+    let scripts = if template.contains("bundle.js") {
+        Vec::new()
+    } else {
+        vec!["bundle.js".to_string()]
+    };
+    let mut html = wake_html::generate(
+        Some(&template),
+        &wake_html::HtmlInputs {
+            scripts: &scripts,
+            styles: &[],
+            public_path: base_path,
+        },
+    );
+    if base_path != "/" {
+        html = html.replace(
+            "src=\"/bundle.js\"",
+            &format!("src=\"{base_path}bundle.js\""),
+        );
+    }
     if federation_bootstrap {
         inject_federation_bootstrap(&mut html, base_path);
     }
@@ -6378,6 +6420,7 @@ mod tests {
             base_path: "/".to_owned(),
             loading: DevLoading::Eager,
             plan: Some(DevMountPlan {
+                html_template: None,
                 entry: entry.clone(),
                 file_system: Arc::new(OsFileSystem),
                 resolve_options: ResolveOptions::default(),
@@ -6714,6 +6757,7 @@ mod tests {
             base_path: "/".to_string(),
             loading: DevLoading::Eager,
             plan: Some(DevMountPlan {
+                html_template: None,
                 entry: entry.clone(),
                 file_system: Arc::new(OsFileSystem),
                 resolve_options: ResolveOptions::default(),
@@ -6783,6 +6827,7 @@ mod tests {
             base_path: "/".to_owned(),
             loading: DevLoading::Eager,
             plan: Some(DevMountPlan {
+                html_template: None,
                 entry: entry.clone(),
                 file_system: Arc::new(OsFileSystem),
                 resolve_options: ResolveOptions::default(),
@@ -6833,6 +6878,7 @@ mod tests {
             base_path: "/".to_owned(),
             loading: DevLoading::Eager,
             plan: Some(DevMountPlan {
+                html_template: None,
                 entry: entry.clone(),
                 file_system: source_file_system.clone(),
                 resolve_options: ResolveOptions::default(),
@@ -7174,6 +7220,7 @@ mod tests {
                 quiet: true,
                 federation: test_federation_options("catalog"),
                 mounts: vec![MountedServeOptions {
+                    html_template: None,
                     name: "workspace".to_owned(),
                     root: workspace.path().to_path_buf(),
                     base_path: "/workspace/".to_owned(),
@@ -7232,6 +7279,7 @@ mod tests {
                 quiet: true,
                 federation: test_federation_options("alpha"),
                 mounts: vec![MountedServeOptions {
+                    html_template: None,
                     name: "beta-workspace".to_owned(),
                     root: workspace.path().to_path_buf(),
                     base_path: "/beta/".to_owned(),
@@ -7589,7 +7637,7 @@ mod tests {
         assert!(h.contains("id=\"root\""));
         assert!(h.contains("window.__WAKE_MOUNT__=\"rc-grid\""));
         assert!(!h.contains("@wake/federation/bootstrap.mjs"));
-        assert!(h.contains("<script src=\"/docs/bundle.js\"></script>"));
+        assert!(h.contains("<script defer src=\"/docs/bundle.js\"></script>"));
     }
 
     #[test]
@@ -7766,6 +7814,7 @@ mod tests {
                     captured.lock().unwrap().push(event);
                 })),
                 mounts: vec![MountedServeOptions {
+                    html_template: None,
                     name: "rc-grid".to_string(),
                     root: workspace.path().to_path_buf(),
                     base_path: "/components/rc-grid/workbench/".to_string(),
@@ -7844,6 +7893,7 @@ mod tests {
         .unwrap();
         let mounts = (0..51)
             .map(|index| MountedServeOptions {
+                html_template: None,
                 name: format!("rc-{index:02}"),
                 root: root.path().to_path_buf(),
                 base_path: format!("/components/rc-{index:02}/workbench/"),
@@ -7977,6 +8027,7 @@ mod tests {
                 entry: root.path().join("src/index.js"),
                 quiet: true,
                 mounts: vec![MountedServeOptions {
+                    html_template: None,
                     name: "lazy".to_owned(),
                     root: workspace.path().to_path_buf(),
                     base_path: "/lazy/".to_owned(),
@@ -8040,6 +8091,7 @@ mod tests {
         let refresh_outcomes = Arc::clone(&outcomes);
         let refresh_recovery_file = recovery_file.clone();
         let plan = DevMountPlan {
+            html_template: None,
             entry: workspace.path().join("src/index.js"),
             resolve_options: ResolveOptions::default(),
             define: Vec::new(),
@@ -8157,6 +8209,7 @@ mod tests {
             observed_calls.fetch_add(1, Ordering::SeqCst);
             let selected = std::fs::read_to_string(&observed_control).unwrap();
             let plan = DevMountPlan {
+                html_template: None,
                 entry: observed_root.join(format!("src/{selected}.js")),
                 resolve_options: ResolveOptions::default(),
                 define: Vec::new(),

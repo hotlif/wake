@@ -230,7 +230,7 @@ Wake Federation v1 暂不创建或接收 Trusted Types policy，浏览器 transp
 
 | 配置段 | 字段 | 说明 |
 | --- | --- | --- |
-| `html` | `template` | HTML 外壳路径；未设置时使用 `public/index.html` 或内置外壳 |
+| `html` | `template` | HTML 外壳路径，相对项目根目录解析；未设置时只读取根目录 `index.html`，不存在则使用内置外壳 |
 | `html` | `entry` | 应用入口；默认 `src/entry.tsx` |
 | `react` | `enabled` | 是否启用 React JSX automatic runtime |
 | `react` | `jsx_import_source` | JSX runtime 的包来源 |
@@ -240,6 +240,15 @@ Wake Federation v1 暂不创建或接收 Trusted Types policy，浏览器 transp
 | `transforms` | `include` | 强制启用的转换名称 |
 | `transforms` | `exclude` | 强制禁用的转换名称 |
 | `hooks` | `bootstrap_path` | 自定义 bootstrap 文件路径 |
+
+开发服务器与应用生产构建共用 HTML 模板选择和资源注入规则。`html.template` 显式指定后，
+文件缺失、不可读或不是 UTF-8 都会报错，不回退其他位置。未配置时也不会搜索 `public/index.html`；
+原先把模板放在该位置的项目应将其移至根目录，或设置 `template = "public/index.html"`。
+模板中的标题、属性、挂载点和自定义内容保留，Wake 在 `</head>` 前注入入口脚本和样式；
+没有该结束标签时追加到模板末尾。开发模式额外注入 Live Reload 客户端。
+开发挂载根路径及其 `index.html` 地址均返回同一份生成首页，`public/index.html` 不覆盖该首页。
+开发服务监听选定模板的修改、创建和删除，以及配置中的模板路径变化；模板错误阻止新版本发布，
+保留上一份成功页面并报告诊断，修复后自动恢复。生产模板读取失败时不替换上次成功产物。
 
 ## 组件扫描
 

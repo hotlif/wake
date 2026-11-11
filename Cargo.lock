@@ -4390,6 +4390,7 @@ dependencies = [
  "wake_common",
  "wake_ecma_transform",
  "wake_federation_contract",
+ "wake_html",
  "wake_turbo",
 ]
 
@@ -4519,6 +4520,9 @@ dependencies = [
 [[package]]
 name = "wake_html"
 version = "0.1.46"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "wake_js_runtime"

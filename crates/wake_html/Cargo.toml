@@ -10,3 +10,6 @@ description = "构建期 HTML 生成：模板 + chunk <script>/<link> 注入（�
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true

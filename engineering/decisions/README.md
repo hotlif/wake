@@ -65,6 +65,7 @@
 - [ADR 0045: Isolated incremental candidate sessions](0045-isolated-incremental-candidate-sessions.md) — `accepted`
 - [ADR 0069: 原生构建活动与卡顿诊断](0069-live-build-progress-diagnostics.md) — `accepted`
 - [ADR 0070: 构建归属、诊断上下文与步骤统计](0070-build-scoped-progress-context.md) — `accepted`
+- [ADR 0076: 开发与生产共享 HTML 模板生成](0076-shared-html-template-generation.md) — `accepted`
 
 ### css-editor
 

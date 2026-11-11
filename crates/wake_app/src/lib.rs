@@ -2657,6 +2657,7 @@ fn app_dev_plan(
         resolve_options.resolved_redirects.dedup();
     }
     Ok(wake_dev_server::DevMountPlan {
+        html_template: prepared.config.html.template.as_ref().map(PathBuf::from),
         entry,
         resolve_options,
         define: build_defines(&prepared.config, true),
@@ -2936,6 +2937,10 @@ fn project_watch_interests_from(
         WatchInterest::all_files_tree(root.join("public")),
         WatchInterest::exact_file(root.join("index.html")),
     ];
+    interests.push(WatchInterest::exact_file(wake_html::template_path(
+        root,
+        config.html.template.as_deref().map(Path::new),
+    )));
     // Physical generated entries are projected at stable `.wake` module identities and are
     // driven by their source facts. Only a user-owned source entry is itself a watch input.
     if !logical_entry.starts_with(root.join(".wake")) {
@@ -3361,10 +3366,11 @@ fn prepare_application_output(
         .collect::<Vec<_>>();
     files.extend(federation.output_files());
     let html = emit_html(
+        &prepared.root,
         &output,
         &prepared.config,
         federation.bootstrap_file.as_deref(),
-    );
+    )?;
     if options.write {
         files.push(OutputFile {
             path: "index.html".to_string(),
@@ -3437,9 +3443,13 @@ fn finish_output(
         diagnostic_file_system.as_ref(),
     )?;
     if options.write {
+        let template = wake_html::template_path(
+            &prepared.root,
+            prepared.config.html.template.as_deref().map(Path::new),
+        );
         let (_, target) = publish_staged_output(
             &prepared.root,
-            &[prepared.entry.as_path()],
+            &[prepared.entry.as_path(), template.as_path()],
             &prepared.outdir,
             OutputProduct::Application,
             cancellation,
@@ -3670,10 +3680,11 @@ fn write_build_output(output: &BuildOutput, outdir: &Path) -> Result<(), WakeErr
 }
 
 fn emit_html(
+    root: &Path,
     output: &BuildOutput,
     config: &wake_config::Config,
     federation_bootstrap: Option<&str>,
-) -> String {
+) -> Result<String, WakeError> {
     let scripts = if federation_bootstrap.is_some() {
         Vec::new()
     } else {
@@ -3685,8 +3696,10 @@ fn emit_html(
             .collect::<Vec<_>>()
     };
     let styles = output.entry().styles.clone();
+    let template = wake_html::load_template(root, config.html.template.as_deref().map(Path::new))
+        .map_err(|error| WakeError::new("WAKE_IO", error.to_string()))?;
     let mut html = wake_html::generate(
-        None,
+        Some(&template),
         &wake_html::HtmlInputs {
             scripts: &scripts,
             styles: &styles,
@@ -3708,7 +3721,7 @@ fn emit_html(
             html.push_str(&script);
         }
     }
-    html
+    Ok(html)
 }
 fn build_defines(config: &wake_config::Config, development: bool) -> Vec<(String, String)> {
     let node_env = if development {
@@ -5745,6 +5758,7 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         forward_dev_server_event(&event_tx, event);
     });
     let serve_options = wake_dev_server::ServeOptions {
+        html_template: config.html.template.as_ref().map(PathBuf::from),
         entry: dev_federation.entry,
         base_path: config.public_path().to_string(),
         resolve_options: ResolveOptions {
@@ -6254,21 +6268,6 @@ fn materialize_docs_leaf(
             ),
         );
     }
-    let scripts = output
-        .chunks
-        .iter()
-        .filter(|chunk| chunk.is_entry)
-        .map(|chunk| chunk.file_name.clone())
-        .collect::<Vec<_>>();
-    let styles = output.entry().styles.clone();
-    let html = wake_html::generate(
-        None,
-        &wake_html::HtmlInputs {
-            scripts: &scripts,
-            styles: &styles,
-            public_path: prepared.config.public_path(),
-        },
-    );
     let federation = federation::build_artifacts(
         &prepared,
         &output,
@@ -6302,7 +6301,7 @@ fn materialize_docs_leaf(
     wake_docs::write_route_shells(
         outdir,
         &routes,
-        &html,
+        &application.html,
         &docs.title,
         &docs.description,
         &docs.locale,
@@ -7217,6 +7216,7 @@ fn start_docs_dev_server_leaf(
         None,
     );
     let serve_options = wake_dev_server::ServeOptions {
+        html_template: config.html.template.as_ref().map(PathBuf::from),
         entry: prepared.entry,
         base_path: docs_base_path,
         resolve_options: ResolveOptions {
@@ -7415,6 +7415,7 @@ fn start_aggregated_docs_dev_server(
         };
         let target_env = resolve_target_env(&workspace_config, &workspace_prepared.root)?;
         mounts.push(wake_dev_server::MountedServeOptions {
+            html_template: workspace_config.html.template.as_ref().map(PathBuf::from),
             name: workspace.name,
             root: workspace_prepared.root.clone(),
             base_path: workspace.base_path,
@@ -7433,6 +7434,7 @@ fn start_aggregated_docs_dev_server(
 
     let site_watch_interests = docs_watch_interests(&prepared, &site_docs);
     let serve_options = wake_dev_server::ServeOptions {
+        html_template: config.html.template.as_ref().map(PathBuf::from),
         entry: prepared.entry,
         base_path: site_docs.base_path,
         resolve_options: ResolveOptions {
@@ -10728,6 +10730,7 @@ entry = "packages/Button.tsx"
             "export const createRoot = () => ({ render() {} });\n",
         );
         fixture.write("public/robots.txt", "User-agent: *\n");
+        fixture.write("index.html", "<html><head></head><body data-shell=\"DOCS_TEMPLATE\"><div id=\"root\"></div></body></html>");
 
         let result = build_docs(
             DocsBuildOptions {
@@ -10740,6 +10743,11 @@ entry = "packages/Button.tsx"
         .unwrap();
 
         let output = fixture.0.join("docs-dist");
+        assert!(
+            std::fs::read_to_string(output.join("index.html"))
+                .unwrap()
+                .contains("DOCS_TEMPLATE")
+        );
         let ownership: OutputOwnership =
             serde_json::from_slice(&std::fs::read(output.join(OUTPUT_OWNERSHIP_FILE)).unwrap())
                 .unwrap();
@@ -12754,6 +12762,195 @@ generate_source = true
                     .starts_with(".wake-bundle-"))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn html_template_is_shared_by_build_and_dev() {
+        for configured in [false, true] {
+            let fixture = Fixture::new("html-template-shared");
+            fixture.write(
+                "public/index.html",
+                "<head></head><body>WRONG_PUBLIC</body>",
+            );
+            fixture.write(
+                "index.html",
+                "<head><title>ROOT_TEMPLATE</title></head><body><div id=\"root\"></div></body>",
+            );
+            let marker = if configured {
+                fixture.write("shell/custom.shell", "<head><title>CUSTOM_TEMPLATE</title></head><body data-custom=\"yes\"><div id=\"root\"></div></body>");
+                fixture.write(
+                    wake_config::CONFIG_FILE,
+                    "[html]\nentry = \"src/index.js\"\ntemplate = \"shell/custom.shell\"\n",
+                );
+                "CUSTOM_TEMPLATE"
+            } else {
+                "ROOT_TEMPLATE"
+            };
+            build(
+                BuildOptions {
+                    project: fixture.project(),
+                    outdir: Some(fixture.0.join("dist")),
+                    write: true,
+                    ..BuildOptions::default()
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            let html = std::fs::read_to_string(fixture.0.join("dist/index.html")).unwrap();
+            assert!(html.contains(marker), "{html}");
+            assert!(!html.contains("WRONG_PUBLIC"));
+            assert!(html.contains("<script defer src="));
+            let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let server = start_dev_server(DevServerOptions {
+                project: fixture.project(),
+                port: Some(port),
+                ..DevServerOptions::default()
+            })
+            .unwrap();
+            let html = http_get(port, "/");
+            server.close().unwrap();
+            assert!(html.contains(marker), "{html}");
+            assert!(!html.contains("WRONG_PUBLIC"));
+            assert!(html.contains("/__wake/client.js"));
+            assert!(html.contains("bundle.js"));
+        }
+    }
+
+    #[test]
+    fn html_template_dev_ignores_public_and_uses_explicit_path() {
+        let fixture = Fixture::new("html-template-dev");
+        fixture.write(
+            "public/index.html",
+            "<head></head><body>WRONG_PUBLIC</body>",
+        );
+        fixture.write("index.html", "<head></head><body>WRONG_ROOT</body>");
+        fixture.write(
+            "templates/custom.shell",
+            "<head><title>EXPLICIT_SHELL</title></head><body><div id=\"root\"></div></body>",
+        );
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\ntemplate = \"templates/custom.shell\"\n",
+        );
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let server = start_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        let html = http_get(port, "/");
+        let index = http_get(port, "/index.html");
+        server.close().unwrap();
+        assert!(html.contains("EXPLICIT_SHELL"), "{html}");
+        assert!(index.contains("EXPLICIT_SHELL"), "{index}");
+        assert!(index.contains("/__wake/client.js"));
+        assert!(!html.contains("WRONG_PUBLIC"));
+        assert!(!html.contains("WRONG_ROOT"));
+    }
+
+    #[test]
+    fn html_template_dev_watches_edits_and_failed_path_candidates() {
+        let fixture = Fixture::new("html-template-watch");
+        fixture.write(
+            "templates/first.shell",
+            "<head></head><body>FIRST_SHELL</body>",
+        );
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\ntemplate = \"templates/first.shell\"\n",
+        );
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let server = start_dev_server(DevServerOptions {
+            project: fixture.project(),
+            port: Some(port),
+            ..DevServerOptions::default()
+        })
+        .unwrap();
+        let wait_for = |marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let html = http_get(port, "/");
+                if html.contains(marker) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    server.close().unwrap();
+                    panic!("template did not update to {marker}: {html}");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        };
+        wait_for("FIRST_SHELL");
+        fixture.write(
+            "templates/first.shell",
+            "<head></head><body>EDITED_SHELL</body>",
+        );
+        wait_for("EDITED_SHELL");
+        server.drain_events();
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\ntemplate = \"new-directory/second.shell\"\n",
+        );
+        let wait_for_error = || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if server.drain_events().iter().any(|event| matches!(event,
+                DevServerEvent::Diagnostic { diagnostic } if diagnostic.message.contains("second.shell")
+            )) { break; }
+                if Instant::now() >= deadline {
+                    server.close().unwrap();
+                    panic!("missing template did not report a diagnostic");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        };
+        wait_for_error();
+        assert!(http_get(port, "/").contains("EDITED_SHELL"));
+        fixture.write(
+            "new-directory/second.shell",
+            "<head></head><body>RECOVERED_SHELL</body>",
+        );
+        wait_for("RECOVERED_SHELL");
+        server.drain_events();
+        std::fs::remove_file(fixture.0.join("new-directory/second.shell")).unwrap();
+        wait_for_error();
+        assert!(http_get(port, "/").contains("RECOVERED_SHELL"));
+        fixture.write(
+            "new-directory/second.shell",
+            "<head></head><body>RESTORED_SHELL</body>",
+        );
+        wait_for("RESTORED_SHELL");
+        server.close().unwrap();
+    }
+
+    #[test]
+    fn html_template_missing_explicit_preserves_production_output() {
+        let fixture = Fixture::new("html-template-missing");
+        let options = BuildOptions {
+            project: fixture.project(),
+            outdir: Some(fixture.0.join("dist")),
+            write: true,
+            ..BuildOptions::default()
+        };
+        build(options.clone(), &CancellationToken::default()).unwrap();
+        let previous = std::fs::read(fixture.0.join("dist/index.html")).unwrap();
+        fixture.write(
+            wake_config::CONFIG_FILE,
+            "[html]\nentry = \"src/index.js\"\ntemplate = \"missing.shell\"\n",
+        );
+        let error = build(options, &CancellationToken::default()).unwrap_err();
+        assert!(error.to_string().contains("missing.shell"), "{error}");
+        assert_eq!(
+            std::fs::read(fixture.0.join("dist/index.html")).unwrap(),
+            previous
         );
     }
 
