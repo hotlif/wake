@@ -479,6 +479,8 @@ pub enum DevLoading {
 pub enum WatchTreeFilter {
     SourceFiles,
     AllFiles,
+    /// All project inputs except generated/dependency/cache components at any depth.
+    ProjectFiles,
 }
 
 /// Why a retained development build must refresh.
@@ -556,6 +558,28 @@ impl WatchInterest {
             excluded: Vec::new(),
             watch_declared_parent: false,
         }
+    }
+
+    /// Conservative project-local resource coverage, installed before candidate compilation.
+    /// Products additionally exclude their actual output directory when it is configurable.
+    pub fn project_resources(root: &Path) -> Self {
+        let mut interest = Self::all_files_tree(root);
+        if let Self::Tree { filter, .. } = &mut interest {
+            *filter = WatchTreeFilter::ProjectFiles;
+        }
+        for directory in [
+            ".wake",
+            ".git",
+            ".tmp",
+            ".yarn",
+            "node_modules",
+            "target",
+            "dist",
+            "docs-dist",
+        ] {
+            interest = interest.excluding_tree(root.join(directory));
+        }
+        interest
     }
 
     pub fn exact_file(path: impl Into<PathBuf>) -> Self {
@@ -640,7 +664,7 @@ impl WatchInterest {
                 in_tree
                     && (paths_equal(&declared_event, declared)
                         || paths_equal(&resolved_event, resolved)
-                        || *filter == WatchTreeFilter::AllFiles
+                        || *filter != WatchTreeFilter::SourceFiles
                         || declared_event
                             .extension()
                             .and_then(|extension| extension.to_str())
@@ -765,6 +789,18 @@ fn has_internal_generated_component(path: &Path, root: &Path, filter: WatchTreeF
         .any(|component| {
             let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
             (filter == WatchTreeFilter::SourceFiles && name == ".wake")
+                || (filter == WatchTreeFilter::ProjectFiles
+                    && matches!(
+                        name.as_str(),
+                        ".wake"
+                            | ".git"
+                            | ".tmp"
+                            | ".yarn"
+                            | "node_modules"
+                            | "target"
+                            | "dist"
+                            | "docs-dist"
+                    ))
                 || [
                     ".wake-output-stage-",
                     ".wake-app-backup-",
@@ -3793,12 +3829,8 @@ fn report_pending_watch_backend_error(
 }
 
 fn mount_watch_interests(spec: &MountSpec) -> Vec<WatchInterest> {
-    let default_watch_dir = {
-        let src = spec.root.join("src");
-        if src.is_dir() { src } else { spec.root.clone() }
-    };
     let mut interests = vec![
-        WatchInterest::tree(default_watch_dir),
+        WatchInterest::project_resources(&spec.root),
         WatchInterest::all_files_tree(spec.root.join("public")),
         WatchInterest::exact_file(spec.root.join("index.html")),
     ]
@@ -6038,6 +6070,34 @@ mod tests {
         assert!(!browsers.matches(&root.join("nested/.browserslistrc")));
     }
 
+    #[test]
+    fn project_resource_watch_covers_workers_missing_files_and_binary_assets() {
+        let root = PathBuf::from("project");
+        let interest = WatchInterest::project_resources(&root);
+        for input in [
+            "scripts/monaco-workers/editor.js",
+            "assets/new-file.data",
+            "src/image.svg",
+        ] {
+            assert!(interest.matches(&root.join(input)), "{input}");
+        }
+        for generated in [
+            ".wake/entry.js",
+            ".tmp/run/data",
+            ".yarn/cache/file",
+            "node_modules/pkg/index.js",
+            "target/debug/a",
+            "dist/bundle.js",
+            "docs-dist/index.html",
+            ".git/index",
+            ".wake-output-stage-test/bundle.js",
+            "packages/ui/node_modules/pkg/index.js",
+            "docs/workspace/.wake/entry.js",
+        ] {
+            assert!(!interest.matches(&root.join(generated)), "{generated}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn reported_watch_paths_coalesce_windows_verbatim_aliases() {
@@ -6597,6 +6657,16 @@ mod tests {
                 interests.iter().any(|interest| interest.matches(&path)),
                 "missing watch interest for {}",
                 path.display()
+            );
+        }
+        std::fs::remove_dir(root.path().join("src")).unwrap();
+        let root_fallback = mount_watch_interests(&spec);
+        for output in ["dist/bundle.js", "docs-dist/bundle.js", ".tmp/generated.js"] {
+            assert!(
+                !root_fallback
+                    .iter()
+                    .any(|interest| interest.matches(&root.path().join(output))),
+                "{output}"
             );
         }
     }
@@ -7912,6 +7982,71 @@ mod tests {
     #[test]
     fn html_changes_are_watched() {
         assert!(is_watched_ext("html"));
+    }
+
+    #[test]
+    fn native_worker_watch_updates_and_recovers_outside_src() {
+        let _network_guard = lock_network_test();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(root.path().join("scripts/monaco-workers")).unwrap();
+        let entry = root.path().join("src/index.js");
+        let worker = root.path().join("scripts/monaco-workers/editor.js");
+        std::fs::write(
+            &entry,
+            "new Worker(new URL('../scripts/monaco-workers/editor.js',import.meta.url));",
+        )
+        .unwrap();
+        std::fs::write(&worker, "self.postMessage('first-worker');").unwrap();
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let server = start(
+            root.path(),
+            port,
+            ServeOptions {
+                entry,
+                quiet: true,
+                event_handler: Some(Arc::new(move |event| captured.lock().unwrap().push(event))),
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+        let name = regex::Regex::new(r"editor\.[a-f0-9]+\.js").unwrap();
+        let first = http_get(port, "/bundle.js");
+        let first_name = name
+            .find(&first)
+            .expect("Worker URL in entry")
+            .as_str()
+            .to_owned();
+        assert!(http_get(port, &format!("/{first_name}")).contains("first-worker"));
+        std::fs::remove_file(&worker).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !events.lock().unwrap().iter().any(|event| matches!(event,
+            ServerEvent::Diagnostics { diagnostics, .. } if diagnostics.iter().any(|d| d.code.as_deref() == Some("WAKE0304")))) {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(events.lock().unwrap().iter().any(|event| matches!(event,
+            ServerEvent::Diagnostics { diagnostics, .. } if diagnostics.iter().any(|d| d.code.as_deref() == Some("WAKE0304")))));
+        std::fs::write(&worker, "self.postMessage('recovered-worker');").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let recovered = loop {
+            let response = http_get(port, "/bundle.js");
+            if let Some(found) = name.find(&response)
+                && found.as_str() != first_name
+            {
+                break found.as_str().to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Worker did not recover: {response}"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        assert!(http_get(port, &format!("/{recovered}")).contains("recovered-worker"));
+        server.close().unwrap();
     }
 
     #[test]

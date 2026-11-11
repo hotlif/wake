@@ -67,6 +67,7 @@
 - [ADR 0070: 构建归属、诊断上下文与步骤统计](0070-build-scoped-progress-context.md) — `accepted`
 - [ADR 0076: 开发与生产共享 HTML 模板生成](0076-shared-html-template-generation.md) — `accepted`
 - [ADR 0077: 原生开发代理流与升级连接](0077-development-proxy-streams.md) — `accepted`
+- [ADR 0078: 原生 Worker 与静态资源 URL](0078-native-worker-resource-urls.md) — `accepted`
 
 ### css-editor
 

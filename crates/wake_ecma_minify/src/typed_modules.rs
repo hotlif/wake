@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
+use wake_common::Span;
 use wake_ecma_ast::{BinaryOperator, LogicalOperator, VarKind};
 use wake_ecma_semantic::{DeclKind, SymbolId};
 
@@ -374,6 +375,8 @@ pub struct TypedModuleSpecifierRewrite {
 pub struct TypedFinalModuleFacts {
     pub modules: Vec<TypedResolvedModule>,
     pub request_rewrites: Vec<TypedModuleSpecifierRewrite>,
+    /// Source span, original string value, and linker-owned public resource URL.
+    pub resource_urls: Vec<(Span, String, String)>,
     /// Preserve-CommonJS output may deliberately express external `import()` through the host
     /// `require` contract. Bundled output leaves this false and uses native import/runtime chunks.
     pub lower_external_dynamic_to_require: bool,
@@ -1111,6 +1114,7 @@ fn finalize_typed_modules_in_place(
         generated_module_requests,
     )?;
     rewrite_native_specifiers(program, facts, &mut report)?;
+    rewrite_resource_urls(program, facts)?;
     insert_esmodule_marker(program, plan, facts.no_esmodule)?;
     finalize_runtime_sentinels(program, plan)?;
     program.validate()?;
@@ -4406,6 +4410,34 @@ fn rewrite_native_specifiers(
     Ok(())
 }
 
+fn rewrite_resource_urls(
+    program: &mut TypedProgram,
+    facts: &TypedFinalModuleFacts,
+) -> Result<(), TypedModuleError> {
+    if facts.resource_urls.is_empty() {
+        return Ok(());
+    }
+    for node in program.preorder_validated()? {
+        let Some(record) = program.node(node) else {
+            continue;
+        };
+        let IrNodeData::StringLiteral { value } = record.data() else {
+            continue;
+        };
+        let span = match record.origin() {
+            IrOrigin::Source(span) => Some(span),
+            IrOrigin::Derived { anchor, .. } | IrOrigin::Synthetic { anchor, .. } => anchor,
+        };
+        let Some((_, _, url)) = facts.resource_urls.iter().find(|(source_span, source, _)| {
+            span == Some(*source_span) && value.as_str() == Some(source.as_str())
+        }) else {
+            continue;
+        };
+        program.replace_node_data(node, IrNodeData::StringLiteral { value: url.into() })?;
+    }
+    Ok(())
+}
+
 fn insert_esmodule_marker(
     program: &mut TypedProgram,
     plan: &TypedModulePlan,
@@ -5520,6 +5552,7 @@ mod tests {
                 request_kind: TypedModuleRequestKind::Require,
                 rewritten_specifier: "pkg".into(),
             }],
+            resource_urls: Vec::new(),
             lower_external_dynamic_to_require: false,
             no_esmodule: false,
         };

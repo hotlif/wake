@@ -768,11 +768,18 @@ struct RequestRewrite {
 pub struct ModuleFinalizeFacts {
     resolutions: Vec<FinalModuleResolution>,
     rewrites: Vec<RequestRewrite>,
+    resource_urls: Vec<(Span, String, String)>,
     lower_external_dynamic_to_require: bool,
     no_esmodule: bool,
 }
 
 impl ModuleFinalizeFacts {
+    /// Rewrite a parser-proven resource URL literal without editing source or generated text.
+    /// The original span and value identify the typed literal; the URL belongs to the linker.
+    pub fn rewrite_resource_url(&mut self, span: Span, source: String, url: String) {
+        self.resource_urls.push((span, source, url));
+    }
+
     pub fn resolve_external(&mut self, specifier: impl Into<String>, kind: ModuleRequestKind) {
         self.set_resolution(
             ModuleRequest::new(specifier, kind),
@@ -1777,6 +1784,10 @@ struct FinalLinker<'a> {
 }
 
 impl ModuleLinker for FinalLinker<'_> {
+    fn resource_urls(&self) -> Vec<(Span, String, String)> {
+        self.facts.resource_urls.clone()
+    }
+
     fn module_id(
         &self,
         specifier: &str,

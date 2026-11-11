@@ -31,6 +31,368 @@ fn wake_cache_diagnostics(output: &BuildOutput) -> Vec<&Diagnostic> {
 }
 
 #[test]
+fn resource_url_emits_static_asset_and_preserves_suffix() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "globalThis.image = new URL('./logo.svg?q=1#icon', import.meta.url);",
+        ),
+        ("src/logo.svg", "<svg>logo</svg>"),
+    ]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.assets.len(), 1, "{}", out.bundle);
+    assert_eq!(out.assets[0].bytes, b"<svg>logo</svg>");
+    assert!(
+        out.bundle
+            .contains(&format!("/{}?q=1#icon", out.assets[0].file_name)),
+        "{}",
+        out.bundle
+    );
+}
+
+#[test]
+fn resource_url_decodes_paths_and_encodes_published_names() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "globalThis.image=new URL('./icon%20%23.svg?v=1#part',import.meta.url);",
+        ),
+        ("src/icon #.svg", "icon"),
+    ]);
+    let output = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.assets.len(), 1);
+    assert!(output.bundle.contains("icon%20%23."), "{}", output.bundle);
+    assert!(output.bundle.contains("?v=1#part"));
+}
+
+#[test]
+fn resource_url_shadowed_constructor_is_unchanged() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "function make(URL) { return new URL('./missing.svg', import.meta.url); } globalThis.make = make;",
+    )]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.assets.is_empty());
+    assert!(out.bundle.contains("./missing.svg"));
+}
+
+#[test]
+fn resource_url_missing_file_is_a_build_error() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "globalThis.image = new URL('./missing.svg', import.meta.url);",
+    )]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(
+        out.has_errors(),
+        "missing resource must not silently succeed"
+    );
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("WAKE0304"))
+    );
+}
+
+#[test]
+fn native_worker_is_an_independent_bundle() {
+    let fs = MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "globalThis.worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });",
+        ),
+        (
+            "src/worker.js",
+            "import {answer} from './answer.js'; self.postMessage(answer);",
+        ),
+        ("src/answer.js", "export const answer = 42;"),
+    ]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert_eq!(out.module_count, 1);
+    assert_eq!(out.assets.len(), 1);
+    assert!(out.assets[0].file_name.ends_with(".js"));
+    let worker = String::from_utf8(out.assets[0].bytes.clone()).unwrap();
+    assert!(worker.contains("postMessage"));
+    assert!(worker.contains("42"));
+    assert!(worker.contains("__wake_require__"));
+    assert!(!worker.contains("from './answer.js'"));
+    assert!(out.bundle.contains(&out.assets[0].file_name));
+    if node_available() {
+        let executed = execute_runtime_differential_bundle(&format!(
+            "globalThis.self={{postMessage:x=>process.stdout.write(String(x))}};{worker}"
+        ));
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(executed.stdout, b"42");
+    }
+}
+
+#[test]
+fn resource_url_changes_invalidate_cached_body() {
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "globalThis.image = new URL('./logo.svg', import.meta.url);",
+        ),
+        ("src/logo.svg", "first"),
+    ]));
+    let mut bundler = IncrementalBundler::new(fs.clone());
+    bundler.enable_load_cache();
+    let first = bundler.build(Path::new("src/index.js"));
+    fs.insert("src/logo.svg", "second");
+    bundler.invalidate_paths(&[PathBuf::from("src/logo.svg")], false);
+    let second = bundler.build(Path::new("src/index.js"));
+    assert!(!second.has_errors(), "{:?}", second.diagnostics);
+    assert_ne!(first.assets[0].file_name, second.assets[0].file_name);
+    assert!(second.bundle.contains(&second.assets[0].file_name));
+    assert!(!second.bundle.contains(&first.assets[0].file_name));
+}
+
+#[test]
+fn resource_url_persistent_cache_preserves_literal_provenance() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = cache_dir.path().join("resources.cache");
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "globalThis.original='./logo.svg';globalThis.image=new URL('./logo.svg',import.meta.url);",
+        ),
+        ("src/logo.svg", "first"),
+    ]));
+    let build = || {
+        let mut bundler = IncrementalBundler::new(fs.clone());
+        bundler
+            .enable_minify()
+            .enable_persistent_cache(cache.clone());
+        let out = bundler.build(Path::new("src/index.js"));
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert!(
+            wake_cache_diagnostics(&out).is_empty(),
+            "{:?}",
+            out.diagnostics
+        );
+        out
+    };
+    let first = build();
+    assert_eq!(first.bundle, build().bundle);
+    fs.insert("src/logo.svg", "second");
+    let second = build();
+    assert_ne!(first.assets[0].file_name, second.assets[0].file_name);
+    assert!(second.bundle.contains(&second.assets[0].file_name));
+    assert!(
+        second.bundle.contains("./logo.svg"),
+        "ordinary string must retain its value"
+    );
+}
+
+#[test]
+fn resource_url_dynamic_and_remote_references_are_unchanged() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "globalThis.a=new URL(globalThis.path,import.meta.url);globalThis.b=new URL('https://example.test/a',import.meta.url);",
+    )]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.assets.is_empty());
+    assert!(out.bundle.contains("https://example.test/a"));
+}
+
+#[test]
+fn native_worker_dependency_changes_update_public_url() {
+    let fs = Arc::new(MemoryFileSystem::from_files([
+        (
+            "src/index.js",
+            "new Worker(new URL('./worker.js', import.meta.url));",
+        ),
+        (
+            "src/worker.js",
+            "import { value } from './value.js'; self.postMessage(value);",
+        ),
+        ("src/value.js", "export const value = 1;"),
+    ]));
+    let mut bundler = IncrementalBundler::new(fs.clone());
+    bundler.enable_load_cache();
+    let first = bundler.build(Path::new("src/index.js"));
+    fs.insert("src/value.js", "export const value = 2;");
+    bundler.invalidate_paths(&[PathBuf::from("src/value.js")], false);
+    let second = bundler.build(Path::new("src/index.js"));
+    assert!(!second.has_errors(), "{:?}", second.diagnostics);
+    assert_ne!(first.assets[0].file_name, second.assets[0].file_name);
+    assert!(second.bundle.contains(&second.assets[0].file_name));
+}
+
+#[test]
+fn resource_url_project_boundary_is_explicit() {
+    let fs = MemoryFileSystem::from_files([
+        ("app/index.js", "new URL('../outside.svg',import.meta.url);"),
+        ("outside.svg", "outside"),
+    ]);
+    let output = crate::BuildSession::new_one_shot(
+        Arc::new(fs),
+        crate::BuildOptions {
+            project_root: Some(PathBuf::from("app")),
+            ..crate::BuildOptions::default()
+        },
+    )
+    .build_once(crate::BuildRequest::new("app/index.js"));
+    assert!(output.has_errors());
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("project root"))
+    );
+}
+
+#[test]
+fn resource_url_project_boundary_uses_filesystem_identity() {
+    struct LinkedFs(MemoryFileSystem);
+    impl wake_common::FileSystem for LinkedFs {
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            if path == Path::new("app/linked.svg") {
+                Ok(PathBuf::from("outside/logo.svg"))
+            } else {
+                self.0.canonicalize(path)
+            }
+        }
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.0.read_to_string(path)
+        }
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.0.read(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.0.exists(path)
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.0.is_file(path)
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.0.is_dir(path)
+        }
+        fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>> {
+            self.0.read_dir(path)
+        }
+    }
+    let fs = LinkedFs(MemoryFileSystem::from_files([
+        ("app/index.js", "new URL('./linked.svg',import.meta.url);"),
+        ("app/linked.svg", "outside"),
+    ]));
+    let output = crate::BuildSession::new_one_shot(
+        Arc::new(fs),
+        crate::BuildOptions {
+            project_root: Some(PathBuf::from("app")),
+            ..crate::BuildOptions::default()
+        },
+    )
+    .build_once(crate::BuildRequest::new("app/index.js"));
+    assert!(
+        output.has_errors(),
+        "physical targets outside the covered root must be rejected"
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("project root"))
+    );
+}
+
+#[test]
+fn native_worker_shared_reference_preserves_all_owners() {
+    let fs = MemoryFileSystem::from_files([
+        ("src/index.js", "import './a.js'; import './b.js';"),
+        (
+            "src/a.js",
+            "new Worker(new URL('./worker.js',import.meta.url));",
+        ),
+        (
+            "src/b.js",
+            "new Worker(new URL('./worker.js',import.meta.url));",
+        ),
+        ("src/worker.js", "self.postMessage(1);"),
+    ]);
+    let output = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.assets.len(), 1);
+    assert_eq!(output.assets[0].owner_module_ids.len(), 2);
+}
+
+#[test]
+fn native_worker_cycles_report_a_diagnostic() {
+    let fs = MemoryFileSystem::from_files([(
+        "src/index.js",
+        "new Worker(new URL('./index.js', import.meta.url));",
+    )]);
+    let out = Bundler::new(Arc::new(fs)).build(Path::new("src/index.js"));
+    assert!(out.has_errors());
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("recursive Worker build"))
+    );
+}
+
+#[test]
+fn native_worker_resource_urls_use_worker_location_and_public_path() {
+    for public_path in ["/app/", "./"] {
+        for minify in [false, true] {
+            let fs = MemoryFileSystem::from_files([
+                (
+                    "src/index.js",
+                    "new Worker(new URL('./worker.js', import.meta.url),{type:'module'});",
+                ),
+                (
+                    "src/worker.js",
+                    "self.postMessage(new URL('./logo.svg', import.meta.url).href);",
+                ),
+                ("src/logo.svg", "logo"),
+            ]);
+            let mut bundler = IncrementalBundler::new(Arc::new(fs));
+            bundler.set_public_path(public_path);
+            if minify {
+                bundler.enable_minify();
+            }
+            let out = bundler.build(Path::new("src/index.js"));
+            assert!(!out.has_errors(), "{:?}", out.diagnostics);
+            let worker = out
+                .assets
+                .iter()
+                .find(|asset| asset.file_name.ends_with(".js"))
+                .unwrap();
+            let image = out
+                .assets
+                .iter()
+                .find(|asset| asset.file_name.ends_with(".svg"))
+                .unwrap();
+            if node_available() {
+                let code = format!(
+                    "globalThis.location={{href:'https://example.test/app/worker.js'}};globalThis.self={{postMessage:x=>process.stdout.write(x)}};{}",
+                    String::from_utf8_lossy(&worker.bytes)
+                );
+                let executed = execute_runtime_differential_bundle(&code);
+                assert!(
+                    executed.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&executed.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8(executed.stdout).unwrap(),
+                    format!("https://example.test/app/{}", image.file_name)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn bundles_multi_module_esm() {
     let out = Bundler::new(Arc::new(fixture())).build(Path::new("src/index.js"));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);

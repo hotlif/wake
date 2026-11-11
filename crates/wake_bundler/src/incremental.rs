@@ -637,6 +637,7 @@ struct OptimizeLinkerData {
 /// the chunk graph has been recomputed from that converged graph.
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 struct EmitLinkerData {
+    resource_urls: Vec<(Span, String, String)>,
     deps: DepIds,
     dyn_chunks: DepIds,
     /// Literal dynamic imports owned by the page-level federation broker.
@@ -2933,6 +2934,8 @@ impl IncrementalBundler {
             frontier = next;
         }
 
+        let resource_urls =
+            self.build_resource_references(&mut modules, &mut diagnostics, &mut collected_assets);
         let t_scan = t0.elapsed();
         drop(scan_progress);
         let link_progress =
@@ -3329,6 +3332,7 @@ impl IncrementalBundler {
             async_deps.sort_unstable();
             async_deps.dedup();
             let emit_data = EmitLinkerData {
+                resource_urls: resource_urls.get(&plan.id).cloned().unwrap_or_default(),
                 deps: rec.dep_ids.clone(),
                 dyn_chunks: dyn_chunks_of(edges, chunk_graph.as_ref()),
                 runtime_imports: rec.runtime_imports.clone(),
@@ -4022,6 +4026,180 @@ impl IncrementalBundler {
             self.optimize_linker_cells.insert(path.to_path_buf(), cell);
             cell
         }
+    }
+
+    fn build_resource_references(
+        &self,
+        modules: &mut FxHashMap<u32, ModuleRec>,
+        diagnostics: &mut Vec<Diagnostic>,
+        assets: &mut Vec<(u32, String, Vec<u8>)>,
+    ) -> FxHashMap<u32, Vec<(Span, String, String)>> {
+        let mut urls = FxHashMap::default();
+        if self.platform != BuildPlatform::Browser {
+            return urls;
+        }
+        let mut ids: Vec<_> = modules.keys().copied().collect();
+        ids.sort_unstable();
+        // Only the cheap prefilter reads text. Syntax and binding ownership stay in the parser.
+        // Restore parse facts on summary hits rather than extending the persistent wire schema.
+        let mut built_workers: FxHashMap<PathBuf, (String, Vec<usize>)> = FxHashMap::default();
+        for id in ids {
+            let rec = modules.get_mut(&id).expect("resource owner");
+            let possible = self.engine.enter(|| {
+                let source = rec.content_vc.read();
+                source.contains("new") && source.contains("import")
+            });
+            if !possible {
+                continue;
+            }
+            if rec.parsed.is_none() {
+                let (vc, parsed) = self.engine.enter(|| {
+                    parse_request(
+                        rec.content_vc,
+                        self.compiler.clone(),
+                        rec.source_type,
+                        self.jsx.clone(),
+                        self.target.clone(),
+                        self.jsx
+                            .dev
+                            .then(|| Arc::<str>::from(path_to_slash(&rec.path))),
+                    )
+                });
+                rec.parse_vc = Some(vc);
+                rec.parsed = Some(parsed);
+            }
+            let references = rec
+                .parsed
+                .as_ref()
+                .expect("parsed resource owner")
+                .ast
+                .with_ast(|program| crate::resource_refs::collect(program, &self.interner));
+            for reference in references {
+                let split = reference
+                    .request
+                    .find(['?', '#'])
+                    .unwrap_or(reference.request.len());
+                let (file, suffix) = reference.request.split_at(split);
+                let result: Result<String, String> = (|| {
+                    let file = crate::resource_refs::decode_path(file)?;
+                    let path = normalize(&rec.path.parent().unwrap_or(Path::new("")).join(file));
+                    if let Some(root) = &self.project_root
+                        && !path.starts_with(normalize(root))
+                    {
+                        return Err(format!(
+                            "static resource must remain inside project root {}",
+                            root.display()
+                        ));
+                    }
+                    let path = normalize(
+                        &self
+                            .fs
+                            .canonicalize(&path)
+                            .map_err(|error| format!("{}: {error}", path.display()))?,
+                    );
+                    if let Some(root) = &self.project_root {
+                        let identity = normalize(
+                            &self
+                                .fs
+                                .canonicalize(root)
+                                .map_err(|error| format!("{}: {error}", root.display()))?,
+                        );
+                        if !path.starts_with(&identity) {
+                            return Err(format!(
+                                "static resource resolves outside project root {}",
+                                root.display()
+                            ));
+                        }
+                    }
+                    if reference.worker {
+                        if let Some((name, indexes)) = built_workers.get(&path) {
+                            let additional_owners = indexes
+                                .iter()
+                                .map(|index| {
+                                    let (_, file_name, bytes) = &assets[*index];
+                                    (id, file_name.clone(), bytes.clone())
+                                })
+                                .collect::<Vec<_>>();
+                            assets.extend(additional_owners);
+                            return Ok(name.clone());
+                        }
+                        let _guard = crate::resource_refs::WorkerGuard::enter(&path)?;
+                        let options = crate::BuildOptions {
+                            project_root: self.project_root.clone(),
+                            resolve: self.resolve_options.clone(),
+                            define: self.define.to_vec(),
+                            extract_css: self.extract_css,
+                            asset_inline_limit: self.asset_inline_limit,
+                            public_path: self.public_path.clone(),
+                            minify: self.minify,
+                            dead_module_elimination: self.dead_module_elimination,
+                            css_in_js: self.css_in_js,
+                            drop_console: self.drop_console,
+                            drop_debugger: self.drop_debugger,
+                            tree_shaking: self.tree_shaking,
+                            jsx: crate::JsxOptions {
+                                development: self.jsx.dev,
+                                import_source: self.jsx.import_source.to_string(),
+                            },
+                            target_env: self.target.clone(),
+                            ..crate::BuildOptions::default()
+                        };
+                        // One-shot consumes its engine; do not retain Worker ASTs between siblings.
+                        let output = crate::BuildSession::new_one_shot(self.fs.clone(), options)
+                            .build_once(crate::BuildRequest::new(&path));
+                        let failed = output.has_errors();
+                        diagnostics.extend(output.diagnostics);
+                        if failed {
+                            return Err(format!("Worker build failed: {}", path.display()));
+                        }
+                        let bytes = output.bundle.into_bytes();
+                        let name =
+                            crate::loader::asset_file_name(&path.with_extension("js"), &bytes);
+                        let start = assets.len();
+                        assets.push((id, name.clone(), bytes));
+                        for asset in output.assets {
+                            assets.push((id, asset.file_name, asset.bytes));
+                        }
+                        built_workers.insert(
+                            path.clone(),
+                            (name.clone(), (start..assets.len()).collect()),
+                        );
+                        Ok(name)
+                    } else {
+                        let bytes = self
+                            .fs
+                            .read(&path)
+                            .map_err(|error| format!("{}: {error}", path.display()))?;
+                        let name = crate::loader::asset_file_name(&path, &bytes);
+                        assets.push((id, name.clone(), bytes));
+                        Ok(name)
+                    }
+                })();
+                match result {
+                    Ok(name) => urls.entry(id).or_insert_with(Vec::new).push((
+                        reference.span,
+                        reference.request.clone(),
+                        format!(
+                            "{}{suffix}",
+                            crate::loader::join_public_path(
+                                &self.public_path,
+                                &crate::resource_refs::encode_file_name(&name)
+                            )
+                        ),
+                    )),
+                    Err(error) => diagnostics.push(
+                        Diagnostic::error(format!(
+                            "cannot build resource URL `{}`: {error}",
+                            reference.request
+                        ))
+                        .with_code("WAKE0304")
+                        .with_path(path_to_slash(&rec.path))
+                        .with_primary(reference.span, "static resource reference"),
+                    ),
+                }
+            }
+        }
+        urls
     }
 
     fn emit_linker_cell(&mut self, path: &Path, data: EmitLinkerData) -> Vc<EmitLinkerData> {
@@ -5631,6 +5809,9 @@ fn compiler_finalize_facts(
         })
     };
     let mut facts = ModuleFinalizeFacts::default();
+    for (span, source, url) in &data.resource_urls {
+        facts.rewrite_resource_url(*span, source.clone(), url.clone());
+    }
     for dependency in data
         .deps
         .iter()
@@ -8523,10 +8704,12 @@ fn append_typed_runtime_services(
     if capabilities.meta_url {
         let value = if split_runtime {
             format!(
-                "typeof {global_name}.document!='undefined'?new {global_name}.URL(__wake__.publicPath||'.',{global_name}.document.baseURI).href:''"
+                "typeof {global_name}.document!='undefined'?new {global_name}.URL(__wake__.publicPath||'.',{global_name}.document.baseURI).href:typeof {global_name}.location!='undefined'?{global_name}.location.href:''"
             )
         } else {
-            format!("typeof {global_name}.document!='undefined'?{global_name}.document.baseURI:''")
+            format!(
+                "typeof {global_name}.document!='undefined'?{global_name}.document.baseURI:typeof {global_name}.location!='undefined'?{global_name}.location.href:''"
+            )
         };
         push(
             out,

@@ -331,7 +331,7 @@ fn push_css_module_exports(js: &mut String, exports: &Option<Vec<(String, String
 }
 
 /// 超阈值资源的写盘文件名：`<stem>.<hash8>.<ext>`（内容 hash）。
-fn asset_file_name(path: &Path, bytes: &[u8]) -> String {
+pub(crate) fn asset_file_name(path: &Path, bytes: &[u8]) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
     format!(
@@ -341,7 +341,7 @@ fn asset_file_name(path: &Path, bytes: &[u8]) -> String {
 }
 
 /// 拼接 `publicPath` 与文件名（规范化斜杠）。
-fn join_public_path(public_path: &str, name: &str) -> String {
+pub(crate) fn join_public_path(public_path: &str, name: &str) -> String {
     if public_path.is_empty() {
         name.to_string()
     } else if public_path.ends_with('/') {

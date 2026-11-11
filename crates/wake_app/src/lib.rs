@@ -2935,21 +2935,8 @@ fn project_watch_interests_from(
     explicit_entry: Option<&Path>,
     config: &wake_config::Config,
 ) -> Vec<WatchInterest> {
-    let source = {
-        let source = root.join("src");
-        if source.is_dir() {
-            source
-        } else {
-            root.to_path_buf()
-        }
-    };
-    let source_interest = if source == root {
-        WatchInterest::tree(source).excluding_tree(root.join(".wake"))
-    } else {
-        WatchInterest::tree(source)
-    };
     let mut interests = vec![
-        source_interest,
+        WatchInterest::project_resources(root),
         WatchInterest::all_files_tree(root.join("public")),
         WatchInterest::exact_file(root.join("index.html")),
     ];
@@ -12372,6 +12359,39 @@ generate_source = true
                 .iter()
                 .any(|interest| { interest.matches(&fixture.0.join("index.js")) })
         );
+    }
+
+    #[test]
+    fn resource_watch_plan_covers_scripts_and_excludes_custom_output() {
+        let fixture = Fixture::new("resource-watch-plan");
+        let options = BuildOptions {
+            project: fixture.project(),
+            outdir: Some(PathBuf::from("artifacts")),
+            write: true,
+            ..BuildOptions::default()
+        };
+        let prepared = prepare_build_candidate(&options).unwrap();
+        let interests = build_context_watch_interests(&prepared, &options);
+        for path in ["scripts/monaco-workers/editor.js", "assets/new-file.data"] {
+            assert!(
+                interests
+                    .iter()
+                    .any(|interest| interest.matches(&fixture.0.join(path))),
+                "{path}"
+            );
+        }
+        for path in [
+            "artifacts/worker.js",
+            ".wake/generated.js",
+            ".tmp/cache.data",
+        ] {
+            assert!(
+                !interests
+                    .iter()
+                    .any(|interest| interest.matches(&fixture.0.join(path))),
+                "{path}"
+            );
+        }
     }
 
     #[test]

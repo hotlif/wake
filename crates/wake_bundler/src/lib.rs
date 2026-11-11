@@ -19,6 +19,7 @@ mod generation;
 mod incremental;
 pub mod library;
 mod loader;
+mod resource_refs;
 mod session;
 pub use generation::BuildGeneration;
 pub(crate) use incremental::IncrementalBundler;

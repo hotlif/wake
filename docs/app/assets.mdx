@@ -30,6 +30,25 @@ declare module "*.svg" {
 
 类型声明让 TypeScript 理解资源导入，不负责复制文件。普通 CSS 的 `url('./font.woff2')` 相对 CSS 文件解析；构建后检查重写的 URL，不硬编码哈希文件名。
 
+## 静态 URL 与 Worker
+
+`new URL('./logo.svg', import.meta.url)` 保持 URL 对象语义，将相对文件输出为独立的内容哈希资源，
+并使用 `public_path` 生成地址。查询参数和 fragment 保留；文件变化会更新引用。动态参数、远程地址、
+被局部变量遮蔽的 `URL` 构造器保持原语义。缺失的静态文件会导致构建失败。
+路径中的 UTF-8 百分号编码按 URL 语义解码，例如 `./icon%20x.svg` 引用 `icon x.svg`；无效编码会报错。
+
+```ts title="src/editor.ts"
+const logo = new URL('./logo.svg', import.meta.url);
+const worker = new Worker(new URL('./editor.worker.ts', import.meta.url), { type: 'module' });
+```
+
+静态 Worker 入口由 Wake 独立打包，支持其模块依赖，并按顺序释放每个子构建的编译状态。
+Worker 不依赖页面模块表，也不继承页面 federation 上下文；循环 Worker 构建会报错。
+开发和生产使用相同构建逻辑。普通资源 URL 始终输出文件，不应用 import 资源的内联阈值。
+静态 URL 和 Worker 文件必须位于项目根内，跨根引用会报错。开发与 `build --watch` 在构建前监听
+项目内文件，因此 `scripts/` 中的 Worker 和新建的缺失资源也能触发更新；项目内其他文件编辑也可能
+触发构建。生成目录、依赖与缓存目录不属于这个默认监听范围。
+
 ## public 文件
 
 把 `robots.txt`、固定名称的下载文件或站点图标放到 `public`。代码使用它们的公开 URL；文件内容中的路径不会因为它位于 public 就自动获得模块导入的重写语义。

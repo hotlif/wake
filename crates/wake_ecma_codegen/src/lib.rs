@@ -55,6 +55,10 @@ pub fn codegen(program: &Program, interner: &Interner) -> String {
 /// 用于 [`codegen_optimized`]：把 ESM import/export 与 `import()`/`require()` 改写为 CJS，
 /// 供 webpack 式函数包装打包（DESIGN §6.1）。
 pub trait ModuleLinker {
+    /// Parser-owned resource literal spans and their original/replacement URL values.
+    fn resource_urls(&self) -> Vec<(Span, String, String)> {
+        Vec::new()
+    }
     /// 说明符 → 内部模块 id；`None` 表示外部/未解析（MVP 保留原样）。
     fn module_id(&self, specifier: &str, kind: ModuleRequestKind) -> Option<u32>;
     /// 动态 `import(specifier)` 目标所属的 async/shared chunk id（代码分割，6.5）。
@@ -480,6 +484,7 @@ fn bundled_module_facts(
     TypedFinalModuleFacts {
         modules,
         no_esmodule,
+        resource_urls: linker.resource_urls(),
         ..TypedFinalModuleFacts::default()
     }
 }
