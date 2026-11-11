@@ -48,8 +48,8 @@ const HELP = `Wake ${version()}
 Usage:
   wake [--ui auto|tui|plain] [--no-color] <command>
   wake build [entry] [--outdir DIR] [--cache] [--sourcemap]
-  wake bundle <entry> --outfile FILE [--platform browser|node] [--format iife|cjs]
-              [--target node20] [--external PACKAGE] [--minify] [--sourcemap]
+  wake bundle <entry> --outfile FILE [--platform browser|node] [--format iife|cjs|esm]
+              [--target node20] [--external PACKAGE] [--banner TEXT] [--footer TEXT] [--minify] [--sourcemap]
               [--cache] [--config FILE]
   wake library token [project] [--config token.toml]
   wake federation init [root]
@@ -842,10 +842,12 @@ export async function runCli(argv = process.argv.slice(2)) {
     }
     const format = takeOption(args, '--format', true)
     if (format !== undefined) {
-      options.format = validateBundleChoice(format, '--format', ['iife', 'cjs'])
+      options.format = validateBundleChoice(format, '--format', ['iife', 'cjs', 'esm'])
     }
     options.target = takeOption(args, '--target', true)
     options.external = takeOptions(args, '--external', true)
+    options.banner = takeOption(args, '--banner', true)
+    options.footer = takeOption(args, '--footer', true)
     options.minify = takeFlag(args, '--minify')
     options.sourceMap = takeFlag(args, '--sourcemap')
     options.cache = takeFlag(args, '--cache')

@@ -10,7 +10,7 @@ import { runInNewContext } from 'node:vm'
 // This is the one intentionally Node-owned gate: it loads the real `.node` addon and exercises
 // Worker, socket, and cleanup-hook lifecycles. It is not a Wake Test runner or product fallback.
 import { after, test } from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { assertComponentsRuntime } from '../../../scripts/components-runtime-smoke.mjs'
 import {
@@ -1548,6 +1548,34 @@ test('programmatic defines survive build context and dev configuration reloads',
   } finally {
     await server?.close()
     await context?.close()
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('bundle ESM and affixes cross Node and npm CLI boundaries', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-esm-contract-'))
+  try {
+    await writeFile(join(cwd, 'entry.ts'), 'export const answer: number = 42; export function activate() { return answer; }')
+    const outfile = join(cwd, 'plugin.mjs')
+    const result = await bundle({ cwd, entry: 'entry.ts', outfile, platform: 'node', format: 'esm', minify: true, sourceMap: true, banner: 'globalThis.__wakeBanner = 1;', footer: 'globalThis.__wakeFooter = 2;' })
+    const loaded = await import(pathToFileURL(outfile).href)
+    assert.equal(loaded.answer, 42)
+    assert.equal(loaded.activate(), 42)
+    assert.equal(globalThis.__wakeBanner, 1)
+    assert.equal(globalThis.__wakeFooter, 2)
+    assert.equal(await readFile(outfile, 'utf8'), result.code)
+    assert.equal(await readFile(`${outfile}.map`, 'utf8'), result.sourceMap)
+    const cli = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url))
+    const cliFile = join(cwd, 'cli.mjs')
+    const child = spawnSync(process.execPath, [cli, 'bundle', join(cwd, 'entry.ts'), '--outfile', cliFile, '--platform', 'node', '--format', 'esm', '--banner', '// CLI banner', '--footer', '// CLI footer', '--sourcemap'], { encoding: 'utf8', env: process.env })
+    assert.equal(child.status, 0, child.stderr)
+    assert.equal((await import(pathToFileURL(cliFile).href)).activate(), 42)
+    const code = await readFile(cliFile, 'utf8')
+    assert.ok(code.startsWith('// CLI banner\n'))
+    assert.ok(code.includes('// CLI footer\n//# sourceMappingURL='))
+  } finally {
+    delete globalThis.__wakeBanner
+    delete globalThis.__wakeFooter
     await rm(cwd, { recursive: true, force: true })
   }
 })

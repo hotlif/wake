@@ -110,7 +110,16 @@ console.log(result.outputFile);
 ```
 
 Node 平台自动外置 Node 内置模块。显式 external 必须是裸 npm 包名并同时覆盖其子路径。
-首版 Node bundle 只支持 CommonJS 单文件，`minify` 与 `sourceMap` 可以同时启用；生成 map 不会
+Node 默认输出 CommonJS；Browser 和 Node 均可显式选择 `format: "esm"`。
+ESM 首版限定同步、无 external 的模块图，入口支持直接 const 标识符、未被赋值的函数/类和
+default 表达式导出。可变导出、解构导出、导出列表、再导出、CommonJS 全局、require、eval、
+import.meta 和顶层 await 会报告 `WAKE0305`。Node 加载时使用 `.mjs` 或 `type: "module"`。
+
+`banner` / `footer` 接受原样 JavaScript 字符串，以换行与生成代码分隔；调用方负责其语法。
+banner 会同步移动 source map 的生成行，附加代码本身不映射到输入源码。可用这两个选项
+组合已有 IIFE/CJS 产物与宿主包装代码，无需引入宿主专用构建格式。
+
+`minify` 与 `sourceMap` 可以同时启用；生成 map 不会
 选择另一套未压缩代码，也不改变 JavaScript 主体。
 `minify` 使用 Wake 集中式的 Closure 风格有序 pass/固定点管线；这不是 Closure `ADVANCED`
 兼容模式，Node API 不新增 externs 或 whole-world 选项。

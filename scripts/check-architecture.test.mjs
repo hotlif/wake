@@ -739,7 +739,7 @@ test('Node owns exact closed request and Docs response DTOs', () => {
   }
   const expectedRustFields = new Map([
     ['RawBuildOptions', ['cache', 'config_path', 'cwd', 'define', 'entry', 'federation', 'outdir', 'source_map']],
-    ['RawBundleOptions', ['cache', 'config_path', 'cwd', 'define', 'entry', 'external', 'format', 'minify', 'outfile', 'platform', 'source_map', 'target']],
+    ['RawBundleOptions', ['banner', 'cache', 'config_path', 'cwd', 'define', 'entry', 'external', 'footer', 'format', 'minify', 'outfile', 'platform', 'source_map', 'target']],
     ['RawGenerateCssTokenOptions', ['config_path', 'cwd']],
     ['RawGenerateDocgenOptions', ['cwd', 'entry']],
     ['RawLibraryBuildOptions', ['cwd', 'entry']],

@@ -3307,6 +3307,68 @@ impl IncrementalBundler {
                 }
             }
         }
+        // Native entry exports are validated from source facts even on persistent body hits.
+        // This intentionally rejects graphs whose host or live-binding semantics are unproven.
+        let mut esm_exports = Vec::new();
+        if self.module_format == ModuleFormat::Esm {
+            if chunk_graph.is_some() {
+                diagnostics.push(
+                    Diagnostic::error("ESM bundle requires single-file output")
+                        .with_code("WAKE0305"),
+                );
+            }
+            for id in ordered.iter().copied().filter(|id| live.contains(id)) {
+                let rec = &modules[&id];
+                let graph_error = if rec.has_top_level_await {
+                    Some("ESM bundle does not yet support top-level await")
+                } else if !rec.external_deps.is_empty()
+                    || !rec.runtime_imports.is_empty()
+                    || !rec.shared_imports.is_empty()
+                {
+                    Some("ESM bundle does not yet support external or federation imports")
+                } else if rec
+                    .deps
+                    .iter()
+                    .any(|dep| dep.kind == DependencyKind::Require)
+                {
+                    Some("ESM bundle does not yet support require()")
+                } else {
+                    None
+                };
+                if let Some(message) = graph_error {
+                    diagnostics.push(
+                        Diagnostic::error(message)
+                            .with_code("WAKE0305")
+                            .with_path(path_to_slash(&rec.path)),
+                    );
+                    continue;
+                }
+                let parsed = rec.parsed.clone().unwrap_or_else(|| {
+                    self.engine.enter(|| {
+                        parse_request(
+                            rec.content_vc,
+                            self.compiler.clone(),
+                            rec.source_type,
+                            self.jsx.clone(),
+                            self.target.clone(),
+                            None,
+                        )
+                        .1
+                    })
+                });
+                match parsed.ast.with_ast(|program| {
+                    crate::esm_bundle::exports(program, self.compiler.interner(), id == entry_id)
+                }) {
+                    Ok(names) if id == entry_id => esm_exports = names,
+                    Ok(_) => {}
+                    Err(message) => diagnostics.push(
+                        Diagnostic::error(message)
+                            .with_code("WAKE0305")
+                            .with_path(path_to_slash(&rec.path)),
+                    ),
+                }
+            }
+        }
         // Single-package minify can omit the ESM marker. A split runtime needs it for ESM/CJS
         // interop; this final-layout fact is intentionally downstream of optimization.
         let no_esmodule = self.minify && chunk_graph.is_none();
@@ -3684,7 +3746,7 @@ impl IncrementalBundler {
 
         let mut output = match &chunk_graph {
             None => {
-                let bundle = emit(
+                let mut bundle = emit(
                     &bodies,
                     &final_edges,
                     entry_id,
@@ -3702,6 +3764,9 @@ impl IncrementalBundler {
                     self.federation_entry_export_build_scoped,
                     want_map.then_some(&mut body_placements),
                 );
+                if self.module_format == ModuleFormat::Esm {
+                    crate::esm_bundle::append_exports(&mut bundle, &esm_exports);
+                }
                 let mut o =
                     crate::single_chunk(bundle, live_ids.len(), diagnostics, live_ids.clone());
                 if let Some(name) = self
@@ -7344,6 +7409,9 @@ fn emit(
         final_modules.sort_by_key(|(id, _)| *id);
 
         let mut out = String::new();
+        if module_format == ModuleFormat::Esm {
+            out.push_str("const __wake_esm_entry__ = ");
+        }
 
         // Runtime capabilities are part of each byte-identical typed body contract. A concat body
         // may absorb several source modules, so consume all live metadata rather than attempting
@@ -7357,14 +7425,16 @@ fn emit(
         // 取之得 `undefined`。非 ESM 的 block fact 会让它保留独立 factory 所有权；简化
         // interop 会让 `import pkg from 'cjs-pkg'` 直接拿到 undefined。
         // async 变体：async 模块的包装器返回 Promise → 缓存并返回它，导入方 `await` 得到最终 exports。
-        out.push_str(match async_ids.is_empty() {
+        out.push_str(if module_format == ModuleFormat::Esm {
+            "(function(g){var c={};function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(void 0,m,m.exports,r);return m.exports}"
+        } else { match async_ids.is_empty() {
             true => {
                 "(function(g){var c={};function r(i){var x=c[i];if(x)return x.exports;var m={exports:{}};c[i]=m;var f=t[i];f&&f.call(m.exports,m,m.exports,r);return m.exports}"
             }
             false => {
                 "(function(g){var c={};function r(i){var x=c[i];if(x)return x.p||x.exports;var m={exports:{}};c[i]=m;var f=t[i],p=f&&f.call(m.exports,m,m.exports,r);if(p&&typeof p.then==='function')return m.p=p.then(function(){return m.exports});return m.exports}"
             }
-        });
+        }});
 
         append_typed_runtime_services(&mut out, "r", "g", &runtime_capabilities, true, false);
         if federation_entry_export_build_scoped
@@ -7432,6 +7502,8 @@ fn emit(
                 true,
             );
             out.push_str("return e;})(typeof globalThis!='undefined'?globalThis:this);");
+        } else if module_format == ModuleFormat::Esm {
+            out.push_str("return e;})(typeof globalThis!='undefined'?globalThis:this);");
         } else if module_format == ModuleFormat::CommonJs {
             out.push_str(
                 "module.exports=e;return e;})(typeof globalThis!='undefined'?globalThis:this);",
@@ -7448,7 +7520,12 @@ fn emit(
             .collect();
 
         let mut out = String::new();
-        out.push_str(if async_ids.is_empty() {
+        if module_format == ModuleFormat::Esm {
+            out.push_str("const __wake_esm_entry__ = ");
+        }
+        out.push_str(if module_format == ModuleFormat::Esm {
+            crate::esm_bundle::PRELUDE
+        } else if async_ids.is_empty() {
             PRELUDE
         } else {
             PRELUDE_ASYNC
@@ -7540,7 +7617,9 @@ fn emit(
                 "return __wake_entry__;\n})(typeof globalThis !== \"undefined\" ? globalThis : this);\n",
             );
         } else {
-            out.push_str(if module_format == ModuleFormat::CommonJs {
+            out.push_str(if module_format == ModuleFormat::Esm {
+                "return __wake_entry__;\n})(typeof globalThis !== \"undefined\" ? globalThis : this);\n"
+            } else if module_format == ModuleFormat::CommonJs {
                 POSTLUDE_COMMONJS
             } else {
                 POSTLUDE

@@ -15,6 +15,7 @@ use wake_ecma_codegen::ModuleRequestKind;
 
 mod chunk;
 mod concat;
+mod esm_bundle;
 mod generation;
 mod incremental;
 pub mod library;
@@ -44,6 +45,8 @@ pub enum ModuleFormat {
     #[default]
     Iife,
     CommonJs,
+    /// Synchronous native exports whose immutable entry bindings are proven from source.
+    Esm,
 }
 
 /// 把宿主或外来平台路径转换成产物使用的正斜杠形式，并移除 Windows verbatim 前缀。

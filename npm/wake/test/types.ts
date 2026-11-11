@@ -33,6 +33,11 @@ import * as wakeContract from '@crab-dev/wake'
 void build({ define: { __EDITOR_TYPES__: JSON.stringify({}) } })
 void createBuildContext({ define: { __BUILD_ID__: '"dev"' } })
 void bundle({ define: { __FEATURE__: 'true' } })
+void bundle({ format: 'esm', banner: '// generated', footer: '// end' })
+// @ts-expect-error Bundle affixes are JavaScript text.
+void bundle({ banner: { js: '// generated' } })
+// @ts-expect-error Unimplemented module formats must not cross the public contract.
+void bundle({ format: 'umd' })
 void startDevServer({ define: { __PORT__: '8080' } })
 // @ts-expect-error Defines contain JavaScript expression source strings.
 void build({ define: { __FEATURE__: true } })

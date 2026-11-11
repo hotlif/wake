@@ -68,6 +68,7 @@
 - [ADR 0076: 开发与生产共享 HTML 模板生成](0076-shared-html-template-generation.md) — `accepted`
 - [ADR 0077: 原生开发代理流与升级连接](0077-development-proxy-streams.md) — `accepted`
 - [ADR 0078: 原生 Worker 与静态资源 URL](0078-native-worker-resource-urls.md) — `accepted`
+- [ADR 0079: 同步 ESM 库输出与源码映射组合](0079-synchronous-esm-bundle-and-affixes.md) — `accepted`
 
 ### css-editor
 

@@ -457,10 +457,14 @@ export class TestContext extends EventEmitter {
 }
 
 export type BundlePlatform = 'browser' | 'node'
-export type BundleFormat = 'iife' | 'cjs'
+/** ESM accepts only synchronous graphs without externals and direct immutable entry exports. */
+export type BundleFormat = 'iife' | 'cjs' | 'esm'
 export type NodeTarget = `node${number}` | `node${number}.${number}`
 
 export interface BundleOptions extends ProjectOptions {
+  /** Verbatim JavaScript on separate lines before/after output. Source maps account for banner lines. */
+  banner?: string
+  footer?: string
   /** JavaScript expression strings; override matching TOML defines. import.meta.hot is reserved. */
   define?: Record<string, string>
   entry?: string

@@ -126,6 +126,12 @@ enum Command {
         /// Bare package supplied by the runtime; may be repeated.
         #[arg(long)]
         external: Vec<String>,
+        /// Verbatim JavaScript before the generated bundle.
+        #[arg(long, default_value = "")]
+        banner: String,
+        /// Verbatim JavaScript after the generated bundle.
+        #[arg(long, default_value = "")]
+        footer: String,
         /// Minify the bundle.
         #[arg(long)]
         minify: bool,
@@ -459,6 +465,7 @@ enum BundlePlatformArg {
 enum BundleFormatArg {
     Iife,
     Cjs,
+    Esm,
 }
 
 impl From<DocsModeArg> for wake_app::DocsMode {
@@ -642,6 +649,8 @@ fn main() -> ExitCode {
             format,
             target,
             external,
+            banner,
+            footer,
             minify,
             sourcemap,
             cache,
@@ -655,6 +664,8 @@ fn main() -> ExitCode {
                     format,
                     target,
                     external,
+                    banner,
+                    footer,
                     minify,
                     sourcemap,
                     cache,
@@ -1481,6 +1492,8 @@ struct BundleCommandOptions {
     format: Option<BundleFormatArg>,
     target: Option<String>,
     external: Vec<String>,
+    banner: String,
+    footer: String,
     minify: bool,
     sourcemap: bool,
     cache: bool,
@@ -1496,6 +1509,7 @@ fn cmd_bundle(options: BundleCommandOptions, ui: Ui) -> Result<(), ExitCode> {
     let format = options.format.map(|format| match format {
         BundleFormatArg::Iife => wake_app::ModuleFormat::Iife,
         BundleFormatArg::Cjs => wake_app::ModuleFormat::CommonJs,
+        BundleFormatArg::Esm => wake_app::ModuleFormat::Esm,
     });
     let project = wake_app::ProjectOptions {
         cwd: std::env::current_dir().ok(),
@@ -1511,6 +1525,8 @@ fn cmd_bundle(options: BundleCommandOptions, ui: Ui) -> Result<(), ExitCode> {
             format,
             target: options.target,
             external: options.external,
+            banner: options.banner,
+            footer: options.footer,
             minify: options.minify,
             source_map: options.sourcemap,
             cache: options.cache,
@@ -3227,6 +3243,36 @@ fn cmd_tokenize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_cli_accepts_esm_and_verbatim_affixes() {
+        let parsed = Cli::try_parse_from([
+            "wake",
+            "bundle",
+            "entry.ts",
+            "--outfile",
+            "plugin.mjs",
+            "--format",
+            "esm",
+            "--banner",
+            "// before\n",
+            "--footer",
+            "// after",
+        ])
+        .unwrap();
+        let Command::Bundle {
+            format,
+            banner,
+            footer,
+            ..
+        } = parsed.command
+        else {
+            panic!("bundle command")
+        };
+        assert!(matches!(format, Some(BundleFormatArg::Esm)));
+        assert_eq!(banner, "// before\n");
+        assert_eq!(footer, "// after");
+    }
 
     fn watch_plan(
         revision: u64,

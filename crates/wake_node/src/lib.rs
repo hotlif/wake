@@ -1154,6 +1154,8 @@ struct RawBundleOptions {
     format: Option<String>,
     target: Option<String>,
     external: Vec<String>,
+    banner: String,
+    footer: String,
     minify: bool,
     source_map: bool,
     cache: bool,
@@ -1517,6 +1519,7 @@ impl RawBundleOptions {
             None => None,
             Some("iife") => Some(wake_app::ModuleFormat::Iife),
             Some("cjs") => Some(wake_app::ModuleFormat::CommonJs),
+            Some("esm") => Some(wake_app::ModuleFormat::Esm),
             Some(value) => {
                 return Err(WakeError::new(
                     "WAKE_CONFIG",
@@ -1536,6 +1539,8 @@ impl RawBundleOptions {
             format,
             target: self.target,
             external: self.external,
+            banner: self.banner,
+            footer: self.footer,
             minify: self.minify,
             source_map: self.source_map,
             cache: self.cache,
@@ -2507,6 +2512,16 @@ mod tests {
             assert_eq!(node_output_file_kind(kind), expected);
             assert_eq!(kind.as_str(), expected);
         }
+    }
+
+    #[test]
+    fn bundle_esm_and_affixes_cross_the_node_contract() {
+        let options = RawBundleOptions::parse(Some(
+            r#"{"format":"esm","banner":"globalThis.before = true;","footer":"globalThis.after = true;"}"#.to_string(),
+        )).unwrap().into_app().unwrap();
+        assert_eq!(format!("{:?}", options.format), "Some(Esm)");
+        assert_eq!(options.banner, "globalThis.before = true;");
+        assert_eq!(options.footer, "globalThis.after = true;");
     }
 
     #[test]

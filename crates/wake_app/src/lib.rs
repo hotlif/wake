@@ -332,6 +332,9 @@ pub struct BundleOptions {
     pub format: Option<ModuleFormat>,
     pub target: Option<String>,
     pub external: Vec<String>,
+    /// Verbatim JavaScript inserted on separate lines before/after the generated bundle.
+    pub banner: String,
+    pub footer: String,
     pub minify: bool,
     pub source_map: bool,
     pub cache: bool,
@@ -384,6 +387,8 @@ struct ResolvedBundleOptions {
     format: ModuleFormat,
     target: Option<String>,
     external: Vec<String>,
+    banner: String,
+    footer: String,
     minify: bool,
     source_map: bool,
     cache: bool,
@@ -1986,11 +1991,12 @@ fn resolve_bundle_options(options: BundleOptions) -> Result<ResolvedBundleOption
         (platform, format),
         (BuildPlatform::Browser, ModuleFormat::Iife)
             | (BuildPlatform::Node, ModuleFormat::CommonJs)
+            | (_, ModuleFormat::Esm)
     );
     if !valid_pair {
         return Err(WakeError::new(
             "WAKE_CONFIG",
-            "supported bundle combinations are browser+iife and node+cjs",
+            "supported bundle combinations are browser+iife, node+cjs, browser+esm and node+esm",
         ));
     }
     if platform == BuildPlatform::Browser && options.target.is_some() {
@@ -2017,6 +2023,8 @@ fn resolve_bundle_options(options: BundleOptions) -> Result<ResolvedBundleOption
         target: (platform == BuildPlatform::Node)
             .then(|| options.target.unwrap_or_else(|| "node20".to_string())),
         external: options.external,
+        banner: options.banner,
+        footer: options.footer,
         minify: options.minify,
         source_map: options.source_map,
         cache: options.cache,
@@ -3587,6 +3595,27 @@ fn finish_bundle(
         .as_deref()
         .map(|outfile| absolute_from(&prepared.root, outfile));
     let mut source_map = output.entry().source_map.clone();
+    if !options.banner.is_empty()
+        && let Some(map) = &source_map
+    {
+        let mut value: serde_json::Value = serde_json::from_str(map)
+            .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))?;
+        let mappings = value["mappings"]
+            .as_str()
+            .ok_or_else(|| WakeError::new("WAKE_INTERNAL", "bundle source map has no mappings"))?;
+        // CRLF is one generated line; lone CR and Unicode line separators also terminate JS lines.
+        let prefix = format!("{}\n", options.banner);
+        let lines = prefix
+            .replace("\r\n", "\n")
+            .chars()
+            .filter(|c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}'))
+            .count();
+        value["mappings"] = serde_json::Value::String(format!("{}{mappings}", ";".repeat(lines)));
+        source_map = Some(
+            serde_json::to_string(&value)
+                .map_err(|error| WakeError::new("WAKE_INTERNAL", error.to_string()))?,
+        );
+    }
     if let (Some(map), Some(output_path)) = (&source_map, &output_file)
         && let Some(file_name) = output_path.file_name().and_then(|name| name.to_str())
     {
@@ -3596,7 +3625,20 @@ fn finish_bundle(
         .as_ref()
         .filter(|_| source_map.is_some())
         .map(|path| append_path_suffix(path, ".map"));
-    let mut code = output.bundle.clone();
+    let mut code = String::new();
+    if !options.banner.is_empty() {
+        code.push_str(&options.banner);
+        code.push('\n');
+    }
+    code.push_str(&output.bundle);
+    // Affixes and the sourceMappingURL directive always start on their own line.
+    if (!options.footer.is_empty() || source_map_file.is_some()) && !code.ends_with('\n') {
+        code.push('\n');
+    }
+    if !options.footer.is_empty() {
+        code.push_str(&options.footer);
+        code.push('\n');
+    }
     if let Some(map_path) = &source_map_file
         && let Some(map_name) = map_path.file_name().and_then(|name| name.to_str())
     {
@@ -12444,6 +12486,145 @@ generate_source = true
         assert_eq!(location.line, 3);
         assert_eq!(location.line_text, "const broken = ;");
         assert!(location.column > 1);
+    }
+
+    #[test]
+    fn bundle_esm_executes_native_exports_with_affixes_and_maps() {
+        let fixture = Fixture::new("bundle-esm-affixes");
+        fixture.write("src/helper.js", "export const answer = 42;\n");
+        fixture.write("src/index.js", "import { answer } from './helper.js';\nexport const value = answer;\nexport const top = this;\nexport function activate() { return value; }\nexport class Plugin { value() { return answer; } }\nexport default { activate };\n");
+        for minify in [false, true] {
+            for pass in 0..2 {
+                let result = bundle(
+                    BundleOptions {
+                        project: fixture.project(),
+                        entry: Some("src/index.js".into()),
+                        outfile: Some("dist/plugin.mjs".into()),
+                        platform: Some(BuildPlatform::Node),
+                        format: Some(ModuleFormat::Esm),
+                        minify,
+                        source_map: true,
+                        cache: true,
+                        banner: "globalThis.before = 1;\n// banner".into(),
+                        footer: "globalThis.after = globalThis.before + 1;".into(),
+                        ..BundleOptions::default()
+                    },
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+                let child = Command::new("node").current_dir(&fixture.0).args([
+                "--input-type=module", "-e", "const m = await import('./dist/plugin.mjs'); if (m.top !== undefined || m.activate() !== 42 || m.value !== 42 || m.default.activate() !== 42 || new m.Plugin().value() !== 42 || globalThis.after !== 2 || '__wake_entry__' in globalThis) throw Error('invalid ESM exports'); console.log('ok');"
+            ]).output().unwrap();
+                assert!(
+                    child.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&child.stderr)
+                );
+                assert_eq!(String::from_utf8_lossy(&child.stdout).trim(), "ok");
+                assert_eq!(
+                    std::fs::read_to_string(fixture.0.join("dist/plugin.mjs")).unwrap(),
+                    result.code
+                );
+                let map: serde_json::Value =
+                    serde_json::from_str(result.source_map.as_ref().unwrap()).unwrap();
+                assert!(map["mappings"].as_str().unwrap().starts_with(";;"));
+                if pass == 1 {
+                    assert!(
+                        result.cached_module_count > 0,
+                        "ESM persistent body cache was not exercised"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_affixes_preserve_original_exception_locations() {
+        let fixture = Fixture::new("bundle-affix-map");
+        fixture.write("src/index.js", "export function fail() {\n  const reason = 'mapped failure';\n  throw new Error(reason);\n}\nfail();\n");
+        for format in [ModuleFormat::CommonJs, ModuleFormat::Esm] {
+            for (minify, banner) in [
+                (false, "// first line\n// second line"),
+                (true, "// first line\r\n// second line"),
+                (true, "// trailing CR\r"),
+                (true, "// unicode\u{2028}// second\u{2029}"),
+            ] {
+                let file = if format == ModuleFormat::Esm {
+                    "dist/fail.mjs"
+                } else {
+                    "dist/fail.cjs"
+                };
+                bundle(
+                    BundleOptions {
+                        project: fixture.project(),
+                        entry: Some("src/index.js".into()),
+                        outfile: Some(file.into()),
+                        platform: Some(BuildPlatform::Node),
+                        format: Some(format),
+                        minify,
+                        source_map: true,
+                        banner: banner.into(),
+                        footer: "// footer".into(),
+                        ..BundleOptions::default()
+                    },
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+                let child = Command::new("node")
+                    .current_dir(&fixture.0)
+                    .args(["--enable-source-maps", file])
+                    .output()
+                    .unwrap();
+                let error = String::from_utf8_lossy(&child.stderr).replace('\\', "/");
+                assert!(!child.status.success());
+                assert!(
+                    error.contains("src/index.js:3:"),
+                    "{format:?} minify={minify}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_esm_rejects_unproven_semantics() {
+        let fixture = Fixture::new("bundle-esm-reject");
+        for source in [
+            "export let value = 1; value++;",
+            "export function value() {} value = () => 1;",
+            "export function value() { value = () => 1; }",
+            "const value = 1; export { value };",
+            "export * from './helper.js';",
+            "export const value = require('./helper.js');",
+            "import fs from 'node:fs'; export default fs;",
+            "export const value = await Promise.resolve(1);",
+            "export const value = import.meta.url;",
+            "export function value() { return eval('value = 1'); }",
+            "const eval = globalThis.eval; export function value() { return eval('value = 1'); }",
+            "module.exports = 1;",
+            "export const value = arguments;",
+            "export const value = __dirname;",
+        ] {
+            fixture.write("src/index.js", source);
+            fixture.write("src/helper.js", "export const helper = 1;");
+            let error = bundle(
+                BundleOptions {
+                    project: fixture.project(),
+                    entry: Some("src/index.js".into()),
+                    platform: Some(BuildPlatform::Node),
+                    format: Some(ModuleFormat::Esm),
+                    ..BundleOptions::default()
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_deref() == Some("WAKE0305")),
+                "{source}: {error:?}"
+            );
+        }
     }
 
     #[test]

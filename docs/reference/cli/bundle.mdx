@@ -16,9 +16,9 @@ status = "stable"
 
 ```text
 wake bundle <ENTRY> --outfile <FILE>
-  [--platform browser|node] [--format iife|cjs]
+  [--platform browser|node] [--format iife|cjs|esm]
   [--target node20] [--external PACKAGE]...
-  [--minify] [--sourcemap] [--cache] [--config FILE]
+  [--banner TEXT] [--footer TEXT] [--minify] [--sourcemap] [--cache] [--config FILE]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -26,7 +26,8 @@ wake bundle <ENTRY> --outfile <FILE>
 | `ENTRY` | 必填 | TypeScript 或 JavaScript 入口 |
 | `--outfile` | 必填 | 精确输出文件；自动创建父目录且不清理同目录文件或未证明归属的旧 map |
 | `--platform` | `browser` | 目标宿主；`node` 自动外置 Node 内置模块 |
-| `--format` | 随平台 | Browser 使用 `iife`，Node 使用 `cjs` |
+| `--format` | 随平台 | Browser 默认 `iife`，Node 默认 `cjs`；两者可显式使用 `esm` |
+| `--banner` / `--footer` | 空 | 原样添加于最终代码前后，各自与生成代码换行分隔；Node API 使用 `banner` / `footer` |
 | `--target` | Node 为 `node20` | Node 语法转换目标，例如 `node20.0` |
 | `--external` | 无 | 宿主提供的裸 npm 包；可重复，且同时匹配包的子路径 |
 | `--minify` | 关闭 | 压缩单文件产物 |
@@ -37,9 +38,17 @@ wake bundle <ENTRY> --outfile <FILE>
 持久缓存不保存源码快照；新进程读取并哈希真实输入后，才按内容身份复用分析与生成结果。缓存
 缺失或版本不兼容是静默 miss，损坏、I/O 或提交冲突以非致命 `WAKE_CACHE` warning 返回。
 
-首版只接受 `browser+iife` 与 `node+cjs`。`--minify` 和 `--sourcemap` 可以同时启用；生成映射不会
+支持 `browser+iife`、`node+cjs` 以及两种平台的 `esm`。`--minify` 和 `--sourcemap` 可以同时启用；生成映射不会
 选择另一套未压缩代码。CommonJS 同步入口图包含顶层 `await` 时构建失败，但动态导入后的异步模块
 可以使用顶层 `await`。
+
+ESM 单文件首版只支持同步、无 external 的模块图，以及入口直接导出的 const 标识符、未被
+赋值的函数/类和 default 表达式。可变绑定、解构导出、导出列表、再导出、CommonJS 全局、
+require、eval、import.meta 和顶层 await 会报告 `WAKE0305`，不会静默把 live binding 变为
+快照。Node 中请使用 `.mjs` outfile 或将所在 package 标为 `type: "module"`。
+
+banner/footer 不经过编译，调用方负责其语法和语义。banner 的行数自动计入 source map；
+footer 与附加代码本身不映射到输入源码。选项变化复用模块编译缓存并重新组合最终 JS/map。
 
 设置 `--sourcemap` 时，JavaScript 与 `<outfile>.map` 会先在各自目标目录完整写入并同步，再作为
 一个集合提交；任一目标被锁定或替换失败都会恢复上一组字节。Wake 会拒绝把任一候选写到本次

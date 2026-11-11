@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-08-17
+- Amended by: [ADR 0079](0079-synchronous-esm-bundle-and-affixes.md)
 
 ## Context
 
