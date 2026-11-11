@@ -34,6 +34,11 @@ declare module "*.svg" {
 
 把 `robots.txt`、固定名称的下载文件或站点图标放到 `public`。代码使用它们的公开 URL；文件内容中的路径不会因为它位于 public 就自动获得模块导入的重写语义。
 
+应用生产构建将 `public/` 的普通文件按原相对路径纳入同一次产物发布，并在返回的文件清单中列为
+`asset`；删除的文件在下一次成功构建时清理。根级 `public/index.html` 不作为静态首页复制，首页始终
+由选定 HTML 模板生成。其他文件与生成产物重名、包含符号链接或 Windows reparse point 时构建失败，
+上一次成功产物保持不变。输出目录不得位于 `public/` 输入目录内。
+
 ```html title="链接固定公开文件"
 <a href="/guide.pdf">下载指南</a>
 ```

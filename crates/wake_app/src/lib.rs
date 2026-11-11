@@ -3447,18 +3447,106 @@ fn finish_output(
             &prepared.root,
             prepared.config.html.template.as_deref().map(Path::new),
         );
-        let (_, target) = publish_staged_output(
+        let public = prepared.root.join("public");
+        let (public_files, target) = publish_staged_output(
             &prepared.root,
-            &[prepared.entry.as_path(), template.as_path()],
+            &[
+                prepared.entry.as_path(),
+                template.as_path(),
+                public.as_path(),
+            ],
             &prepared.outdir,
             OutputProduct::Application,
             cancellation,
-            |stage| write_application_output(prepared, &application, stage),
+            |stage| {
+                write_application_output(prepared, &application, stage)?;
+                stage_public_assets(&public, stage)
+            },
         )?;
+        application.result.files.extend(public_files);
         application.result.output_dir = Some(target.to_string_lossy().into_owned());
     }
     application.result.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(application.result)
+}
+
+/// Copy fixed-name application assets inside the existing publication transaction.
+fn stage_public_assets(public: &Path, stage: &Path) -> Result<Vec<OutputFile>, WakeError> {
+    fn visit(
+        base: &Path,
+        source: &Path,
+        stage: &Path,
+        files: &mut Vec<OutputFile>,
+    ) -> Result<(), WakeError> {
+        let metadata = std::fs::symlink_metadata(source)
+            .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(source))?;
+        if metadata_is_link_or_reparse_point(&metadata) {
+            return Err(WakeError::new(
+                "WAKE_IO",
+                "public assets cannot contain links or reparse points",
+            )
+            .at(source));
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(source)
+                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(source))?
+            {
+                let entry = entry
+                    .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(source))?;
+                visit(base, &entry.path(), stage, files)?;
+            }
+        } else if metadata.is_file() {
+            let relative = source.strip_prefix(base).expect("public descendant");
+            if relative == Path::new("index.html") {
+                return Ok(());
+            }
+            if relative == Path::new(OUTPUT_OWNERSHIP_FILE)
+                || relative == Path::new(".wake-output.lock")
+            {
+                return Err(
+                    WakeError::new("WAKE_IO", "public asset uses a reserved output name")
+                        .at(source),
+                );
+            }
+            let target = output_file_path(stage, relative)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(parent))?;
+            }
+            let mut destination = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|error| {
+                    WakeError::new(
+                        "WAKE_IO",
+                        format!("public asset collision or write failure: {error}"),
+                    )
+                    .at(&target)
+                })?;
+            let mut input = std::fs::File::open(source)
+                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(source))?;
+            let bytes = std::io::copy(&mut input, &mut destination)
+                .map_err(|error| WakeError::new("WAKE_IO", error.to_string()).at(&target))?;
+            files.push(OutputFile {
+                path: relative.to_string_lossy().replace('\\', "/"),
+                kind: OutputFileKind::Asset,
+                bytes: bytes as usize,
+            });
+        } else {
+            return Err(WakeError::new("WAKE_IO", "unsupported public asset type").at(source));
+        }
+        Ok(())
+    }
+    match std::fs::symlink_metadata(public) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(WakeError::new("WAKE_IO", error.to_string()).at(public)),
+        Ok(_) => {}
+    }
+    let mut files = Vec::new();
+    visit(public, public, stage, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
 }
 
 fn finish_bundle(
@@ -12762,6 +12850,43 @@ generate_source = true
                     .starts_with(".wake-bundle-"))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn application_public_assets_publish_and_rollback_with_generation() {
+        let fixture = Fixture::new("application-public-assets");
+        fixture.write("public/monaco-workers/0.js", "self.onmessage = () => {};\n");
+        fixture.write("public/robots.txt", "User-agent: *\n");
+        let options = BuildOptions {
+            project: fixture.project(),
+            outdir: Some(fixture.0.join("dist")),
+            ..BuildOptions::default()
+        };
+        let result = build(options.clone(), &CancellationToken::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("dist/robots.txt")).unwrap(),
+            "User-agent: *\n"
+        );
+        assert!(
+            result.files.iter().any(
+                |file| file.path == "monaco-workers/0.js" && file.kind == OutputFileKind::Asset
+            )
+        );
+        std::fs::remove_file(fixture.0.join("public/robots.txt")).unwrap();
+        build(options.clone(), &CancellationToken::default()).unwrap();
+        assert!(!fixture.0.join("dist/robots.txt").exists());
+        let previous = std::fs::read(fixture.0.join("dist/index.html")).unwrap();
+        let entry = result
+            .files
+            .iter()
+            .find(|file| file.kind == OutputFileKind::Chunk)
+            .unwrap();
+        fixture.write(&format!("public/{}", entry.path), "collision");
+        assert!(build(options, &CancellationToken::default()).is_err());
+        assert_eq!(
+            std::fs::read(fixture.0.join("dist/index.html")).unwrap(),
+            previous
         );
     }
 
