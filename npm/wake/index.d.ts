@@ -210,6 +210,8 @@ export interface FederationDisabledOptions {
 export type FederationOptions = FederationEnabledOptions | FederationDisabledOptions
 
 export interface BuildOptions extends ProjectOptions {
+  /** JavaScript expression strings; override matching TOML defines. import.meta.hot is reserved. */
+  define?: Record<string, string>
   entry?: string
   outdir?: string
   cache?: boolean
@@ -459,6 +461,8 @@ export type BundleFormat = 'iife' | 'cjs'
 export type NodeTarget = `node${number}` | `node${number}.${number}`
 
 export interface BundleOptions extends ProjectOptions {
+  /** JavaScript expression strings; override matching TOML defines. import.meta.hot is reserved. */
+  define?: Record<string, string>
   entry?: string
   outfile?: string
   platform?: BundlePlatform
@@ -623,6 +627,8 @@ export interface DocsBuildResult extends BuildResult {
 }
 
 export interface DevServerOptions extends ProjectOptions {
+  /** JavaScript expression strings; override matching TOML defines. import.meta.hot is reserved. */
+  define?: Record<string, string>
   entry?: string
   host?: string
   /** An integer from 0 through 65,535. */

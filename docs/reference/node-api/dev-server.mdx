@@ -65,3 +65,8 @@ Broker，开发入口再注册宿主 provider、冻结 share context，随后才
 `unref()` 允许 Node 在没有其他任务时退出；`close()` 返回服务真正关闭后的 Promise。
 
 测试必须在 `finally` 中关闭服务器，避免端口和文件监听泄漏。
+
+`build()`、`createBuildContext()`、`bundle()` 和 `startDevServer()` 接受 `define: Record<string, string>`。
+每个值是 JavaScript 表达式源码，例如 `{ __EDITOR_TYPES__: JSON.stringify(types) }`。
+同名 API 项覆盖 TOML `[define]`，未覆盖项保留；开发配置重载继续使用该次启动的 API 覆盖。
+`import.meta.hot` 为保留项，API 与 TOML 都不能覆盖。无需为动态生成的常量写临时 TOML 文件。

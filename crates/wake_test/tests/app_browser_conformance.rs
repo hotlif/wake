@@ -140,6 +140,7 @@ struct RunningServer(DevServer);
 impl RunningServer {
     fn start(root: &Path, port: u16) -> Self {
         let server = start_dev_server(DevServerOptions {
+            define: Default::default(),
             project: ProjectOptions {
                 cwd: Some(root.to_path_buf()),
                 config_path: None,

@@ -293,6 +293,8 @@ pub struct ProjectOptions {
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
+    /// JavaScript expression overrides, merged over TOML defines.
+    pub define: std::collections::BTreeMap<String, String>,
     pub project: ProjectOptions,
     pub entry: Option<PathBuf>,
     pub outdir: Option<PathBuf>,
@@ -306,6 +308,7 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
+            define: std::collections::BTreeMap::new(),
             project: ProjectOptions::default(),
             entry: None,
             outdir: None,
@@ -320,6 +323,8 @@ impl Default for BuildOptions {
 /// 单文件 library bundle 选项。与 Web application build 明确分离。
 #[derive(Debug, Clone, Default)]
 pub struct BundleOptions {
+    /// JavaScript expression overrides, merged over TOML defines.
+    pub define: std::collections::BTreeMap<String, String>,
     pub project: ProjectOptions,
     pub entry: Option<PathBuf>,
     pub outfile: Option<PathBuf>,
@@ -370,6 +375,8 @@ pub struct BundleResult {
 
 #[derive(Debug, Clone)]
 struct ResolvedBundleOptions {
+    /// JavaScript expression overrides, merged over TOML defines.
+    pub define: std::collections::BTreeMap<String, String>,
     project: ProjectOptions,
     entry: Option<PathBuf>,
     outfile: Option<PathBuf>,
@@ -1900,6 +1907,7 @@ fn execute_bundle(
     cancellation.check()?;
     let phase_started = Instant::now();
     let prepared = prepare_build(&BuildOptions {
+        define: options.define.clone(),
         project: options.project.clone(),
         entry: options.entry.clone(),
         write: false,
@@ -2000,6 +2008,7 @@ fn resolve_bundle_options(options: BundleOptions) -> Result<ResolvedBundleOption
         }
     }
     Ok(ResolvedBundleOptions {
+        define: options.define,
         project: options.project,
         entry: options.entry,
         outfile: options.outfile,
@@ -2089,6 +2098,13 @@ fn probe_build_candidate_once(options: &BuildOptions) -> Result<PreparedBuildPro
     let config_before = control_file_fingerprint(&config_path);
     let mut config = wake_config::load(&config_dir)
         .map_err(|error| WakeError::new("WAKE_CONFIG", error.to_string()).at(&config_path))?;
+    if options.define.contains_key("import.meta.hot") {
+        return Err(WakeError::new(
+            "WAKE_CONFIG",
+            "import.meta.hot is reserved and cannot be overridden",
+        ));
+    }
+    config.define.extend(options.define.clone());
     if let Some(federation) = &options.federation {
         config.federation = federation
             .clone()
@@ -5366,6 +5382,8 @@ fn execute_context_session_build(
 }
 #[derive(Debug, Clone, Default)]
 pub struct DevServerOptions {
+    /// JavaScript expression overrides, merged over TOML defines.
+    pub define: std::collections::BTreeMap<String, String>,
     pub project: ProjectOptions,
     pub entry: Option<PathBuf>,
     pub host: Option<String>,
@@ -5579,6 +5597,7 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
     });
     let dev_options = options.clone();
     let build_options = BuildOptions {
+        define: options.define.clone(),
         project: options.project.clone(),
         entry: options.entry.clone(),
         write: false,
@@ -12854,6 +12873,64 @@ generate_source = true
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn programmatic_defines_override_config_in_build_and_bundle() {
+        let fixture = Fixture::new("programmatic-define");
+        fixture.write(wake_config::CONFIG_FILE, "[html]\nentry = \"src/index.js\"\n[define]\n__VALUE__ = '\"CONFIG\"'\n__OTHER__ = '\"KEEP\"'\n");
+        fixture.write(
+            "src/index.js",
+            "globalThis.values = [__VALUE__, __OTHER__];",
+        );
+        let define = std::collections::BTreeMap::from([("__VALUE__".into(), "\"API\"".into())]);
+        let result = build(
+            BuildOptions {
+                project: fixture.project(),
+                entry: Some("src/index.js".into()),
+                define: define.clone(),
+                write: false,
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let code = result.code.unwrap();
+        assert!(
+            code.contains("API") && code.contains("KEEP") && !code.contains("CONFIG"),
+            "{code}"
+        );
+        let result = bundle(
+            BundleOptions {
+                project: fixture.project(),
+                entry: Some("src/index.js".into()),
+                define,
+                ..BundleOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            result.code.contains("API")
+                && result.code.contains("KEEP")
+                && !result.code.contains("CONFIG"),
+            "{}",
+            result.code
+        );
+        let error = build(
+            BuildOptions {
+                project: fixture.project(),
+                define: std::collections::BTreeMap::from([(
+                    "import.meta.hot".into(),
+                    "true".into(),
+                )]),
+                write: false,
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "WAKE_CONFIG");
     }
 
     #[test]

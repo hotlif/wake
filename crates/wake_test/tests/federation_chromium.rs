@@ -358,6 +358,7 @@ fn write_shared_package(root: &Path, implementation: &str, execution_counter: &s
 
 fn start(root: &Path, port: u16) -> RunningServer {
     let server = start_dev_server(DevServerOptions {
+        define: Default::default(),
         project: ProjectOptions {
             cwd: Some(root.to_path_buf()),
             config_path: None,

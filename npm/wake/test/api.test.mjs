@@ -1513,6 +1513,45 @@ test('builds, bundles, and serializes context rebuilds', async () => {
   await rm(outputRoot, { recursive: true, force: true })
 })
 
+test('programmatic defines survive build context and dev configuration reloads', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-define-contract-'))
+  let context
+  let server
+  const config = (other) => `[html]\nentry = "entry.js"\n[define]\n__VALUE__ = '\"CONFIG\"'\n__OTHER__ = '\"${other}\"'\n`
+  const options = { cwd, entry: 'entry.js', define: { __VALUE__: '"API"' } }
+  const values = (code) => {
+    const scope = {}
+    runInNewContext(code, scope)
+    return Array.from(scope.values)
+  }
+  try {
+    await writeFile(join(cwd, 'entry.js'), 'globalThis.values = [__VALUE__, __OTHER__];')
+    await writeFile(join(cwd, 'wake.config.toml'), config('FIRST'))
+    const built = await build(options)
+    assert.deepEqual(values(await readFile(join(built.outputDir, 'bundle.js'), 'utf8')), ['API', 'FIRST'])
+    assert.deepEqual(values((await bundle(options)).code), ['API', 'FIRST'])
+    context = await createBuildContext(options)
+    const first = await context.rebuild()
+    assert.deepEqual(values(await readFile(join(first.outputDir, 'bundle.js'), 'utf8')), ['API', 'FIRST'])
+    const reservation = createServer()
+    const port = await listen(reservation)
+    await new Promise((resolve) => reservation.close(resolve))
+    server = await startDevServer({ ...options, port })
+    assert.deepEqual(values(await (await fetch(new URL('bundle.js', server.url))).text()), ['API', 'FIRST'])
+    const rebuilt = onceMatching(server, 'rebuilt', (event) => !event.initial && event.updatedModules > 0)
+    await writeFile(join(cwd, 'wake.config.toml'), config('SECOND'))
+    await rebuilt
+    assert.deepEqual(values(await (await fetch(new URL('bundle.js', server.url))).text()), ['API', 'SECOND'])
+    const second = await context.rebuild()
+    assert.deepEqual(values(await readFile(join(second.outputDir, 'bundle.js'), 'utf8')), ['API', 'SECOND'])
+    await assert.rejects(bundle({ ...options, define: { 'import.meta.hot': 'true' } }), { code: 'WAKE_CONFIG' })
+  } finally {
+    await server?.close()
+    await context?.close()
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 test('writes an executable Node CommonJS bundle to an exact outfile', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'wake-node-bundle-'))
   const outfile = join(cwd, 'dist', 'extension.cjs')

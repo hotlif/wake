@@ -1503,6 +1503,7 @@ fn cmd_bundle(options: BundleCommandOptions, ui: Ui) -> Result<(), ExitCode> {
     };
     match wake_app::bundle(
         wake_app::BundleOptions {
+            define: Default::default(),
             project,
             entry: Some(options.entry),
             outfile: Some(options.outfile),
@@ -1622,6 +1623,7 @@ fn cmd_build(
 ) -> Result<(), ExitCode> {
     ui.header("build");
     let options = wake_app::BuildOptions {
+        define: Default::default(),
         project: wake_app::ProjectOptions {
             cwd: std::env::current_dir().ok(),
             config_path: None,
@@ -1953,6 +1955,7 @@ fn cmd_build_watch(
     let mut dashboard = start_dashboard(mode, &ui, &state)?;
 
     let build_options = wake_app::BuildOptions {
+        define: Default::default(),
         project: wake_app::ProjectOptions {
             cwd: Some(cwd.clone()),
             config_path: None,
@@ -2618,6 +2621,7 @@ fn cmd_dev(
         DashboardState::new("dev", root, "LOCAL", "Live reload · source maps · watching");
     let mut dashboard = start_dashboard(mode, &ui, &state)?;
     let server = match wake_app::start_dev_server(wake_app::DevServerOptions {
+        define: Default::default(),
         project: wake_app::ProjectOptions {
             cwd: Some(root.to_path_buf()),
             config_path: None,
@@ -2658,6 +2662,7 @@ fn cmd_docs_dev(
     let mut dashboard = start_dashboard(ui_mode, &ui, &state)?;
     let server = match wake_app::start_docs_dev_server_with_mode(
         wake_app::DevServerOptions {
+            define: Default::default(),
             project: wake_app::ProjectOptions {
                 cwd: Some(root.to_path_buf()),
                 config_path: None,

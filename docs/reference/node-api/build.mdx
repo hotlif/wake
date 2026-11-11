@@ -90,6 +90,9 @@ CSS Modules 与 Wake CSS-in-JS；同步或异步 closure 中的普通 `.css` 会
 原子写入该文件且不生成 HTML、manifest 或其他 Web 应用产物。`platform: "node"` 会默认
 选择 `format: "cjs"` 和 `target: "node20"`，这些默认值由 Wake 应用层统一决定。
 
+`build()`、`createBuildContext()` 和 `bundle()` 也接受 `define: Record<string, string>`，
+以 JavaScript 表达式字符串覆盖 TOML 中同名定义；详见[开发服务 API 的 define 说明](/reference/node-api/dev-server)。
+
 Node/CommonJS bundle 可指定宿主 external：
 
 ```ts

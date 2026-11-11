@@ -738,13 +738,13 @@ test('Node owns exact closed request and Docs response DTOs', () => {
     return [...block[1].matchAll(/^\s+([a-z_]+):/gm)].map((match) => match[1]).sort()
   }
   const expectedRustFields = new Map([
-    ['RawBuildOptions', ['cache', 'config_path', 'cwd', 'entry', 'federation', 'outdir', 'source_map']],
-    ['RawBundleOptions', ['cache', 'config_path', 'cwd', 'entry', 'external', 'format', 'minify', 'outfile', 'platform', 'source_map', 'target']],
+    ['RawBuildOptions', ['cache', 'config_path', 'cwd', 'define', 'entry', 'federation', 'outdir', 'source_map']],
+    ['RawBundleOptions', ['cache', 'config_path', 'cwd', 'define', 'entry', 'external', 'format', 'minify', 'outfile', 'platform', 'source_map', 'target']],
     ['RawGenerateCssTokenOptions', ['config_path', 'cwd']],
     ['RawGenerateDocgenOptions', ['cwd', 'entry']],
     ['RawLibraryBuildOptions', ['cwd', 'entry']],
     ['RawDocsOptions', ['base_path', 'config_path', 'cwd', 'mode', 'outdir']],
-    ['RawApplicationDevServerOptions', ['config_path', 'cwd', 'entry', 'federation', 'host', 'open', 'port']],
+    ['RawApplicationDevServerOptions', ['config_path', 'cwd', 'define', 'entry', 'federation', 'host', 'open', 'port']],
     ['RawDocsDevServerOptions', ['config_path', 'cwd', 'host', 'mode', 'open', 'port']],
     ['RawTestOptions', [
       'allow_no_tests',
@@ -780,6 +780,7 @@ test('Node owns exact closed request and Docs response DTOs', () => {
       .sort()
   }
   assert.deepEqual(typeFields('DevServerOptions'), [
+    'define',
     'entry',
     'federation',
     'host',

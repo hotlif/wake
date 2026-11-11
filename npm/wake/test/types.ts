@@ -30,6 +30,13 @@ import {
 } from '@crab-dev/wake'
 import * as wakeContract from '@crab-dev/wake'
 
+void build({ define: { __EDITOR_TYPES__: JSON.stringify({}) } })
+void createBuildContext({ define: { __BUILD_ID__: '"dev"' } })
+void bundle({ define: { __FEATURE__: 'true' } })
+void startDevServer({ define: { __PORT__: '8080' } })
+// @ts-expect-error Defines contain JavaScript expression source strings.
+void build({ define: { __FEATURE__: true } })
+
 const docsVisualResult: Promise<TestRunResult> = testDocs({
   themes: ['light', 'dark'], viewports: [{ width: 390, height: 844 }],
   updateSnapshots: false, signal: new AbortController().signal,

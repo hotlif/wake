@@ -945,6 +945,7 @@ impl RawNodeFederationSharedOptions {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawBuildOptions {
+    define: std::collections::BTreeMap<String, String>,
     cwd: Option<String>,
     config_path: Option<String>,
     entry: Option<String>,
@@ -952,6 +953,22 @@ struct RawBuildOptions {
     cache: bool,
     source_map: bool,
     federation: Option<RawNodeFederationOptions>,
+}
+
+#[cfg(test)]
+mod define_option_tests {
+    use super::*;
+    #[test]
+    fn node_define_options_accept_expression_strings_only() {
+        let json = Some(r#"{"define":{"__VALUE__":"42"}}"#.to_owned());
+        assert!(RawBuildOptions::parse(json.clone()).is_ok());
+        assert!(RawBundleOptions::parse(json.clone()).is_ok());
+        assert!(RawApplicationDevServerOptions::parse(json).is_ok());
+        let invalid = Some(r#"{"define":{"__VALUE__":42}}"#.to_owned());
+        assert!(RawBuildOptions::parse(invalid.clone()).is_err());
+        assert!(RawBundleOptions::parse(invalid.clone()).is_err());
+        assert!(RawApplicationDevServerOptions::parse(invalid).is_err());
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -977,6 +994,7 @@ impl RawBuildOptions {
 
     fn into_app(self, write: bool) -> wake_app::BuildOptions {
         wake_app::BuildOptions {
+            define: self.define,
             project: wake_app::ProjectOptions {
                 cwd: self.cwd.map(PathBuf::from),
                 config_path: self.config_path.map(PathBuf::from),
@@ -1127,6 +1145,7 @@ fn parse_test_options(options_json: Option<String>) -> Result<wake_app::TestOpti
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawBundleOptions {
+    define: std::collections::BTreeMap<String, String>,
     cwd: Option<String>,
     config_path: Option<String>,
     entry: Option<String>,
@@ -1506,6 +1525,7 @@ impl RawBundleOptions {
             }
         };
         Ok(wake_app::BundleOptions {
+            define: self.define,
             project: wake_app::ProjectOptions {
                 cwd: self.cwd.map(PathBuf::from),
                 config_path: self.config_path.map(PathBuf::from),
@@ -1978,6 +1998,7 @@ impl Drop for NativeBuildContext {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawApplicationDevServerOptions {
+    define: std::collections::BTreeMap<String, String>,
     cwd: Option<String>,
     config_path: Option<String>,
     entry: Option<String>,
@@ -1994,6 +2015,7 @@ impl RawApplicationDevServerOptions {
 
     fn into_app(self) -> wake_app::DevServerOptions {
         wake_app::DevServerOptions {
+            define: self.define,
             project: wake_app::ProjectOptions {
                 cwd: self.cwd.map(PathBuf::from),
                 config_path: self.config_path.map(PathBuf::from),
@@ -2027,6 +2049,7 @@ impl RawDocsDevServerOptions {
         let mode = self.mode.unwrap_or_default();
         (
             wake_app::DevServerOptions {
+                define: Default::default(),
                 project: wake_app::ProjectOptions {
                     cwd: self.cwd.map(PathBuf::from),
                     config_path: self.config_path.map(PathBuf::from),
