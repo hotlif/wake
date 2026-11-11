@@ -8018,7 +8018,12 @@ mod tests {
         let first = http_get(port, "/bundle.js");
         let first_name = name
             .find(&first)
-            .expect("Worker URL in entry")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Worker URL missing from entry response: {first}; events: {:?}",
+                    events.lock().unwrap()
+                )
+            })
             .as_str()
             .to_owned();
         assert!(http_get(port, &format!("/{first_name}")).contains("first-worker"));
