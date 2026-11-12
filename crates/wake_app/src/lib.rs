@@ -2948,6 +2948,17 @@ fn project_watch_interests_from(
         WatchInterest::all_files_tree(root.join("public")),
         WatchInterest::exact_file(root.join("index.html")),
     ];
+    // Install dependency coverage before building a candidate. Invalid PnP data is reported by
+    // the build; existing exact control interests retain recovery coverage for a repaired graph.
+    let resolution = wake_resolver::ResolutionEnvironment::new(Arc::new(OsFileSystem));
+    if let Ok(watches) = resolution.package_resource_watches(root) {
+        interests.extend(watches.into_iter().map(|watch| match watch {
+            wake_resolver::PackageResourceWatch::Archive(path) => WatchInterest::exact_file(path),
+            wake_resolver::PackageResourceWatch::Directory(path) => {
+                WatchInterest::all_files_tree(path)
+            }
+        }));
+    }
     interests.push(WatchInterest::exact_file(wake_html::template_path(
         root,
         config.html.template.as_deref().map(Path::new),
@@ -12434,6 +12445,124 @@ generate_source = true
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn resource_watch_plan_covers_external_pnp_packages_before_build() {
+        let fixture = Fixture::new("pnp-resource-watch-plan");
+        fixture.write("src/index.js", "import 'dep';");
+        fixture.write(".pnp.cjs", "module.exports = require('./.pnp.data.json');");
+        fixture.write(".pnp.data.json", serde_json::json!({"packageRegistryData":[
+            [null,[[null,{"packageLocation":"./","packageDependencies":[["dep","npm:1"]]}]]],
+            ["dep",[["npm:1",{"packageLocation":"../cache/dep.zip/node_modules/dep/","packageDependencies":[]}]]],
+            ["unplugged",[["npm:1",{"packageLocation":"../cache/unplugged/","packageDependencies":[]}]]]
+        ]}).to_string());
+        let options = BuildOptions {
+            project: fixture.project(),
+            ..BuildOptions::default()
+        };
+        let prepared = prepare_build_candidate(&options).unwrap();
+        let interests = build_context_watch_interests(&prepared, &options);
+        let cache = fixture.0.parent().unwrap().join("cache");
+        for path in [
+            cache.join("dep.zip"),
+            cache.join("unplugged/new-resource.data"),
+        ] {
+            assert!(
+                interests.iter().any(|interest| interest.matches(&path)),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(
+            !interests
+                .iter()
+                .any(|interest| interest.matches(&cache.join("unrelated.zip")))
+        );
+    }
+
+    #[test]
+    fn build_context_pnp_resource_archive_updates_and_recovers() {
+        mod pnp_resource_fixture {
+            include!("../../wake_bundler/tests/fixtures/pnp-resource/fixture.rs");
+        }
+        let fixture = Fixture::new("pnp-resource-archive-watch");
+        fixture.write("app/wake.config.toml", "[html]\nentry = \"src/index.js\"\n");
+        fixture.write("app/src/index.js", "import 'dep';");
+        fixture.write(
+            "app/.pnp.cjs",
+            "module.exports = require('./.pnp.data.json');",
+        );
+        fixture.write("app/.pnp.data.json", serde_json::json!({"packageRegistryData":[
+            [null,[[null,{"packageLocation":"./","packageDependencies":[["dep","npm:1"]]}]]],
+            ["dep",[["npm:1",{"packageLocation":"../cache/dep.zip/node_modules/dep/","packageDependencies":[]}]]]
+        ]}).to_string());
+        fixture.write("cache/dep.zip", pnp_resource_fixture::archive(1));
+        let context = BuildContext::create(BuildOptions {
+            project: ProjectOptions {
+                cwd: Some(fixture.0.join("app")),
+                config_path: None,
+            },
+            write: true,
+            ..BuildOptions::default()
+        })
+        .unwrap();
+        let plan = context.watch_plan();
+        let archive = fixture.0.join("cache/dep.zip");
+        assert!(
+            plan.interests
+                .iter()
+                .any(|interest| interest.matches(&archive))
+        );
+        let first = context
+            .rebuild_watch_at(
+                WatchInvalidation::Rescan,
+                plan.revision,
+                CancellationToken::default(),
+            )
+            .unwrap();
+        let first_asset = first
+            .files
+            .iter()
+            .find(|file| file.path.ends_with(".data"))
+            .unwrap();
+        let dist = fixture.0.join("app/dist");
+        assert_eq!(
+            std::fs::read(dist.join(&first_asset.path)).unwrap(),
+            b"payload-v1"
+        );
+        fixture.write("cache/dep.zip", pnp_resource_fixture::archive(2));
+        let rebuild = || {
+            context.rebuild_watch_at(
+                WatchInvalidation::Paths(vec![archive.clone()]),
+                plan.revision,
+                CancellationToken::default(),
+            )
+        };
+        let second = rebuild().unwrap();
+        let second_asset = second
+            .files
+            .iter()
+            .find(|file| file.path.ends_with(".data"))
+            .unwrap();
+        assert_ne!(first_asset.path, second_asset.path);
+        assert_eq!(
+            std::fs::read(dist.join(&second_asset.path)).unwrap(),
+            b"payload-v2"
+        );
+        std::fs::remove_file(&archive).unwrap();
+        assert!(rebuild().is_err());
+        assert_eq!(
+            std::fs::read(dist.join(&second_asset.path)).unwrap(),
+            b"payload-v2"
+        );
+        fixture.write("cache/dep.zip", pnp_resource_fixture::archive(1));
+        assert!(rebuild().unwrap().success);
+        assert_eq!(
+            std::fs::read(dist.join(&first_asset.path)).unwrap(),
+            b"payload-v1"
+        );
+        context.close();
     }
 
     #[test]

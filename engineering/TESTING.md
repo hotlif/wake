@@ -458,6 +458,7 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 - `hello-esm`：最小 ESM；
 - `react-ts-app`：React 19 + TypeScript；
 - `react-ts-app-yarn-pnp`：Yarn PnP/zip 包；
+- `monaco-worker-yarn-pnp`：真实 Monaco 静态 Worker URL 位于项目根外 Yarn 缓存的构建与资源发布回归；在该目录运行 `yarn reproduce`；
 - `react-components-yarn-pnp`：只声明 Wake、React 和 React DOM 的 Components PnP 发布包门禁；
 - `react-docs`：MDX、Demo、Props、主题和组件工作台；
 - `react-docs-workspaces`：一个主站与两个隔离工作台的聚合生产构建；

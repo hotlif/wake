@@ -1,0 +1,13 @@
+{
+  "name": "wake-fixture-monaco-worker-yarn-pnp",
+  "private": true,
+  "type": "module",
+  "packageManager": "yarn@4.16.0",
+  "scripts": {
+    "build": "cargo run --quiet --locked --offline --manifest-path ../../Cargo.toml -p wake_cli -- build src/index.js --outdir dist",
+    "reproduce": "node reproduce.mjs"
+  },
+  "dependencies": {
+    "monaco-editor": "0.57.0"
+  }
+}

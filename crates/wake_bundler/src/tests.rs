@@ -8,6 +8,10 @@ use wake_ecma_transform::TargetEnv;
 
 use crate::{BuildOutput, BuildPlatform, Bundler, IncrementalBundler, ModuleFormat};
 
+mod pnp_resource_fixture {
+    include!("../tests/fixtures/pnp-resource/fixture.rs");
+}
+
 /// 一个多模块 ESM fixture：index 依赖 math + msg。
 fn fixture() -> MemoryFileSystem {
     MemoryFileSystem::from_files([
@@ -249,6 +253,139 @@ fn resource_url_project_boundary_is_explicit() {
             .iter()
             .any(|d| d.message.contains("project root"))
     );
+}
+
+fn external_pnp_resource_fixture(request: &str) -> Arc<MemoryFileSystem> {
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.insert(
+        "app/.pnp.cjs",
+        "module.exports = require('./.pnp.data.json');",
+    );
+    fs.insert(
+        "app/.pnp.data.json",
+        serde_json::json!({"packageRegistryData":[
+            [null,[[null,{"packageLocation":"./","packageDependencies":[["dep","npm:1"]]}]]],
+            ["dep",[["npm:1",{"packageLocation":"../cache/dep/","packageDependencies":[]}]]],
+            ["other",[["npm:1",{"packageLocation":"../cache/other/","packageDependencies":[]}]]]
+        ]})
+        .to_string(),
+    );
+    fs.insert("app/index.js", "import 'dep';");
+    fs.insert(
+        "cache/dep/package.json",
+        r#"{"name":"dep","main":"index.js"}"#,
+    );
+    fs.insert(
+        "cache/dep/index.js",
+        format!("globalThis.resource = new URL('{request}', import.meta.url);"),
+    );
+    fs.insert("cache/dep/payload.data", "package resource");
+    fs.insert("cache/other/payload.data", "other package");
+    fs
+}
+
+#[test]
+fn resource_url_external_pnp_package_is_allowed() {
+    let output = crate::BuildSession::new_one_shot(
+        external_pnp_resource_fixture("./payload.data"),
+        crate::BuildOptions {
+            project_root: Some("app".into()),
+            ..Default::default()
+        },
+    )
+    .build_once(crate::BuildRequest::new("app/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.assets.len(), 1);
+    assert_eq!(output.assets[0].bytes, b"package resource");
+}
+
+#[test]
+fn resource_url_external_pnp_package_cannot_escape_to_another_package() {
+    let output = crate::BuildSession::new_one_shot(
+        external_pnp_resource_fixture("../other/payload.data"),
+        crate::BuildOptions {
+            project_root: Some("app".into()),
+            ..Default::default()
+        },
+    )
+    .build_once(crate::BuildRequest::new("app/index.js"));
+    assert!(output.has_errors());
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("WAKE0304"))
+    );
+}
+
+#[test]
+fn native_worker_external_pnp_package_keeps_relative_dependency_closure() {
+    let fs = external_pnp_resource_fixture("./payload.data");
+    fs.insert(
+        "cache/dep/index.js",
+        "globalThis.worker = new Worker(new URL('./worker.js', import.meta.url));",
+    );
+    fs.insert(
+        "cache/dep/worker.js",
+        "import { value } from './value.js'; self.postMessage(value);",
+    );
+    fs.insert("cache/dep/value.js", "export const value = 42;");
+    let output = crate::BuildSession::new_one_shot(
+        fs,
+        crate::BuildOptions {
+            project_root: Some("app".into()),
+            ..Default::default()
+        },
+    )
+    .build_once(crate::BuildRequest::new("app/index.js"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+    assert_eq!(output.assets.len(), 1);
+    if node_available() {
+        let worker = String::from_utf8(output.assets[0].bytes.clone()).unwrap();
+        let executed = execute_runtime_differential_bundle(&format!(
+            "globalThis.self={{postMessage:x=>process.stdout.write(String(x))}};{worker}"
+        ));
+        assert!(
+            executed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&executed.stdout), "42");
+    }
+}
+
+#[test]
+fn resource_url_external_pnp_archive_replacement_refreshes_resource_and_module() {
+    let fs = external_pnp_resource_fixture("./payload.data");
+    fs.insert("app/.pnp.data.json", serde_json::json!({"packageRegistryData":[
+        [null,[[null,{"packageLocation":"./","packageDependencies":[["dep","npm:1"]]}]]],
+        ["dep",[["npm:1",{"packageLocation":"../cache/dep.zip/node_modules/dep/","packageDependencies":[]}]]]
+    ]}).to_string());
+    fs.insert("cache/dep.zip", pnp_resource_fixture::archive(1));
+    let mut bundler = IncrementalBundler::new(fs.clone());
+    bundler.set_project_root("app").enable_load_cache();
+    let first = bundler.build(Path::new("app/index.js"));
+    assert!(!first.has_errors(), "{:?}", first.diagnostics);
+    assert_eq!(first.assets[0].bytes, b"payload-v1");
+    fs.insert("cache/dep.zip", pnp_resource_fixture::archive(2));
+    bundler.invalidate_paths(&["cache/dep.zip".into()], false);
+    let second = bundler.build(Path::new("app/index.js"));
+    assert!(!second.has_errors(), "{:?}", second.diagnostics);
+    assert_eq!(second.assets[0].bytes, b"payload-v2");
+    assert_ne!(first.assets[0].file_name, second.assets[0].file_name);
+    assert!(second.bundle.contains(&second.assets[0].file_name));
+    if node_available() {
+        let output = execute_runtime_differential_bundle(&format!(
+            "globalThis.location={{href:'https://example.test/'}};globalThis.document={{baseURI:'https://example.test/'}};{};process.stdout.write(String(globalThis.revision));",
+            second.bundle
+        ));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "2");
+    }
 }
 
 #[test]

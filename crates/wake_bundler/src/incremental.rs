@@ -1723,6 +1723,10 @@ impl IncrementalBundler {
     /// 普通内容修改保留 resolver cache。
     pub fn invalidate_paths(&self, paths: &[PathBuf], structural: bool) {
         let normalized: FxHashSet<PathBuf> = paths.iter().map(|p| normalize(p)).collect();
+        let archive_changed = normalized.iter().any(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        });
         let resolution_metadata_changed = normalized.iter().any(|p| {
             p.file_name()
                 .and_then(|name| name.to_str())
@@ -1762,13 +1766,14 @@ impl IncrementalBundler {
         });
         self.load_cache.lock().unwrap().retain(|path, _| {
             !(normalized.contains(path)
+                || normalized.contains(&self.resolution_environment.watch_path(path))
                 || asset_changed
                     && path
                         .extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| e.eq_ignore_ascii_case("css")))
         });
-        if structural || resolution_metadata_changed {
+        if structural || resolution_metadata_changed || archive_changed {
             self.resolution_environment
                 .invalidate_paths(normalized.iter().map(PathBuf::as_path));
             self.topology_invalidated.store(true, Ordering::Release);
@@ -4150,20 +4155,24 @@ impl IncrementalBundler {
                     let path = normalize(&rec.path.parent().unwrap_or(Path::new("")).join(file));
                     // Compare physical identities: Windows long and 8.3 paths can spell the
                     // same covered directory differently. This also rejects links escaping it.
-                    let path = normalize(
+                    let target_identity = normalize(
                         &self
-                            .fs
-                            .canonicalize(&path)
+                            .resolution_environment
+                            .resource_identity(&path)
                             .map_err(|error| format!("{}: {error}", path.display()))?,
                     );
                     if let Some(root) = &self.project_root {
                         let identity = normalize(
                             &self
-                                .fs
-                                .canonicalize(root)
+                                .resolution_environment
+                                .resource_identity(root)
                                 .map_err(|error| format!("{}: {error}", root.display()))?,
                         );
-                        if !path.starts_with(&identity) {
+                        if !target_identity.starts_with(&identity)
+                            && !self
+                                .resolution_environment
+                                .allows_package_resource(root, &rec.path, &path)?
+                        {
                             return Err(format!(
                                 "static resource resolves outside project root {}",
                                 root.display()
@@ -4182,7 +4191,7 @@ impl IncrementalBundler {
                             assets.extend(additional_owners);
                             return Ok(name.clone());
                         }
-                        let _guard = crate::resource_refs::WorkerGuard::enter(&path)?;
+                        let _guard = crate::resource_refs::WorkerGuard::enter(&target_identity)?;
                         let options = crate::BuildOptions {
                             project_root: self.project_root.clone(),
                             resolve: self.resolve_options.clone(),
