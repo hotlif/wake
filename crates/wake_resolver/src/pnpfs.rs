@@ -55,6 +55,17 @@ impl PnpFileSystem {
         self.physical(path)
     }
 
+    /// Physical containment identity, never a replacement for a logical module path.
+    pub(crate) fn containment_identity(&self, path: &Path) -> io::Result<PathBuf> {
+        let physical = self.physical(path);
+        if let Some((archive, inner)) = split_zip(&physical) {
+            return Ok(normalize(&self.inner.canonicalize(&archive)?.join(inner)));
+        }
+        self.inner
+            .canonicalize(&physical)
+            .map(|path| normalize(&path))
+    }
+
     /// Return the physical filesystem object whose mutation can change `path`.
     ///
     /// Entries inside a Yarn cache archive are watched through the archive file itself. Virtual

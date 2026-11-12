@@ -20,7 +20,10 @@ mod environment;
 pub mod pnp;
 mod pnpfs;
 
-pub use environment::{NodeModulesPath, NodeModulesView, ResolutionContext, ResolutionEnvironment};
+pub use environment::{
+    NodeModulesPath, NodeModulesView, PackageResourceWatch, ResolutionContext,
+    ResolutionEnvironment,
+};
 use environment::{PnpRegistry, PnpRoute};
 pub use pnp::{PnpError, PnpLoadError, PnpManifest};
 pub use pnpfs::PnpFileSystem;

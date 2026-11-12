@@ -374,6 +374,17 @@ impl PnpManifest {
             .map(|package| package.location.as_path())
     }
 
+    pub(crate) fn package_locations(&self) -> impl Iterator<Item = &Path> {
+        self.locations
+            .iter()
+            .map(|(location, _)| location.as_path())
+    }
+
+    pub(crate) fn same_package(&self, issuer: &Path, target: &Path) -> bool {
+        self.find_package_locator(issuer).is_some()
+            && self.find_package_locator(issuer) == self.find_package_locator(target)
+    }
+
     pub(crate) fn has_package_below(&self, directory: &Path) -> bool {
         self.locations
             .iter()

@@ -128,6 +128,13 @@ pub struct ResolutionEnvironment {
     resolver: Arc<Resolver>,
 }
 
+/// Physical coverage required before building PnP package-local resources.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PackageResourceWatch {
+    Archive(PathBuf),
+    Directory(PathBuf),
+}
+
 impl ResolutionEnvironment {
     pub fn new(base_fs: Arc<dyn FileSystem>) -> Self {
         Self::with_options(base_fs, ResolveOptions::default())
@@ -185,6 +192,83 @@ impl ResolutionEnvironment {
         self.pnp_fs.watch_path(path)
     }
 
+    /// Validate existence and obtain a physical identity for containment/cycle checks only.
+    /// Keep the original logical path for resolution, reads and module identity.
+    pub fn resource_identity(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.pnp_fs.canonicalize(path)?;
+        self.pnp_fs.containment_identity(path)
+    }
+
+    /// Check an extra resource boundary against the project's authoritative installation graph.
+    /// Both logical locator and physical containment must agree; no cache-directory heuristic.
+    pub fn allows_package_resource(
+        &self,
+        project: &Path,
+        issuer: &Path,
+        target: &Path,
+    ) -> Result<bool, String> {
+        let PnpRoute::Managed(manifest) =
+            self.registry.route(project).map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let issuer = normalize(issuer);
+        let target = normalize(target);
+        if manifest.is_ignored(&issuer)
+            || manifest.is_ignored(&target)
+            || !manifest.same_package(&issuer, &target)
+        {
+            return Ok(false);
+        }
+        let Some(root) = manifest.issuer_location(&issuer) else {
+            return Ok(false);
+        };
+        if normalize(project).starts_with(root) {
+            return Ok(false);
+        }
+        let identity = self
+            .pnp_fs
+            .containment_identity(root)
+            .map_err(|e| e.to_string())?;
+        let issuer_identity = self
+            .pnp_fs
+            .containment_identity(&issuer)
+            .map_err(|e| e.to_string())?;
+        let target_identity = self
+            .pnp_fs
+            .containment_identity(&target)
+            .map_err(|e| e.to_string())?;
+        Ok(issuer_identity.starts_with(&identity) && target_identity.starts_with(&identity))
+    }
+
+    /// Conservative installation coverage available before AST/resource discovery.
+    /// The application owns registration and generation publication, not this resolver.
+    pub fn package_resource_watches(
+        &self,
+        project: &Path,
+    ) -> Result<Vec<PackageResourceWatch>, PnpLoadError> {
+        let PnpRoute::Managed(manifest) = self.registry.route(project)? else {
+            return Ok(Vec::new());
+        };
+        let project = normalize(project);
+        let mut watches = Vec::new();
+        for location in manifest.package_locations() {
+            if project.starts_with(location) {
+                continue;
+            }
+            let physical = self.pnp_fs.physical_path(location);
+            let watch = self.watch_path(location);
+            watches.push(if watch != physical {
+                PackageResourceWatch::Archive(watch)
+            } else {
+                PackageResourceWatch::Directory(watch)
+            });
+        }
+        watches.sort();
+        watches.dedup();
+        Ok(watches)
+    }
+
     pub fn has_pnp_root(&self, issuer_dir: &Path) -> bool {
         self.registry.discover_root(issuer_dir).is_some()
     }
@@ -229,6 +313,116 @@ mod tests {
     use super::*;
     use crate::{PnpError, ResolveErrorKind};
     use wake_common::MemoryFileSystem;
+
+    #[test]
+    fn package_resource_authority_keeps_virtual_locators_and_rejects_escapes() {
+        let disk = Arc::new(MemoryFileSystem::new());
+        disk.insert(
+            "app/.pnp.cjs",
+            "module.exports = require('./.pnp.data.json');",
+        );
+        disk.insert("app/.pnp.data.json", serde_json::json!({"packageRegistryData":[
+            [null,[[null,{"packageLocation":"./","packageDependencies":[]}]]],
+            ["dep",[
+                ["virtual:one",{"packageLocation":"../cache/__virtual__/dep-one/0/dep/","packageDependencies":[]}],
+                ["virtual:two",{"packageLocation":"../cache/__virtual__/dep-two/0/dep/","packageDependencies":[]}]
+            ]]
+        ]}).to_string());
+        disk.insert("cache/dep/index.js", "source");
+        disk.insert("cache/dep/asset.bin", "resource");
+        disk.insert("app/index.js", "source");
+        let environment = ResolutionEnvironment::new(disk);
+        let issuer = Path::new("cache/__virtual__/dep-one/0/dep/index.js");
+        let target = Path::new("cache/__virtual__/dep-one/0/dep/asset.bin");
+        assert!(
+            environment
+                .allows_package_resource(Path::new("app"), issuer, target)
+                .unwrap()
+        );
+        assert_eq!(
+            environment.file_system().canonicalize(target).unwrap(),
+            target
+        );
+        for denied in [
+            "cache/__virtual__/dep-two/0/dep/asset.bin",
+            "cache/other/asset.bin",
+            "app/index.js",
+        ] {
+            assert!(
+                !environment
+                    .allows_package_resource(Path::new("app"), issuer, Path::new(denied))
+                    .unwrap()
+            );
+        }
+        assert!(
+            !environment
+                .allows_package_resource(Path::new("app"), Path::new("app/index.js"), target)
+                .unwrap()
+        );
+        assert_eq!(
+            environment
+                .package_resource_watches(Path::new("app"))
+                .unwrap(),
+            vec![PackageResourceWatch::Directory("cache/dep".into())]
+        );
+    }
+
+    #[test]
+    fn package_resource_authority_rejects_physical_symlink_escape() {
+        struct Linked(MemoryFileSystem);
+        impl FileSystem for Linked {
+            fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+                if path == Path::new("cache/dep/escape.bin") {
+                    Ok("outside/secret.bin".into())
+                } else {
+                    self.0.canonicalize(path)
+                }
+            }
+            fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.0.read(path)
+            }
+            fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+                self.0.read_to_string(path)
+            }
+            fn exists(&self, path: &Path) -> bool {
+                self.0.exists(path)
+            }
+            fn is_file(&self, path: &Path) -> bool {
+                self.0.is_file(path)
+            }
+            fn is_dir(&self, path: &Path) -> bool {
+                self.0.is_dir(path)
+            }
+            fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>> {
+                self.0.read_dir(path)
+            }
+        }
+        let disk = MemoryFileSystem::new();
+        disk.insert(
+            "app/.pnp.cjs",
+            "module.exports = require('./.pnp.data.json');",
+        );
+        disk.insert(
+            "app/.pnp.data.json",
+            serde_json::json!({"packageRegistryData":[
+                [null,[[null,{"packageLocation":"./","packageDependencies":[]}]]],
+                ["dep",[["npm:1",{"packageLocation":"../cache/dep/","packageDependencies":[]}]]]
+            ]})
+            .to_string(),
+        );
+        disk.insert("cache/dep/index.js", "source");
+        disk.insert("cache/dep/escape.bin", "link");
+        let environment = ResolutionEnvironment::new(Arc::new(Linked(disk)));
+        assert!(
+            !environment
+                .allows_package_resource(
+                    Path::new("app"),
+                    Path::new("cache/dep/index.js"),
+                    Path::new("cache/dep/escape.bin")
+                )
+                .unwrap()
+        );
+    }
 
     #[test]
     fn node_modules_view_keeps_installed_package_directory_boundaries_literal() {
