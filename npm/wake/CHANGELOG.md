@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.49
+
+- Allow PnP dependencies in external Yarn caches to publish package-local static URL resources
+  and Worker entries, while retaining locator and physical-containment checks.
+- Register package archive/directory watches before candidate builds and invalidate archive-backed
+  module and resource caches on replacement. Preserve published output across failed rebuilds.
+- Add a real Monaco 0.57 regression fixture with published-resource byte and URL checks.
+
 ## 0.1.48
 
 - Supersede the 0.1.47 candidate, stopped before npm publication. Admit reviewed Linux Chrome 156
