@@ -1192,6 +1192,10 @@ impl Default for ServeOptions {
 /// 一条代理规则（保持既定行为 `Proxy`）。
 #[derive(Clone)]
 pub struct ProxyRule {
+    /// HTTP TCP/DNS connection timeout in milliseconds; absent uses 5000.
+    pub connect_timeout_ms: Option<u64>,
+    /// HTTP forwarding deadline through response headers; absent or zero disables it.
+    pub request_timeout_ms: Option<u64>,
     /// Forward WebSocket upgrades when enabled.
     pub ws: bool,
     /// 匹配的路径前缀（如 `["/api"]`）。
@@ -1612,6 +1616,8 @@ fn run_server(
             // 默认服务：先试代理转发（任意方法），未命中且为 GET 则回退 SPA HTML。
             .default_service(web::to(serve_default))
     })
+    // Browser cancellation must drop pending proxy futures and idle upstream streams.
+    .h1_allow_half_closed(false)
     .bind((host.as_str(), port));
     let server = match server {
         Ok(server) => server.workers(4).run(),
@@ -1649,6 +1655,8 @@ fn run_server(
 
 /// 已编译的代理规则（pathRewrite 正则预编译）。
 struct CompiledProxy {
+    connect_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
     ws: bool,
     context: Vec<String>,
     target: String,
@@ -1668,6 +1676,8 @@ impl CompiledProxy {
             }
         }
         Some(CompiledProxy {
+            connect_timeout_ms: p.connect_timeout_ms,
+            request_timeout_ms: p.request_timeout_ms,
             ws: p.ws,
             context: p.context,
             target: p.target,
@@ -5074,7 +5084,18 @@ async fn forward(req: &HttpRequest, body: web::Bytes, p: &CompiledProxy) -> Http
         format!("{base}{new_path}?{qs}")
     };
 
-    let client = awc::Client::default();
+    // The connector deadline is independent of the request-through-headers deadline.
+    // Disable awc's implicit five-second request limit for normal slow APIs and SSE.
+    let mut client = awc::Client::builder()
+        .connector(
+            awc::Connector::new()
+                .timeout(Duration::from_millis(p.connect_timeout_ms.unwrap_or(5000))),
+        )
+        .disable_timeout();
+    if let Some(timeout) = p.request_timeout_ms.filter(|timeout| *timeout > 0) {
+        client = client.timeout(Duration::from_millis(timeout));
+    }
+    let client = client.finish();
     // no_decompress：保持上游压缩体与 Content-Encoding 头一致（不解压后再原样转发头）。
     let mut fwd = client.request(req.method().clone(), &url).no_decompress();
     for (name, value) in req.headers() {
@@ -5107,7 +5128,10 @@ async fn forward(req: &HttpRequest, body: web::Bytes, p: &CompiledProxy) -> Http
             builder.streaming(resp)
         }
         Err(e) => {
-            HttpResponse::BadGateway().body(format!("wake proxy: 转发到 {} 失败：{e}", p.target))
+            HttpResponse::BadGateway().body(format!(
+                "wake proxy: 转发到 {} 失败：{e}；上游执行结果可能未知，Wake 未自动重试；写请求重试前请确认执行结果",
+                p.target
+            ))
         }
     }
 }
@@ -8657,6 +8681,8 @@ mod tests {
     #[test]
     fn proxy_matches_and_rewrites() {
         let p = CompiledProxy::compile(ProxyRule {
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
             ws: false,
             context: vec!["/api".to_string()],
             target: "http://localhost:8080".to_string(),
@@ -8670,6 +8696,42 @@ mod tests {
         // pathRewrite 去掉 /api 前缀。
         assert_eq!(p.rewrite("/api/users"), "/users");
         assert_eq!(p.rewrite("/other"), "/other");
+    }
+
+    #[test]
+    fn proxy_waits_for_slow_json_headers() {
+        for request_timeout_ms in [None, Some(0), Some(15_000)] {
+            actix_web::rt::System::new().block_on(async {
+            use std::io::{Read as _, Write as _};
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let backend = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"POST /api/slow "));
+                let mut body = [0; 2];
+                socket.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"{}");
+                std::thread::sleep(Duration::from_millis(6200));
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+            });
+            let proxy = CompiledProxy::compile(ProxyRule { connect_timeout_ms: None, request_timeout_ms,
+                ws: false, context: vec!["/api".into()], target: format!("http://{address}"),
+                path_rewrite: vec![], change_origin: true,
+            }).unwrap();
+            let request = actix_web::test::TestRequest::post().uri("/api/slow").to_http_request();
+            let response = tokio::time::timeout(Duration::from_secs(12), forward(&request, web::Bytes::from_static(b"{}"), &proxy)).await.unwrap();
+            backend.join().unwrap();
+            assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+            assert_eq!(actix_web::body::to_bytes(response.into_body()).await.unwrap().as_ref(), b"{\"ok\":true}");
+        });
+        }
     }
 
     #[test]
@@ -8689,11 +8751,12 @@ mod tests {
                 socket.read_exact(&mut byte).unwrap();
                 request.push(byte[0]);
             }
+            std::thread::sleep(Duration::from_millis(6200));
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close, x-private\r\nx-private: hidden\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nD\r\ndata: first\n\n\r\n").unwrap();
             let _ = released.recv_timeout(Duration::from_secs(3));
             let _ = socket.write_all(b"C\r\ndata: last\n\n\r\n0\r\n\r\n");
         });
-        let proxy = CompiledProxy::compile(ProxyRule {
+        let proxy = CompiledProxy::compile(ProxyRule { connect_timeout_ms: None, request_timeout_ms: None,
             ws: false,
             context: vec!["/api".into()], target: format!("http://{address}"),
             path_rewrite: vec![], change_origin: false,
@@ -8743,7 +8806,7 @@ mod tests {
             let port = reservation.local_addr().unwrap().port(); drop(reservation);
             let server = start(root.path(), port, ServeOptions {
                 entry: root.path().join("index.js"), quiet: true,
-                proxy: vec![ProxyRule { context: vec!["/api".into()], target: format!("http://{upstream}"), ws: true, change_origin: true, path_rewrite: vec![("^/api".into(), "".into())] }, ProxyRule { context: vec!["/disabled".into()], target: format!("http://{upstream}"), ws: false, change_origin: true, path_rewrite: vec![] }],
+                proxy: vec![ProxyRule { connect_timeout_ms: None, request_timeout_ms: None, context: vec!["/api".into()], target: format!("http://{upstream}"), ws: true, change_origin: true, path_rewrite: vec![("^/api".into(), "".into())] }, ProxyRule { connect_timeout_ms: None, request_timeout_ms: None, context: vec!["/disabled".into()], target: format!("http://{upstream}"), ws: false, change_origin: true, path_rewrite: vec![] }],
                 ..ServeOptions::default()
             }).unwrap();
             let disabled = awc::Client::default().ws(format!("ws://127.0.0.1:{port}/disabled")).connect().await;
@@ -8775,6 +8838,8 @@ mod tests {
     #[test]
     fn proxy_multi_context() {
         let p = CompiledProxy::compile(ProxyRule {
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
             ws: false,
             context: vec!["/api".to_string(), "/auth".to_string()],
             target: "http://localhost:9000".to_string(),
@@ -8998,3 +9063,6 @@ pub fn start(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<S
         }),
     })
 }
+
+#[cfg(test)]
+mod proxy_timeout_tests;

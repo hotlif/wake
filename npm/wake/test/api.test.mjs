@@ -2202,3 +2202,88 @@ test('normalizes cancellation and configuration failures', async () => {
     (error) => error instanceof WakeError && error.code === 'WAKE_CONFIG',
   )
 })
+
+
+test('native proxy supports slow headers, deadlines, and client cancellation', { timeout: 45000 }, async () => {
+  const { createServer: createHttpServer } = await import('node:http')
+  const counts = new Map()
+  let streamClosed
+  const closed = new Promise(resolve => { streamClosed = resolve })
+  let pendingStarted, pendingClosed
+  const started = new Promise(resolve => { pendingStarted = resolve })
+  const cancelled = new Promise(resolve => { pendingClosed = resolve })
+  const backend = createHttpServer((req, res) => {
+    counts.set(req.url, (counts.get(req.url) ?? 0) + 1)
+    if (req.url === '/pending') {
+      res.once('close', pendingClosed)
+      pendingStarted()
+      return
+    }
+    if (req.url === '/stream') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      res.flushHeaders()
+      const timer = setTimeout(() => res.write('data: first\n\n'), 6200)
+      res.once('close', () => { clearTimeout(timer); streamClosed() })
+      return
+    }
+    const timer = setTimeout(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end('{"ok":true}')
+    }, req.url === '/limited' ? 500 : 6200)
+    res.once('close', () => clearTimeout(timer))
+  })
+  const backendPort = await listen(backend)
+  const reservation = createServer()
+  const port = await listen(reservation)
+  await new Promise(resolve => reservation.close(resolve))
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-proxy-timeout-'))
+  let server
+  try {
+    await writeFile(join(cwd, 'entry.js'), 'export const ready = true;')
+    const rules = [
+      ['/default', ''], ['/zero', 'request_timeout_ms = 0'],
+      ['/long', 'request_timeout_ms = 15000'], ['/limited', 'request_timeout_ms = 150'],
+      ['/stream', 'request_timeout_ms = 150'],
+      ['/pending', ''],
+    ].map(([path, extra]) => `[[dev_server.proxy]]\ncontext = ["${path}"]\ntarget = "http://127.0.0.1:${backendPort}"\nconnect_timeout_ms = 1000\n${extra}\n`).join('\n')
+    await writeFile(join(cwd, 'wake.config.toml'), `[html]\nentry = "entry.js"\n${rules}`)
+    server = await startDevServer({ cwd, port, open: false })
+    await Promise.all(['/default', '/zero', '/long'].map(async path => {
+      const response = await fetch(new URL(path, server.url), { method: 'POST', body: '{}', signal: AbortSignal.timeout(20000) })
+      assert.equal(response.status, 200, path)
+      assert.deepEqual(await response.json(), { ok: true })
+      assert.equal(counts.get(path), 1)
+    }))
+    const limited = await fetch(new URL('/limited', server.url), { method: 'POST', signal: AbortSignal.timeout(5000) })
+    assert.equal(limited.status, 502)
+    assert.match(await limited.text(), /上游执行结果可能未知/)
+    assert.equal(counts.get('/limited'), 1)
+    const pendingController = new AbortController()
+    const pending = fetch(new URL('/pending', server.url), { signal: pendingController.signal })
+    const rejected = assert.rejects(pending, { name: 'AbortError' })
+    await started
+    pendingController.abort()
+    await rejected
+    await Promise.race([cancelled, new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('cancelled pending request did not release upstream')), 3000)
+      timer.unref()
+    })])
+    assert.equal(counts.get('/pending'), 1)
+    const controller = new AbortController()
+    const response = await fetch(new URL('/stream', server.url), { signal: controller.signal })
+    assert.equal(response.status, 200)
+    const reader = response.body.getReader()
+    assert.match(new TextDecoder().decode((await reader.read()).value), /data: first/)
+    controller.abort()
+    await Promise.race([closed, new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('cancelled client did not release upstream')), 3000)
+      timer.unref()
+    })])
+    assert.equal(counts.get('/stream'), 1)
+  } finally {
+    await server?.close()
+    backend.closeAllConnections()
+    await new Promise(resolve => backend.close(resolve))
+    await rm(cwd, { recursive: true, force: true })
+  }
+})

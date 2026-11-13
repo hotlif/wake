@@ -5690,6 +5690,8 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
         .proxy
         .iter()
         .map(|proxy| wake_dev_server::ProxyRule {
+            connect_timeout_ms: proxy.connect_timeout_ms,
+            request_timeout_ms: proxy.request_timeout_ms,
             ws: proxy.ws,
             context: proxy.context.clone(),
             target: proxy.target.clone(),
@@ -7383,6 +7385,8 @@ fn start_docs_dev_server_leaf(
             .proxy
             .iter()
             .map(|proxy| wake_dev_server::ProxyRule {
+                connect_timeout_ms: proxy.connect_timeout_ms,
+                request_timeout_ms: proxy.request_timeout_ms,
                 ws: proxy.ws,
                 context: proxy.context.clone(),
                 target: proxy.target.clone(),
@@ -7602,6 +7606,8 @@ fn start_aggregated_docs_dev_server(
             .proxy
             .iter()
             .map(|proxy| wake_dev_server::ProxyRule {
+                connect_timeout_ms: proxy.connect_timeout_ms,
+                request_timeout_ms: proxy.request_timeout_ms,
                 ws: proxy.ws,
                 context: proxy.context.clone(),
                 target: proxy.target.clone(),
@@ -8667,7 +8673,8 @@ mod tests {
             "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
         )
         .unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        // Connection: close ends the exchange after the response. Sending FIN here
+        // would cancel the request under the development server's HTTP/1 policy.
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response

@@ -36,12 +36,22 @@ context = ["/api"]
 target = "http://127.0.0.1:3000"
 change_origin = true
 ws = false
+connect_timeout_ms = 5000
+request_timeout_ms = 0
 
 [dev_server.proxy.path_rewrite]
 "^/api" = ""
 ```
 
 应用请求 `/api/health` 时，Wake 将请求转发到后端 `/health`。`change_origin` 调整转发的 Host；`ws` 控制 WebSocket 代理。规则按声明顺序匹配，先配置更具体的规则。
+
+HTTP 代理的 `connect_timeout_ms` 是建立 TCP 连接（包括 DNS）的上限，默认 5000 毫秒；0 表示立即超时，不表示禁用。TLS 握手仍有独立的 5 秒上限。
+`request_timeout_ms` 是从开始转发到收到响应头的总上限（包括连接与发送请求体），默认或设为 0 时禁用；
+例如设为 60000 可等待一分钟。它不限制收到响应头后的响应流或 SSE 首帧等待时间。
+因此默认配置允许超过 5 秒才返回响应头的 JSON API 和 SSE。两项配置仅作用于 HTTP 转发，WebSocket 升级保持原有行为。
+代理失败返回 502，不自动重试或重放请求。超时不意味着后端任务失败：上游执行结果可能未知，写请求应先查询结果，避免重复执行。
+客户端取消连接会释放代理持有的上游连接，但不能保证取消后端任务。开发服务不支持 HTTP/1 TCP 半关闭：
+收到客户端 FIN 即终止请求，不支持先关闭写半连接再继续读取响应的客户端。
 
 创建一个最小后端，单独用 Node 运行：
 

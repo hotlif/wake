@@ -789,6 +789,10 @@ pub struct DevServer {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Proxy {
+    /// HTTP TCP/DNS connection timeout in milliseconds; absent uses 5000.
+    pub connect_timeout_ms: Option<u64>,
+    /// HTTP forwarding deadline through response headers; absent or zero disables it.
+    pub request_timeout_ms: Option<u64>,
     /// 匹配的路径前缀（如 `["/api"]`）。
     pub context: Vec<String>,
     /// 转发目标（如 `http://localhost:8080`）。
@@ -799,6 +803,33 @@ pub struct Proxy {
     pub change_origin: bool,
     /// 路径改写（正则字符串 → 替换）。
     pub path_rewrite: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod proxy_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_timeout_config_accepts_defaults_zero_and_long_deadlines() {
+        for (fields, connect, request) in [
+            ("", None, None),
+            (
+                "connect_timeout_ms = 2000\nrequest_timeout_ms = 60000",
+                Some(2000),
+                Some(60000),
+            ),
+            ("request_timeout_ms = 0", None, Some(0)),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[[dev_server.proxy]]\ncontext = [\"/api\"]\ntarget = \"http://localhost:3000\"\n{fields}"
+            )).unwrap();
+            assert_eq!(config.dev_server.proxy[0].connect_timeout_ms, connect);
+            assert_eq!(config.dev_server.proxy[0].request_timeout_ms, request);
+        }
+        for fields in ["request_timeout_ms = -1", "connect_timeout_ms = 1.5"] {
+            assert!(toml::from_str::<Proxy>(fields).is_err());
+        }
+    }
 }
 
 /// HTML / 入口生成配置。
@@ -1615,6 +1646,8 @@ strategy = "version-first"
         assert!(c.dev_server.open);
         assert_eq!(c.dev_server.proxy.len(), 1);
         assert!(c.dev_server.proxy[0].ws);
+        assert_eq!(c.dev_server.proxy[0].connect_timeout_ms, None);
+        assert_eq!(c.dev_server.proxy[0].request_timeout_ms, None);
         assert_eq!(c.html.entry.as_deref(), Some("src/main.tsx"));
         assert_eq!(c.hooks.bootstrap_path.as_deref(), Some("src/bootstrap.tsx"));
         assert_eq!(
