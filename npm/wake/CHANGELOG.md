@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.51
+
+- 组件扫描的 `component` 改为 `() => import(...)` 加载函数；导入扫描模块或读取路由、菜单元数据不再启动所有页面的导入。
+- **调用契约变更**：将 `await page.component` 改为 `await page.component()`，将 `.component.then(...)` 改为 `.component().then(...)`，并同步应用类型声明。没有旧 eager Promise 兼容模式。
+- 保留 `name`、`path`、TOML `frontmatter` 和 `generate_source`；开发与生产均按调用加载页面及独占 JS/CSS，开发模式继续更新增删页面和 frontmatter。
+
 ## 0.1.50
 
 - 原生 HTTP 开发代理默认不再以 5 秒上限截断慢响应；新增独立连接超时与可禁用的请求超时配置。
