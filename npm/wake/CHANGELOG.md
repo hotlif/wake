@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.50
+
+- 原生 HTTP 开发代理默认不再以 5 秒上限截断慢响应；新增独立连接超时与可禁用的请求超时配置。
+- 转发失败不自动重试，诊断明确提示上游执行结果可能未知。
+- 客户端取消释放等待响应头或 SSE 流的上游连接；开发服务不再接受 HTTP/1 TCP 半关闭。
+
 ## 0.1.49
 
 - Allow PnP dependencies in external Yarn caches to publish package-local static URL resources
