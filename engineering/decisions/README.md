@@ -70,6 +70,7 @@
 - [ADR 0078: 原生 Worker 与静态资源 URL](0078-native-worker-resource-urls.md) — `accepted`
 - [ADR 0079: 同步 ESM 库输出与源码映射组合](0079-synchronous-esm-bundle-and-affixes.md) — `accepted`
 - [ADR 0081: PnP 包内静态资源边界](0081-pnp-package-resource-boundaries.md) — `accepted`
+- [ADR 0082: 组件扫描导出按需加载函数](0082-component-scan-loaders.md) — `accepted`
 
 ### css-editor
 

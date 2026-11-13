@@ -467,7 +467,10 @@ mapped fixture 都不能替代运行时差分、重解析和完整 source-map �
 关键语义必须执行产物或在真实服务器中验证。仅检查 bundle 字符串适合局部形态断言，不能替代运行时回归。
 `browser-conformance` CI 的 Linux x64 目标在确认受审系统 Chrome 身份后，显式执行
 `cargo test --locked --offline -p wake_test --test app_browser_conformance -- --ignored --nocapture --test-threads=1`。
-该浏览器证据覆盖 React 应用的一次 Live Reload 与状态重置，以及根路径/子路径的资源、导航和 404；
+该浏览器证据覆盖 React 应用的一次 Live Reload 与状态重置，以及根路径/子路径的资源、导航和 404。
+其中 `component_scan` 用例无需 React/Yarn fixture，覆盖开发与生产中仅读取扫描元数据不加载页面、
+按调用加载页面及独占 JS/CSS、重复调用不重复执行、`generate_source` 开关及元数据保持，
+并验证开发模式修改 frontmatter、新增和删除页面后的 Live Reload；可按 `component_scan` 过滤执行。
 失败时上传 `target/browser-artifacts/app-conformance/` 下的截图、控制台/网络记录及页面状态。
 同一 Linux x64 浏览器目标还显式执行
 `cargo test --locked --offline -p wake_test --test components_browser_conformance -- --ignored --nocapture --test-threads=1`。

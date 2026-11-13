@@ -4,14 +4,22 @@
 //! `cargo test -p wake_test --test app_browser_conformance -- --ignored`
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use wake_app::{DevServer, DevServerEvent, DevServerOptions, ProjectOptions, start_dev_server};
+use wake_app::{
+    BuildOptions, CancellationToken, DevServer, DevServerEvent, DevServerOptions, ProjectOptions,
+    build, start_dev_server,
+};
 use wake_common::zip::ZipArchive;
 use wake_test_browser::{BrowserDriver, BrowserLaunchOptions, BrowserPage};
 
@@ -445,6 +453,541 @@ fn chromium_loads_root_and_nested_app_routes_with_resources_and_404s() {
             assert!(
                 evidence.document_requests(&route) >= 2,
                 "direct navigation and refresh must each request the nested route"
+            );
+        });
+    }
+}
+
+// These pages have exclusive JS dependencies and styles. No framework or package installation is
+// needed: the entry represents a menu/router which only reads metadata and captures the loaders.
+fn scan_page(name: &str, route: &str) -> String {
+    format!(
+        r#"/*
+path = {route:?}
+layout = "emptyLayout"
+*/
+import {{ dependency }} from '../{name}-dependency.js';
+import '../{name}.css';
+(globalThis.__scanExecutions ||= []).push('scan-{name}-executed');
+export default {{ name: {name:?}, dependency }};
+"#
+    )
+}
+
+fn create_scan_fixture(root: &Path, generate_source: bool) {
+    write(root, "package.json", r#"{"type":"module"}"#);
+    write(
+        root,
+        "wake.config.toml",
+        &format!(
+            r#"[html]
+entry = "src/main.jsx"
+
+[[component_scan]]
+namespace = "pages"
+cwd = "src/pages"
+include = '\.page\.ts$'
+generate_source = {generate_source}
+"#
+        ),
+    );
+    write(
+        root,
+        "src/main.jsx",
+        r#"import pages from '@@@/pages';
+globalThis.__scanBoot = String(Math.random());
+globalThis.__scanMenu = pages.map(page => page.frontmatter?.path);
+globalThis.__scanMetadata = pages.map(({ name, path, frontmatter, source, component }) => ({
+  name, path, frontmatter, source, loaderType: typeof component
+}));
+// Capturing/destructuring a loader must be as inert as reading the menu.
+globalThis.__scanLoaders = pages.map(({ component }) => component);
+"#,
+    );
+    for (name, route, color) in [
+        ("Login", "/user/login", "red"),
+        ("Editor", "/editor", "blue"),
+    ] {
+        write(
+            root,
+            &format!("src/pages/{name}.page.ts"),
+            &scan_page(name, route),
+        );
+        write(
+            root,
+            &format!("src/{name}-dependency.js"),
+            &format!(
+                "(globalThis.__scanExecutions ||= []).push('scan-{name}-dependency'); export const dependency = '{name}-dependency';\n"
+            ),
+        );
+        write(
+            root,
+            &format!("src/{name}.css"),
+            &format!(":root {{ --scan-{name}: {color}; }}\n"),
+        );
+    }
+    // The include filter still excludes unrelated files from the metadata list.
+    write(
+        root,
+        "src/pages/ignored.ts",
+        "throw new Error('excluded scan file');",
+    );
+}
+
+fn scan_state(page: &BrowserPage) -> Result<Value, String> {
+    page.evaluate(r#"({
+      boot: globalThis.__scanBoot,
+      menu: globalThis.__scanMenu,
+      metadata: globalThis.__scanMetadata,
+      executions: globalThis.__scanExecutions || [],
+      loginStyle: getComputedStyle(document.documentElement).getPropertyValue('--scan-Login').trim(),
+      editorStyle: getComputedStyle(document.documentElement).getPropertyValue('--scan-Editor').trim(),
+      styles: Array.from(document.styleSheets, sheet => ({href: sheet.href, rules: Array.from(sheet.cssRules, rule => rule.cssText)}))
+    })"#).map_err(|error| error.to_string())
+}
+
+fn wait_for_scan(page: &BrowserPage, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + WAIT;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match scan_state(page) {
+            Ok(state) if ready(&state) => return state,
+            Ok(state) => last = state.to_string(),
+            Err(error) => last = error,
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("scan page did not become ready: {last}");
+}
+
+fn wait_for_scan_update(page: &BrowserPage, previous_boot: &Value, menu: Value) -> Value {
+    let deadline = Instant::now() + WAIT;
+    let mut boot = Value::Null;
+    let mut stable_since = Instant::now();
+    let mut last = String::new();
+    // File creation/deletion can deliver separate watcher batches. Exercise the final document,
+    // after the reload burst settles, rather than racing a loader call against another navigation.
+    while Instant::now() < deadline {
+        match scan_state(page) {
+            Ok(state) if state["boot"] != *previous_boot && state["menu"] == menu => {
+                if state["boot"] != boot {
+                    boot = state["boot"].clone();
+                    stable_since = Instant::now();
+                } else if stable_since.elapsed() >= Duration::from_millis(750) {
+                    return state;
+                }
+                last = state.to_string();
+            }
+            other => {
+                boot = Value::Null;
+                stable_since = Instant::now();
+                last = format!("{other:?}");
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("scan update did not settle: {last}");
+}
+
+fn scan_requests(evidence: &mut Evidence, page: &BrowserPage) -> Vec<String> {
+    evidence.capture(page);
+    evidence
+        .events
+        .iter()
+        .filter(|item| {
+            item["method"] == "Network.requestWillBeSent"
+                && matches!(
+                    item["event"]["params"]["type"].as_str(),
+                    Some("Script" | "Stylesheet")
+                )
+        })
+        .map(|item| {
+            item["event"]["params"]["request"]["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+fn assert_scan_is_idle(page: &BrowserPage, generate_source: bool) -> Value {
+    wait_for_scan(page, |state| {
+        state["metadata"]
+            .as_array()
+            .is_some_and(|items| items.len() == 2)
+    });
+    // Give an accidentally eager import time to complete even though the entry has finished.
+    page.evaluate("new Promise(resolve => setTimeout(resolve, 250))")
+        .unwrap();
+    let state = scan_state(page).unwrap();
+    assert_eq!(
+        state["executions"],
+        json!([]),
+        "metadata import executed pages: {state}"
+    );
+    assert_eq!(state["loginStyle"], "");
+    assert_eq!(state["editorStyle"], "");
+    assert_eq!(state["menu"], json!(["/editor", "/user/login"]));
+    for (index, name, route) in [(0, "Editor", "/editor"), (1, "Login", "/user/login")] {
+        let metadata = &state["metadata"][index];
+        assert_eq!(metadata["loaderType"], "function");
+        assert_eq!(metadata["name"], format!("___src_pages_{name}_page_ts"));
+        assert_eq!(metadata["path"], format!("/src/pages/{name}.page.ts"));
+        assert_eq!(
+            metadata["frontmatter"],
+            json!({"path": route, "layout": "emptyLayout"})
+        );
+        assert_eq!(
+            metadata["source"],
+            if generate_source {
+                json!(scan_page(name, route))
+            } else {
+                Value::Null
+            }
+        );
+    }
+    state
+}
+
+fn assert_scan_loads_on_call(
+    page: &BrowserPage,
+    evidence: &mut Evidence,
+    generate_source: bool,
+    production: bool,
+) {
+    assert_scan_is_idle(page, generate_source);
+    let initial = scan_requests(evidence, page);
+    assert_eq!(
+        initial.len(),
+        2,
+        "metadata-only entry requested page assets: {initial:?}"
+    );
+    let initial_files = initial
+        .iter()
+        .map(|url| url.rsplit('/').next().unwrap())
+        .collect::<Vec<_>>();
+    if production {
+        assert!(
+            initial_files
+                .iter()
+                .any(|file| file.starts_with("entry.") && file.ends_with(".js"))
+        );
+        assert!(
+            initial_files
+                .iter()
+                .any(|file| file.starts_with("main.") && file.ends_with(".js"))
+        );
+    } else {
+        assert!(initial.iter().any(|url| url.ends_with("/__wake/client.js")));
+        assert!(initial_files.contains(&"bundle.js"));
+    }
+
+    let loaded = page
+        .evaluate("__scanLoaders[1]().then(module => module.default)")
+        .unwrap();
+    assert_eq!(
+        loaded,
+        json!({"name": "Login", "dependency": "Login-dependency"})
+    );
+    let login = scan_state(page).unwrap();
+    assert_eq!(
+        login["executions"],
+        json!(["scan-Login-dependency", "scan-Login-executed"])
+    );
+    assert_eq!(login["loginStyle"], "red", "login style state: {login}");
+    assert_eq!(login["editorStyle"], "");
+    let after_login = scan_requests(evidence, page);
+    assert!(after_login.len() > initial.len());
+    assert_eq!(
+        after_login
+            .iter()
+            .filter(|url| url.ends_with(".css"))
+            .count(),
+        usize::from(production)
+    );
+
+    // The other page's exclusive code must not even have been downloaded. Source inlining
+    // intentionally puts page text into the metadata entry, so only that case excludes the entry.
+    for event in &evidence.events {
+        if event["method"] == "Network.responseReceived"
+            && matches!(
+                event["event"]["params"]["type"].as_str(),
+                Some("Script" | "Stylesheet")
+            )
+            && (!generate_source
+                || !initial
+                    .iter()
+                    .any(|url| event["event"]["params"]["response"]["url"] == *url))
+        {
+            let body = page
+                .command(
+                    "Network.getResponseBody",
+                    json!({"requestId": event["event"]["params"]["requestId"]}),
+                )
+                .unwrap();
+            let text = body["body"].as_str().unwrap();
+            assert!(
+                !text.contains("scan-Editor"),
+                "downloaded unvisited Editor code/style: {text}"
+            );
+        }
+    }
+
+    page.evaluate("Promise.all([__scanLoaders[1](), __scanLoaders[1]()])")
+        .unwrap();
+    assert_eq!(scan_state(page).unwrap()["executions"], login["executions"]);
+    assert_eq!(
+        scan_requests(evidence, page),
+        after_login,
+        "repeat loading requested duplicate assets"
+    );
+
+    let loaded = page
+        .evaluate("__scanLoaders[0]().then(module => module.default)")
+        .unwrap();
+    assert_eq!(
+        loaded,
+        json!({"name": "Editor", "dependency": "Editor-dependency"})
+    );
+    let editor = scan_state(page).unwrap();
+    assert_eq!(
+        editor["executions"],
+        json!([
+            "scan-Login-dependency",
+            "scan-Login-executed",
+            "scan-Editor-dependency",
+            "scan-Editor-executed"
+        ])
+    );
+    assert_eq!(editor["editorStyle"], "blue");
+    let after_editor = scan_requests(evidence, page);
+    assert!(after_editor.len() > after_login.len());
+    assert_eq!(
+        after_editor
+            .iter()
+            .filter(|url| url.ends_with(".css"))
+            .count(),
+        if production { 2 } else { 0 }
+    );
+    eprintln!(
+        "component scan production={production} source={generate_source}: asset requests {}/{}/{}, executions {}",
+        initial.len(),
+        after_login.len(),
+        after_editor.len(),
+        editor["executions"]
+    );
+}
+
+// A small static host serves the actual production output; it never compiles or injects dev code.
+struct ScanStaticServer {
+    origin: String,
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl ScanStaticServer {
+    fn start(root: PathBuf) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("scan static host failed: {error}"),
+                };
+                // Windows can inherit the listener's nonblocking mode. Partial writes would
+                // corrupt the JS/CSS evidence, so serve complete requests and responses.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 2048];
+                while request.len() < 64 * 1024
+                    && !request.windows(4).any(|part| part == b"\r\n\r\n")
+                {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                if !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&request);
+                let path = head
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/");
+                let relative = path.trim_start_matches('/');
+                let safe = !relative.contains(['\\', ':'])
+                    && !relative.split('/').any(|part| part == ".." || part == ".");
+                let file = root.join(if relative.is_empty() {
+                    "index.html"
+                } else {
+                    relative
+                });
+                let found = safe.then(|| fs::read(&file).ok()).flatten();
+                let (status, bytes) = match found {
+                    Some(bytes) => ("200 OK", bytes),
+                    None => ("404 Not Found", b"not found".to_vec()),
+                };
+                let mime = match file.extension().and_then(|ext| ext.to_str()) {
+                    Some("html") => "text/html",
+                    Some("js") => "text/javascript",
+                    Some("css") => "text/css",
+                    _ => "application/octet-stream",
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(&bytes);
+            }
+        });
+        Self {
+            origin,
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for ScanStaticServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.join.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires an installed system Chromium browser"]
+fn chromium_component_scan_production_loads_only_called_pages_and_css() {
+    let driver = browser();
+    eprintln!("component scan browser: {:?}", driver.installation);
+    for generate_source in [false, true] {
+        let fixture = tempfile::Builder::new()
+            .prefix("wake-scan-production-")
+            .tempdir()
+            .unwrap();
+        create_scan_fixture(fixture.path(), generate_source);
+        let result = build(
+            BuildOptions {
+                project: ProjectOptions {
+                    cwd: Some(fixture.path().to_path_buf()),
+                    config_path: None,
+                },
+                outdir: Some(PathBuf::from("dist")),
+                ..BuildOptions::default()
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(result.success, "{:?}", result.diagnostics);
+        let server = ScanStaticServer::start(fixture.path().join("dist"));
+        let context = driver.create_context().unwrap();
+        let page = context.new_page("about:blank").unwrap();
+        page.command("Network.enable", json!({})).unwrap();
+        page.command("Network.setCacheDisabled", json!({"cacheDisabled": true}))
+            .unwrap();
+        with_evidence("component-scan-production", &page, |evidence| {
+            page.navigate(&format!("{}/", server.origin)).unwrap();
+            assert_scan_loads_on_call(&page, evidence, generate_source, true);
+        });
+    }
+}
+
+#[test]
+#[ignore = "requires an installed system Chromium browser"]
+fn chromium_component_scan_development_loads_on_call_and_refreshes_metadata() {
+    let driver = browser();
+    eprintln!("component scan browser: {:?}", driver.installation);
+    for generate_source in [false, true] {
+        let fixture = tempfile::Builder::new()
+            .prefix("wake-scan-development-")
+            .tempdir()
+            .unwrap();
+        create_scan_fixture(fixture.path(), generate_source);
+        let port = reserve_port();
+        let server = RunningServer::start(fixture.path(), port);
+        let context = driver.create_context().unwrap();
+        let page = context.new_page("about:blank").unwrap();
+        page.command("Network.enable", json!({})).unwrap();
+        page.command("Network.setCacheDisabled", json!({"cacheDisabled": true}))
+            .unwrap();
+        with_evidence("component-scan-development", &page, |evidence| {
+            page.navigate(&format!("http://127.0.0.1:{port}/")).unwrap();
+            assert_scan_loads_on_call(&page, evidence, generate_source, false);
+            let deadline = Instant::now() + WAIT;
+            while !evidence.has_live_reload_socket() && Instant::now() < deadline {
+                evidence.capture(&page);
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(evidence.has_live_reload_socket());
+
+            let initial = scan_state(&page).unwrap();
+            write(
+                fixture.path(),
+                "src/pages/Login.page.ts",
+                &scan_page("Login", "/sign-in"),
+            );
+            server.await_rebuild();
+            let edited =
+                wait_for_scan_update(&page, &initial["boot"], json!(["/editor", "/sign-in"]));
+            assert_eq!(edited["executions"], json!([]));
+            assert_eq!(
+                edited["metadata"][1]["source"],
+                if generate_source {
+                    json!(scan_page("Login", "/sign-in"))
+                } else {
+                    Value::Null
+                }
+            );
+
+            write(
+                fixture.path(),
+                "src/pages/New.page.ts",
+                "/* path = '/new' */\n(globalThis.__scanExecutions ||= []).push('new'); export default 'new';\n",
+            );
+            server.await_rebuild();
+            let added = wait_for_scan_update(
+                &page,
+                &edited["boot"],
+                json!(["/editor", "/sign-in", "/new"]),
+            );
+            assert_eq!(added["executions"], json!([]));
+            assert_eq!(
+                page.evaluate("__scanLoaders[2]().then(module => module.default)")
+                    .unwrap(),
+                "new"
+            );
+            assert_eq!(scan_state(&page).unwrap()["executions"], json!(["new"]));
+
+            fs::remove_file(fixture.path().join("src/pages/Editor.page.ts")).unwrap();
+            server.await_rebuild();
+            let removed = wait_for_scan_update(&page, &added["boot"], json!(["/sign-in", "/new"]));
+            assert_eq!(removed["executions"], json!([]));
+            assert_eq!(removed["loginStyle"], "");
+            assert_eq!(removed["editorStyle"], "");
+            assert_eq!(removed["metadata"][0]["path"], "/src/pages/Login.page.ts");
+            assert_eq!(
+                page.evaluate("__scanLoaders[0]().then(module => module.default.name)")
+                    .unwrap(),
+                "Login"
+            );
+            eprintln!(
+                "component scan source={generate_source}: frontmatter edit, addition, deletion reloaded successfully"
             );
         });
     }

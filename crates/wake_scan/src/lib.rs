@@ -5,7 +5,7 @@
 //! `.md/.mdx` 取 `+++ … +++` frontmatter。产出一段 JS 模块源码，经 `@@@/{namespace}` 别名被入口引用：
 //!
 //! ```ts
-//! const ___src_pages_home_tsx = import("@@/src/pages/home.tsx");
+//! const ___src_pages_home_tsx = () => import("@@/src/pages/home.tsx");
 //! const components = [
 //!   { name: "___src_pages_home_tsx", component: ___src_pages_home_tsx,
 //!     path: "/src/pages/home.tsx", frontmatter: {"title":"Home"}, source: null },
@@ -14,7 +14,9 @@
 //! ```
 //!
 //! `import("@@/…")` 中的 `@@` 是项目根别名（wake_resolver 解析），动态 import 让每个组件独立成
-//! async chunk（开启代码分割时）。本 crate **只做数据 + 字符串**：不依赖任何 wake crate。
+//! async chunk（开启代码分割时）。读取条目或其 `component` 不启动导入；只有调用加载函数才导入，
+//! 返回模块命名空间的 Promise。旧 Promise 调用方须迁移为 `await entry.component()`。
+//! 本 crate **只做数据 + 字符串**：不依赖任何 wake crate。
 
 use std::path::{Path, PathBuf};
 
@@ -234,11 +236,11 @@ fn toml_frontmatter(src: &str) -> Option<String> {
 /// 渲染懒加载模块源码。
 fn generate_module(entries: &[ScanEntry]) -> String {
     let mut out = String::new();
-    // 逐条 `const <name> = import("<url>");`
+    // 保存加载函数；导入扫描模块或读取元数据时不能启动页面导入。
     for e in entries {
         out.push_str("const ");
         out.push_str(&e.name);
-        out.push_str(" = import(");
+        out.push_str(" = () => import(");
         push_js_string(&mut out, &e.import_url);
         out.push_str(");\n");
     }
@@ -359,7 +361,9 @@ mod tests {
             },
         ];
         let m = generate_module(&entries);
-        assert!(m.contains("const ___a_tsx = import(\"@@/a.tsx\");"));
+        assert!(m.contains("const ___a_tsx = () => import(\"@@/a.tsx\");"));
+        assert!(m.contains("const ___b_tsx = () => import(\"@@/b.tsx\");"));
+        assert!(!m.contains(" = import("), "must not create eager Promises");
         assert!(m.contains("component: ___a_tsx"));
         assert!(m.contains("path: \"/a.tsx\""));
         assert!(m.contains("frontmatter: {\"index\":true}"));

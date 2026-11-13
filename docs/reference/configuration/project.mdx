@@ -262,6 +262,44 @@ Wake Federation v1 暂不创建或接收 Trusted Types policy，浏览器 transp
 | `include` | 文件包含正则字符串 |
 | `exclude` | 文件排除正则字符串 |
 
+扫描模块默认导出按文件路径排序的条目数组。`component` 是无参数加载函数，调用后返回
+`import()` 的 Promise（解析为模块命名空间），例如：
+
+```ts
+import pages from '@@@/pages';
+
+// 只读取菜单或路由元数据，不启动页面导入。
+const paths = pages.map(page => page.frontmatter?.path);
+const { component: loadPage } = pages[0];
+const module = await loadPage();
+```
+
+条目保留 `name`（由导入路径生成的标识符）、`path`（项目根相对路径，带前导 `/`，使用 `/`
+分隔符）、`frontmatter`（解析后的 TOML 对象，无有效 frontmatter 时为 `null`）及 `source`
+（`generate_source = true` 时为完整源码字符串，否则为 `null`）。例如：
+
+```ts
+{
+  name: '___src_pages_Login_page_tsx',
+  path: '/src/pages/Login.page.tsx',
+  frontmatter: { path: '/user/login', layout: 'emptyLayout' },
+  component: () => import('@@/src/pages/Login.page.tsx'),
+  source: null,
+}
+```
+
+开发服务和生产构建均在调用加载函数时才启动对应动态导入。导入扫描模块、遍历元数据、读取或
+解构 `component` 不会加载或执行页面；仅由未访问页面拥有的 JS、CSS 不会因扫描提前加载。
+页面及必要的共享依赖按正常动态导入规则加载，多次调用复用模块执行结果。其他入口的显式导入
+仍按其自身规则加载。开发模式新增、删除扫描文件或修改 frontmatter 后，通过整页 Live Reload
+发布新的扫描结果。`generate_source` 内联的是文本，不会执行页面，也不取消动态分块。
+
+迁移：0.1.50 及更早版本的 `component` 是在扫描模块求值时创建的 Promise。从 0.1.51 起必须把
+`await page.component` 改为 `await page.component()`，把 `page.component.then(...)` 改为
+`page.component().then(...)`，并将应用中的类型声明改为 `() => Promise<页面模块类型>`。
+React `lazy` 可直接接收 `page.component`（页面需有默认组件导出）；路由框架需要其他导出形状时，
+在其 `lazy` 回调内部调用加载函数并适配模块。不提供隐式 Promise 兼容或同时创建 eager Promise。
+
 ## 加载与错误
 
 所有相对路径以配置文件所在目录为基准，再应用 `root_dir`。找不到 `wake.config.toml` 时使用默认配置；文件存在但无法读取、TOML 无效或 Browserslist 查询失败时，Wake 终止并报告对应文件，不会静默回退。
