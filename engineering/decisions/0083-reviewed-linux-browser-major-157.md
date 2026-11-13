@@ -32,13 +32,15 @@ Linux x64 的 reviewed-major-conformance 增加 157，记录对应官方镜像�
 
 新镜像可进入原有实验性门禁，完整功能结果由云端验证。后续镜像升级继续显式审查。
 0.1.51 的未发布候选记录和标签保留，不改写已有标签。
+托管镜像滚动更新期间，CI 与发布消费任务可能取得不同的已审查主版本；分别记录实际
+CDP 版本，不将旧主版本的完整回归声明为新主版本的完整回归。两类门禁均须通过。
 
 ## Validation
 
 - `corepack yarn browser:conformance:test`、`corepack yarn release:check`。
 - `corepack yarn architecture:test`、`corepack yarn architecture:check`。
 - `node scripts/check-system-browser-conformance.mjs --stable-readiness blocked`。
-- Linux Chrome 157 云端完整 browser-conformance，以及发布前后干净 npm 消费验证。
+- Linux 云端完整 browser-conformance，以及发布前后干净 npm 消费验证；各任务校验并记录实际浏览器版本。
 
 ## Supersedes
 
