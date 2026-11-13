@@ -64,7 +64,7 @@
       "rustTarget": "x86_64-unknown-linux-gnu",
       "experimental": {
         "mode": "reviewed-major-conformance",
-        "majors": [151, 152, 155, 156]
+        "majors": [151, 152, 155, 156, 157]
       },
       "reviewedRunnerEvidence": [
         {
@@ -99,6 +99,15 @@
           "imageVersion": "20261101.360.1",
           "browserVersions": {
             "chrome": "156.0.8078.79"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/fb099341ddaf44a428fb17495341cb7c2300faf2/images/ubuntu/Ubuntu2404-Readme.md",
+          "imageVersion": "20261111.370.1",
+          "browserVersions": {
+            "chrome": "157.0.8103.50",
+            "chromium": "157.0.8103.0",
+            "edge": "157.0.4341.46"
           }
         }
       ]

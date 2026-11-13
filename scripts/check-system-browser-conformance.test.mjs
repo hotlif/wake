@@ -51,7 +51,7 @@ for (const [target, version] of [
   assert.equal(checked.browser.major, 155)
   assert.equal(checked.mode, 'reviewed-major-conformance')
   assert.equal(checked.stableConformance, false)
-  const unreviewedMajors = [153, 154, 157]
+  const unreviewedMajors = target === 'linux-x64-gnu' ? [153, 154, 158] : [153, 154, 157, 158]
   for (const major of unreviewedMajors) {
     assert.throws(() => validateExperimentalBrowserIdentity({
       manifest,
@@ -84,7 +84,7 @@ wrongWindowsInventory.targets['win32-x64-msvc'].reviewedRunnerEvidence[0].source
 assert.throws(() => validateSystemBrowserConformanceManifest(wrongWindowsInventory),
   /immutable official runner-images inventory/)
 
-for (const major of [151, 152, 155, 156]) {
+for (const major of [151, 152, 155, 156, 157]) {
   const linuxChromeEvidence = validateExperimentalBrowserIdentity({
     manifest,
     target: 'linux-x64-gnu',
@@ -142,6 +142,7 @@ for (const major of [150, 152, 157]) {
 
 for (const [target, version, mode] of [
   ['linux-x64-gnu', 'Chrome/156.0.8078.79', 'reviewed-major-conformance'],
+  ['linux-x64-gnu', 'Chrome/157.0.8103.50', 'reviewed-major-conformance'],
   ['darwin-arm64', 'Chrome/157.0.8103.39', 'reviewed-major-smoke'],
 ]) {
   const checked = validateExperimentalBrowserIdentity({
