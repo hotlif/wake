@@ -294,7 +294,7 @@ const module = await loadPage();
 仍按其自身规则加载。开发模式新增、删除扫描文件或修改 frontmatter 后，通过整页 Live Reload
 发布新的扫描结果。`generate_source` 内联的是文本，不会执行页面，也不取消动态分块。
 
-迁移：0.1.50 及更早版本的 `component` 是在扫描模块求值时创建的 Promise。从 0.1.51 起必须把
+迁移：0.1.50 及更早版本的 `component` 是在扫描模块求值时创建的 Promise。从 0.1.52 起必须把
 `await page.component` 改为 `await page.component()`，把 `page.component.then(...)` 改为
 `page.component().then(...)`，并将应用中的类型声明改为 `() => Promise<页面模块类型>`。
 React `lazy` 可直接接收 `page.component`（页面需有默认组件导出）；路由框架需要其他导出形状时，

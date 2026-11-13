@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.51
+## 0.1.52
+
+- 接续未发布的 0.1.51 候选，保留其标签；正式审查 Linux Chrome 157 官方镜像并纳入原有实验性门禁，stable readiness 仍为 blocked。
+- 包含下述组件扫描按需加载修复和调用契约变更。
+
+## 0.1.51（未发布）
 
 - 组件扫描的 `component` 改为 `() => import(...)` 加载函数；导入扫描模块或读取路由、菜单元数据不再启动所有页面的导入。
 - **调用契约变更**：将 `await page.component` 改为 `await page.component()`，将 `.component.then(...)` 改为 `.component().then(...)`，并同步应用类型声明。没有旧 eager Promise 兼容模式。
