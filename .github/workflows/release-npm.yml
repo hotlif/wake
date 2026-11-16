@@ -16,7 +16,7 @@ env:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.package-version.outputs.version }}
       source_date_epoch: ${{ steps.source-date.outputs.epoch }}
@@ -25,6 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -33,7 +34,7 @@ jobs:
       - run: corepack yarn yarn:lock:check
       - run: corepack yarn pnp:conformance:check
       - name: Fetch locked Rust dependencies
-        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu --target wasm32-unknown-unknown
       - name: Verify pinned Rusty V8 input
         run: node scripts/prepare-rusty-v8.mjs --target x86_64-unknown-linux-gnu
       - name: Read package version
@@ -52,6 +53,7 @@ jobs:
       - run: corepack yarn npm:test:wake:federation
       - run: corepack yarn npm:typecheck:wake
       - run: corepack yarn npm:typecheck:css
+      - run: corepack yarn browser:build
       - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css,npm/wake,npm/wake-lint-sdk
@@ -66,6 +68,27 @@ jobs:
         run: ./target/debug/wake test npm/css/test/runtime.test.mjs --serial
       - name: Test the explicit Node realm boundary
         run: node --test npm/css/test/realm.node.mjs
+      - name: Verify browser compiler from the packed npm artifact
+        shell: bash
+        env:
+          WAKE_SYSTEM_BROWSER_PATH: /usr/bin/google-chrome
+        run: |
+          set -euo pipefail
+          identity="$RUNNER_TEMP/wake-browser-preview-identity.json"
+          cargo run --locked --offline --quiet -p wake_test_browser --example system_browser_identity > "$identity"
+          node scripts/check-system-browser-conformance.mjs --target linux-x64-gnu --identity "$identity"
+          preview="$RUNNER_TEMP/wake-browser-package"
+          mkdir -p "$preview"
+          npm pack ./npm/wake --ignore-scripts --pack-destination "$preview"
+          tar -xzf "$preview/crab-dev-wake-${{ steps.package-version.outputs.version }}.tgz" -C "$preview"
+          export WAKE_BROWSER_PACKAGE_DIR="$preview/package"
+          export WAKE_BROWSER_WASM_PATH="$preview/package/browser/wake_browser.wasm"
+          cargo test --locked --offline -p wake_browser --test browser -- --ignored --nocapture --test-threads=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-compiler
+          path: npm/wake/browser/wake_browser.wasm
+          if-no-files-found: error
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
@@ -244,6 +267,10 @@ jobs:
           node-version: 24
       - run: npm install --global corepack@0.34.6 --force
       - run: corepack yarn install --immutable --check-cache
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-compiler
+          path: npm/wake/browser
       - run: mkdir -p artifacts
       - run: corepack yarn npm:pack:check
         env:
@@ -316,18 +343,24 @@ jobs:
                 ;;
               '@crab-dev/wake')
                 test "$native_count" -eq 0
-                test "$(stat -c%s "$archive")" -le 524288
+                test "$(stat -c%s "$archive")" -le 4194304
                 for required in \
                   bin/wake.mjs \
                   index.cjs index.mjs index.d.ts \
                   experimental.cjs experimental.mjs experimental.d.ts \
                   federation.mjs federation.d.mts \
                   federation-react.mjs federation-react.d.ts \
+                  browser.mjs browser.d.ts browser-preview.mjs browser-worker.mjs browser-wasm.mjs \
+                  browser-service-worker.mjs browser-service-worker-handler.mjs browser-service-worker.d.mts \
+                  browser/wake_browser.wasm \
                   test.cjs test.mjs test.d.ts \
                   test-react.cjs test-react.mjs test-react.d.ts \
                   internal/components-runtime.mjs internal/components-runtime.d.ts; do
                   grep -qx "package/$required" <<<"$list"
                 done
+                extracted="$(mktemp -d)"
+                tar -xzf "$archive" -C "$extracted"
+                node --input-type=module -e 'import { verifyBrowserArtifact } from "./scripts/verify-browser-artifact.mjs"; verifyBrowserArtifact(process.argv[1])' "$extracted/package/browser/wake_browser.wasm"
                 ;;
               '@crab-dev/wake-lint-sdk')
                 test "$native_count" -eq 0

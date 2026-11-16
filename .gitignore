@@ -41,6 +41,7 @@ fixtures/*/input/src/
 # a platform package staging directory.
 /npm/*/*.node
 /npm/wake/native.d.ts
+/npm/wake/browser/*.wasm
 /npm/*/test-host/
 /npm/wake-*/native-manifest.json
 /npm/wake-*/sbom.spdx.json

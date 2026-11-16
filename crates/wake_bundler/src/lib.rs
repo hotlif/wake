@@ -22,6 +22,7 @@ pub mod library;
 mod loader;
 mod resource_refs;
 mod session;
+mod timer;
 pub use generation::BuildGeneration;
 pub(crate) use incremental::IncrementalBundler;
 pub use session::{

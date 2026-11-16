@@ -28,6 +28,25 @@ import { validateSkill } from './check-skills.mjs'
 const decision = 'engineering/decisions/0044-architecture-decision-routing.md'
 const indexed = (status = 'accepted') => ({ status, indexed: true })
 
+test('browser compilation and portable Federation assembly cannot own native product services', () => {
+  const saved = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
+  const names = ['wake_browser', 'wake_federation_build', 'wake_bundler', 'wake_common', 'wake_resolver', 'wake_federation_contract', 'wake_app', 'wake_dev_server', 'wake_node']
+  const records = activeAdrRecords
+  for (const id of ['browser-build-reuses-portable-compiler', 'federation-build-is-portable-assembly']) {
+    const rule = saved.rules.find(candidate => candidate.id === id)
+    assert.ok(rule, `${id} must be enforced`)
+    const fixture = policy({ crates: names, groups: {}, rules: [rule] })
+    const packages = new Map(names.map(name => [name, new Set()]))
+    packages.set(rule.from[0], new Set(rule.allowOnly))
+    assert.deepEqual(validatePolicy({ policy: fixture, packages, adrRecords: records }), [])
+    for (const forbidden of ['wake_app', 'wake_dev_server', 'wake_node']) {
+      packages.get(rule.from[0]).add(forbidden)
+      assert(validatePolicy({ policy: fixture, packages, adrRecords: records }).some(error => error.includes(`[${id}]`)))
+      packages.get(rule.from[0]).delete(forbidden)
+    }
+  }
+})
+
 test('npm release publishes the audited lint SDK before the root package', () => {
   const workflow = readFileSync(new URL('../.github/workflows/release-npm.yml', import.meta.url), 'utf8')
   const publish = workflow.match(/^  publish:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:\r?$)/m)?.[0]
@@ -95,6 +114,7 @@ const activeAdrRecords = new Map([
   ['0053-source-semantic-facts-for-lint.md', indexed()],
   ['0054-lint-control-flow-completions.md', indexed()],
   ['0055-content-addressed-lint-cache.md', indexed()],
+  ['0084-browser-preview-builds.md', indexed()],
 ])
 
 test('lint source fixes use snapshot validation and the shared publication owner', () => {
@@ -1987,6 +2007,8 @@ test('expands allow-only groups and rejects dependencies outside the declared la
 test('repository policy rejects foundation, parser, and shell boundary regressions', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_browser', new Set(['wake_bundler', 'wake_common', 'wake_resolver', 'wake_federation_contract', 'wake_federation_build']))
+  packages.set('wake_federation_build', new Set(['wake_bundler', 'wake_federation_contract']))
   packages.get('wake_common').add('wake_css')
   packages.get('wake_ecma_parser').add('wake_ecma_semantic')
   packages.get('wake_cli').add('wake_bundler')
@@ -2004,6 +2026,8 @@ test('repository policy rejects foundation, parser, and shell boundary regressio
 test('repository policy keeps the public compiler facade above one pure backend', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_browser', new Set(['wake_bundler', 'wake_common', 'wake_resolver', 'wake_federation_contract', 'wake_federation_build']))
+  packages.set('wake_federation_build', new Set(['wake_bundler', 'wake_federation_contract']))
   packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
   packages.get('wake_compiler_core').add('wake_ecma_parser')
   packages.get('wake_compiler_core').add('wake_ecma_minify')
@@ -2035,6 +2059,8 @@ test('repository policy keeps the public compiler facade above one pure backend'
 test('repository policy keeps browser policy above the driver', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_browser', new Set(['wake_bundler', 'wake_common', 'wake_resolver', 'wake_federation_contract', 'wake_federation_build']))
+  packages.set('wake_federation_build', new Set(['wake_bundler', 'wake_federation_contract']))
   packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
   packages.get('wake_test').add('wake_test_browser')
   packages.get('wake_test').add('wake_test_contract')
@@ -2065,6 +2091,8 @@ test('repository policy keeps browser policy above the driver', () => {
 test('repository policy separates the test contract, runner, host, and app', () => {
   const repositoryPolicy = JSON.parse(readFileSync(new URL('../engineering/architecture-boundaries.json', import.meta.url), 'utf8'))
   const packages = new Map(repositoryPolicy.crates.map((name) => [name, new Set()]))
+  packages.set('wake_browser', new Set(['wake_bundler', 'wake_common', 'wake_resolver', 'wake_federation_contract', 'wake_federation_build']))
+  packages.set('wake_federation_build', new Set(['wake_bundler', 'wake_federation_contract']))
   packages.set('wake_lint_core', new Set(['wake_common', 'wake_ecma_ast', 'wake_ecma_parser', 'wake_ecma_semantic']))
   packages.get('wake_test').add('wake_test_contract')
   packages.get('wake_test_host').add('wake_test_contract')

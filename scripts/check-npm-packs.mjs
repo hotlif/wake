@@ -10,6 +10,7 @@ import {
   platformContract,
 } from './native-package-contract.mjs'
 import { verifyNativePackage } from './verify-native-package.mjs'
+import { verifyBrowserArtifact } from './verify-browser-artifact.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const wakePackageDir = 'npm/wake'
@@ -110,12 +111,18 @@ for (const { directory, value: packageManifest } of manifests) {
     throw new Error(`${directory} must not contain native binaries`)
   }
   if (isWake) {
+    verifyBrowserArtifact(resolve(root, directory, 'browser/wake_browser.wasm'))
     for (const subpath of [
       '.',
       './experimental',
       './docs',
       './federation',
       './federation/react',
+      './browser',
+      './browser/worker',
+      './browser/service-worker',
+      './browser/service-worker-handler',
+      './browser/wasm',
       './test',
       './test/react',
       './internal/components-runtime',
@@ -179,7 +186,7 @@ for (const { directory, value: packageManifest } of manifests) {
   const limit = isCss || isSdk
     ? 128 * 1024
     : isWake
-      ? 500 * 1024
+      ? 4 * 1024 * 1024
       : PLATFORM_PACKED_LIMIT
   if (pack.size > limit) {
     throw new Error(`${directory} packed size ${pack.size} exceeds ${limit}`)

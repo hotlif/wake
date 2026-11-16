@@ -90,6 +90,7 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 crossterm = "0.29.0"
 arboard = { version = "=3.6.1", default-features = false, features = ["wayland-data-control"] }
 base64 = "=0.22.1"
+sha2 = "=0.10.9"
 ring = "=0.17.14"
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 # Embedded DOM fetch transport. Keep TLS in pure Rust and bound every call in wake_js_runtime;
@@ -135,6 +136,7 @@ wake_test = { path = "crates/wake_test" }
 wake_test_contract = { path = "crates/wake_test_contract" }
 wake_test_browser = { path = "crates/wake_test_browser" }
 wake_federation_contract = { path = "crates/wake_federation_contract" }
+wake_federation_build = { path = "crates/wake_federation_build" }
 
 # —— 测试 / 基准（dev-dependencies 复用）——
 insta = "1.48.0"

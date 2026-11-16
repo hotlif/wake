@@ -71,6 +71,7 @@
 - [ADR 0079: 同步 ESM 库输出与源码映射组合](0079-synchronous-esm-bundle-and-affixes.md) — `accepted`
 - [ADR 0081: PnP 包内静态资源边界](0081-pnp-package-resource-boundaries.md) — `accepted`
 - [ADR 0082: 组件扫描导出按需加载函数](0082-component-scan-loaders.md) — `accepted`
+- [ADR 0084: 浏览器内存构建与预览发布](0084-browser-preview-builds.md) — `accepted`
 
 ### css-editor
 

@@ -35,6 +35,14 @@ Compiler primitives are intentionally isolated under
 `@crab-dev/wake/experimental`. A `ParsedModule` is an opaque, disposable
 native handle and cannot be cloned, persisted, or transferred to a Worker.
 
+The experimental `@crab-dev/wake/browser` entry runs the same compiler in a
+Worker/WASM instance against complete virtual file snapshots. It returns
+Federation assets and supports local preview updates through a host-controlled
+Service Worker. Dependencies and shared React provider identities are supplied by
+the host; no Node binding or backend build request is used during compilation.
+See the [browser preview guide](https://github.com/hotlif/wake/blob/canary/docs/integration/browser-preview.mdx)
+for deployment, lifecycle callbacks and current limits.
+
 The stable API also includes in-memory `bundle()`, incremental
 `createBuildContext()`, documentation builds and development servers. Build
 and server operations accept `AbortSignal`; long-lived contexts and servers

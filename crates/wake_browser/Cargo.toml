@@ -1,0 +1,26 @@
+[package]
+name = "wake_browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Wake browser-owned virtual project builds"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+wake_common.workspace = true
+wake_bundler.workspace = true
+wake_resolver.workspace = true
+wake_federation_contract.workspace = true
+wake_federation_build.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wake_test_browser.workspace = true

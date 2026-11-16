@@ -19,6 +19,16 @@ Node 绑定或 JavaScript 测试 host 时，先确认产物与当前相关源码
 
 行为保持重构先运行现有聚焦测试建立基线，仅在存在覆盖缺口时补测试。纯文档、纯测试、只读审查、格式或版本同步不要求制造失败测试。行为缺陷无法稳定复现时先构造最小复现；仍不能复现则在修改实现前报告阻塞。
 
+## 浏览器构建预览
+
+浏览器构建产品的聚焦入口是 `cargo test --locked --offline -p wake_browser --test project`。
+`corepack yarn browser:build` 生成版本匹配的 release WASM 后，设置 `WAKE_BROWSER_WASM_PATH`
+为 `npm/wake/browser/wake_browser.wasm` 的绝对路径，运行
+`cargo test --locked --offline -p wake_browser --test browser -- --ignored --nocapture --test-threads=1`。
+此门禁覆盖真实 Worker/Service Worker、原生与 WASM 产物字节对照、React 共享、CSS、图片、延迟分块、
+取消与预览释放，并沿用已审查的系统浏览器矩阵。主 npm 包必须包含该 WASM，packed 上限为 4 MiB，
+独立 WASM 上限为 10 MiB；平台原生包预算不变。公共声明同时运行 `npm:typecheck:wake`。
+
 ## 本地临时产物
 
 手工验证的临时脚本、配置和日志放在仓库根 `.tmp/<任务名>/` 下，不散落在 `.tmp` 根目录。

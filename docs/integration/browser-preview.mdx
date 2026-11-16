@@ -1,0 +1,157 @@
++++
+title = "浏览器内构建预览"
+description = "在编译 Worker 中构建虚拟项目，并在宿主中更新本地 Federation 预览。"
+kind = "guide"
+status = "experimental"
++++
+
+# 浏览器内构建预览
+
+浏览器 SDK 使用与原生构建相同的 Wake 编译器、resolver、CSS 转换和 BuildSession。项目文件与依赖
+准备后，编译不需要 Node、原生扩展或后端构建请求。正式发布仍走原生构建和项目的完整检查。
+
+## 输入与构建
+
+`@crab-dev/wake/browser` 的 `createBrowserBuildContext` 接收 `wasmUrl`、可选 `workerUrl` 及构建配置。
+`federation` 使用现有 exposes/shared 配置；首版支持 generic 和 host-rendered，依赖由宿主以虚拟
+`node_modules` 文件供应，共享依赖必须显式 `fallback: false`。不下载依赖，不执行配置或安装脚本。
+`hostShared` 按 share key 提供宿主已注册 provider 的真实包身份（name、version、packageContext、
+buildVariant），可从宿主 Federation manifest 的 shared offers 取得。构建校验虚拟依赖包的名称、
+版本与包上下文，再将宿主的 buildVariant 写入 requirement；不要用预览结果反向伪造宿主身份。
+
+```ts
+import { createBrowserBuildContext, createBrowserPreview } from '@crab-dev/wake/browser';
+
+const builder = await createBrowserBuildContext({
+  wasmUrl: '/wake/wake_browser.wasm',
+  workerUrl: '/wake/browser-worker.mjs',
+  hostShared: platformSharedIdentities,
+  federation: {
+    enabled: true,
+    name: 'editor_preview',
+    exposes: { './page': { entry: 'src/page.tsx', mode: 'host-rendered', scope: 'editor' } },
+    shared: platformSharedConfig,
+  },
+});
+const result = await builder.build(files, { signal });
+```
+
+`files` 是路径到字符串或 `Uint8Array` 的完整快照，二进制文件不经过文本编码。新增、修改与删除
+都由快照表达。路径必须是相对 POSIX 路径，拒绝 `..`、绝对路径、反斜杠、URL 转义、文件/目录冲突
+及 `.wake-browser` 保留目录。首版上限为 20,000 个文件、128 MiB 原始内容。
+
+成功结果包含 `manifest`、全部产物 `files`、结构化诊断和模块复用计数。每个产物携带路径、MIME
+和实际字节，Manifest 的摘要针对实际加载字节。失败返回错误码和源码位置，不替换上次成功结果。
+连续请求以最新请求为准；取消运行中的编译会终止 Worker，下次构建重新初始化。`dispose()` 释放
+Worker 和编译上下文。浏览器耗时由 Worker 外围测量，原生阶段计时不作为浏览器测量值提供。
+
+## 本地产物与更新
+
+本地预览通过同源 Service Worker 提供不可变的虚拟资源 URL，保持 CSS、图片和延迟分块引用。
+宿主负责部署编译 Worker、WASM 和预览 Service Worker，并确保当前页面受该 Service Worker 控制。
+现有应用 Service Worker 可以集成 Wake 的预览处理器；SDK 不替换或注销应用已有的 Service Worker。
+CacheStorage 仅作为可恢复的本地资源存储，不向服务器上传源码或构建结果。
+JavaScript 响应的 `SourceMap` 头指向同一快照中的 map；关联调试资源时不改写 JavaScript 字节或完整性摘要。
+
+资源命名空间固定为 `/__wake_preview__/`，Service Worker 的 scope 必须覆盖宿主页面和这个路径。
+需要 HTTPS 或 localhost、安全上下文中的 Worker、WebAssembly、Service Worker、CacheStorage 与
+Web Crypto。主页面的 CSP 需要允许同源 module script、worker、style 和图片；WASM 实例化也须
+符合宿主 CSP。SDK 不自动更改这些部署策略。预览代码在宿主页面上下文执行，本入口不提供代码沙箱。
+
+已有应用 Service Worker 应使用无副作用的 handler 入口，保留应用自己的 install/activate 策略：
+
+```js
+import {
+  handleBrowserPreviewFetch,
+  handleBrowserPreviewMessage,
+  cleanupBrowserPreviews,
+} from '@crab-dev/wake/browser/service-worker-handler';
+
+self.addEventListener('message', event => {
+  if (handleBrowserPreviewMessage(event)) return;
+  // 接着处理应用自己的消息。
+});
+self.addEventListener('fetch', event => {
+  if (handleBrowserPreviewFetch(event)) return;
+  // 接着运行应用自己的 fetch 路由。
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(cleanupBrowserPreviews());
+});
+```
+
+将这段入口按应用原有方式打包；handler 的导入不注册监听器，也不调用 skipWaiting 或 clients.claim。
+没有已有 Service Worker 时，可部署 `@crab-dev/wake/browser/service-worker` 对应的独立模块；此入口
+会主动 skipWaiting/claim。注册后等待当前页面被控制，再将 registration 交给 preview。无需刷新页面。
+
+预览使用 Federation 的 `preview` 模式，保留 Manifest、资源完整性、包身份和 React 五成员组校验。
+该模式不订阅开发服务器租约、不执行整页刷新。`refreshPreviewRemote(name)` 重新读取已注册的本地
+Manifest；`releasePreviewBuild(name, buildId)` 在消费者卸载后释放该代受 Wake 管理的记录和资源节点。
+这些操作只适用于 preview remote，不能绕过 production lock 或修改原有 development 更新策略。
+
+宿主先准备新视图，再同步提交到预览区域；只有新视图提交后才卸载并释放旧视图。旧视图仍活跃时，
+其延迟资源保持可用。构建、加载或视图准备失败时，旧视图继续显示。首版允许组件重新挂载，不保证
+React 状态保持或 Fast Refresh。编辑器文档、撤销历史及业务 API 生命周期由宿主管理。
+
+```ts
+const preview = await createBrowserPreview({
+  registration, name: 'editor_preview', expose: './page', runtime: hostFederationRuntime,
+});
+await preview.update(result, async exports => {
+  // renderOffscreen 由宿主实现，并在失败时自行释放尚未返回的视图。
+  const view = await renderOffscreen(exports.default);
+  return {
+    commit() { previewElement.replaceChildren(view.element); },
+    dispose() { view.unmount(); view.element.remove(); },
+  };
+});
+// 编辑器关闭预览时：
+await preview.dispose();
+builder.dispose();
+```
+
+`commit()` 必须同步且不抛错；SDK 无法撤销宿主回调已经执行的任意副作用。`dispose()` 只处理自己的
+视图，因为新视图可能已提交。旧视图释放失败时，update 返回 `cleanupError`，已提交的新视图继续显示。
+同一 buildId 不重复准备视图，重复的更新请求只允许最新请求提交。失败的 prepare 若已创建 React root，
+须在抛错前自行 unmount。输入快照会复制；调用 update 后不要修改它持有的 manifest 或产物字节。
+
+存储按受控页面 client、preview session 和 publication 隔离，暂存上限为每次 40,000 个产物、256 MiB、
+每个 session 最多 4 个快照。release/dispose 删除对应缓存；后续维护清理已经关闭页面遗留的缓存。
+存储配额不足、完整性不匹配或资源加载失败会拒绝更新，不回退到后端构建。
+
+## 部署产物
+
+npm 包中包含与 JS adapter 匹配的 `browser/wake_browser.wasm`。可用包导出路径解析以下文件并复制
+到宿主的静态资源目录；这些是部署操作，用户编辑期间无需服务器参与编译。
+
+| 包导出 | 用途 |
+| --- | --- |
+| `@crab-dev/wake/browser` | 主页面 SDK 和类型 |
+| `@crab-dev/wake/browser/worker` | 编译 Worker，保留同目录的 browser-wasm.mjs |
+| `@crab-dev/wake/browser/wasm` | 编译器 WASM，URL 通过 wasmUrl 指定 |
+| `@crab-dev/wake/browser/service-worker` | 独立 Service Worker，保留同目录的 browser-service-worker-handler.mjs |
+| `@crab-dev/wake/browser/service-worker-handler` | 集成进已有应用 Service Worker 的处理器和类型 |
+
+源码仓库使用 `corepack yarn browser:build` 生成 npm WASM 产物；先安装 Rust 1.95 的
+`wasm32-unknown-unknown` target 并准备锁定依赖。构建脚本离线执行，打包检查验证无 host imports、
+ABI 和体积预算。构建后的 WASM 约 6.8 MB（未压缩），主 npm 包压缩后约 2.1 MB；具体大小随版本变化。
+
+## 验证与首版范围
+
+覆盖多文件 JS/TS/JSX/TSX、React automatic runtime、Wake CSS、CSS Modules、JSON、静态图片、
+字面量动态导入和 source map。宿主仍须提供与配置匹配的 React 共享组及依赖包文件。浏览器构建使用
+现代浏览器目标；不支持 Node 内置模块、磁盘插件、远程 Federation 依赖或共享依赖的本地 fallback。
+浏览器自身的 ES module 缓存由浏览器管理，释放 Wake 记录不等于强制卸载浏览器的模块缓存。
+宿主 React 五成员组包括 `react`、`react-dom`、`react-dom/client`、`react/jsx-runtime`、
+`react/jsx-dev-runtime`。本地验证覆盖 Windows Chromium 中的开发与生产模式 React 宿主；跨平台浏览器验证交由仓库已审查的 CI 矩阵，
+不据此宣称 Safari、Firefox 或所有浏览器版本均已验证。
+
+接入后至少检查：编译错误保留旧预览、连续编辑只提交最新结果、旧视图准备交接期间仍可加载 lazy
+分块、关闭预览后缓存得到释放，以及编辑器输入与撤销历史保持不变。可从 result.durationMs 记录
+Worker 实际耗时，首次初始化的 WASM 下载和编译耗时应单独统计。
+
+## 下一步
+
+- [配置宿主 React 共享组](/integration/remote-react)
+- [了解 Federation 资源与身份契约](/integration/federation)
+- [正式发布检查](/integration/remote-delivery)

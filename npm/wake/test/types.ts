@@ -732,3 +732,20 @@ defineDocsUI({ Header: 'header' });
 defineDocsUI({ Headre: () => null });
 // @ts-expect-error Incorrect props cannot be registered for a slot.
 defineDocsUI({ Header: (_props: { wrong: number }) => null });
+
+import { createBrowserBuildContext, createBrowserPreview, BrowserBuildError } from '@crab-dev/wake/browser'
+const browserBuilder = await createBrowserBuildContext({
+  wasmUrl: new URL('/wake.wasm', 'https://example.test'),
+  federation: { enabled: true, name: 'preview', exposes: { './page': { entry: 'src/page.ts' } } },
+})
+const browserOutput = await browserBuilder.build({ 'src/page.ts': 'export const value = 42;', 'image.png': new Uint8Array() }, { signal: new AbortController().signal })
+const browserPreview = await createBrowserPreview({ name: 'preview', registration: {} as ServiceWorkerRegistration })
+await browserPreview.update(browserOutput, (exports) => ({ commit() { void exports }, dispose() {} }))
+const browserError: string = new BrowserBuildError('WAKE_BUILD', 'failed').code
+void browserError
+// @ts-expect-error Snapshots preserve binary bytes, not numeric arrays.
+browserBuilder.build({ 'image.png': [1, 2, 3] })
+// @ts-expect-error The browser SDK does not accept native disk output options.
+createBrowserBuildContext({ wasmUrl: '/wake.wasm', outdir: 'dist' })
+browserBuilder.dispose()
+await browserPreview.dispose()

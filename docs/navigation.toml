@@ -71,7 +71,7 @@ pages = ["integration/remote-components"]
 [[group.section]]
 id = "remote-guides"
 title = "接入与发布"
-pages = ["integration/federation", "integration/remote-react", "integration/remote-isolated", "integration/remote-delivery"]
+pages = ["integration/federation", "integration/remote-react", "integration/remote-isolated", "integration/remote-delivery", "integration/browser-preview"]
 
 [[group]]
 id = "wake-docs"

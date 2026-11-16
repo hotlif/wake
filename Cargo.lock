@@ -3341,6 +3341,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4208,6 +4219,7 @@ dependencies = [
  "wake_dev_server",
  "wake_docs",
  "wake_ecma_transform",
+ "wake_federation_build",
  "wake_federation_contract",
  "wake_html",
  "wake_lint_core",
@@ -4217,6 +4229,20 @@ dependencies = [
  "wake_tsdoc",
  "wake_turbo",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wake_browser"
+version = "0.1.52"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wake_bundler",
+ "wake_common",
+ "wake_federation_build",
+ "wake_federation_contract",
+ "wake_resolver",
+ "wake_test_browser",
 ]
 
 [[package]]
@@ -4499,6 +4525,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "wake_common",
+]
+
+[[package]]
+name = "wake_federation_build"
+version = "0.1.52"
+dependencies = [
+ "base64 0.22.1",
+ "serde_json",
+ "sha2",
+ "wake_bundler",
+ "wake_federation_contract",
 ]
 
 [[package]]

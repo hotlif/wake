@@ -95,6 +95,7 @@
   },
   "crates": [
     "wake_app",
+    "wake_browser",
     "wake_bundler",
     "wake_cache",
     "wake_cli",
@@ -116,8 +117,8 @@
     "wake_ecma_semantic",
     "wake_ecma_transform",
     "wake_ecma_vm",
-    "wake_federation_contract",
-    "wake_graph",
+    "wake_federation_build",
+    "wake_federation_contract",    "wake_graph",
     "wake_html",
     "wake_js_runtime",
     "wake_lint_core",
@@ -147,10 +148,10 @@
       "wake_ecma_transform"
     ],
     "cssLayers": ["wake_css", "wake_css_in_js", "wake_css_language"],
-    "productEdges": ["wake_dev_server", "wake_docs", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp", "wake_lint_lsp"],
+    "productEdges": ["wake_browser", "wake_federation_build", "wake_dev_server", "wake_docs", "wake_test", "wake_test_browser", "wake_test_contract", "wake_test_host", "wake_app", "wake_cli", "wake_node", "wake_css_lsp", "wake_lint_lsp"],
     "shells": ["wake_cli", "wake_node"],
     "nonShells": [
-      "wake_app", "wake_bundler", "wake_cache", "wake_common", "wake_compiler", "wake_compiler_core", "wake_config",
+      "wake_app", "wake_browser", "wake_federation_build", "wake_bundler", "wake_cache", "wake_common", "wake_compiler", "wake_compiler_core", "wake_config",
       "wake_css", "wake_css_in_js", "wake_css_language", "wake_css_lsp", "wake_dev_server", "wake_docs", "wake_ecma_ast",
       "wake_ecma_codegen", "wake_ecma_lexer", "wake_ecma_minify", "wake_ecma_parser",
       "wake_ecma_semantic", "wake_ecma_transform", "wake_ecma_vm", "wake_federation_contract", "wake_graph", "wake_html",
@@ -176,6 +177,33 @@
     }
   ],
   "rules": [
+    {
+      "id": "browser-build-reuses-portable-compiler",
+      "description": "browser compilation owns snapshots and Worker lifecycle above the existing compiler",
+      "from": ["wake_browser"],
+      "allowOnly": ["wake_bundler", "wake_common", "wake_resolver", "wake_federation_contract", "wake_federation_build"],
+      "require": ["wake_bundler", "wake_resolver", "wake_federation_build"],
+      "decision": "engineering/decisions/0084-browser-preview-builds.md",
+      "suggestion": "Keep native products, OS services and a second compiler out of browser builds."
+    },
+    {
+      "id": "federation-build-is-portable-assembly",
+      "description": "portable Federation assembly binds existing bundler outputs to the common contract",
+      "from": ["wake_federation_build"],
+      "allowOnly": ["wake_bundler", "wake_federation_contract"],
+      "require": ["wake_bundler", "wake_federation_contract"],
+      "decision": "engineering/decisions/0084-browser-preview-builds.md",
+      "suggestion": "Keep publication, configuration discovery, network and session lifetimes in product callers."
+    },
+    {
+      "id": "browser-products-stay-above-foundations",
+      "description": "shared lower layers cannot depend on browser products or Federation assembly",
+      "fromGroups": ["compilerCore", "cssLayers"],
+      "from": ["wake_cache", "wake_graph", "wake_resolver", "wake_turbo"],
+      "deny": ["wake_browser", "wake_federation_build"],
+      "decision": "engineering/decisions/0084-browser-preview-builds.md",
+      "suggestion": "Keep browser policy and Federation publication above reusable compiler infrastructure."
+    },
     {
       "id": "lint-core-is-source-analysis",
       "description": "single-file lint owns pure source rules without filesystem or product orchestration",

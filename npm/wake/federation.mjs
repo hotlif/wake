@@ -165,11 +165,11 @@ function boundedPositiveInteger(value, field, maximum, phase) {
 }
 
 function federationMode(value, phase) {
-  if (value !== 'development' && value !== 'production') {
-    fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Federation mode must be development or production', {
+  if (value !== 'development' && value !== 'production' && value !== 'preview') {
+    fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Federation mode must be development, production or preview', {
       phase,
       retryable: false,
-      details: { field: 'mode', actual: value, allowed: ['development', 'production'] },
+      details: { field: 'mode', actual: value, allowed: ['development', 'production', 'preview'] },
     })
   }
   return value
@@ -2043,6 +2043,112 @@ export class FederationRuntime {
     return this
   }
 
+  /** Refresh an explicitly local preview without dispatching a page reload or server lease. */
+  async refreshPreviewRemote(name) {
+    const remote = this.#remote(name)
+    if (remote.mode !== 'preview') {
+      fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Only preview remotes support local refresh', {
+        phase: 'preview-refresh', retryable: false, details: { name, mode: remote.mode },
+      })
+    }
+    const previous = remote.manifest
+    const revision = ++remote.revision
+    remote.manifest = null
+    remote.manifestFlight = null
+    remote.fatalError = null
+    remote.exposeErrors.clear()
+    try {
+      return await this.#manifest(remote)
+    } catch (error) {
+      if (remote.revision === revision) {
+        remote.manifest = previous
+        remote.manifestFlight = null
+        remote.fatalError = null
+      }
+      throw error
+    }
+  }
+
+  /** The caller must first unmount every consumer of this preview build, including lazy users. */
+  async releasePreviewBuild(name, buildId) {
+    const remote = this.#remote(name)
+    if (remote.mode !== 'preview') {
+      fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Only preview builds can be explicitly released', {
+        phase: 'preview-release', retryable: false, details: { name, mode: remote.mode },
+      })
+    }
+    const manifest = remote.acceptedManifests.get(buildId)
+    if (manifest === undefined) return
+    if (remote.manifest?.buildId === buildId) {
+      remote.revision += 1
+      remote.manifest = null
+      remote.manifestFlight = null
+      remote.fatalError = null
+    }
+    remote.acceptedManifests.delete(buildId)
+    remote.acceptedManifestSignatures.delete(buildId)
+    const key = containerKey(name, buildId)
+    this.containers.delete(key)
+    this.containerFlights.delete(key)
+    for (const map of [this.moduleValues, this.moduleFlights]) {
+      for (const item of map.keys()) if (item.startsWith(`${key}\0`)) map.delete(item)
+    }
+    const assets = manifestAssetRecords(manifest).map(record => record.asset)
+    const stillUsed = new Set()
+    for (const other of this.remotes.values()) {
+      for (const accepted of other.acceptedManifests.values()) {
+        for (const { asset } of manifestAssetRecords(accepted)) stillUsed.add(`${asset.url}\0${asset.integrity}`)
+      }
+    }
+    const releases = []
+    for (const asset of assets) {
+      const assetKey = `${asset.url}\0${asset.integrity}`
+      if (stillUsed.has(assetKey)) continue
+      const style = this.styleFlights.get(assetKey)
+      this.styleFlights.delete(assetKey)
+      if (style !== undefined) releases.push(Promise.resolve(style).then(node => node?.remove?.(), () => {}))
+      for (const scriptKey of this.scriptFlights.keys()) {
+        if (scriptKey.startsWith(`${assetKey}\0${key}\0`)) this.scriptFlights.delete(scriptKey)
+      }
+      const contexts = this.global[ASSET_CONTEXTS_SYMBOL]
+      if (contexts instanceof Map && contexts.get(asset.url)?.buildId === buildId) contexts.delete(asset.url)
+      for (const node of this.global.document?.querySelectorAll?.('script[type="module"][src]') ?? []) {
+        if (node.src === asset.url) node.remove()
+      }
+    }
+    for (const symbol of ['wake.federation.exposes.v1', 'wake.federation.share-contexts.v1']) {
+      const builds = this.global[Symbol.for(symbol)]?.[name]
+      if (builds !== undefined) delete builds[buildId]
+    }
+    const bundles = this.global[Symbol.for('wake.federation.bundle-runtimes.v1')]
+    if (bundles instanceof Map) {
+      for (const bundleKey of bundles.keys()) if (bundleKey.startsWith(`${key}\0`)) bundles.delete(bundleKey)
+    }
+    for (const [bucketKey, bucket] of this.isolatedStyleBuckets) {
+      if (bucketKey.startsWith(`${key}\0`)) {
+        for (const target of bucket.targets.values()) {
+          target.references = 1
+          this.#releaseIsolatedStyleTarget(bucket, target)
+        }
+        this.isolatedStyleBuckets.delete(bucketKey)
+      }
+    }
+    await Promise.all(releases)
+  }
+
+  /** Close a preview after unmounting its consumers. Native remote registrations are unaffected. */
+  async unregisterPreviewRemote(name) {
+    const remote = this.#remote(name)
+    if (remote.mode !== 'preview') {
+      fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Only preview remotes can be explicitly unregistered', {
+        phase: 'preview-release', retryable: false, details: { name, mode: remote.mode },
+      })
+    }
+    remote.revision += 1
+    for (const buildId of [...remote.acceptedManifests.keys()]) await this.releasePreviewBuild(name, buildId)
+    this.remotes.delete(name)
+  }
+
   applyDevUpdate(value) {
     const update = normalizeDevUpdate(value)
     const remote = this.#remote(update.remote)
@@ -2905,6 +3011,12 @@ export class FederationRuntime {
       }
       this.#assertRevision(remote, revision)
       const manifest = normalizeManifest(rawManifest, remote)
+      if (remote.mode === 'preview' && (manifest.development !== undefined ||
+          manifest.shared.offers.length !== 0 || manifest.shared.requirements.some(item => item.policy.fallback))) {
+        fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Preview manifests require host-owned shares and no development server', {
+          phase: 'manifest-validate', retryable: false, details: { name: remote.name },
+        })
+      }
       this.#assertRevision(remote, revision)
       this.#acceptDevelopmentManifest(remote, manifest, controlAtStart)
       this.#rememberAcceptedManifest(remote, manifest)

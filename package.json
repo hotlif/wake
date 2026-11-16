@@ -13,6 +13,7 @@
   "scripts": {
     "architecture:check": "node scripts/check-skills.mjs && node scripts/check-architecture.mjs",
     "architecture:test": "wake test scripts/check-architecture.test.mjs",
+    "browser:build": "node scripts/build-browser.mjs",
     "browser:conformance:check": "node scripts/check-system-browser-conformance.mjs --manifest-only true",
     "browser:conformance:test": "node scripts/check-system-browser-conformance.test.mjs",
     "docs:dev": "cargo run -q -p wake_cli -- docs dev .",
@@ -27,7 +28,7 @@
     "npm:test:wake:federation": "node --test npm/wake/test/federation.test.mjs npm/wake/test/federation-react.test.mjs",
     "npm:test:css": "yarn workspace @crab-dev/css test",
     "npm:typecheck": "yarn npm:typecheck:wake && yarn npm:typecheck:css",
-    "npm:typecheck:wake": "yarn exec pnpify tsc -p npm/wake/test/tsconfig.json",
+    "npm:typecheck:wake": "yarn exec pnpify tsc -p npm/wake/test/tsconfig.json && yarn exec pnpify tsc -p npm/wake/test/tsconfig.browser.json && yarn exec pnpify tsc -p npm/wake/test/tsconfig.service-worker.json",
     "npm:typecheck:css": "yarn workspace @crab-dev/css typecheck",
     "typescript:7:check": "yarn exec pnpify node scripts/check-typescript-7.mjs",
     "test262:es2024": "node scripts/run-test262.mjs",

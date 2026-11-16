@@ -46,6 +46,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -64,6 +66,7 @@ jobs:
       - name: Stage matching npm platform package
         run: node scripts/stage-test-host.mjs --package-dir npm/${{ matrix.package_dir }}
       - run: node -e "require('node:fs').mkdirSync('artifacts', {recursive:true})"
+      - run: corepack yarn browser:build
       - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css,npm/wake,npm/${{ matrix.package_dir }}
@@ -310,6 +313,8 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@1.95.0
         if: matrix.browser_evidence != 'unavailable'
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         if: matrix.browser_evidence != 'unavailable'
         with:
@@ -325,7 +330,7 @@ jobs:
             --target "${{ matrix.target }}" \
             --unavailable true > "$RUNNER_TEMP/wake-browser-evidence.json"
       - if: matrix.browser_evidence != 'unavailable'
-        run: cargo fetch --locked --target ${{ matrix.rust_target }}
+        run: cargo fetch --locked --target ${{ matrix.rust_target }} --target wasm32-unknown-unknown
       - if: matrix.browser_evidence != 'unavailable'
         run: node scripts/prepare-rusty-v8.mjs --target ${{ matrix.rust_target }}
       - name: Require the reviewed post-CDP system browser identity
@@ -345,6 +350,14 @@ jobs:
         run: cargo test --locked --offline -p wake_test_browser --lib -- --ignored --nocapture --test-threads=1
         env:
           CARGO_NET_OFFLINE: "true"
+      - name: Build browser compiler from locked inputs
+        if: matrix.browser_evidence != 'unavailable'
+        run: corepack yarn browser:build
+      - name: Worker WASM and local preview conformance
+        if: matrix.browser_evidence != 'unavailable'
+        run: cargo test --locked --offline -p wake_browser --test browser -- --ignored --nocapture --test-threads=1
+        env:
+          WAKE_BROWSER_WASM_PATH: ${{ github.workspace }}/npm/wake/browser/wake_browser.wasm
       - name: React, input, source-map and screenshot conformance
         if: matrix.browser_evidence != 'unavailable'
         run: cargo test --locked --offline -p wake_test --lib -- --ignored --nocapture --test-threads=1
@@ -599,6 +612,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
@@ -623,6 +638,7 @@ jobs:
       - run: corepack yarn npm:test:wake
       - run: corepack yarn npm:typecheck:wake
       - run: node scripts/check-startup.mjs
+      - run: corepack yarn browser:build
       - run: corepack yarn npm:pack:check
         env:
           WAKE_PACK_TARGETS: npm/css,npm/wake,npm/wake-win32-x64-msvc

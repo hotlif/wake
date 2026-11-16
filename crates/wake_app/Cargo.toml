@@ -25,6 +25,7 @@ wake_tsdoc.workspace = true
 wake_ecma_transform.workspace = true
 wake_test_contract.workspace = true
 wake_federation_contract.workspace = true
+wake_federation_build.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

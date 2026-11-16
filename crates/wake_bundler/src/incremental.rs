@@ -1832,7 +1832,7 @@ impl IncrementalBundler {
                 }
             })
             .collect();
-        let tr = timing.then(std::time::Instant::now);
+        let tr = timing.then(crate::timer::BuildTimer::now);
         let loaded_results = self.exec.parallel(jobs);
         if let Some(t) = tr {
             *read_time += t.elapsed();
@@ -1985,7 +1985,7 @@ impl IncrementalBundler {
         }
         // 分阶段计时（仅 `WAKE_TIMING` 环境变量存在时打印，用于定位性能热点）。
         let timing = std::env::var_os("WAKE_TIMING").is_some();
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timer::BuildTimer::now();
         let mut resolve_time = std::time::Duration::ZERO;
         let mut read_time = std::time::Duration::ZERO;
 
@@ -2107,7 +2107,7 @@ impl IncrementalBundler {
                 Option<Arc<Loaded>>,
                 FederationResolutionContext,
             )> = std::mem::take(&mut frontier);
-            let tr = timing.then(std::time::Instant::now);
+            let tr = timing.then(crate::timer::BuildTimer::now);
             let loaded_results: Vec<LoadedResult> = {
                 let mut slots: Vec<Option<LoadedResult>> = std::iter::repeat_with(|| None)
                     .take(frontier_items.len())
@@ -2512,7 +2512,7 @@ impl IncrementalBundler {
             let resolved_flat: Vec<ResolveResult> = if resolve_reqs.is_empty() {
                 Vec::new()
             } else {
-                let tr = timing.then(std::time::Instant::now);
+                let tr = timing.then(crate::timer::BuildTimer::now);
                 let mut slots: Vec<Option<ResolveResult>> = std::iter::repeat_with(|| None)
                     .take(resolve_reqs.len())
                     .collect();
@@ -2945,7 +2945,7 @@ impl IncrementalBundler {
         drop(scan_progress);
         let link_progress =
             wake_common::progress::phase("link", || format!("{} modules", modules.len()));
-        let t_link_start = timing.then(std::time::Instant::now);
+        let t_link_start = timing.then(crate::timer::BuildTimer::now);
 
         let link_fingerprint = self.link_plan_fingerprint(&modules, entry_id, next_id);
         let (keep, export_stars) = if let Some(plan) = self
@@ -2971,7 +2971,7 @@ impl IncrementalBundler {
         drop(link_progress);
         let codegen_progress =
             wake_common::progress::phase("codegen", || format!("{} modules", modules.len()));
-        let t_codegen_start = timing.then(std::time::Instant::now);
+        let t_codegen_start = timing.then(crate::timer::BuildTimer::now);
         let mut optimize_time = std::time::Duration::ZERO;
         let mut body_time = std::time::Duration::ZERO;
 
@@ -3184,7 +3184,7 @@ impl IncrementalBundler {
             });
         }
         let engine = Arc::clone(&self.engine);
-        let t_optimize_start = timing.then(std::time::Instant::now);
+        let t_optimize_start = timing.then(crate::timer::BuildTimer::now);
         let optimized_results = par_request_batched(&engine, &self.exec, requests);
         drop(engine);
         optimize_time +=
@@ -3520,7 +3520,7 @@ impl IncrementalBundler {
             });
         }
         let engine = Arc::clone(&self.engine);
-        let t_late_optimize_start = timing.then(std::time::Instant::now);
+        let t_late_optimize_start = timing.then(crate::timer::BuildTimer::now);
         let late_results = par_request_batched(&engine, &self.exec, late_requests);
         drop(engine);
         optimize_time +=
@@ -3596,7 +3596,7 @@ impl IncrementalBundler {
             });
         }
         let engine = Arc::clone(&self.engine);
-        let t_body_start = timing.then(std::time::Instant::now);
+        let t_body_start = timing.then(crate::timer::BuildTimer::now);
         let emitted = par_request_batched(&engine, &self.exec, body_requests);
         drop(engine);
         body_time += t_body_start.map_or(std::time::Duration::ZERO, |started| started.elapsed());
@@ -3718,7 +3718,7 @@ impl IncrementalBundler {
         let codegen_time = t_codegen_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         drop(codegen_progress);
         let emit_progress = wake_common::progress::phase("emit", || entry.display().to_string());
-        let t_emit_start = timing.then(std::time::Instant::now);
+        let t_emit_start = timing.then(crate::timer::BuildTimer::now);
 
         // —— Emit：双路（无 async chunk → 旧单包，逐字节不变；有 → 多 chunk 全局 registry）——
         // 模块 id / 数量用 `live_ids`（DME 后；未启用 DME 时 = 全量 `ordered`）。
@@ -4007,7 +4007,7 @@ impl IncrementalBundler {
 
         let _cleanup_progress = wake_common::progress::phase("cleanup", String::new);
         if self.one_shot {
-            let release_started = std::time::Instant::now();
+            let release_started = crate::timer::BuildTimer::now();
             // These maps only describe a possible later generation. A one-shot bundler rejects a
             // second build, so retaining them would merely serialize their destruction on the
             // caller's return path.
@@ -5790,7 +5790,7 @@ fn emit_body(
     };
     let sealed_trivial = optimized.can_emit_sealed_without_finalization(data.no_esmodule);
     let finalize_facts = compiler_finalize_facts(data, optimized.retained_requests());
-    let codegen_started = std::time::Instant::now();
+    let codegen_started = crate::timer::BuildTimer::now();
     // Mapping facts remain unconditional so source-map enablement stays a downstream-only task.
     let emission =
         match compiler.emit_module(optimized, &finalize_facts, CompilerMapMode::SourceMap) {

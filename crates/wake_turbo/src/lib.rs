@@ -32,6 +32,7 @@
 pub mod engine;
 // 执行器依赖 crossbeam，loom 验证不需要它（见 tests/loom_single_flight.rs）。
 #[cfg(not(loom))]
+#[cfg_attr(target_arch = "wasm32", path = "executor_wasm.rs")]
 pub mod executor;
 pub mod spike;
 pub mod vc;

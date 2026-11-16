@@ -186,6 +186,30 @@ if (!ciBrowserJobMatch) {
   throw new Error('ci.yml must define the browser-conformance job')
 }
 const ciBrowserJob = ciBrowserJobMatch[0]
+const packRootJob = releaseJob('pack-root')
+requireJobMarkers('audit-tarballs', auditTarballsJob.source, [
+  '4194304', 'browser/wake_browser.wasm', 'browser-wasm.mjs', 'verifyBrowserArtifact',
+])
+requireJobMarkers('verify', verifyJob.source, [
+  'runs-on: ubuntu-24.04', 'WAKE_BROWSER_PACKAGE_DIR', 'WAKE_BROWSER_WASM_PATH',
+  '--example system_browser_identity', '--target linux-x64-gnu', '-p wake_browser --test browser -- --ignored',
+])
+requireOrderedJobMarkers('verify', verifyJob.source, [
+  'wasm32-unknown-unknown', 'corepack yarn browser:build', 'corepack yarn npm:pack:check', 'name: browser-compiler',
+])
+requireOrderedJobMarkers('pack-root', packRootJob.source, [
+  'name: browser-compiler', 'path: npm/wake/browser', 'corepack yarn npm:pack:check', 'npm pack ./npm/wake ',
+])
+for (const name of ['npm-package-artifacts', 'node']) {
+  const source = ciJob(name).source
+  if (!source.includes('targets: wasm32-unknown-unknown') || source.indexOf('corepack yarn browser:build') < 0 ||
+      source.indexOf('corepack yarn browser:build') > source.indexOf('corepack yarn npm:pack:check')) {
+    throw new Error(`ci.yml ${name} must build version-matched WASM before packing the root package`)
+  }
+}
+if (!ciBrowserJob.includes('-p wake_browser --test browser -- --ignored') || !ciBrowserJob.includes('corepack yarn browser:build')) {
+  throw new Error('Browser CI must execute Worker/WASM, preview and React sharing conformance')
+}
 const ciNodeJobMatch = ciWorkflow.match(/\r?\n  node:\r?\n/)
 if (!ciNodeJobMatch) {
   throw new Error('ci.yml must define the node job')

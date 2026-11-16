@@ -41,7 +41,7 @@ export declare const FEDERATION_ERROR_CODES: Readonly<{
 }>
 
 export type FederationErrorCode = typeof FEDERATION_ERROR_CODES[keyof typeof FEDERATION_ERROR_CODES]
-export type FederationMode = 'development' | 'production'
+export type FederationMode = 'development' | 'production' | 'preview'
 export type FederationDevUpdateAction = 'types-only' | 'isolated-remount' | 'full-reload'
 export type FederationDevLeaseReloadReason = 'build-gone' | 'invalid-lease' | 'lease-limit' | 'update-lagged'
 export type ExposeMode = 'generic' | 'host-rendered' | 'isolated'
@@ -446,6 +446,12 @@ export interface FederationRemoteDescriptor {
 }
 
 export declare class FederationRuntime {
+  /** Refresh a local preview; failed validation restores the previous accepted Manifest. */
+  refreshPreviewRemote(name: string): Promise<FederationManifest>
+  /** Call only after all consumers of this preview build have been unmounted. */
+  releasePreviewBuild(name: string, buildId: string): Promise<void>
+  /** Unmount all consumers before closing the preview registration. */
+  unregisterPreviewRemote(name: string): Promise<void>
   constructor(options?: FederationRuntimeOptions)
   readonly runtimeAbi: 'wake.federation.v1'
   readonly mode: FederationMode

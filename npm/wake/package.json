@@ -12,6 +12,19 @@
   "module": "./index.mjs",
   "types": "./index.d.ts",
   "exports": {
+    "./browser": {
+      "types": "./browser.d.ts",
+      "import": "./browser.mjs",
+      "default": "./browser.mjs"
+    },
+    "./browser/worker": "./browser-worker.mjs",
+    "./browser/service-worker": "./browser-service-worker.mjs",
+    "./browser/service-worker-handler": {
+      "types": "./browser-service-worker.d.mts",
+      "import": "./browser-service-worker-handler.mjs",
+      "default": "./browser-service-worker-handler.mjs"
+    },
+    "./browser/wasm": "./browser/wake_browser.wasm",
     "./docs": {
       "types": "./docs.d.ts",
       "import": "./docs.mjs",
@@ -60,9 +73,12 @@
   "files": [
     "bin",
     "internal",
+    "browser/*.wasm",
     "*.cjs",
     "*.mjs",
     "index.d.ts",
+    "browser.d.ts",
+    "browser-service-worker.d.mts",
     "docs.d.ts",
     "experimental.d.ts",
     "federation.d.mts",
