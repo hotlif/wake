@@ -132,6 +132,9 @@ npm 包中包含与 JS adapter 匹配的 `browser/wake_browser.wasm`。可用包
 | `@crab-dev/wake/browser/service-worker` | 独立 Service Worker，保留同目录的 browser-service-worker-handler.mjs |
 | `@crab-dev/wake/browser/service-worker-handler` | 集成进已有应用 Service Worker 的处理器和类型 |
 
+Worker、独立 Service Worker 和 WASM 子路径是供部署工具解析的资源入口，不是主页面可导入的
+类型 API；类型消费使用 `browser` 和 `browser/service-worker-handler` 入口。
+
 源码仓库使用 `corepack yarn browser:build` 生成 npm WASM 产物；先安装 Rust 1.95 的
 `wasm32-unknown-unknown` target 并准备锁定依赖。构建脚本离线执行，打包检查验证无 host imports、
 ABI 和体积预算。构建后的 WASM 约 6.8 MB（未压缩），主 npm 包压缩后约 2.1 MB；具体大小随版本变化。

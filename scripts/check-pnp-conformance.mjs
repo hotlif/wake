@@ -157,8 +157,19 @@ async function checkTypeConsumer(temporary, { typecheck = true } = {}) {
   await mkdir(archiveDirectory, { recursive: true })
   const rootManifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
   const wakeManifest = JSON.parse(await readFile(join(wakeSource, 'package.json'), 'utf8'))
+  // Deployment resources have no importable type API. Their bytes are checked by the
+  // tarball/browser gates; keep this exception exact so new API exports still require types.
+  const resourceExports = new Map([
+    ['./browser/worker', './browser-worker.mjs'],
+    ['./browser/service-worker', './browser-service-worker.mjs'],
+    ['./browser/wasm', './browser/wake_browser.wasm'],
+  ])
   const declarationPaths = [...new Set(Object.entries(wakeManifest.exports).flatMap(([subpath, entry]) => {
     if (subpath === './package.json') return []
+    if (resourceExports.has(subpath)) {
+      assert.equal(entry, resourceExports.get(subpath), `Unexpected Wake resource export for ${subpath}`)
+      return []
+    }
     assert.ok(typeof entry?.types === 'string', `Missing Wake types export for ${subpath}`)
     assert.match(entry.types, /^\.\/[\w/-]+\.d\.(?:ts|mts|cts)$/)
     return [entry.types.slice(2)]

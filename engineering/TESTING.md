@@ -27,7 +27,10 @@ Node 绑定或 JavaScript 测试 host 时，先确认产物与当前相关源码
 `cargo test --locked --offline -p wake_browser --test browser -- --ignored --nocapture --test-threads=1`。
 此门禁覆盖真实 Worker/Service Worker、原生与 WASM 产物字节对照、React 共享、CSS、图片、延迟分块、
 取消与预览释放，并沿用已审查的系统浏览器矩阵。主 npm 包必须包含该 WASM，packed 上限为 4 MiB，
-独立 WASM 上限为 10 MiB；平台原生包预算不变。公共声明同时运行 `npm:typecheck:wake`。
+独立 WASM 上限为 10 MiB；平台原生包预算不变。公共声明同时运行 `npm:typecheck:wake` 和
+`pnp:conformance:check`。PnP 声明投影覆盖浏览器 SDK 与 Service Worker handler 的类型消费；
+仅按精确子路径和目标排除 Worker、独立 Service Worker 与 WASM 三个部署资源入口，其实际文件
+由 tarball 审计和真实浏览器消费验证，其他 API 入口仍必须声明 `types`。
 
 ## 本地临时产物
 

@@ -1,12 +1,23 @@
 import { build, type BuildOptions, type WakeErrorCode } from '@crab-dev/wake'
 import { expect, test, type TestApi } from '@crab-dev/wake/test'
 import { css, type ClassName } from '@crab-dev/css'
+import { createBrowserBuildContext, type BrowserBuildOptions } from '@crab-dev/wake/browser'
+import { handleBrowserPreviewFetch } from '@crab-dev/wake/browser/service-worker-handler'
 
 declare const options: BuildOptions
 void build(options)
 
 const className: ClassName = css`color: red;`
 void className
+
+declare const browserOptions: BrowserBuildOptions
+void createBrowserBuildContext(browserOptions)
+const handled: boolean = handleBrowserPreviewFetch({
+  request: new Request('https://example.invalid/__wake_preview__/fixture'),
+  clientId: 'fixture',
+  respondWith(response) { void response },
+})
+void handled
 
 test('packed declarations', () => {
   expect(42).toBe(42)
