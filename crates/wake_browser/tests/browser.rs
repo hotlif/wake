@@ -1,7 +1,7 @@
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -51,47 +51,14 @@ impl Server {
         let files = Arc::new(files);
         let thread = thread::spawn(move || {
             while !flag.load(Ordering::Acquire) {
-                let Ok((mut stream, _)) = listener.accept() else {
+                let Ok((stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
                 let files = files.clone();
                 thread::spawn(move || {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut request = Vec::new();
-                    let mut buffer = [0u8; 4096];
-                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n")
-                        && request.len() < 16384
-                    {
-                        let Ok(size) = stream.read(&mut buffer) else {
-                            return;
-                        };
-                        if size == 0 {
-                            return;
-                        }
-                        request.extend_from_slice(&buffer[..size]);
-                    }
-                    let request = String::from_utf8_lossy(&request);
-                    let path = request
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .split('?')
-                        .next()
-                        .unwrap();
-                    let (status, bytes, mime) = match files.get(path) {
-                        Some((bytes, mime)) => ("200 OK", bytes.as_slice(), *mime),
-                        None => ("404 Not Found", b"missing".as_slice(), "text/plain"),
-                    };
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nService-Worker-Allowed: /\r\nConnection: close\r\n\r\n",
-                        bytes.len()
-                    );
-                    if !request.starts_with("HEAD ") {
-                        let _ = stream.write_all(bytes);
+                    if let Err(error) = serve_connection(stream, &files) {
+                        eprintln!("browser fixture HTTP connection failed: {error}");
                     }
                 });
             }
@@ -108,6 +75,82 @@ impl Drop for Server {
         self.stopped.store(true, Ordering::Release);
         self.thread.take().unwrap().join().unwrap();
     }
+}
+
+fn serve_connection(
+    mut stream: TcpStream,
+    files: &BTreeMap<String, (Vec<u8>, &'static str)>,
+) -> std::io::Result<()> {
+    // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") && request.len() < 16384 {
+        let size = stream.read(&mut buffer)?;
+        if size == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&buffer[..size]);
+    }
+    let request = String::from_utf8_lossy(&request);
+    let path = request
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .split('?')
+        .next()
+        .unwrap();
+    let (status, bytes, mime) = match files.get(path) {
+        Some((bytes, mime)) => ("200 OK", bytes.as_slice(), *mime),
+        None => ("404 Not Found", b"missing".as_slice(), "text/plain"),
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nService-Worker-Allowed: /\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    )?;
+    if !request.starts_with("HEAD ") {
+        stream.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_completes_large_responses_on_nonblocking_accepted_streams() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    // Model accepted-socket flag inheritance on every OS, then apply backpressure.
+    stream.set_nonblocking(true).unwrap();
+    let body = vec![0x5a; 32 * 1024 * 1024];
+    let expected_length = body.len();
+    let server = thread::spawn(move || {
+        serve_connection(
+            stream,
+            &BTreeMap::from([("/large.wasm".into(), (body, "application/wasm"))]),
+        )
+    });
+    // A newly accepted stream may need to wait for the request as well as for writes.
+    thread::sleep(Duration::from_millis(100));
+    let write = client.write_all(b"GET /large.wasm HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    thread::sleep(Duration::from_millis(100));
+    let mut response = Vec::new();
+    let read = client.read_to_end(&mut response);
+    server.join().unwrap().unwrap();
+    write.unwrap();
+    read.unwrap();
+    let body_start = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    assert_eq!(response.len() - body_start, expected_length);
+    assert!(response[body_start..].iter().all(|&byte| byte == 0x5a));
 }
 
 #[test]

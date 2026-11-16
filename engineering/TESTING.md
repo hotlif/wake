@@ -31,6 +31,8 @@ Node 绑定或 JavaScript 测试 host 时，先确认产物与当前相关源码
 `pnp:conformance:check`。PnP 声明投影覆盖浏览器 SDK 与 Service Worker handler 的类型消费；
 仅按精确子路径和目标排除 Worker、独立 Service Worker 与 WASM 三个部署资源入口，其实际文件
 由 tarball 审计和真实浏览器消费验证，其他 API 入口仍必须声明 `types`。
+浏览器 fixture 的 HTTP 服务必须显式配置已接受连接的阻塞模式，并完整发送大型 WASM 和依赖响应；
+默认测试通过强制非阻塞连接及延迟读取验证该传输约束，不依赖 runner 的 socket 继承行为。
 
 ## 本地临时产物
 
