@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.54
+## 0.1.55
 
-- 接续未发布的 0.1.53 候选，保留其标签；修复 PnP 声明投影对浏览器部署资源入口的分类，并验证独立项目中的 SDK 与 Service Worker handler 类型。
+- 接续未发布的 0.1.53、0.1.54 候选，保留其标签；修复 macOS 测试 HTTP 服务的非阻塞连接继承问题，并增加大型响应回归。修复 PnP 声明投影对浏览器部署资源入口的分类，并验证独立项目中的 SDK 与 Service Worker handler 类型。
 
 - 新增实验性 `@crab-dev/wake/browser` SDK：Worker/WASM 使用同一 Wake 编译器处理完整虚拟项目快照，输出 Federation JS、CSS、图片、延迟分块和 source map。
 - 本地预览通过宿主 Service Worker 提供不可变资源；支持最新请求提交、取消恢复、失败回滚和资源释放，不刷新编辑器页面。
