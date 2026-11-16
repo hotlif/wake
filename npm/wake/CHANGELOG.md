@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.53
+
+- 新增实验性 `@crab-dev/wake/browser` SDK：Worker/WASM 使用同一 Wake 编译器处理完整虚拟项目快照，输出 Federation JS、CSS、图片、延迟分块和 source map。
+- 本地预览通过宿主 Service Worker 提供不可变资源；支持最新请求提交、取消恢复、失败回滚和资源释放，不刷新编辑器页面。
+- 共享依赖绑定宿主真实包身份，覆盖开发与生产 React 宿主、Hooks、TSX、CSS Modules 和 Wake CSS。宿主负责供应依赖、共享 provider 与挂载回调；首版不保证 Fast Refresh 状态保持。
+- WASM 随主 npm 包发布；构建、产物完整性、严格浏览器类型和实际 tarball 浏览器消费接入发布门禁。原生 Federation 复用可移植产物装配层。
+
 ## 0.1.52
 
 - 接续未发布的 0.1.51 候选，保留其标签；正式审查 Linux Chrome 157 官方镜像并纳入原有实验性门禁，stable readiness 仍为 blocked。
