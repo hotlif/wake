@@ -120,6 +120,7 @@
 - [ADR 0011: 由产品拥有自动包发布流程](0011-release-automation.md) — `accepted`
 - [ADR 0021: 用根级本地链接拥有平台 optional 包](0021-local-platform-package-links.md) — `superseded`
 - [ADR 0022: Yarn PnP 权威与 npm 经典解析兼容](0022-yarn-pnp-ownership.md) — `accepted`
+- [ADR 0085: 由 Changesets 管理 Wake npm 版本](0085-changesets-npm-release.md) — `accepted`
 
 ### cli
 

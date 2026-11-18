@@ -24,6 +24,7 @@ import {
   validateRepositorySources,
 } from './check-architecture.mjs'
 import { validateSkill } from './check-skills.mjs'
+import { publicationOrder } from './npm-release.mjs'
 
 const decision = 'engineering/decisions/0044-architecture-decision-routing.md'
 const indexed = (status = 'accepted') => ({ status, indexed: true })
@@ -51,10 +52,9 @@ test('npm release publishes the audited lint SDK before the root package', () =>
   const workflow = readFileSync(new URL('../.github/workflows/release-npm.yml', import.meta.url), 'utf8')
   const publish = workflow.match(/^  publish:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:\r?$)/m)?.[0]
   assert.ok(publish, 'the npm release must retain its gated publish job')
-  const sdk = 'npm publish "./artifacts/crab-dev-wake-lint-sdk-${{ needs.verify.outputs.version }}.tgz"'
-  const root = 'npm publish "./artifacts/crab-dev-wake-${{ needs.verify.outputs.version }}.tgz"'
-  assert.ok(publish.includes(sdk), 'packing and auditing the SDK does not publish it')
-  assert.ok(publish.indexOf(sdk) < publish.indexOf(root), 'the root package must remain last')
+  assert.ok(publish.includes('node scripts/npm-release.mjs publish'))
+  const main = JSON.parse(readFileSync(new URL('../npm/wake/package.json', import.meta.url), 'utf8'))
+  assert.deepEqual(publicationOrder(main).slice(-2), ['@crab-dev/wake-lint-sdk', main.name])
 })
 
 test('lint cache persists opaque bytes without depending on analysis owners', () => {

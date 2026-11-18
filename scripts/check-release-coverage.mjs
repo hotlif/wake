@@ -144,9 +144,6 @@ if (packages.length === 0) {
   throw new Error('No publishable npm packages were discovered under npm/*')
 }
 for (const required of [
-  "- 'v*'",
-  "- '!vscode-css-v*'",
-  "if: github.ref_type == 'tag' && github.ref_name == format('v{0}', needs.verify.outputs.version)",
   'node scripts/stage-test-host.mjs',
   'node scripts/prepare-rusty-v8.mjs',
   'package/test-host/wake-test-host',
@@ -162,7 +159,6 @@ for (const required of [
   'React browser and screenshot smoke',
   'visual.browser.test.mjs',
   "toMatchScreenshot('published-ready')",
-  'npm publish',
 ]) {
   if (!workflow.includes(required)) {
     throw new Error(`release-npm.yml is missing release contract marker ${required}`)
@@ -463,7 +459,7 @@ requireJobMarkers('prepublish-smoke', prepublishSmokeJob.source, [
 if (prepublishSmokeJob.source.includes('continue-on-error')) {
   throw new Error('prepublish local tarball smoke must never continue on error')
 }
-if (prepublishSmokeJob.source.includes('npm publish')) {
+if (prepublishSmokeJob.source.includes('npm publish') || prepublishSmokeJob.source.includes('npm-release.mjs publish')) {
   throw new Error('prepublish local tarball smoke must not mutate the npm registry')
 }
 for (const forbidden of ['--package-lock=false', 'mkdir local-smoke', 'cd local-smoke']) {
@@ -524,7 +520,10 @@ for (const marker of [
 }
 requireJobMarkers('publish', publishJob.source, [
   'needs: [verify, audit-tarballs, prepublish-smoke]',
-  'npm publish',
+  "if: github.event_name == 'workflow_run'",
+  'environment: npm-release',
+  'node scripts/npm-release.mjs publish',
+  'NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}',
 ])
 requireJobMarkers('smoke', registrySmokeJob.source, [
   'needs: publish',

@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-08-17
+- Amended by: [ADR 0085](0085-changesets-npm-release.md)
 
 ## Context
 

@@ -653,7 +653,14 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
 
 ## 6. 发布门禁
 
-发布 workflow 在 tag 上：
+在变更分支运行 `corepack yarn changeset`，选择受影响的公共包，提交生成的 Markdown。
+八个公共包按本批最高升幅一起发布。成功的 `canary` push CI 会创建或刷新 Changesets Release PR，
+其中包含 Cargo 和 npm 版本、精确内部依赖、锁文件与变更日志。合并后的提交须再次通过 CI。
+仓库 Actions 需允许创建 PR，`npm-release` 环境需允许默认分支 `canary` 部署并提供原有 npm 发布凭据。
+手动运行 `Release npm packages` 可以演练至发布前消费矩阵。VSIX 沿用 `vscode-css-v<version>` 标签。
+
+对于已合并且尚未发布的版本，工作流检出 CI 验证过的 SHA，执行以下门禁。如果构建期间
+`canary` 前移，后续通过 CI 的分支头可在没有待处理 changeset 时接续该版本，并重新构建、审计其产物。
 
 1. 运行 workspace test、clippy 和许可证检查；
 2. 在 Windows、macOS x64/arm64、manylinux glibc 2.28 x64/arm64 构建；
@@ -680,7 +687,9 @@ JavaScript payload，因此不含 bundler runtime/header 或 source-map trailer�
    per-target browser evidence，并再次证明 stable readiness 仍为 blocked。平台包的硬上限为 64 MiB
    packed / 192 MiB unpacked，56 MiB packed 起发布 warning；运行期不得下载 host 或浏览器。
 
-部分发布失败不能覆盖已有 npm 版本；修复后统一提升八个包和 workspace 版本。
+注册表写入前再次确认该 SHA 仍是 `canary` 分支头。中途失败时可重跑失败 job，继续使用本次已审计的
+tarball。已存在的包须与本地产物的 SHA-512 相同才会跳过。内容冲突时提交修复 changeset，由下一份
+Release PR 统一升版。主包成功后由 CI 记录版本标签。
 
 Wake Test 仍是 experimental。除上述通用发布门禁外，转为 stable 前还必须同时满足：从 registry
 lock 记录固定并审计 Deno/V8 与私有 DOM adapter 的来源、checksum、许可证和 SBOM；在五个平台执行 fast DOM

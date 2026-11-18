@@ -41,6 +41,10 @@ npx wake build --outdir dist
 用户文档从 [Wake 首页](docs/index.mdx)阅读。贡献者先阅读 [工程入口](engineering/README.md)
 和 [测试与门禁](engineering/TESTING.md)，再运行与变更对应的检查。
 
+影响 npm 用户的变更随代码提交 `corepack yarn changeset` 生成的说明，选择受影响的公共包及
+patch、minor 或 major。CI 会汇总为面向 `canary` 的 Release PR。维护者核对版本和变更日志后合并，
+由 CI 完成构建、发布和打标签。发布与重试步骤见[发布门禁](engineering/TESTING.md#6-发布门禁)。
+
 ```bash
 corepack yarn docs:check
 corepack yarn docs:build

@@ -393,8 +393,10 @@ fixture，也不把 lazy observation cache 描述成全局快照。跨编译所�
 ## 8. 发布边界
 
 npm registry 包与 Crab CSS VS Code 扩展是两个独立产品边缘：前者只由
-`release-npm.yml` 发布，后者只由 `vscode-css.yml` 发布。各自的 package manifest 是版本事实
-来源，标签必须与 manifest 精确一致；发布 job 只消费已经构建和审计的不可变制品。可执行的
+`release-npm.yml` 发布，后者只由 `vscode-css.yml` 发布。Changesets Release PR 同步 npm 和
+Cargo 版本，成功的 `canary` CI 驱动发布。扩展标签必须与扩展 manifest 精确一致。
+发布 job 只消费已经构建和审计的不可变制品。npm 版本事务见
+[ADR 0085](decisions/0085-changesets-npm-release.md)。可执行的
 覆盖规则由 `scripts/check-release-coverage.mjs` 持有，长期决策见
 [ADR 0011](decisions/0011-release-automation.md)。
 

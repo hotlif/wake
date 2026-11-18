@@ -1,11 +1,15 @@
 name: Release npm packages
 
 on:
-  push:
-    tags:
-      - 'v*'
-      - '!vscode-css-v*'
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [canary]
   workflow_dispatch:
+
+concurrency:
+  group: npm-release-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'canary' }}
+  queue: max
 
 permissions:
   contents: read
@@ -15,13 +19,68 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '11.0'
 
 jobs:
+  prepare-release:
+    if: >-
+      github.event_name == 'workflow_dispatch' || (
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'canary' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_sha == github.sha)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      build: ${{ github.event_name == 'workflow_dispatch' || (steps.changesets.outputs.has-changesets == 'false' && env.WAKE_RELEASE_CANDIDATE == 'true') }}
+    steps:
+      - if: github.event_name == 'workflow_dispatch'
+        run: echo "Manual verification runs through the prepublish matrix."
+      - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_run'
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        if: github.event_name == 'workflow_run'
+        with:
+          node-version: 24
+      - if: github.event_name == 'workflow_run'
+        run: npm install --global corepack@0.34.6 --force
+      - if: github.event_name == 'workflow_run'
+        run: corepack yarn install --immutable --check-cache
+      - uses: dtolnay/rust-toolchain@1.95.0
+        if: github.event_name == 'workflow_run'
+      - name: Check the verified canary head
+        if: github.event_name == 'workflow_run'
+        id: verified
+        run: node scripts/npm-release.mjs head
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Prepare Release PR or select the release matrix
+        if: steps.verified.outputs.current == 'true'
+        id: changesets
+        uses: changesets/action@v2
+        with:
+          pr-base-branch: canary
+          version-script: corepack yarn changeset:version
+          publish-script: node scripts/npm-release.mjs candidate
+          create-github-releases: false
+          push-git-tags: false
+          pr-title: "chore(release): version Wake npm packages"
+          commit-message: "chore(release): version Wake npm packages"
+
   verify:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.build == 'true'
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.package-version.outputs.version }}
       source_date_epoch: ${{ steps.source-date.outputs.epoch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
@@ -119,6 +178,8 @@ jobs:
       SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
@@ -199,6 +260,8 @@ jobs:
       image: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
@@ -262,6 +325,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -293,6 +358,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -446,6 +513,8 @@ jobs:
       WAKE_RELEASE_BROWSER_PATH: ${{ matrix.browser_path }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/download-artifact@v4
         with:
           pattern: npm-*
@@ -575,7 +644,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.ref_type == 'tag' && github.ref_name == format('v{0}', needs.verify.outputs.version)
+    if: github.event_name == 'workflow_run'
     needs: [verify, audit-tarballs, prepublish-smoke]
     runs-on: ubuntu-latest
     outputs:
@@ -585,6 +654,10 @@ jobs:
       id-token: write
       contents: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: npm-*
@@ -595,25 +668,25 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@latest
-      - name: Publish platform packages first
-        run: |
-          for package in artifacts/*wake-{win32,linux,darwin}-*.tgz; do
-            npm publish "./$package" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
-          done
+      - name: Publish audited packages in dependency order
+        run: node scripts/npm-release.mjs publish
         env:
+          GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish CSS package
-        run: npm publish "./artifacts/crab-dev-css-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
+
+  tag:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Record the published version
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish lint extension SDK
-        run: npm publish "./artifacts/crab-dev-wake-lint-sdk-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish root package last
-        run: npm publish "./artifacts/crab-dev-wake-${{ needs.verify.outputs.version }}.tgz" --access public --provenance=${{ github.event.repository.visibility == 'public' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          WAKE_VERSION: ${{ needs.publish.outputs.version }}
+        run: git push origin "HEAD:refs/tags/v${WAKE_VERSION}"
 
   smoke-glibc-228:
     needs: publish
@@ -692,6 +765,8 @@ jobs:
       WAKE_RELEASE_BROWSER_PATH: ${{ matrix.browser_path }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}

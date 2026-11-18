@@ -1,0 +1,20 @@
+{
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [[
+    "@crab-dev/css",
+    "@crab-dev/wake",
+    "@crab-dev/wake-darwin-arm64",
+    "@crab-dev/wake-darwin-x64",
+    "@crab-dev/wake-linux-arm64-gnu",
+    "@crab-dev/wake-linux-x64-gnu",
+    "@crab-dev/wake-lint-sdk",
+    "@crab-dev/wake-win32-x64-msvc"
+  ]],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "canary",
+  "updateInternalDependencies": "patch",
+  "ignore": [],
+  "privatePackages": { "version": false, "tag": false }
+}

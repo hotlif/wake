@@ -265,13 +265,4 @@ for (const platformName of platformNames) {
   }
 }
 
-if (
-  process.env.GITHUB_REF_TYPE === 'tag' &&
-  process.env.GITHUB_REF_NAME !== `v${cargoVersion}`
-) {
-  throw new Error(
-    `Git tag ${process.env.GITHUB_REF_NAME} does not match v${cargoVersion}`,
-  )
-}
-
 console.log(`Published package versions are aligned at ${cargoVersion}`)
