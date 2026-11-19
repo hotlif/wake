@@ -9,17 +9,18 @@ Wake 0.1.56 的合并验证在 Windows x64 镜像 20261116.315.1 上取得 Chrom
 
 ## Decision
 
-Windows x64 在实验性门禁中加入主版本 157。macOS Intel 的 CI、发布前和发布后冒烟统一选择运行器镜像预装的 Chrome for Testing，避免测试期间更换浏览器版本。macOS Intel 仍按 150、151 审查实际 CDP 身份。
+Windows x64 在实验性门禁中加入主版本 157。macOS Intel 的 CI、发布前和发布后冒烟统一选择运行器镜像预装的 Chrome for Testing，避免测试期间更换浏览器版本。macOS Intel 仍按 150、151 审查实际 CDP 身份。真实浏览器输入用例连续两次耗尽 5 秒，因此给这一项集成用例单独设置 20 秒上限，覆盖渲染和多轮 CDP 请求。
 
 ## Invariants
 
 - 使用运行器预装浏览器。路径缺失或 CDP 身份超出审查范围时，门禁失败。
-- 原有浏览器功能断言、超时和 stable readiness 策略继续生效。
+- 原有浏览器功能断言、Wake Test 默认超时、独立的超时语义回归和 stable readiness 策略继续生效。
 
 ## Evidence
 
 - [Windows CI](https://github.com/hotlif/wake/actions/runs/44444096321/job/135292324091) 和 [Windows 官方镜像清单](https://github.com/actions/runner-images/blob/9aa6d32300c1b8caaeb4f01efdcd619261422fd4/images/windows/Windows2025-VS2026-Readme.md) 记录了同一镜像与 Chrome 版本。
 - [macOS Intel CI](https://github.com/hotlif/wake/actions/runs/44444096321/job/135292324286) 记录了一次运行中的两个 Chrome 版本。[官方镜像清单](https://github.com/actions/runner-images/blob/f10516542b8f2fef89b652a8d5f5de63aa543b77/images/macos/macos-15-Readme.md) 记录预装的 Chrome for Testing 151.0.7922.138。[镜像构建脚本](https://github.com/actions/runner-images/blob/f10516542b8f2fef89b652a8d5f5de63aa543b77/images/macos/scripts/build/install-chrome.sh) 给出其安装位置。
+- [修复分支首次 macOS Intel 验证](https://github.com/hotlif/wake/actions/runs/44452048899/job/135318597041) 确认 Chrome 版本保持 151.0.7922.138，并在同一输入用例复现 5 秒超时。
 
 ## Consequences
 

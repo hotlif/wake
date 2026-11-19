@@ -8596,6 +8596,7 @@ environment = "dom"
                     await render(React.createElement(InteractiveForm))
                     const user = userEvent.setup()
                     const button = screen.getByRole('button', {name: 'Clicks 0; doubles 0; hovered false'})
+                    expect(button).toBeVisible()
                     const primary = screen.getByLabelText('Primary')
                     const secondary = screen.getByLabelText('Secondary')
                     const checkbox = screen.getByLabelText('Enabled')
@@ -8664,7 +8665,7 @@ environment = "dom"
                     try { await user.click(noLayout) } catch (error) { layoutFailure = error }
                     expect(layoutFailure.code).toBe('WAKE_TEST_BROWSER')
                     expect(layoutFailure.message).toContain('layout box')
-                })
+                }, {timeout: 20_000})
             "#
         .replace("__ALLOW_URL__", &allow_url);
         fs::write(fixture.path().join("math.browser.test.ts"), source).unwrap();
