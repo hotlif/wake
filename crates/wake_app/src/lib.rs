@@ -551,6 +551,10 @@ struct GenerationViewInner {
 static GENERATION_SEALS: std::sync::LazyLock<Mutex<HashMap<PathBuf, usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+static PACKAGE_WATCH_QUERIES: std::sync::LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl GenerationView {
     fn from_tree(project_root: PathBuf, files: OwnedFileTree) -> Result<Self, WakeError> {
         let logical_root = project_root.join(".wake");
@@ -2917,17 +2921,25 @@ fn project_control_interests_from(
 }
 
 fn project_watch_interests(prepared: &PreparedBuild) -> Vec<WatchInterest> {
-    project_watch_interests_from(
+    let local = project_local_watch_interests(
         &prepared.config_dir,
         &prepared.root,
         &prepared.logical_entry,
         prepared.explicit_entry.as_deref(),
         &prepared.config,
-    )
+    );
+    union_watch_interests(&local, &package_resource_watch_interests(&prepared.root))
 }
 
 fn probe_watch_interests(prepared: &PreparedBuildProbe) -> Vec<WatchInterest> {
-    project_watch_interests_from(
+    union_watch_interests(
+        &probe_local_watch_interests(prepared),
+        &package_resource_watch_interests(&prepared.root),
+    )
+}
+
+fn probe_local_watch_interests(prepared: &PreparedBuildProbe) -> Vec<WatchInterest> {
+    project_local_watch_interests(
         &prepared.config_dir,
         &prepared.root,
         &prepared.logical_entry,
@@ -2936,7 +2948,33 @@ fn probe_watch_interests(prepared: &PreparedBuildProbe) -> Vec<WatchInterest> {
     )
 }
 
-fn project_watch_interests_from(
+fn package_resource_watch_interests(root: &Path) -> Vec<WatchInterest> {
+    // Install dependency coverage before building a candidate. Invalid PnP data is reported by
+    // the build; existing exact control interests retain recovery coverage for a repaired graph.
+    #[cfg(test)]
+    {
+        *PACKAGE_WATCH_QUERIES
+            .lock()
+            .unwrap()
+            .entry(root.to_owned())
+            .or_default() += 1;
+    }
+    let resolution = wake_resolver::ResolutionEnvironment::new(Arc::new(OsFileSystem));
+    resolution
+        .package_resource_watches(root)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|watch| match watch {
+            wake_resolver::PackageResourceWatch::Archive(path) => WatchInterest::exact_file(path),
+            wake_resolver::PackageResourceWatch::Directory(path) => {
+                WatchInterest::all_files_tree(path)
+            }
+        })
+        .map(|interest| interest.resolve_against(root))
+        .collect()
+}
+
+fn project_local_watch_interests(
     config_dir: &Path,
     root: &Path,
     logical_entry: &Path,
@@ -2948,17 +2986,6 @@ fn project_watch_interests_from(
         WatchInterest::all_files_tree(root.join("public")),
         WatchInterest::exact_file(root.join("index.html")),
     ];
-    // Install dependency coverage before building a candidate. Invalid PnP data is reported by
-    // the build; existing exact control interests retain recovery coverage for a repaired graph.
-    let resolution = wake_resolver::ResolutionEnvironment::new(Arc::new(OsFileSystem));
-    if let Ok(watches) = resolution.package_resource_watches(root) {
-        interests.extend(watches.into_iter().map(|watch| match watch {
-            wake_resolver::PackageResourceWatch::Archive(path) => WatchInterest::exact_file(path),
-            wake_resolver::PackageResourceWatch::Directory(path) => {
-                WatchInterest::all_files_tree(path)
-            }
-        }));
-    }
     interests.push(WatchInterest::exact_file(wake_html::template_path(
         root,
         config.html.template.as_deref().map(Path::new),
@@ -7517,7 +7544,7 @@ fn start_aggregated_docs_dev_server(
         if workspace.dev_loading == wake_config::DocsWorkspaceDevLoading::Lazy {
             let probe = probe_docs_candidate(&workspace_options, DocsMode::Components)
                 .map_err(|error| scope_workspace_error(error, &workspace.name, &workspace.root))?;
-            let watch_interests = docs_probe_watch_interests(&probe);
+            let watch_interests = pending_docs_watch_interests(&probe);
             let refresh = deferred_docs_refresh(
                 workspace_options,
                 dev_options.clone(),
@@ -7797,7 +7824,8 @@ fn make_docs_refresh_candidate(
     event_tx: mpsc::Sender<DevServerEvent>,
     workspace: Option<String>,
 ) -> wake_dev_server::DevMountCandidate {
-    let preliminary_interests = docs_probe_watch_interests(&draft);
+    let preliminary_interests = pending_docs_watch_interests(&draft);
+    let package_root = draft.prepared.root.clone();
     let accepted_slot = Arc::new(Mutex::new(None::<PreparedDocsRefresh>));
     let materialize_slot = Arc::clone(&accepted_slot);
     let materialize_state = Arc::clone(&state);
@@ -7905,6 +7933,7 @@ fn make_docs_refresh_candidate(
             }
         },
     )
+    .with_materialization_watches(move || package_resource_watch_interests(&package_root))
 }
 
 #[allow(clippy::result_large_err)]
@@ -8279,15 +8308,23 @@ fn docs_probe_watch_interests(prepared: &PreparedDocsProbe) -> Vec<WatchInterest
     )
 }
 
+fn pending_docs_watch_interests(prepared: &PreparedDocsProbe) -> Vec<WatchInterest> {
+    docs_watch_interests_from(
+        probe_local_watch_interests(&prepared.prepared),
+        &prepared.prepared.root,
+        &prepared.docs,
+    )
+}
+
 fn docs_watch_interests_from(
-    mut interests: Vec<WatchInterest>,
+    project_interests: Vec<WatchInterest>,
     root: &Path,
     docs: &wake_docs::DocsOptions,
 ) -> Vec<WatchInterest> {
-    interests.extend([
+    let mut interests = vec![
         WatchInterest::tree(root.join(&docs.source_dir)),
         WatchInterest::exact_file(root.join(&docs.source_dir).join("navigation.toml")),
-    ]);
+    ];
     if let Some(preview) = &docs.preview {
         interests.push(WatchInterest::tree(root.join(preview)));
     }
@@ -8301,9 +8338,7 @@ fn docs_watch_interests_from(
         .into_iter()
         .map(|interest| interest.resolve_against(root))
         .collect();
-    interests.sort();
-    interests.dedup();
-    interests
+    union_watch_interests(&project_interests, &interests)
 }
 
 fn send_docs_warnings(
@@ -11392,12 +11427,28 @@ dev_loading = "lazy"
         .unwrap();
         let alpha = root.join("components/rc-alpha");
         let beta = root.join("components/rc-beta");
+        let package_queries = |root: &Path| {
+            PACKAGE_WATCH_QUERIES
+                .lock()
+                .unwrap()
+                .get(&canonical_project_root(root).unwrap())
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            package_queries(&alpha),
+            0,
+            "unvisited workspace enumerated package watches"
+        );
+        assert_eq!(package_queries(&beta), 0);
         assert_eq!(generation_seal_count(&alpha), 0);
         assert_eq!(generation_seal_count(&beta), 0);
 
         let response = http_get(port, "/docs/components/rc-alpha/workbench/bundle.js");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(generation_seal_count(&alpha), 1);
+        assert!(package_queries(&alpha) > 0);
+        assert_eq!(package_queries(&beta), 0);
         assert_eq!(generation_seal_count(&beta), 0);
         assert!(!alpha.join(".wake").exists());
         assert!(!beta.join(".wake").exists());
@@ -12486,6 +12537,47 @@ generate_source = true
                 .iter()
                 .any(|interest| interest.matches(&cache.join("unrelated.zip")))
         );
+    }
+
+    #[test]
+    fn pending_docs_candidate_observes_current_pnp_resources_before_materialization() {
+        let fixture = Fixture::new("pending-docs-pnp");
+        fixture.write(".pnp.cjs", "module.exports = require('./.pnp.data.json');");
+        let manifest = serde_json::json!({"packageRegistryData": [
+            [null, [[null, {"packageLocation":"./","packageDependencies":[["dep","npm:1"]]}]]],
+            ["dep", [["npm:1", {"packageLocation":"../cache/old.zip/node_modules/dep/","packageDependencies":[]}]]]
+        ]}).to_string();
+        fixture.write(".pnp.data.json", &manifest);
+        let options = DocsBuildOptions {
+            project: fixture.project(),
+            ..Default::default()
+        };
+        let probe = probe_docs_candidate(&options, DocsMode::Components).unwrap();
+        let idle = pending_docs_watch_interests(&probe);
+        let cache = fixture.0.parent().unwrap().join("cache");
+        let covers = |interests: &[WatchInterest], path: &Path| {
+            interests.iter().any(|interest| interest.matches(path))
+        };
+        assert!(covers(&idle, &fixture.0.join(".pnp.data.json")));
+        assert!(!covers(&idle, &cache.join("old.zip")));
+
+        let refresh = deferred_docs_refresh(
+            options,
+            DevServerOptions::default(),
+            probe,
+            DocsMode::Components,
+            mpsc::channel().0,
+            Some("component".into()),
+        );
+        let wake_dev_server::DevMountRefresh::Candidate(candidate) =
+            refresh(&wake_dev_server::WatchInvalidation::Rescan).unwrap()
+        else {
+            panic!("expected a pending workspace candidate")
+        };
+        fixture.write(".pnp.data.json", manifest.replace("old.zip", "new.zip"));
+        assert!(covers(candidate.watch_interests(), &cache.join("new.zip")));
+        assert!(!covers(candidate.watch_interests(), &cache.join("old.zip")));
+        assert_eq!(generation_seal_count(&fixture.0), 0);
     }
 
     #[test]

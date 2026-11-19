@@ -980,12 +980,15 @@ pub struct DevMountMaterialization {
 pub type RefreshCompletion = Box<dyn FnOnce(RefreshOutcome) + Send + 'static>;
 type MaterializeMount =
     Box<dyn FnOnce() -> Result<DevMountMaterialization, Diagnostic> + Send + 'static>;
+type MaterializationWatches =
+    std::sync::LazyLock<Vec<WatchInterest>, Box<dyn FnOnce() -> Vec<WatchInterest> + Send + Sync>>;
 
 /// A move-only refresh candidate. Its preliminary interests are available before any generated
 /// input is materialized. Dropping an unfinished candidate is an explicit abort rather than a
 /// silent lost completion.
 pub struct DevMountCandidate {
-    watch_interests: Vec<WatchInterest>,
+    pending_interests: Vec<WatchInterest>,
+    materialization_watches: Option<MaterializationWatches>,
     materialize: Option<MaterializeMount>,
     completion: Option<RefreshCompletion>,
 }
@@ -997,14 +1000,32 @@ impl DevMountCandidate {
         completion: impl FnOnce(RefreshOutcome) + Send + 'static,
     ) -> Self {
         Self {
-            watch_interests,
+            pending_interests: watch_interests,
+            materialization_watches: None,
             materialize: Some(Box::new(materialize)),
             completion: Some(Box::new(completion)),
         }
     }
 
+    /// Defer discovery of inputs used only during materialization or compilation. A pending
+    /// lazy mount still watches its probe inputs. Both build paths register the full union
+    /// returned by `watch_interests` before reading any of the additional inputs.
+    pub fn with_materialization_watches(
+        mut self,
+        discover: impl FnOnce() -> Vec<WatchInterest> + Send + Sync + 'static,
+    ) -> Self {
+        let pending = self.pending_interests.clone();
+        self.materialization_watches = Some(std::sync::LazyLock::new(Box::new(move || {
+            union_watch_interests(&pending, &discover())
+        })));
+        self
+    }
+
     pub fn watch_interests(&self) -> &[WatchInterest] {
-        &self.watch_interests
+        match &self.materialization_watches {
+            Some(full) => full,
+            None => &self.pending_interests,
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -2993,43 +3014,47 @@ fn watch_and_rebuild(
                                 },
                             );
                         }
-                        workers[index].watch_interests = union_watch_interests(
-                            &workers[index].watch_interests,
-                            candidate.watch_interests(),
-                        );
-                        let desired_interests = workers
-                            .iter()
-                            .flat_map(|worker| worker.watch_interests.iter().cloned())
-                            .collect::<Vec<_>>();
-                        if let Err(message) = reconcile_runtime_watch_targets(
-                            watcher.as_mut().expect("active watcher"),
-                            &mut registered,
-                            &desired_interests,
-                            &mut watch_retry_at,
-                            &mut watch_retry_delay,
-                            &mut last_watch_error,
-                            &tx,
-                            event_handler.as_ref(),
+                        // Batch coverage was reconciled before probing. Only a wider pending
+                        // declaration needs another registration here. Demand and recovery keep
+                        // their own coverage fences, including re-observation of physical paths.
+                        if extend_watch_interests(
+                            &mut workers[index].watch_interests,
+                            &candidate.pending_interests,
                         ) {
-                            watcher_lease.revoke();
-                            watcher_lease
-                                .finish_candidate(candidate, RefreshOutcome::RetryableFailure);
-                            watcher.take();
-                            registered.clear_after_backend_loss();
-                            recreate_watcher = true;
-                            schedule_watch_coverage_retry(
-                                message.clone(),
+                            let desired_interests = workers
+                                .iter()
+                                .flat_map(|worker| worker.watch_interests.iter().cloned())
+                                .collect::<Vec<_>>();
+                            if let Err(message) = reconcile_runtime_watch_targets(
+                                watcher.as_mut().expect("active watcher"),
+                                &mut registered,
+                                &desired_interests,
                                 &mut watch_retry_at,
                                 &mut watch_retry_delay,
-                                &mut watch_coverage_lost,
                                 &mut last_watch_error,
                                 &tx,
                                 event_handler.as_ref(),
-                            );
-                            mounts[index]
-                                .loading
-                                .set_idle_phase(MountIdlePhase::Pending);
-                            continue 'watch;
+                            ) {
+                                watcher_lease.revoke();
+                                watcher_lease
+                                    .finish_candidate(candidate, RefreshOutcome::RetryableFailure);
+                                watcher.take();
+                                registered.clear_after_backend_loss();
+                                recreate_watcher = true;
+                                schedule_watch_coverage_retry(
+                                    message.clone(),
+                                    &mut watch_retry_at,
+                                    &mut watch_retry_delay,
+                                    &mut watch_coverage_lost,
+                                    &mut last_watch_error,
+                                    &tx,
+                                    event_handler.as_ref(),
+                                );
+                                mounts[index]
+                                    .loading
+                                    .set_idle_phase(MountIdlePhase::Pending);
+                                continue 'watch;
+                            }
                         }
                         // Preserve the move-only candidate until the first request. No generated
                         // input, BuildSession, or visible generation is produced here.
@@ -3879,6 +3904,15 @@ fn union_watch_interests(left: &[WatchInterest], right: &[WatchInterest]) -> Vec
     interests.sort();
     interests.dedup();
     interests
+}
+
+fn extend_watch_interests(current: &mut Vec<WatchInterest>, additional: &[WatchInterest]) -> bool {
+    let union = union_watch_interests(current, additional);
+    if *current == union {
+        return false;
+    }
+    *current = union;
+    true
 }
 
 fn watch_targets(interests: &[WatchInterest]) -> BTreeMap<PathBuf, RecursiveMode> {
@@ -5881,6 +5915,37 @@ mod tests {
             *outcomes.lock().unwrap(),
             vec![RefreshOutcome::Committed, RefreshOutcome::Aborted]
         );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn pending_candidate_expands_compile_coverage_only_when_needed() {
+        let controls = WatchInterest::exact_file("wake.config.toml");
+        let archive = WatchInterest::exact_file("dep.zip");
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&reads);
+        let package = archive.clone();
+        let candidate = DevMountCandidate::new(vec![controls.clone()], || unreachable!(), |_| {})
+            .with_materialization_watches(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                vec![package]
+            });
+        let mut registered = vec![controls.clone()];
+        assert!(!extend_watch_interests(
+            &mut registered,
+            &candidate.pending_interests
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(extend_watch_interests(
+            &mut registered,
+            candidate.watch_interests()
+        ));
+        assert!(registered.contains(&controls) && registered.contains(&archive));
+        assert!(!extend_watch_interests(
+            &mut registered,
+            candidate.watch_interests()
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
