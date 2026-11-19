@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-10-26
 - Amended by: [ADR 0080](0080-reviewed-linux-156-macos-arm64-157.md)
+- Amended by: [ADR 0086](0086-windows-157-and-macos-intel-browser.md)
 
 ## Context
 

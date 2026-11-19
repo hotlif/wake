@@ -485,7 +485,7 @@ jobs:
           - platform: win32-x64-msvc
             runner: windows-latest
             browser_evidence: reviewed-major-conformance
-            browser_majors: '151,152,155,156'
+            browser_majors: '151,152,155,156,157'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
@@ -499,7 +499,7 @@ jobs:
             runner: macos-15-intel
             browser_evidence: reviewed-major-smoke
             browser_majors: '150,151'
-            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+            browser_path: '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: reviewed-major-smoke
@@ -740,7 +740,7 @@ jobs:
           - platform: win32-x64-msvc
             runner: windows-latest
             browser_evidence: reviewed-major-conformance
-            browser_majors: '151,152,155,156'
+            browser_majors: '151,152,155,156,157'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
@@ -754,7 +754,7 @@ jobs:
             runner: macos-15-intel
             browser_evidence: reviewed-major-smoke
             browser_majors: '150,151'
-            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+            browser_path: '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: reviewed-major-smoke

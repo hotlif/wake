@@ -23,7 +23,7 @@
       "rustTarget": "x86_64-pc-windows-msvc",
       "experimental": {
         "mode": "reviewed-major-conformance",
-        "majors": [151, 152, 155, 156]
+        "majors": [151, 152, 155, 156, 157]
       },
       "reviewedRunnerEvidence": [
         {
@@ -55,6 +55,14 @@
           "browserVersions": {
             "chrome": "156.0.8078.48",
             "edge": "155.0.4283.62"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/9aa6d32300c1b8caaeb4f01efdcd619261422fd4/images/windows/Windows2025-VS2026-Readme.md",
+          "imageVersion": "20261116.315.1",
+          "browserVersions": {
+            "chrome": "157.0.8103.79",
+            "edge": "157.0.4341.60"
           }
         }
       ]
@@ -147,7 +155,7 @@
           "source": "https://github.com/actions/runner-images/blob/f10516542b8f2fef89b652a8d5f5de63aa543b77/images/macos/macos-15-Readme.md",
           "imageVersion": "20260824.0482.1",
           "browserVersions": {
-            "chrome": "151.0.7922.174",
+            "chrome": "151.0.7922.138",
             "edge": "151.0.4129.101"
           }
         }
