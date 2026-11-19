@@ -7,6 +7,7 @@
 - Amended by: [ADR 0048](0048-windows-browser-reviewed-majors.md)
 - Amended by: [ADR 0073](0073-reviewed-browser-major-155.md)
 - Amended by: [ADR 0080](0080-reviewed-linux-156-macos-arm64-157.md)
+- Amended by: [ADR 0086](0086-windows-157-and-macos-intel-browser.md)
 
 ## Context
 

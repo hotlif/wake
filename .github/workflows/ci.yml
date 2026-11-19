@@ -280,7 +280,7 @@ jobs:
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
             browser_evidence: reviewed-major-conformance
-            browser_majors: '151,152,155,156'
+            browser_majors: '151,152,155,156,157'
             browser_path: 'C:/Program Files/Google/Chrome/Application/chrome.exe'
           - target: linux-x64-gnu
             os: ubuntu-24.04
@@ -303,7 +303,7 @@ jobs:
             rust_target: x86_64-apple-darwin
             browser_evidence: reviewed-major-smoke
             browser_majors: '150,151'
-            browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+            browser_path: '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
     env:
       WAKE_SYSTEM_BROWSER_PATH: ${{ matrix.browser_path }}
     steps:

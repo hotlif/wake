@@ -114,6 +114,7 @@
 - [ADR 0075: Wake Test 工程控制与可信统计](0075-test-engineering-controls.md) — `accepted`
 - [ADR 0080: Linux 156 与 macOS arm64 157 浏览器镜像准入](0080-reviewed-linux-156-macos-arm64-157.md) — `accepted`
 - [ADR 0083: Linux 157 浏览器镜像准入](0083-reviewed-linux-browser-major-157.md) — `accepted`
+- [ADR 0086: Windows 157 与 macOS Intel 浏览器运行器修复](0086-windows-157-and-macos-intel-browser.md) — `accepted`
 
 ### node-release
 

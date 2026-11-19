@@ -118,6 +118,9 @@ function requireBrowserMatrix(name, source, { targetKey, runnerKey, rustTargetKe
     } else if (policy.mode !== 'unavailable') {
       lines.push(`browser_major: ${policy.major}`)
     }
+    if (target === 'darwin-x64') {
+      lines.push("browser_path: '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'")
+    }
     const row = lines
       .map((line, index) => index === 0
         ? escapeRegExp(line)
