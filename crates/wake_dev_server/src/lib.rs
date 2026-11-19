@@ -14,7 +14,7 @@
 
 mod federation;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -715,6 +715,13 @@ impl WatchInterest {
     }
 
     pub fn registrations(&self) -> Vec<(PathBuf, RecursiveMode)> {
+        self.registrations_in(&mut WatchDirectories::default())
+    }
+
+    fn registrations_in<'a>(
+        &'a self,
+        directories: &mut WatchDirectories<'a>,
+    ) -> Vec<(PathBuf, RecursiveMode)> {
         let (paths, tree) = match self {
             Self::Tree {
                 declared, resolved, ..
@@ -724,10 +731,11 @@ impl WatchInterest {
         let mut registrations = paths
             .into_iter()
             .filter_map(|path| {
-                if tree && path.is_dir() {
+                if tree && directories.is_directory(path) {
                     Some((path.clone(), RecursiveMode::Recursive))
                 } else {
-                    nearest_existing_watch_ancestor(path)
+                    directories
+                        .nearest_existing(path)
                         .map(|ancestor| (ancestor, RecursiveMode::NonRecursive))
                 }
             })
@@ -737,7 +745,9 @@ impl WatchInterest {
             watch_declared_parent: true,
             ..
         } = self
-            && let Some(parent) = declared.parent().and_then(nearest_existing_watch_ancestor)
+            && let Some(parent) = declared
+                .parent()
+                .and_then(|path| directories.nearest_existing(path))
         {
             registrations.push((parent, RecursiveMode::NonRecursive));
         }
@@ -862,7 +872,14 @@ fn resolve_declared_watch_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static WATCH_PATH_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn normalize_watch_path(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    WATCH_PATH_RESOLUTIONS.set(WATCH_PATH_RESOLUTIONS.get() + 1);
     wake_common::fs::resolve_existing_prefix(path)
 }
 
@@ -881,13 +898,30 @@ fn reported_watch_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     reported
 }
 
-fn nearest_existing_watch_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut candidate = path;
-    loop {
-        if candidate.is_dir() {
-            return Some(normalize_watch_path(candidate));
-        }
-        candidate = candidate.parent()?;
+// One physical registration plan observes shared directories once. Reconciliation creates a
+// fresh plan so directory creation, removal and symlink retargeting are visible on the next pass.
+#[derive(Default)]
+struct WatchDirectories<'a> {
+    is_directory: HashMap<&'a Path, bool>,
+    physical: HashMap<&'a Path, PathBuf>,
+}
+
+impl<'a> WatchDirectories<'a> {
+    fn is_directory(&mut self, path: &'a Path) -> bool {
+        *self
+            .is_directory
+            .entry(path)
+            .or_insert_with(|| path.is_dir())
+    }
+
+    fn nearest_existing(&mut self, path: &'a Path) -> Option<PathBuf> {
+        let directory = path.ancestors().find(|path| self.is_directory(path))?;
+        Some(
+            self.physical
+                .entry(directory)
+                .or_insert_with(|| normalize_watch_path(directory))
+                .clone(),
+        )
     }
 }
 
@@ -3921,7 +3955,11 @@ fn watch_targets(interests: &[WatchInterest]) -> BTreeMap<PathBuf, RecursiveMode
     // filesystem observations in `registrations`, while still observing every distinct interest
     // on each reconciliation (including missing-tree promotion and retargeted symlinks).
     let unique = interests.iter().collect::<BTreeSet<_>>();
-    for (path, mode) in unique.into_iter().flat_map(WatchInterest::registrations) {
+    let mut directories = WatchDirectories::default();
+    for (path, mode) in unique
+        .into_iter()
+        .flat_map(|interest| interest.registrations_in(&mut directories))
+    {
         targets
             .entry(path)
             .and_modify(|current| {
@@ -6258,6 +6296,26 @@ mod tests {
             std::fs::remove_file(&control).unwrap();
             std::fs::write(&control, contents).unwrap();
             assert_eq!(interest.registrations(), expected);
+        }
+    }
+
+    #[test]
+    fn watch_targets_resolve_shared_archive_directory_once_per_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let interests = (0..54)
+            .map(|id| WatchInterest::exact_file(cache.join(format!("package-{id}.zip"))))
+            .collect::<Vec<_>>();
+
+        for expected in [root.path(), cache.as_path()] {
+            std::fs::create_dir_all(expected).unwrap();
+            let physical = normalize_watch_path(expected);
+            let before = WATCH_PATH_RESOLUTIONS.get();
+            assert_eq!(
+                watch_targets(&interests),
+                BTreeMap::from([(physical, RecursiveMode::NonRecursive)])
+            );
+            assert_eq!(WATCH_PATH_RESOLUTIONS.get() - before, 1);
         }
     }
 
