@@ -356,6 +356,8 @@ export interface FederationRemoteDefinition {
   readonly typesIntegrity?: `sha384-${string}` | string
   readonly typesHash?: string
   readonly lock?: FederationRemoteLock
+  /** Defaults to HEAD. Direct GET applies only to locked, same-origin HTTPS production assets. */
+  readonly assetPreflight?: FederationAssetPreflight
   /** Positive safe integer, at most 300,000 milliseconds. */
   readonly timeoutMs?: number
   /** Positive safe integer, at most 16 MiB. */
@@ -363,6 +365,8 @@ export interface FederationRemoteDefinition {
   /** Positive safe integer, at most 512 MiB. */
   readonly maxAssetSize?: number
 }
+
+export type FederationAssetPreflight = 'head' | 'verified-get'
 
 export interface FederationTransportManifestResult {
   /** Untrusted decoded JSON. Wake validates and normalizes it into FederationManifest. */
@@ -384,11 +388,21 @@ export interface FederationTransportContext {
   readonly styleTarget?: ShadowRoot
 }
 
+export interface FederationAssetPreflightContext {
+  readonly signal?: AbortSignal
+  readonly mode: FederationMode
+  readonly maxAssetSize: number
+  readonly assetPreflight: FederationAssetPreflight
+  readonly assetContext: Readonly<FederationAssetExecutionContext>
+}
+
 export interface FederationTransport {
   fetchManifest(
     url: string,
     context: FederationTransportContext,
   ): unknown | FederationTransportManifestResult | Promise<unknown | FederationTransportManifestResult>
+  /** Validates the resource without installing nodes or executing code. Production results may be shared. */
+  preflightAsset?(asset: FederationAsset, context: FederationAssetPreflightContext): void | Promise<void>
   loadScript(
     asset: FederationAsset,
     context: FederationTransportContext,
@@ -398,11 +412,9 @@ export interface FederationTransport {
 }
 
 /**
- * The default browser transport bounds streamed Manifest and failure-diagnostic bodies. Native
- * module/style success requires bounded HEAD Content-Length metadata together with browser-enforced
- * SHA-384 SRI. Identity transfers require the exact Manifest size; compressed transfers use their
- * distinct bounded wire size. HEAD is not proof of the final GET origin, so CSP/CORS must constrain
- * origins too.
+ * The default browser transport bounds streamed Manifest and validation bodies. It checks HEAD
+ * metadata by default and can verify decoded GET bytes for eligible production assets. Native
+ * scripts and styles enforce SHA-384 SRI. Deployments use CSP/CORS to constrain native origins.
  */
 export interface FederationRuntimeOptions {
   readonly global?: Window & typeof globalThis
@@ -467,8 +479,10 @@ export declare class FederationRuntime {
   resolveShared<T = unknown>(request: string | SharedRequest | SharedRequirement): Promise<T>
   /** Accepts a dev update and returns the canonical frozen update object. */
   applyDevUpdate(update: unknown): Readonly<FederationDevUpdate>
-  /** Attaches an isolated expose's ordered initial and lazy styles to one open ShadowRoot. */
-  attachIsolatedStyleTarget(specifier: string, root: ShadowRoot): Promise<() => void>
+  /** Attaches ordered styles to one open ShadowRoot. The signal cancels pending attachment. */
+  attachIsolatedStyleTarget(
+    specifier: string, root: ShadowRoot, options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<() => void>
   /** Loads an asset only from the previously accepted immutable Manifest for `request.buildId`. */
   loadFederatedAsset(request: FederatedAssetRequest): Promise<void>
   prepareRemote(name: string): Promise<Readonly<{ name: string; buildId: string; generation: number }>>

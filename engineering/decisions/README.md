@@ -103,6 +103,7 @@
 - [ADR 0029: Node contracts and Federation control stay product-owned](0029-node-contract-and-federation-control-ownership.md) — `accepted`
 - [ADR 0032: Federation 开发快照使用浏览器租约与有界竞态窗口](0032-federation-development-snapshot-leases.md) — `accepted`
 - [ADR 0040: Parser-owned frozen declaration graph](0040-parser-owned-frozen-declaration-graph.md) — `accepted`
+- [ADR 0087: Federation 生产资源预检策略与启动队列](0087-federation-production-preflight.md) — `accepted`
 
 ### testing
 

@@ -312,8 +312,17 @@ async function api() {
     devReconnectMs: 5_000,
     transport: {
       fetchManifest: () => ({}),
+      preflightAsset: (_asset, context) => {
+        const strategy: 'head' | 'verified-get' = context.assetPreflight
+        void strategy
+      },
       loadScript: () => undefined,
     },
+  })
+  federationRuntime.registerRemote({
+    name: 'production', manifestUrl: 'https://remote.test/manifest.json', mode: 'production',
+    assetPreflight: 'verified-get',
+    lock: { buildId: 'production-1', manifestIntegrity: 'sha384-example', hasExposes: false, allowedAssets: {} },
   })
   federationRuntime.applyDevUpdate({
     schemaVersion: 'wake.federation.dev-update.v1',
@@ -338,6 +347,7 @@ async function api() {
   const detachIsolatedStyles = await federationRuntime.attachIsolatedStyleTarget(
     'catalog/Button',
     document.createElement('div').attachShadow({ mode: 'open' }),
+    { signal: new AbortController().signal },
   )
   detachIsolatedStyles()
   const remoteDescriptor = await federationRuntime.describeRemote('catalog/Button')

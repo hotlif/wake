@@ -124,6 +124,28 @@ npx wake dev . --port 4173
 
 本地 HTTP 示例仅用于开发。生产 remote 先发布完整产物与 HTTPS Manifest，host 配置生产 URL 和允许 origin，再运行 `wake federation lock .`，最后构建 host。lock 绑定 build、声明和资源完整性；配置不匹配或 remote 缺失时应修复，不跳过校验。
 
+浏览器接受生产 Manifest 并解析目标 expose 后，会有界并行预检初始 CSS、容器入口、同步
+JavaScript 和 expose 入口。多个 ShadowRoot 可以复用同一资源的预检。样式的挂载顺序、
+脚本的执行顺序和原生 SHA-384 SRI 均保持原有语义。懒加载资源仍在使用时预检。
+调用 `attachIsolatedStyleTarget` 时可传入 `{ signal }` 来取消等待中的挂载，其他预览可以继续等待同一资源。
+
+默认预检通过 `HEAD` 检查 MIME 和 `Content-Length`。如果静态托管的 `HEAD` 响应省略
+`Content-Length`，可在浏览器注册生产 remote 时为已锁定的同源 HTTPS 资源启用直接校验。
+
+```ts
+runtime.registerRemote({
+  name: "catalog",
+  manifestUrl: lock.manifestUrl,
+  mode: "production",
+  lock,
+  assetPreflight: "verified-get",
+});
+```
+
+`verified-get` 跟踪解码后的字节数并校验 MIME、精确大小和 SHA-384。预检拒绝重定向并省略
+凭据，随后浏览器仍用带 `integrity` 的原生标签加载资源。跨源资源、开发和预览模式继续使用
+`HEAD`，开发租约和 `410` 重载语义保持原有行为。
+
 具体发布顺序和检查项见[开发与发布](/integration/remote-delivery)。
 
 ## 接入 React 时的选择

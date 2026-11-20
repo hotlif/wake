@@ -15,6 +15,8 @@ use wake_app::{
 use wake_common::zip::ZipArchive;
 use wake_test_browser::{BrowserDriver, BrowserLaunchOptions};
 
+mod federation_preflight;
+
 fn write(root: &Path, path: &str, contents: &str) {
     let path = root.join(path);
     fs::create_dir_all(path.parent().expect("fixture file has a parent")).unwrap();

@@ -2381,6 +2381,27 @@ test('native GET diagnostics recognize the typed 410 JSON control without trusti
   assert.equal(reloads, 1)
 })
 
+test('native failure diagnostics keep compressed wire size separate from the decoded manifest size', async () => {
+  const requested = { ...asset('https://cdn.test/tiny.mjs'), integrity: sri('X') }
+  const fallback = new FederationError(FEDERATION_ERROR_CODES.NETWORK, 'native request failed')
+  const context = {
+    global: {
+      crypto: webcrypto,
+      async fetch() {
+        return new Response('X', {
+          headers: {
+            'content-type': requested.mime,
+            'content-encoding': 'gzip',
+            'content-length': '21',
+          },
+        })
+      },
+    },
+    maxAssetSize: 32,
+  }
+  await assert.rejects(__diagnoseFederatedAssetFailure(requested, context, fallback), (error) => error === fallback)
+})
+
 test('native failure diagnostics stream with the manifest size bound and cache an overflow', async () => {
   const manifestUrl = 'https://cdn.test/diagnostic/manifest.json'
   const lazyUrl = 'https://cdn.test/diagnostic/b1/lazy.mjs'
@@ -2673,4 +2694,338 @@ test('default browser transport preflights metadata with HEAD and downloads each
   )
   assert.equal(scripts.length, scriptsBeforeUrlReuse)
   assert.deepEqual(contexts.get(remoteB2Url), { name: 'browser', buildId: 'b2', generation: 1 })
+})
+
+function productionPreflightFixture({
+  strategy = 'verified-get',
+  origin = 'https://host.test',
+  respond,
+  changeLock = () => {},
+  mode = 'production',
+  extraScripts = [],
+  isolatedMode = true,
+  sharedFallback = false,
+} = {}) {
+  const manifestUrl = `${origin}/catalog/manifest.json`
+  const source = new Map()
+  const makeAsset = (file, kind = 'javascript', mime = 'text/javascript') => {
+    const url = `${origin}/catalog/b1/${file}`
+    const body = file
+    source.set(url, body)
+    return { ...asset(url, kind, mime), size: body.length, integrity: sri(body) }
+  }
+  const initial = ['base.css', 'button.css'].map((file) => makeAsset(file, 'css', 'text/css'))
+  const synchronous = ['one.mjs', 'two.mjs', ...extraScripts].map((file) => makeAsset(file))
+  const lazy = makeAsset('lazy.mjs')
+  const isolated = {
+    ...expose('unused', isolatedMode ? 'isolated' : 'generic'),
+    scope: isolatedMode ? 'catalog-isolated' : 'default',
+    entry: makeAsset('button.mjs'),
+    synchronousAssets: [initial[0], ...synchronous],
+    css: [initial[1]],
+    asynchronousAssets: [lazy],
+  }
+  const remoteManifest = manifest('catalog', 'b1', { exposes: { './Button': isolated } })
+  delete remoteManifest.development
+  remoteManifest.remoteEntry = makeAsset('remote.mjs')
+  const typeAsset = makeAsset('types.json')
+  remoteManifest.types = {
+    buildId: 'b1', url: typeAsset.url, contentHash: typeAsset.contentHash,
+    integrity: typeAsset.integrity, size: typeAsset.size, format: 'declaration-bundle',
+  }
+  const resources = [remoteManifest.remoteEntry, isolated.entry, ...initial, ...synchronous, lazy]
+  if (sharedFallback) {
+    const shared = makeAsset('shared.mjs')
+    const ownership = { singleton: true, owner: 'catalog' }
+    remoteManifest.shared = {
+      offers: [{ ...offer('shared', '1.0.0', 'catalog', ownership), asset: shared }],
+      requirements: [requirement('shared', '1.0.0', ownership)],
+    }
+    resources.push(shared)
+  }
+  const body = JSON.stringify(remoteManifest)
+  const lock = {
+    manifestUrl, buildId: 'b1', manifestIntegrity: sri(body),
+    hasExposes: true, typesIntegrity: typeAsset.integrity,
+    allowedAssets: Object.fromEntries([...resources, typeAsset].map((item) => [item.url, item.integrity])),
+  }
+  changeLock(lock)
+  const manifests = new Map([[manifestUrl, body]])
+  const requests = []
+  const scripts = []
+  const targetGlobal = {
+    crypto: webcrypto,
+    location: new URL('https://host.test/page'),
+    document: {
+      createElement: () => ownedStyleNode(null),
+      head: {
+        append(script) {
+          scripts.push(script)
+          if (script.src === remoteManifest.remoteEntry.url) {
+            runtime.registerContainer({
+              name: 'catalog', buildId: 'b1',
+              container: { init() {}, get() { return () => 'button' }, getShared() { return 'shared' } },
+            })
+          }
+          queueMicrotask(() => script.onload?.())
+        },
+      },
+    },
+    async fetch(url, options) {
+      if (manifests.has(url)) {
+        return new Response(manifests.get(url), { headers: { 'content-type': 'application/json' } })
+      }
+      const requested = resources.find((item) => item.url === url)
+      assert.ok(requested, url)
+      requests.push({ url, ...options })
+      assert.equal(options.credentials, 'omit')
+      assert.equal(options.redirect, 'error')
+      const valid = () => new Response(options.method === 'GET' ? source.get(url) : null, {
+        headers: {
+          'content-type': requested.mime,
+          ...(options.method === 'HEAD' ? { 'content-length': String(requested.size) } : {}),
+        },
+      })
+      return respond === undefined ? valid() : respond(requested, options, valid)
+    },
+  }
+  targetGlobal.window = targetGlobal
+  const runtime = createFederationRuntime({ global: targetGlobal })
+  runtime.registerRemote({ name: 'catalog', manifestUrl, mode, lock, assetPreflight: strategy })
+  const registerAlias = (name, assetPreflight) => {
+    const url = `${origin}/${name}/manifest.json`
+    const json = JSON.stringify({ ...remoteManifest, name })
+    manifests.set(url, json)
+    runtime.registerRemote({
+      name, manifestUrl: url, mode, assetPreflight,
+      lock: { ...lock, manifestUrl: url, manifestIntegrity: sri(json) },
+    })
+  }
+  return { runtime, requests, initial, synchronous, isolated, remoteEntry: remoteManifest.remoteEntry, scripts, registerAlias }
+}
+
+test('production startup preflights overlap and share verification while native loading stays ordered', async () => {
+  const releaseCss = Promise.withResolvers()
+  const receivedSecondCss = Promise.withResolvers()
+  const fixture = productionPreflightFixture({
+    async respond(item, _options, valid) {
+      if (item.url.endsWith('/button.css')) receivedSecondCss.resolve()
+      if (item.kind === 'css') await releaseCss.promise
+      return valid()
+    },
+  })
+  const { runtime, requests, initial, remoteEntry, synchronous, isolated, scripts } = fixture
+  const roots = [openShadowRoot('one'), openShadowRoot('two')]
+  const mounts = Promise.all(roots.map((root) => runtime.attachIsolatedStyleTarget('catalog/Button', root)))
+  void mounts.catch(() => {})
+  try {
+    const overlap = await Promise.race([receivedSecondCss.promise.then(() => true), new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 200)
+      void receivedSecondCss.promise.then(() => clearTimeout(timer))
+    })])
+    assert.equal(overlap, true, 'both CSS requests should reach the server before either can complete')
+    assert.ok(requests.some(({ url }) => url === remoteEntry.url))
+    assert.deepEqual(roots.map(({ children }) => children.length), [0, 0])
+  } finally {
+    releaseCss.resolve()
+    await mounts
+  }
+  assert.equal(await runtime.loadRemote('catalog/Button'), 'button')
+  const orderedScripts = [remoteEntry, ...synchronous, isolated.entry]
+  assert.deepEqual(scripts.map(({ src, integrity }) => [src, integrity]), orderedScripts.map((item) => [item.url, item.integrity]))
+  for (const root of roots) {
+    assert.deepEqual(root.children.map(({ href, integrity }) => [href, integrity]), initial.map((item) => [item.url, item.integrity]))
+  }
+  assert.deepEqual(requests.map(({ url, method }) => [url, method]).sort(),
+    [...initial, ...orderedScripts].map(({ url }) => [url, 'GET']).sort())
+})
+
+test('verified GET rejects invalid responses and allows a new attachment to verify corrected bytes', async () => {
+  for (const [label, expected, badResponse] of [
+    ['digest', 'ASSET_INTEGRITY', (item) => new Response('x'.repeat(item.size), { headers: { 'content-type': item.mime } })],
+    ['truncated', 'ASSET_SIZE', (item) => new Response('x'.repeat(item.size - 1), { headers: { 'content-type': item.mime } })],
+    ['limit', 'ASSET_SIZE', (item, cancel) => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(item.size + 1)) },
+      cancel,
+    }), { headers: { 'content-type': item.mime } })],
+    ['MIME', 'ASSET_MIME', () => new Response('base.css', { headers: { 'content-type': 'text/plain' } })],
+    ['redirect', 'NETWORK', () => { throw new TypeError('redirect rejected by fetch') }],
+  ]) {
+    let corrupt = true
+    let cancelled = false
+    const { runtime, requests, initial } = productionPreflightFixture({
+      respond(item, _options, valid) {
+        return corrupt && item.url.endsWith('/base.css')
+          ? badResponse(item, () => { cancelled = true })
+          : valid()
+      },
+    })
+    const target = openShadowRoot(label)
+    await assert.rejects(runtime.attachIsolatedStyleTarget('catalog/Button', target), {
+      code: FEDERATION_ERROR_CODES[expected],
+    }, label)
+    if (label === 'limit') assert.equal(cancelled, true)
+    assert.deepEqual(target.children, [])
+    corrupt = false
+    await runtime.attachIsolatedStyleTarget('catalog/Button', target)
+    assert.deepEqual(target.children.map(({ href }) => href), initial.map(({ url }) => url))
+    assert.deepEqual(requests.filter(({ url }) => url === initial[0].url).map(({ method }) => method), ['GET', 'GET'])
+  }
+})
+
+test('verification failures on ordered production scripts do not poison future loads', async () => {
+  let corrupt = true
+  const fixture = productionPreflightFixture({
+    respond(item, _options, valid) {
+      if (corrupt && item.url.endsWith('/one.mjs')) {
+        return new Response('x'.repeat(item.size), { headers: { 'content-type': item.mime } })
+      }
+      return valid()
+    },
+  })
+  const { runtime, scripts, synchronous } = fixture
+  await assert.rejects(runtime.loadRemote('catalog/Button'), { code: FEDERATION_ERROR_CODES.ASSET_INTEGRITY })
+  assert.equal(scripts.some(({ src }) => src === synchronous[0].url), false)
+  corrupt = false
+  assert.equal(await runtime.loadRemote('catalog/Button'), 'button')
+})
+
+test('production shared fallback verification can retry container initialization', async () => {
+  let corrupt = true
+  const { runtime, requests } = productionPreflightFixture({
+    sharedFallback: true,
+    respond(item, _options, valid) {
+      if (corrupt && item.url.endsWith('/shared.mjs')) {
+        return new Response('x'.repeat(item.size), { headers: { 'content-type': item.mime } })
+      }
+      return valid()
+    },
+  })
+  await assert.rejects(runtime.loadRemote('catalog/Button'), (error) =>
+    error.code === FEDERATION_ERROR_CODES.SHARE_UNSATISFIABLE &&
+    error.cause?.code === FEDERATION_ERROR_CODES.ASSET_INTEGRITY)
+  corrupt = false
+  assert.equal(await runtime.loadRemote('catalog/Button'), 'button')
+  assert.equal(requests.filter(({ url }) => url.endsWith('/shared.mjs')).length, 2)
+})
+
+test('manifest digest and lock mismatches block production startup preflight completely', async () => {
+  for (const [mutate, expected] of [
+    [(lock) => { lock.manifestIntegrity = sri('wrong manifest') }, 'MANIFEST_INTEGRITY'],
+    [(lock) => { lock.buildId = 'wrong-build' }, 'LOCK_MISMATCH'],
+    [(lock) => { delete lock.allowedAssets['https://host.test/catalog/b1/one.mjs'] }, 'ASSET_INTEGRITY'],
+  ]) {
+    const { runtime, requests } = productionPreflightFixture({ changeLock: mutate })
+    await assert.rejects(runtime.attachIsolatedStyleTarget('catalog/Button', openShadowRoot()), {
+      code: FEDERATION_ERROR_CODES[expected],
+    })
+    assert.deepEqual(requests, [])
+  }
+})
+
+test('the optional verified GET strategy falls back to HEAD for cross-origin and development', async () => {
+  for (const options of [{ origin: 'https://cdn.test' }, { mode: 'development' }, { strategy: 'head' }]) {
+    const { runtime, requests } = productionPreflightFixture(options)
+    await runtime.attachIsolatedStyleTarget('catalog/Button', openShadowRoot())
+    assert.ok(requests.length > 0)
+    assert.ok(requests.every(({ method }) => method === 'HEAD'))
+  }
+  assert.throws(() => productionPreflightFixture({ strategy: 'invalid' }), {
+    code: FEDERATION_ERROR_CODES.CONFIG_INVALID,
+  })
+})
+
+test('a completed HEAD does not satisfy verified GET for a page-owned stylesheet', async () => {
+  const { runtime, requests, registerAlias } = productionPreflightFixture({
+    strategy: 'head',
+    isolatedMode: false,
+    respond(item, { method }, valid) {
+      return method === 'GET'
+        ? new Response('x'.repeat(item.size), { headers: { 'content-type': item.mime } })
+        : valid()
+    },
+  })
+  registerAlias('verified', 'verified-get')
+  const load = (name) => runtime.loadFederatedAsset({
+    name, buildId: 'b1', fileName: 'base.css', kind: 'css',
+  })
+  await load('catalog')
+  await assert.rejects(load('verified'), { code: FEDERATION_ERROR_CODES.ASSET_INTEGRITY })
+  assert.deepEqual(requests.map(({ method }) => method), ['HEAD', 'GET'])
+})
+
+test('the production preflight queue bounds startup concurrency', async () => {
+  const release = Promise.withResolvers()
+  const filled = Promise.withResolvers()
+  let active = 0
+  let peak = 0
+  const { runtime, requests } = productionPreflightFixture({
+    extraScripts: ['three.mjs', 'four.mjs'],
+    async respond(_item, _options, valid) {
+      active += 1
+      peak = Math.max(peak, active)
+      if (active === 6) filled.resolve()
+      await release.promise
+      active -= 1
+      return valid()
+    },
+  })
+  const loading = runtime.loadRemote('catalog/Button')
+  const timer = setTimeout(() => filled.reject(new Error('startup queue did not fill')), 500)
+  try {
+    await filled.promise
+    assert.equal(requests.length, 6)
+  } finally {
+    clearTimeout(timer)
+    release.resolve()
+    await loading
+  }
+  assert.equal(peak, 6)
+  assert.equal(requests.length, 8)
+})
+
+test('cancelling production mounts keeps other waiters alive and releases abandoned work', async () => {
+  const held = []
+  const fixture = productionPreflightFixture({
+    respond(item, { signal }, valid) {
+      if (!item.url.endsWith('/base.css')) return valid()
+      const { promise, resolve, reject } = Promise.withResolvers()
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      held.push({ signal, release: () => resolve(valid()) })
+      return promise
+    },
+  })
+  const { runtime } = fixture
+  const attach = (controller) => runtime.attachIsolatedStyleTarget('catalog/Button', openShadowRoot(), {
+    signal: controller.signal,
+  })
+  const waitForHeld = async (count) => {
+    for (let attempt = 0; held.length < count && attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(held.length, count)
+  }
+  const one = new AbortController()
+  const two = new AbortController()
+  const first = attach(one)
+  const second = attach(two)
+  await waitForHeld(1)
+  one.abort()
+  await assert.rejects(first, { name: 'AbortError' })
+  assert.equal(held[0].signal.aborted, false)
+  two.abort()
+  await assert.rejects(second, { name: 'AbortError' })
+  assert.equal(held[0].signal.aborted, true)
+
+  const three = new AbortController()
+  const four = new AbortController()
+  const third = attach(three)
+  const fourth = attach(four)
+  await waitForHeld(2)
+  three.abort()
+  await assert.rejects(third, { name: 'AbortError' })
+  assert.equal(held[1].signal.aborted, false)
+  held[1].release()
+  const detach = await fourth
+  detach()
 })

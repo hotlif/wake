@@ -8,6 +8,7 @@ const DEFAULT_SCOPE = 'default'
 const DEFAULT_TIMEOUT_MS = 15_000
 const DEFAULT_MAX_MANIFEST_SIZE = 1024 * 1024
 const DEFAULT_MAX_ASSET_SIZE = 64 * 1024 * 1024
+const MAX_CONCURRENT_ASSET_PREFLIGHTS = 6
 const MAX_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_MANIFEST_SIZE = 16 * 1024 * 1024
 const MAX_ASSET_SIZE = 512 * 1024 * 1024
@@ -927,46 +928,155 @@ function assertBrowserGlobal(targetGlobal) {
   }
 }
 
+function waitWithSignal(promise, signal) {
+  if (signal === undefined) return promise
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    void promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      },
+    )
+    if (signal.aborted) onAbort()
+  })
+}
+
+function initialExposeStyles(expose) {
+  return [...expose.synchronousAssets.filter((asset) => asset.kind === 'css'), ...expose.css]
+}
+
+function createAssetPreflightQueue(preflight) {
+  const entries = new Map()
+  const startupQueue = new Set()
+  const demandQueue = new Set()
+  let active = 0
+
+  function drain() {
+    while (active < MAX_CONCURRENT_ASSET_PREFLIGHTS) {
+      const queue = startupQueue.size > 0 ? startupQueue : demandQueue
+      if (queue.size === 0) return
+      const entry = queue.values().next().value
+      queue.delete(entry)
+      active += 1
+      void entry.run().finally(() => {
+        active -= 1
+        drain()
+      })
+    }
+  }
+
+  return async (asset, context, startup) => {
+    const { signal, maxAssetSize, assetPreflight } = context
+    signal?.throwIfAborted()
+    const key = JSON.stringify([
+      asset.url, asset.integrity, asset.kind, asset.mime, asset.size, maxAssetSize, assetPreflight,
+    ])
+    let entry = entries.get(key)
+    if (entry === true) return
+    if (entry === undefined) {
+      const controller = new AbortController()
+      let resolve, reject
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no })
+      entry = {
+        promise,
+        controller,
+        reject,
+        waiters: 0,
+        async run() {
+          try {
+            await preflight(asset, { ...context, signal: controller.signal })
+            if (entries.get(key) === entry) entries.set(key, true)
+            resolve()
+          } catch (error) {
+            if (entries.get(key) === entry) entries.delete(key)
+            reject(error)
+          }
+        },
+      }
+      entries.set(key, entry)
+      const queue = startup ? startupQueue : demandQueue
+      queue.add(entry)
+    } else if (startup && demandQueue.delete(entry)) {
+      startupQueue.add(entry)
+    }
+
+    entry.waiters += 1
+    try {
+      const result = waitWithSignal(entry.promise, signal)
+      drain()
+      await result
+    } finally {
+      entry.waiters -= 1
+      if (entry.waiters === 0 && entries.get(key) === entry) {
+        entries.delete(key)
+        startupQueue.delete(entry)
+        demandQueue.delete(entry)
+        entry.controller.abort()
+        entry.reject(entry.controller.signal.reason)
+      }
+    }
+  }
+}
+
 async function preflightAsset(asset, context) {
-  // This HEAD request is a metadata gate, not proof of the native GET's final origin. Successful
-  // identity transfers require the exact decoded size; encoded transfers have a distinct wire
-  // length and are bounded instead. The browser's SHA-384 SRI check binds the executed content,
-  // while deployment CSP/CORS must independently constrain the executable origins.
+  // Native loads independently enforce SHA-384 SRI. Deployment CSP/CORS constrains their origins.
+  const verifiedGet = context.assetPreflight === 'verified-get'
   const response = await context.global.fetch(asset.url, {
     cache: 'default',
     credentials: 'omit',
-    method: 'HEAD',
+    method: verifiedGet ? 'GET' : 'HEAD',
     mode: 'cors',
     redirect: 'error',
     signal: context.signal,
   })
-  if (!response.ok) {
-    if (response.status === 410) {
-      const control = devFullReloadFromHeaders(response)
-      const matched = reloadForDevelopmentAsset(control, context)
-      throw goneAssetError(asset, response, matched ? control : null)
+  try {
+    if (!response.ok) {
+      if (response.status === 410) {
+        const control = devFullReloadFromHeaders(response)
+        const matched = reloadForDevelopmentAsset(control, context)
+        throw goneAssetError(asset, response, matched ? control : null)
+      }
+      fail(FEDERATION_ERROR_CODES.NETWORK, `Asset request failed with HTTP ${response.status}`, {
+        phase: 'asset-fetch',
+        retryable: response.status >= 500 || response.status === 408 || response.status === 429,
+        details: { url: asset.url, status: response.status },
+      })
     }
-    fail(FEDERATION_ERROR_CODES.NETWORK, `Asset request failed with HTTP ${response.status}`, {
+    const contentType = normalizeMime(response.headers.get('content-type'))
+    if (!assetMimeMatches(asset.kind, asset.mime, contentType)) {
+      fail(FEDERATION_ERROR_CODES.ASSET_MIME, 'Asset response MIME does not match the manifest', {
+        phase: 'asset-fetch',
+        retryable: false,
+        details: { url: asset.url, expected: asset.mime, actual: contentType },
+      })
+    }
+    const limits = {
       phase: 'asset-fetch',
-      retryable: response.status >= 500 || response.status === 408 || response.status === 429,
-      details: { url: asset.url, status: response.status },
-    })
+      url: asset.url,
+      maximumBytes: context.maxAssetSize,
+      expectedBytes: asset.size,
+    }
+    if (verifiedGet) {
+      const bytes = await readBoundedResponseBytes(response, limits)
+      await verifyIntegrity(bytes, asset.integrity, context.global, FEDERATION_ERROR_CODES.ASSET_INTEGRITY, {
+        url: asset.url,
+      })
+    } else {
+      responseContentLength(response, { ...limits, requireContentLength: true })
+    }
+  } catch (error) {
+    if (verifiedGet) void response.body?.cancel().catch(() => {})
+    throw error
   }
-  const contentType = normalizeMime(response.headers.get('content-type'))
-  if (!assetMimeMatches(asset.kind, asset.mime, contentType)) {
-    fail(FEDERATION_ERROR_CODES.ASSET_MIME, 'Asset response MIME does not match the manifest', {
-      phase: 'asset-fetch',
-      retryable: false,
-      details: { url: asset.url, expected: asset.mime, actual: contentType },
-    })
-  }
-  responseContentLength(response, {
-    phase: 'asset-fetch',
-    url: asset.url,
-    maximumBytes: context.maxAssetSize,
-    expectedBytes: asset.size,
-    requireContentLength: true,
-  })
 }
 
 async function diagnoseNativeAssetFailure(asset, context, fallbackError) {
@@ -1004,7 +1114,7 @@ async function diagnoseNativeAssetFailure(asset, context, fallbackError) {
     bytes = await readBoundedResponseBytes(response, {
       phase: 'asset-diagnose',
       url: asset.url,
-      maximumBytes: Math.min(asset.size, context.maxAssetSize),
+      maximumBytes: context.maxAssetSize,
       expectedBytes: asset.size,
     })
   } catch (error) {
@@ -1097,13 +1207,11 @@ function createBrowserTransport(targetGlobal, options) {
       return { manifest, rawBytes, contentType }
     },
 
+    preflightAsset(asset, context) {
+      return preflightAsset(asset, { ...context, global: targetGlobal })
+    },
+
     async loadScript(asset, context) {
-      await preflightAsset(asset, {
-        global: targetGlobal,
-        signal: context.signal,
-        maxAssetSize: context.maxAssetSize,
-        assetContext: context.assetContext,
-      })
       installAssetExecutionContext(targetGlobal, asset.url, context.assetContext)
       await new Promise((resolve, reject) => {
         const script = targetGlobal.document.createElement('script')
@@ -1153,12 +1261,6 @@ function createBrowserTransport(targetGlobal, options) {
     },
 
     async loadStyle(asset, context) {
-      await preflightAsset(asset, {
-        global: targetGlobal,
-        signal: context.signal,
-        maxAssetSize: context.maxAssetSize,
-        assetContext: context.assetContext,
-      })
       const target = context.styleTarget ?? targetGlobal.document.head
       if (target === null || typeof target?.append !== 'function') {
         fail(FEDERATION_ERROR_CODES.STYLE_LOAD, 'Remote stylesheet target is unavailable', {
@@ -1819,6 +1921,22 @@ function normalizeProvider(raw, defaults) {
 }
 
 export class FederationRuntime {
+  #preflightFailures = new WeakSet()
+
+  #productionPreflight = createAssetPreflightQueue(async (asset, context) => {
+    try {
+      await this.transport.preflightAsset(asset, context)
+    } catch (cause) {
+      if (cause instanceof FederationError) {
+        this.#preflightFailures.add(cause)
+        throw cause
+      }
+      throw new FederationError(FEDERATION_ERROR_CODES.NETWORK, 'Asset preflight request failed', {
+        phase: 'asset-fetch', retryable: true, cause, details: { url: asset.url },
+      })
+    }
+  })
+
   constructor(options = {}) {
     const mode = federationMode(options.mode === undefined ? 'development' : options.mode, 'runtime-config')
     if (options.transport === undefined) assertBrowserGlobal(options.global ?? globalThis)
@@ -1870,6 +1988,12 @@ export class FederationRuntime {
       })
     }
     const mode = federationMode(config.mode === undefined ? this.mode : config.mode, 'remote-register')
+    const assetPreflight = config.assetPreflight === undefined ? 'head' : config.assetPreflight
+    if (assetPreflight !== 'head' && assetPreflight !== 'verified-get') {
+      fail(FEDERATION_ERROR_CODES.CONFIG_INVALID, 'Unknown Federation asset preflight strategy', {
+        phase: 'remote-register', retryable: false, details: { name: config.name, assetPreflight },
+      })
+    }
     const manifestOrigin = new URL(manifestUrl).origin
     let allowedOrigins
     try {
@@ -1978,6 +2102,7 @@ export class FederationRuntime {
     const registrationSignature = JSON.stringify({
       manifestUrl,
       mode,
+      assetPreflight,
       allowedOrigins: [...allowedOrigins].sort(),
       expectedBuildId,
       manifestIntegrity: lockedManifestIntegrity,
@@ -2001,6 +2126,7 @@ export class FederationRuntime {
       name: config.name,
       manifestUrl,
       mode,
+      assetPreflight,
       registrationSignature,
       allowedOrigins,
       expectedBuildId,
@@ -2248,7 +2374,7 @@ export class FederationRuntime {
     return update
   }
 
-  async attachIsolatedStyleTarget(specifier, root) {
+  async attachIsolatedStyleTarget(specifier, root, { signal } = {}) {
     if (!isRecord(root) || root.mode !== 'open' || typeof root.append !== 'function' ||
         !isRecord(root.host) || root.host.shadowRoot !== root) {
       fail(FEDERATION_ERROR_CODES.STYLE_LOAD, 'Isolated styles require an open ShadowRoot', {
@@ -2258,7 +2384,9 @@ export class FederationRuntime {
     const parsed = parseRemoteSpecifier(specifier)
     const remote = this.#remote(parsed.remote)
     const revision = remote.revision
-    const manifest = await this.#manifest(remote)
+    signal?.throwIfAborted()
+    const manifest = await waitWithSignal(this.#manifest(remote), signal)
+    signal?.throwIfAborted()
     this.#assertRevision(remote, revision)
     const expose = manifest.exposes[parsed.expose]
     if (expose === undefined) this.#unknownExpose(remote, parsed.expose)
@@ -2269,16 +2397,14 @@ export class FederationRuntime {
       })
     }
     const bucket = this.#isolatedStyleBucket(manifest, parsed.expose, remote)
-    this.#rememberIsolatedStyles(bucket, [
-      ...expose.synchronousAssets.filter((asset) => asset.kind === 'css'),
-      ...expose.css,
-    ])
+    this.#rememberIsolatedStyles(bucket, initialExposeStyles(expose))
     let target = bucket.targets.get(root)
     if (target === undefined) {
       target = {
         root,
         references: 0,
         active: true,
+        controller: new AbortController(),
         tail: Promise.resolve(),
         flights: new Map(),
         nodes: new Map(),
@@ -2286,11 +2412,14 @@ export class FederationRuntime {
       bucket.targets.set(root, target)
     }
     target.references += 1
+    const stopPreflights = this.#startStartupPreflights(remote, manifest, parsed.expose, expose)
     let released = false
     try {
-      await this.#hydrateIsolatedStyleTarget(bucket, target)
+      await waitWithSignal(this.#hydrateIsolatedStyleTarget(bucket, target), signal)
+      signal?.throwIfAborted()
       this.#assertRevision(remote, revision)
     } catch (error) {
+      stopPreflights?.()
       this.#releaseIsolatedStyleTarget(bucket, target)
       released = true
       throw error
@@ -2298,6 +2427,7 @@ export class FederationRuntime {
     return () => {
       if (released) return
       released = true
+      stopPreflights?.()
       this.#releaseIsolatedStyleTarget(bucket, target)
     }
   }
@@ -2448,19 +2578,24 @@ export class FederationRuntime {
     const parsed = parseRemoteSpecifier(specifier)
     const remote = this.#remote(parsed.remote)
     const revision = remote.revision
+    let stopPreflights
     try {
       const manifest = await this.#manifest(remote)
       this.#assertRevision(remote, revision)
-      if (manifest.exposes[parsed.expose] === undefined) this.#unknownExpose(remote, parsed.expose)
+      const expose = manifest.exposes[parsed.expose]
+      if (expose === undefined) this.#unknownExpose(remote, parsed.expose)
+      stopPreflights = this.#startStartupPreflights(remote, manifest, parsed.expose, expose)
       await this.#container(remote, manifest)
       this.#assertRevision(remote, revision)
-      await this.#exposeAssets(parsed.expose, manifest.exposes[parsed.expose], remote, manifest)
+      await this.#exposeAssets(parsed.expose, expose, remote, manifest)
       this.#assertRevision(remote, revision)
       this.#trace(remote, 'preload', 'ready', { expose: parsed.expose, buildId: manifest.buildId })
     } catch (error) {
       this.#rememberFatal(remote, error, revision)
       this.#traceError(remote, 'preload', error, { expose: parsed.expose })
       throw error
+    } finally {
+      stopPreflights?.()
     }
   }
 
@@ -2499,10 +2634,6 @@ export class FederationRuntime {
       this.#assertRevision(remote, revision)
       const expose = manifest.exposes[parsed.expose]
       if (expose === undefined) this.#unknownExpose(remote, parsed.expose)
-      const css = [
-        ...expose.synchronousAssets.filter((asset) => asset.kind === 'css'),
-        ...expose.css,
-      ]
       return Object.freeze({
         specifier,
         name: manifest.name,
@@ -2513,7 +2644,7 @@ export class FederationRuntime {
         mode: expose.mode,
         scope: expose.scope,
         shadow: expose.shadow,
-        css: Object.freeze(css),
+        css: Object.freeze(initialExposeStyles(expose)),
       })
     } catch (error) {
       this.#rememberFatal(remote, error, revision)
@@ -2546,11 +2677,13 @@ export class FederationRuntime {
     const remote = this.#remote(parsed.remote)
     const revision = remote.revision
     let manifest
+    let stopPreflights
     try {
       manifest = await this.#manifest(remote)
       this.#assertRevision(remote, revision)
       const expose = manifest.exposes[parsed.expose]
       if (expose === undefined) this.#unknownExpose(remote, parsed.expose)
+      stopPreflights = this.#startStartupPreflights(remote, manifest, parsed.expose, expose)
       const state = await this.#container(remote, manifest)
       this.#assertRevision(remote, revision)
       await this.#exposeAssets(parsed.expose, expose, remote, manifest)
@@ -2631,6 +2764,8 @@ export class FederationRuntime {
       }
       this.#traceError(remote, 'load', error, { expose: parsed.expose, buildId: manifest?.buildId })
       throw error
+    } finally {
+      stopPreflights?.()
     }
   }
 
@@ -2942,24 +3077,28 @@ export class FederationRuntime {
     }
   }
 
-  async #withTimeout(operation, milliseconds, phase, details) {
+  async #withTimeout(operation, milliseconds, phase, details, parentSignal) {
     const Controller = this.global.AbortController ?? globalThis.AbortController
     const controller = Controller === undefined ? null : new Controller()
+    const abort = () => controller?.abort(parentSignal.reason)
     let timer
     try {
-      return await Promise.race([
+      parentSignal?.throwIfAborted()
+      parentSignal?.addEventListener('abort', abort, { once: true })
+      return await waitWithSignal(Promise.race([
         operation(controller?.signal),
         new Promise((_, reject) => {
           timer = setTimeout(() => {
-            controller?.abort()
             reject(new FederationError(FEDERATION_ERROR_CODES.TIMEOUT, `${phase} timed out`, {
               phase, retryable: true, details: { ...details, timeoutMs: milliseconds },
             }))
+            controller?.abort()
           }, milliseconds)
         }),
-      ])
+      ]), parentSignal)
     } finally {
       clearTimeout(timer)
+      parentSignal?.removeEventListener('abort', abort)
     }
   }
 
@@ -3142,7 +3281,7 @@ export class FederationRuntime {
       let returned
       try {
         returned = await this.#withTimeout(
-          (signal) => this.transport.loadScript(manifest.remoteEntry, {
+          (signal) => this.#loadPreparedAsset('loadScript', manifest.remoteEntry, remote, {
             signal,
             runtime: this,
             manifest,
@@ -3226,7 +3365,7 @@ export class FederationRuntime {
     } catch (error) {
       // A transient shared fallback/network failure must not poison this container forever.
       // Non-retryable init failures remain frozen for the lifetime of the page.
-      if (error?.retryable && state.initFlight === initFlight) state.initFlight = null
+      if (this.#canRetryAsset(error) && state.initFlight === initFlight) state.initFlight = null
       throw error
     }
   }
@@ -3448,18 +3587,22 @@ export class FederationRuntime {
         return moduleValue
       })
     }
+    const flight = provider.promise
     try {
-      const value = await provider.promise
+      const value = await flight
       this.#recordShareDecision(provider, request, context, false)
       return value
     } catch (cause) {
       const error = new FederationError(FEDERATION_ERROR_CODES.SHARE_UNSATISFIABLE, 'Shared dependency provider failed to load', {
-        phase: 'share-load', retryable: cause instanceof FederationError ? cause.retryable : true,
+        phase: 'share-load', retryable: !(cause instanceof FederationError) || this.#canRetryAsset(cause),
         cause,
         details: { shareKey: request.shareKey, version: provider.version, owner: provider.ownerKey },
       })
-      if (error.retryable) provider.promise = null
-      else provider.fatalError = error
+      if (error.retryable) {
+        if (provider.promise === flight) provider.promise = null
+      } else {
+        provider.fatalError = error
+      }
       throw error
     }
   }
@@ -3518,7 +3661,7 @@ export class FederationRuntime {
           })
         }
         const loaded = await this.#withTimeout(
-          (signal) => this.transport.loadStyle(asset, {
+          (signal) => this.#loadPreparedAsset('loadStyle', asset, bucket.remote, {
             signal,
             maxAssetSize: bucket.remote.maxAssetSize,
             styleTarget: target.root,
@@ -3533,6 +3676,7 @@ export class FederationRuntime {
           bucket.remote.timeoutMs,
           'style-load',
           { name: bucket.name, buildId: bucket.buildId, expose: bucket.expose, url: asset.url },
+          target.controller.signal,
         )
         if (loaded !== undefined && typeof loaded?.remove === 'function') {
           if (target.active && target.references > 0) target.nodes.set(key, loaded)
@@ -3545,7 +3689,7 @@ export class FederationRuntime {
     try {
       await flight
     } catch (error) {
-      if (error?.retryable && target.flights.get(key) === flight) target.flights.delete(key)
+      if (this.#canRetryAsset(error) && target.flights.get(key) === flight) target.flights.delete(key)
       throw error
     }
   }
@@ -3572,6 +3716,7 @@ export class FederationRuntime {
     if (target.references > 0) target.references -= 1
     if (target.references > 0) return
     target.active = false
+    target.controller.abort()
     if (bucket.targets.get(target.root) === target) bucket.targets.delete(target.root)
     for (const node of [...target.nodes.values()].reverse()) node.remove()
     target.nodes.clear()
@@ -3581,24 +3726,32 @@ export class FederationRuntime {
     if (typeof this.transport.loadStyle !== 'function') return
     for (const asset of assets) {
       const key = `${asset.url}\0${asset.integrity}`
+      const context = {
+        maxAssetSize: remote.maxAssetSize,
+        assetContext: runtimeAssetContext(remote, manifest),
+      }
       let flight = this.styleFlights.get(key)
       if (flight === undefined) {
         flight = this.#withTimeout(
-          (signal) => this.transport.loadStyle(asset, {
-            signal,
-            maxAssetSize: remote.maxAssetSize,
-            assetContext: runtimeAssetContext(remote, manifest),
-          }),
+          (signal) => this.#loadPreparedAsset('loadStyle', asset, remote, { ...context, signal }),
           remote.timeoutMs,
           'style-load',
           { url: asset.url },
         )
         this.styleFlights.set(key, flight)
+      } else if (remote.mode === 'production' && typeof this.transport.preflightAsset === 'function') {
+        // Reuse the native stylesheet only after satisfying this remote's verification policy.
+        await this.#withTimeout(
+          (signal) => this.#preflight(asset, remote, { ...context, signal }),
+          remote.timeoutMs,
+          'style-load',
+          { url: asset.url },
+        )
       }
       try {
         await flight
       } catch (error) {
-        if (error?.retryable && this.styleFlights.get(key) === flight) this.styleFlights.delete(key)
+        if (this.#canRetryAsset(error) && this.styleFlights.get(key) === flight) this.styleFlights.delete(key)
         throw error
       }
     }
@@ -3610,8 +3763,7 @@ export class FederationRuntime {
     }
     await this.#script(expose.entry, remote, manifest, exposeKey)
     if (expose.mode !== 'isolated') {
-      const synchronousStyles = expose.synchronousAssets.filter((asset) => asset.kind === 'css')
-      await this.#styles([...synchronousStyles, ...expose.css], remote, manifest)
+      await this.#styles(initialExposeStyles(expose), remote, manifest)
     }
   }
 
@@ -3621,7 +3773,7 @@ export class FederationRuntime {
     let flight = this.scriptFlights.get(key)
     if (flight === undefined) {
       flight = this.#withTimeout(
-        (signal) => this.transport.loadScript(asset, {
+        (signal) => this.#loadPreparedAsset('loadScript', asset, remote, {
           signal,
           runtime: this,
           manifest,
@@ -3638,9 +3790,64 @@ export class FederationRuntime {
     try {
       await flight
     } catch (error) {
-      if (error?.retryable && this.scriptFlights.get(key) === flight) this.scriptFlights.delete(key)
+      if (this.#canRetryAsset(error) && this.scriptFlights.get(key) === flight) this.scriptFlights.delete(key)
       throw error
     }
+  }
+
+  #startStartupPreflights(remote, manifest, exposeKey, expose) {
+    if (remote.mode !== 'production' || typeof this.transport.preflightAsset !== 'function') return
+    const controller = new AbortController()
+    const stop = () => controller.abort()
+    const timer = setTimeout(stop, remote.timeoutMs)
+    const assets = [
+      ...initialExposeStyles(expose),
+      manifest.remoteEntry,
+      ...expose.synchronousAssets.filter((asset) => asset.kind === 'javascript'),
+      expose.entry,
+    ]
+    const context = {
+      signal: controller.signal,
+      maxAssetSize: remote.maxAssetSize,
+      assetContext: runtimeAssetContext(remote, manifest),
+    }
+    void Promise.allSettled(assets.map((asset) => this.#preflight(
+      asset,
+      remote,
+      asset === expose.entry || (asset.kind === 'css' && expose.mode === 'isolated')
+        ? { ...context, assetContext: runtimeAssetContext(remote, manifest, exposeKey) }
+        : context,
+      true,
+    ))).then(() => clearTimeout(timer))
+    return () => {
+      clearTimeout(timer)
+      stop()
+    }
+  }
+
+  #preflight(asset, remote, { signal, maxAssetSize, assetContext }, startup = false) {
+    const mode = remote.mode
+    let assetPreflight = 'head'
+    if (mode === 'production' && remote.assetPreflight === 'verified-get') {
+      const url = new URL(asset.url)
+      const location = this.global.location
+      const origin = location?.origin ?? (location?.href ? new URL(location.href).origin : undefined)
+      if (url.protocol === 'https:' && url.origin === origin) assetPreflight = 'verified-get'
+    }
+    const context = { signal, maxAssetSize, assetContext, mode, assetPreflight }
+    return mode === 'production'
+      ? this.#productionPreflight(asset, context, startup)
+      : this.transport.preflightAsset(asset, context)
+  }
+
+  async #loadPreparedAsset(method, asset, remote, context) {
+    if (typeof this.transport.preflightAsset === 'function') await this.#preflight(asset, remote, context)
+    context.signal?.throwIfAborted()
+    return this.transport[method](asset, context)
+  }
+
+  #canRetryAsset(error) {
+    return error?.retryable || this.#preflightFailures.has(error)
   }
 
   #unknownExpose(remote, expose) {
@@ -3663,7 +3870,7 @@ export class FederationRuntime {
 
   #rememberFatal(remote, error, revision) {
     if (revision !== undefined && remote.revision !== revision) return
-    if (!(error instanceof FederationError) || error.retryable) return
+    if (!(error instanceof FederationError) || this.#canRetryAsset(error)) return
     if (FATAL_REMOTE_CODES.has(error.code)) remote.fatalError = error
   }
 }
