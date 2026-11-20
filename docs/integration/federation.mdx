@@ -128,6 +128,7 @@ npx wake dev . --port 4173
 JavaScript 和 expose 入口。多个 ShadowRoot 可以复用同一资源的预检。样式的挂载顺序、
 脚本的执行顺序和原生 SHA-384 SRI 均保持原有语义。懒加载资源仍在使用时预检。
 调用 `attachIsolatedStyleTarget` 时可传入 `{ signal }` 来取消等待中的挂载，其他预览可以继续等待同一资源。
+Federation React bridge 在卸载时也会取消尚未完成的样式挂载。
 
 默认预检通过 `HEAD` 检查 MIME 和 `Content-Length`。如果静态托管的 `HEAD` 响应省略
 `Content-Length`，可在浏览器注册生产 remote 时为已锁定的同源 HTTPS 资源启用直接校验。

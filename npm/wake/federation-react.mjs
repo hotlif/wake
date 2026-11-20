@@ -281,6 +281,7 @@ export function createIsolatedBridge(options) {
   let currentSlots
   let ownedNodes = []
   let detachStyleTarget
+  let styleAttachment
   let mountFlight = null
   let operationTail = Promise.resolve()
   let devEventTarget
@@ -414,6 +415,7 @@ export function createIsolatedBridge(options) {
     }
     status = 'mounting'
     host = target
+    let attachment
     try {
       currentProps = cloneStructured(props)
       const document = target.ownerDocument ?? globalThis.document
@@ -426,11 +428,19 @@ export function createIsolatedBridge(options) {
         throw bridgeError(FEDERATION_ERROR_CODES.BRIDGE_LIFECYCLE, 'Existing ShadowRoot must be open', {})
       }
       if (options.attachStyleTarget !== undefined) {
-        const detach = await options.attachStyleTarget(shadowRoot)
-        if (typeof detach !== 'function') {
-          throw bridgeError(FEDERATION_ERROR_CODES.BRIDGE_LIFECYCLE, 'Style target attachment must return detach()', {})
+        attachment = styleAttachment ?? new AbortController()
+        styleAttachment = attachment
+        try {
+          attachment.signal.throwIfAborted()
+          const detach = await options.attachStyleTarget(shadowRoot, { signal: attachment.signal })
+          if (typeof detach !== 'function') {
+            throw bridgeError(FEDERATION_ERROR_CODES.BRIDGE_LIFECYCLE, 'Style target attachment must return detach()', {})
+          }
+          detachStyleTarget = detach
+          attachment.signal.throwIfAborted()
+        } finally {
+          styleAttachment = undefined
         }
-        detachStyleTarget = detach
       }
       mountRoot = document.createElement('div')
       mountRoot.setAttribute?.('data-wake-federation-root', '')
@@ -445,7 +455,7 @@ export function createIsolatedBridge(options) {
       installDevListener(document)
       return instance
     } catch (cause) {
-      status = 'failed'
+      status = attachment?.signal.aborted ? 'unmounted' : 'failed'
       removeNodes(ownedNodes)
       ownedNodes = []
       releaseStyleTarget()
@@ -473,6 +483,7 @@ export function createIsolatedBridge(options) {
       if (status !== 'idle') {
         return Promise.reject(bridgeError(FEDERATION_ERROR_CODES.BRIDGE_LIFECYCLE, 'Bridge instances can only be mounted once', { status }))
       }
+      if (options.attachStyleTarget !== undefined) styleAttachment = new AbortController()
       mountFlight = enqueue(() => mountInto(target, props, mountOptions))
       return mountFlight
     },
@@ -494,6 +505,9 @@ export function createIsolatedBridge(options) {
     },
 
     async unmount() {
+      styleAttachment?.abort(new FederationError(FEDERATION_ERROR_CODES.TIMEOUT, 'Isolated style attachment was cancelled', {
+        phase: 'react-bridge-style-target', retryable: true,
+      }))
       if (mountFlight !== null) {
         try {
           await mountFlight
@@ -558,7 +572,7 @@ export async function createFederatedIsolatedBridge(runtime, specifier, options 
   return createIsolatedBridge({
     ...bridgeOptions,
     styles: additionalStyles,
-    attachStyleTarget: (root) => runtime.attachIsolatedStyleTarget(specifier, root),
+    attachStyleTarget: (root, options) => runtime.attachIsolatedStyleTarget(specifier, root, options),
     load: () => runtime.loadRemote(specifier),
     dev,
   })

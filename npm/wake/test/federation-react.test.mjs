@@ -427,6 +427,34 @@ test('federated isolated bridge attaches the ShadowRoot before loading its remot
   )
 })
 
+test('unmount cancels a pending federated style attachment before loading module code', async () => {
+  const started = Promise.withResolvers()
+  const host = new FakeHost(new FakeDocument())
+  const runtime = {
+    async describeRemote() {
+      return { mode: 'isolated', shadow: 'open', development: false }
+    },
+    attachIsolatedStyleTarget(_specifier, _root, options) {
+      started.resolve()
+      assert.ok(options?.signal)
+      return new Promise((_, reject) => {
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+      })
+    },
+    loadRemote() {
+      assert.fail('cancelled bridges must not load module code')
+    },
+  }
+  const bridge = await createFederatedIsolatedBridge(runtime, 'catalog/Button')
+  const mount = bridge.mount(host, {})
+  const rejection = assert.rejects(mount, { code: FEDERATION_ERROR_CODES.TIMEOUT })
+  await started.promise
+  await bridge.unmount()
+  await rejection
+  assert.equal(bridge.status, 'unmounted')
+  assert.deepEqual(host.shadowRoot.children, [])
+})
+
 test('federated isolated bridge does not load code when style target attachment fails', async () => {
   const document = new FakeDocument()
   const host = new FakeHost(document)
