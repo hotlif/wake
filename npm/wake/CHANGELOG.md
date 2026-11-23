@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.58
+
+### Patch Changes
+
+- 77ecd08: Support matching React and React DOM 19.3.1 in the Wake Test React adapter and npm peer dependencies.
+- @crab-dev/css@0.1.58
+
 ## 0.1.57
 
 ### Patch Changes
