@@ -1,5 +1,9 @@
 # @crab-dev/wake-linux-arm64-gnu
 
+## 0.1.58
+
+No changes in this release.
+
 ## 0.1.57
 
 No changes in this release.
