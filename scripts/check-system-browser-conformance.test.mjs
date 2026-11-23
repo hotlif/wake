@@ -116,7 +116,7 @@ for (const major of [150, 151]) {
   assert.equal(checked.stableConformance, false)
 }
 
-for (const major of [150, 152, 157]) {
+for (const major of [150, 152, 157, 158]) {
   const result = {
     schemaVersion: 'wake.test.v1',
     success: true,
@@ -145,6 +145,7 @@ for (const [target, version, mode] of [
   ['linux-x64-gnu', 'Chrome/157.0.8103.50', 'reviewed-major-conformance'],
   ['darwin-x64', 'Chrome/151.0.7922.138', 'reviewed-major-smoke'],
   ['darwin-arm64', 'Chrome/157.0.8103.39', 'reviewed-major-smoke'],
+  ['darwin-arm64', 'Chrome/158.0.8127.37', 'reviewed-major-smoke'],
 ]) {
   const checked = validateExperimentalBrowserIdentity({
     manifest,
@@ -159,7 +160,7 @@ for (const [target, version, mode] of [
   assert.throws(() => validateSystemBrowserConformanceManifest(missingEvidence),
     /must cover every reviewed experimental major/)
 }
-for (const major of [151, 153, 154, 155, 156, 158]) {
+for (const major of [151, 153, 154, 155, 156, 159]) {
   assert.throws(() => validateExperimentalBrowserIdentity({
     manifest,
     target: 'darwin-arm64',

@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-11-11
 - Amended by: [ADR 0083](0083-reviewed-linux-browser-major-157.md)
+- Amended by: [ADR 0088](0088-reviewed-macos-arm64-browser-major-158.md)
 
 ## Context
 

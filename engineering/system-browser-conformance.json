@@ -166,7 +166,7 @@
       "rustTarget": "aarch64-apple-darwin",
       "experimental": {
         "mode": "reviewed-major-smoke",
-        "majors": [150, 152, 157]
+        "majors": [150, 152, 157, 158]
       },
       "reviewedRunnerEvidence": [
         {
@@ -190,6 +190,13 @@
           "imageVersion": "20261104.0514.1",
           "browserVersions": {
             "chrome": "157.0.8103.39"
+          }
+        },
+        {
+          "source": "https://github.com/actions/runner-images/blob/186066b10e735549f10370f053c1891445b20e96/images/macos/macos-15-arm64-Readme.md",
+          "imageVersion": "20261118.0550.1",
+          "browserVersions": {
+            "chrome": "158.0.8127.37"
           }
         }
       ]

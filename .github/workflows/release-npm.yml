@@ -503,7 +503,7 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: reviewed-major-smoke
-            browser_majors: '150,152,157'
+            browser_majors: '150,152,157,158'
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:
@@ -758,7 +758,7 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
             browser_evidence: reviewed-major-smoke
-            browser_majors: '150,152,157'
+            browser_majors: '150,152,157,158'
             browser_path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
     runs-on: ${{ matrix.runner }}
     env:
