@@ -176,8 +176,9 @@ Node `vm` 跨 realm 的公开包值语义，并覆盖
 Node Worker、socket 与 cleanup-hook 生命周期，不能由 Wake 自身的测试 realm 证明；它不执行
 Wake Test 语义，也不是产品运行时的回退路径。普通 JavaScript、CLI 和包测试不得加入该例外。
 
-React 版本升级保留根工作区的 19.2.8 基线，并通过 `fixtures/react-19-3` 的独立 PnP workspace
-固定 19.3.0。`cargo test -p wake_test --test react19_conformance` 执行两版 DOM 契约；加上
+React 版本升级保留根工作区的 19.2.8 基线，并分别在 `fixtures/react-19-3` 和
+`fixtures/react-19-3-1` 两个 PnP workspace 固定 19.3.0 和 19.3.1。
+`cargo test -p wake_test --test react19_conformance` 执行三个版本的 DOM 契约；加上
 `-- --ignored --nocapture` 执行同一 fixture 的真实浏览器契约。来源策略允许每个包列出多个
 精确版本，但每个声明仍须精确 pin，所有列出的版本都须存在声明与校验和锁记录。
 版本门禁须同时验证匹配版本、上下界、预发布与不匹配负例，不能仅凭伪 manifest 宣称适配成功。

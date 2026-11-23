@@ -12,35 +12,41 @@ fn repository_root() -> &'static Path {
 
 #[test]
 fn react_19_lifecycle_suspense_transition_ssr_and_hydration_conformance() {
-    react_conformance("19.2.8", "dom");
+    react_conformance("target", "19.2.8", "dom");
 }
 
 #[test]
 fn react_19_3_dom_conformance() {
-    react_conformance("19.3.0", "dom");
+    react_conformance("fixtures/react-19-3", "19.3.0", "dom");
+}
+
+#[test]
+fn react_19_3_1_dom_conformance() {
+    react_conformance("fixtures/react-19-3-1", "19.3.1", "dom");
 }
 
 #[test]
 #[ignore = "requires an installed system Chromium browser"]
 fn react_19_browser_conformance() {
-    react_conformance("19.2.8", "browser");
+    react_conformance("target", "19.2.8", "browser");
 }
 
 #[test]
 #[ignore = "requires an installed system Chromium browser"]
 fn react_19_3_browser_conformance() {
-    react_conformance("19.3.0", "browser");
+    react_conformance("fixtures/react-19-3", "19.3.0", "browser");
 }
 
-fn react_conformance(version: &str, environment: &str) {
-    let parent = repository_root().join(if version == "19.3.0" {
-        "fixtures/react-19-3"
-    } else {
-        "target"
-    });
+#[test]
+#[ignore = "requires an installed system Chromium browser"]
+fn react_19_3_1_browser_conformance() {
+    react_conformance("fixtures/react-19-3-1", "19.3.1", "browser");
+}
+
+fn react_conformance(workspace: &str, version: &str, environment: &str) {
     let fixture = tempfile::Builder::new()
         .prefix("wake-react19-conformance-")
-        .tempdir_in(parent)
+        .tempdir_in(repository_root().join(workspace))
         .unwrap();
     fs::write(fixture.path().join("package.json"), "{}").unwrap();
     fs::write(

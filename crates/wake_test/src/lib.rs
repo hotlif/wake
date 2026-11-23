@@ -5389,12 +5389,14 @@ fn structured_failure(
 }
 
 fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> {
+    const SUPPORTED_RANGE: &str = ">=19.2.8 <=19.3.1";
+
     fn manifest(importer: &Path, package: &str) -> Result<(PathBuf, String), TestError> {
         let metadata = resolve_package_manifest(importer, package).map_err(|error| {
             TestError::new(
                 "WAKE_TEST_REACT_VERSION",
                 format!(
-                    "{package} is required by @crab-dev/wake/test/react; install matching react and react-dom >=19.2.8 <19.3.0 || =19.3.0 ({error})"
+                    "{package} is required by @crab-dev/wake/test/react; install matching react and react-dom {SUPPORTED_RANGE} ({error})"
                 ),
             )
             .at(importer)
@@ -5403,7 +5405,7 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
     }
 
     fn supported(version: &str) -> bool {
-        if version == "19.3.0" {
+        if matches!(version, "19.3.0" | "19.3.1") {
             return true;
         }
         let mut parts = version.split('.').map(str::parse::<u64>);
@@ -5419,7 +5421,7 @@ fn validate_react_versions(importer: &Path) -> Result<ReactVersions, TestError> 
         return Err(TestError::new(
             "WAKE_TEST_REACT_VERSION",
             format!(
-                "Wake Test requires one matching react/react-dom version >=19.2.8 <19.3.0 || =19.3.0; resolved react {react:?} at {} and react-dom {react_dom:?} at {}",
+                "Wake Test requires one matching react/react-dom version {SUPPORTED_RANGE}; resolved react {react:?} at {} and react-dom {react_dom:?} at {}",
                 react_manifest.display(),
                 react_dom_manifest.display()
             ),
@@ -8379,12 +8381,15 @@ environment = "dom"
             ("19.2.8", "19.2.8", true),
             ("19.2.9", "19.2.9", true),
             ("19.3.0", "19.3.0", true),
+            ("19.3.1", "19.3.1", true),
+            ("19.3.1", "19.3.0", false),
             ("19.3.0", "19.2.8", false),
             ("19.2.7", "19.2.7", false),
-            ("19.3.1", "19.3.1", false),
+            ("19.3.2", "19.3.2", false),
             ("19.4.0", "19.4.0", false),
             ("20.0.0", "20.0.0", false),
             ("19.3.0-rc.0", "19.3.0-rc.0", false),
+            ("19.3.1-rc.0", "19.3.1-rc.0", false),
             ("19.2.8-canary", "19.2.8-canary", false),
             ("19.3", "19.3", false),
         ] {
