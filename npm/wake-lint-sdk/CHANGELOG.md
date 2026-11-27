@@ -1,5 +1,9 @@
 # @crab-dev/wake-lint-sdk
 
+## 0.1.59
+
+No changes in this release.
+
 ## 0.1.58
 
 No changes in this release.
