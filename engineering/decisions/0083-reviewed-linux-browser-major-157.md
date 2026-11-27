@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-13
+- Amended by: [ADR 0091](0091-reviewed-linux-browser-major-158.md)
 
 ## Context
 
