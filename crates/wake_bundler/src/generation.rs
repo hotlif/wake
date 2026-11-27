@@ -234,7 +234,7 @@ impl<T> CachedIo<T> {
     fn capture(result: io::Result<T>) -> Self {
         match result {
             Ok(value) => Self::Ok(value),
-            Err(error) => Self::Err(IoErrorSnapshot::capture(error)),
+            Err(error) => Self::Err(IoErrorSnapshot::capture(&error)),
         }
     }
 }
@@ -248,15 +248,15 @@ impl<T: Clone> CachedIo<T> {
     }
 }
 
-#[derive(Clone)]
-struct IoErrorSnapshot {
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct IoErrorSnapshot {
     kind: io::ErrorKind,
     raw_os_error: Option<i32>,
     message: String,
 }
 
 impl IoErrorSnapshot {
-    fn capture(error: io::Error) -> Self {
+    pub(super) fn capture(error: &io::Error) -> Self {
         Self {
             kind: error.kind(),
             raw_os_error: error.raw_os_error(),

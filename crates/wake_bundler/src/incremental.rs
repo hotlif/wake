@@ -77,6 +77,18 @@ use crate::{
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
 type Content = Arc<str>;
 
+type WorkerArtifacts = FxHashMap<PathBuf, Arc<CachedWorker>>;
+
+struct CachedWorker {
+    target_identity: PathBuf,
+    options: crate::BuildOptions,
+    inputs: crate::worker_inputs::WorkerInputs,
+    name: String,
+    // Owner IDs are assigned by the current parent graph on every use.
+    files: Vec<(String, Vec<u8>)>,
+    diagnostics: Vec<Diagnostic>,
+}
+
 /// 「说明符 → 内部模块 id」映射（dep 顺序确定，指纹稳定）。
 type DepIds = Vec<ResolvedModuleRequest>;
 type LoadedResult = (
@@ -830,6 +842,7 @@ impl std::hash::Hash for ParsedModule {
 
 /// 增量 + 并行打包器。持有引擎、工作窃取执行器与跨构建保留的输入 cell 表。
 pub struct IncrementalBundler {
+    worker_artifacts: WorkerArtifacts,
     fs: Arc<dyn FileSystem>,
     resolution_environment: Arc<ResolutionEnvironment>,
     compiler: CompilerBackend,
@@ -1045,6 +1058,7 @@ impl IncrementalBundler {
         self.memory_parse_vcs = accepted.memory_parse_vcs.clone();
         self.stable_graph = accepted.stable_graph.clone();
         self.link_plan = accepted.link_plan.clone();
+        self.worker_artifacts = accepted.worker_artifacts.clone();
         self.topology_invalidated.store(
             accepted.topology_invalidated.load(Ordering::Acquire),
             Ordering::Release,
@@ -1086,6 +1100,7 @@ impl IncrementalBundler {
         let compiler = CompilerBackend::new();
         let interner = compiler.interner_owner();
         IncrementalBundler {
+            worker_artifacts: WorkerArtifacts::default(),
             resolver: resolution_environment.resolver(),
             resolve_options: ResolveOptions::default(),
             platform: BuildPlatform::Browser,
@@ -2939,8 +2954,13 @@ impl IncrementalBundler {
             frontier = next;
         }
 
-        let resource_urls =
-            self.build_resource_references(&mut modules, &mut diagnostics, &mut collected_assets);
+        let mut next_workers = WorkerArtifacts::default();
+        let resource_urls = self.build_resource_references(
+            &mut modules,
+            &mut diagnostics,
+            &mut collected_assets,
+            &mut next_workers,
+        );
         let t_scan = t0.elapsed();
         drop(scan_progress);
         let link_progress =
@@ -4045,6 +4065,7 @@ impl IncrementalBundler {
             }
         } else {
             if !output.has_errors() {
+                self.worker_artifacts = next_workers;
                 let live_content: FxHashSet<u64> =
                     modules.values().map(|module| module.content_key).collect();
                 self.memory_summaries
@@ -4098,11 +4119,107 @@ impl IncrementalBundler {
         }
     }
 
+    fn build_worker_resource(
+        &self,
+        path: &Path,
+        target_identity: &Path,
+        owner: u32,
+        assets: &mut Vec<(u32, String, Vec<u8>)>,
+        diagnostics: &mut Vec<Diagnostic>,
+        next_workers: &mut WorkerArtifacts,
+    ) -> Result<String, String> {
+        let options = crate::BuildOptions {
+            project_root: self.project_root.clone(),
+            resolve: self.resolve_options.clone(),
+            define: self.define.to_vec(),
+            extract_css: self.extract_css,
+            asset_inline_limit: self.asset_inline_limit,
+            public_path: self.public_path.clone(),
+            minify: self.minify,
+            dead_module_elimination: self.dead_module_elimination,
+            css_in_js: self.css_in_js,
+            drop_console: self.drop_console,
+            drop_debugger: self.drop_debugger,
+            tree_shaking: self.tree_shaking,
+            jsx: crate::JsxOptions {
+                development: self.jsx.dev,
+                import_source: self.jsx.import_source.to_string(),
+            },
+            target_env: self.target.clone(),
+            ..crate::BuildOptions::default()
+        };
+        if let Some(cached) = self.worker_artifacts.get(path)
+            && cached.target_identity == target_identity
+            && cached.options == options
+            && cached.inputs.matches(self.fs.as_ref())
+        {
+            diagnostics.extend_from_slice(&cached.diagnostics);
+            assets.extend(
+                cached
+                    .files
+                    .iter()
+                    .map(|(name, bytes)| (owner, name.clone(), bytes.clone())),
+            );
+            next_workers.insert(path.to_owned(), Arc::clone(cached));
+            return Ok(cached.name.clone());
+        }
+
+        // Only retained parents record inputs. Nested one-shots observe through the outer
+        // recorder and release their engines before the next sibling starts.
+        let recorder = self.load_cache_enabled.then(|| {
+            Arc::new(crate::worker_inputs::WorkerInputRecorder::new(Arc::clone(
+                &self.fs,
+            )))
+        });
+        let worker_fs: Arc<dyn FileSystem> = match &recorder {
+            Some(recorder) => recorder.clone(),
+            None => Arc::clone(&self.fs),
+        };
+        let output = crate::BuildSession::new_one_shot(worker_fs, options.clone())
+            .build_once(crate::BuildRequest::new(path));
+        let failed = output.has_errors();
+        let diagnostics_start = diagnostics.len();
+        diagnostics.extend(output.diagnostics);
+        if failed {
+            return Err(format!("Worker build failed: {}", path.display()));
+        }
+        let bytes = output.bundle.into_bytes();
+        let name = crate::loader::asset_file_name(&path.with_extension("js"), &bytes);
+        let start = assets.len();
+        assets.push((owner, name.clone(), bytes));
+        assets.extend(
+            output
+                .assets
+                .into_iter()
+                .map(|asset| (owner, asset.file_name, asset.bytes)),
+        );
+        if let Some(recorder) = recorder.and_then(Arc::into_inner)
+            && let Some(inputs) = recorder.finish()
+        {
+            next_workers.insert(
+                path.to_owned(),
+                Arc::new(CachedWorker {
+                    target_identity: target_identity.to_owned(),
+                    options,
+                    inputs,
+                    name: name.clone(),
+                    files: assets[start..]
+                        .iter()
+                        .map(|(_, name, bytes)| (name.clone(), bytes.clone()))
+                        .collect(),
+                    diagnostics: diagnostics[diagnostics_start..].to_vec(),
+                }),
+            );
+        }
+        Ok(name)
+    }
+
     fn build_resource_references(
         &self,
         modules: &mut FxHashMap<u32, ModuleRec>,
         diagnostics: &mut Vec<Diagnostic>,
         assets: &mut Vec<(u32, String, Vec<u8>)>,
+        next_workers: &mut WorkerArtifacts,
     ) -> FxHashMap<u32, Vec<(Span, String, String)>> {
         let mut urls = FxHashMap::default();
         if self.platform != BuildPlatform::Browser {
@@ -4192,42 +4309,15 @@ impl IncrementalBundler {
                             return Ok(name.clone());
                         }
                         let _guard = crate::resource_refs::WorkerGuard::enter(&target_identity)?;
-                        let options = crate::BuildOptions {
-                            project_root: self.project_root.clone(),
-                            resolve: self.resolve_options.clone(),
-                            define: self.define.to_vec(),
-                            extract_css: self.extract_css,
-                            asset_inline_limit: self.asset_inline_limit,
-                            public_path: self.public_path.clone(),
-                            minify: self.minify,
-                            dead_module_elimination: self.dead_module_elimination,
-                            css_in_js: self.css_in_js,
-                            drop_console: self.drop_console,
-                            drop_debugger: self.drop_debugger,
-                            tree_shaking: self.tree_shaking,
-                            jsx: crate::JsxOptions {
-                                development: self.jsx.dev,
-                                import_source: self.jsx.import_source.to_string(),
-                            },
-                            target_env: self.target.clone(),
-                            ..crate::BuildOptions::default()
-                        };
-                        // One-shot consumes its engine; do not retain Worker ASTs between siblings.
-                        let output = crate::BuildSession::new_one_shot(self.fs.clone(), options)
-                            .build_once(crate::BuildRequest::new(&path));
-                        let failed = output.has_errors();
-                        diagnostics.extend(output.diagnostics);
-                        if failed {
-                            return Err(format!("Worker build failed: {}", path.display()));
-                        }
-                        let bytes = output.bundle.into_bytes();
-                        let name =
-                            crate::loader::asset_file_name(&path.with_extension("js"), &bytes);
                         let start = assets.len();
-                        assets.push((id, name.clone(), bytes));
-                        for asset in output.assets {
-                            assets.push((id, asset.file_name, asset.bytes));
-                        }
+                        let name = self.build_worker_resource(
+                            &path,
+                            &target_identity,
+                            id,
+                            assets,
+                            diagnostics,
+                            next_workers,
+                        )?;
                         built_workers.insert(
                             path.clone(),
                             (name.clone(), (start..assets.len()).collect()),

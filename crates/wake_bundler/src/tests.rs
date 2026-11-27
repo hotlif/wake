@@ -354,14 +354,19 @@ fn native_worker_external_pnp_package_keeps_relative_dependency_closure() {
     }
 }
 
-#[test]
-fn resource_url_external_pnp_archive_replacement_refreshes_resource_and_module() {
+fn external_pnp_archive_fixture(version: u8) -> Arc<MemoryFileSystem> {
     let fs = external_pnp_resource_fixture("./payload.data");
     fs.insert("app/.pnp.data.json", serde_json::json!({"packageRegistryData":[
         [null,[[null,{"packageLocation":"./","packageDependencies":[["dep","npm:1"]]}]]],
         ["dep",[["npm:1",{"packageLocation":"../cache/dep.zip/node_modules/dep/","packageDependencies":[]}]]]
     ]}).to_string());
-    fs.insert("cache/dep.zip", pnp_resource_fixture::archive(1));
+    fs.insert("cache/dep.zip", pnp_resource_fixture::archive(version));
+    fs
+}
+
+#[test]
+fn resource_url_external_pnp_archive_replacement_refreshes_resource_and_module() {
+    let fs = external_pnp_archive_fixture(1);
     let mut bundler = IncrementalBundler::new(fs.clone());
     bundler.set_project_root("app").enable_load_cache();
     let first = bundler.build(Path::new("app/index.js"));
@@ -385,6 +390,73 @@ fn resource_url_external_pnp_archive_replacement_refreshes_resource_and_module()
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "2");
+    }
+}
+
+fn worker_archive_project(version: u8) -> Arc<MemoryFileSystem> {
+    let fs = external_pnp_archive_fixture(version);
+    fs.insert(
+        "app/index.js",
+        "new Worker(new URL('./worker.js', import.meta.url));",
+    );
+    fs.insert("app/worker.js", "import 'dep';");
+    fs
+}
+
+#[test]
+fn worker_artifact_pnp_archive_replacement_validates_candidate_filesystem() {
+    let request = crate::BuildRequest::new("app/index.js");
+    let options = crate::BuildOptions {
+        project_root: Some("app".into()),
+        ..Default::default()
+    };
+    let builds = &crate::session::ONE_SHOT_BUILDS;
+    let start = builds.get();
+    let mut accepted = crate::BuildSession::new(worker_archive_project(1), options.clone());
+    let initial = accepted.build_current(request.clone());
+    assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+    assert_eq!(initial.assets.len(), 2);
+    assert!(
+        initial
+            .assets
+            .iter()
+            .any(|asset| asset.bytes == b"payload-v1")
+    );
+    assert_eq!(builds.get() - start, 1);
+
+    let mut rescan = accepted.fork(worker_archive_project(1), options.clone(), None);
+    let unchanged = rescan.build_current(request.clone());
+    assert!(!unchanged.has_errors(), "{:?}", unchanged.diagnostics);
+    assert_eq!(unchanged.bundle, initial.bundle);
+    assert_eq!(builds.get() - start, 1);
+
+    let replacement = worker_archive_project(2);
+    let archive = [PathBuf::from("cache/dep.zip")];
+    let mut candidate = rescan.fork(
+        replacement.clone(),
+        options.clone(),
+        Some((&archive, false)),
+    );
+    let changed = candidate.build_current(request.clone());
+    assert!(!changed.has_errors(), "{:?}", changed.diagnostics);
+    assert_eq!(builds.get() - start, 2);
+    assert_ne!(changed.bundle, initial.bundle);
+    assert_eq!(changed.assets.len(), 2);
+    assert!(
+        changed
+            .assets
+            .iter()
+            .any(|asset| asset.bytes == b"payload-v2")
+    );
+
+    let cold = crate::BuildSession::new_one_shot(replacement, options).build_once(request);
+    assert!(!cold.has_errors(), "{:?}", cold.diagnostics);
+    assert_eq!(changed.bundle, cold.bundle);
+    assert_eq!(changed.assets.len(), cold.assets.len());
+    for (cached, cold) in changed.assets.iter().zip(&cold.assets) {
+        assert_eq!(cached.file_name, cold.file_name);
+        assert_eq!(cached.bytes, cold.bytes);
+        assert_eq!(cached.owner_module_ids, cold.owner_module_ids);
     }
 }
 

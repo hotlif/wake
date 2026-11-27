@@ -6,6 +6,11 @@ use wake_ecma_transform::TargetEnv;
 
 use crate::{BuildOutput, BuildPlatform, IncrementalBundler, ModuleFormat, ResolveOptions};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static ONE_SHOT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// JSX automatic runtime options owned by a build session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JsxOptions {
@@ -229,6 +234,8 @@ impl BuildSession {
             SessionLifetime::OneShot,
             "build_once requires BuildSession::new_one_shot"
         );
+        #[cfg(test)]
+        ONE_SHOT_BUILDS.set(ONE_SHOT_BUILDS.get() + 1);
         self.bundler.build(&request.entry)
     }
 
@@ -879,10 +886,14 @@ mod tests {
     }
 
     fn assert_build_outputs_equal(left: &BuildOutput, right: &BuildOutput) {
-        assert_eq!(left.bundle, right.bundle);
-        assert_eq!(left.module_count, right.module_count);
         assert_eq!(left.updated_module_count, right.updated_module_count);
         assert_eq!(left.cached_module_count, right.cached_module_count);
+        assert_published_outputs_equal(left, right);
+    }
+
+    fn assert_published_outputs_equal(left: &BuildOutput, right: &BuildOutput) {
+        assert_eq!(left.bundle, right.bundle);
+        assert_eq!(left.module_count, right.module_count);
         assert_eq!(left.entry_chunk, right.entry_chunk);
         assert_eq!(
             format!("{:?}", left.diagnostics),
@@ -915,6 +926,190 @@ mod tests {
                 right.unscoped_css_owner_module_ids
             );
         }
+    }
+
+    #[test]
+    fn worker_artifact_rescan_validates_dependencies_and_replays_for_current_owners() {
+        const OWNER: &str = "new Worker(new URL('./worker.js',import.meta.url));";
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            ("src/index.js", "import './a.js'; import './b.js';"),
+            ("src/a.js", OWNER),
+            ("src/b.js", OWNER),
+            (
+                "src/worker.js",
+                "import value from './dep.js';self.postMessage([value,new URL('./logo.svg',import.meta.url)]);",
+            ),
+            ("src/dep.js", "export default 'before';"),
+            ("src/logo.svg", "<svg/>"),
+        ]));
+        let options = BuildOptions::default();
+        let request = BuildRequest::new("src/index.js");
+        let mut accepted = BuildSession::new(fs.clone(), options.clone());
+        let start = ONE_SHOT_BUILDS.get();
+        let initial = accepted.build_current(request.clone());
+        assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+        assert_eq!(ONE_SHOT_BUILDS.get() - start, 1);
+        assert_eq!(initial.assets.len(), 2);
+        assert!(
+            initial
+                .assets
+                .iter()
+                .all(|asset| asset.owner_module_ids.len() == 2)
+        );
+
+        let mut rescanned = accepted.fork(fs.clone(), options.clone(), None);
+        let unchanged = rescanned.build_current(request.clone());
+        assert_published_outputs_equal(&initial, &unchanged);
+        assert_eq!(
+            ONE_SHOT_BUILDS.get() - start,
+            1,
+            "unchanged startup rescan reuses Worker"
+        );
+
+        fs.insert("src/index.js", "import './b.js';");
+        let mut one_owner = rescanned.fork(fs.clone(), options.clone(), None);
+        let reassigned = one_owner.build_current(request.clone());
+        assert_eq!(ONE_SHOT_BUILDS.get() - start, 1);
+        assert_eq!(reassigned.assets.len(), 2);
+        assert!(
+            reassigned
+                .assets
+                .iter()
+                .all(|asset| asset.owner_module_ids.len() == 1)
+        );
+        let cold = BuildSession::new(fs.clone(), options.clone()).build_current(request.clone());
+        assert_published_outputs_equal(&reassigned, &cold);
+
+        fs.insert("src/dep.js", "export default 'after';");
+        let before_edit = ONE_SHOT_BUILDS.get();
+        let mut edited = one_owner.fork(fs.clone(), options.clone(), None);
+        let changed = edited.build_current(request.clone());
+        assert!(!changed.has_errors(), "{:?}", changed.diagnostics);
+        assert_ne!(changed.bundle, reassigned.bundle);
+        assert_eq!(ONE_SHOT_BUILDS.get() - before_edit, 1);
+        let cold = BuildSession::new(fs, options).build_current(request);
+        assert_published_outputs_equal(&changed, &cold);
+    }
+
+    #[test]
+    fn worker_artifact_failed_candidate_does_not_replace_accepted_inputs() {
+        const ORIGINAL: &str = "self.postMessage('accepted');";
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "new Worker(new URL('./worker.js',import.meta.url));",
+            ),
+            ("src/worker.js", ORIGINAL),
+        ]));
+        let options = BuildOptions::default();
+        let request = BuildRequest::new("src/index.js");
+        let mut accepted = BuildSession::new(fs.clone(), options.clone());
+        let first = accepted.build_current(request.clone());
+        assert!(!first.has_errors(), "{:?}", first.diagnostics);
+
+        fs.insert("src/worker.js", "import './missing.js';");
+        let start = ONE_SHOT_BUILDS.get();
+        let mut candidate = accepted.fork(fs.clone(), options.clone(), None);
+        let failed = candidate.build_current(request.clone());
+        assert!(failed.has_errors());
+        assert_eq!(ONE_SHOT_BUILDS.get() - start, 1);
+        let cold = BuildSession::new(fs.clone(), options.clone()).build_current(request.clone());
+        assert_published_outputs_equal(&failed, &cold);
+        drop(candidate);
+
+        fs.insert("src/worker.js", ORIGINAL);
+        let start = ONE_SHOT_BUILDS.get();
+        let mut recovered = accepted.fork(fs, options, None);
+        assert_published_outputs_equal(&first, &recovered.build_current(request));
+        assert_eq!(
+            ONE_SHOT_BUILDS.get() - start,
+            0,
+            "accepted Worker survived candidate failure"
+        );
+    }
+
+    #[test]
+    fn worker_artifact_nested_worker_resolves_new_higher_priority_dependency() {
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "new Worker(new URL('./outer.js',import.meta.url));",
+            ),
+            (
+                "src/outer.js",
+                "new Worker(new URL('./inner.js',import.meta.url));",
+            ),
+            (
+                "src/inner.js",
+                "import value from './dep';self.postMessage(value);",
+            ),
+            ("src/dep.js", "export default 'old';"),
+        ]));
+        let options = BuildOptions::default();
+        let request = BuildRequest::new("src/index.js");
+        let mut accepted = BuildSession::new(fs.clone(), options.clone());
+        let start = ONE_SHOT_BUILDS.get();
+        let initial = accepted.build_current(request.clone());
+        assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+        assert_eq!(ONE_SHOT_BUILDS.get() - start, 2);
+
+        let mut rescanned = accepted.fork(fs.clone(), options.clone(), None);
+        assert_published_outputs_equal(&initial, &rescanned.build_current(request.clone()));
+        assert_eq!(
+            ONE_SHOT_BUILDS.get() - start,
+            2,
+            "outer hit skips both one-shot builds"
+        );
+
+        fs.insert("src/dep", "export default 'new';");
+        let changes = [PathBuf::from("src/dep")];
+        let mut changed = rescanned.fork(fs.clone(), options.clone(), Some((&changes, true)));
+        let updated = changed.build_current(request.clone());
+        assert!(!updated.has_errors(), "{:?}", updated.diagnostics);
+        assert_eq!(ONE_SHOT_BUILDS.get() - start, 4);
+        assert_ne!(updated.bundle, initial.bundle);
+        let cold = BuildSession::new(fs, options).build_current(request);
+        assert_published_outputs_equal(&updated, &cold);
+    }
+
+    #[test]
+    fn worker_artifact_option_change_rebuilds_worker_and_matches_cold() {
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            (
+                "src/index.js",
+                "new Worker(new URL('./worker.js',import.meta.url));",
+            ),
+            (
+                "src/worker.js",
+                "self.postMessage(new URL('./logo.svg',import.meta.url));",
+            ),
+            ("src/logo.svg", "<svg/>"),
+        ]));
+        let mut retained = IncrementalBundler::new(fs.clone());
+        retained.enable_load_cache();
+        let entry = Path::new("src/index.js");
+        let initial = retained.build(entry);
+        assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+
+        let start = ONE_SHOT_BUILDS.get();
+        assert_published_outputs_equal(&initial, &retained.build(entry));
+        assert_eq!(ONE_SHOT_BUILDS.get(), start);
+        let changed = retained.set_public_path("/updated/").build(entry);
+        assert_eq!(ONE_SHOT_BUILDS.get() - start, 1);
+        let worker_name = |output: &BuildOutput| {
+            output
+                .assets
+                .iter()
+                .find(|asset| asset.file_name.ends_with(".js"))
+                .unwrap()
+                .file_name
+                .clone()
+        };
+        assert_ne!(worker_name(&initial), worker_name(&changed));
+        let cold = IncrementalBundler::new(fs)
+            .set_public_path("/updated/")
+            .build(entry);
+        assert_published_outputs_equal(&changed, &cold);
     }
 
     #[test]

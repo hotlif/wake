@@ -23,6 +23,7 @@ mod loader;
 mod resource_refs;
 mod session;
 mod timer;
+mod worker_inputs;
 pub use generation::BuildGeneration;
 pub(crate) use incremental::IncrementalBundler;
 pub use session::{
