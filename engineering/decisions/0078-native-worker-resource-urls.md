@@ -3,6 +3,7 @@
 - Status: accepted
 - Date: 2026-11-11
 - Amended by: [ADR 0081](0081-pnp-package-resource-boundaries.md)
+- Amended by: [ADR 0089](0089-validated-worker-artifacts.md)
 
 ## Context
 

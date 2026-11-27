@@ -638,6 +638,8 @@ export interface DevServerOptions extends ProjectOptions {
   /** An integer from 0 through 65,535. */
   port?: number
   open?: boolean
+  /** Persist module compilation results for top-level native Workers across dev server restarts. Defaults to false. */
+  workerCache?: boolean
   federation?: FederationOptions
 }
 export interface DocsDevServerOptions extends ProjectOptions {

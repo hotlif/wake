@@ -1180,6 +1180,8 @@ pub type EventHandler = Arc<dyn Fn(ServerEvent) + Send + Sync + 'static>;
 
 /// Dev server 选项（由 CLI 读 `wake.config.toml` 装配）。WAKE-COMPATIBILITY §M3。
 pub struct ServeOptions {
+    /// Optional project-wide directory for persistent module caches of native Workers.
+    pub worker_cache_dir: Option<PathBuf>,
     /// Explicit HTML template, relative to the mount root. None selects root index.html.
     pub html_template: Option<PathBuf>,
     /// 已由调用方解析完成的入口文件。
@@ -1222,6 +1224,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
+            worker_cache_dir: None,
             html_template: None,
             entry: PathBuf::from("src/index.tsx"),
             base_path: "/".to_string(),
@@ -1270,6 +1273,7 @@ pub fn serve(root: &Path, port: u16, options: ServeOptions) -> std::io::Result<(
 
 #[derive(Clone)]
 struct MountSpec {
+    worker_cache_dir: Option<PathBuf>,
     name: Option<String>,
     root: PathBuf,
     base_path: String,
@@ -1323,6 +1327,7 @@ fn run_server(
     stop: Arc<StopSignal>,
 ) -> std::io::Result<()> {
     let ServeOptions {
+        worker_cache_dir,
         html_template,
         entry,
         base_path,
@@ -1360,6 +1365,7 @@ fn run_server(
         String::new()
     };
     let mut specs = vec![MountSpec {
+        worker_cache_dir: worker_cache_dir.clone(),
         name: None,
         root: root.clone(),
         base_path: base_path.clone(),
@@ -1403,6 +1409,7 @@ fn run_server(
             String::new()
         };
         specs.push(MountSpec {
+            worker_cache_dir: worker_cache_dir.clone(),
             name: Some(mount.name),
             root: mount_root,
             base_path: mount_base,
@@ -1442,6 +1449,7 @@ fn run_server(
             String::new()
         };
         specs.push(MountSpec {
+            worker_cache_dir: worker_cache_dir.clone(),
             name: Some(mount.name),
             root: mount_root,
             base_path: mount_base,
@@ -4221,6 +4229,7 @@ fn create_candidate_mount_session(
     let generation = BuildGeneration::new(Arc::clone(&plan.file_system));
     let options = BundlerBuildOptions {
         project_root: Some(spec.root.clone()),
+        worker_cache_dir: spec.worker_cache_dir.clone(),
         // 别名（@/@@）+ define（dev 口径）须在首次 build 前固定，dev 与 build 一致。
         resolve: plan.resolve_options.clone(),
         define: plan.define.clone(),
@@ -4435,6 +4444,33 @@ fn rebuild_mount(
         .expect("a mount build requires a materialized plan")
         .entry;
     let (out, generation_fs) = session.build_current_generation(BuildRequest::new(entry));
+    // Cache diagnostics refer to a binary snapshot, so there is no source frame to capture.
+    // Publish them at the same commit point as the build that observed the problem.
+    let cache_warnings: Vec<_> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_deref() == Some("WAKE_CACHE") && !d.is_error())
+        .cloned()
+        .collect();
+    let report_cache_warnings = || {
+        if cache_warnings.is_empty() {
+            return;
+        }
+        if !sty.quiet {
+            for warning in &cache_warnings {
+                eprintln!("  {}  {}", sty.warn("WAKE_CACHE"), warning.message);
+                for note in &warning.notes {
+                    eprintln!("    {note}");
+                }
+            }
+        }
+        if let Some(handler) = event_handler {
+            handler(ServerEvent::Diagnostics {
+                diagnostics: cache_warnings,
+                sources: Vec::new(),
+            });
+        }
+    };
     let (html, template_error) = match load_html_template(
         &spec.root,
         spec.plan
@@ -4487,6 +4523,7 @@ fn rebuild_mount(
             RefreshOutcome::RetryableFailure,
             || {
                 mount.published.write().unwrap().bundle.error = Some(err.clone());
+                report_cache_warnings();
                 if !sty.quiet {
                     eprintln!(
                         "  {}  {}  {sep}  {}",
@@ -4548,6 +4585,7 @@ fn rebuild_mount(
                         RefreshOutcome::RetryableFailure,
                         || {
                             mount.published.write().unwrap().bundle.error = Some(error.clone());
+                            report_cache_warnings();
                             if let Some(handler) = event_handler {
                                 handler(ServerEvent::Diagnostics {
                                     diagnostics: vec![
@@ -4605,6 +4643,7 @@ fn rebuild_mount(
                         html,
                         federation,
                     });
+            report_cache_warnings();
             if !first && !sty.quiet {
                 eprintln!(
                     "  {}  {}  {sep}  {}  {sep}  {}  {sep}  {}",
@@ -6772,6 +6811,7 @@ mod tests {
         let entry = root.path().join("entry.tsx");
         std::fs::write(&entry, "export default 1").unwrap();
         let spec = MountSpec {
+            worker_cache_dir: None,
             name: None,
             root: root.path().to_path_buf(),
             base_path: "/".to_owned(),
@@ -7119,6 +7159,7 @@ mod tests {
         )
         .unwrap();
         let spec = MountSpec {
+            worker_cache_dir: None,
             name: None,
             root: root.path().to_path_buf(),
             base_path: "/".to_string(),
@@ -7189,6 +7230,7 @@ mod tests {
         )
         .unwrap();
         let spec = MountSpec {
+            worker_cache_dir: None,
             name: None,
             root: root.path().to_path_buf(),
             base_path: "/".to_owned(),
@@ -7240,6 +7282,7 @@ mod tests {
             later_source,
         ));
         let spec = MountSpec {
+            worker_cache_dir: None,
             name: None,
             root: root.path().to_path_buf(),
             base_path: "/".to_owned(),
@@ -8799,6 +8842,79 @@ mod tests {
             vec![(2, 0), (0, 2)],
             "startup must retain its Rescan fence without recompiling unchanged modules"
         );
+    }
+
+    #[test]
+    fn worker_disk_cache_corruption_warns_and_repairs_before_startup_ready() {
+        let _network_guard = lock_network_test();
+        let root = tempfile::tempdir().unwrap();
+        let entry = root.path().join("index.js");
+        let cache = root.path().join(".wake/worker-cache");
+        std::fs::write(&entry, "new Worker(new URL('./task.js',import.meta.url));").unwrap();
+        std::fs::write(root.path().join("task.js"), "self.postMessage('ready');").unwrap();
+        let run = || {
+            let port = TcpListener::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let server = start(
+                root.path(),
+                port,
+                ServeOptions {
+                    entry: entry.clone(),
+                    worker_cache_dir: Some(cache.clone()),
+                    quiet: true,
+                    event_handler: Some(Arc::new(move |event| {
+                        captured.lock().unwrap().push(event)
+                    })),
+                    ..ServeOptions::default()
+                },
+            )
+            .unwrap();
+            let bundle = http_get(port, "/bundle.js");
+            let name = regex::Regex::new(r"task\.[a-f0-9]+\.js").unwrap();
+            let asset = http_get(port, &format!("/{}", name.find(&bundle).unwrap().as_str()));
+            assert!(asset.contains("postMessage"));
+            server.close().unwrap();
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, ServerEvent::Rebuilt { .. }))
+                    .count(),
+                2
+            );
+            let warnings: usize = events
+                .iter()
+                .filter_map(|event| match event {
+                    ServerEvent::Diagnostics { diagnostics, .. } => Some(
+                        diagnostics
+                            .iter()
+                            .filter(|d| d.code.as_deref() == Some("WAKE_CACHE") && !d.is_error())
+                            .count(),
+                    ),
+                    _ => None,
+                })
+                .sum();
+            (
+                bundle.split_once("\r\n\r\n").unwrap().1.to_owned(),
+                asset.split_once("\r\n\r\n").unwrap().1.to_owned(),
+                warnings,
+            )
+        };
+        let (original, asset, warnings) = run();
+        assert_eq!(warnings, 0);
+        let snapshot = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
+            .unwrap();
+        std::fs::write(&snapshot, b"broken").unwrap();
+        assert_eq!(run(), (original.clone(), asset.clone(), 1));
+        assert_eq!(run(), (original, asset, 0));
     }
 
     #[test]

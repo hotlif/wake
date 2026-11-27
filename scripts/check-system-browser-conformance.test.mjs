@@ -51,7 +51,7 @@ for (const [target, version] of [
   assert.equal(checked.browser.major, 155)
   assert.equal(checked.mode, 'reviewed-major-conformance')
   assert.equal(checked.stableConformance, false)
-  for (const major of [153, 154, 158]) {
+  for (const major of [153, 154, 159]) {
     assert.throws(() => validateExperimentalBrowserIdentity({
       manifest,
       target,
@@ -70,7 +70,7 @@ assert.equal(windows156.stableConformance, false)
 assert.throws(() => validateExperimentalBrowserIdentity({
   manifest,
   target: 'win32-x64-msvc',
-  identity: { kind: 'chrome', version: 'Chrome/153.0.0.1', headless: true },
+  identity: { kind: 'chrome', version: 'Chrome/158.0.8127.36', headless: true },
 }), /permits reviewed Chromium-family majors 151, 152, 155, 156, 157/)
 
 const missingWindowsEvidence = structuredClone(manifest)
@@ -83,7 +83,7 @@ wrongWindowsInventory.targets['win32-x64-msvc'].reviewedRunnerEvidence[0].source
 assert.throws(() => validateSystemBrowserConformanceManifest(wrongWindowsInventory),
   /immutable official runner-images inventory/)
 
-for (const major of [151, 152, 155, 156, 157]) {
+for (const major of [151, 152, 155, 156, 157, 158]) {
   const linuxChromeEvidence = validateExperimentalBrowserIdentity({
     manifest,
     target: 'linux-x64-gnu',
@@ -143,6 +143,7 @@ for (const [target, version, mode] of [
   ['win32-x64-msvc', 'Chrome/157.0.8103.79', 'reviewed-major-conformance'],
   ['linux-x64-gnu', 'Chrome/156.0.8078.79', 'reviewed-major-conformance'],
   ['linux-x64-gnu', 'Chrome/157.0.8103.50', 'reviewed-major-conformance'],
+  ['linux-x64-gnu', 'Chrome/158.0.8127.36', 'reviewed-major-conformance'],
   ['darwin-x64', 'Chrome/151.0.7922.138', 'reviewed-major-smoke'],
   ['darwin-arm64', 'Chrome/157.0.8103.39', 'reviewed-major-smoke'],
   ['darwin-arm64', 'Chrome/158.0.8127.37', 'reviewed-major-smoke'],

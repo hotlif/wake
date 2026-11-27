@@ -23,6 +23,10 @@ server.on("diagnostic", (diagnostic) => console.error(diagnostic));
 await server.waitUntilClosed();
 ```
 
+应用开发服务器默认只在当前会话中复用 Worker 产物。传入 `workerCache: true` 可将顶层原生 Web Worker
+子构建的模块编译结果保存在项目的 `.wake/worker-cache/` 目录中。下次开启此选项时，Wake 会重新读取输入并解析依赖，复用与当前编译选项和输入匹配的结果。此选项等同于
+`wake dev --worker-cache`。
+
 `startDevServer()` 也接受与 `build()` 相同的 `FederationOptions`。Remote 的 `devFollow: true`
 允许开发环境跟随新的 build ID；这不会放宽生产 lock 或 origin 校验：
 

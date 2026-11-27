@@ -72,6 +72,8 @@
 - [ADR 0081: PnP 包内静态资源边界](0081-pnp-package-resource-boundaries.md) — `accepted`
 - [ADR 0082: 组件扫描导出按需加载函数](0082-component-scan-loaders.md) — `accepted`
 - [ADR 0084: 浏览器内存构建与预览发布](0084-browser-preview-builds.md) — `accepted`
+- [ADR 0089: 开发会话复用已验证的 Worker 产物](0089-validated-worker-artifacts.md) — `accepted`
+- [ADR 0090: 开发服务的可选 Worker 磁盘缓存](0090-dev-worker-disk-cache.md) — `accepted`
 
 ### css-editor
 
@@ -117,6 +119,7 @@
 - [ADR 0083: Linux 157 浏览器镜像准入](0083-reviewed-linux-browser-major-157.md) — `accepted`
 - [ADR 0086: Windows 157 与 macOS Intel 浏览器运行器修复](0086-windows-157-and-macos-intel-browser.md) — `accepted`
 - [ADR 0088: macOS arm64 的 Chrome 158 镜像准入](0088-reviewed-macos-arm64-browser-major-158.md) — `accepted`
+- [ADR 0091: Linux x64 的 Chrome 158 镜像准入](0091-reviewed-linux-browser-major-158.md) — `accepted`
 
 ### node-release
 

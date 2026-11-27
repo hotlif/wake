@@ -350,7 +350,9 @@ test('persistent cache remains derived, transactional, and non-fatal', () => {
   }
   assert.match(cache, /fn envelope_checksum[\s\S]{0,320}hasher\.update\(prefix\)[\s\S]{0,160}hasher\.update\(payload\)/)
   assert.match(cache, /fn acquire_lock[\s\S]{0,360}try_lock\(\)[\s\S]{0,520}timed out waiting for persistent cache lock/)
-  assert.match(cache, /NamedTempFile::new_in\(parent\)[\s\S]{0,520}sync_all\(\)[\s\S]{0,520}persist\(path\)/)
+  const store = /^    fn store_inner\([\s\S]*?^    \}/m.exec(cache)?.[0]
+  assert.ok(store, 'cache publication must have a shared transaction')
+  assert.match(store, /NamedTempFile::new_in\(parent\)[\s\S]*?sync_all\(\)[\s\S]*?make_room\(path, bytes\.len\(\)\)[\s\S]*?temporary\s*\.persist\(path\)/)
   assert.match(cache, /fn put_emission\s*\([\s\S]{0,900}authored_bodies\.insert\(key\)[\s\S]{0,160}authored_mappings\.insert\(key\)/)
   assert.doesNotMatch(cache, /pub fn put_(?:body|mappings)\b/)
   assert.doesNotMatch(
@@ -512,9 +514,11 @@ test('wake_dev_server generation owns Federation and diagnostic source views', (
     /fn\s+build_current_generation\s*\([\s\S]{0,700}?session\.file_system_view\(\)[\s\S]{0,300}?session\.build_current_ref\([\s\S]{0,200}?\(output, file_system\)/,
     'the mount owner must return the runtime output with its exact decorated generation filesystem view',
   )
+  const rebuild = /^fn rebuild_mount\([\s\S]*?^\}/m.exec(devServer)?.[0]
+  assert.ok(rebuild, 'the development mount must retain its rebuild boundary')
   assert.match(
-    devServer,
-    /let\s*\(out, generation_fs\)\s*=\s*session\.build_current_generation\([\s\S]{0,4000}?FederationSnapshot::assemble\(\s*&spec\.federation,\s*out,\s*generation_fs,/,
+    rebuild,
+    /let\s*\(out, generation_fs\)\s*=\s*session\.build_current_generation\([\s\S]*?FederationSnapshot::assemble\(\s*&spec\.federation,\s*out,\s*generation_fs,/,
     'Federation assembly must receive the same generation view paired with the runtime build',
   )
   assert.match(
@@ -528,8 +532,8 @@ test('wake_dev_server generation owns Federation and diagnostic source views', (
     'development diagnostics must carry source bytes across the event boundary',
   )
   assert.match(
-    devServer,
-    /capture_diagnostic_sources\(&diagnostics,\s*generation_fs\.as_ref\(\)\)[\s\S]{0,1000}?ServerEvent::Diagnostics\s*\{\s*diagnostics,\s*sources,\s*\}/,
+    rebuild,
+    /capture_diagnostic_sources\(&diagnostics,\s*generation_fs\.as_ref\(\)\)[\s\S]*?ServerEvent::Diagnostics\s*\{\s*diagnostics,\s*sources,\s*\}/,
     'build failures must capture sources through the runtime build generation view',
   )
   assert.match(
@@ -764,7 +768,7 @@ test('Node owns exact closed request and Docs response DTOs', () => {
     ['RawGenerateDocgenOptions', ['cwd', 'entry']],
     ['RawLibraryBuildOptions', ['cwd', 'entry']],
     ['RawDocsOptions', ['base_path', 'config_path', 'cwd', 'mode', 'outdir']],
-    ['RawApplicationDevServerOptions', ['config_path', 'cwd', 'define', 'entry', 'federation', 'host', 'open', 'port']],
+    ['RawApplicationDevServerOptions', ['config_path', 'cwd', 'define', 'entry', 'federation', 'host', 'open', 'port', 'worker_cache']],
     ['RawDocsDevServerOptions', ['config_path', 'cwd', 'host', 'mode', 'open', 'port']],
     ['RawTestOptions', [
       'allow_no_tests',
@@ -806,6 +810,7 @@ test('Node owns exact closed request and Docs response DTOs', () => {
     'host',
     'open',
     'port',
+    'workerCache',
   ])
   assert.deepEqual(typeFields('DocsDevServerOptions'), ['host', 'mode', 'open', 'port'])
   const testOptionFields = [
@@ -1555,7 +1560,7 @@ test('system browser evidence separates experimental publication from stable rea
   assert.equal(manifest.targets['win32-x64-msvc'].experimental.mode, 'reviewed-major-conformance')
   assert.deepEqual(manifest.targets['win32-x64-msvc'].experimental.majors, [151, 152, 155, 156, 157])
   assert.equal(manifest.targets['linux-x64-gnu'].experimental.mode, 'reviewed-major-conformance')
-  assert.deepEqual(manifest.targets['linux-x64-gnu'].experimental.majors, [151, 152, 155, 156, 157])
+  assert.deepEqual(manifest.targets['linux-x64-gnu'].experimental.majors, [151, 152, 155, 156, 157, 158])
   assert.equal(manifest.targets['linux-arm64-gnu'].experimental.mode, 'unavailable')
   assert.deepEqual(
     manifest.targets['linux-arm64-gnu'].reviewedRunnerEvidence[0].browserVersions,

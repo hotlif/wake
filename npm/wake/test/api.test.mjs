@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
@@ -1787,6 +1787,41 @@ function onceMatching(emitter, eventName, predicate, timeoutMs = 10_000) {
   })
 }
 
+test('application dev persists Worker artifacts only when explicitly enabled', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wake-node-worker-cache-'))
+  const cache = join(cwd, '.wake', 'worker-cache')
+  try {
+    await writeFile(join(cwd, 'wake.config.toml'), '[html]\nentry = "index.js"\n')
+    await writeFile(join(cwd, 'index.js'), "new Worker(new URL('./worker.js', import.meta.url));")
+    await writeFile(join(cwd, 'worker.js'), "self.postMessage('ready');")
+    for (const workerCache of [undefined, false, true]) {
+      const server = await startDevServer({ cwd, port: 0, workerCache })
+      await server.close()
+      if (workerCache) {
+        assert.ok((await readdir(cache)).some((name) => name.endsWith('.bin')))
+      } else {
+        await assert.rejects(access(cache), { code: 'ENOENT' })
+      }
+    }
+
+    await rm(cache, { recursive: true })
+    const cli = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url))
+    const child = spawn(process.execPath, [cli, 'dev', cwd, '--port', '0', '--worker-cache', '--ui', 'plain'], {
+      stdio: ['ignore', 'ignore', 'pipe'], timeout: 30_000,
+    })
+    let stderr = ''
+    child.stderr.setEncoding('utf8').on('data', (chunk) => {
+      stderr += chunk
+      if (stderr.includes('http://127.0.0.1:')) child.kill()
+    })
+    await once(child, 'close')
+    assert.match(stderr, /http:\/\/127\.0\.0\.1:/)
+    assert.ok((await readdir(cache)).some((name) => name.endsWith('.bin')))
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 test('emits rebuild events, performs Live Reload, and releases the port', async () => {
   const source = fileURLToPath(new URL('../../../fixtures/hello-esm/', import.meta.url))
   const cwd = await mkdtemp(join(tmpdir(), 'wake-node-dev-'))
@@ -1938,7 +1973,9 @@ test('rejects fields outside each closed Node request contract', async () => {
     () => buildLibrary({ entryPath: 'src/index.ts' }),
     () => buildDocs({ base_path: '/docs/' }),
     () => startDevServer({ mode: 'site' }),
+    () => startDevServer({ workerCache: 'true' }),
     () => startDocsDevServer({ entry: 'src/index.ts' }),
+    () => startDocsDevServer({ workerCache: true }),
     () => startDocsDevServer({ federation: { enabled: false } }),
   ]) {
     await assert.rejects(

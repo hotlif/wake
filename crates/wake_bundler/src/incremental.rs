@@ -77,6 +77,62 @@ use crate::{
 /// 内容输入 cell 的类型：文件源码文本（`Arc<str>`，指纹 = 内容 hash）。
 type Content = Arc<str>;
 
+type WorkerArtifacts = FxHashMap<PathBuf, Arc<CachedWorker>>;
+
+enum CacheDestination {
+    Build(PathBuf),
+    Worker(PathBuf),
+}
+
+impl CacheDestination {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Build(path) | Self::Worker(path) => path,
+        }
+    }
+
+    fn load(&self) -> CacheLoadOutcome {
+        match self {
+            Self::Build(path) => BuildCache::load(path),
+            Self::Worker(path) => BuildCache::load_worker(path),
+        }
+    }
+
+    fn store(
+        &self,
+        cache: &mut BuildCache,
+    ) -> Result<wake_cache::CacheStoreReport, wake_cache::CacheStoreError> {
+        match self {
+            Self::Build(path) => cache.store(path),
+            Self::Worker(path) => cache.store_worker(path),
+        }
+    }
+}
+
+struct CachedWorker {
+    target_identity: PathBuf,
+    options: crate::BuildOptions,
+    inputs: crate::worker_inputs::WorkerInputs,
+    name: String,
+    // Owner IDs are assigned by the current parent graph on every use.
+    files: Vec<(String, Vec<u8>)>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+fn push_cache_warning(diagnostics: &mut Vec<Diagnostic>, warning: Diagnostic) {
+    if let Some(existing) = diagnostics
+        .iter_mut()
+        .find(|d| d.code.as_deref() == Some("WAKE_CACHE"))
+    {
+        if let Some(path) = warning.path {
+            existing.notes.push(path);
+        }
+        existing.notes.extend(warning.notes);
+    } else {
+        diagnostics.push(warning);
+    }
+}
+
 /// 「说明符 → 内部模块 id」映射（dep 顺序确定，指纹稳定）。
 type DepIds = Vec<ResolvedModuleRequest>;
 type LoadedResult = (
@@ -830,6 +886,8 @@ impl std::hash::Hash for ParsedModule {
 
 /// 增量 + 并行打包器。持有引擎、工作窃取执行器与跨构建保留的输入 cell 表。
 pub struct IncrementalBundler {
+    worker_artifacts: WorkerArtifacts,
+    worker_cache_dir: Option<PathBuf>,
     fs: Arc<dyn FileSystem>,
     resolution_environment: Arc<ResolutionEnvironment>,
     compiler: CompilerBackend,
@@ -914,9 +972,9 @@ pub struct IncrementalBundler {
     share_threshold: usize,
     /// 持久化构建缓存（opt-in，PLAN §7.1）。命中摘要跳 parse；retained facts、body 与 mapping
     /// facts 各自按阶段命中。
-    /// 落盘路径见 `cache_path`。默认 `None`——默认构建路径与产物逐字节不变、性能不受影响。
+    /// 落盘目标见 `cache_destination`。默认关闭。
     cache: Option<BuildCache>,
-    cache_path: Option<PathBuf>,
+    cache_destination: Option<CacheDestination>,
     /// Cache loading happens when the option is enabled, before a build output exists. Carry its
     /// non-fatal issue into exactly the next build so all cache problems can be rendered as one
     /// build-scoped `WAKE_CACHE` warning.
@@ -1045,6 +1103,7 @@ impl IncrementalBundler {
         self.memory_parse_vcs = accepted.memory_parse_vcs.clone();
         self.stable_graph = accepted.stable_graph.clone();
         self.link_plan = accepted.link_plan.clone();
+        self.worker_artifacts = accepted.worker_artifacts.clone();
         self.topology_invalidated.store(
             accepted.topology_invalidated.load(Ordering::Acquire),
             Ordering::Release,
@@ -1086,6 +1145,8 @@ impl IncrementalBundler {
         let compiler = CompilerBackend::new();
         let interner = compiler.interner_owner();
         IncrementalBundler {
+            worker_artifacts: WorkerArtifacts::default(),
+            worker_cache_dir: None,
             resolver: resolution_environment.resolver(),
             resolve_options: ResolveOptions::default(),
             platform: BuildPlatform::Browser,
@@ -1137,7 +1198,7 @@ impl IncrementalBundler {
             content_hash: true,
             share_threshold: 2,
             cache: None,
-            cache_path: None,
+            cache_destination: None,
             pending_cache_warning: None,
             pnp_detected: None,
             extract_css: false,
@@ -1619,8 +1680,22 @@ impl IncrementalBundler {
     /// 启用持久化构建缓存（PLAN §7.1）：从 `path` 载入既有缓存；构建结束 `store` 回盘。
     /// 让全新进程的冷构建跳过未变模块的 parse + codegen（「冷启动首跑毫秒级」）。opt-in。
     pub fn enable_persistent_cache(&mut self, path: PathBuf) -> &mut Self {
-        let _progress = wake_common::progress::phase("cache-load", || path.display().to_string());
-        let (cache, warning) = match BuildCache::load(&path) {
+        self.open_cache(CacheDestination::Build(path));
+        self
+    }
+
+    pub(super) fn set_worker_cache_dir(&mut self, dir: Option<PathBuf>) {
+        self.worker_cache_dir = dir;
+    }
+
+    pub(super) fn enable_worker_cache(&mut self, path: PathBuf) {
+        self.open_cache(CacheDestination::Worker(path));
+    }
+
+    fn open_cache(&mut self, destination: CacheDestination) {
+        let _progress =
+            wake_common::progress::phase("cache-load", || destination.path().display().to_string());
+        let (cache, warning) = match destination.load() {
             CacheLoadOutcome::Loaded(cache) => (*cache, None),
             CacheLoadOutcome::Missing | CacheLoadOutcome::Incompatible { .. } => {
                 (BuildCache::new(), None)
@@ -1635,9 +1710,8 @@ impl IncrementalBundler {
             ),
         };
         self.cache = Some(cache);
-        self.cache_path = Some(path);
+        self.cache_destination = Some(destination);
         self.pending_cache_warning = warning;
-        self
     }
 
     /// 启用 Tree Shaking（移除未用导出，PLAN §6.6）。prod build 用；dev 保持关闭以缩短增量重建。
@@ -2939,8 +3013,13 @@ impl IncrementalBundler {
             frontier = next;
         }
 
-        let resource_urls =
-            self.build_resource_references(&mut modules, &mut diagnostics, &mut collected_assets);
+        let mut next_workers = WorkerArtifacts::default();
+        let resource_urls = self.build_resource_references(
+            &mut modules,
+            &mut diagnostics,
+            &mut collected_assets,
+            &mut next_workers,
+        );
         let t_scan = t0.elapsed();
         drop(scan_progress);
         let link_progress =
@@ -3947,12 +4026,13 @@ impl IncrementalBundler {
         // 全命中（未变）时缓存内容没变，跳过落盘——缓存文件常和 bundle 一样大，
         // 每次白写会让 `--cache` 的 I/O 反超它省下的 parse（实测小项目会更慢）。
         if !output.has_errors()
-            && let (Some(cache), Some(path)) = (&mut self.cache, &self.cache_path)
+            && let (Some(cache), Some(destination)) = (&mut self.cache, &self.cache_destination)
             && cache.is_dirty()
         {
-            let _progress =
-                wake_common::progress::phase("cache-store", || path.display().to_string());
-            match cache.store(path) {
+            let _progress = wake_common::progress::phase("cache-store", || {
+                destination.path().display().to_string()
+            });
+            match destination.store(cache) {
                 Ok(report) => {
                     if report.repaired_corrupt_latest {
                         cache_warnings.push("已原子替换损坏的持久化缓存文件".to_string());
@@ -3965,24 +4045,28 @@ impl IncrementalBundler {
                     }
                 }
                 Err(error) => {
-                    cache_warnings.push(format!(
-                        "写入持久化缓存失败：{error}；内存缓存保持待写，后续构建将重试"
-                    ));
+                    cache_warnings.push(match destination {
+                        CacheDestination::Build(_) => {
+                            format!("写入持久化缓存失败：{error}；内存缓存保持待写，后续构建将重试")
+                        }
+                        CacheDestination::Worker(_) => format!("写入 Worker 模块缓存失败：{error}"),
+                    });
                 }
             }
         }
         if !cache_warnings.is_empty() {
             let path = self
-                .cache_path
-                .as_deref()
-                .expect("cache warnings require an enabled persistent cache");
+                .cache_destination
+                .as_ref()
+                .expect("cache warnings require an enabled persistent cache")
+                .path();
             let mut diagnostic = Diagnostic::warning("持久化构建缓存出现问题；本次构建已继续")
                 .with_code("WAKE_CACHE")
                 .with_path(path.to_string_lossy().into_owned());
             for warning in cache_warnings {
                 diagnostic = diagnostic.with_note(warning);
             }
-            output.diagnostics.push(diagnostic);
+            push_cache_warning(&mut output.diagnostics, diagnostic);
         }
 
         let pre_release_total = t0.elapsed();
@@ -4045,6 +4129,7 @@ impl IncrementalBundler {
             }
         } else {
             if !output.has_errors() {
+                self.worker_artifacts = next_workers;
                 let live_content: FxHashSet<u64> =
                     modules.values().map(|module| module.content_key).collect();
                 self.memory_summaries
@@ -4098,11 +4183,126 @@ impl IncrementalBundler {
         }
     }
 
+    fn build_worker_resource(
+        &self,
+        path: &Path,
+        target_identity: &Path,
+        owner: u32,
+        assets: &mut Vec<(u32, String, Vec<u8>)>,
+        diagnostics: &mut Vec<Diagnostic>,
+        next_workers: &mut WorkerArtifacts,
+    ) -> Result<String, String> {
+        let options = crate::BuildOptions {
+            project_root: self.project_root.clone(),
+            resolve: self.resolve_options.clone(),
+            define: self.define.to_vec(),
+            extract_css: self.extract_css,
+            asset_inline_limit: self.asset_inline_limit,
+            public_path: self.public_path.clone(),
+            minify: self.minify,
+            dead_module_elimination: self.dead_module_elimination,
+            css_in_js: self.css_in_js,
+            drop_console: self.drop_console,
+            drop_debugger: self.drop_debugger,
+            tree_shaking: self.tree_shaking,
+            jsx: crate::JsxOptions {
+                development: self.jsx.dev,
+                import_source: self.jsx.import_source.to_string(),
+            },
+            target_env: self.target.clone(),
+            ..crate::BuildOptions::default()
+        };
+        if let Some(cached) = self.worker_artifacts.get(path)
+            && cached.target_identity == target_identity
+            && cached.options == options
+            && cached.inputs.matches(self.fs.as_ref())
+        {
+            diagnostics.extend_from_slice(&cached.diagnostics);
+            assets.extend(
+                cached
+                    .files
+                    .iter()
+                    .map(|(name, bytes)| (owner, name.clone(), bytes.clone())),
+            );
+            next_workers.insert(path.to_owned(), Arc::clone(cached));
+            return Ok(cached.name.clone());
+        }
+
+        // Only retained parents record inputs. Nested one-shots observe through the outer
+        // recorder and release their engines before the next sibling starts.
+        let recorder = self.load_cache_enabled.then(|| {
+            Arc::new(crate::worker_inputs::WorkerInputRecorder::new(Arc::clone(
+                &self.fs,
+            )))
+        });
+        let worker_fs: Arc<dyn FileSystem> = match &recorder {
+            Some(recorder) => recorder.clone(),
+            None => Arc::clone(&self.fs),
+        };
+        let cache_path = self.worker_cache_dir.as_ref().map(|dir| {
+            let entry = self
+                .project_root
+                .as_ref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            let hash = xxhash_rust::xxh3::xxh3_128(entry.as_os_str().as_encoded_bytes());
+            dir.join(format!("{hash:032x}.bin"))
+        });
+        let output = crate::BuildSession::new_one_shot(worker_fs, options.clone())
+            .build_worker_once(crate::BuildRequest::new(path), cache_path);
+        let failed = output.has_errors();
+        let diagnostics_start = diagnostics.len();
+        for diagnostic in output.diagnostics {
+            if diagnostic.code.as_deref() == Some("WAKE_CACHE") {
+                push_cache_warning(diagnostics, diagnostic);
+            } else {
+                diagnostics.push(diagnostic);
+            }
+        }
+        if failed {
+            return Err(format!("Worker build failed: {}", path.display()));
+        }
+        let bytes = output.bundle.into_bytes();
+        let name = crate::loader::asset_file_name(&path.with_extension("js"), &bytes);
+        let start = assets.len();
+        assets.push((owner, name.clone(), bytes));
+        assets.extend(
+            output
+                .assets
+                .into_iter()
+                .map(|asset| (owner, asset.file_name, asset.bytes)),
+        );
+        if let Some(recorder) = recorder.and_then(Arc::into_inner)
+            && let Some(inputs) = recorder.finish()
+        {
+            next_workers.insert(
+                path.to_owned(),
+                Arc::new(CachedWorker {
+                    target_identity: target_identity.to_owned(),
+                    options,
+                    inputs,
+                    name: name.clone(),
+                    files: assets[start..]
+                        .iter()
+                        .map(|(_, name, bytes)| (name.clone(), bytes.clone()))
+                        .collect(),
+                    diagnostics: diagnostics[diagnostics_start..]
+                        .iter()
+                        .filter(|diagnostic| diagnostic.code.as_deref() != Some("WAKE_CACHE"))
+                        .cloned()
+                        .collect(),
+                }),
+            );
+        }
+        Ok(name)
+    }
+
     fn build_resource_references(
         &self,
         modules: &mut FxHashMap<u32, ModuleRec>,
         diagnostics: &mut Vec<Diagnostic>,
         assets: &mut Vec<(u32, String, Vec<u8>)>,
+        next_workers: &mut WorkerArtifacts,
     ) -> FxHashMap<u32, Vec<(Span, String, String)>> {
         let mut urls = FxHashMap::default();
         if self.platform != BuildPlatform::Browser {
@@ -4192,42 +4392,15 @@ impl IncrementalBundler {
                             return Ok(name.clone());
                         }
                         let _guard = crate::resource_refs::WorkerGuard::enter(&target_identity)?;
-                        let options = crate::BuildOptions {
-                            project_root: self.project_root.clone(),
-                            resolve: self.resolve_options.clone(),
-                            define: self.define.to_vec(),
-                            extract_css: self.extract_css,
-                            asset_inline_limit: self.asset_inline_limit,
-                            public_path: self.public_path.clone(),
-                            minify: self.minify,
-                            dead_module_elimination: self.dead_module_elimination,
-                            css_in_js: self.css_in_js,
-                            drop_console: self.drop_console,
-                            drop_debugger: self.drop_debugger,
-                            tree_shaking: self.tree_shaking,
-                            jsx: crate::JsxOptions {
-                                development: self.jsx.dev,
-                                import_source: self.jsx.import_source.to_string(),
-                            },
-                            target_env: self.target.clone(),
-                            ..crate::BuildOptions::default()
-                        };
-                        // One-shot consumes its engine; do not retain Worker ASTs between siblings.
-                        let output = crate::BuildSession::new_one_shot(self.fs.clone(), options)
-                            .build_once(crate::BuildRequest::new(&path));
-                        let failed = output.has_errors();
-                        diagnostics.extend(output.diagnostics);
-                        if failed {
-                            return Err(format!("Worker build failed: {}", path.display()));
-                        }
-                        let bytes = output.bundle.into_bytes();
-                        let name =
-                            crate::loader::asset_file_name(&path.with_extension("js"), &bytes);
                         let start = assets.len();
-                        assets.push((id, name.clone(), bytes));
-                        for asset in output.assets {
-                            assets.push((id, asset.file_name, asset.bytes));
-                        }
+                        let name = self.build_worker_resource(
+                            &path,
+                            &target_identity,
+                            id,
+                            assets,
+                            diagnostics,
+                            next_workers,
+                        )?;
                         built_workers.insert(
                             path.clone(),
                             (name.clone(), (start..assets.len()).collect()),
