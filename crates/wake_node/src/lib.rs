@@ -2010,6 +2010,7 @@ struct RawApplicationDevServerOptions {
     host: Option<String>,
     port: Option<u16>,
     open: Option<bool>,
+    worker_cache: bool,
     federation: Option<RawNodeFederationOptions>,
 }
 
@@ -2029,6 +2030,7 @@ impl RawApplicationDevServerOptions {
             host: self.host,
             port: self.port,
             open: self.open,
+            worker_cache: self.worker_cache,
             federation: self.federation.map(RawNodeFederationOptions::into_contract),
         }
     }
@@ -2063,6 +2065,7 @@ impl RawDocsDevServerOptions {
                 host: self.host,
                 port: self.port,
                 open: self.open,
+                worker_cache: false,
                 federation: None,
             },
             mode,

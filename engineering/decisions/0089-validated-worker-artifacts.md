@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-27
+- Amended by: [ADR 0090](0090-dev-worker-disk-cache.md)
 
 ## Context
 

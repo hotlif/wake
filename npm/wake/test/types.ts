@@ -423,7 +423,11 @@ async function api() {
   await context.rebuild(['src/index.ts'])
   await context.close()
 
-  const server: DevServer = await startDevServer({ port: 5173, federation })
+  const server: DevServer = await startDevServer({ port: 5173, federation, workerCache: true })
+  // @ts-expect-error The Worker disk cache switch takes a boolean.
+  await startDevServer({ workerCache: 'true' })
+  // @ts-expect-error The Worker disk cache switch belongs to the application dev server.
+  await startDocsDevServer({ workerCache: true })
   // @ts-expect-error Application servers do not accept Docs rendering modes.
   await startDevServer({ mode: 'site' })
   // @ts-expect-error Wake provides always-on Live Reload, not a configurable module-HMR API.

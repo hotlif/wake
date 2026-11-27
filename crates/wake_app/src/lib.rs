@@ -5456,6 +5456,8 @@ pub struct DevServerOptions {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub open: Option<bool>,
+    /// Persist native Worker module compilation results across application dev server restarts.
+    pub worker_cache: bool,
     /// Programmatic federation override. `None` uses `wake.config.toml`.
     pub federation: Option<FederationOptions>,
 }
@@ -5937,6 +5939,9 @@ pub fn start_dev_server(options: DevServerOptions) -> Result<DevServer, WakeErro
     let serve_options = wake_dev_server::ServeOptions {
         html_template: config.html.template.as_ref().map(PathBuf::from),
         entry: dev_federation.entry,
+        worker_cache_dir: options
+            .worker_cache
+            .then(|| prepared.root.join(".wake").join("worker-cache")),
         base_path: config.public_path().to_string(),
         resolve_options: ResolveOptions {
             alias: dev_aliases,
@@ -7396,6 +7401,7 @@ fn start_docs_dev_server_leaf(
         html_template: config.html.template.as_ref().map(PathBuf::from),
         entry: prepared.entry,
         base_path: docs_base_path,
+        worker_cache_dir: None,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
             conditions: ["browser", "development", "import", "module", "default"]
@@ -7617,6 +7623,7 @@ fn start_aggregated_docs_dev_server(
         html_template: config.html.template.as_ref().map(PathBuf::from),
         entry: prepared.entry,
         base_path: site_docs.base_path,
+        worker_cache_dir: None,
         resolve_options: ResolveOptions {
             alias: prepared.aliases,
             conditions: ["browser", "development", "import", "module", "default"]

@@ -404,6 +404,41 @@ fn worker_archive_project(version: u8) -> Arc<MemoryFileSystem> {
 }
 
 #[test]
+fn worker_disk_cache_pnp_archive_replacement_matches_cold() {
+    let directory = tempfile::tempdir().unwrap();
+    let build = |version, worker_cache_dir| {
+        let options = crate::BuildOptions {
+            project_root: Some("app".into()),
+            worker_cache_dir,
+            ..Default::default()
+        };
+        crate::BuildSession::new(worker_archive_project(version), options)
+            .build_entry(Path::new("app/index.js"))
+    };
+    let dir = Some(directory.path().to_owned());
+    let first = build(1, dir.clone());
+    let updated = build(2, dir);
+    let cold = build(2, None);
+    assert!(!first.has_errors(), "{:?}", first.diagnostics);
+    assert!(!updated.has_errors(), "{:?}", updated.diagnostics);
+    assert!(!cold.has_errors(), "{:?}", cold.diagnostics);
+    assert_ne!(updated.bundle, first.bundle);
+    assert_eq!(updated.bundle, cold.bundle);
+    assert_eq!(updated.assets.len(), cold.assets.len());
+    assert!(
+        updated
+            .assets
+            .iter()
+            .any(|asset| asset.bytes == b"payload-v2")
+    );
+    for (cached, cold) in updated.assets.iter().zip(cold.assets) {
+        assert_eq!(cached.file_name, cold.file_name);
+        assert_eq!(cached.bytes, cold.bytes);
+        assert_eq!(cached.owner_module_ids, cold.owner_module_ids);
+    }
+}
+
+#[test]
 fn worker_artifact_pnp_archive_replacement_validates_candidate_filesystem() {
     let request = crate::BuildRequest::new("app/index.js");
     let options = crate::BuildOptions {

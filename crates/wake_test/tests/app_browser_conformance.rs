@@ -157,6 +157,7 @@ impl RunningServer {
             host: Some("127.0.0.1".to_owned()),
             port: Some(port),
             open: Some(false),
+            worker_cache: false,
             federation: None,
         })
         .unwrap();

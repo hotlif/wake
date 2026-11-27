@@ -15,7 +15,7 @@ status = "stable"
 ## 用法
 
 ```text
-wake dev [ROOT] [--entry FILE] [--port PORT]
+wake dev [ROOT] [--entry FILE] [--port PORT] [--worker-cache]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -23,6 +23,9 @@ wake dev [ROOT] [--entry FILE] [--port PORT]
 | `ROOT` | `.` | 项目根或其内部路径 |
 | `--entry` | 配置入口 | 覆盖当前开发入口 |
 | `--port` | `5173` | HTTP 与 Live Reload WebSocket 监听端口 |
+| `--worker-cache` | 关闭 | 将顶层原生 Web Worker 子构建的模块编译结果保存到磁盘，供下次启动开发服务器时复用 |
+
+缓存位于项目的 `.wake/worker-cache/`，其中的缓存文件合计最多 256 MiB。再次使用 `--worker-cache` 启动时，Wake 会重新读取 Worker 源文件并解析依赖，复用与当前输入和编译选项匹配的模块编译结果。
 
 host、自动打开和 API 代理来自 `[dev_server]`。命令常驻直到收到关闭信号；端口已占用时启动失败，不会自动选择随机端口。
 

@@ -166,6 +166,9 @@ enum Command {
         /// Listening port.
         #[arg(long, default_value_t = 5173)]
         port: u16,
+        /// Reuse native Worker module compilation results on disk across dev server restarts.
+        #[arg(long)]
+        worker_cache: bool,
     },
     /// Build or develop a React component documentation site.
     Docs {
@@ -692,7 +695,12 @@ fn main() -> ExitCode {
                 ensure_static_mode(cli.ui).and_then(|()| cmd_federation_lock(&root, ui))
             }
         },
-        Command::Dev { root, entry, port } => cmd_dev(&root, entry.as_deref(), port, ui, cli.ui),
+        Command::Dev {
+            root,
+            entry,
+            port,
+            worker_cache,
+        } => cmd_dev(&root, entry.as_deref(), port, worker_cache, ui, cli.ui),
         Command::Docs { command } => match command {
             DocsCommand::Test {
                 root,
@@ -2630,6 +2638,7 @@ fn cmd_dev(
     root: &Path,
     entry: Option<&Path>,
     port: u16,
+    worker_cache: bool,
     ui: Ui,
     mode: UiMode,
 ) -> Result<(), ExitCode> {
@@ -2646,6 +2655,7 @@ fn cmd_dev(
         host: None,
         port: Some(port),
         open: None,
+        worker_cache,
         federation: None,
     }) {
         Ok(server) => server,
@@ -2687,6 +2697,7 @@ fn cmd_docs_dev(
             host: None,
             port,
             open: None,
+            worker_cache: false,
             federation: None,
         },
         docs_mode.into(),
@@ -3243,6 +3254,21 @@ fn cmd_tokenize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_cache_flag_is_available_for_application_dev() {
+        for (args, expected) in [
+            (vec!["wake", "dev", "."], false),
+            (vec!["wake", "dev", ".", "--worker-cache"], true),
+        ] {
+            let Command::Dev { worker_cache, .. } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("expected dev command")
+            };
+            assert_eq!(worker_cache, expected);
+        }
+        assert!(Cli::try_parse_from(["wake", "docs", "dev", ".", "--worker-cache"]).is_err());
+    }
 
     #[test]
     fn bundle_cli_accepts_esm_and_verbatim_affixes() {

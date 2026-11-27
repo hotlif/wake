@@ -54,7 +54,7 @@ Usage:
   wake library token [project] [--config token.toml]
   wake federation init [root]
   wake federation lock [root]
-  wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open]
+  wake dev [root] [--entry FILE] [--host HOST] [--port PORT] [--open] [--worker-cache]
   wake docs build [root] [--mode site|components] [--outdir DIR] [--base PATH]
   wake docs dev [root] [--mode site|components] [--host HOST] [--port PORT] [--open]
   wake docs test [root] [--theme light|dark ...] [--viewport WIDTHxHEIGHT ...]
@@ -917,6 +917,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     const port = takeOption(args, '--port')
     if (port) options.port = Number(port)
     options.open = takeFlag(args, '--open')
+    options.workerCache = takeFlag(args, '--worker-cache')
     if (args[0]) options.cwd = args.shift()
     if (args.length) throw new Error(`unknown dev arguments: ${args.join(' ')}`)
     const reason = await runServer(startDevServer, options, 'dev', options.cwd, ui, uiMode)

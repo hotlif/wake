@@ -73,6 +73,7 @@
 - [ADR 0082: 组件扫描导出按需加载函数](0082-component-scan-loaders.md) — `accepted`
 - [ADR 0084: 浏览器内存构建与预览发布](0084-browser-preview-builds.md) — `accepted`
 - [ADR 0089: 开发会话复用已验证的 Worker 产物](0089-validated-worker-artifacts.md) — `accepted`
+- [ADR 0090: 开发服务的可选 Worker 磁盘缓存](0090-dev-worker-disk-cache.md) — `accepted`
 
 ### css-editor
 

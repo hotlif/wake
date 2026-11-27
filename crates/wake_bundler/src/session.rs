@@ -9,6 +9,7 @@ use crate::{BuildOutput, BuildPlatform, IncrementalBundler, ModuleFormat, Resolv
 #[cfg(test)]
 thread_local! {
     pub(super) static ONE_SHOT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ONE_SHOT_BODY_EMISSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// JSX automatic runtime options owned by a build session.
@@ -97,6 +98,8 @@ pub struct BuildOptions {
     /// Hash the single JavaScript entry filename instead of retaining the legacy `bundle.js`.
     pub single_chunk_content_hash: bool,
     pub persistent_cache: Option<PathBuf>,
+    /// Absolute directory for independent persistent module caches of this build's top-level native Workers.
+    pub worker_cache_dir: Option<PathBuf>,
     pub jsx: JsxOptions,
     pub federation: FederationBuildPlan,
     /// 已规范化的浏览器目标。
@@ -137,6 +140,7 @@ impl Default for BuildOptions {
             entry_chunk_name: None,
             single_chunk_content_hash: false,
             persistent_cache: None,
+            worker_cache_dir: None,
             jsx: JsxOptions::default(),
             federation: FederationBuildPlan::default(),
             target_env: TargetEnv::default(),
@@ -216,6 +220,17 @@ impl BuildSession {
         }
     }
 
+    pub(super) fn build_worker_once(
+        mut self,
+        request: BuildRequest,
+        cache_path: Option<PathBuf>,
+    ) -> BuildOutput {
+        if let Some(path) = cache_path {
+            self.bundler.enable_worker_cache(path);
+        }
+        self.build_once(request)
+    }
+
     /// Execute an owned one-shot build without committing and cloning its output.
     ///
     /// Taking `self` makes a second invocation impossible at the type level.
@@ -236,7 +251,10 @@ impl BuildSession {
         );
         #[cfg(test)]
         ONE_SHOT_BUILDS.set(ONE_SHOT_BUILDS.get() + 1);
-        self.bundler.build(&request.entry)
+        let output = self.bundler.build(&request.entry);
+        #[cfg(test)]
+        ONE_SHOT_BODY_EMISSIONS.set(ONE_SHOT_BODY_EMISSIONS.get() + output.updated_module_count);
+        output
     }
 
     /// 强制执行一次构建。适合一次性 build；推进 generation，且不会使用已提交产物短路。
@@ -396,6 +414,7 @@ fn apply_options(bundler: &mut IncrementalBundler, options: BuildOptions) {
         entry_chunk_name,
         single_chunk_content_hash,
         persistent_cache,
+        worker_cache_dir,
         jsx,
         federation,
         target_env,
@@ -473,6 +492,7 @@ fn apply_options(bundler: &mut IncrementalBundler, options: BuildOptions) {
     if let Some(path) = persistent_cache {
         bundler.enable_persistent_cache(path);
     }
+    bundler.set_worker_cache_dir(worker_cache_dir);
 }
 
 #[cfg(test)]
@@ -989,6 +1009,208 @@ mod tests {
         assert_eq!(ONE_SHOT_BUILDS.get() - before_edit, 1);
         let cold = BuildSession::new(fs, options).build_current(request);
         assert_published_outputs_equal(&changed, &cold);
+    }
+
+    fn worker_disk_project(dep: Option<(&str, &str)>) -> Arc<MemoryFileSystem> {
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            (
+                "app/index.js",
+                "new Worker(new URL('./worker.js',import.meta.url));",
+            ),
+            ("app/worker.js", "import './message.js';"),
+            (
+                "app/message.js",
+                "import value from './dep';self.postMessage([value,MODE]);",
+            ),
+        ]));
+        if let Some((path, source)) = dep {
+            fs.insert(path, source);
+        }
+        fs
+    }
+
+    fn worker_disk_build(
+        fs: Arc<MemoryFileSystem>,
+        options: &BuildOptions,
+    ) -> (BuildOutput, usize) {
+        let before = ONE_SHOT_BODY_EMISSIONS.get();
+        let output = BuildSession::new(fs, options.clone()).build_entry(Path::new("app/index.js"));
+        (output, ONE_SHOT_BODY_EMISSIONS.get() - before)
+    }
+
+    #[test]
+    fn worker_disk_cache_fresh_sessions_reuse_bodies_and_validate_current_inputs_and_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = BuildOptions {
+            worker_cache_dir: Some(directory.path().join("workers")),
+            ..BuildOptions::default()
+        };
+        options.define.push(("MODE".into(), "'first'".into()));
+        let fs = worker_disk_project(Some(("app/dep.js", "export default 'old';")));
+        let (initial, cold_emits) = worker_disk_build(fs.clone(), &options);
+        assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+        assert_eq!(cold_emits, 3);
+        let (warm, warm_emits) = worker_disk_build(fs.clone(), &options);
+        assert_build_outputs_equal(&initial, &warm);
+        assert_eq!(
+            warm_emits, 0,
+            "unchanged child module bodies should come from disk"
+        );
+
+        fs.insert("app/dep.js", "export default 'new';");
+        let (changed, changed_emits) = worker_disk_build(fs.clone(), &options);
+        assert!(changed_emits > 0 && changed_emits < cold_emits);
+        assert_ne!(changed.bundle, initial.bundle);
+        let uncached = |fs, options: &BuildOptions| {
+            worker_disk_build(
+                fs,
+                &BuildOptions {
+                    worker_cache_dir: None,
+                    ..options.clone()
+                },
+            )
+            .0
+        };
+        assert_build_outputs_equal(&changed, &uncached(fs.clone(), &options));
+
+        fs.insert("app/dep", "export default 'higher';");
+        let (rerouted, _) = worker_disk_build(fs.clone(), &options);
+        assert_ne!(changed.bundle, rerouted.bundle);
+        assert_build_outputs_equal(&rerouted, &uncached(fs.clone(), &options));
+        options.define.last_mut().unwrap().1 = "'other'".into();
+        let (reconfigured, _) = worker_disk_build(fs.clone(), &options);
+        assert_ne!(rerouted.bundle, reconfigured.bundle);
+        assert_build_outputs_equal(&reconfigured, &uncached(fs.clone(), &options));
+
+        let missing = worker_disk_project(None);
+        let (failed, _) = worker_disk_build(missing.clone(), &options);
+        assert!(failed.has_errors());
+        assert_build_outputs_equal(&failed, &uncached(missing, &options));
+        let (restored, restored_emits) = worker_disk_build(fs, &options);
+        assert_build_outputs_equal(&restored, &reconfigured);
+        assert_eq!(restored_emits, 0);
+    }
+
+    fn worker_snapshots(path: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .filter(|file| file.extension().is_some_and(|ext| ext == "bin"))
+            .collect()
+    }
+
+    #[test]
+    fn worker_disk_cache_isolates_top_level_entries_and_defaults_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let workers = directory.path().join("workers");
+        let options = BuildOptions {
+            persistent_cache: Some(directory.path().join("main.bin")),
+            ..BuildOptions::default()
+        };
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            (
+                "app/index.js",
+                "new Worker(new URL('./a/entry.js',import.meta.url));new Worker(new URL('./b/entry.js',import.meta.url));",
+            ),
+            (
+                "app/a/entry.js",
+                "new Worker(new URL('./nested.js',import.meta.url));",
+            ),
+            ("app/a/nested.js", "self.postMessage(1);"),
+            ("app/b/entry.js", "self.postMessage(2);"),
+        ]));
+        let (initial, initial_emits) = worker_disk_build(fs.clone(), &options);
+        assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+        assert_eq!(initial_emits, 3);
+        assert_eq!(worker_disk_build(fs.clone(), &options).1, initial_emits);
+        assert_eq!(
+            worker_snapshots(directory.path()),
+            [directory.path().join("main.bin")]
+        );
+        assert!(!workers.exists());
+        let options = BuildOptions {
+            worker_cache_dir: Some(workers.clone()),
+            ..options
+        };
+        let (filled, filled_emits) = worker_disk_build(fs.clone(), &options);
+        assert_published_outputs_equal(&filled, &initial);
+        assert_eq!(filled_emits, initial_emits);
+        assert_eq!(worker_snapshots(&workers).len(), 2);
+        let (restarted, restarted_emits) = worker_disk_build(fs, &options);
+        assert_published_outputs_equal(&restarted, &initial);
+        assert_eq!(
+            restarted_emits, 1,
+            "nested Worker stays one-shot and outside the disk cache"
+        );
+    }
+
+    #[test]
+    fn worker_disk_cache_corruption_recovers_and_warning_is_local_to_the_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = BuildOptions {
+            worker_cache_dir: Some(directory.path().to_owned()),
+            ..BuildOptions::default()
+        };
+        let fs = worker_disk_project(Some(("app/dep.js", "export default 'old';")));
+        let (cold, _) = worker_disk_build(fs.clone(), &options);
+        assert!(!cold.has_errors(), "{:?}", cold.diagnostics);
+        let snapshots = worker_snapshots(directory.path());
+        assert_eq!(snapshots.len(), 1);
+        std::fs::write(&snapshots[0], b"broken snapshot").unwrap();
+        let mut retained = BuildSession::new(fs.clone(), options.clone());
+        let mut repaired = retained.build_entry(Path::new("app/index.js"));
+        assert_eq!(repaired.diagnostics.len(), 1);
+        let warning = repaired.diagnostics.remove(0);
+        assert_eq!(warning.code.as_deref(), Some("WAKE_CACHE"));
+        assert_eq!(warning.path.as_deref(), snapshots[0].to_str());
+        assert_published_outputs_equal(&cold, &repaired);
+        let before = ONE_SHOT_BUILDS.get();
+        let replayed = retained.build_entry(Path::new("app/index.js"));
+        assert_published_outputs_equal(&cold, &replayed);
+        assert_eq!(ONE_SHOT_BUILDS.get(), before);
+        let (warm, emits) = worker_disk_build(fs, &options);
+        assert_eq!(emits, 0);
+        assert_build_outputs_equal(&cold, &warm);
+    }
+
+    #[test]
+    fn worker_disk_cache_io_failure_is_nonfatal_for_multiple_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, "keep this file").unwrap();
+        let fs = Arc::new(MemoryFileSystem::from_files([
+            (
+                "app/index.js",
+                "new Worker(new URL('./a.js',import.meta.url));new Worker(new URL('./b.js',import.meta.url));",
+            ),
+            ("app/a.js", "self.postMessage('a');"),
+            ("app/b.js", "self.postMessage('b');"),
+        ]));
+        let options = BuildOptions {
+            worker_cache_dir: Some(blocked.clone()),
+            ..BuildOptions::default()
+        };
+        let (mut output, _) = worker_disk_build(fs.clone(), &options);
+        assert!(!output.has_errors(), "{:?}", output.diagnostics);
+        assert_eq!(output.diagnostics.len(), 1, "aggregate both cache attempts");
+        let warning = output.diagnostics.remove(0);
+        assert_eq!(warning.code.as_deref(), Some("WAKE_CACHE"));
+        assert!(warning.notes.iter().any(|note| note.contains(".bin")));
+        assert!(
+            warning
+                .notes
+                .iter()
+                .any(|note| note.contains("Worker 模块缓存"))
+        );
+        assert!(
+            warning
+                .notes
+                .iter()
+                .all(|note| !note.contains("内存缓存保持待写"))
+        );
+        let (cold, _) = worker_disk_build(fs, &BuildOptions::default());
+        assert_build_outputs_equal(&cold, &output);
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "keep this file");
     }
 
     #[test]

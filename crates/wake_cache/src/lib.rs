@@ -33,6 +33,8 @@ use tempfile::NamedTempFile;
 use xxhash_rust::xxh3::Xxh3;
 
 mod blobs;
+mod files;
+mod workers;
 pub use blobs::{BlobCache, BlobLoadOutcome, BlobStoreReport};
 
 /// 缓存文件魔数。
@@ -98,6 +100,7 @@ pub enum CacheStoreStage {
     WriteTemporary,
     FlushTemporary,
     SyncTemporary,
+    Evict,
     Replace,
 }
 
@@ -396,24 +399,18 @@ impl BuildCache {
 
     /// Load a bounded schema-13 cache without collapsing normal misses, corruption, and I/O.
     pub fn load(path: &Path) -> CacheLoadOutcome {
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return CacheLoadOutcome::Missing;
-            }
-            Err(error) => return CacheLoadOutcome::Io(error),
-        };
-        load_open_file(file)
+        load_open_file(File::open(path), MAX_CACHE_BYTES)
     }
 
     /// Merge with the latest cache under an OS lock and atomically replace the durable file.
     pub fn store(&mut self, path: &Path) -> Result<CacheStoreReport, CacheStoreError> {
-        self.store_inner(path, LOCK_WAIT_TIMEOUT, || Ok(()))
+        self.store_inner(path, None, LOCK_WAIT_TIMEOUT, || Ok(()))
     }
 
     fn store_inner(
         &mut self,
         path: &Path,
+        worker_limits: Option<workers::DirectoryLimits>,
         lock_timeout: Duration,
         before_replace: impl FnOnce() -> io::Result<()>,
     ) -> Result<CacheStoreReport, CacheStoreError> {
@@ -421,10 +418,18 @@ impl BuildCache {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .map_err(|error| CacheStoreError::io(CacheStoreStage::CreateDirectory, error))?;
-
-        let lock_path = companion_lock_path(path);
+        let lock_path = if worker_limits.is_some() {
+            let directory = workers::directory(path, true)
+                .map_err(|error| CacheStoreError::io(CacheStoreStage::CreateDirectory, error))?;
+            let lock_path = directory.join(".write.lock");
+            files::reject_special(&lock_path)
+                .map_err(|error| CacheStoreError::io(CacheStoreStage::OpenLock, error))?;
+            lock_path
+        } else {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| CacheStoreError::io(CacheStoreStage::CreateDirectory, error))?;
+            companion_lock_path(path)
+        };
         let lock_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -436,7 +441,12 @@ impl BuildCache {
             .map_err(|error| CacheStoreError::io(CacheStoreStage::Lock, error))?;
 
         let mut report = CacheStoreReport::default();
-        let latest = match Self::load(path) {
+        let outcome = if worker_limits.is_some() {
+            Self::load_worker(path)
+        } else {
+            Self::load(path)
+        };
+        let latest = match outcome {
             CacheLoadOutcome::Loaded(cache) => *cache,
             CacheLoadOutcome::Missing | CacheLoadOutcome::Incompatible { .. } => Self::new(),
             CacheLoadOutcome::Corrupt(_) => {
@@ -449,8 +459,16 @@ impl BuildCache {
         };
         let (mut committed, dropped_conflicts) = self.merge_with_latest(latest);
         report.dropped_conflicts = dropped_conflicts;
-        committed.compact(CacheLimits::default());
+        committed.compact(CacheLimits {
+            max_bytes: worker_limits.map_or(MAX_CACHE_BYTES, |limits| limits.max_bytes),
+            ..CacheLimits::default()
+        });
         let bytes = committed.encode().map_err(CacheStoreError::Encode)?;
+        if worker_limits.is_some_and(|limits| bytes.len() > limits.max_bytes) {
+            return Err(CacheStoreError::Encode(CacheEncodeError::BudgetExceeded(
+                "worker snapshot bytes",
+            )));
+        }
 
         let mut temporary = NamedTempFile::new_in(parent)
             .map_err(|error| CacheStoreError::io(CacheStoreStage::CreateTemporary, error))?;
@@ -465,6 +483,13 @@ impl BuildCache {
             .sync_all()
             .map_err(|error| CacheStoreError::io(CacheStoreStage::SyncTemporary, error))?;
         before_replace().map_err(|error| CacheStoreError::io(CacheStoreStage::Replace, error))?;
+        if let Some(limits) = worker_limits {
+            files::reject_special(path)
+                .map_err(|error| CacheStoreError::io(CacheStoreStage::Replace, error))?;
+            limits
+                .make_room(path, bytes.len())
+                .map_err(|error| CacheStoreError::io(CacheStoreStage::Evict, error))?;
+        }
         temporary
             .persist(path)
             .map_err(|error| CacheStoreError::io(CacheStoreStage::Replace, error.error))?;
@@ -1253,7 +1278,12 @@ impl BuildCache {
     }
 }
 
-fn load_open_file(mut file: File) -> CacheLoadOutcome {
+fn load_open_file(file: io::Result<File>, max_payload: usize) -> CacheLoadOutcome {
+    let mut file = match file {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return CacheLoadOutcome::Missing,
+        Err(error) => return CacheLoadOutcome::Io(error),
+    };
     let mut prefix = [0_u8; 8];
     if let Err(error) = file.read_exact(&mut prefix) {
         return if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -1281,10 +1311,10 @@ fn load_open_file(mut file: File) -> CacheLoadOutcome {
         };
     }
     let declared = u64::from_le_bytes(tail[..8].try_into().expect("fixed payload length bytes"));
-    if declared > MAX_CACHE_BYTES as u64 {
+    if declared > max_payload as u64 {
         return CacheLoadOutcome::Corrupt(CacheDecodeError::PayloadTooLarge {
             declared,
-            maximum: MAX_CACHE_BYTES,
+            maximum: max_payload,
         });
     }
     let payload_len = match usize::try_from(declared) {
@@ -2810,7 +2840,7 @@ mod tests {
 
         let started = Instant::now();
         let error = writer
-            .store_inner(&path, Duration::from_millis(40), || Ok(()))
+            .store_inner(&path, None, Duration::from_millis(40), || Ok(()))
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
@@ -2938,7 +2968,7 @@ mod tests {
         let mut changed = loaded(BuildCache::load(&path));
         changed.put_summary(99, ModuleSummary::default());
         let error = changed
-            .store_inner(&path, LOCK_WAIT_TIMEOUT, || {
+            .store_inner(&path, None, LOCK_WAIT_TIMEOUT, || {
                 Err(io::Error::other("injected before replace"))
             })
             .unwrap_err();
